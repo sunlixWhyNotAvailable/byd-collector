@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@drawable/collector_apk_icon"
+        android:label="${collectorLabel}"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:roundIcon="@drawable/collector_apk_icon"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme">
+
+        <activity
+            android:name="com.bydcollector.collector.MainActivity"
+            android:autoRemoveFromRecents="true"
+            android:excludeFromRecents="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name="com.bydcollector.collector.service.CollectorService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="dataSync" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/update_file_paths" />
+        </provider>
+
+        <receiver
+            android:name="com.bydcollector.collector.system.BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter android:priority="9900">
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.USER_PRESENT" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </receiver>
+
+        <receiver
+            android:name="com.bydcollector.collector.system.InternalAutoStartReceiver"
+            android:enabled="true"
+            android:exported="false" />
+
+        <receiver
+            android:name="com.bydcollector.collector.system.KeepAliveRecoveryReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="com.bydcollector.collector.action.KEEP_ALIVE_RECOVERY" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
