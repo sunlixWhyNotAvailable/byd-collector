@@ -54,7 +54,12 @@ object DirectBridgeManager {
 
     fun launchCommand(apkPath: String, appUid: Int): String {
         val quotedApk = shellQuote(apkPath)
-        return "CLASSPATH=$quotedApk setsid app_process /system/bin --nice-name=${CollectorHelperProtocol.PROCESS_NAME} " +
+        //clear stale shell helper from prior install before starting the current app-owned helper
+        val cleanup = "for pid in ${'$'}(pidof ${CollectorHelperProtocol.PROCESS_NAME} 2>/dev/null); " +
+            "do kill \"${'$'}pid\" 2>/dev/null || true; done; " +
+            "rm -f ${CollectorHelperProtocol.LOCK_PATH}; "
+        return cleanup +
+            "CLASSPATH=$quotedApk setsid app_process /system/bin --nice-name=${CollectorHelperProtocol.PROCESS_NAME} " +
             "${CollectorHelperProtocol.HELPER_CLASS} $appUid </dev/null >${CollectorHelperProtocol.LOG_PATH} 2>&1 & " +
             "for i in 1 2 3; do service list 2>/dev/null | grep -q ${CollectorHelperProtocol.SERVICE_NAME} && break; sleep 1; done"
     }
