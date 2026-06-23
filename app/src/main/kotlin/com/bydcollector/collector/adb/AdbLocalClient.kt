@@ -27,6 +27,7 @@ import java.util.Base64
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 
+//implements the small local adb client needed on dilink without depending on an external adb server
 class AdbLocalClient(
     private val keyDir: File,
     private val eventSink: ((category: String, message: String, detail: String?) -> Unit)? = null,
@@ -37,6 +38,7 @@ class AdbLocalClient(
         timeoutMs: Int = SHELL_TIMEOUT_MS,
         allowAuthorizationPrompt: Boolean = false
     ): AdbShellResult {
+        //keeps shell calls serialized with auth so one adb socket owns the rsa prompt/handshake sequence
         if (!AUTH_LOCK.tryLock(AUTH_LOCK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
             return AdbShellResult(
                 ok = false,
@@ -177,6 +179,7 @@ class AdbLocalClient(
     private fun openLocalAdbSocket(endpoint: AdbEndpoint): Socket {
         val socket = Socket()
         try {
+            //normalizes local adb endpoints to loopback because the app must never shell out to remote hosts
             val socketAddress = when (endpoint.port) {
                 5555 -> InetSocketAddress("127.0.0.1", 5555)
                 1439 -> InetSocketAddress("127.0.0.1", 1439)
@@ -224,6 +227,7 @@ class AdbLocalClient(
 
         var signatureSent = false
         var publicKeySent = false
+        //tries signature auth first so already-approved installs avoid showing the rsa prompt again
         while (true) {
             val response = try {
                 readPacket(input)
@@ -319,6 +323,7 @@ class AdbLocalClient(
     ): AdbShellResult {
         val startedAt = System.currentTimeMillis()
         val localId = 1
+        //adds an explicit marker because adb shell streams do not otherwise expose the remote exit code
         val service = "shell:($command); echo __BYDCOLLECTOR_EXIT_${'$'}?__\u0000"
         writePacket(output, COMMAND_OPEN, localId, 0, service.toByteArray())
 
@@ -384,6 +389,7 @@ class AdbLocalClient(
         val privateFile = File(keyDir, "adb_key.priv")
         val publicFile = File(keyDir, "adb_key.pub")
         keyDir.mkdirs()
+        //keeps the same adb identity across app updates so the user grant remains stable
         migrateLegacyAdbKeyIfPresent(privateFile, publicFile)
         if (privateFile.exists()) {
             runCatching {
@@ -428,6 +434,7 @@ class AdbLocalClient(
     }
 
     private fun signToken(privateKey: PrivateKey, token: ByteArray): ByteArray {
+        //matches android adb's sha1 digestinfo signing format instead of a generic rsa signature wrapper
         val digestInfo = SHA1_DIGEST_INFO_PREFIX + token
         val signature = Signature.getInstance("NONEwithRSA")
         signature.initSign(privateKey)
@@ -436,6 +443,7 @@ class AdbLocalClient(
     }
 
     private fun androidAdbPublicKey(publicKey: RSAPublicKey): ByteArray {
+        //serializes rsa public key in android adb's little-endian wire format for AUTH_RSAPUBLICKEY
         val wordCount = 64
         val radix = BigInteger.ONE.shiftLeft(32)
         val mask = radix.subtract(BigInteger.ONE)

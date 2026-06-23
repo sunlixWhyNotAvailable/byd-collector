@@ -5,6 +5,7 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import com.bydcollector.collector.BuildConfig
 
+//creates and upgrades the app-private sqlite database without dropping user telemetry on normal upgrades
 class TelemetryDatabaseHelper(
     private val appContext: Context,
     databaseName: String = DATABASE_NAME
@@ -21,12 +22,14 @@ class TelemetryDatabaseHelper(
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        //replays the schema asset then adds missing columns so older installs keep their existing rows
         executeSqlAsset(db, SCHEMA_ASSET)
         createCollectorEvents(db)
         ensureSchemaCompatibility(db)
     }
 
     override fun onDowngrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        //downgrade support is destructive because old code cannot safely interpret newer telemetry tables
         recreateDatabase(db)
     }
 
@@ -115,6 +118,7 @@ class TelemetryDatabaseHelper(
     }
 
     private fun ensureSchemaCompatibility(db: SQLiteDatabase) {
+        //keeps migrations idempotent because users often install debug builds over several intermediate versions
         ensureColumns(
             db = db,
             tableName = "catalog_versions",
@@ -418,6 +422,7 @@ class TelemetryDatabaseHelper(
         columnName: String,
         definition: String
     ) {
+        //sqlite supports adding nullable/defaulted columns in place, which preserves existing telemetry rows
         db.execSQL("ALTER TABLE $tableName ADD COLUMN $columnName $definition")
     }
 

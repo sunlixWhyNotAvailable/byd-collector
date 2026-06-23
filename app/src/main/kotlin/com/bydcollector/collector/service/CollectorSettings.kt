@@ -7,6 +7,7 @@ import com.bydcollector.collector.influx.InfluxConfig
 import com.bydcollector.collector.keepalive.KeepAliveConfig
 import com.bydcollector.collector.mqtt.HaMqttConfig
 
+//persistent user settings facade that also records operational events for later diagnostics
 class CollectorSettings(
     context: Context,
     private val store: TelemetryStore? = null
@@ -56,6 +57,7 @@ class CollectorSettings(
     fun debugBatchSize(): Int = prefs.getInt(KEY_DEBUG_BATCH_SIZE, DEFAULT_DEBUG_BATCH_SIZE)
         .coerceIn(1, MAX_DEBUG_BATCH_SIZE)
 
+    //keeps debug autostart safer than manual debug because it may run without the user watching the tablet
     fun debugAutostartBatchSize(): Int = debugBatchSize().coerceAtMost(SAFE_DEBUG_AUTOSTART_BATCH_SIZE)
 
     fun setDebugBatchSize(value: Int) {
@@ -69,6 +71,7 @@ class CollectorSettings(
     }
 
     fun mqttConfig(): HaMqttConfig {
+        //builds an immutable snapshot so async mqtt work uses one consistent set of settings
         return HaMqttConfig(
             enabled = isMqttEnabled(),
             discoveryEnabled = true,
@@ -191,6 +194,7 @@ class CollectorSettings(
     }
 
     fun influxConfig(): InfluxConfig {
+        //shares category selection with mqtt by default so ha live state and history stay aligned
         return InfluxConfig(
             enabled = isInfluxEnabled(),
             host = influxHost(),
@@ -314,6 +318,7 @@ class CollectorSettings(
     }
 
     fun keepAliveConfig(): KeepAliveConfig {
+        //groups radio/service recovery toggles for foreground-service reconciliation
         return KeepAliveConfig(
             keepWifi = isKeepWifiEnabled(),
             keepMobileData = isKeepMobileDataEnabled(),

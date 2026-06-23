@@ -4,6 +4,7 @@ import com.bydcollector.collector.data.direct.DirectFidRegistry
 import com.bydcollector.collector.data.local.PollReading
 import java.util.Locale
 
+//converts raw BYD collector readings into stable semantic fields for dashboard, mqtt, and influx
 class VehicleStateNormalizer(
     private val catalog: List<NormalizedFieldDefinition> = NormalizedFieldCatalog.fields,
     private val directFloatSourceKeys: Set<String> = DirectFidRegistry.entries
@@ -29,6 +30,7 @@ class VehicleStateNormalizer(
         observedAt: String
     ): NormalizedObservation {
         if (field.normalizerId in DERIVED_HV_POWER_NORMALIZERS) {
+            //derives hv power from voltage/current because the charge-power source does not represent discharge
             val (quality, value) = when (field.normalizerId) {
                 "derived_signed_hv_power_kw" -> normalizeDerivedHvPower(byKey, split = null)
                 "derived_hv_charge_power_kw" -> normalizeDerivedHvPower(byKey, split = "charge")
@@ -64,6 +66,7 @@ class VehicleStateNormalizer(
             if (quality == NormalizedQuality.OK) {
                 return candidate
             }
+            //preserves the first present bad source so diagnostics can distinguish invalid from missing
             if (firstPresentObservation == null) {
                 firstPresentObservation = candidate
             }
@@ -172,6 +175,7 @@ class VehicleStateNormalizer(
         scale: Double = 1.0,
         isValid: (Double) -> Boolean
     ): Pair<NormalizedQuality, NormalizedValue> {
+        //rejects float raw-only values because direct float reads are meaningful only after helper decoding
         if (hasRawWithoutDecodedFloat(reading)) {
             return NormalizedQuality.INVALID to emptyValue(field.valueType)
         }
@@ -242,6 +246,7 @@ class VehicleStateNormalizer(
     }
 
     private fun stableDouble(value: Double): Double {
+        //normalizes numeric precision so tiny double noise does not create fake history changes
         return String.format(Locale.US, "%.6f", value)
             .trimEnd('0')
             .trimEnd('.')

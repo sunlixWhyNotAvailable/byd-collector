@@ -19,6 +19,7 @@ data class EcImportResult(
     val errorMessage: String? = null
 )
 
+//imports BYD's energy-consumption sqlite file into the app db without making it the primary telemetry store
 class EcDatabaseImporter(
     private val context: Context,
     private val helper: TelemetryDatabaseHelper,
@@ -66,6 +67,7 @@ class EcDatabaseImporter(
         val existing = sourceCandidates.firstOrNull { it.exists() && it.isFile }
         if (existing != null) return existing
 
+        //reports permission separately from missing file so setup guidance can be actionable
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
             throw EcImportException(
                 category = "source_permission_missing",
@@ -83,6 +85,7 @@ class EcDatabaseImporter(
 
     private fun readSourceRows(sourceFile: File): List<EcSourceRow> {
         try {
+            //opens the source read-only because the collector must never mutate vehicle/diLink-owned databases
             SQLiteDatabase.openDatabase(sourceFile.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { db ->
                 val fuelColumn = findFuelColumn(db)
                 val fuelSelect = fuelColumn?.let { "${quoteIdentifier(it)} AS fuel" } ?: "NULL AS fuel"
@@ -122,6 +125,7 @@ class EcDatabaseImporter(
         val maxSourceId = rows.maxOfOrNull { it.sourceId }
         val existingRows = readExistingRows(db)
 
+        //dedupes by source id so repeated service starts refresh history without duplicating trips
         db.beginTransaction()
         try {
             rows.forEach { row ->

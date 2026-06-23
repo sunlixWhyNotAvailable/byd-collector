@@ -1,5 +1,6 @@
 package com.bydcollector.collector.data.normalized
 
+//semantic catalog that maps curated raw keys to stable fields exposed to dashboard, mqtt, and influx
 object NormalizedFieldCatalog {
     const val CATALOG_VERSION = "normalized-direct-v6-20260622-soc-display"
 
@@ -27,6 +28,7 @@ object NormalizedFieldCatalog {
     val batterySoh = number("battery_soh_percent", NormalizedCategory.BATTERY, "%", "Battery SOH", "battery", "measurement", listOf("statistic_1014_1145045032_5"), "decoded_percent_0_100")
     val hvBatteryVoltage = number("hv_battery_voltage_v", NormalizedCategory.BATTERY, "V", "HV battery voltage", "voltage", "measurement", listOf("charging_charge_battery_volt"), "decoded_voltage_v")
     val hvBatteryCurrent = number("hv_battery_current_a", NormalizedCategory.BATTERY, "A", "HV battery current", "current", "measurement", listOf("charging_charging_charge_current_not_convert"), "decoded_current_a")
+    //splits hv power into signed/charge/discharge views because charging power alone misses driving/v2l discharge
     val batteryPower = number("battery_power_kw", NormalizedCategory.BATTERY, "kW", "Battery power", "power", "measurement", listOf("charging_charge_battery_volt", "charging_charging_charge_current_not_convert"), "derived_signed_hv_power_kw")
     val batteryChargePower = number("battery_charge_power_kw", NormalizedCategory.BATTERY, "kW", "Battery charge power", "power", "measurement", listOf("charging_charge_battery_volt", "charging_charging_charge_current_not_convert"), "derived_hv_charge_power_kw")
     val batteryDischargePower = number("battery_discharge_power_kw", NormalizedCategory.BATTERY, "kW", "Battery discharge power", "power", "measurement", listOf("charging_charge_battery_volt", "charging_charging_charge_current_not_convert"), "derived_hv_discharge_power_kw")

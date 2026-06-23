@@ -15,6 +15,7 @@ interface PahoMqttClientHandle {
     fun close()
 }
 
+//thin paho wrapper that keeps mqtt connection lifecycle replaceable in unit tests
 class PahoMqttClientFacade(
     internal val clientFactory: (serverUri: String, clientId: String) -> PahoMqttClientHandle = { serverUri, clientId ->
         PahoMqttClientHandleAdapter(MqttClient(serverUri, clientId, MemoryPersistence()))
@@ -34,6 +35,7 @@ class PahoMqttClientFacade(
     }
 
     private fun replaceClient(config: HaMqttConfig): PahoMqttClientHandle {
+        //closes stale clients when broker/client-id settings change to avoid publishing to an old target
         val oldClient = client
         client = null
         oldClient?.let { closeBestEffort(it) }
@@ -87,6 +89,7 @@ class PahoMqttClientFacade(
                 retained = true,
                 qos = 1
             )
+            //sets retained offline lwt so ha marks entities unavailable if the collector process dies
             setWill(will.topic, will.payload.toByteArray(Charsets.UTF_8), will.qos, will.retained)
         }
     }

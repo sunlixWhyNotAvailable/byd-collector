@@ -6,6 +6,7 @@ import android.os.Parcel
 import android.util.Log
 import com.bydcollector.collector.direct.CollectorHelperProtocol
 
+//wraps the helper binder so autoservice calls stay behind one read-only app-facing interface
 class DirectVehicleHelperClient : DirectVehicleHelper {
     private val lock = Any()
 
@@ -26,6 +27,7 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
 
     private fun transact(code: Int, writeArgs: (Parcel) -> Unit): DirectHelperReadResult? {
         return synchronized(lock) {
+            //synchronizes binder parcels because one cached binder is shared by polling and status checks
             val binder = ensureBinder() ?: return@synchronized null
             val data = Parcel.obtain()
             val reply = Parcel.obtain()
@@ -52,6 +54,7 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
     }
 
     private fun ensureBinder(): IBinder? {
+        //reuses the service-manager lookup until android tells us the binder died
         cached?.takeIf { it.isBinderAlive }?.let { return it }
         return resolveBinder()?.also { cached = it }
     }

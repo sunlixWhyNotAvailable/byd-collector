@@ -59,6 +59,7 @@ fun BydCollectorApp(
     onDismissBackgroundSetupPrompt: () -> Unit = {}
 ) {
     val s = strings(language)
+    //renders the operational dashboard directly; this app intentionally has no landing/marketing screen
     BydCollectorTheme(darkTheme) {
         val p = LocalBydPalette.current
         Box(
@@ -90,6 +91,7 @@ fun BydCollectorApp(
                             .fillMaxWidth()
                             .weight(1f)
                     ) {
+                        //keeps tabs mounted from one state snapshot so service/runtime facts stay consistent
                         when (activeTab) {
                             AppTab.MAIN -> MainTab(state, s, actions)
                             AppTab.ALL_PARAMETERS -> AllParametersTab(state, s, language, debugBatchText, actions)
@@ -102,6 +104,7 @@ fun BydCollectorApp(
                 BottomTabs(activeTab = activeTab, strings = s, actions = actions)
             }
             if (backgroundSetupPromptVisible) {
+                //blocks underlying controls while the dilink background-app instruction is visible
                 BackgroundAppsSetupPrompt(
                     strings = s,
                     onOpenSettings = onOpenBackgroundSettingsFromPrompt,
@@ -109,6 +112,7 @@ fun BydCollectorApp(
                 )
             }
             if (updateUiState != UpdateUiState.Hidden) {
+                //uses the same modal layer as background setup so update flow cannot trigger other controls
                 UpdateCheckDialog(
                     strings = s,
                     appVersionName = appVersionName,
@@ -495,7 +499,7 @@ private fun InfluxCard(state: DashboardState?, strings: UiStrings, draft: Influx
             Text(strings.autoStart, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
             BydSwitch(state?.influxAutoStartEnabled == true, actions::onToggleInfluxAutoStart)
         }
-        ChannelPrelude(strings, mqtt = false, pendingText = "${state?.influxPendingRows ?: 0L} ${strings.rows.lowercase()}", actions = actions)
+        ChannelPrelude(strings, mqtt = false, pendingText = "${state?.influxPendingRows ?: 0L} ${strings.points}", actions = actions)
         CategoryGrid(
             strings.influxCategories,
             if (state?.haSharedCategoriesEnabled == true) state.mqttEnabledCategories else state?.influxEnabledCategories.orEmpty(),
@@ -929,8 +933,8 @@ private fun LogsMetricsGrid(state: DashboardState?, strings: UiStrings) {
                 status = compactChannelStatusText(state?.influxStatus, strings),
                 kind = channelStatusKind(state?.influxStatus, state?.influxEnabled == true),
                 rows = listOf(
-                    strings.exported to "${formatCount(state?.influxExportedRowsTotal ?: 0L)} ${strings.rows.lowercase()}",
-                    strings.queued to "${formatCount(state?.influxPendingRows ?: 0L)} ${strings.rows.lowercase()}",
+                    strings.exported to "${formatCount(state?.influxExportedRowsTotal ?: 0L)} ${strings.points}",
+                    strings.queued to "${formatCount(state?.influxPendingRows ?: 0L)} ${strings.points}",
                     strings.lastSuccess to (state?.influxLastSuccessAt ?: "-"),
                     strings.lastError to (state?.influxLastErrorAt ?: state?.influxLastError ?: "-"),
                     strings.batch to "300"

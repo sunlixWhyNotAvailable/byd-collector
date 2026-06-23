@@ -5,6 +5,7 @@ import com.bydcollector.collector.service.CollectorSettings
 import java.net.HttpURLConnection
 import java.net.URL
 
+//checks github releases from a background executor and returns ui-safe update states
 class UpdateChecker(
     private val settings: CollectorSettings,
     private val nowMs: () -> Long = { System.currentTimeMillis() }
@@ -12,6 +13,7 @@ class UpdateChecker(
     fun check(force: Boolean): UpdateCheckResult {
         val now = nowMs()
         val last = settings.lastUpdateCheckAtMs()
+        //throttles automatic checks so normal app launches do not hammer the github api
         if (!force && now - last < CHECK_INTERVAL_MS) {
             return UpdateCheckResult.UpToDate
         }

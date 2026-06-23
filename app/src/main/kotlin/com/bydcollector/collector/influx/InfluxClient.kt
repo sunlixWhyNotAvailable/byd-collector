@@ -12,10 +12,12 @@ interface InfluxClient {
     fun write(config: InfluxConfig, lines: List<String>): InfluxActionResult
 }
 
+//minimal influxdb v1 http client used by foreground-service export actions
 class HttpInfluxClient : InfluxClient {
     override fun test(config: InfluxConfig): InfluxActionResult {
         val ping = request(config, "GET", "/ping", null)
         if (!ping.ok) return ping
+        //writes a tiny point because /ping can succeed even when database/write permissions are wrong
         val line = "bydcollector_connectivity_test value=1i ${System.currentTimeMillis() * 1_000_000L}"
         return write(config.copy(enabled = true), listOf(line))
     }
@@ -67,6 +69,7 @@ class HttpInfluxClient : InfluxClient {
     private fun InfluxConfig.basicAuthHeader(): String? {
         val user = username ?: return null
         val pass = password ?: ""
+        //supports optional basic auth for ha add-ons while allowing unauthenticated local influx setups
         val token = Base64.getEncoder().encodeToString("$user:$pass".toByteArray(StandardCharsets.UTF_8))
         return "Basic $token"
     }

@@ -15,6 +15,7 @@ import com.bydcollector.collector.influx.InfluxCursor
 import com.bydcollector.collector.influx.InfluxExportStateSnapshot
 import com.bydcollector.collector.influx.InfluxExportStore
 import com.bydcollector.collector.influx.InfluxPendingHistoryRow
+import com.bydcollector.collector.influx.InfluxPendingSummary
 import com.bydcollector.collector.mqtt.MqttOutboxStore
 import com.bydcollector.collector.mqtt.MqttRetryState
 import com.bydcollector.collector.mqtt.MqttRetryStateStore
@@ -25,6 +26,7 @@ import java.io.File
 import java.security.MessageDigest
 import java.util.Locale
 
+//central sqlite facade that keeps raw polls, normalized state, mqtt outbox, and influx cursors consistent
 class TelemetryStore(
     private val context: Context,
     private val helper: TelemetryDatabaseHelper,
@@ -43,6 +45,7 @@ class TelemetryStore(
 
     fun ensureCatalogImported(): Long {
         val catalogVersionId = directImporter.ensureImported()
+        //adds wide poll columns for the active catalog before any poll attempts to write values
         ensurePollValueColumns(helper.writableDatabase, catalogParameters(catalogVersionId))
         return catalogVersionId
     }
@@ -89,6 +92,7 @@ class TelemetryStore(
         vehicleModel: String = "BYD Sea Lion 07 EV"
     ): Long {
         val catalogVersionId = ensureCatalogImported()
+        //closes stale sessions because android can kill the process before onDestroy/endSession runs
         closeOpenSessions("implicit_end")
         val sessionId = helper.writableDatabase.insertOrThrow(
             "collection_sessions",
@@ -164,6 +168,7 @@ class TelemetryStore(
     ): Long {
         val db = helper.writableDatabase
         ensurePollValueColumns(db, parameters)
+        //writes the poll header and wide raw values atomically so dashboard counts never see half a poll
         db.beginTransaction()
         try {
             val requestedParameterCount = parameters.size
@@ -234,6 +239,7 @@ class TelemetryStore(
         }
         try {
             val db = helper.writableDatabase
+            //stores only recent operational events so diagnostics stay useful without growing unbounded
             db.insert(
                 "collector_events",
                 null,
@@ -288,6 +294,7 @@ class TelemetryStore(
 
     override fun upsertPending(message: HaMqttMessage, targetType: String, priority: Int) {
         val now = clock.nowIso()
+        //keeps only the latest retained payload per topic because ha needs current state more than old retries
         val values = ContentValues().apply {
             put("target_type", targetType)
             put("topic", message.topic)
@@ -428,6 +435,7 @@ class TelemetryStore(
     override fun ensureInfluxCursors(fieldKeys: Set<String>) {
         if (fieldKeys.isEmpty()) return
         val db = helper.writableDatabase
+        //creates one cursor per normalized field so enabling categories later does not reset old exports
         fieldKeys.forEach { fieldKey ->
             db.insertWithOnConflict(
                 "influx_export_cursor",
@@ -437,6 +445,28 @@ class TelemetryStore(
                     put("last_exported_history_id", 0)
                 },
                 SQLiteDatabase.CONFLICT_IGNORE
+            )
+        }
+    }
+
+    override fun pendingInfluxSummary(fieldKeys: Set<String>): InfluxPendingSummary {
+        if (fieldKeys.isEmpty()) return InfluxPendingSummary(rows = 0, oldestObservedAt = null)
+        ensureInfluxCursors(fieldKeys)
+        val placeholders = fieldKeys.joinToString(",") { "?" }
+        helper.readableDatabase.rawQuery(
+            """
+            SELECT COUNT(*), MIN(history.observed_at)
+            FROM vehicle_state_history history
+            JOIN influx_export_cursor cursor ON cursor.field_key = history.field_key
+            WHERE history.field_key IN ($placeholders)
+              AND history.id > cursor.last_exported_history_id
+            """.trimIndent(),
+            fieldKeys.toTypedArray()
+        ).use { cursor ->
+            if (!cursor.moveToFirst()) return InfluxPendingSummary(rows = 0, oldestObservedAt = null)
+            return InfluxPendingSummary(
+                rows = cursor.getLong(0),
+                oldestObservedAt = cursor.getNullableString(1)
             )
         }
     }
@@ -711,6 +741,7 @@ class TelemetryStore(
 
     fun healthSnapshot(running: Boolean): HealthSnapshot {
         val mqttRetryState = safeMqttRetryState()
+        //uses safe queries because the dashboard must keep rendering through migrations and partial failures
         return HealthSnapshot(
             running = running,
             activeSessionId = if (running) safeActiveSessionId() else null,
@@ -871,6 +902,7 @@ class TelemetryStore(
         val catalogVersionId = parameters.firstOrNull()?.catalogVersionId ?: return
         if (pollValueColumnsEnsuredForCatalogVersionId == catalogVersionId) return
 
+        //keeps raw and desc values queryable by stable column names instead of burying them in json blobs
         val existingColumns = pollValueColumnNames(db)
             .map { it.lowercase(Locale.US) }
             .toMutableSet()

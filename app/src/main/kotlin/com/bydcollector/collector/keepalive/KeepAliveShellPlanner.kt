@@ -1,5 +1,6 @@
 package com.bydcollector.collector.keepalive
 
+//builds the only shell commands the keep-alive supervisor is allowed to send over local adb
 object KeepAliveShellPlanner {
     fun mirrorSettingsCommands(config: KeepAliveConfig): List<String> {
         return listOf(
@@ -23,6 +24,7 @@ object KeepAliveShellPlanner {
 
     fun daemonLaunchCommand(apkPath: String): String {
         val quotedApk = shellQuote(apkPath)
+        //uses app_process so the same apk contains the shell-side daemon class
         return "pidof bydcollector_keepalive >/dev/null 2>&1 || " +
             "CLASSPATH=$quotedApk setsid app_process /system/bin --nice-name=bydcollector_keepalive " +
             "com.bydcollector.collector.keepalive.KeepAliveDaemon </dev/null " +

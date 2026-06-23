@@ -5,6 +5,7 @@ import com.bydcollector.collector.data.local.SystemClockAdapter
 import java.time.OffsetDateTime
 import java.util.Locale
 
+//coordinates retained ha mqtt publishing with an sqlite outbox so short broker outages do not lose current state
 class MqttPublishCoordinator(
     private val client: MqttClientFacade,
     private val outbox: MqttOutboxStore,
@@ -42,6 +43,7 @@ class MqttPublishCoordinator(
         }
 
         retryStateStore.recordRetrySuccess(clock.nowIso())
+        //publishes discovery before state so ha can attach incoming retained values to known entities
         enqueueBuildResult(messageFactory.discoveryMessages(), DISCOVERY_PRIORITY)?.let { return it }
         enqueueBuildResult(messageFactory.fullResyncMessages(), STATE_PRIORITY)?.let { return it }
         return flushPending(force = true)
@@ -102,6 +104,7 @@ class MqttPublishCoordinator(
         if (!config.enabled) return MqttActionResult.ok("mqtt disabled")
 
         val startingRetryState = retryStateStore.retryState()
+        //honors persisted backoff unless the user explicitly tests/starts the channel
         if (!retryPolicy.canAttempt(startingRetryState, clock.nowIso(), force)) {
             return MqttActionResult.ok("mqtt backoff active")
         }
@@ -146,6 +149,7 @@ class MqttPublishCoordinator(
         val hadPreviousFailure = startingRetryState.failureCount > 0 || startingRetryState.lastError != null
         retryStateStore.recordRetrySuccess(clock.nowIso())
         if (hadPreviousFailure && allowFullResyncAfterSuccess) {
+            //after reconnect, resync everything because retained topics may have gone stale during outage
             return enqueueBuildResult(messageFactory.fullResyncMessages(), STATE_PRIORITY)
                 ?: flushPendingInternal(force = true, allowFullResyncAfterSuccess = false)
         }
@@ -159,6 +163,7 @@ class MqttPublishCoordinator(
         return when (buildResult) {
             is MqttMessageBuildResult.Failure -> MqttActionResult.fail(buildResult.category, buildResult.message)
             is MqttMessageBuildResult.Success -> {
+                //upserts by topic so the outbox holds the newest payload, not a backlog of obsolete states
                 buildResult.messages.forEach { message ->
                     outbox.upsertPending(
                         message = message,

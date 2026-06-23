@@ -18,6 +18,7 @@
         android:allowBackup="false"
         android:icon="@drawable/collector_apk_icon"
         android:label="${collectorLabel}"
+        android:name="com.bydcollector.collector.BydCollectorApplication"
         android:networkSecurityConfig="@xml/network_security_config"
         android:roundIcon="@drawable/collector_apk_icon"
         android:supportsRtl="true"

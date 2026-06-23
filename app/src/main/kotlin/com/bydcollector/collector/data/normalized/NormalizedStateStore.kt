@@ -9,6 +9,7 @@ import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import java.time.OffsetDateTime
 import java.time.temporal.ChronoUnit
 
+//stores latest semantic vehicle state plus change history for ha live state and influx time series
 class NormalizedStateStore(
     private val helper: TelemetryDatabaseHelper,
     private val clock: Clock = SystemClockAdapter()
@@ -37,6 +38,7 @@ class NormalizedStateStore(
             observations.forEach { observation ->
                 val next = observation.toStoredState()
                 val previous = currentStateForField(db, next.fieldKey)
+                //dedupes unchanged semantic values so history represents changes instead of every poll tick
                 val decision = NormalizedStateReducer.decide(previous, next)
 
                 if (decision.insertHistory) {
@@ -88,6 +90,7 @@ class NormalizedStateStore(
 
     fun markStale(nowIso: String = clock.nowIso()): Int {
         val now = parseIso(nowIso) ?: return 0
+        //marks stale fields when polling stops so ha can see old values as degraded instead of fresh
         val staleRows = currentState()
             .filter { it.quality == NormalizedQuality.OK.name }
             .filter { row ->
@@ -115,6 +118,7 @@ class NormalizedStateStore(
 
     private fun upsertCatalogField(db: SQLiteDatabase, field: NormalizedFieldDefinition) {
         val now = clock.nowIso()
+        //keeps discovery/export metadata in sqlite next to the current values that use it
         val values = ContentValues().apply {
             put("category", field.category.mqttKey)
             put("value_type", field.valueType.name)

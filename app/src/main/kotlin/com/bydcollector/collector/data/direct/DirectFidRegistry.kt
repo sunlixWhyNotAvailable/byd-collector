@@ -16,6 +16,7 @@ data class DirectFidEntry(
     val source: String = "wide-poll-session-20260605_161751"
 ) {
     val sourceId: String = "autoservice:$dev:$fid:$tx"
+    //keeps discovery provenance queryable in sqlite next to each raw field
     val note: String = "source=$source dev=$dev fid=$fid tx=$tx decoder=$decoder scale=$scale classification=$classification prod_category=$prodCategory feature_names=$featureNames"
 }
 
@@ -33,6 +34,7 @@ enum class DirectValueDecoder {
     FLOAT_VOLT
 }
 
+//curated read-only autoservice scope for the main db; exploratory values belong in round-robin
 object DirectFidRegistry {
     const val CATALOG_VERSION = "autoservice-fid-direct-20260622-curated-80-v1"
     const val TX_GET_INT = 5

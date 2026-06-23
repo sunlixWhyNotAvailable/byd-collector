@@ -33,6 +33,8 @@ import com.bydcollector.collector.ui.compose.BydCollectorApp
 import com.bydcollector.collector.ui.compose.InfluxDraft
 import com.bydcollector.collector.ui.compose.MqttDraft
 import com.bydcollector.collector.ui.compose.UiLanguage
+import com.bydcollector.collector.update.UpdateAutoCheckAction
+import com.bydcollector.collector.update.UpdateAutoCheckRuntime
 import com.bydcollector.collector.update.UpdateChecker
 import com.bydcollector.collector.update.UpdateCheckResult
 import com.bydcollector.collector.update.UpdateDownloader
@@ -40,6 +42,7 @@ import com.bydcollector.collector.update.UpdateInfo
 import com.bydcollector.collector.update.UpdateUiState
 import java.util.concurrent.Executors
 
+//coordinates the user-facing compose shell while CollectorService owns long-running vehicle work
 class MainActivity : ComponentActivity() {
     private lateinit var store: TelemetryStore
     private lateinit var settings: CollectorSettings
@@ -74,6 +77,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    //maps every ui command to persisted settings plus service intents so process restarts keep the same intent
     private val uiActions = object : BydCollectorActions {
         override fun onTabSelected(tab: AppTab) {
             activeTab = tab
@@ -255,6 +259,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onToggleUpdateAutoCheck(enabled: Boolean) {
             settings.setUpdateAutoCheckEnabled(enabled)
+            handleUpdateAutoCheckAction(UpdateAutoCheckRuntime.onAutoCheckEnabledChanged(enabled))
             refresh()
         }
 
@@ -312,6 +317,7 @@ class MainActivity : ComponentActivity() {
             database = settings.influxDatabase(),
             measurement = settings.influxMeasurement()
         )
+        startRuntimeUpdateAutoCheck()
         setContent {
             BydCollectorApp(
                 state = dashboardState,
@@ -340,24 +346,25 @@ class MainActivity : ComponentActivity() {
         if (!setupHandled && BuildConfig.ENABLE_ADB_UI) {
             maybeRunStartupAdbSelfCheck("startup")
         }
-        scheduleStartupUpdateCheck()
+        runPendingStartupUpdateCheckIfReady()
         handler.postDelayed(refreshTask, DASHBOARD_REFRESH_INTERVAL_MS)
     }
 
     override fun onPause() {
         foreground = false
         handler.removeCallbacks(refreshTask)
-        handler.removeCallbacks(::runAutomaticUpdateCheck)
         super.onPause()
     }
 
     override fun onDestroy() {
         destroyed = true
+        //asks the watchdog path to recover service work if the user closes only the activity
         if (::settings.isInitialized && ::store.isInitialized) {
             CollectorAutoStart.scheduleRestartAfterUiClosed(applicationContext, settings, store)
         }
         dashboardExecutor.shutdownNow()
         updateExecutor.shutdownNow()
+        handler.removeCallbacks(::onUpdateAutoCheckTimerElapsed)
         super.onDestroy()
     }
 
@@ -370,6 +377,7 @@ class MainActivity : ComponentActivity() {
         if (refreshInFlight || destroyed) return
         refreshInFlight = true
         val tab = activeTab
+        //loads only the heavy dashboard slices needed by the visible tab to keep ui refresh cheap
         val includeTelemetryDetails = tab == AppTab.MAIN || tab == AppTab.ALL_PARAMETERS || tab == AppTab.LOGS
         val includeDebugStatus = tab == AppTab.ALL_PARAMETERS || tab == AppTab.LOGS
         val includeVehicleKpis = tab == AppTab.ALL_PARAMETERS
@@ -389,6 +397,7 @@ class MainActivity : ComponentActivity() {
                         if (!state.autoStartEnabled && state.debugAutoStartEnabled) {
                             settings.setDebugAutoStartEnabled(false)
                         }
+                        //preserves last known heavy-tab values so switching tabs does not blank telemetry until next poll
                         dashboardState = DashboardStateMerger.merge(
                             previous = dashboardState,
                             next = state,
@@ -410,6 +419,7 @@ class MainActivity : ComponentActivity() {
 
     private fun maybeRunStartupSetup(): Boolean {
         val prefs = getSharedPreferences(STARTUP_SETUP_PREFS, MODE_PRIVATE)
+        //runs the byd background-app prompt once per app version because dilink may reset this after updates
         if (prefs.getBoolean(KEY_BACKGROUND_SETTINGS_PENDING_RETURN, false)) {
             prefs.edit()
                 .putBoolean(KEY_BACKGROUND_SETTINGS_PENDING_RETURN, false)
@@ -499,6 +509,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun openBackgroundSettings(autoLaunch: Boolean): Boolean {
+        //tries the byd-specific settings screen first, then falls back to generic android settings
         val intents = listOf(
             Intent(Intent.ACTION_MAIN).apply {
                 setClassName(
@@ -586,11 +597,38 @@ class MainActivity : ComponentActivity() {
         }, delayMs)
     }
 
-    private fun scheduleStartupUpdateCheck() {
-        //gate auto check to foreground so background service never opens update ui
-        handler.removeCallbacks(::runAutomaticUpdateCheck)
-        if (settings.isUpdateAutoCheckEnabled()) {
-            handler.postDelayed(::runAutomaticUpdateCheck, UPDATE_AUTO_CHECK_DELAY_MS)
+    private fun startRuntimeUpdateAutoCheck() {
+        //starts the 30s clock at activity runtime creation, even before the app is foregrounded
+        handleUpdateAutoCheckAction(
+            UpdateAutoCheckRuntime.onRuntimeStarted(settings.isUpdateAutoCheckEnabled())
+        )
+    }
+
+    private fun runPendingStartupUpdateCheckIfReady() {
+        //runs a deferred startup check as soon as the user brings the already-running app forward
+        handleUpdateAutoCheckAction(
+            UpdateAutoCheckRuntime.onForeground(settings.isUpdateAutoCheckEnabled())
+        )
+    }
+
+    private fun onUpdateAutoCheckTimerElapsed() {
+        //records background expiry as pending while preserving the foreground-only popup rule
+        handleUpdateAutoCheckAction(
+            UpdateAutoCheckRuntime.onTimerElapsed(
+                enabled = settings.isUpdateAutoCheckEnabled(),
+                foreground = foreground
+            )
+        )
+    }
+
+    private fun handleUpdateAutoCheckAction(action: UpdateAutoCheckAction) {
+        when (action) {
+            UpdateAutoCheckAction.None -> Unit
+            UpdateAutoCheckAction.Run -> runAutomaticUpdateCheck()
+            is UpdateAutoCheckAction.Schedule -> {
+                handler.removeCallbacks(::onUpdateAutoCheckTimerElapsed)
+                handler.postDelayed(::onUpdateAutoCheckTimerElapsed, action.delayMs)
+            }
         }
     }
 
@@ -626,6 +664,7 @@ class MainActivity : ComponentActivity() {
             val result = runCatching {
                 val downloadId = updateDownloader.enqueue(info)
                 var progress = 0
+                //polls downloadmanager because install intent should be offered only after the apk is fully written
                 while (progress < 100 && !destroyed) {
                     Thread.sleep(350L)
                     progress = updateDownloader.progress(downloadId)
@@ -648,6 +687,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun saveMqttDraft() {
+        //keeps saved passwords sticky while empty password fields mean "leave existing secret unchanged"
         settings.setMqttHost(mqttDraft.host)
         settings.setMqttPort(mqttDraft.port.toIntOrNull() ?: settings.mqttPort())
         settings.setMqttUsername(mqttDraft.username)
@@ -660,6 +700,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun saveInfluxDraft() {
+        //mirrors mqtt draft semantics so editing non-secret influx fields never clears the stored password
         settings.setInfluxHost(influxDraft.host)
         settings.setInfluxPort(influxDraft.port.toIntOrNull() ?: settings.influxPort())
         settings.setInfluxUsername(influxDraft.username)
@@ -758,7 +799,6 @@ class MainActivity : ComponentActivity() {
         private const val KEY_BACKGROUND_SETTINGS_PENDING_RETURN = "background_settings_pending_return"
         private const val DELAYED_ADB_AUTH_AFTER_BACKGROUND_MS = 2_500L
         private const val STARTUP_ADB_SELF_CHECK_DELAY_MS = 900L
-        private const val UPDATE_AUTO_CHECK_DELAY_MS = 30_000L
         private const val DASHBOARD_REFRESH_INTERVAL_MS = 5_000L
     }
 }

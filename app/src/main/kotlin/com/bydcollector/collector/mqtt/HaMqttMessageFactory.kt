@@ -9,6 +9,7 @@ sealed class MqttMessageBuildResult {
     data class Failure(val category: String, val message: String) : MqttMessageBuildResult()
 }
 
+//builds ha mqtt messages from normalized state rather than raw BYD keys
 class HaMqttMessageFactory(
     private val normalizedProvider: NormalizedStateProvider,
     private val configProvider: () -> HaMqttConfig,
@@ -23,6 +24,7 @@ class HaMqttMessageFactory(
         val config = configProvider()
         return runCatching {
             val categories = config.enabledCategories
+            //filters at publish time so changing categories does not require rewriting normalized storage
             val rows = HaMqttFieldFilter.publishableRows(normalizedProvider.currentState(categories), config)
             buildList {
                 add(onlineStatusMessage(config, rows))
@@ -41,6 +43,7 @@ class HaMqttMessageFactory(
     fun changedCategoryMessages(categories: Set<String>): MqttMessageBuildResult {
         val config = configProvider()
         val enabledChanged = categories.intersect(config.enabledCategories)
+        //skips disabled categories even if their normalized values changed in sqlite
         if (enabledChanged.isEmpty()) return MqttMessageBuildResult.Success(emptyList())
 
         return runCatching {
@@ -60,6 +63,7 @@ class HaMqttMessageFactory(
         categories: Set<String>
     ): List<HaMqttMessage> {
         val rowsByCategory = rows.groupBy { it.category }
+        //keeps one retained state topic per category so ha receives compact grouped updates
         return categories.sorted()
             .mapNotNull { category ->
                 val categoryRows = rowsByCategory[category].orEmpty()
@@ -104,6 +108,7 @@ class HaMqttMessageFactory(
     }
 
     private fun offlineStatusMessage(config: HaMqttConfig): HaMqttMessage {
+        //retained offline status lets ha mark all entities unavailable after collector shutdown
         return HaMqttMessage(
             topic = "${config.normalizedTopicPrefix()}/status",
             payload = HaMqttPayloadBuilder.offlineStatus(),

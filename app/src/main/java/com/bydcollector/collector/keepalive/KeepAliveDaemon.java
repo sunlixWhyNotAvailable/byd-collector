@@ -8,11 +8,13 @@ import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.util.concurrent.TimeUnit;
 
+//keeps selected dilink radios/service recovery alive from shell while the app process may be backgrounded
 public final class KeepAliveDaemon {
     private static final String PACKAGE_NAME = "com.bydcollector.collector";
     private static final String RECOVER_COLLECTOR_COMMAND =
             "am broadcast -a com.bydcollector.collector.action.KEEP_ALIVE_RECOVERY " +
                     "-n com.bydcollector.collector/com.bydcollector.collector.system.KeepAliveRecoveryReceiver";
+    //limits the shell delegate to fixed maintenance commands instead of accepting arbitrary app input
     private static final String[] ALLOWED_COMMANDS = new String[]{
             "settings get global bydcollector_keep_wifi",
             "settings get global bydcollector_keep_mobile_data",
@@ -61,6 +63,7 @@ public final class KeepAliveDaemon {
     }
 
     private static void runOnce() {
+        //reads mirrored global flags each loop so toggles can change without restarting the delegate
         boolean keepWifi = isEnabled("settings get global bydcollector_keep_wifi");
         boolean keepMobileData = isEnabled("settings get global bydcollector_keep_mobile_data");
         boolean keepBluetooth = isEnabled("settings get global bydcollector_keep_bluetooth");
@@ -91,12 +94,14 @@ public final class KeepAliveDaemon {
     private static void keepBluetoothAlive() {
         ShellResult power = run("dumpsys power | grep mWakefulness", 5_000L);
         if (power.output.contains("Asleep")) {
+            //keeps bluetooth usable during sleep by disabling only the profiles dilink tends to suspend
             runAndLog(
                     "bluetooth_sleep_keepalive_requested",
                     "settings put global bluetooth_disabled_profiles 202803"
             );
             runAndLog("bluetooth_enable_requested", "svc bluetooth enable");
         } else {
+            //restores normal profile policy while awake so the keep-alive path is not permanently invasive
             runAndLog(
                     "bluetooth_profiles_restored_awake",
                     "settings put global bluetooth_disabled_profiles 0"
@@ -112,6 +117,7 @@ public final class KeepAliveDaemon {
             return;
         }
 
+        //asks the app-side receiver to choose the correct recovery mode instead of starting internals directly
         runAndLog(
                 "collector_service_recovery_requested",
                 RECOVER_COLLECTOR_COMMAND
@@ -127,6 +133,7 @@ public final class KeepAliveDaemon {
     }
 
     private static ShellResult run(String command, long timeoutMs) {
+        //fails closed if a future code path tries to run a non-whitelisted shell command
         if (!isAllowedCommand(command)) {
             return new ShellResult(false, "", "command_rejected", 0);
         }
@@ -189,6 +196,7 @@ public final class KeepAliveDaemon {
 
     private static OwnerLock acquireSingleOwnerLock() {
         try {
+            //keeps one daemon loop active so repeated reconciles do not stack shell work
             RandomAccessFile file = new RandomAccessFile(KeepAliveProtocol.LOCK_PATH, "rw");
             FileChannel channel = file.getChannel();
             FileLock lock = channel.tryLock();

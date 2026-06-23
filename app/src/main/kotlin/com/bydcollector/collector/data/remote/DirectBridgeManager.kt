@@ -8,8 +8,10 @@ import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.direct.CollectorHelperProtocol
 import java.io.File
 
+//starts and verifies the shell-owned binder helper that reads autoservice for the app uid
 object DirectBridgeManager {
     fun status(context: Context): String? {
+        //reports ready from binder ping first; adb auth is only a fallback status check
         if (DirectVehicleHelperClient().isAlive()) return "ready"
 
         val appContext = context.applicationContext
@@ -29,6 +31,7 @@ object DirectBridgeManager {
         adbClient: AdbLocalClient,
         helper: DirectVehicleHelper = DirectVehicleHelperClient()
     ): DirectBridgeResult {
+        //avoids relaunching when the current helper binder already accepts this app uid
         if (helper.isAlive()) return DirectBridgeResult(ok = true, message = "Direct helper already running")
 
         val launch = adbClient.execShell(launchCommand(context), timeoutMs = 15_000)

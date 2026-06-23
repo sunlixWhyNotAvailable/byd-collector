@@ -12,6 +12,7 @@ import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorServiceController
 import com.bydcollector.collector.service.CollectorSettings
 
+//restores collector service intent after boot, task removal, ui close, or keep-alive recovery broadcasts
 object CollectorAutoStart {
     val ACTION_RETRY_AUTO_START: String = "${BuildConfig.ACTION_PREFIX}.action.RETRY_AUTO_START"
     val ACTION_WATCHDOG_AUTO_START: String = "${BuildConfig.ACTION_PREFIX}.action.WATCHDOG_AUTO_START"
@@ -35,10 +36,12 @@ object CollectorAutoStart {
         }
 
         if (settings.isAutoStartEnabled()) {
+            //auto-start means main polling should become enabled again after device/process recovery
             ensurePollingEnabled(settings)
             syncDebugAutoStart(settings)
         }
         if (CollectorService.isRunning()) {
+            //reconciles an already-running service instead of assuming its previous flags are still correct
             requestServiceReconcile(appContext, settings, store, action)
             cancelRetry(appContext)
             scheduleWatchdog(appContext, settings, store)
@@ -131,6 +134,7 @@ object CollectorAutoStart {
         }
 
         val appContext = context.applicationContext
+        //periodically re-enters the same decision path because dilink can kill background work silently
         appContext.getSystemService(AlarmManager::class.java).set(
             AlarmManager.ELAPSED_REALTIME_WAKEUP,
             SystemClock.elapsedRealtime() + WATCHDOG_DELAY_MS,
@@ -158,6 +162,7 @@ object CollectorAutoStart {
     }
 
     private fun shouldRunService(settings: CollectorSettings): Boolean {
+        //keep-alive alone is enough reason to keep a foreground service even when polling is disabled
         return settings.isAutoStartEnabled() || settings.keepAliveConfig().anyEnabled
     }
 
@@ -173,6 +178,7 @@ object CollectorAutoStart {
     ) {
         try {
             store.recordEvent(category, message, detail)
+            //chooses keep-alive-only reconcile when the user wants radios alive but not telemetry polling
             if (keepAliveOnly) {
                 CollectorServiceController.reconcileKeepAlive(context)
             } else {

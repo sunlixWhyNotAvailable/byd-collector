@@ -21,6 +21,17 @@ class InfluxExportCoordinatorTest {
     }
 
     @Test
+    fun failedWriteKeepsPendingRowsVisibleForDashboard() {
+        val store = FakeInfluxStore(rows = listOf(row(id = 10, fieldKey = "soc")))
+        val client = FakeInfluxClient(writeResult = InfluxActionResult.fail("influx_error", "write failed"))
+        val coordinator = coordinator(store, client)
+
+        coordinator.runOneCycle(force = true)
+
+        assertEquals(1, store.influxExportState().pendingRows)
+    }
+
+    @Test
     fun successfulWriteAdvancesPerFieldCursor() {
         val store = FakeInfluxStore(
             rows = listOf(
@@ -37,6 +48,20 @@ class InfluxExportCoordinatorTest {
         assertEquals(10, store.cursor("soc").lastExportedHistoryId)
         assertEquals(11, store.cursor("remaining_range_km").lastExportedHistoryId)
         assertEquals(2, client.writtenLines.single().size)
+    }
+
+    @Test
+    fun successfulBatchKeepsRemainingPendingRowsVisibleForDashboard() {
+        val rows = (1L..301L).map { id -> row(id = id, fieldKey = "soc") }
+        val store = FakeInfluxStore(rows = rows)
+        val client = FakeInfluxClient()
+        val coordinator = coordinator(store, client)
+
+        coordinator.runOneCycle(force = true)
+
+        assertEquals(300, client.writtenLines.single().size)
+        assertEquals(300, store.cursor("soc").lastExportedHistoryId)
+        assertEquals(1, store.influxExportState().pendingRows)
     }
 
     @Test
@@ -124,6 +149,17 @@ class InfluxExportCoordinatorTest {
 
         override fun ensureInfluxCursors(fieldKeys: Set<String>) {
             fieldKeys.forEach { fieldKey -> cursors.putIfAbsent(fieldKey, InfluxCursor(fieldKey, 0)) }
+        }
+
+        override fun pendingInfluxSummary(fieldKeys: Set<String>): InfluxPendingSummary {
+            ensureInfluxCursors(fieldKeys)
+            val pending = rows.filter { row ->
+                fieldKeys.contains(row.fieldKey) && row.id > cursor(row.fieldKey).lastExportedHistoryId
+            }
+            return InfluxPendingSummary(
+                rows = pending.size.toLong(),
+                oldestObservedAt = pending.minByOrNull { it.id }?.observedAt
+            )
         }
 
         override fun pendingInfluxRows(fieldKey: String, afterHistoryId: Long, limit: Int): List<InfluxPendingHistoryRow> {

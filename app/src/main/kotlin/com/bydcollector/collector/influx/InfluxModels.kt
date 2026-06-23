@@ -39,6 +39,11 @@ data class InfluxExportStateSnapshot(
     val exportedRowsTotal: Long
 )
 
+data class InfluxPendingSummary(
+    val rows: Long,
+    val oldestObservedAt: String?
+)
+
 data class InfluxCursor(
     val fieldKey: String,
     val lastExportedHistoryId: Long
@@ -46,6 +51,7 @@ data class InfluxCursor(
 
 interface InfluxExportStore {
     fun ensureInfluxCursors(fieldKeys: Set<String>)
+    fun pendingInfluxSummary(fieldKeys: Set<String>): InfluxPendingSummary
     fun pendingInfluxRows(fieldKey: String, afterHistoryId: Long, limit: Int): List<InfluxPendingHistoryRow>
     fun influxCursors(fieldKeys: Set<String>): List<InfluxCursor>
     fun updateInfluxCursorSuccess(fieldKey: String, historyId: Long, exportedAt: String)

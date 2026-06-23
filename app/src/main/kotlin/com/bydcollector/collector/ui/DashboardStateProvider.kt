@@ -11,6 +11,7 @@ import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.system.RequiredAccessChecker
 
+//assembles one immutable dashboard snapshot from settings, service flags, sqlite health, and diagnostics
 class DashboardStateProvider(
     private val context: Context,
     private val store: TelemetryStore,
@@ -23,8 +24,10 @@ class DashboardStateProvider(
     ): DashboardState {
         val serviceRunning = CollectorService.isRunning()
         val mainPollingRunning = CollectorService.isMainPollingRunning()
+        //uses main polling state for health so keep-alive-only service runs do not look like active collection
         val health = store.healthSnapshot(running = mainPollingRunning)
         val debugStatus = if (includeDebugStatus) {
+            //opens the debug db only on heavy tabs because status scans can be expensive on the tablet
             DirectDebugStore(context).use { debugStore -> debugStore.status() }
         } else {
             lightweightDebugStatus()
@@ -34,6 +37,7 @@ class DashboardStateProvider(
         val influxConfig = settings.influxConfig()
         val influxState = store.influxExportState()
         val vehicleKpis = if (includeVehicleKpis) {
+            //kpi mapping is kept off lightweight tabs to avoid wide normalized reads during every refresh
             VehicleKpiMapper.from(store.normalizedCurrentState())
         } else {
             VehicleKpis()
@@ -184,16 +188,18 @@ class DashboardStateProvider(
     }
 
     private fun formatInfluxStatus(state: com.bydcollector.collector.influx.InfluxExportStateSnapshot): String {
+        val base = "${state.status}; pending: ${state.pendingRows}"
         return when {
-            !state.lastError.isNullOrBlank() -> "${state.status}; error: ${state.lastError.truncate(96)}"
-            !state.nextRetryAt.isNullOrBlank() -> "${state.status}; retry at ${DisplayTimeFormatter.formatNullable(state.nextRetryAt) ?: state.nextRetryAt}"
-            !state.lastSuccessAt.isNullOrBlank() -> "${state.status}; last success: ${DisplayTimeFormatter.formatNullable(state.lastSuccessAt) ?: state.lastSuccessAt}"
-            else -> state.status
+            !state.lastError.isNullOrBlank() -> "$base; error: ${state.lastError.truncate(96)}"
+            !state.nextRetryAt.isNullOrBlank() -> "$base; retry at ${DisplayTimeFormatter.formatNullable(state.nextRetryAt) ?: state.nextRetryAt}"
+            !state.lastSuccessAt.isNullOrBlank() -> "$base; last success: ${DisplayTimeFormatter.formatNullable(state.lastSuccessAt) ?: state.lastSuccessAt}"
+            else -> base
         }
     }
 
     private fun lightweightDebugStatus(): DirectDebugStatus {
         val dbFile = context.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME)
+        //keeps debug card geometry stable without reading round-robin history outside debug/log tabs
         return DirectDebugStatus(
             databasePath = dbFile.absolutePath,
             databaseSizeBytes = dbFile.takeIf { it.exists() }?.length() ?: 0L,

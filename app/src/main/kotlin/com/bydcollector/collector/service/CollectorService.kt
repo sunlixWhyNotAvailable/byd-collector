@@ -53,6 +53,7 @@ import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
+//owns the runtime lifecycle so collection, exports, and keep-alive can continue without an open activity
 class CollectorService : Service() {
     private lateinit var store: TelemetryStore
     private lateinit var settings: CollectorSettings
@@ -96,6 +97,7 @@ class CollectorService : Service() {
             PollPersistenceCoordinator(
                 store = store,
                 client = telemetryClient(),
+                //normalizes only after raw poll persistence so raw telemetry remains the source of truth
                 successfulPollObserver = object : SuccessfulPollObserver {
                     override fun onSuccessfulPoll(
                         sessionId: Long,
@@ -183,6 +185,7 @@ class CollectorService : Service() {
             val debugEnabled = BuildConfig.ENABLE_DIRECT_DEBUG_ROUND_ROBIN && settings.isDebugPollingEnabled()
             val keepAliveConfig = settings.keepAliveConfig()
             val keepAliveEnabled = keepAliveConfig.anyEnabled
+            //stops the foreground service only after keep-alive settings have been mirrored to the shell delegate
             if (!mainEnabled && !debugEnabled && !keepAliveEnabled) {
                 store.recordEvent("service_start_skipped", "Polling and keep-alive disabled")
                 stopMain("polling_disabled")
@@ -194,6 +197,7 @@ class CollectorService : Service() {
             lastNotificationText = initialNotificationText
             startForeground(NOTIFICATION_ID, buildNotification(initialNotificationText))
             acquireWakeLock()
+            //keeps network/bluetooth policy independent from whether telemetry polling itself is active
             keepAliveSupervisor.reconcile(keepAliveConfig)
 
             if (mainEnabled) {
@@ -223,6 +227,7 @@ class CollectorService : Service() {
             val keepAliveEnabled = keepAliveConfig.anyEnabled
             val mainRunning = poller.isRunning()
             val debugRunning = debugPoller?.isRunning() == true
+            //allows the service to exist solely for keep-alive toggles when collection is intentionally stopped
             if (!mainRunning && !debugRunning && !keepAliveEnabled) {
                 store.recordEvent("keep_alive_reconcile_stopped", "Keep-alive disabled and no active collector runtime")
                 stopAfterKeepAliveReconcile(keepAliveConfig)
@@ -262,6 +267,7 @@ class CollectorService : Service() {
         val openedSessionId = store.openSession()
         sessionId = openedSessionId
         try {
+            //imports the car energy database opportunistically; telemetry polling must survive import failure
             store.importEcDatabaseAtSessionStart(openedSessionId)
         } catch (error: RuntimeException) {
             store.recordEvent(
@@ -294,6 +300,7 @@ class CollectorService : Service() {
                 }
                 if (!settings.isDebugPollingEnabled()) return@execute
                 val requestedBatchSize = settings.debugBatchSize()
+                //caps automatic debug work so a reboot does not immediately start a huge round-robin load
                 val batchSize = if (reason == DEBUG_REASON_MANUAL) {
                     requestedBatchSize
                 } else {
@@ -389,11 +396,13 @@ class CollectorService : Service() {
         }
         sessionId = null
         if (wasPolling || reason == "service_destroyed") {
+            //publishes retained offline only after there was a real live mqtt runtime to retire
             disconnectOfflineAsync()
         }
     }
 
     private fun exportInfluxAfterNormalizedWrite(summary: NormalizedWriteSummary) {
+        //exports history after normalized changes because influx is the long-term time-series channel
         if (summary.historyInsertedCount <= 0) return
         if (!settings.isInfluxEnabled()) return
         executeInflux("influx_cycle_error") {
@@ -411,6 +420,7 @@ class CollectorService : Service() {
         val current = wakeLock
         if (current?.isHeld == true) return
 
+        //uses a partial wake lock because dilink may keep the tablet alive while still idling app threads
         val powerManager = getSystemService(PowerManager::class.java)
         wakeLock = powerManager.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK,
@@ -448,6 +458,7 @@ class CollectorService : Service() {
         if (categories.isEmpty()) return
         if (!settings.isMqttEnabled()) return
         mqttRuntimeActive.set(true)
+        //queues latest state for mqtt so transient broker outages do not lose the newest ha value
         executeMqtt("mqtt_changed_publish_error") {
             mqttCoordinator.queueChangedCategoriesAndFlush(categories)
         }
@@ -517,6 +528,7 @@ class CollectorService : Service() {
     ) {
         if (!settings.isMqttEnabled()) return
         val now = SystemClock.elapsedRealtime()
+        //throttles status chatter while still forcing immediate error visibility
         if (!force && now - lastStatusHeartbeatAtMs < STATUS_HEARTBEAT_INTERVAL_MS) return
         lastStatusHeartbeatAtMs = now
         mqttRuntimeActive.set(true)
@@ -549,6 +561,7 @@ class CollectorService : Service() {
     private fun disconnectOfflineAsync() {
         if (!mqttRuntimeActive.get() && !settings.isMqttEnabled()) return
         if (!mqttOfflineQueued.compareAndSet(false, true)) return
+        //uses a fresh executor so queued live publishes cannot run after the retained offline message
         val executor = resetMqttExecutorForOffline()
         try {
             executor.execute {
@@ -587,6 +600,7 @@ class CollectorService : Service() {
         val executor = synchronized(mqttExecutorLock) { mqttExecutor }
         try {
             executor.execute {
+                //drops stale work submitted before an offline/reset boundary
                 if (generation != mqttWorkGeneration.get()) return@execute
                 runCatching { action() }
                     .onSuccess { result ->
@@ -640,6 +654,7 @@ class CollectorService : Service() {
         try {
             executor.execute {
                 Thread.currentThread().priority = Thread.MIN_PRIORITY
+                //drops stale export work after the channel executor has been replaced
                 if (generation != influxWorkGeneration.get()) return@execute
                 runCatching { action() }
                     .onSuccess { result ->

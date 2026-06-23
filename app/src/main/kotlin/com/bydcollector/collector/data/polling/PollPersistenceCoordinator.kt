@@ -32,6 +32,7 @@ interface SuccessfulPollObserver {
     fun onSuccessfulPoll(sessionId: Long, pollId: Long, timestamp: String, readings: List<PollReading>)
 }
 
+//ties one vehicle read to raw persistence, normalized observers, and explicit failure records
 class PollPersistenceCoordinator(
     private val store: PollStorage,
     private val client: DiPlusClient,
@@ -44,6 +45,7 @@ class PollPersistenceCoordinator(
 
     override fun pollOnce(sessionId: Long): PollCycleResult {
         val parameters = store.getActiveCatalogParameters()
+        //builds the request from the active catalog so curated main-db changes are data-driven
         val request = templateBuilder.build(parameters)
         val result = client.get(request)
 
@@ -51,6 +53,7 @@ class PollPersistenceCoordinator(
             when (result) {
                 is DiPlusResult.Success -> {
                     val timestamp = clock.nowIso()
+                    //stores raw readings before observers derive state for mqtt/influx consumers
                     val pollId = store.insertPoll(
                         sessionId,
                         PersistedPollInput(
@@ -71,6 +74,7 @@ class PollPersistenceCoordinator(
                     try {
                         successfulPollObserver?.onSuccessfulPoll(sessionId, pollId, timestamp, result.readings)
                     } catch (error: RuntimeException) {
+                        //keeps raw polling alive even if normalized state/export logic has a bug
                         val detail = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
                         logError("Normalized state write failed", error)
                         try {
@@ -87,6 +91,7 @@ class PollPersistenceCoordinator(
                 is DiPlusResult.Failure -> {
                     val failureKey = "${result.category}:${result.message}"
                     val nowMs = clock.elapsedRealtimeMs()
+                    //throttles identical failures so helper outages do not flood sqlite every second
                     if (shouldSkipRepeatedFailure(failureKey, nowMs)) {
                         return PollCycleResult(null, ok = false, category = result.category, elapsedMs = result.elapsedMs, requestCount = request.requestCount)
                     }

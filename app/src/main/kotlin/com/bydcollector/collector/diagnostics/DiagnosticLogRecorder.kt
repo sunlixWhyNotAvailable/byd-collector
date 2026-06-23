@@ -10,6 +10,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
+//captures a small support bundle without making dashboard refresh perform zip work
 object DiagnosticLogRecorder {
     private const val WINDOWS_PULL_ROOT = "D:\\Work_folder\\!test\\byd web\\manual_pulls"
     private const val DIAGNOSTICS_DIR = "diagnostics"
@@ -33,6 +34,7 @@ object DiagnosticLogRecorder {
         if (isRecording()) return activeRunDir ?: logRoot(context)
 
         activeContext = context.applicationContext
+        //creates one run directory per recording so logs, events, and notes describe the same incident window
         val runDir = File(logRoot(context), "logcat_${timestamp()}").apply {
             mkdirs()
         }
@@ -50,6 +52,7 @@ object DiagnosticLogRecorder {
         )
         writeCollectorEventsSnapshot(context, runDir)
         writeKeepAliveLogNote(runDir)
+        //updates latest zip only at explicit diagnostics lifecycle points, never from passive ui state loading
         writeLatestZip(context, runDir)
 
         val logFile = File(runDir, "logcat_threadtime.txt")
@@ -128,6 +131,7 @@ object DiagnosticLogRecorder {
             return
         }
         runCatching {
+            //opens sqlite read-only so diagnostics cannot mutate live telemetry while copying recent events
             SQLiteDatabase.openDatabase(
                 dbFile.absolutePath,
                 null,

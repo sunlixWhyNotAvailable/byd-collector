@@ -12,6 +12,7 @@ import java.lang.reflect.Method;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 
+//runs as shell app_process so the app can read autoservice through a narrow binder bridge
 public final class CollectorHelperDaemon {
     private CollectorHelperDaemon() {
     }
@@ -44,8 +45,7 @@ public final class CollectorHelperDaemon {
         Binder helperBinder = new Binder() {
             @Override
             protected boolean onTransact(int code, Parcel data, Parcel reply, int flags) throws RemoteException {
-                // The helper is launched by the shell ADB session, but Binder reports the app process
-                // as the caller here. Keep the helper private to this collector package UID.
+                //keeps the shell-launched helper private to the collector app that requested it
                 if (Binder.getCallingUid() != appUid) {
                     return false;
                 }
@@ -55,6 +55,7 @@ public final class CollectorHelperDaemon {
                     return true;
                 }
                 if (code == CollectorHelperProtocol.TX_READ) {
+                    //passes through read-only autoservice transactions; no vehicle control opcodes are exposed
                     int tx = data.readInt();
                     int dev = data.readInt();
                     int fid = data.readInt();
@@ -114,6 +115,7 @@ public final class CollectorHelperDaemon {
 
     private static OwnerLock acquireSingleOwnerLock() {
         try {
+            //prevents multiple shell helper processes from registering competing binder services
             RandomAccessFile file = new RandomAccessFile(CollectorHelperProtocol.LOCK_PATH, "rw");
             FileChannel channel = file.getChannel();
             FileLock lock = channel.tryLock();

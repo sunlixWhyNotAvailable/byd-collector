@@ -8,6 +8,7 @@ import com.bydcollector.collector.system.RequiredAccessChecker
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
+//coordinates user-approved local adb setup before any direct autoservice helper work can run
 object AdbAuthorizationManager {
     private val running = AtomicBoolean(false)
 
@@ -23,6 +24,7 @@ object AdbAuthorizationManager {
         allowAutoPrompt: Boolean,
         source: String
     ) {
+        //serializes adb auth because concurrent rsa handshakes can confuse the system prompt state
         if (!running.compareAndSet(false, true)) {
             store.recordEvent(
                 "adb_self_check_in_progress",
@@ -147,6 +149,7 @@ object AdbAuthorizationManager {
         val promptedVersion = prefs.getInt(KEY_AUTO_PROMPTED_APP_VERSION, -1)
         val alreadyPromptedForCurrentKeyAndVersion =
             promptedFingerprint == fingerprint && promptedVersion == BuildConfig.VERSION_CODE
+        //limits automatic rsa prompts to one per app version/key; manual grant stays available afterwards
         if (!allowAutoPrompt || alreadyPromptedForCurrentKeyAndVersion) {
             store.recordEvent(
                 "adb_auto_prompt_skipped",
@@ -184,6 +187,7 @@ object AdbAuthorizationManager {
         client: AdbLocalClient,
         source: String
     ) {
+        //uses local adb only for app-required grants and helper startup; vehicle reads stay read-only
         RequiredAccessChecker.missingShellGrantCommands(appContext).forEachIndexed { index, command ->
             store.recordEvent(
                 "adb_permission_grant_started",

@@ -4,11 +4,13 @@ import com.bydcollector.collector.data.local.PollReading
 import org.json.JSONArray
 import org.json.JSONObject
 
+//turns curated autoservice fid reads into raw poll readings while preserving per-field failures
 class DirectAutoserviceReader(
     private val helper: DirectVehicleHelper,
     private val entries: List<DirectFidEntry> = DirectFidRegistry.entries
 ) {
     fun readSnapshot(): DirectAutoserviceSnapshot {
+        //reads every configured entry once so partial autoservice failures can be stored with the poll
         val fields = entries.map { entry ->
             val result = helper.read(entry)
             val raw = result.raw
@@ -65,6 +67,7 @@ data class DirectAutoserviceSnapshot(
         json.put("reading_count", readings.size)
         json.put("error_count", errors.size)
         if (includeFields) {
+            //full field json is diagnostic-only because storing every failed field can get large
             json.put("fields", JSONArray().also { array ->
                 fields.forEach { field ->
                     array.put(JSONObject().apply {
@@ -81,6 +84,7 @@ data class DirectAutoserviceSnapshot(
                 }
             })
         } else {
+            //compact error samples keep repeated poll failures queryable without bloating sqlite rows
             json.put("error_samples", JSONArray().also { array ->
                 errorFields.take(maxErrorSamples).forEach { field ->
                     array.put(JSONObject().apply {

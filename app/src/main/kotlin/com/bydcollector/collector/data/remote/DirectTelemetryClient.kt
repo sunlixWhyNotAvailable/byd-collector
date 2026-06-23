@@ -9,6 +9,7 @@ import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import java.io.File
 
+//adapts direct autoservice binder reads to the legacy DiPlusClient shape used by the poller
 class DirectTelemetryClient(
     context: Context,
     private val clock: Clock = SystemClockAdapter(),
@@ -23,6 +24,7 @@ class DirectTelemetryClient(
         val startedAt = clock.elapsedRealtimeMs()
         if (!helper.isAlive()) {
             val now = clock.elapsedRealtimeMs()
+            //backs off helper launch failures because adb/app_process startup can block for seconds
             if (now < nextLaunchAttemptAtMs) {
                 return failure("helper_launch_backoff", "Direct helper launch is cooling down after a previous failure", startedAt)
             }
@@ -39,6 +41,7 @@ class DirectTelemetryClient(
 
         val snapshot = reader.readSnapshot()
         return if (snapshot.readings.isEmpty()) {
+            //records an explicit failed poll instead of pretending an empty autoservice snapshot is success
             failure(
                 category = "autoservice_snapshot_empty",
                 message = snapshot.errorSummary().ifBlank { "Direct autoservice helper returned no usable readings" },
@@ -47,6 +50,7 @@ class DirectTelemetryClient(
             )
         } else {
             val warningMessage = snapshot.errorSummary().takeIf { it.isNotBlank() }
+            //keeps partial successes usable while preserving warning metadata for diagnostics
             DiPlusResult.Success(
                 rawBody = snapshot.toJson(ok = true, includeFields = false),
                 elapsedMs = clock.elapsedRealtimeMs() - startedAt,

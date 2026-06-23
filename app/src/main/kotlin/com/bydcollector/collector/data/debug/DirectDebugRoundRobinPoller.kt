@@ -9,6 +9,7 @@ import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
 
+//cycles through non-main direct parameters so debug discovery can progress without one huge poll
 class DirectDebugRoundRobinCursor(
     private val parameters: List<DirectDebugParameter>
 ) {
@@ -25,6 +26,7 @@ class DirectDebugRoundRobinCursor(
     }
 }
 
+//stores exploratory direct reads separately from main telemetry so noisy candidates do not pollute main db
 class DirectDebugRoundRobinPoller(
     private val parameters: List<DirectDebugParameter>,
     private val helper: DirectVehicleHelper,
@@ -47,6 +49,7 @@ class DirectDebugRoundRobinPoller(
         sessionId = store.openSession(parameters, safeBatchSize)
         future = executor.submit {
             runCatching {
+                //keeps round-robin work below ui/service priority on the car tablet
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
             }
             while (running.get()) {
@@ -54,6 +57,7 @@ class DirectDebugRoundRobinPoller(
                 val startedAt = clock.nowIso()
                 val summary = pollOnce(sessionId ?: return@submit, safeBatchSize, startedAt)
                 onCycle(summary)
+                //backs off when a cycle overruns so wide debug polling does not peg a core continuously
                 val sleepMs = nextSleepMs(clock.elapsedRealtimeMs() - cycleStartedElapsed)
                 if (sleepMs > 0) {
                     try {

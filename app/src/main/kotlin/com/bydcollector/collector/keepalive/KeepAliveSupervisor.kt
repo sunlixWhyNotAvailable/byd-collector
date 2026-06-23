@@ -7,6 +7,7 @@ import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
+//mirrors app keep-alive settings into shell-visible flags and owns the delegate lifecycle
 class KeepAliveSupervisor(
     private val context: Context,
     private val store: TelemetryStore,
@@ -46,14 +47,17 @@ class KeepAliveSupervisor(
     private fun runReconcile(config: KeepAliveConfig) {
         try {
             val shell = shellFactory()
+            //writes every flag before launch/stop so the daemon loop observes a complete desired state
             KeepAliveShellPlanner.mirrorSettingsCommands(config).forEach { command ->
                 runCommand(shell, command, "keep_alive_setting_sync")
             }
 
             if (config.anyEnabled) {
+                //starts the delegate only when at least one keep-alive feature needs shell privileges
                 runCommand(shell, KeepAliveShellPlanner.daemonLaunchCommand(context.applicationInfo.sourceDir), "keep_alive_daemon_start")
                 val status = runCommand(shell, KeepAliveShellPlanner.daemonStatusRetryCommand(), "keep_alive_daemon_status")
                 if (!status.ok) {
+                    //captures the daemon tail because shell startup failures are otherwise invisible in the app ui
                     val tail = shell.exec(KeepAliveShellPlanner.daemonLogTailCommand(), timeoutMs = 10_000)
                     store.recordEvent(
                         category = "keep_alive_daemon_log_tail",
@@ -80,6 +84,7 @@ class KeepAliveSupervisor(
 
     private fun runCommand(shell: KeepAliveShell, command: String, category: String): KeepAliveShellResult {
         val result = shell.exec(command, timeoutMs = 10_000)
+        //persists shell command outcomes into collector_events so live tests can be audited after the fact
         val detail = buildString {
             append("command=").append(command)
             append(" elapsed_ms=").append(result.elapsedMs)

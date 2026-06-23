@@ -56,6 +56,7 @@ fun Modifier.pressScaleModifier(
     enabled: Boolean = true
 ): Modifier {
     val pressed by interactionSource.collectIsPressedAsState()
+    //gives buttons/tabs physical feedback without changing their measured layout size
     val scale by animateFloatAsState(
         targetValue = if (pressed && enabled) 0.97f else 1f,
         animationSpec = tween(durationMillis = 90)
@@ -98,6 +99,7 @@ fun StatusPill(
     compact: Boolean = false
 ) {
     val p = LocalBydPalette.current
+    //uses a limited status palette so repeated cards scan consistently across tabs
     val (bg, fg, border) = when (kind) {
         StatusKind.OK -> Triple(p.greenSoft, p.green, p.green.copy(alpha = 0.62f))
         StatusKind.WARNING -> Triple(p.yellowSoft, p.yellow, p.yellow.copy(alpha = 0.70f))
@@ -380,6 +382,7 @@ fun TextInput(
 ) {
     val p = LocalBydPalette.current
     Column(modifier = modifier) {
+        //keeps labeled inputs compact so ha settings fit the tablet viewport
         Text(
             text = label,
             color = p.muted,
@@ -420,6 +423,7 @@ fun NumericInput(
     modifier: Modifier = Modifier
 ) {
     val p = LocalBydPalette.current
+    //filters to digits at entry so batch-size parsing never sees symbols or whitespace
     Box(
         modifier = modifier
             .height(42.dp)

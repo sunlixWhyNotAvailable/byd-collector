@@ -22,6 +22,7 @@ data class DirectDebugPrevious(
     val error: String?
 )
 
+//records only meaningful round-robin changes so debug db stays small enough for live use
 object DirectDebugChangeDetector {
     fun reason(previous: DirectDebugPrevious?, current: DirectDebugObserved): String? {
         if (previous == null) return "initial"
@@ -62,6 +63,7 @@ data class DirectDebugStatus(
     val errorCount: Long
 )
 
+//sqlite store for exploratory direct parameters that are intentionally kept out of the main telemetry db
 class DirectDebugStore(
     private val context: Context,
     private val helper: DirectDebugDatabaseHelper = DirectDebugDatabaseHelper(context),
@@ -114,6 +116,7 @@ class DirectDebugStore(
         elapsedMs: Long
     ): DirectDebugCycleSummary {
         val db = helper.writableDatabase
+        //writes a cycle row only when at least one candidate changed, reducing idle debug churn
         db.beginTransaction()
         try {
             val cycleId = db.insertOrThrow(
@@ -240,6 +243,7 @@ class DirectDebugStore(
         sampledAt: String
     ): Boolean {
         val candidateId = candidateIds.getOrPut(signature(parameter)) { findCandidateId(parameter) }
+        //compares against per-session state so repeated identical values do not create history noise
         val observed = DirectDebugObserved(
             status = result.status,
             rawPresent = result.raw != null,

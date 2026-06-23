@@ -4,6 +4,7 @@ import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import java.util.concurrent.atomic.AtomicBoolean
 
+//runs fixed-interval poll cycles on one worker thread so service state and sqlite writes stay ordered
 class TelemetryPoller(
     private val coordinator: PollCycleRunner,
     private val clock: Clock = SystemClockAdapter(),
@@ -18,6 +19,7 @@ class TelemetryPoller(
 
     fun start(sessionId: Long): Boolean {
         if (!running.compareAndSet(false, true)) return false
+        //names the thread for live top/thread-dump diagnosis on the car tablet
         worker = Thread({ loop(sessionId) }, "bydcollector-telemetry-poller").apply {
             isDaemon = true
             start()
@@ -39,7 +41,7 @@ class TelemetryPoller(
             } catch (_: InterruptedException) {
                 running.set(false)
             } catch (_: RuntimeException) {
-                // The coordinator records failure categories; the next poll should continue.
+                //continues polling after one bad cycle because vehicle access can be transiently unavailable
                 runCatching {
                     onCycleResult(PollCycleResult(null, ok = false, category = "poller_runtime_error", elapsedMs = 0, requestCount = 0))
                 }
@@ -47,6 +49,7 @@ class TelemetryPoller(
 
             val elapsed = clock.elapsedRealtimeMs() - startedAt
             val sleepMs = intervalMs - elapsed
+            //keeps the period close to intervalMs without overlapping poll cycles
             if (running.get() && sleepMs > 0) {
                 try {
                     sleeper(sleepMs)
