@@ -741,14 +741,16 @@ class TelemetryStore(
 
     fun healthSnapshot(running: Boolean): HealthSnapshot {
         val mqttRetryState = safeMqttRetryState()
+        val activeSessionId = if (running) safeActiveSessionId() else null
+        val activePollScope = ActivePollSessionScope.from(running = running, activeSessionId = activeSessionId)
         //uses safe queries because the dashboard must keep rendering through migrations and partial failures
         return HealthSnapshot(
             running = running,
-            activeSessionId = if (running) safeActiveSessionId() else null,
-            lastSuccessAt = safeScalarString("SELECT ts FROM polls WHERE ok = 1 ORDER BY id DESC LIMIT 1"),
-            lastError = safeScalarString("SELECT errors FROM polls WHERE ok = 0 AND errors IS NOT NULL ORDER BY id DESC LIMIT 1"),
-            lastErrorAt = safeScalarString("SELECT ts FROM polls WHERE ok = 0 ORDER BY id DESC LIMIT 1"),
-            lastPollStatus = safeLastPollStatus(),
+            activeSessionId = activeSessionId,
+            lastSuccessAt = activePollScope.lastSuccessAtSql()?.let { safeScalarString(it) },
+            lastError = activePollScope.lastErrorSql()?.let { safeScalarString(it) },
+            lastErrorAt = activePollScope.lastErrorAtSql()?.let { safeScalarString(it) },
+            lastPollStatus = activePollScope.lastPollStatusSql()?.let { safeLastPollStatus(it) },
             pollCount = safeScalarLong("SELECT COUNT(*) FROM polls"),
             valueRowCount = safeScalarLong("SELECT COUNT(*) FROM poll_values"),
             ecRowCount = safeScalarLong("SELECT COUNT(*) FROM ec_energy_consumption"),
@@ -763,8 +765,8 @@ class TelemetryStore(
             mqttRetryLastSuccessAt = mqttRetryState.lastSuccessAt,
             lastEcImport = safeScalarString("SELECT ts FROM ec_import_runs ORDER BY id DESC LIMIT 1"),
             lastEcImportStatus = safeLastEcImportStatus(),
-            elapsedMs = safeScalarLongOrNull("SELECT elapsed_ms FROM polls ORDER BY id DESC LIMIT 1"),
-            requestCount = safeScalarLongOrNull("SELECT request_count FROM polls ORDER BY id DESC LIMIT 1")?.toInt(),
+            elapsedMs = activePollScope.elapsedMsSql()?.let { safeScalarLongOrNull(it) },
+            requestCount = activePollScope.requestCountSql()?.let { safeScalarLongOrNull(it) }?.toInt(),
             databasePath = databaseFile().absolutePath,
             databaseSizeBytes = databaseFile().length(),
             latestSoc = safeLatestReading(listOf("statistic_1014_1145045040_5", "statistic_1014_1134559272_5", "SOC", "soc")),
@@ -818,20 +820,15 @@ class TelemetryStore(
         Log.w(TAG, "recent events query failed", error)
     }.getOrDefault(emptyList())
 
-    private fun safeLastPollStatus(): String? = runCatching {
-        lastPollStatus()
+    private fun safeLastPollStatus(sql: String): String? = runCatching {
+        lastPollStatus(sql)
     }.onFailure { error ->
         Log.w(TAG, "last poll status query failed", error)
     }.getOrNull()
 
-    private fun lastPollStatus(): String? {
+    private fun lastPollStatus(sql: String): String? {
         helper.readableDatabase.rawQuery(
-            """
-            SELECT ts, ok, error_category, error_message
-            FROM polls
-            ORDER BY id DESC
-            LIMIT 1
-            """.trimIndent(),
+            sql,
             emptyArray()
         ).use { cursor ->
             if (!cursor.moveToFirst()) return null

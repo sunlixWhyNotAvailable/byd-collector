@@ -332,8 +332,13 @@ private fun MainCollectionCard(
 
 @Composable
 private fun MainStatusCard(state: DashboardState?, strings: UiStrings, modifier: Modifier) {
+    val mainPollingStatus = MainPollStatusFormatter.format(
+        running = state?.mainPollingRunning == true,
+        lastPollStatus = state?.lastPollStatus,
+        strings = strings
+    )
     SectionCard(title = strings.status, modifier = modifier.height(226.dp)) {
-        StatusRow(strings.mainPolling, if (state?.lastPollStatus?.contains("failed", ignoreCase = true) == true) strings.error else strings.successful, if (state?.lastPollStatus?.contains("failed", ignoreCase = true) == true) StatusKind.ERROR else StatusKind.OK)
+        StatusRow(strings.mainPolling, mainPollingStatus.text, mainPollingStatus.kind)
         StatusRow(strings.mqttPublish, compactChannelStatusText(state?.mqttStatus, strings), channelStatusKind(state?.mqttStatus, state?.mqttEnabled == true))
         StatusRow(strings.influxExport, compactChannelStatusText(state?.influxStatus, strings), channelStatusKind(state?.influxStatus, state?.influxEnabled == true))
     }
@@ -1038,21 +1043,9 @@ private fun hasAllAccess(state: DashboardState?): Boolean {
 }
 
 private fun compactChannelStatusText(status: String?, strings: UiStrings): String {
-    val normalized = status.orEmpty().lowercase(Locale.US)
-    return when {
-        normalized.contains("error") || normalized.contains("failed") -> strings.error.lowercase(Locale.getDefault())
-        normalized.contains("catch") || normalized.contains("export") || normalized.contains("run") -> strings.exporting
-        normalized.contains("enabled") -> strings.running
-        normalized.contains("idle") || normalized.isBlank() -> strings.waiting
-        else -> strings.waiting
-    }
+    return ChannelStatusFormatter.compactText(status, strings)
 }
 
 private fun channelStatusKind(status: String?, enabled: Boolean): StatusKind {
-    val normalized = status.orEmpty().lowercase(Locale.US)
-    return when {
-        normalized.contains("error") || normalized.contains("failed") -> StatusKind.ERROR
-        enabled || normalized.contains("catch") || normalized.contains("export") || normalized.contains("run") -> StatusKind.OK
-        else -> StatusKind.WAITING
-    }
+    return ChannelStatusFormatter.kind(status, enabled)
 }

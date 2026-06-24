@@ -127,6 +127,7 @@ data class UiStrings(
     val missing: String,
     val ok: String,
     val idle: String,
+    val stopped: String,
     val messages: String
 )
 
@@ -234,6 +235,7 @@ fun strings(language: UiLanguage): UiStrings {
             missing = "відсутні",
             ok = "OK",
             idle = "очікування",
+            stopped = "зупинено",
             messages = "повідомлень"
         )
 
@@ -339,6 +341,7 @@ fun strings(language: UiLanguage): UiStrings {
             missing = "missing",
             ok = "OK",
             idle = "idle",
+            stopped = "stopped",
             messages = "messages"
         )
     }
