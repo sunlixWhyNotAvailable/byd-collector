@@ -106,10 +106,15 @@ class DirectDebugRoundRobinPollerTest {
 
         val rows = DirectDebugParameterAsset.parse(asset.readText(Charsets.UTF_8))
 
-        assertEquals("wide-poll-session-20260605_161751-curated-main80-roundrobin6433-v1", DirectDebugParameterAsset.SOURCE_VERSION)
-        assertEquals(6433, rows.size)
+        assertEquals("wide-poll-session-20260605_161751-curated-main77-roundrobin6436-charge-current-v2", DirectDebugParameterAsset.SOURCE_VERSION)
+        assertEquals(6436, rows.size)
         assertTrue(rows.none { it.key == "statistic_1014_1145045040_5" })
+        assertTrue(rows.none { it.key == "charging_charge_current" })
+        assertTrue(rows.any { it.key == "charging_charging_charge_current_not_convert" })
         assertTrue(rows.any { it.key == "charging_1009_842006544_5" })
+        assertTrue(rows.any { it.key == "power_low_voltage" })
+        assertTrue(rows.any { it.key == "statistic_remaining_battery_power" })
+        assertTrue(rows.any { it.key == "statistic_1014_877658152_5" })
         assertEquals(
             DirectDebugParameterAsset.EXPECTED_HEADER,
             asset.useLines(Charsets.UTF_8) { it.first().split(",") }

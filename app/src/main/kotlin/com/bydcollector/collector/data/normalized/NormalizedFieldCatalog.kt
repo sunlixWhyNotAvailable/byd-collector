@@ -2,7 +2,7 @@ package com.bydcollector.collector.data.normalized
 
 //semantic catalog that maps curated raw keys to stable fields exposed to dashboard, mqtt, and influx
 object NormalizedFieldCatalog {
-    const val CATALOG_VERSION = "normalized-direct-v6-20260622-soc-display"
+    const val CATALOG_VERSION = "normalized-direct-v8-20260627-charge-current"
 
     val soc = number(
         fieldKey = "soc",
@@ -27,11 +27,11 @@ object NormalizedFieldCatalog {
 
     val batterySoh = number("battery_soh_percent", NormalizedCategory.BATTERY, "%", "Battery SOH", "battery", "measurement", listOf("statistic_1014_1145045032_5"), "decoded_percent_0_100")
     val hvBatteryVoltage = number("hv_battery_voltage_v", NormalizedCategory.BATTERY, "V", "HV battery voltage", "voltage", "measurement", listOf("charging_charge_battery_volt"), "decoded_voltage_v")
-    val hvBatteryCurrent = number("hv_battery_current_a", NormalizedCategory.BATTERY, "A", "HV battery current", "current", "measurement", listOf("charging_charging_charge_current_not_convert"), "decoded_current_a")
+    val chargeCurrent = number("charge_current_a", NormalizedCategory.BATTERY, "A", "Charge current", "current", "measurement", listOf("charging_charge_current"), "decoded_current_a")
     //splits hv power into signed/charge/discharge views because charging power alone misses driving/v2l discharge
-    val batteryPower = number("battery_power_kw", NormalizedCategory.BATTERY, "kW", "Battery power", "power", "measurement", listOf("charging_charge_battery_volt", "charging_charging_charge_current_not_convert"), "derived_signed_hv_power_kw")
-    val batteryChargePower = number("battery_charge_power_kw", NormalizedCategory.BATTERY, "kW", "Battery charge power", "power", "measurement", listOf("charging_charge_battery_volt", "charging_charging_charge_current_not_convert"), "derived_hv_charge_power_kw")
-    val batteryDischargePower = number("battery_discharge_power_kw", NormalizedCategory.BATTERY, "kW", "Battery discharge power", "power", "measurement", listOf("charging_charge_battery_volt", "charging_charging_charge_current_not_convert"), "derived_hv_discharge_power_kw")
+    val batteryPower = number("battery_power_kw", NormalizedCategory.BATTERY, "kW", "Battery power", "power", "measurement", listOf("charging_charge_battery_volt", "charging_charge_current"), "derived_signed_hv_power_kw")
+    val batteryChargePower = number("battery_charge_power_kw", NormalizedCategory.BATTERY, "kW", "Battery charge power", "power", "measurement", listOf("charging_charge_battery_volt", "charging_charge_current"), "derived_hv_charge_power_kw")
+    val batteryDischargePower = number("battery_discharge_power_kw", NormalizedCategory.BATTERY, "kW", "Battery discharge power", "power", "measurement", listOf("charging_charge_battery_volt", "charging_charge_current"), "derived_hv_discharge_power_kw")
     val auxVoltage = number("aux_voltage_v", NormalizedCategory.BATTERY, "V", "12V battery", "voltage", "measurement", listOf("ota_battery_voltage"), "decoded_voltage_v")
     val batteryHighestCellVoltage = number("battery_highest_cell_voltage_raw", NormalizedCategory.BATTERY, "V", "Cell max voltage", "voltage", "measurement", listOf("statistic_highest_battery_voltage"), "raw_number_milli_non_negative")
     val batteryLowestCellVoltage = number("battery_lowest_cell_voltage_raw", NormalizedCategory.BATTERY, "V", "Cell min voltage", "voltage", "measurement", listOf("statistic_lowest_battery_voltage"), "raw_number_milli_non_negative")
@@ -92,7 +92,6 @@ object NormalizedFieldCatalog {
     val gearAutoMode = rawEnum("gear_auto_mode_raw", NormalizedCategory.MOTION, "Gear auto mode raw", "gearbox_1011_555745336_5")
     val pm25Inside = number("pm25_inside", NormalizedCategory.CLIMATE, "µg/m³", "PM2.5 inside", null, "measurement", listOf("pm2p5_value_in"), "decoded_number_non_negative")
     val pm25Outside = number("pm25_outside", NormalizedCategory.CLIMATE, "µg/m³", "PM2.5 outside", null, "measurement", listOf("pm2p5_value_out"), "decoded_number_non_negative")
-    val lowVoltageWarning = rawEnum("low_voltage_warning_raw", NormalizedCategory.BATTERY, "Low voltage warning raw", "power_low_voltage")
     val radarLeftFront = number("radar_1025_neg_1728053151_5", NormalizedCategory.SAFETY, "cm", "Radar left front", "distance", "measurement", listOf("radar_1025_-1728053151_5"), "decoded_number_non_negative", mqttDefaultEnabled = false)
     val radarFrontLeftMid = number("radar_1025_neg_1728053150_5", NormalizedCategory.SAFETY, "cm", "Radar front left mid", "distance", "measurement", listOf("radar_1025_-1728053150_5"), "decoded_number_non_negative", mqttDefaultEnabled = false)
     val radarFrontRightMid = number("radar_1025_neg_1728053149_5", NormalizedCategory.SAFETY, "cm", "Radar front right mid", "distance", "measurement", listOf("radar_1025_-1728053149_5"), "decoded_number_non_negative", mqttDefaultEnabled = false)
@@ -102,18 +101,16 @@ object NormalizedFieldCatalog {
     val radarRightRear = number("radar_1025_neg_1728053145_5", NormalizedCategory.SAFETY, "cm", "Radar right rear", "distance", "measurement", listOf("radar_1025_-1728053145_5"), "decoded_number_non_negative", mqttDefaultEnabled = false)
     val radarRight = number("radar_1025_neg_1728053144_5", NormalizedCategory.SAFETY, "cm", "Radar right", "distance", "measurement", listOf("radar_1025_-1728053144_5"), "decoded_number_non_negative", mqttDefaultEnabled = false)
     val maxChargePowerAllow = number("max_charge_power_allow_raw", NormalizedCategory.BATTERY, "kW", "Max charge power allow raw", "power", "measurement", listOf("statistic_max_charge_power_allow"), "decoded_number_non_negative")
-    val remainingBatteryPower = number("remaining_battery_power_raw", NormalizedCategory.BATTERY, "kW", "Remaining battery power raw", "power", "measurement", listOf("statistic_remaining_battery_power"), "decoded_number_non_negative")
     val batteryAverageTemp = number("battery_average_temp_raw", NormalizedCategory.BATTERY, "°C", "Battery average temperature", "temperature", "measurement", listOf("statistic_average_battery_temp"), "raw_temp_c_offset_40")
     val chargerConnected = bool("charger_connected_raw", NormalizedCategory.BATTERY, "Charger connected raw", "plug", listOf("charging_1009_89128973_5"), "zero_false_nonzero_true")
     val maxDischargePowerAllow = number("max_discharge_power_allow_raw", NormalizedCategory.BATTERY, "kW", "Max discharge power allow raw", "power", "measurement", listOf("statistic_1014_877658120_5"), "decoded_number_non_negative")
-    val maxChargeCurrentAllow = number("max_charge_current_allow_raw", NormalizedCategory.BATTERY, "A", "Max charge current allow raw", "current", "measurement", listOf("statistic_1014_877658152_5"), "decoded_current_a")
 
     val fields: List<NormalizedFieldDefinition> = listOf(
         soc,
         socEstimate,
         batterySoh,
         hvBatteryVoltage,
-        hvBatteryCurrent,
+        chargeCurrent,
         batteryPower,
         batteryChargePower,
         batteryDischargePower,
@@ -177,7 +174,6 @@ object NormalizedFieldCatalog {
         gearAutoMode,
         pm25Inside,
         pm25Outside,
-        lowVoltageWarning,
         radarLeftFront,
         radarFrontLeftMid,
         radarFrontRightMid,
@@ -187,11 +183,9 @@ object NormalizedFieldCatalog {
         radarRightRear,
         radarRight,
         maxChargePowerAllow,
-        remainingBatteryPower,
         batteryAverageTemp,
         chargerConnected,
-        maxDischargePowerAllow,
-        maxChargeCurrentAllow
+        maxDischargePowerAllow
     )
 
     private fun rawEnum(

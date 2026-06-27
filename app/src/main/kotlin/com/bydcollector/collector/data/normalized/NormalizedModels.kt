@@ -59,7 +59,8 @@ data class NormalizedObservation(
     val quality: NormalizedQuality,
     val sourcePollId: Long,
     val sourceKey: String?,
-    val observedAt: String
+    val observedAt: String,
+    val reason: String? = null
 ) {
     fun semanticKey(): String {
         return listOf(

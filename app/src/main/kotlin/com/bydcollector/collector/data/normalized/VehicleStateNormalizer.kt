@@ -31,19 +31,20 @@ class VehicleStateNormalizer(
     ): NormalizedObservation {
         if (field.normalizerId in DERIVED_HV_POWER_NORMALIZERS) {
             //derives hv power from voltage/current because the charge-power source does not represent discharge
-            val (quality, value) = when (field.normalizerId) {
+            val result = when (field.normalizerId) {
                 "derived_signed_hv_power_kw" -> normalizeDerivedHvPower(byKey, split = null)
                 "derived_hv_charge_power_kw" -> normalizeDerivedHvPower(byKey, split = "charge")
                 "derived_hv_discharge_power_kw" -> normalizeDerivedHvPower(byKey, split = "discharge")
-                else -> NormalizedQuality.UNSUPPORTED to emptyValue(field.valueType)
+                else -> NormalizedResult(NormalizedQuality.UNSUPPORTED, emptyValue(field.valueType))
             }
             return observation(
                 field = field,
                 pollId = pollId,
                 observedAt = observedAt,
                 sourceKey = DERIVED_HV_POWER_SOURCE_KEY,
-                quality = quality,
-                value = value
+                quality = result.quality,
+                value = result.value,
+                reason = result.reason
             )
         }
 
@@ -118,20 +119,24 @@ class VehicleStateNormalizer(
     private fun normalizeDerivedHvPower(
         byKey: Map<String, PollReading>,
         split: String?
-    ): Pair<NormalizedQuality, NormalizedValue> {
+    ): NormalizedResult {
         val voltageReading = byKey[HV_BATTERY_VOLTAGE_SOURCE_KEY]
         val currentReading = byKey[HV_BATTERY_CURRENT_SOURCE_KEY]
         if (voltageReading == null || currentReading == null) {
-            return NormalizedQuality.MISSING to emptyValue(NormalizedValueType.NUMBER)
+            return NormalizedResult(NormalizedQuality.MISSING, emptyValue(NormalizedValueType.NUMBER))
         }
         if (hasRawWithoutDecodedFloat(voltageReading) || hasRawWithoutDecodedFloat(currentReading)) {
-            return NormalizedQuality.INVALID to emptyValue(NormalizedValueType.NUMBER)
+            return NormalizedResult(
+                NormalizedQuality.INVALID,
+                emptyValue(NormalizedValueType.NUMBER),
+                "raw_float_without_decoded_desc"
+            )
         }
 
         val voltage = parseNumber(decodedPreferred(voltageReading))
         val current = parseNumber(decodedPreferred(currentReading))
         if (voltage == null || current == null) {
-            return NormalizedQuality.INVALID to emptyValue(NormalizedValueType.NUMBER)
+            return NormalizedResult(NormalizedQuality.INVALID, emptyValue(NormalizedValueType.NUMBER))
         }
 
         val signed = stableDouble(voltage * current / 1000.0)
@@ -140,9 +145,12 @@ class VehicleStateNormalizer(
             "discharge" -> maxOf(0.0, signed)
             else -> signed
         }
-        return NormalizedQuality.OK to NormalizedValue(
-            type = NormalizedValueType.NUMBER,
-            number = stableDouble(number)
+        return NormalizedResult(
+            quality = NormalizedQuality.OK,
+            value = NormalizedValue(
+                type = NormalizedValueType.NUMBER,
+                number = stableDouble(number)
+            )
         )
     }
 
@@ -259,7 +267,8 @@ class VehicleStateNormalizer(
         observedAt: String,
         sourceKey: String?,
         quality: NormalizedQuality,
-        value: NormalizedValue
+        value: NormalizedValue,
+        reason: String? = null
     ): NormalizedObservation {
         return NormalizedObservation(
             field = field,
@@ -267,7 +276,8 @@ class VehicleStateNormalizer(
             quality = quality,
             sourcePollId = pollId,
             sourceKey = sourceKey,
-            observedAt = observedAt
+            observedAt = observedAt,
+            reason = reason
         )
     }
 
@@ -275,9 +285,15 @@ class VehicleStateNormalizer(
         return NormalizedValue(type = type)
     }
 
+    private data class NormalizedResult(
+        val quality: NormalizedQuality,
+        val value: NormalizedValue,
+        val reason: String? = null
+    )
+
     private companion object {
         const val HV_BATTERY_VOLTAGE_SOURCE_KEY = "charging_charge_battery_volt"
-        const val HV_BATTERY_CURRENT_SOURCE_KEY = "charging_charging_charge_current_not_convert"
+        const val HV_BATTERY_CURRENT_SOURCE_KEY = "charging_charge_current"
         const val DERIVED_HV_POWER_SOURCE_KEY =
             "$HV_BATTERY_VOLTAGE_SOURCE_KEY+$HV_BATTERY_CURRENT_SOURCE_KEY"
         val DERIVED_HV_POWER_NORMALIZERS = setOf(
