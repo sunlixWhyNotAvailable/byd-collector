@@ -18,9 +18,11 @@ class NormalizedStateStore(
         val db = helper.writableDatabase
         db.beginTransaction()
         try {
+            val activeFieldKeys = fields.mapTo(mutableSetOf()) { it.fieldKey }
             fields.forEach { field ->
                 upsertCatalogField(db, field)
             }
+            deleteRetiredCurrentCatalogRows(db, activeFieldKeys)
             db.setTransactionSuccessful()
         } finally {
             db.endTransaction()
@@ -147,6 +149,14 @@ class NormalizedStateStore(
         }
     }
 
+    private fun deleteRetiredCurrentCatalogRows(db: SQLiteDatabase, activeFieldKeys: Set<String>) {
+        retiredNormalizedFieldKeysToDelete(activeFieldKeys).forEach { fieldKey ->
+            //guards mqtt/influx current-state export from retired canonical keys after in-place updates
+            db.delete("vehicle_state_current", "field_key = ?", arrayOf(fieldKey))
+            db.delete("normalized_field_catalog", "field_key = ?", arrayOf(fieldKey))
+        }
+    }
+
     private fun NormalizedObservation.toStoredState(): StoredNormalizedState {
         return StoredNormalizedState(
             fieldKey = field.fieldKey,
@@ -253,6 +263,10 @@ class NormalizedStateStore(
             .firstOrNull { it.mqttKey == category }
             ?.staleAfterMs
     }
+}
+
+internal fun retiredNormalizedFieldKeysToDelete(activeFieldKeys: Set<String>): Set<String> {
+    return setOf("hv_battery_current_a").filterNot { it in activeFieldKeys }.toSet()
 }
 
 data class NormalizedWriteSummary(

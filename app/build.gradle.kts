@@ -23,8 +23,8 @@ android {
         create("legacy") {
             dimension = "collectorLine"
             applicationId = "com.bydcollector.collector"
-            versionCode = 127
-            versionName = "1.0.9-mqtt-and-laststatus-fixes"
+            versionCode = 129
+            versionName = "1.1.0"
             manifestPlaceholders["collectorLabel"] = "BYD Collector"
             buildConfigField("String", "COLLECTOR_DISPLAY_NAME", "\"BYD Collector\"")
             buildConfigField("String", "COLLECTOR_DATABASE_NAME", "\"bydcollector_telemetry.db\"")

@@ -40,7 +40,7 @@ data class DirectDebugParameter(
 
 object DirectDebugParameterAsset {
     const val ASSET_NAME = "direct_debug_round_robin_parameters.csv"
-    const val SOURCE_VERSION = "wide-poll-session-20260605_161751-curated-main80-roundrobin6433-v1"
+    const val SOURCE_VERSION = "wide-poll-session-20260605_161751-curated-main77-roundrobin6436-charge-current-v2"
     val EXPECTED_HEADER = listOf(
         "key",
         "feature_group",

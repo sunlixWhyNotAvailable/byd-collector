@@ -87,11 +87,11 @@ class HaDiscoveryBuilderTest {
     fun discoverySkipsNonDefaultRawFieldsWithinEnabledDefaultCategory() {
         val tireStateRaw = NormalizedFieldCatalog.fields.single { it.fieldKey == "tyre_state_lf" }
         val radarDistance = NormalizedFieldCatalog.fields.single { it.fieldKey == "radar_1025_neg_1728053151_5" }
-        val lowVoltageWarning = NormalizedFieldCatalog.fields.single { it.fieldKey == "low_voltage_warning_raw" }
+        val chargingState = NormalizedFieldCatalog.fields.single { it.fieldKey == "charging_state" }
 
         val messages = HaDiscoveryBuilder.discoveryMessages(
             config = config(enabledCategories = setOf("safety", "battery")),
-            fields = listOf(tireStateRaw, radarDistance, lowVoltageWarning)
+            fields = listOf(tireStateRaw, radarDistance, chargingState)
         )
 
         assertEquals(emptyList(), messages)

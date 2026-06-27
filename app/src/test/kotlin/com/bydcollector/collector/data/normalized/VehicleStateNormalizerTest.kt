@@ -6,6 +6,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNotEquals
+import kotlin.test.assertTrue
 
 class VehicleStateNormalizerTest {
     @Test
@@ -71,13 +72,13 @@ class VehicleStateNormalizerTest {
     fun chargeCurrentUsesDecodedValueInsteadOfRawFloatBits() {
         val fieldsByKey = NormalizedFieldCatalog.fields.associateBy { it.fieldKey }
         val output = VehicleStateNormalizer(
-            catalog = listOf(fieldsByKey.getValue("hv_battery_current_a"))
+            catalog = listOf(fieldsByKey.getValue("charge_current_a"))
         ).normalize(
             pollId = 56L,
             observedAt = "2026-06-15T12:00:00+03:00",
             readings = listOf(
                 PollReading(
-                    rawKey = "charging_charging_charge_current_not_convert",
+                    rawKey = "charging_charge_current",
                     rawValue = java.lang.Float.floatToIntBits(81.5f).toString(),
                     descValue = "81.5"
                 )
@@ -87,6 +88,7 @@ class VehicleStateNormalizerTest {
         val chargeCurrent = output.single()
         assertEquals(NormalizedQuality.OK, chargeCurrent.quality)
         assertEquals(81.5, chargeCurrent.value.number)
+        assertEquals("charging_charge_current", chargeCurrent.sourceKey)
     }
 
     @Test
@@ -279,8 +281,8 @@ class VehicleStateNormalizerTest {
     fun catalogVersionAndExpansionWaveExposeRepresentativeFields() {
         val fieldsByKey = NormalizedFieldCatalog.fields.associateBy { it.fieldKey }
 
-        assertEquals("normalized-direct-v6-20260622-soc-display", NormalizedFieldCatalog.CATALOG_VERSION)
-        assertEquals(83, NormalizedFieldCatalog.fields.size)
+        assertEquals("normalized-direct-v8-20260627-charge-current", NormalizedFieldCatalog.CATALOG_VERSION)
+        assertEquals(80, NormalizedFieldCatalog.fields.size)
         assertEquals(emptyList(), NormalizedFieldCatalog.fields.filter { field ->
             field.sourceKeys.any {
                 it.startsWith("adas_") ||
@@ -295,17 +297,23 @@ class VehicleStateNormalizerTest {
         assertEquals(listOf("statistic_1014_1134559272_5"), fieldsByKey.getValue("soc_estimate").sourceKeys)
         assertEquals(listOf("ota_battery_voltage"), fieldsByKey.getValue("aux_voltage_v").sourceKeys)
         assertEquals(listOf("charging_charge_battery_volt"), fieldsByKey.getValue("hv_battery_voltage_v").sourceKeys)
+        assertTrue(fieldsByKey.containsKey("charge_current_a"))
         assertEquals(
-            listOf("charging_charging_charge_current_not_convert"),
-            fieldsByKey.getValue("hv_battery_current_a").sourceKeys
+            listOf("charging_charge_current"),
+            fieldsByKey.getValue("charge_current_a").sourceKeys
+        )
+        assertFalse(fieldsByKey.containsKey("hv_battery_current_a"))
+        assertEquals(
+            listOf("charging_charge_battery_volt", "charging_charge_current"),
+            fieldsByKey.getValue("battery_power_kw").sourceKeys
         )
         assertEquals("binary_sensor", fieldsByKey.getValue("left_rear_door_open").entityPlatform)
         assertEquals("sensor", fieldsByKey.getValue("front_motor_torque").entityPlatform)
         assertEquals(listOf("tyre_1016_-1728052952_5"), fieldsByKey.getValue("tire_pressure_rf_raw").sourceKeys)
         assertEquals("door_lock_state_locked", fieldsByKey.getValue("ota_lf_door_lock").normalizerId)
-        assertEquals(null, fieldsByKey.getValue("low_voltage_warning_raw").unit)
-        assertEquals(null, fieldsByKey.getValue("low_voltage_warning_raw").deviceClass)
-        assertEquals(null, fieldsByKey.getValue("low_voltage_warning_raw").stateClass)
+        assertFalse(fieldsByKey.containsKey("low_voltage_warning_raw"))
+        assertFalse(fieldsByKey.containsKey("remaining_battery_power_raw"))
+        assertFalse(fieldsByKey.containsKey("max_charge_current_allow_raw"))
         assertFalse(fieldsByKey.getValue("radar_1025_neg_1728053151_5").mqttDefaultEnabled)
     }
 
@@ -319,7 +327,6 @@ class VehicleStateNormalizerTest {
             "tyre_state_rf",
             "tyre_state_lr",
             "tyre_state_rr",
-            "low_voltage_warning_raw",
             "radar_1025_neg_1728053151_5"
         ).forEach { fieldKey ->
             assertFalse(fieldsByKey.getValue(fieldKey).mqttDefaultEnabled, fieldKey)
@@ -475,7 +482,11 @@ class VehicleStateNormalizerTest {
             observedAt = "2026-06-22T12:00:00+03:00",
             readings = listOf(
                 PollReading("charging_charge_battery_volt", "560", "560"),
-                PollReading("charging_charging_charge_current_not_convert", "640", "640")
+                PollReading(
+                    "charging_charge_current",
+                    java.lang.Float.floatToIntBits(640f).toString(),
+                    "640"
+                )
             )
         )
 
@@ -485,7 +496,7 @@ class VehicleStateNormalizerTest {
         output.forEach {
             assertEquals(NormalizedQuality.OK, it.quality)
             assertEquals(
-                "charging_charge_battery_volt+charging_charging_charge_current_not_convert",
+                "charging_charge_battery_volt+charging_charge_current",
                 it.sourceKey
             )
         }
@@ -506,7 +517,7 @@ class VehicleStateNormalizerTest {
             observedAt = "2026-06-22T12:00:06+03:00",
             readings = listOf(
                 PollReading("charging_charge_battery_volt", "560", "560"),
-                PollReading("charging_charging_charge_current_not_convert", "bad", "bad")
+                PollReading("charging_charge_current", "bad", "bad")
             )
         ).single()
         val missingDecodedFloat = VehicleStateNormalizer(catalog = listOf(field)).normalize(
@@ -515,7 +526,7 @@ class VehicleStateNormalizerTest {
             readings = listOf(
                 PollReading("charging_charge_battery_volt", "560", "560"),
                 PollReading(
-                    rawKey = "charging_charging_charge_current_not_convert",
+                    rawKey = "charging_charge_current",
                     rawValue = java.lang.Float.floatToIntBits(640f).toString(),
                     descValue = null
                 )
@@ -525,6 +536,8 @@ class VehicleStateNormalizerTest {
         assertEquals(NormalizedQuality.MISSING, missing.quality)
         assertEquals(NormalizedQuality.INVALID, invalidText.quality)
         assertEquals(NormalizedQuality.INVALID, missingDecodedFloat.quality)
+        assertEquals(null, missingDecodedFloat.value.number)
+        assertEquals("raw_float_without_decoded_desc", missingDecodedFloat.reason)
     }
 
     private fun syntheticPercentField(): NormalizedFieldDefinition {

@@ -208,7 +208,7 @@ class MqttPublishCoordinatorTest {
         val provider = MutableNormalizedProvider(
             listOf(
                 storedState("soc", "battery", valueNumber = 73.0),
-                storedState("low_voltage_warning_raw", "battery", valueNumber = 2.0)
+                storedState("charging_state", "battery", valueNumber = 2.0)
             )
         )
         val coordinator = coordinator(client = client, provider = provider)
@@ -218,7 +218,7 @@ class MqttPublishCoordinatorTest {
         assertTrue(result.ok)
         val batteryPayload = client.published.single { it.topic == "bydcollector/state/battery" }.payload
         assertTrue(batteryPayload.contains("soc"))
-        assertFalse(batteryPayload.contains("low_voltage_warning_raw"))
+        assertFalse(batteryPayload.contains("charging_state"))
     }
 
     @Test
