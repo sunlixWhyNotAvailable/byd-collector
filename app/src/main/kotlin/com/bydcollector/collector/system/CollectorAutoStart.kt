@@ -5,8 +5,8 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.os.SystemClock
+import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.BuildConfig
-import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorServiceController
@@ -25,8 +25,7 @@ object CollectorAutoStart {
 
     fun handleBroadcast(context: Context, action: String, retryAttempt: Int = 0) {
         val appContext = context.applicationContext
-        val helper = TelemetryDatabaseHelper(appContext)
-        val store = TelemetryStore(appContext, helper)
+        val store = BydCollectorApplication.store(appContext)
         val settings = CollectorSettings(appContext, store)
         if (!shouldRunService(settings)) {
             store.recordEvent("boot_auto_start_skipped", "Auto-start and keep-alive disabled", action)

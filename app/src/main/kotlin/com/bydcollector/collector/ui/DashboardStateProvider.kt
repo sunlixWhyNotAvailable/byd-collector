@@ -1,15 +1,19 @@
 package com.bydcollector.collector.ui
 
 import android.content.Context
+import android.os.SystemClock
 import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.debug.DirectDebugStatus
+import com.bydcollector.collector.data.local.HealthSnapshot
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.remote.DirectBridgeManager
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.system.RequiredAccessChecker
+import com.bydcollector.collector.system.RequiredAccessRow
+import com.bydcollector.collector.util.TimedCache
 
 //assembles one immutable dashboard snapshot from settings, service flags, sqlite health, and diagnostics
 class DashboardStateProvider(
@@ -17,6 +21,10 @@ class DashboardStateProvider(
     private val store: TelemetryStore,
     private val settings: CollectorSettings
 ) {
+    private val healthCache = TimedCache<HealthSnapshot>(ttlMs = 15_000L)
+    private val requiredAccessCache = TimedCache<List<RequiredAccessRow>>(ttlMs = 30_000L)
+    private var healthCacheRunning: Boolean? = null
+
     fun load(
         includeTelemetryDetails: Boolean = true,
         includeDebugStatus: Boolean = false,
@@ -24,8 +32,13 @@ class DashboardStateProvider(
     ): DashboardState {
         val serviceRunning = CollectorService.isRunning()
         val mainPollingRunning = CollectorService.isMainPollingRunning()
+        val nowMs = SystemClock.elapsedRealtime()
+        val healthRunningChanged = healthCacheRunning != mainPollingRunning
         //uses main polling state for health so keep-alive-only service runs do not look like active collection
-        val health = store.healthSnapshot(running = mainPollingRunning)
+        val health = healthCache.get(nowMs = nowMs, force = healthRunningChanged) {
+            healthCacheRunning = mainPollingRunning
+            store.healthSnapshot(running = mainPollingRunning)
+        }
         val debugStatus = if (includeDebugStatus) {
             //opens the debug db only on heavy tabs because status scans can be expensive on the tablet
             DirectDebugStore(context).use { debugStore -> debugStore.status() }
@@ -136,7 +149,7 @@ class DashboardStateProvider(
             influxExportedRowsTotal = influxState.exportedRowsTotal,
             normalizedCurrentCount = health.normalizedCurrentCount,
             normalizedHistoryCount = health.normalizedHistoryCount,
-            requiredAccessRows = RequiredAccessChecker.displayCheck(context),
+            requiredAccessRows = requiredAccessCache.get(nowMs) { RequiredAccessChecker.displayCheck(context) },
             directBridgeStatus = DirectBridgeManager.status(context),
             vehicleKpis = vehicleKpis,
             recentEvents = health.recentEvents.map { event ->

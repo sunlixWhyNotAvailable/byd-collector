@@ -21,4 +21,15 @@ class CsvCatalogParserTest {
         assertTrue(rows[0].includeDesc)
         assertFalse(rows[1].includeDesc)
     }
+
+    @Test
+    fun stripsUtf8BomFromHeader() {
+        val rows = CsvCatalogParser.parse(
+            "\uFEFFid,key,name,group,include_desc,note\n33,SOC,电量百分比,all,true,"
+        )
+
+        assertEquals("33", rows.single().sourceId)
+        assertEquals("SOC", rows.single().key)
+        assertEquals("电量百分比", rows.single().name)
+    }
 }

@@ -22,6 +22,7 @@ import com.bydcollector.collector.mqtt.MqttRetryStateStore
 import com.bydcollector.collector.mqtt.PendingMqttMessage
 import com.bydcollector.collector.mqtt.MqttPublishStateRecorder
 import com.bydcollector.collector.mqtt.NormalizedStateProvider
+import java.io.Closeable
 import java.io.File
 import java.security.MessageDigest
 import java.util.Locale
@@ -37,11 +38,16 @@ class TelemetryStore(
     MqttPublishStateRecorder,
     MqttOutboxStore,
     MqttRetryStateStore,
-    InfluxExportStore {
+    InfluxExportStore,
+    Closeable {
     private val directImporter = DirectCatalogImporter(helper)
     private val ecImporter = EcDatabaseImporter(context, helper, clock)
     private val normalizedStore = NormalizedStateStore(helper, clock)
     @Volatile private var pollValueColumnsEnsuredForCatalogVersionId: Long? = null
+
+    override fun close() {
+        helper.close()
+    }
 
     fun ensureCatalogImported(): Long {
         val catalogVersionId = directImporter.ensureImported()

@@ -14,7 +14,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.bydcollector.collector.adb.AdbAuthorizationManager
-import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
 import com.bydcollector.collector.influx.InfluxActionResult
@@ -40,7 +39,7 @@ import com.bydcollector.collector.update.UpdateCheckResult
 import com.bydcollector.collector.update.UpdateDownloader
 import com.bydcollector.collector.update.UpdateInfo
 import com.bydcollector.collector.update.UpdateUiState
-import java.util.concurrent.Executors
+import com.bydcollector.collector.util.namedSingleThreadExecutor
 
 //coordinates the user-facing compose shell while CollectorService owns long-running vehicle work
 class MainActivity : ComponentActivity() {
@@ -48,8 +47,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var settings: CollectorSettings
     private lateinit var stateProvider: DashboardStateProvider
     private val handler = Handler(Looper.getMainLooper())
-    private val dashboardExecutor = Executors.newSingleThreadExecutor()
-    private val updateExecutor = Executors.newSingleThreadExecutor()
+    private val dashboardExecutor = namedSingleThreadExecutor("byd-ui-dash")
+    private val updateExecutor = namedSingleThreadExecutor("byd-update")
     private val updateChecker by lazy { UpdateChecker(settings) }
     private val updateDownloader by lazy { UpdateDownloader(applicationContext) }
     private var startupBackgroundLaunchPosted = false
@@ -295,8 +294,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val helper = TelemetryDatabaseHelper(applicationContext)
-        store = TelemetryStore(applicationContext, helper)
+        store = BydCollectorApplication.store(applicationContext)
         settings = CollectorSettings(applicationContext, store)
         stateProvider = DashboardStateProvider(applicationContext, store, settings)
         debugBatchText = settings.debugBatchSize().toString()
