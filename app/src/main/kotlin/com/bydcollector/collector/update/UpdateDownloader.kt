@@ -11,6 +11,11 @@ import java.io.File
 
 class UpdateDownloader(private val context: Context) {
     fun enqueue(info: UpdateInfo): Long {
+        val apkFileName = updateApkName(info.version)
+        deleteOldUpdateApks(
+            context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS),
+            keepFileName = apkFileName
+        )
         val request = DownloadManager.Request(Uri.parse(info.downloadUrl))
             .setTitle("BYD Collector ${info.version}")
             .setDescription("Downloading update")
@@ -19,7 +24,7 @@ class UpdateDownloader(private val context: Context) {
             .setDestinationInExternalFilesDir(
                 context,
                 Environment.DIRECTORY_DOWNLOADS,
-                "bydcollector-${info.version}.apk"
+                apkFileName
             )
         val manager = context.getSystemService(DownloadManager::class.java)
         //bridge downloadmanager progress into compose state by returning stable id
@@ -45,7 +50,7 @@ class UpdateDownloader(private val context: Context) {
     fun install(info: UpdateInfo) {
         val file = File(
             context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS),
-            "bydcollector-${info.version}.apk"
+            updateApkName(info.version)
         )
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
         val intent = Intent(Intent.ACTION_VIEW)
@@ -68,5 +73,19 @@ class UpdateDownloader(private val context: Context) {
 
     companion object {
         private const val APK_MIME = "application/vnd.android.package-archive"
+
+        internal fun updateApkName(version: String): String = "bydcollector-$version.apk"
+
+        internal fun deleteOldUpdateApks(downloadDir: File?, keepFileName: String) {
+            if (downloadDir == null || !downloadDir.exists()) return
+            downloadDir.listFiles()
+                ?.filter { file ->
+                    file.isFile &&
+                        file.name.startsWith("bydcollector-") &&
+                        file.name.endsWith(".apk") &&
+                        file.name != keepFileName
+                }
+                ?.forEach { file -> runCatching { file.delete() } }
+        }
     }
 }
