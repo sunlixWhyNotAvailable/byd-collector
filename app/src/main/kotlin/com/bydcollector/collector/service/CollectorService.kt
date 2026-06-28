@@ -13,6 +13,7 @@ import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
+import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.BuildConfig
 import com.bydcollector.collector.adb.AdbAuthorizationManager
 import com.bydcollector.collector.adb.AdbLocalClient
@@ -21,7 +22,6 @@ import com.bydcollector.collector.data.debug.DirectDebugParameterAsset
 import com.bydcollector.collector.data.debug.DirectDebugRoundRobinPoller
 import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
-import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.normalized.NormalizedWriteSummary
 import com.bydcollector.collector.data.normalized.VehicleStateNormalizer
@@ -46,9 +46,9 @@ import com.bydcollector.collector.mqtt.MqttClientFacade
 import com.bydcollector.collector.mqtt.MqttPublishCoordinator
 import com.bydcollector.collector.mqtt.PahoMqttClientFacade
 import com.bydcollector.collector.system.CollectorAutoStart
+import com.bydcollector.collector.util.namedSingleThreadExecutor
 import java.io.File
 import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -67,12 +67,12 @@ class CollectorService : Service() {
     private var sessionId: Long? = null
     private var debugPoller: DirectDebugRoundRobinPoller? = null
     private var normalizedStateChangedCallback: ((Set<String>) -> Unit)? = null
-    private val debugStartExecutor = Executors.newSingleThreadExecutor()
+    private val debugStartExecutor = namedSingleThreadExecutor("byd-debug-start")
     private val mainHandler = Handler(Looper.getMainLooper())
     private val mqttExecutorLock = Any()
-    private var mqttExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private var mqttExecutor: ExecutorService = namedSingleThreadExecutor("byd-mqtt")
     private val influxExecutorLock = Any()
-    private var influxExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private var influxExecutor: ExecutorService = namedSingleThreadExecutor("byd-influx")
     private val mqttWorkGeneration = AtomicLong(0L)
     private val influxWorkGeneration = AtomicLong(0L)
     private val debugStartInProgress = AtomicBoolean(false)
@@ -84,8 +84,7 @@ class CollectorService : Service() {
     override fun onCreate() {
         super.onCreate()
         running.set(true)
-        val helper = TelemetryDatabaseHelper(applicationContext)
-        store = TelemetryStore(applicationContext, helper)
+        store = BydCollectorApplication.store(applicationContext)
         settings = CollectorSettings(applicationContext, store)
         debugStore = DirectDebugStore(applicationContext, DirectDebugDatabaseHelper(applicationContext))
         keepAliveSupervisor = KeepAliveSupervisor(applicationContext, store)
@@ -156,6 +155,9 @@ class CollectorService : Service() {
         shutdownInfluxExecutor()
         mainPollingRunning.set(false)
         running.set(false)
+        if (::debugStore.isInitialized) {
+            debugStore.close()
+        }
         super.onDestroy()
     }
 
@@ -544,7 +546,7 @@ class CollectorService : Service() {
             polling = poller.isRunning(),
             collectorStatus = if (result.ok) "polling" else "polling_error",
             adb = if (AdbAuthorizationManager.isAdbGranted(applicationContext)) "authorized" else "not_authorized",
-            helper = DirectBridgeManager.status(applicationContext) ?: "unknown",
+            helper = DirectBridgeManager.status(applicationContext, forceRefresh = !result.ok) ?: "unknown",
             lastSuccessAt = health.lastSuccessAt,
             lastError = if (result.ok) health.lastError else health.lastError ?: result.category,
             categories = mqttCategoryStatus()
@@ -633,7 +635,7 @@ class CollectorService : Service() {
         mqttWorkGeneration.incrementAndGet()
         return synchronized(mqttExecutorLock) {
             mqttExecutor.shutdownNow()
-            Executors.newSingleThreadExecutor().also { replacement ->
+            namedSingleThreadExecutor("byd-mqtt").also { replacement ->
                 mqttExecutor = replacement
             }
         }

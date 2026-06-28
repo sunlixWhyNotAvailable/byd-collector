@@ -4,7 +4,7 @@ import com.bydcollector.collector.data.direct.DirectHelperReadResult
 import com.bydcollector.collector.data.direct.DirectVehicleHelper
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
-import java.util.concurrent.Executors
+import com.bydcollector.collector.util.namedSingleThreadExecutor
 import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
@@ -34,7 +34,7 @@ class DirectDebugRoundRobinPoller(
     private val clock: Clock = SystemClockAdapter(),
     private val onCycle: (DirectDebugCycleSummary) -> Unit = {}
 ) {
-    private val executor = Executors.newSingleThreadExecutor()
+    private val executor = namedSingleThreadExecutor("byd-round-robin")
     private val running = AtomicBoolean(false)
     private val cursor = DirectDebugRoundRobinCursor(parameters)
     private var future: Future<*>? = null

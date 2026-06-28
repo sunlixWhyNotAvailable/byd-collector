@@ -2,7 +2,7 @@ package com.bydcollector.collector.data.local
 
 object CsvCatalogParser {
     fun parse(content: String): List<CatalogSeedRow> {
-        val rows = content.lineSequence()
+        val rows = content.removePrefix("\uFEFF").lineSequence()
             .filter { it.isNotBlank() }
             .map { parseLine(it) }
             .toList()

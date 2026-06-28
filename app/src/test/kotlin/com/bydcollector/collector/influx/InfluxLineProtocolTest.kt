@@ -55,6 +55,29 @@ class InfluxLineProtocolTest {
         assertTrue(line.contains("value_num=3.312"))
     }
 
+    @Test
+    fun omitsTimestampWhenObservedAtCannotBeParsed() {
+        val row = InfluxPendingHistoryRow(
+            id = 3,
+            fieldKey = "soc_display_percent",
+            category = "battery",
+            valueType = "NUMBER",
+            valueText = null,
+            valueNumber = 96.0,
+            valueBool = null,
+            quality = "OK",
+            unit = "%",
+            sourcePollId = 88,
+            sourceKeys = "statistic_1014_1145045040_5",
+            observedAt = "bad timestamp",
+            changedAt = "2026-06-15T10:20:31Z"
+        )
+
+        val line = InfluxLineProtocol.toLine(row, config())
+
+        assertTrue(line.endsWith("changed_at=\"2026-06-15T10:20:31Z\""))
+    }
+
     private fun config(): InfluxConfig = InfluxConfig(
         enabled = true,
         host = "influx.local",

@@ -3,8 +3,7 @@ package com.bydcollector.collector.system
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
-import com.bydcollector.collector.data.local.TelemetryStore
+import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.service.CollectorSettings
 
 class KeepAliveRecoveryReceiver : BroadcastReceiver() {
@@ -13,7 +12,7 @@ class KeepAliveRecoveryReceiver : BroadcastReceiver() {
         if (action != CollectorAutoStart.ACTION_KEEP_ALIVE_RECOVERY) return
 
         val appContext = context.applicationContext
-        val store = TelemetryStore(appContext, TelemetryDatabaseHelper(appContext))
+        val store = BydCollectorApplication.store(appContext)
         val settings = CollectorSettings(appContext, store)
         store.recordEvent(
             "keep_alive_recovery_broadcast",

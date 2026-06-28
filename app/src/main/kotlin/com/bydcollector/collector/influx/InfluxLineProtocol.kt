@@ -21,7 +21,8 @@ object InfluxLineProtocol {
             row.sourcePollId?.let { add("source_poll_id=${it}i") }
             add("changed_at=\"${escapeFieldString(row.changedAt)}\"")
         }.joinToString(",")
-        return "$measurement,$tags $fields ${timestampNanos(row.observedAt)}"
+        val baseLine = "$measurement,$tags $fields"
+        return timestampNanos(row.observedAt)?.let { timestamp -> "$baseLine $timestamp" } ?: baseLine
     }
 
     fun escapeMeasurement(value: String): String = value
@@ -39,10 +40,10 @@ object InfluxLineProtocol {
         .replace("\\", "\\\\")
         .replace("\"", "\\\"")
 
-    fun timestampNanos(iso: String): Long {
+    fun timestampNanos(iso: String): Long? {
         return runCatching {
             val parsed = OffsetDateTime.parse(iso)
             parsed.toInstant().epochSecond * 1_000_000_000L + parsed.nano
-        }.getOrDefault(0L)
+        }.getOrNull()
     }
 }

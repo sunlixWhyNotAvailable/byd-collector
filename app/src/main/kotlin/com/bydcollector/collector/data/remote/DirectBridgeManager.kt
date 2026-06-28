@@ -2,28 +2,54 @@ package com.bydcollector.collector.data.remote
 
 import android.content.Context
 import android.os.Process
+import android.os.SystemClock
 import com.bydcollector.collector.adb.AdbLocalClient
 import com.bydcollector.collector.data.direct.DirectVehicleHelper
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.direct.CollectorHelperProtocol
 import java.io.File
 
+internal class DirectBridgeStatusCache(
+    private val ttlMs: Long
+) {
+    private var cachedStatus: CachedStatus? = null
+
+    fun status(nowMs: Long, force: Boolean = false, helperAlive: () -> Boolean, authorizationStatus: () -> String?): String? {
+        if (helperAlive()) return "ready"
+        val cached = cachedStatus
+        if (!force && cached != null && nowMs - cached.loadedAtMs < ttlMs) return cached.value
+        return authorizationStatus().also { value -> cachedStatus = CachedStatus(value, nowMs) }
+    }
+
+    private data class CachedStatus(
+        val value: String?,
+        val loadedAtMs: Long
+    )
+}
+
 //starts and verifies the shell-owned binder helper that reads autoservice for the app uid
 object DirectBridgeManager {
-    fun status(context: Context): String? {
-        //reports ready from binder ping first; adb auth is only a fallback status check
-        if (DirectVehicleHelperClient().isAlive()) return "ready"
+    private const val STATUS_TTL_MS = 30_000L
+    private val statusCache = DirectBridgeStatusCache(STATUS_TTL_MS)
 
-        val appContext = context.applicationContext
-        val authorization = AdbLocalClient(File(appContext.filesDir, "adb_keys")).checkAuthorization()
-        return when (authorization.category) {
-            "adb_authorization_connected" -> "ready"
-            "adb_authorization_required" -> "needs Grant ADB"
-            "adb_authorization_unavailable",
-            "adb_authorization_timeout",
-            "adb_authorization_error" -> "unavailable"
-            else -> "unavailable"
-        }
+    fun status(context: Context, forceRefresh: Boolean = false): String? {
+        return statusCache.status(
+            nowMs = SystemClock.elapsedRealtime(),
+            force = forceRefresh,
+            helperAlive = { DirectVehicleHelperClient().isAlive() },
+            authorizationStatus = {
+                val appContext = context.applicationContext
+                val authorization = AdbLocalClient(File(appContext.filesDir, "adb_keys")).checkAuthorization()
+                when (authorization.category) {
+                    "adb_authorization_connected" -> "ready"
+                    "adb_authorization_required" -> "needs Grant ADB"
+                    "adb_authorization_unavailable",
+                    "adb_authorization_timeout",
+                    "adb_authorization_error" -> "unavailable"
+                    else -> "unavailable"
+                }
+            }
+        )
     }
 
     fun ensureRunning(

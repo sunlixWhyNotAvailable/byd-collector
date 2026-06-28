@@ -7,6 +7,7 @@ import com.bydcollector.collector.data.direct.DirectHelperReadResult
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import java.io.Closeable
+import java.util.concurrent.ConcurrentHashMap
 
 data class DirectDebugObserved(
     val status: Int,
@@ -69,7 +70,7 @@ class DirectDebugStore(
     private val helper: DirectDebugDatabaseHelper = DirectDebugDatabaseHelper(context),
     private val clock: Clock = SystemClockAdapter()
 ) : Closeable {
-    private val candidateIds = mutableMapOf<String, Long>()
+    private val candidateIds = ConcurrentHashMap<String, Long>()
 
     fun openSession(parameters: List<DirectDebugParameter>, batchSize: Int): Long {
         val db = helper.writableDatabase

@@ -22,7 +22,7 @@ class NormalizedStateStore(
             fields.forEach { field ->
                 upsertCatalogField(db, field)
             }
-            deleteRetiredCurrentCatalogRows(db, activeFieldKeys)
+            deleteRetiredCurrentRows(db, activeFieldKeys)
             db.setTransactionSuccessful()
         } finally {
             db.endTransaction()
@@ -149,11 +149,11 @@ class NormalizedStateStore(
         }
     }
 
-    private fun deleteRetiredCurrentCatalogRows(db: SQLiteDatabase, activeFieldKeys: Set<String>) {
+    private fun deleteRetiredCurrentRows(db: SQLiteDatabase, activeFieldKeys: Set<String>) {
         retiredNormalizedFieldKeysToDelete(activeFieldKeys).forEach { fieldKey ->
             //guards mqtt/influx current-state export from retired canonical keys after in-place updates
             db.delete("vehicle_state_current", "field_key = ?", arrayOf(fieldKey))
-            db.delete("normalized_field_catalog", "field_key = ?", arrayOf(fieldKey))
+            //keeps catalog metadata because historical rows still reference it through sqlite foreign keys
         }
     }
 
