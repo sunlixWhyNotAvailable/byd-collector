@@ -33,6 +33,12 @@ class AdbLocalClient(
     private val eventSink: ((category: String, message: String, detail: String?) -> Unit)? = null,
     private val endpoints: List<AdbEndpoint> = LOCAL_ADB_ENDPOINTS
 ) {
+    init {
+        require(endpoints.all { it.isLoopbackHost() }) {
+            "AdbLocalClient endpoints must use loopback hosts only"
+        }
+    }
+
     fun execShell(
         command: String,
         timeoutMs: Int = SHELL_TIMEOUT_MS,
@@ -532,6 +538,15 @@ class AdbLocalClient(
         return "command=0x${Integer.toHexString(command)} arg0=$arg0 arg1=$arg1 payload=${payload.size}"
     }
 
+    private fun AdbEndpoint.isLoopbackHost(): Boolean {
+        val value = host.trim().lowercase()
+        return value == "localhost" ||
+            value == "::1" ||
+            value == "[::1]" ||
+            value == "0:0:0:0:0:0:0:1" ||
+            LOOPBACK_IPV4.matches(value)
+    }
+
     companion object {
         const val COMMAND_CNXN = 0x4e584e43
         const val COMMAND_AUTH = 0x48545541
@@ -555,6 +570,7 @@ class AdbLocalClient(
         private val LOCAL_ADB_ENDPOINTS = listOf(
             AdbEndpoint("127.0.0.1", 5555)
         )
+        private val LOOPBACK_IPV4 = Regex("""127(?:\.\d{1,3}){3}""")
         private val SHA1_DIGEST_INFO_PREFIX = byteArrayOf(
             0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02,
             0x1a, 0x05, 0x00, 0x04, 0x14

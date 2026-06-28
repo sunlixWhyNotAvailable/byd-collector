@@ -11,10 +11,21 @@ import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class AdbLocalClientTest {
+    @Test
+    fun rejectsNonLoopbackEndpoints() {
+        assertFailsWith<IllegalArgumentException> {
+            AdbLocalClient(
+                keyDir = Files.createTempDirectory("bydcollector-adb-test").toFile(),
+                endpoints = listOf(AdbEndpoint("192.168.1.10", 5555))
+            )
+        }
+    }
+
     @Test
     fun acceptsBydReferenceAdbFramesWithoutStrictChecksumFallback() {
         BrokenAdbServer().use { broken ->

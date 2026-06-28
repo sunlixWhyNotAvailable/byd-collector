@@ -21,6 +21,20 @@ class VehicleKpiMapperTest {
     }
 
     @Test
+    fun mapsBatteryDischargePowerFromCurrentNormalizedSplit() {
+        val kpis = VehicleKpiMapper.from(
+            listOf(
+                state("battery_charge_power_kw", 0.0),
+                state("battery_discharge_power_kw", 35.8)
+            )
+        )
+
+        assertEquals("Розряджання", kpis.batteryPowerLabelUk)
+        assertEquals("Discharging", kpis.batteryPowerLabelEn)
+        assertEquals("-35.8 кВт", kpis.batteryPowerKw)
+    }
+
+    @Test
     fun missingOrInvalidBatteryHealthValuesFailClosed() {
         val missing = VehicleKpiMapper.from(emptyList())
         val invalidDelta = VehicleKpiMapper.from(

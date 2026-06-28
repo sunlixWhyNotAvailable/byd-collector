@@ -9,12 +9,14 @@ import kotlin.math.roundToInt
 object VehicleKpiMapper {
     fun from(rows: List<StoredNormalizedState>): VehicleKpis {
         val byKey = rows.associateBy { it.fieldKey }
-        val power = byKey.number("charge_power_kw")
+        val chargePower = byKey.number("battery_charge_power_kw")
+        val dischargePower = byKey.number("battery_discharge_power_kw")
         val highestCell = byKey.number("battery_highest_cell_voltage_raw")
         val lowestCell = byKey.number("battery_lowest_cell_voltage_raw")
         val deltaMv = cellDeltaMv(highestCell, lowestCell)
 
-        val charging = power != null && power > 0.05
+        val charging = chargePower != null && chargePower > 0.05
+        val power = if (charging) chargePower else dischargePower
         return VehicleKpis(
             socPercent = byKey.percent("soc"),
             odometerKm = byKey.km("odometer_km"),
