@@ -15,10 +15,6 @@ class MqttPublishCoordinator(
     private val retryPolicy: MqttRetryPolicy = MqttRetryPolicy(),
     private val clock: Clock = SystemClockAdapter()
 ) {
-    fun testConnectionAndMaybeFlush(): MqttActionResult {
-        return startLiveExport()
-    }
-
     fun testConnectionOnly(): MqttActionResult {
         val config = configProvider()
 

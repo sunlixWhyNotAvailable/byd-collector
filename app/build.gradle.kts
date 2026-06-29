@@ -9,31 +9,21 @@ android {
     compileSdk = 35
 
     defaultConfig {
+        applicationId = "com.bydcollector.collector"
         minSdk = 26
         targetSdk = 29
+        versionCode = 132
+        versionName = "1.2.0"
+        manifestPlaceholders["collectorLabel"] = "BYD Collector"
+        buildConfigField("String", "COLLECTOR_DISPLAY_NAME", "\"BYD Collector\"")
+        buildConfigField("String", "COLLECTOR_DATABASE_NAME", "\"bydcollector_telemetry.db\"")
+        buildConfigField("String", "UPDATE_RELEASES_API_URL", "\"https://api.github.com/repos/sunlixWhyNotAvailable/byd-collector/releases/latest\"")
+        buildConfigField("String", "ACTION_PREFIX", "\"com.bydcollector.collector\"")
     }
 
     buildFeatures {
         buildConfig = true
         compose = true
-    }
-
-    flavorDimensions += "collectorLine"
-    productFlavors {
-        create("legacy") {
-            dimension = "collectorLine"
-            applicationId = "com.bydcollector.collector"
-            versionCode = 131
-            versionName = "1.1.2"
-            manifestPlaceholders["collectorLabel"] = "BYD Collector"
-            buildConfigField("String", "COLLECTOR_DISPLAY_NAME", "\"BYD Collector\"")
-            buildConfigField("String", "COLLECTOR_DATABASE_NAME", "\"bydcollector_telemetry.db\"")
-            buildConfigField("String", "UPDATE_RELEASES_API_URL", "\"https://api.github.com/repos/sunlixWhyNotAvailable/byd-collector/releases/latest\"")
-            buildConfigField("String", "ACTION_PREFIX", "\"com.bydcollector.collector\"")
-            buildConfigField("boolean", "ENABLE_DIRECT_TELEMETRY", "true")
-            buildConfigField("boolean", "ENABLE_ADB_UI", "true")
-            buildConfigField("boolean", "ENABLE_DIRECT_DEBUG_ROUND_ROBIN", "true")
-        }
     }
 
     testOptions {

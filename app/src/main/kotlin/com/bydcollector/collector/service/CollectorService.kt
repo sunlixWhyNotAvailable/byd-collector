@@ -29,10 +29,9 @@ import com.bydcollector.collector.data.polling.PollPersistenceCoordinator
 import com.bydcollector.collector.data.polling.SuccessfulPollObserver
 import com.bydcollector.collector.data.polling.TelemetryPoller
 import com.bydcollector.collector.data.local.PollReading
-import com.bydcollector.collector.data.remote.DiPlusClient
-import com.bydcollector.collector.data.remote.DiPlusResult
 import com.bydcollector.collector.data.remote.DirectTelemetryClient
 import com.bydcollector.collector.data.remote.DirectBridgeManager
+import com.bydcollector.collector.data.remote.TelemetryClient
 import com.bydcollector.collector.keepalive.KeepAliveConfig
 import com.bydcollector.collector.keepalive.KeepAliveSupervisor
 import com.bydcollector.collector.influx.HttpInfluxClient
@@ -177,14 +176,14 @@ class CollectorService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun telemetryClient(): DiPlusClient {
+    private fun telemetryClient(): TelemetryClient {
         return DirectTelemetryClient(applicationContext)
     }
 
     private fun reconcileCollection(debugStartReason: String = DEBUG_REASON_AUTOSTART) {
         try {
             val mainEnabled = settings.isPollingEnabled()
-            val debugEnabled = BuildConfig.ENABLE_DIRECT_DEBUG_ROUND_ROBIN && settings.isDebugPollingEnabled()
+            val debugEnabled = settings.isDebugPollingEnabled()
             val keepAliveConfig = settings.keepAliveConfig()
             val keepAliveEnabled = keepAliveConfig.anyEnabled
             //stops the foreground service only after keep-alive settings have been mirrored to the shell delegate
@@ -744,14 +743,14 @@ class CollectorService : Service() {
 
     private fun pollingErrorSummary(category: String?): String {
         return when (category) {
-            DiPlusResult.NETWORK_ERROR, DiPlusResult.TIMEOUT -> "Direct telemetry unavailable"
-            DiPlusResult.HTTP_ERROR, DiPlusResult.DI_SUCCESS_FALSE, DiPlusResult.PARSE_ERROR -> "Direct telemetry error"
             "adb_authorization_required" -> "ADB not authorized"
             "adb_authorization_unavailable" -> "ADB unavailable"
             "adb_authorization_timeout" -> "ADB authorization timeout"
-            "bridge_launch_failed", "bridge_unavailable",
-            "helper_launch_failed", "helper_unavailable", "helper_launch_backoff",
-            "autoservice_snapshot_empty" -> "Direct helper unavailable"
+            "helper_launch_failed",
+            "helper_unavailable",
+            "helper_launch_backoff" -> "Direct telemetry unavailable"
+            "autoservice_snapshot_empty",
+            "autoservice_partial_failure" -> "Direct telemetry error"
             "service_start_error" -> "service start failed"
             else -> category ?: "unknown"
         }
