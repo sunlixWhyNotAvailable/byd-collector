@@ -8,8 +8,7 @@ object HaIntegrationCategories {
         NormalizedCategory.MOTION.mqttKey,
         NormalizedCategory.BODY.mqttKey,
         NormalizedCategory.CLIMATE.mqttKey,
-        NormalizedCategory.SAFETY.mqttKey,
-        NormalizedCategory.DRIVER_ASSIST.mqttKey
+        NormalizedCategory.SAFETY.mqttKey
     )
 
     val defaults: Set<String> = setOf(

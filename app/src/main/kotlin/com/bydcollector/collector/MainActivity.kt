@@ -18,6 +18,8 @@ import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
 import com.bydcollector.collector.influx.InfluxActionResult
 import com.bydcollector.collector.influx.InfluxActions
+import com.bydcollector.collector.maintenance.DbMaintenanceOperation
+import com.bydcollector.collector.maintenance.DbMaintenanceUiState
 import com.bydcollector.collector.mqtt.HaMqttActions
 import com.bydcollector.collector.mqtt.MqttActionResult
 import com.bydcollector.collector.service.CollectorServiceController
@@ -66,6 +68,7 @@ class MainActivity : ComponentActivity() {
     private var mqttDraft by mutableStateOf(MqttDraft())
     private var influxDraft by mutableStateOf(InfluxDraft())
     private var updateUiState by mutableStateOf<UpdateUiState>(UpdateUiState.Hidden)
+    private var pendingMaintenanceOperation by mutableStateOf<DbMaintenanceOperation?>(null)
     private var backgroundSetupPromptVisible by mutableStateOf(false)
     private var backgroundSetupPromptAutoLaunch = false
 
@@ -92,18 +95,21 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onStartMain() {
+            refreshStoreBackedState()
             settings.setPollingEnabled(true)
             CollectorServiceController.start(this@MainActivity)
             refresh()
         }
 
         override fun onStopMain() {
+            refreshStoreBackedState()
             settings.setPollingEnabled(false)
             CollectorServiceController.stop(this@MainActivity)
             refresh()
         }
 
         override fun onToggleMainAutoStart(enabled: Boolean) {
+            refreshStoreBackedState()
             if (settings.isAutoStartEnabled() != enabled) {
                 settings.setAutoStartEnabled(enabled)
                 val message = if (enabled) {
@@ -113,7 +119,7 @@ class MainActivity : ComponentActivity() {
                 }
                 Toast.makeText(this@MainActivity, message, Toast.LENGTH_SHORT).show()
                 if (enabled) {
-                    CollectorAutoStart.scheduleWatchdog(applicationContext, settings, store)
+                    CollectorAutoStart.scheduleWatchdog(applicationContext, settings, currentStore())
                 }
                 refresh()
             }
@@ -128,7 +134,34 @@ class MainActivity : ComponentActivity() {
             showBackgroundSetupPrompt(autoLaunch = false)
         }
 
+        override fun onOpenCompactDatabase() {
+            pendingMaintenanceOperation = DbMaintenanceOperation.COMPACT
+            refresh()
+        }
+
+        override fun onOpenArchiveDatabase() {
+            pendingMaintenanceOperation = DbMaintenanceOperation.ARCHIVE
+            refresh()
+        }
+
+        override fun onConfirmDatabaseMaintenance() {
+            when (pendingMaintenanceOperation) {
+                DbMaintenanceOperation.COMPACT -> CollectorServiceController.compactDatabase(this@MainActivity)
+                DbMaintenanceOperation.ARCHIVE -> CollectorServiceController.archiveDatabase(this@MainActivity)
+                null -> return
+            }
+            refresh()
+        }
+
+        override fun onDismissDatabaseMaintenance() {
+            if (dashboardState?.dbMaintenanceStatus?.running == true) return
+            pendingMaintenanceOperation = null
+            settings.clearDbMaintenanceStatus()
+            refresh()
+        }
+
         override fun onStartDebug() {
+            refreshStoreBackedState()
             settings.setDebugBatchSize(debugBatchText.toIntOrNull()?.coerceAtLeast(1) ?: 1)
             settings.setDebugPollingEnabled(true)
             CollectorServiceController.startDebug(this@MainActivity)
@@ -136,6 +169,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onStopDebug() {
+            refreshStoreBackedState()
             settings.setDebugPollingEnabled(false)
             CollectorServiceController.stopDebug(this@MainActivity)
             refresh()
@@ -159,6 +193,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onStartMqtt() {
+            refreshStoreBackedState()
             saveMqttDraft()
             settings.setMqttEnabled(true)
             CollectorServiceController.startMqttExport(this@MainActivity)
@@ -166,6 +201,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onStopMqtt() {
+            refreshStoreBackedState()
             settings.setMqttEnabled(false)
             CollectorServiceController.stopMqttExport(this@MainActivity)
             refresh()
@@ -173,7 +209,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onTestMqtt() {
             runMqttChannelAction("MQTT test") {
-                HaMqttActions.testConnection(store, settings)
+                HaMqttActions.testConnection(currentStore(), settings)
             }
         }
 
@@ -193,6 +229,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onStartInflux() {
+            refreshStoreBackedState()
             saveInfluxDraft()
             settings.setInfluxEnabled(true)
             CollectorServiceController.startInfluxExport(this@MainActivity)
@@ -200,6 +237,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onStopInflux() {
+            refreshStoreBackedState()
             settings.setInfluxEnabled(false)
             CollectorServiceController.stopInfluxExport(this@MainActivity)
             refresh()
@@ -207,13 +245,13 @@ class MainActivity : ComponentActivity() {
 
         override fun onTestInflux() {
             runInfluxChannelAction("Influx test") {
-                InfluxActions.testConnection(store, settings)
+                InfluxActions.testConnection(currentStore(), settings)
             }
         }
 
         override fun onReExportInflux() {
             runInfluxChannelAction("Influx re-export") {
-                InfluxActions.reExportNewCategories(store, settings)
+                InfluxActions.reExportNewCategories(currentStore(), settings)
             }
         }
 
@@ -233,24 +271,28 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onToggleKeepWifi(enabled: Boolean) {
+            refreshStoreBackedState()
             settings.setKeepWifiEnabled(enabled)
             CollectorServiceController.reconcileKeepAlive(this@MainActivity)
             refresh()
         }
 
         override fun onToggleKeepMobile(enabled: Boolean) {
+            refreshStoreBackedState()
             settings.setKeepMobileDataEnabled(enabled)
             CollectorServiceController.reconcileKeepAlive(this@MainActivity)
             refresh()
         }
 
         override fun onToggleKeepBluetooth(enabled: Boolean) {
+            refreshStoreBackedState()
             settings.setKeepBluetoothEnabled(enabled)
             CollectorServiceController.reconcileKeepAlive(this@MainActivity)
             refresh()
         }
 
         override fun onToggleKeepCollector(enabled: Boolean) {
+            refreshStoreBackedState()
             settings.setRecoverCollectorServiceEnabled(enabled)
             CollectorServiceController.reconcileKeepAlive(this@MainActivity)
             refresh()
@@ -294,9 +336,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        store = BydCollectorApplication.store(applicationContext)
+        store = currentStore()
         settings = CollectorSettings(applicationContext, store)
-        stateProvider = DashboardStateProvider(applicationContext, store, settings)
+        stateProvider = DashboardStateProvider(applicationContext, { BydCollectorApplication.store(applicationContext) }, settings)
         debugBatchText = settings.debugBatchSize().toString()
         mqttDraft = MqttDraft(
             host = settings.mqttHost(),
@@ -328,6 +370,7 @@ class MainActivity : ComponentActivity() {
                 appVersionName = BuildConfig.VERSION_NAME,
                 updateAutoCheckEnabled = settings.isUpdateAutoCheckEnabled(),
                 updateUiState = updateUiState,
+                databaseMaintenanceUiState = currentMaintenanceUiState(),
                 actions = uiActions,
                 backgroundSetupPromptVisible = backgroundSetupPromptVisible,
                 onOpenBackgroundSettingsFromPrompt = ::onOpenBackgroundSettingsFromPrompt,
@@ -358,7 +401,8 @@ class MainActivity : ComponentActivity() {
         destroyed = true
         //asks the watchdog path to recover service work if the user closes only the activity
         if (::settings.isInitialized && ::store.isInitialized) {
-            CollectorAutoStart.scheduleRestartAfterUiClosed(applicationContext, settings, store)
+            refreshStoreBackedState()
+            CollectorAutoStart.scheduleRestartAfterUiClosed(applicationContext, settings, currentStore())
         }
         dashboardExecutor.shutdownNow()
         updateExecutor.shutdownNow()
@@ -371,7 +415,15 @@ class MainActivity : ComponentActivity() {
         moveTaskToBack(true)
     }
 
+    private fun currentStore(): TelemetryStore = BydCollectorApplication.store(applicationContext)
+
+    private fun refreshStoreBackedState() {
+        store = currentStore()
+        settings = CollectorSettings(applicationContext, store)
+    }
+
     private fun refresh() {
+        refreshStoreBackedState()
         if (refreshInFlight || destroyed) return
         refreshInFlight = true
         val tab = activeTab
@@ -405,7 +457,7 @@ class MainActivity : ComponentActivity() {
                     }
                     .onFailure { error ->
                         Log.e(TAG, "Dashboard refresh failed", error)
-                        store.recordEvent(
+                        currentStore().recordEvent(
                             "dashboard_refresh_failed",
                             "Dashboard refresh failed",
                             "${error::class.java.simpleName}: ${error.message ?: "no message"}"
@@ -423,12 +475,12 @@ class MainActivity : ComponentActivity() {
                 .putBoolean(KEY_BACKGROUND_SETTINGS_PENDING_RETURN, false)
                 .putInt(KEY_BACKGROUND_SETTINGS_VERSION, BuildConfig.VERSION_CODE)
                 .apply()
-            store.recordEvent(
+            currentStore().recordEvent(
                 "startup_background_settings_returned",
                 "Returned from background settings",
                 "version=${BuildConfig.VERSION_CODE}"
             )
-            store.recordEvent(
+            currentStore().recordEvent(
                 "adb_authorization_delayed_after_background",
                 "Scheduling delayed ADB self-check after background setup"
             )
@@ -446,7 +498,7 @@ class MainActivity : ComponentActivity() {
         if (checkedVersion == BuildConfig.VERSION_CODE) return false
 
         startupBackgroundLaunchPosted = true
-        store.recordEvent(
+        currentStore().recordEvent(
             "startup_background_check_required",
             "Showing BYD background settings prompt for this app version",
             "checked_version=$checkedVersion current_version=${BuildConfig.VERSION_CODE}"
@@ -493,7 +545,7 @@ class MainActivity : ComponentActivity() {
             .putInt(KEY_BACKGROUND_SETTINGS_VERSION, BuildConfig.VERSION_CODE)
             .remove(KEY_BACKGROUND_SETTINGS_PENDING_RETURN)
             .apply()
-        store.recordEvent(
+        currentStore().recordEvent(
             eventKey,
             message,
             "version=${BuildConfig.VERSION_CODE}"
@@ -525,7 +577,7 @@ class MainActivity : ComponentActivity() {
                         .edit()
                         .putBoolean(KEY_BACKGROUND_SETTINGS_PENDING_RETURN, true)
                         .apply()
-                    store.recordEvent(
+                    currentStore().recordEvent(
                         "startup_background_settings_opened",
                         "Background settings opened automatically",
                         "version=${BuildConfig.VERSION_CODE}"
@@ -544,7 +596,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestAdbAuthorizationFlow(source: String) {
-        store.recordEvent(
+        currentStore().recordEvent(
             "adb_authorization_flow_started",
             "Starting local ADB RSA authorization request",
             "source=$source"
@@ -564,25 +616,25 @@ class MainActivity : ComponentActivity() {
 
     private fun scheduleAdbAuthorization(source: String, delayMs: Long) {
         handler.postDelayed({
-            store.recordEvent(
+            currentStore().recordEvent(
                 "adb_authorization_delayed",
                 "Starting delayed ADB authorization",
                 "source=$source"
             )
-            AdbAuthorizationManager.requestAuthorization(applicationContext, store)
+            AdbAuthorizationManager.requestAuthorization(applicationContext, currentStore())
         }, delayMs)
     }
 
     private fun scheduleAdbSelfCheck(source: String, delayMs: Long, allowAutoPrompt: Boolean) {
         handler.postDelayed({
-            store.recordEvent(
+            currentStore().recordEvent(
                 "startup_adb_self_check_started",
                 "Starting startup ADB authorization self-check",
                 "source=$source allow_auto_prompt=$allowAutoPrompt"
             )
             AdbAuthorizationManager.selfCheck(
                 context = applicationContext,
-                store = store,
+                store = currentStore(),
                 allowAutoPrompt = allowAutoPrompt,
                 source = source
             )
@@ -704,6 +756,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun runMqttChannelAction(label: String, action: () -> MqttActionResult) {
+        refreshStoreBackedState()
         saveMqttDraft()
         dashboardExecutor.execute {
             val result = runCatching { action() }
@@ -735,6 +788,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun runInfluxChannelAction(label: String, action: () -> InfluxActionResult) {
+        refreshStoreBackedState()
         saveInfluxDraft()
         dashboardExecutor.execute {
             val result = runCatching { action() }
@@ -765,21 +819,42 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun currentMaintenanceUiState(): DbMaintenanceUiState? {
+        val runtime = dashboardState?.dbMaintenanceStatus
+        val runtimeOperation = runtime?.operation
+        if (runtimeOperation != null && (runtime.running || runtime.completed || runtime.error != null)) {
+            return DbMaintenanceUiState(
+                operation = runtimeOperation,
+                running = runtime.running,
+                completed = runtime.completed,
+                stepIndex = runtime.stepIndex,
+                stepCount = runtime.stepCount.takeIf { it > 0 } ?: runtimeOperation.stepsUk.size,
+                messageUk = runtime.messageUk,
+                messageEn = runtime.messageEn,
+                error = runtime.error,
+                archivePath = runtime.archivePath
+            )
+        }
+        return pendingMaintenanceOperation?.let { DbMaintenanceUiState(operation = it) }
+    }
+
     private fun startDiagnostics(source: String) {
+        refreshStoreBackedState()
         try {
             val dir = DiagnosticLogRecorder.start(applicationContext)
-            store.recordEvent("log_recording_started", "Diagnostic log recording started", "source=$source path=${dir.absolutePath}")
+            currentStore().recordEvent("log_recording_started", "Diagnostic log recording started", "source=$source path=${dir.absolutePath}")
             Toast.makeText(this, "Запис логів почато", Toast.LENGTH_SHORT).show()
         } catch (error: Exception) {
-            store.recordEvent("log_recording_error", "Diagnostic log recording failed", error.message)
+            currentStore().recordEvent("log_recording_error", "Diagnostic log recording failed", error.message)
             Toast.makeText(this, "Помилка запису логів: ${error.message}", Toast.LENGTH_LONG).show()
         }
         refresh()
     }
 
     private fun stopDiagnostics(source: String) {
+        refreshStoreBackedState()
         val dir = DiagnosticLogRecorder.stop()
-        store.recordEvent("log_recording_stopped", "Diagnostic log recording stopped", "source=$source path=${dir?.absolutePath}")
+        currentStore().recordEvent("log_recording_stopped", "Diagnostic log recording stopped", "source=$source path=${dir?.absolutePath}")
         Toast.makeText(this, "Запис логів зупинено", Toast.LENGTH_SHORT).show()
         refresh()
     }

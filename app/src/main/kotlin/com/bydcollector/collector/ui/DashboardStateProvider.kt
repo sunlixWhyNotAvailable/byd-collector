@@ -18,9 +18,15 @@ import com.bydcollector.collector.util.TimedCache
 //assembles one immutable dashboard snapshot from settings, service flags, sqlite health, and diagnostics
 class DashboardStateProvider(
     private val context: Context,
-    private val store: TelemetryStore,
+    private val storeProvider: () -> TelemetryStore,
     private val settings: CollectorSettings
 ) {
+    constructor(
+        context: Context,
+        store: TelemetryStore,
+        settings: CollectorSettings
+    ) : this(context, { store }, settings)
+
     private val healthCache = TimedCache<HealthSnapshot>(ttlMs = 15_000L)
     private val requiredAccessCache = TimedCache<List<RequiredAccessRow>>(ttlMs = 30_000L)
     private var healthCacheRunning: Boolean? = null
@@ -30,6 +36,7 @@ class DashboardStateProvider(
         includeDebugStatus: Boolean = false,
         includeVehicleKpis: Boolean = false
     ): DashboardState {
+        val store = storeProvider()
         val serviceRunning = CollectorService.isRunning()
         val mainPollingRunning = CollectorService.isMainPollingRunning()
         val nowMs = SystemClock.elapsedRealtime()
@@ -75,6 +82,7 @@ class DashboardStateProvider(
             requestCount = health.requestCount,
             databasePath = health.databasePath,
             databaseSizeBytes = health.databaseSizeBytes,
+            dbMaintenanceStatus = settings.dbMaintenanceStatus(),
             latestSoc = health.latestSoc,
             latestSpeed = health.latestSpeed,
             latestCharging = health.latestCharging,

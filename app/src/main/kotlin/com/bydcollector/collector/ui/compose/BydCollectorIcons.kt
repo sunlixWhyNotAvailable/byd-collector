@@ -29,17 +29,19 @@ fun TabIcon(icon: BottomTabIcon, color: Color, modifier: Modifier = Modifier) {
         when (icon) {
             BottomTabIcon.HOME -> {
                 val roof = Path().apply {
-                    moveTo(w * 0.22f, h * 0.46f)
-                    lineTo(w * 0.50f, h * 0.22f)
-                    lineTo(w * 0.78f, h * 0.46f)
+                    moveTo(w * 0.18f, h * 0.48f)
+                    lineTo(w * 0.50f, h * 0.18f)
+                    lineTo(w * 0.82f, h * 0.48f)
                 }
                 drawPath(roof, color, style = stroke)
+                drawLine(color, Offset(w * 0.28f, h * 0.40f), Offset(w * 0.28f, h * 0.26f), strokeWidth = stroke.width, cap = StrokeCap.Round)
                 drawRoundRect(
                     color,
-                    topLeft = Offset(w * 0.30f, h * 0.44f),
-                    size = Size(w * 0.40f, h * 0.34f),
+                    topLeft = Offset(w * 0.27f, h * 0.45f),
+                    size = Size(w * 0.46f, h * 0.38f),
                     style = stroke
                 )
+                drawLine(color, Offset(w * 0.50f, h * 0.83f), Offset(w * 0.50f, h * 0.64f), strokeWidth = stroke.width, cap = StrokeCap.Round)
             }
 
             BottomTabIcon.DATABASE -> {

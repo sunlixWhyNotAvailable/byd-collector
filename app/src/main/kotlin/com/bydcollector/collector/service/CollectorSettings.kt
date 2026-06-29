@@ -5,6 +5,8 @@ import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.ha.HaIntegrationCategories
 import com.bydcollector.collector.influx.InfluxConfig
 import com.bydcollector.collector.keepalive.KeepAliveConfig
+import com.bydcollector.collector.maintenance.DbMaintenanceOperation
+import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
 import com.bydcollector.collector.mqtt.HaMqttConfig
 
 //persistent user settings facade that also records operational events for later diagnostics
@@ -247,6 +249,51 @@ class CollectorSettings(
         )
     }
 
+    fun dbMaintenanceStatus(): DbMaintenanceRuntimeStatus {
+        return DbMaintenanceRuntimeStatus(
+            operation = DbMaintenanceOperation.fromKey(prefs.getString(KEY_DB_MAINTENANCE_OPERATION, null)),
+            running = prefs.getBoolean(KEY_DB_MAINTENANCE_RUNNING, false),
+            completed = prefs.getBoolean(KEY_DB_MAINTENANCE_COMPLETED, false),
+            stepIndex = prefs.getInt(KEY_DB_MAINTENANCE_STEP_INDEX, 0),
+            stepCount = prefs.getInt(KEY_DB_MAINTENANCE_STEP_COUNT, 0),
+            messageUk = prefs.getString(KEY_DB_MAINTENANCE_MESSAGE_UK, "") ?: "",
+            messageEn = prefs.getString(KEY_DB_MAINTENANCE_MESSAGE_EN, "") ?: "",
+            error = prefs.getString(KEY_DB_MAINTENANCE_ERROR, null),
+            archivePath = prefs.getString(KEY_DB_MAINTENANCE_ARCHIVE_PATH, null)
+        )
+    }
+
+    fun setDbMaintenanceStatus(status: DbMaintenanceRuntimeStatus) {
+        prefs.edit().apply {
+            status.operation?.let { putString(KEY_DB_MAINTENANCE_OPERATION, it.key) }
+                ?: remove(KEY_DB_MAINTENANCE_OPERATION)
+            putBoolean(KEY_DB_MAINTENANCE_RUNNING, status.running)
+            putBoolean(KEY_DB_MAINTENANCE_COMPLETED, status.completed)
+            putInt(KEY_DB_MAINTENANCE_STEP_INDEX, status.stepIndex)
+            putInt(KEY_DB_MAINTENANCE_STEP_COUNT, status.stepCount)
+            putString(KEY_DB_MAINTENANCE_MESSAGE_UK, status.messageUk)
+            putString(KEY_DB_MAINTENANCE_MESSAGE_EN, status.messageEn)
+            status.error?.let { putString(KEY_DB_MAINTENANCE_ERROR, it) } ?: remove(KEY_DB_MAINTENANCE_ERROR)
+            status.archivePath?.let { putString(KEY_DB_MAINTENANCE_ARCHIVE_PATH, it) }
+                ?: remove(KEY_DB_MAINTENANCE_ARCHIVE_PATH)
+            apply()
+        }
+    }
+
+    fun clearDbMaintenanceStatus() {
+        prefs.edit()
+            .remove(KEY_DB_MAINTENANCE_OPERATION)
+            .remove(KEY_DB_MAINTENANCE_RUNNING)
+            .remove(KEY_DB_MAINTENANCE_COMPLETED)
+            .remove(KEY_DB_MAINTENANCE_STEP_INDEX)
+            .remove(KEY_DB_MAINTENANCE_STEP_COUNT)
+            .remove(KEY_DB_MAINTENANCE_MESSAGE_UK)
+            .remove(KEY_DB_MAINTENANCE_MESSAGE_EN)
+            .remove(KEY_DB_MAINTENANCE_ERROR)
+            .remove(KEY_DB_MAINTENANCE_ARCHIVE_PATH)
+            .apply()
+    }
+
     fun lastUpdateCheckAtMs(): Long = prefs.getLong(KEY_UPDATE_LAST_CHECK_AT_MS, 0L)
 
     fun setLastUpdateCheckAtMs(value: Long) {
@@ -401,6 +448,15 @@ class CollectorSettings(
         const val KEY_INFLUX_CATEGORIES = "influxCategories"
         const val KEY_UPDATE_AUTO_CHECK = "updateAutoCheck"
         const val KEY_UPDATE_LAST_CHECK_AT_MS = "updateLastCheckAtMs"
+        const val KEY_DB_MAINTENANCE_OPERATION = "dbMaintenanceOperation"
+        const val KEY_DB_MAINTENANCE_RUNNING = "dbMaintenanceRunning"
+        const val KEY_DB_MAINTENANCE_COMPLETED = "dbMaintenanceCompleted"
+        const val KEY_DB_MAINTENANCE_STEP_INDEX = "dbMaintenanceStepIndex"
+        const val KEY_DB_MAINTENANCE_STEP_COUNT = "dbMaintenanceStepCount"
+        const val KEY_DB_MAINTENANCE_MESSAGE_UK = "dbMaintenanceMessageUk"
+        const val KEY_DB_MAINTENANCE_MESSAGE_EN = "dbMaintenanceMessageEn"
+        const val KEY_DB_MAINTENANCE_ERROR = "dbMaintenanceError"
+        const val KEY_DB_MAINTENANCE_ARCHIVE_PATH = "dbMaintenanceArchivePath"
         const val DEFAULT_DEBUG_BATCH_SIZE = 500
         const val SAFE_DEBUG_AUTOSTART_BATCH_SIZE = 500
         const val MAX_DEBUG_BATCH_SIZE = 6100

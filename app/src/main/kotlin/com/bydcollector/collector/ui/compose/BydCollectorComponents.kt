@@ -1,6 +1,7 @@
 package com.bydcollector.collector.ui.compose
 
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -29,11 +30,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -160,7 +161,7 @@ fun SectionCard(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(58.dp)
+                .height(42.dp)
                 .background(p.panelAlt)
                 .padding(horizontal = 14.dp),
             verticalAlignment = Alignment.CenterVertically
@@ -197,9 +198,12 @@ fun ActionButton(
 ) {
     val p = LocalBydPalette.current
     val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
     val bg = when {
         !enabled -> p.disabled.copy(alpha = 0.55f)
+        primary && pressed -> p.accent.copy(alpha = 0.72f)
         primary -> p.accent
+        pressed -> p.activeSoft
         else -> p.surface
     }
     val border = if (primary && enabled) p.accent else p.borderStrong
@@ -235,29 +239,42 @@ fun BydSwitch(
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
-    enabled: Boolean = true
+    enabled: Boolean = true,
+    pending: Boolean = false
 ) {
     val p = LocalBydPalette.current
+    val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
     val track = when {
         !enabled -> p.disabled
+        pressed -> p.activeSoft
+        pending -> p.activeSoft
         checked -> p.accent
         else -> p.switchOff
     }
-    val knobX = if (checked) Alignment.CenterEnd else Alignment.CenterStart
+    val thumbOffset by animateDpAsState(
+        targetValue = when {
+            pending -> 12.dp
+            checked -> 25.dp
+            else -> 0.dp
+        },
+        animationSpec = tween(durationMillis = 120)
+    )
     Box(
         modifier = modifier
             .size(width = 56.dp, height = 32.dp)
             .clip(PillShape)
             .background(track)
             .border(1.dp, if (checked) p.accent else p.border, PillShape)
-            .clickable(enabled = enabled, interactionSource = remember { MutableInteractionSource() }, indication = null) {
+            .clickable(enabled = enabled, interactionSource = interactionSource, indication = null) {
                 onCheckedChange(!checked)
             }
             .padding(3.dp),
-        contentAlignment = knobX
+        contentAlignment = Alignment.CenterStart
     ) {
         Box(
             modifier = Modifier
+                .padding(start = thumbOffset)
                 .size(25.dp)
                 .clip(PillShape)
                 .background(p.switchThumb)
@@ -467,9 +484,11 @@ fun CategoryChip(
 ) {
     val p = LocalBydPalette.current
     val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
     val bg = when {
         !enabled -> p.disabled.copy(alpha = 0.35f)
         selected -> p.active
+        pressed -> p.activeSoft
         else -> p.surface
     }
     val fg = when {
@@ -527,12 +546,19 @@ fun SegmentedControl(
 private fun SegmentButton(text: String, selected: Boolean, onClick: () -> Unit, modifier: Modifier) {
     val p = LocalBydPalette.current
     val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
     Box(
         modifier = modifier
             .fillMaxHeight()
             .pressScaleModifier(interactionSource)
             .clip(PillShape)
-            .background(if (selected) p.accent else Color.Transparent)
+            .background(
+                when {
+                    selected -> p.accent
+                    pressed -> p.activeSoft
+                    else -> Color.Transparent
+                }
+            )
             .clickable(interactionSource = interactionSource, indication = null) { onClick() },
         contentAlignment = Alignment.Center
     ) {

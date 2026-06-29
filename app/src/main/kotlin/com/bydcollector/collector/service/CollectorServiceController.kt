@@ -64,4 +64,22 @@ object CollectorServiceController {
     fun stopInfluxExport(context: Context) {
         context.startService(CollectorService.stopInfluxExportIntent(context))
     }
+
+    fun compactDatabase(context: Context) {
+        val intent = CollectorService.compactDatabaseIntent(context)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
+    }
+
+    fun archiveDatabase(context: Context) {
+        val intent = CollectorService.archiveDatabaseIntent(context)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
+    }
 }

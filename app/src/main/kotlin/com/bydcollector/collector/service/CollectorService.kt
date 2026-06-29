@@ -37,6 +37,8 @@ import com.bydcollector.collector.keepalive.KeepAliveSupervisor
 import com.bydcollector.collector.influx.HttpInfluxClient
 import com.bydcollector.collector.influx.InfluxActionResult
 import com.bydcollector.collector.influx.InfluxExportCoordinator
+import com.bydcollector.collector.maintenance.DbMaintenanceCoordinator
+import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.mqtt.HaMqttConfig
 import com.bydcollector.collector.mqtt.HaMqttMessageFactory
 import com.bydcollector.collector.mqtt.HaMqttStatus
@@ -62,11 +64,13 @@ class CollectorService : Service() {
     private lateinit var vehicleStateNormalizer: VehicleStateNormalizer
     private lateinit var mqttCoordinator: MqttPublishCoordinator
     private lateinit var influxCoordinator: InfluxExportCoordinator
+    private lateinit var maintenanceCoordinator: DbMaintenanceCoordinator
     private var wakeLock: PowerManager.WakeLock? = null
     private var sessionId: Long? = null
     private var debugPoller: DirectDebugRoundRobinPoller? = null
     private var normalizedStateChangedCallback: ((Set<String>) -> Unit)? = null
     private val debugStartExecutor = namedSingleThreadExecutor("byd-debug-start")
+    private val maintenanceExecutor = namedSingleThreadExecutor("byd-db-maintenance")
     private val mainHandler = Handler(Looper.getMainLooper())
     private val mqttExecutorLock = Any()
     private var mqttExecutor: ExecutorService = namedSingleThreadExecutor("byd-mqtt")
@@ -77,6 +81,8 @@ class CollectorService : Service() {
     private val debugStartInProgress = AtomicBoolean(false)
     private val mqttRuntimeActive = AtomicBoolean(false)
     private val mqttOfflineQueued = AtomicBoolean(false)
+    private val maintenanceActive = AtomicBoolean(false)
+    private val restoringRuntime = AtomicBoolean(false)
     private var lastStatusHeartbeatAtMs: Long = -STATUS_HEARTBEAT_INTERVAL_MS
     private var lastNotificationText: String? = null
 
@@ -91,38 +97,24 @@ class CollectorService : Service() {
         mqttCoordinator = createMqttCoordinator(PahoMqttClientFacade())
         influxCoordinator = createInfluxCoordinator()
         normalizedStateChangedCallback = { changedCategories -> publishChangedCategoriesAsync(changedCategories) }
-        poller = TelemetryPoller(
-            PollPersistenceCoordinator(
-                store = store,
-                client = telemetryClient(),
-                //normalizes only after raw poll persistence so raw telemetry remains the source of truth
-                successfulPollObserver = object : SuccessfulPollObserver {
-                    override fun onSuccessfulPoll(
-                        sessionId: Long,
-                        pollId: Long,
-                        timestamp: String,
-                        readings: List<PollReading>
-                    ) {
-                        val observations = vehicleStateNormalizer.normalize(
-                            pollId = pollId,
-                            observedAt = timestamp,
-                            readings = readings
-                        )
-                        val summary = store.applyNormalizedObservations(observations)
-                        if (summary.changedCategories.isNotEmpty()) {
-                            normalizedStateChangedCallback?.invoke(summary.changedCategories)
-                        }
-                        exportInfluxAfterNormalizedWrite(summary)
-                    }
-                }
-            ),
-            onCycleResult = { result -> handlePollCycleResult(result) }
+        poller = createTelemetryPoller()
+        maintenanceCoordinator = DbMaintenanceCoordinator(
+            context = applicationContext,
+            settings = settings,
+            storeProvider = { store },
+            application = applicationContext as BydCollectorApplication,
+            stopRuntime = { stopRuntimeForMaintenance() },
+            onStoreReopened = { rebuildStoreBackedRuntime(it) }
         )
         createNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action ?: ACTION_START) {
+        val action = intent?.action ?: ACTION_START
+        if (maintenanceActive.get() && action != ACTION_COMPACT_DATABASE && action != ACTION_ARCHIVE_DATABASE) {
+            return START_STICKY
+        }
+        when (action) {
             ACTION_STOP -> {
                 settings.setPollingEnabled(false)
                 reconcileCollection()
@@ -141,6 +133,8 @@ class CollectorService : Service() {
             ACTION_STOP_MQTT_EXPORT -> stopMqttExport()
             ACTION_START_INFLUX_EXPORT -> startInfluxExport()
             ACTION_STOP_INFLUX_EXPORT -> stopInfluxExport()
+            ACTION_COMPACT_DATABASE -> startDatabaseMaintenance(DbMaintenanceOperation.COMPACT)
+            ACTION_ARCHIVE_DATABASE -> startDatabaseMaintenance(DbMaintenanceOperation.ARCHIVE)
             ACTION_START -> reconcileCollection()
         }
         return START_STICKY
@@ -150,6 +144,7 @@ class CollectorService : Service() {
         stopCollection("service_destroyed")
         keepAliveSupervisor.shutdown()
         debugStartExecutor.shutdownNow()
+        maintenanceExecutor.shutdownNow()
         shutdownMqttExecutor()
         shutdownInfluxExecutor()
         mainPollingRunning.set(false)
@@ -180,7 +175,38 @@ class CollectorService : Service() {
         return DirectTelemetryClient(applicationContext)
     }
 
+    private fun createTelemetryPoller(): TelemetryPoller {
+        return TelemetryPoller(
+            PollPersistenceCoordinator(
+                store = store,
+                client = telemetryClient(),
+                //normalizes only after raw poll persistence so raw telemetry remains the source of truth
+                successfulPollObserver = object : SuccessfulPollObserver {
+                    override fun onSuccessfulPoll(
+                        sessionId: Long,
+                        pollId: Long,
+                        timestamp: String,
+                        readings: List<PollReading>
+                    ) {
+                        val observations = vehicleStateNormalizer.normalize(
+                            pollId = pollId,
+                            observedAt = timestamp,
+                            readings = readings
+                        )
+                        val summary = store.applyNormalizedObservations(observations)
+                        if (summary.changedCategories.isNotEmpty()) {
+                            normalizedStateChangedCallback?.invoke(summary.changedCategories)
+                        }
+                        exportInfluxAfterNormalizedWrite(summary)
+                    }
+                }
+            ),
+            onCycleResult = { result -> handlePollCycleResult(result) }
+        )
+    }
+
     private fun reconcileCollection(debugStartReason: String = DEBUG_REASON_AUTOSTART) {
+        if (maintenanceBlocksRuntimeStart()) return
         try {
             val mainEnabled = settings.isPollingEnabled()
             val debugEnabled = settings.isDebugPollingEnabled()
@@ -259,6 +285,7 @@ class CollectorService : Service() {
     }
 
     private fun startMainIfNeeded() {
+        if (maintenanceBlocksRuntimeStart()) return
         if (poller.isRunning()) {
             mainPollingRunning.set(true)
             return
@@ -283,6 +310,7 @@ class CollectorService : Service() {
     }
 
     private fun startDebugIfNeeded(reason: String) {
+        if (maintenanceBlocksRuntimeStart()) return
         if (debugPoller?.isRunning() == true) return
         if (!debugStartInProgress.compareAndSet(false, true)) return
         debugStartExecutor.execute {
@@ -417,6 +445,69 @@ class CollectorService : Service() {
         debugRunning.set(false)
     }
 
+    private data class RuntimeSnapshot(
+        val mainEnabled: Boolean,
+        val debugEnabled: Boolean,
+        val mqttEnabled: Boolean,
+        val influxEnabled: Boolean
+    )
+
+    private fun runtimeSnapshot(): RuntimeSnapshot {
+        return RuntimeSnapshot(
+            mainEnabled = settings.isPollingEnabled(),
+            debugEnabled = settings.isDebugPollingEnabled(),
+            mqttEnabled = settings.isMqttEnabled(),
+            influxEnabled = settings.isInfluxEnabled()
+        )
+    }
+
+    private fun stopRuntimeForMaintenance() {
+        if (!poller.stopAndJoin(2_000L)) error("Main poller did not stop for database maintenance")
+        if (debugPoller?.shutdownAndAwait("database_maintenance", 2_000L) == false) {
+            error("Debug poller did not stop for database maintenance")
+        }
+        debugPoller = null
+        mainPollingRunning.set(false)
+        debugRunning.set(false)
+        sessionId?.let { openedSessionId ->
+            runCatching { store.endSession(openedSessionId, "database_maintenance") }
+        }
+        sessionId = null
+        mqttRuntimeActive.set(false)
+        mqttOfflineQueued.set(false)
+        mqttCoordinator.disconnectForMaintenance()
+        resetMqttExecutorForMaintenance()
+        resetInfluxExecutorForMaintenance()
+    }
+
+    private fun restoreRuntimeAfterMaintenance(snapshot: RuntimeSnapshot) {
+        restoringRuntime.set(true)
+        try {
+            settings.setPollingEnabled(snapshot.mainEnabled)
+            settings.setDebugPollingEnabled(snapshot.debugEnabled)
+            settings.setMqttEnabled(snapshot.mqttEnabled)
+            settings.setInfluxEnabled(snapshot.influxEnabled)
+            if (snapshot.mainEnabled || snapshot.debugEnabled || settings.keepAliveConfig().anyEnabled) {
+                reconcileCollection()
+            }
+            if (snapshot.mqttEnabled) startMqttExport()
+            if (snapshot.influxEnabled) startInfluxExport()
+            if (!snapshot.mqttEnabled && !snapshot.influxEnabled) stopIfNoActiveRuntime()
+        } finally {
+            restoringRuntime.set(false)
+        }
+    }
+
+    private fun rebuildStoreBackedRuntime(newStore: TelemetryStore) {
+        store = newStore
+        settings = CollectorSettings(applicationContext, store)
+        keepAliveSupervisor.shutdown()
+        keepAliveSupervisor = KeepAliveSupervisor(applicationContext, store)
+        mqttCoordinator = createMqttCoordinator(PahoMqttClientFacade())
+        influxCoordinator = createInfluxCoordinator()
+        poller = createTelemetryPoller()
+    }
+
     private fun acquireWakeLock() {
         val current = wakeLock
         if (current?.isHeld == true) return
@@ -466,6 +557,7 @@ class CollectorService : Service() {
     }
 
     private fun startMqttExport() {
+        if (maintenanceBlocksRuntimeStart()) return
         settings.setMqttEnabled(true)
         ensureForegroundForChannel("MQTT export running")
         mqttRuntimeActive.set(true)
@@ -482,6 +574,7 @@ class CollectorService : Service() {
     }
 
     private fun startInfluxExport() {
+        if (maintenanceBlocksRuntimeStart()) return
         settings.setInfluxEnabled(true)
         ensureForegroundForChannel("Influx export running")
         executeInflux("influx_start_error") {
@@ -640,6 +733,14 @@ class CollectorService : Service() {
         }
     }
 
+    private fun resetMqttExecutorForMaintenance() {
+        mqttWorkGeneration.incrementAndGet()
+        synchronized(mqttExecutorLock) {
+            mqttExecutor.shutdownNow()
+            mqttExecutor = namedSingleThreadExecutor("byd-mqtt")
+        }
+    }
+
     private fun shutdownMqttExecutor() {
         synchronized(mqttExecutorLock) {
             mqttExecutor.shutdown()
@@ -688,6 +789,40 @@ class CollectorService : Service() {
         synchronized(influxExecutorLock) {
             influxExecutor.shutdown()
         }
+    }
+
+    private fun resetInfluxExecutorForMaintenance() {
+        influxWorkGeneration.incrementAndGet()
+        synchronized(influxExecutorLock) {
+            influxExecutor.shutdownNow()
+            influxExecutor = namedSingleThreadExecutor("byd-influx")
+        }
+    }
+
+    private fun startDatabaseMaintenance(operation: DbMaintenanceOperation) {
+        if (!maintenanceActive.compareAndSet(false, true)) return
+        val snapshot = runtimeSnapshot()
+        ensureForegroundForChannel("Database maintenance")
+        try {
+            maintenanceExecutor.execute {
+                try {
+                    maintenanceCoordinator.run(operation) { restoreRuntimeAfterMaintenance(snapshot) }
+                } finally {
+                    maintenanceActive.set(false)
+                }
+            }
+        } catch (error: RejectedExecutionException) {
+            maintenanceActive.set(false)
+            store.recordEvent(
+                "database_maintenance_rejected",
+                "Database maintenance action rejected",
+                "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+            )
+        }
+    }
+
+    private fun maintenanceBlocksRuntimeStart(): Boolean {
+        return maintenanceActive.get() && !restoringRuntime.get()
     }
 
     private fun oneShotMqttCoordinator(): MqttPublishCoordinator {
@@ -802,6 +937,8 @@ class CollectorService : Service() {
         val ACTION_STOP_MQTT_EXPORT: String = "${BuildConfig.ACTION_PREFIX}.action.STOP_MQTT_EXPORT"
         val ACTION_START_INFLUX_EXPORT: String = "${BuildConfig.ACTION_PREFIX}.action.START_INFLUX_EXPORT"
         val ACTION_STOP_INFLUX_EXPORT: String = "${BuildConfig.ACTION_PREFIX}.action.STOP_INFLUX_EXPORT"
+        val ACTION_COMPACT_DATABASE: String = "${BuildConfig.ACTION_PREFIX}.action.COMPACT_DATABASE"
+        val ACTION_ARCHIVE_DATABASE: String = "${BuildConfig.ACTION_PREFIX}.action.ARCHIVE_DATABASE"
         private const val CHANNEL_ID = "collector"
         private const val NOTIFICATION_ID = 1001
         private const val STATUS_HEARTBEAT_INTERVAL_MS = 30_000L
@@ -850,6 +987,14 @@ class CollectorService : Service() {
 
         fun stopInfluxExportIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
             action = ACTION_STOP_INFLUX_EXPORT
+        }
+
+        fun compactDatabaseIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
+            action = ACTION_COMPACT_DATABASE
+        }
+
+        fun archiveDatabaseIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
+            action = ACTION_ARCHIVE_DATABASE
         }
     }
 }
