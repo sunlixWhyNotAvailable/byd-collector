@@ -4,9 +4,8 @@ import com.bydcollector.collector.data.local.CatalogParameter
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.PersistedPollInput
 import com.bydcollector.collector.data.local.PollReading
-import com.bydcollector.collector.data.remote.DiPlusClient
-import com.bydcollector.collector.data.remote.DiPlusRequest
-import com.bydcollector.collector.data.remote.DiPlusResult
+import com.bydcollector.collector.data.remote.TelemetryClient
+import com.bydcollector.collector.data.remote.TelemetryReadResult
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertSame
@@ -24,7 +23,7 @@ class PollPersistenceCoordinatorTest {
 
         val result = PollPersistenceCoordinator(
             store = store,
-            client = FakeDiPlusClient(DiPlusResult.Success(rawBody = "{}", elapsedMs = 12, readings = readings)),
+            client = FakeTelemetryClient(TelemetryReadResult.Success(rawBody = "{}", elapsedMs = 12, readings = readings)),
             clock = clock,
             successfulPollObserver = object : SuccessfulPollObserver {
                 override fun onSuccessfulPoll(
@@ -59,7 +58,7 @@ class PollPersistenceCoordinatorTest {
 
         val result = PollPersistenceCoordinator(
             store = store,
-            client = FakeDiPlusClient(DiPlusResult.Success(rawBody = "{}", elapsedMs = 12, readings = readings)),
+            client = FakeTelemetryClient(TelemetryReadResult.Success(rawBody = "{}", elapsedMs = 12, readings = readings)),
             clock = FakeClock(now = "2026-06-12T10:00:00Z"),
             successfulPollObserver = object : SuccessfulPollObserver {
                 override fun onSuccessfulPoll(
@@ -123,8 +122,8 @@ class PollPersistenceCoordinatorTest {
         }
     }
 
-    private class FakeDiPlusClient(private val result: DiPlusResult) : DiPlusClient {
-        override fun get(request: DiPlusRequest): DiPlusResult = result
+    private class FakeTelemetryClient(private val result: TelemetryReadResult) : TelemetryClient {
+        override fun read(): TelemetryReadResult = result
     }
 
     private class FakeClock(val now: String) : Clock {

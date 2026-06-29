@@ -2,7 +2,7 @@ package com.bydcollector.collector.data.remote
 
 import com.bydcollector.collector.data.local.PollReading
 
-sealed class DiPlusResult {
+sealed class TelemetryReadResult {
     abstract val rawBody: String?
     abstract val elapsedMs: Long
 
@@ -12,25 +12,16 @@ sealed class DiPlusResult {
         val readings: List<PollReading>,
         val warningCategory: String? = null,
         val warningMessage: String? = null
-    ) : DiPlusResult()
+    ) : TelemetryReadResult()
 
     data class Failure(
         val category: String,
         val message: String,
         override val rawBody: String?,
-        override val elapsedMs: Long,
-        val readings: List<PollReading> = emptyList()
-    ) : DiPlusResult()
-
-    companion object {
-        const val NETWORK_ERROR = "network_error"
-        const val TIMEOUT = "timeout"
-        const val HTTP_ERROR = "http_error"
-        const val DI_SUCCESS_FALSE = "di_success_false"
-        const val PARSE_ERROR = "parse_error"
-    }
+        override val elapsedMs: Long
+    ) : TelemetryReadResult()
 }
 
-interface DiPlusClient {
-    fun get(request: DiPlusRequest): DiPlusResult
+interface TelemetryClient {
+    fun read(): TelemetryReadResult
 }

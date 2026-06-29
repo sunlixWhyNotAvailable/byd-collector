@@ -15,18 +15,8 @@ interface MqttOutboxStore {
     fun pendingMessages(limit: Int): List<PendingMqttMessage> {
         return dueMessages("9999-12-31T23:59:59Z", limit)
     }
-    fun markAttempt(targetKey: String, attemptedAt: String) {
-        throw UnsupportedOperationException("payloadHash is required for MQTT outbox attempt updates")
-    }
-    fun markAttempt(targetKey: String, payloadHash: String, attemptedAt: String) {
-        markAttempt(targetKey, attemptedAt)
-    }
-    fun markFailed(targetKey: String, error: String, failedAt: String, nextAttemptAt: String?) {
-        throw UnsupportedOperationException("payloadHash is required for MQTT outbox failure updates")
-    }
-    fun markFailed(targetKey: String, payloadHash: String, error: String, failedAt: String, nextAttemptAt: String?) {
-        markFailed(targetKey, error, failedAt, nextAttemptAt)
-    }
+    fun markAttempt(targetKey: String, payloadHash: String, attemptedAt: String)
+    fun markFailed(targetKey: String, payloadHash: String, error: String, failedAt: String, nextAttemptAt: String?)
     fun markPublished(targetKey: String, payloadHash: String, publishedAt: String)
     fun pendingCount(): Long
 }

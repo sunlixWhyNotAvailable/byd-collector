@@ -12,30 +12,6 @@ object HaMqttActions {
         return runOneShot(store, settings, client) { testConnectionOnly() }
     }
 
-    fun startLiveExport(
-        store: TelemetryStore,
-        settings: CollectorSettings,
-        client: MqttClientFacade = PahoMqttClientFacade()
-    ): MqttActionResult {
-        return runOneShot(store, settings, client) { startLiveExport() }
-    }
-
-    fun publishDiscovery(
-        store: TelemetryStore,
-        settings: CollectorSettings,
-        client: MqttClientFacade = PahoMqttClientFacade()
-    ): MqttActionResult {
-        return runOneShot(store, settings, client) { queueDiscoveryAndFlush(force = true) }
-    }
-
-    fun fullResync(
-        store: TelemetryStore,
-        settings: CollectorSettings,
-        client: MqttClientFacade = PahoMqttClientFacade()
-    ): MqttActionResult {
-        return runOneShot(store, settings, client) { queueFullResyncAndFlush(force = true) }
-    }
-
     private fun runOneShot(
         store: TelemetryStore,
         settings: CollectorSettings,

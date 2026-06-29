@@ -341,7 +341,7 @@ class MainActivity : ComponentActivity() {
         foreground = true
         refresh()
         val setupHandled = maybeRunStartupSetup()
-        if (!setupHandled && BuildConfig.ENABLE_ADB_UI) {
+        if (!setupHandled) {
             maybeRunStartupAdbSelfCheck("startup")
         }
         runPendingStartupUpdateCheckIfReady()
@@ -428,18 +428,16 @@ class MainActivity : ComponentActivity() {
                 "Returned from background settings",
                 "version=${BuildConfig.VERSION_CODE}"
             )
-            if (BuildConfig.ENABLE_ADB_UI) {
-                store.recordEvent(
-                    "adb_authorization_delayed_after_background",
-                    "Scheduling delayed ADB self-check after background setup"
-                )
-                startupAdbSelfCheckPosted = true
-                scheduleAdbSelfCheck(
-                    source = "after_background",
-                    delayMs = DELAYED_ADB_AUTH_AFTER_BACKGROUND_MS,
-                    allowAutoPrompt = true
-                )
-            }
+            store.recordEvent(
+                "adb_authorization_delayed_after_background",
+                "Scheduling delayed ADB self-check after background setup"
+            )
+            startupAdbSelfCheckPosted = true
+            scheduleAdbSelfCheck(
+                source = "after_background",
+                delayMs = DELAYED_ADB_AUTH_AFTER_BACKGROUND_MS,
+                allowAutoPrompt = true
+            )
             return true
         }
 
@@ -472,9 +470,7 @@ class MainActivity : ComponentActivity() {
                 eventKey = "startup_background_settings_unavailable",
                 message = "Background settings could not be opened from setup prompt"
             )
-            if (BuildConfig.ENABLE_ADB_UI) {
-                maybeRunStartupAdbSelfCheck("startup")
-            }
+            maybeRunStartupAdbSelfCheck("startup")
         }
     }
 
@@ -487,9 +483,7 @@ class MainActivity : ComponentActivity() {
                 eventKey = "startup_background_settings_prompt_dismissed",
                 message = "Background settings setup prompt dismissed"
             )
-            if (BuildConfig.ENABLE_ADB_UI) {
-                maybeRunStartupAdbSelfCheck("startup")
-            }
+            maybeRunStartupAdbSelfCheck("startup")
         }
     }
 

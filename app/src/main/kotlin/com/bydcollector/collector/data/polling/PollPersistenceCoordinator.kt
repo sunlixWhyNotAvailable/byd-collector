@@ -6,9 +6,8 @@ import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.PersistedPollInput
 import com.bydcollector.collector.data.local.PollReading
 import com.bydcollector.collector.data.local.SystemClockAdapter
-import com.bydcollector.collector.data.remote.DiPlusClient
-import com.bydcollector.collector.data.remote.DiPlusResult
-import com.bydcollector.collector.data.remote.DiPlusTemplateBuilder
+import com.bydcollector.collector.data.remote.TelemetryClient
+import com.bydcollector.collector.data.remote.TelemetryReadResult
 
 data class PollCycleResult(
     val pollId: Long?,
@@ -35,8 +34,7 @@ interface SuccessfulPollObserver {
 //ties one vehicle read to raw persistence, normalized observers, and explicit failure records
 class PollPersistenceCoordinator(
     private val store: PollStorage,
-    private val client: DiPlusClient,
-    private val templateBuilder: DiPlusTemplateBuilder = DiPlusTemplateBuilder(),
+    private val client: TelemetryClient,
     private val clock: Clock = SystemClockAdapter(),
     private val successfulPollObserver: SuccessfulPollObserver? = null
 ) : PollCycleRunner {
@@ -45,13 +43,11 @@ class PollPersistenceCoordinator(
 
     override fun pollOnce(sessionId: Long): PollCycleResult {
         val parameters = store.getActiveCatalogParameters()
-        //builds the request from the active catalog so curated main-db changes are data-driven
-        val request = templateBuilder.build(parameters)
-        val result = client.get(request)
+        val result = client.read()
 
         return try {
             when (result) {
-                is DiPlusResult.Success -> {
+                is TelemetryReadResult.Success -> {
                     val timestamp = clock.nowIso()
                     //stores raw readings before observers derive state for mqtt/influx consumers
                     val pollId = store.insertPoll(
@@ -60,7 +56,7 @@ class PollPersistenceCoordinator(
                             timestamp = timestamp,
                             ok = true,
                             elapsedMs = result.elapsedMs,
-                            requestCount = request.requestCount,
+                            requestCount = DIRECT_REQUEST_COUNT,
                             errors = result.warningMessage?.let { warning ->
                                 "${result.warningCategory ?: "poll_warning"}: $warning"
                             },
@@ -85,15 +81,15 @@ class PollPersistenceCoordinator(
                     }
                     lastPersistedFailureKey = null
                     lastPersistedFailureAtMs = Long.MIN_VALUE
-                    PollCycleResult(pollId, ok = true, category = null, elapsedMs = result.elapsedMs, requestCount = request.requestCount)
+                    PollCycleResult(pollId, ok = true, category = null, elapsedMs = result.elapsedMs, requestCount = DIRECT_REQUEST_COUNT)
                 }
 
-                is DiPlusResult.Failure -> {
+                is TelemetryReadResult.Failure -> {
                     val failureKey = "${result.category}:${result.message}"
                     val nowMs = clock.elapsedRealtimeMs()
                     //throttles identical failures so helper outages do not flood sqlite every second
                     if (shouldSkipRepeatedFailure(failureKey, nowMs)) {
-                        return PollCycleResult(null, ok = false, category = result.category, elapsedMs = result.elapsedMs, requestCount = request.requestCount)
+                        return PollCycleResult(null, ok = false, category = result.category, elapsedMs = result.elapsedMs, requestCount = DIRECT_REQUEST_COUNT)
                     }
                     val pollId = store.insertPoll(
                         sessionId,
@@ -101,7 +97,7 @@ class PollPersistenceCoordinator(
                             timestamp = clock.nowIso(),
                             ok = false,
                             elapsedMs = result.elapsedMs,
-                            requestCount = request.requestCount,
+                            requestCount = DIRECT_REQUEST_COUNT,
                             errors = "${result.category}: ${result.message}",
                             errorCategory = result.category,
                             errorMessage = result.message,
@@ -113,7 +109,7 @@ class PollPersistenceCoordinator(
                     lastPersistedFailureKey = failureKey
                     lastPersistedFailureAtMs = nowMs
                     store.recordEvent("poll_failure", "Poll failed: ${result.category}", result.message)
-                    PollCycleResult(pollId, ok = false, category = result.category, elapsedMs = result.elapsedMs, requestCount = request.requestCount)
+                    PollCycleResult(pollId, ok = false, category = result.category, elapsedMs = result.elapsedMs, requestCount = DIRECT_REQUEST_COUNT)
                 }
             }
         } catch (error: RuntimeException) {
@@ -124,7 +120,7 @@ class PollPersistenceCoordinator(
             } catch (eventError: RuntimeException) {
                 logError("Failed to record database write failure", eventError)
             }
-            PollCycleResult(null, ok = false, category = "db_write_error", elapsedMs = 0, requestCount = request.requestCount)
+            PollCycleResult(null, ok = false, category = "db_write_error", elapsedMs = 0, requestCount = DIRECT_REQUEST_COUNT)
         }
     }
 
@@ -139,6 +135,7 @@ class PollPersistenceCoordinator(
 
     companion object {
         private const val TAG = "BYDCollectorPoller"
+        private const val DIRECT_REQUEST_COUNT = 1
         private const val REPEATED_FAILURE_PERSIST_INTERVAL_MS = 30_000L
     }
 }

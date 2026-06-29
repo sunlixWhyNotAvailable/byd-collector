@@ -12,22 +12,6 @@ object InfluxActions {
         return coordinator(store, settings, client).testConnection()
     }
 
-    fun startExport(
-        store: TelemetryStore,
-        settings: CollectorSettings,
-        client: InfluxClient = HttpInfluxClient()
-    ): InfluxActionResult {
-        return coordinator(store, settings, client).startExport()
-    }
-
-    fun stopExport(
-        store: TelemetryStore,
-        settings: CollectorSettings,
-        client: InfluxClient = HttpInfluxClient()
-    ): InfluxActionResult {
-        return coordinator(store, settings, client).stopExport()
-    }
-
     fun reExportNewCategories(
         store: TelemetryStore,
         settings: CollectorSettings,

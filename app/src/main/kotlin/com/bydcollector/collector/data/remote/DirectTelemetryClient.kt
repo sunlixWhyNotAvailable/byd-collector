@@ -9,18 +9,17 @@ import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import java.io.File
 
-//adapts direct autoservice binder reads to the legacy DiPlusClient shape used by the poller
 class DirectTelemetryClient(
     context: Context,
     private val clock: Clock = SystemClockAdapter(),
     private val adbClient: AdbLocalClient = AdbLocalClient(File(context.filesDir, "adb_keys")),
     private val helper: DirectVehicleHelper = DirectVehicleHelperClient(),
     private val reader: DirectAutoserviceReader = DirectAutoserviceReader(helper)
-) : DiPlusClient {
+) : TelemetryClient {
     private val appContext = context.applicationContext
     @Volatile private var nextLaunchAttemptAtMs: Long = 0
 
-    override fun get(request: DiPlusRequest): DiPlusResult {
+    override fun read(): TelemetryReadResult {
         val startedAt = clock.elapsedRealtimeMs()
         if (!helper.isAlive()) {
             val now = clock.elapsedRealtimeMs()
@@ -51,7 +50,7 @@ class DirectTelemetryClient(
         } else {
             val warningMessage = snapshot.errorSummary().takeIf { it.isNotBlank() }
             //keeps partial successes usable while preserving warning metadata for diagnostics
-            DiPlusResult.Success(
+            TelemetryReadResult.Success(
                 rawBody = snapshot.toJson(ok = true, includeFields = false),
                 elapsedMs = clock.elapsedRealtimeMs() - startedAt,
                 readings = snapshot.readings,
@@ -69,8 +68,8 @@ class DirectTelemetryClient(
         return false
     }
 
-    private fun failure(category: String, message: String, startedAt: Long, rawBody: String? = null): DiPlusResult.Failure {
-        return DiPlusResult.Failure(
+    private fun failure(category: String, message: String, startedAt: Long, rawBody: String? = null): TelemetryReadResult.Failure {
+        return TelemetryReadResult.Failure(
             category = category,
             message = message,
             rawBody = rawBody,
@@ -81,7 +80,7 @@ class DirectTelemetryClient(
     private fun launchFailure(
         result: DirectBridgeResult,
         startedAt: Long
-    ): DiPlusResult.Failure {
+    ): TelemetryReadResult.Failure {
         val error = result.message
         return when {
             error.contains("adb_authorization_required") -> {
