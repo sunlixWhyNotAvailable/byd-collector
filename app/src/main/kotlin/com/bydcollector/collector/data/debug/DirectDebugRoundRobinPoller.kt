@@ -6,6 +6,7 @@ import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import com.bydcollector.collector.util.namedSingleThreadExecutor
 import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
 
@@ -80,8 +81,18 @@ class DirectDebugRoundRobinPoller(
     }
 
     fun shutdown(reason: String = "shutdown") {
+        shutdownAndAwait(reason, 0L)
+    }
+
+    fun shutdownAndAwait(reason: String = "shutdown", timeoutMs: Long): Boolean {
         stop(reason)
         executor.shutdownNow()
+        return try {
+            executor.awaitTermination(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
     }
 
     fun pollOnce(sessionId: Long, batchSize: Int, startedAt: String = clock.nowIso()): DirectDebugCycleSummary {

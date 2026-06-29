@@ -92,6 +92,10 @@ class MqttPublishCoordinator(
         return result
     }
 
+    fun disconnectForMaintenance(): MqttActionResult {
+        return client.disconnect(null)
+    }
+
     private fun flushPendingInternal(
         force: Boolean,
         allowFullResyncAfterSuccess: Boolean

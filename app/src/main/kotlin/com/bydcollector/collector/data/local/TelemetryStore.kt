@@ -16,6 +16,7 @@ import com.bydcollector.collector.influx.InfluxExportStateSnapshot
 import com.bydcollector.collector.influx.InfluxExportStore
 import com.bydcollector.collector.influx.InfluxPendingHistoryRow
 import com.bydcollector.collector.influx.InfluxPendingSummary
+import com.bydcollector.collector.maintenance.DbMaintenanceResult
 import com.bydcollector.collector.mqtt.MqttOutboxStore
 import com.bydcollector.collector.mqtt.MqttRetryState
 import com.bydcollector.collector.mqtt.MqttRetryStateStore
@@ -47,6 +48,46 @@ class TelemetryStore(
 
     override fun close() {
         helper.close()
+    }
+
+    fun compactRawHistory(onStage: (Int) -> Unit = {}): DbMaintenanceResult {
+        val db = helper.writableDatabase
+        db.beginTransaction()
+        try {
+            onStage(2)
+            db.execSQL("UPDATE vehicle_state_current SET source_poll_id = NULL")
+            db.execSQL("UPDATE vehicle_state_history SET source_poll_id = NULL")
+            onStage(3)
+            db.execSQL("DELETE FROM poll_values")
+            db.execSQL("DELETE FROM vehicle_snapshots")
+            db.execSQL("DELETE FROM parameter_observations")
+            db.execSQL("DELETE FROM polls")
+            db.execSQL("UPDATE ec_import_runs SET session_id = NULL")
+            db.execSQL("UPDATE ec_energy_consumption SET first_seen_session_id = NULL, last_seen_session_id = NULL")
+            db.execSQL("DELETE FROM collection_sessions")
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        onStage(4)
+        db.execSQL("VACUUM")
+        return DbMaintenanceResult(ok = true, message = "Database compacted")
+    }
+
+    fun checkpointForArchive() {
+        runCatching {
+            helper.writableDatabase.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", emptyArray()).use { cursor ->
+                while (cursor.moveToNext()) Unit
+            }
+        }.onFailure { error ->
+            Log.w(TAG, "database WAL checkpoint failed before archive", error)
+        }
+    }
+
+    fun verifyWritableDatabase(): Boolean {
+        helper.writableDatabase.rawQuery("PRAGMA quick_check", emptyArray()).use { cursor ->
+            return cursor.moveToFirst() && cursor.getString(0) == "ok"
+        }
     }
 
     fun ensureCatalogImported(): Long {

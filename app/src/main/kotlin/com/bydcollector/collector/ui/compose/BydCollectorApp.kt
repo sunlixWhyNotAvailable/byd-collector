@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
@@ -35,6 +36,8 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.bydcollector.collector.R
+import com.bydcollector.collector.maintenance.DbMaintenanceOperation
+import com.bydcollector.collector.maintenance.DbMaintenanceUiState
 import com.bydcollector.collector.ui.DashboardState
 import com.bydcollector.collector.update.UpdateInfo
 import com.bydcollector.collector.update.UpdateUiState
@@ -53,6 +56,7 @@ fun BydCollectorApp(
     appVersionName: String = "",
     updateAutoCheckEnabled: Boolean = true,
     updateUiState: UpdateUiState = UpdateUiState.Hidden,
+    databaseMaintenanceUiState: DbMaintenanceUiState? = null,
     actions: BydCollectorActions,
     backgroundSetupPromptVisible: Boolean = false,
     onOpenBackgroundSettingsFromPrompt: () -> Unit = {},
@@ -121,6 +125,16 @@ fun BydCollectorApp(
                     onUpdate = actions::onInstallUpdate
                 )
             }
+            if (databaseMaintenanceUiState != null) {
+                DatabaseMaintenanceDialog(
+                    strings = s,
+                    state = databaseMaintenanceUiState,
+                    mqttPending = state?.mqttPendingCount ?: 0L,
+                    influxPending = state?.influxPendingRows ?: 0L,
+                    onConfirm = actions::onConfirmDatabaseMaintenance,
+                    onDismiss = actions::onDismissDatabaseMaintenance
+                )
+            }
         }
     }
 }
@@ -174,8 +188,8 @@ private fun BackgroundAppsSetupPrompt(
                     .padding(top = 4.dp),
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                ActionButton(strings.backgroundSetupDismiss, onDismiss, modifier = Modifier.weight(1f))
                 ActionButton(strings.backgroundSetupOpen, onOpenSettings, primary = true, modifier = Modifier.weight(1f))
+                ActionButton(strings.backgroundSetupDismiss, onDismiss, modifier = Modifier.weight(1f))
             }
         }
     }
@@ -288,16 +302,12 @@ private fun MainTab(state: DashboardState?, strings: UiStrings, actions: BydColl
                 state = state,
                 strings = strings,
                 actions = actions,
-                modifier = Modifier.weight(1.7f)
+                modifier = Modifier.weight(1.15f)
             )
             MainStatusCard(
                 state = state,
                 strings = strings,
-                modifier = Modifier.weight(1f)
-            )
-            MainChannelsCard(
-                state = state,
-                strings = strings,
+                actions = actions,
                 modifier = Modifier.weight(1f)
             )
         }
@@ -331,25 +341,30 @@ private fun MainCollectionCard(
 }
 
 @Composable
-private fun MainStatusCard(state: DashboardState?, strings: UiStrings, modifier: Modifier) {
+private fun MainStatusCard(state: DashboardState?, strings: UiStrings, actions: BydCollectorActions, modifier: Modifier) {
     val mainPollingStatus = MainPollStatusFormatter.format(
         running = state?.mainPollingRunning == true,
         lastPollStatus = state?.lastPollStatus,
         strings = strings
     )
     SectionCard(title = strings.status, modifier = modifier.height(226.dp)) {
-        StatusRow(strings.mainPolling, mainPollingStatus.text, mainPollingStatus.kind)
-        StatusRow(strings.mqttPublish, compactChannelStatusText(state?.mqttStatus, strings), channelStatusKind(state?.mqttStatus, state?.mqttEnabled == true))
-        StatusRow(strings.influxExport, compactChannelStatusText(state?.influxStatus, strings), channelStatusKind(state?.influxStatus, state?.influxEnabled == true))
-    }
-}
-
-@Composable
-private fun MainChannelsCard(state: DashboardState?, strings: UiStrings, modifier: Modifier) {
-    SectionCard(title = strings.activeChannels, modifier = modifier.height(226.dp)) {
-        StatusRow("MQTT", compactChannelStatusText(state?.mqttStatus, strings), channelStatusKind(state?.mqttStatus, state?.mqttEnabled == true))
-        StatusRow("InfluxDB", compactChannelStatusText(state?.influxStatus, strings), channelStatusKind(state?.influxStatus, state?.influxEnabled == true))
-        StatusRow(strings.allParameters, if (state?.debugPollingRunning == true) strings.running else strings.waiting, if (state?.debugPollingRunning == true) StatusKind.OK else StatusKind.WAITING)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            StatusRow(strings.mainPolling, mainPollingStatus.text, mainPollingStatus.kind, modifier = Modifier.weight(1f))
+            StatusRow(
+                strings.allParameters,
+                if (state?.debugPollingRunning == true) strings.running else strings.waiting,
+                if (state?.debugPollingRunning == true) StatusKind.OK else StatusKind.WAITING,
+                modifier = Modifier.weight(1f)
+            )
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            StatusRow("MQTT", compactChannelStatusText(state?.mqttStatus, strings), channelStatusKind(state?.mqttStatus, state?.mqttEnabled == true), modifier = Modifier.weight(1f))
+            StatusRow("InfluxDB", compactChannelStatusText(state?.influxStatus, strings), channelStatusKind(state?.influxStatus, state?.influxEnabled == true), modifier = Modifier.weight(1f))
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            ActionButton(strings.compactDatabase, actions::onOpenCompactDatabase, modifier = Modifier.weight(1f))
+            ActionButton(strings.archiveDatabase, actions::onOpenArchiveDatabase, modifier = Modifier.weight(1f))
+        }
     }
 }
 
@@ -582,8 +597,7 @@ private fun CategoryGrid(
         "motion" to strings.motion,
         "body" to strings.body,
         "climate" to strings.climate,
-        "safety" to strings.safety,
-        "driver_assist" to strings.driverAssist
+        "safety" to strings.safety
     )
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         categories.chunked(3).forEach { row ->
@@ -787,7 +801,6 @@ private fun UpdateCheckDialog(
                 UpdateProgressBar(state.progress)
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                ActionButton(strings.close, onDismiss, modifier = Modifier.weight(1f))
                 ActionButton(
                     text = strings.update,
                     onClick = onUpdate,
@@ -795,8 +808,118 @@ private fun UpdateCheckDialog(
                     enabled = state is UpdateUiState.Available,
                     modifier = Modifier.weight(1f)
                 )
+                ActionButton(strings.close, onDismiss, modifier = Modifier.weight(1f))
             }
         }
+    }
+}
+
+@Composable
+private fun DatabaseMaintenanceDialog(
+    strings: UiStrings,
+    state: DbMaintenanceUiState,
+    mqttPending: Long,
+    influxPending: Long,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val p = LocalBydPalette.current
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(p.background.copy(alpha = 0.82f))
+            .padding(28.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        //guard modal taps from reaching the dashboard behind the dialog
+        ModalInputBlocker()
+        Column(
+            modifier = Modifier
+                .width(560.dp)
+                .height(if (!state.running && !state.completed && state.error == null) 340.dp else 300.dp)
+                .background(p.panel, Rounded8)
+                .border(1.dp, p.borderStrong, Rounded8)
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Text(operationTitle(strings, state.operation), color = p.text, fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .background(p.pathField, Rounded8)
+                    .border(1.dp, p.border, Rounded8)
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                when {
+                    state.running -> DatabaseMaintenanceRunningBody(strings, state)
+                    state.error != null -> Text("${strings.dbMaintenanceFailed}: ${state.error}", color = p.red, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                    state.completed -> {
+                        Text(strings.dbMaintenanceComplete, color = p.green, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                        state.archivePath?.let {
+                            Text("${strings.dbMaintenanceArchivePath} $it", color = p.muted, fontSize = 13.sp, lineHeight = 18.sp)
+                        }
+                    }
+                    else -> DatabaseMaintenanceConfirmBody(strings, state, mqttPending, influxPending)
+                }
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                ActionButton(
+                    strings.yes,
+                    onConfirm,
+                    primary = true,
+                    enabled = !state.running && !state.completed && state.error == null,
+                    modifier = Modifier.weight(1f)
+                )
+                ActionButton(strings.no, onDismiss, enabled = !state.running, modifier = Modifier.weight(1f))
+            }
+        }
+    }
+}
+
+@Composable
+private fun DatabaseMaintenanceConfirmBody(
+    strings: UiStrings,
+    state: DbMaintenanceUiState,
+    mqttPending: Long,
+    influxPending: Long
+) {
+    val p = LocalBydPalette.current
+    val pending = mqttPending + influxPending
+    Text(strings.dbMaintenanceStopWarning, color = p.text, fontSize = 14.sp, lineHeight = 19.sp, fontWeight = FontWeight.SemiBold)
+    if (pending > 0) {
+        Text(String.format(strings.dbMaintenancePendingTemplate, mqttPending, influxPending), color = p.text, fontSize = 14.sp, lineHeight = 19.sp)
+    }
+    if (state.operation == DbMaintenanceOperation.ARCHIVE && pending > 0) {
+        Text(strings.dbMaintenanceArchivePendingWarning, color = p.text, fontSize = 14.sp, lineHeight = 19.sp)
+    }
+    Text(String.format(strings.dbMaintenanceConfirmTemplate, operationTitle(strings, state.operation)), color = p.text, fontSize = 14.sp, lineHeight = 19.sp, fontWeight = FontWeight.SemiBold)
+    Text(strings.operationCannotBeStopped, color = p.text, fontSize = 14.sp, lineHeight = 19.sp)
+    Text(strings.interruptionDataLossRisk, color = p.red, fontSize = 15.sp, lineHeight = 20.sp, fontWeight = FontWeight.Bold)
+}
+
+@Composable
+private fun DatabaseMaintenanceRunningBody(strings: UiStrings, state: DbMaintenanceUiState) {
+    val p = LocalBydPalette.current
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        CircularProgressIndicator(modifier = Modifier.size(28.dp), color = p.accent, strokeWidth = 3.dp)
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("${strings.step} ${state.stepIndex}/${state.stepCount}", color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+            Text(localizedMaintenanceMessage(strings, state), color = p.muted, fontSize = 14.sp, lineHeight = 19.sp)
+        }
+    }
+}
+
+private fun localizedMaintenanceMessage(strings: UiStrings, state: DbMaintenanceUiState): String {
+    return if (strings.step == "Крок") state.messageUk.ifBlank { state.operation.stepsUk.getOrNull((state.stepIndex - 1).coerceAtLeast(0)) ?: "" }
+    else state.messageEn.ifBlank { state.operation.stepsEn.getOrNull((state.stepIndex - 1).coerceAtLeast(0)) ?: "" }
+}
+
+private fun operationTitle(strings: UiStrings, operation: DbMaintenanceOperation): String {
+    return when (operation) {
+        DbMaintenanceOperation.COMPACT -> strings.compactDatabase
+        DbMaintenanceOperation.ARCHIVE -> strings.archiveDatabase
     }
 }
 

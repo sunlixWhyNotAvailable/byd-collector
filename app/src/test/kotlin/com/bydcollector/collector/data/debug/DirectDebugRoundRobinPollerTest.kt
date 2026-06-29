@@ -52,6 +52,17 @@ class DirectDebugRoundRobinPollerTest {
     }
 
     @Test
+    fun debugPollerHasAwaitableShutdownForMaintenance() {
+        val source = sourceFile("com/bydcollector/collector/data/debug/DirectDebugRoundRobinPoller.kt").readText()
+
+        assertTrue(source.contains("fun shutdownAndAwait(reason: String = \"shutdown\", timeoutMs: Long): Boolean"))
+        assertTrue(source.contains("executor.shutdownNow()"))
+        assertTrue(source.contains("executor.awaitTermination(timeoutMs, TimeUnit.MILLISECONDS)"))
+        assertTrue(source.contains("fun shutdown(reason: String = \"shutdown\")"))
+        assertTrue(source.contains("shutdownAndAwait(reason, 0L)"))
+    }
+
+    @Test
     fun assetParserReadsCsvRows() {
         val csv = """
             key,feature_group,dev,fid,tx,feature_names,feature_refs,candidate_source,source_read_count,source_write_count,source_change_count,seed_last_status,seed_last_raw_present,seed_last_raw_int,seed_last_error,raw_sample,float_sample
@@ -139,5 +150,12 @@ class DirectDebugRoundRobinPollerTest {
         assertEquals(prodSignatures.size, prodSignatures.distinct().size)
 
         assertEquals(emptySet(), prodSignatures.toSet().intersect(debugSignatures.toSet()))
+    }
+
+    private fun sourceFile(path: String): File {
+        return listOf(
+            File("src/main/kotlin/$path"),
+            File("app/src/main/kotlin/$path")
+        ).firstOrNull { it.isFile } ?: error("Missing source file: $path")
     }
 }

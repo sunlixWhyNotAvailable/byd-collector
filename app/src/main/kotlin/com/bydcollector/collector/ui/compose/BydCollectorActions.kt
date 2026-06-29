@@ -29,6 +29,10 @@ interface BydCollectorActions {
     fun onToggleMainAutoStart(enabled: Boolean)
     fun onGrantAdb()
     fun onOpenBackgroundApps()
+    fun onOpenCompactDatabase()
+    fun onOpenArchiveDatabase()
+    fun onConfirmDatabaseMaintenance()
+    fun onDismissDatabaseMaintenance()
 
     fun onStartDebug()
     fun onStopDebug()

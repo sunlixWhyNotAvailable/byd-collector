@@ -28,9 +28,19 @@ class TelemetryPoller(
     }
 
     fun stop() {
+        stopAndJoin(0L)
+    }
+
+    fun stopAndJoin(timeoutMs: Long): Boolean {
         running.set(false)
-        worker?.interrupt()
-        worker = null
+        val currentWorker = worker
+        currentWorker?.interrupt()
+        if (timeoutMs > 0 && currentWorker != null && currentWorker !== Thread.currentThread()) {
+            currentWorker.join(timeoutMs)
+        }
+        val stopped = currentWorker?.isAlive != true
+        if (stopped && worker === currentWorker) worker = null
+        return stopped
     }
 
     private fun loop(sessionId: Long) {

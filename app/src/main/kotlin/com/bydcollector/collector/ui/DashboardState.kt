@@ -1,6 +1,7 @@
 package com.bydcollector.collector.ui
 
 import com.bydcollector.collector.data.local.CollectorEvent
+import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
 import com.bydcollector.collector.system.RequiredAccessRow
 
 data class DashboardState(
@@ -23,6 +24,7 @@ data class DashboardState(
     val requestCount: Int?,
     val databasePath: String,
     val databaseSizeBytes: Long,
+    val dbMaintenanceStatus: DbMaintenanceRuntimeStatus,
     val latestSoc: String?,
     val latestSpeed: String?,
     val latestCharging: String?,

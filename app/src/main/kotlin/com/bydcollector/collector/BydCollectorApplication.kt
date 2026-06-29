@@ -24,6 +24,20 @@ class BydCollectorApplication : Application() {
         super.onTerminate()
     }
 
+    @Synchronized
+    fun closeTelemetryStoreForMaintenance() {
+        if (::telemetryStore.isInitialized) telemetryStore.close()
+    }
+
+    @Synchronized
+    fun reopenTelemetryStoreForMaintenance(): TelemetryStore {
+        return TelemetryStore(applicationContext, TelemetryDatabaseHelper(applicationContext)).also { store ->
+            store.ensureCatalogImported()
+            store.ensureNormalizedCatalogImported()
+            telemetryStore = store
+        }
+    }
+
     companion object {
         fun store(context: Context): TelemetryStore {
             return (context.applicationContext as BydCollectorApplication).telemetryStore
