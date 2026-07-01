@@ -59,6 +59,7 @@ interface BydCollectorActions {
     fun onToggleKeepMobile(enabled: Boolean)
     fun onToggleKeepBluetooth(enabled: Boolean)
     fun onToggleKeepCollector(enabled: Boolean)
+    fun onToggleTailscaleActivation(enabled: Boolean)
 
     fun onToggleUpdateAutoCheck(enabled: Boolean)
     fun onCheckForUpdates()

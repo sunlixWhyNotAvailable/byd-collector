@@ -282,7 +282,7 @@ class VehicleStateNormalizerTest {
         val fieldsByKey = NormalizedFieldCatalog.fields.associateBy { it.fieldKey }
 
         assertEquals("normalized-direct-v8-20260627-charge-current", NormalizedFieldCatalog.CATALOG_VERSION)
-        assertEquals(80, NormalizedFieldCatalog.fields.size)
+        assertEquals(77, NormalizedFieldCatalog.fields.size)
         assertEquals(emptyList(), NormalizedFieldCatalog.fields.filter { field ->
             field.sourceKeys.any {
                 it.startsWith("adas_") ||
@@ -341,6 +341,17 @@ class VehicleStateNormalizerTest {
             .keys
 
         assertEquals(emptySet(), duplicateKeys)
+    }
+
+    @Test
+    fun catalogDoesNotExportKnownRedundantOrDuplicateFields() {
+        val fieldKeys = NormalizedFieldCatalog.fields.map { it.fieldKey }
+
+        assertFalse(fieldKeys.contains("max_charge_power_allow_raw"))
+        assertFalse(fieldKeys.contains("lr_door_lock_raw"))
+        assertFalse(fieldKeys.contains("rr_door_lock_raw"))
+        assertTrue(fieldKeys.contains("ota_lf_door_lock"))
+        assertTrue(fieldKeys.contains("rf_door_lock_raw"))
     }
 
     @Test

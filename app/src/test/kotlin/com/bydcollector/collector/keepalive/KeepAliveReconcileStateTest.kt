@@ -15,9 +15,10 @@ class KeepAliveReconcileStateTest {
             recoverCollectorService = false
         )
 
-        assertTrue(state.configChanged(enabled))
-        state.markConfigApplied(enabled)
-        assertFalse(state.configChanged(enabled))
+        assertTrue(state.configChanged(enabled, userShutdown = false))
+        state.markConfigApplied(enabled, userShutdown = false)
+        assertFalse(state.configChanged(enabled, userShutdown = false))
+        assertTrue(state.configChanged(enabled, userShutdown = true))
 
         state.markAlive(1_000)
 

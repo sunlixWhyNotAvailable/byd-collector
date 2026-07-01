@@ -3,6 +3,7 @@ package com.bydcollector.collector.keepalive
 import android.content.Context
 import com.bydcollector.collector.adb.AdbLocalClient
 import com.bydcollector.collector.data.local.TelemetryStore
+import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.util.namedSingleThreadExecutor
 import java.io.File
 import java.util.concurrent.ExecutorService
@@ -49,7 +50,8 @@ class KeepAliveSupervisor(
     private fun runReconcile(config: KeepAliveConfig) {
         try {
             val nowMs = clockMs()
-            val configChanged = reconcileState.configChanged(config)
+            val userShutdown = CollectorSettings(context.applicationContext, store).isUserShutdownRequested()
+            val configChanged = reconcileState.configChanged(config, userShutdown)
             val shouldStopDisabledDaemon = reconcileState.shouldStopDaemonForDisabledConfig(configChanged)
             if (config.anyEnabled && !configChanged && reconcileState.aliveFresh(nowMs)) return
             if (!config.anyEnabled && !shouldStopDisabledDaemon) return
@@ -57,11 +59,11 @@ class KeepAliveSupervisor(
             val shell = shellFactory()
             if (configChanged) {
                 //writes every flag before launch/stop so the daemon loop observes a complete desired state
-                val mirrorResults = KeepAliveShellPlanner.mirrorSettingsCommands(config).map { command ->
+                val mirrorResults = KeepAliveShellPlanner.mirrorSettingsCommands(config, userShutdown).map { command ->
                     runCommand(shell, command, "keep_alive_setting_sync")
                 }
                 if (mirrorResults.all { it.ok }) {
-                    reconcileState.markConfigApplied(config)
+                    reconcileState.markConfigApplied(config, userShutdown)
                 }
             }
 

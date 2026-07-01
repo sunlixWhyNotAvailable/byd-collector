@@ -39,6 +39,7 @@ class MainActivityMaintenanceContractTest {
         val actions = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorActions.kt").readText()
 
         assertTrue(source.contains("private var pendingMaintenanceOperation by mutableStateOf<DbMaintenanceOperation?>(null)"))
+        assertTrue(source.contains("private var maintenanceLaunchOperation by mutableStateOf<DbMaintenanceOperation?>(null)"))
         assertTrue(source.contains("databaseMaintenanceUiState = currentMaintenanceUiState()"))
         assertTrue(actions.contains("fun onOpenCompactDatabase()"))
         assertTrue(actions.contains("fun onOpenArchiveDatabase()"))
@@ -46,9 +47,12 @@ class MainActivityMaintenanceContractTest {
         assertTrue(actions.contains("fun onDismissDatabaseMaintenance()"))
         assertTrue(source.contains("pendingMaintenanceOperation = DbMaintenanceOperation.COMPACT"))
         assertTrue(source.contains("pendingMaintenanceOperation = DbMaintenanceOperation.ARCHIVE"))
+        assertInOrder(source, "settings.setDbMaintenanceStatus(", "DbMaintenanceRuntimeStatus(")
+        assertInOrder(source, "maintenanceLaunchOperation = operation", "CollectorServiceController.compactDatabase(this@MainActivity)")
+        assertInOrder(source, "maintenanceLaunchOperation = operation", "CollectorServiceController.archiveDatabase(this@MainActivity)")
         assertTrue(source.contains("CollectorServiceController.compactDatabase(this@MainActivity)"))
         assertTrue(source.contains("CollectorServiceController.archiveDatabase(this@MainActivity)"))
-        assertTrue(source.contains("if (dashboardState?.dbMaintenanceStatus?.running == true) return"))
+        assertTrue(source.contains("if (dashboardState?.dbMaintenanceStatus?.running == true || maintenanceLaunchOperation != null) return"))
         assertTrue(source.contains("settings.clearDbMaintenanceStatus()"))
         assertTrue(source.contains("private fun currentMaintenanceUiState(): DbMaintenanceUiState?"))
         assertFalse(source.contains("sendCmd"))
@@ -65,5 +69,13 @@ class MainActivityMaintenanceContractTest {
             File("src/main/kotlin/$path"),
             File("app/src/main/kotlin/$path")
         ).firstOrNull { it.isFile } ?: error("Missing source file: $path")
+    }
+
+    private fun assertInOrder(source: String, first: String, second: String) {
+        val firstIndex = source.indexOf(first)
+        val secondIndex = source.indexOf(second)
+        assertTrue(firstIndex >= 0, "Missing first token: $first")
+        assertTrue(secondIndex >= 0, "Missing second token: $second")
+        assertTrue(firstIndex < secondIndex, "Expected `$first` before `$second`")
     }
 }

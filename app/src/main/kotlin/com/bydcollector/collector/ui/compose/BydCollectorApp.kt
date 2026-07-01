@@ -667,23 +667,57 @@ private fun ExtraTab(
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         ScreenTitle(strings.extraTab, strings.extraSubtitle)
+        val optionsCardHeight = 264.dp
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            SectionCard(strings.keepAlive, Modifier.weight(1f)) {
+            SectionCard(strings.keepAlive, Modifier.weight(1f).height(optionsCardHeight)) {
                 SwitchRow(strings.keepWifi, state?.keepWifiEnabled == true, actions::onToggleKeepWifi)
                 SwitchRow(strings.keepMobile, state?.keepMobileDataEnabled == true, actions::onToggleKeepMobile)
                 SwitchRow(strings.keepBluetooth, state?.keepBluetoothEnabled == true, actions::onToggleKeepBluetooth)
                 SwitchRow(strings.restoreCollector, state?.recoverCollectorServiceEnabled == true, actions::onToggleKeepCollector)
             }
-            SectionCard(strings.appRuntime, Modifier.weight(1f)) {
+            SectionCard(strings.appRuntime, Modifier.weight(1f).height(optionsCardHeight)) {
+                TailscaleRuntimeRow(strings, state?.tailscaleActivationEnabled == true, actions::onToggleTailscaleActivation)
                 UpdateSettingsRow(
                     strings = strings,
                     updateAutoCheckEnabled = updateAutoCheckEnabled,
                     actions = actions
                 )
                 ShutdownSettingsRow(strings = strings, actions = actions)
-                AppRuntimeBottomSpacer()
             }
         }
+    }
+}
+
+@Composable
+private fun TailscaleRuntimeRow(strings: UiStrings, enabled: Boolean, onChange: (Boolean) -> Unit) {
+    val p = LocalBydPalette.current
+    Column(Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().heightIn(min = 72.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    text = strings.activateTailscale,
+                    color = p.text,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = strings.activateTailscaleDescription,
+                    color = p.muted,
+                    fontSize = 12.sp,
+                    lineHeight = 16.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            BydSwitch(enabled, onChange)
+        }
+        Box(Modifier.fillMaxWidth().height(1.dp).background(p.border))
     }
 }
 
@@ -779,18 +813,6 @@ private fun ShutdownIconButton(onClick: () -> Unit) {
     ) {
         ShutdownIcon(color = p.red, modifier = Modifier.size(23.dp))
     }
-}
-
-@Composable
-private fun AppRuntimeBottomSpacer() {
-    val p = LocalBydPalette.current
-    Box(
-        Modifier
-            .fillMaxWidth()
-            .height(1.dp)
-            .background(p.border)
-    )
-    Spacer(Modifier.height(56.dp))
 }
 
 @Composable
@@ -964,10 +986,10 @@ private fun DatabaseMaintenanceConfirmBody(
     val pending = mqttPending + influxPending
     Text(strings.dbMaintenanceStopWarning, color = p.text, fontSize = 14.sp, lineHeight = 19.sp, fontWeight = FontWeight.SemiBold)
     if (pending > 0) {
-        Text(String.format(strings.dbMaintenancePendingTemplate, mqttPending, influxPending), color = p.text, fontSize = 14.sp, lineHeight = 19.sp)
+        Text(String.format(strings.dbMaintenancePendingTemplate, mqttPending, influxPending), color = p.yellow, fontSize = 14.sp, lineHeight = 19.sp)
     }
     if (state.operation == DbMaintenanceOperation.ARCHIVE && pending > 0) {
-        Text(strings.dbMaintenanceArchivePendingWarning, color = p.text, fontSize = 14.sp, lineHeight = 19.sp)
+        Text(strings.dbMaintenanceArchivePendingWarning, color = p.yellow, fontSize = 14.sp, lineHeight = 19.sp)
     }
     Text(String.format(strings.dbMaintenanceConfirmTemplate, operationTitle(strings, state.operation)), color = p.text, fontSize = 14.sp, lineHeight = 19.sp, fontWeight = FontWeight.SemiBold)
     Text(strings.operationCannotBeStopped, color = p.text, fontSize = 14.sp, lineHeight = 19.sp)

@@ -9,6 +9,7 @@ public final class KeepAliveProtocol {
     public static final String KEY_KEEP_MOBILE_DATA = "bydcollector_keep_mobile_data";
     public static final String KEY_KEEP_BLUETOOTH = "bydcollector_keep_bluetooth";
     public static final String KEY_RECOVER_COLLECTOR_SERVICE = "bydcollector_recover_collector_service";
+    public static final String KEY_USER_SHUTDOWN = "bydcollector_user_shutdown";
     public static final long LOOP_INTERVAL_MS = 30_000L;
 
     private KeepAliveProtocol() {
