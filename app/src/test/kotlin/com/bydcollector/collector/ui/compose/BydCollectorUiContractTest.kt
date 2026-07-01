@@ -59,16 +59,39 @@ class BydCollectorUiContractTest {
     }
 
     @Test
-    fun driverAssistCategoryIsHiddenAndHomeIconRemainsCanvas() {
+    fun driverAssistCategoryIsHiddenAndBottomTabsUseVectorAssets() {
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
         val icons = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorIcons.kt").readText()
 
         assertFalse(app.contains("\"driver_assist\" to strings.driverAssist"))
-        assertTrue(icons.contains("Canvas(modifier = modifier)"))
-        assertTrue(icons.contains("BottomTabIcon.HOME ->"))
-        assertTrue(icons.contains("moveTo(w * 0.18f, h * 0.48f)"))
-        assertTrue(icons.contains("lineTo(w * 0.50f, h * 0.18f)"))
-        assertTrue(icons.contains("drawRoundRect("))
+        assertFalse(icons.contains("Canvas("))
+        assertTrue(icons.contains("BottomTabIcon.HA -> R.drawable.ic_tab_ha_link"))
+        assertTrue(icons.contains("BottomTabIcon.DATABASE -> R.drawable.ic_tab_all_data"))
+        assertTrue(icons.contains("painterResource(id = icon.drawableRes())"))
+        assertTrue(icons.contains("fun ShutdownIcon("))
+        assertTrue(icons.contains("R.drawable.ic_shutdown"))
+    }
+
+    @Test
+    fun optionsTabUsesPreviewRuntimeLayoutAndShutdownAction() {
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val actions = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorActions.kt").readText()
+        val strings = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorStrings.kt").readText()
+
+        assertTrue(actions.contains("fun onShutdownApp()"))
+        assertTrue(strings.contains("val keepAlive: String"))
+        assertTrue(strings.contains("val appRuntime: String"))
+        assertTrue(strings.contains("val shutdown: String"))
+        assertTrue(strings.contains("val shutdownDescription: String"))
+        assertTrue(app.contains("SectionCard(strings.keepAlive, Modifier.weight(1f))"))
+        assertTrue(app.contains("SectionCard(strings.appRuntime, Modifier.weight(1f))"))
+        assertInOrder(app, "SwitchRow(strings.keepWifi", "SwitchRow(strings.restoreCollector")
+        assertInOrder(app, "UpdateSettingsRow(", "ShutdownSettingsRow(")
+        assertInOrder(app, "ShutdownSettingsRow(", "AppRuntimeBottomSpacer(")
+        assertTrue(app.contains("ShutdownIcon(color = p.red"))
+        assertTrue(app.contains("val buttonBackground = if (pressed) p.redSoft else p.redSoft.copy(alpha = 0.56f)"))
+        assertTrue(app.contains(".background(buttonBackground, Rounded8)"))
+        assertTrue(app.contains("actions::onShutdownApp"))
     }
 
     private fun assertInOrder(source: String, first: String, second: String) {

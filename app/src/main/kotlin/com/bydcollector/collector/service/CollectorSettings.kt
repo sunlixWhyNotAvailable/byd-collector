@@ -26,6 +26,22 @@ class CollectorSettings(
         )
     }
 
+    fun isUserShutdownRequested(): Boolean = prefs.getBoolean(KEY_USER_SHUTDOWN, false)
+
+    fun setUserShutdownRequested(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_USER_SHUTDOWN, enabled).commit()
+        store?.recordEvent(
+            category = if (enabled) "user_shutdown_enabled" else "user_shutdown_cleared",
+            message = if (enabled) "User shutdown requested" else "User shutdown cleared"
+        )
+    }
+
+    fun clearUserShutdownRequestIfSet() {
+        if (isUserShutdownRequested()) {
+            setUserShutdownRequested(false)
+        }
+    }
+
     fun isPollingEnabled(): Boolean = prefs.getBoolean(KEY_POLLING_ENABLED, false)
 
     fun setPollingEnabled(enabled: Boolean) {
@@ -417,6 +433,7 @@ class CollectorSettings(
     companion object {
         const val PREFS_NAME = "collector_settings"
         const val KEY_AUTO_START = "autoStart"
+        const val KEY_USER_SHUTDOWN = "userShutdown"
         const val KEY_POLLING_ENABLED = "pollingEnabled"
         const val KEY_DEBUG_POLLING_ENABLED = "debugPollingEnabled"
         const val KEY_DEBUG_AUTO_START = "debugAutoStart"

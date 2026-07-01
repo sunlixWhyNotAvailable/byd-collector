@@ -146,6 +146,12 @@ object CollectorAutoStart {
         )
     }
 
+    fun cancelScheduled(context: Context) {
+        val appContext = context.applicationContext
+        cancelRetry(appContext)
+        cancelWatchdog(appContext)
+    }
+
     private fun ensurePollingEnabled(settings: CollectorSettings) {
         if (!settings.isPollingEnabled()) {
             settings.setPollingEnabled(true)
@@ -161,6 +167,7 @@ object CollectorAutoStart {
     }
 
     private fun shouldRunService(settings: CollectorSettings): Boolean {
+        if (settings.isUserShutdownRequested()) return false
         //keep-alive alone is enough reason to keep a foreground service even when polling is disabled
         return settings.isAutoStartEnabled() || settings.keepAliveConfig().anyEnabled
     }

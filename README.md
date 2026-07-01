@@ -11,13 +11,14 @@
 
 ## Current Features
 
-- Direct local vehicle telemetry collection through Android local ADB and a narrow app_process helper.
-- SQLite storage for raw poll values, collection sessions, normalized current state, history, MQTT state, and diagnostics.
-- Curated main polling set for useful vehicle parameters.
-- Separate debug round-robin polling for research parameters.
-- Normalized vehicle state for SOC, charging, battery, doors, tires, climate, speed, odometer, radar distance sensors, and related fields.
-- Home Assistant MQTT Discovery and live-state publishing.
-- InfluxDB v1 export for historical telemetry.
+- direct local vehicle telemetry collection through Android local ADB and a narrow app_process helper
+- SQLite storage for raw poll values, collection sessions, normalized current state, history, MQTT state, and diagnostics
+- curated main polling set for useful vehicle parameters
+- separate debug round-robin polling for research parameters
+- normalized vehicle state for SOC, charging, battery, doors, tires, climate, speed, odometer, radar distance sensors and related fields
+- Home Assistant MQTT Discovery and live-state publishing
+- `InfluxDB v1` export for historical telemetry
+- database shrink and archive
 
 ## Installation
 
@@ -44,7 +45,6 @@ Tested on *Chinese version* of `BYD Sea Lion 07 EV 2025`, `DiLink 5.0`
 
 ## TO DO
 
-- add db deleting unnecessary and old poll_values (to reduce size)
-- add max size storage options?
+- add max size storage options? as of now user does this manually
 - add user notification when db is too big to pull and delete old db
 - explore possibility of collecting data when the car is turned off (already confirmed the dilink is alive and watchdog/heartbeat process can exist)
