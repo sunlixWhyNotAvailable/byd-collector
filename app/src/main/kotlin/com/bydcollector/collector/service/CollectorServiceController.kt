@@ -17,6 +17,10 @@ object CollectorServiceController {
         context.startService(CollectorService.stopIntent(context))
     }
 
+    fun shutdown(context: Context) {
+        context.startService(CollectorService.shutdownIntent(context))
+    }
+
     fun startDebug(context: Context) {
         val intent = CollectorService.startDebugIntent(context)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

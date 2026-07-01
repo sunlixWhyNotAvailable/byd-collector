@@ -5,6 +5,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -14,6 +15,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -23,6 +25,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -665,23 +668,21 @@ private fun ExtraTab(
     ) {
         ScreenTitle(strings.extraTab, strings.extraSubtitle)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            SectionCard(strings.network, Modifier.weight(1f)) {
+            SectionCard(strings.keepAlive, Modifier.weight(1f)) {
                 SwitchRow(strings.keepWifi, state?.keepWifiEnabled == true, actions::onToggleKeepWifi)
                 SwitchRow(strings.keepMobile, state?.keepMobileDataEnabled == true, actions::onToggleKeepMobile)
-            }
-            SectionCard(strings.bluetooth, Modifier.weight(1f)) {
                 SwitchRow(strings.keepBluetooth, state?.keepBluetoothEnabled == true, actions::onToggleKeepBluetooth)
-            }
-            SectionCard(strings.collector, Modifier.weight(1f)) {
                 SwitchRow(strings.restoreCollector, state?.recoverCollectorServiceEnabled == true, actions::onToggleKeepCollector)
             }
-        }
-        SectionCard(strings.updates, Modifier.fillMaxWidth()) {
-            UpdateSettingsRow(
-                strings = strings,
-                updateAutoCheckEnabled = updateAutoCheckEnabled,
-                actions = actions
-            )
+            SectionCard(strings.appRuntime, Modifier.weight(1f)) {
+                UpdateSettingsRow(
+                    strings = strings,
+                    updateAutoCheckEnabled = updateAutoCheckEnabled,
+                    actions = actions
+                )
+                ShutdownSettingsRow(strings = strings, actions = actions)
+                AppRuntimeBottomSpacer()
+            }
         }
     }
 }
@@ -693,7 +694,7 @@ private fun UpdateSettingsRow(
     actions: BydCollectorActions
 ) {
     Row(
-        modifier = Modifier.fillMaxWidth().height(58.dp),
+        modifier = Modifier.fillMaxWidth().heightIn(min = 72.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp)
     ) {
@@ -701,8 +702,10 @@ private fun UpdateSettingsRow(
             Text(
                 text = strings.checkUpdates,
                 color = LocalBydPalette.current.text,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.SemiBold
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
             Text(
                 text = strings.checkUpdatesDescription,
@@ -716,6 +719,78 @@ private fun UpdateSettingsRow(
         ActionButton(strings.checkUpdates, actions::onCheckForUpdates, modifier = Modifier.width(210.dp))
         BydSwitch(updateAutoCheckEnabled, actions::onToggleUpdateAutoCheck)
     }
+}
+
+@Composable
+private fun ShutdownSettingsRow(strings: UiStrings, actions: BydCollectorActions) {
+    val p = LocalBydPalette.current
+    Column(Modifier.fillMaxWidth()) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(1.dp)
+                .background(p.border)
+        )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 58.dp)
+                .padding(top = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    text = strings.shutdown,
+                    color = p.text,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = strings.shutdownDescription,
+                    color = p.muted,
+                    fontSize = 12.sp,
+                    lineHeight = 16.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            ShutdownIconButton(onClick = actions::onShutdownApp)
+        }
+    }
+}
+
+@Composable
+private fun ShutdownIconButton(onClick: () -> Unit) {
+    val p = LocalBydPalette.current
+    val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
+    val buttonBackground = if (pressed) p.redSoft else p.redSoft.copy(alpha = 0.56f)
+    Box(
+        modifier = Modifier
+            .size(42.dp)
+            .pressScaleModifier(interactionSource)
+            .background(buttonBackground, Rounded8)
+            .border(1.dp, p.red.copy(alpha = 0.72f), Rounded8)
+            .clickable(interactionSource = interactionSource, indication = null) { onClick() },
+        contentAlignment = Alignment.Center
+    ) {
+        ShutdownIcon(color = p.red, modifier = Modifier.size(23.dp))
+    }
+}
+
+@Composable
+private fun AppRuntimeBottomSpacer() {
+    val p = LocalBydPalette.current
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .height(1.dp)
+            .background(p.border)
+    )
+    Spacer(Modifier.height(56.dp))
 }
 
 @Composable

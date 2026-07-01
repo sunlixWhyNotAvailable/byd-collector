@@ -111,6 +111,14 @@ class CollectorService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action ?: ACTION_START
+        if (action == ACTION_SHUTDOWN) {
+            shutdownByUser()
+            return START_NOT_STICKY
+        }
+        if (settings.isUserShutdownRequested()) {
+            suppressStartAfterUserShutdown(action)
+            return START_NOT_STICKY
+        }
         if (maintenanceActive.get() && action != ACTION_COMPACT_DATABASE && action != ACTION_ARCHIVE_DATABASE) {
             return START_STICKY
         }
@@ -409,6 +417,62 @@ class CollectorService : Service() {
         runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
     }
 
+    private fun shutdownByUser() {
+        settings.setUserShutdownRequested(true)
+        if (deferStopForActiveMaintenance("user_shutdown")) return
+        stopRuntimeForUserShutdown()
+        stopServiceAfterUserShutdown()
+    }
+
+    private fun suppressStartAfterUserShutdown(action: String) {
+        store.recordEvent(
+            "user_shutdown_start_suppressed",
+            "Service start suppressed after user shutdown",
+            "action=$action"
+        )
+        if (deferStopForActiveMaintenance("suppressed_action=$action")) return
+        stopRuntimeForUserShutdown()
+        stopServiceAfterUserShutdown()
+    }
+
+    private fun deferStopForActiveMaintenance(reason: String): Boolean {
+        if (!maintenanceActive.get()) return false
+        CollectorAutoStart.cancelScheduled(applicationContext)
+        settings.setPollingEnabled(false)
+        settings.setDebugPollingEnabled(false)
+        settings.setMqttEnabled(false)
+        settings.setInfluxEnabled(false)
+        store.recordEvent(
+            "user_shutdown_deferred_for_maintenance",
+            "User shutdown deferred until database maintenance completes",
+            reason
+        )
+        return true
+    }
+
+    private fun stopRuntimeForUserShutdown() {
+        CollectorAutoStart.cancelScheduled(applicationContext)
+        settings.setPollingEnabled(false)
+        settings.setDebugPollingEnabled(false)
+        settings.setMqttEnabled(false)
+        settings.setInfluxEnabled(false)
+        stopMain("user_shutdown")
+        stopDebug("user_shutdown")
+        disconnectOfflineAsync()
+        runCatching { influxCoordinator.stopExport() }
+        resetInfluxExecutorForMaintenance()
+    }
+
+    private fun stopServiceAfterUserShutdown() {
+        keepAliveSupervisor.reconcileThen(KeepAliveConfig(false, false, false, false)) {
+            mainHandler.post {
+                releaseWakeLock()
+                runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+                stopSelf()
+            }
+        }
+    }
+
     private fun stopMain(reason: String) {
         val wasPolling = poller.isRunning()
         if (wasPolling) poller.stop()
@@ -483,6 +547,14 @@ class CollectorService : Service() {
     private fun restoreRuntimeAfterMaintenance(snapshot: RuntimeSnapshot) {
         restoringRuntime.set(true)
         try {
+            if (settings.isUserShutdownRequested()) {
+                settings.setPollingEnabled(false)
+                settings.setDebugPollingEnabled(false)
+                settings.setMqttEnabled(false)
+                settings.setInfluxEnabled(false)
+                stopServiceAfterUserShutdown()
+                return
+            }
             settings.setPollingEnabled(snapshot.mainEnabled)
             settings.setDebugPollingEnabled(snapshot.debugEnabled)
             settings.setMqttEnabled(snapshot.mqttEnabled)
@@ -929,6 +1001,7 @@ class CollectorService : Service() {
 
     companion object {
         val ACTION_START: String = "${BuildConfig.ACTION_PREFIX}.action.START"
+        val ACTION_SHUTDOWN: String = "${BuildConfig.ACTION_PREFIX}.action.SHUTDOWN"
         val ACTION_STOP: String = "${BuildConfig.ACTION_PREFIX}.action.STOP"
         val ACTION_START_DEBUG: String = "${BuildConfig.ACTION_PREFIX}.action.START_DEBUG"
         val ACTION_STOP_DEBUG: String = "${BuildConfig.ACTION_PREFIX}.action.STOP_DEBUG"
@@ -955,6 +1028,10 @@ class CollectorService : Service() {
 
         fun startIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
             action = ACTION_START
+        }
+
+        fun shutdownIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
+            action = ACTION_SHUTDOWN
         }
 
         fun stopIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {

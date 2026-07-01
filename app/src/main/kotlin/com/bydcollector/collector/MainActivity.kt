@@ -317,6 +317,14 @@ class MainActivity : ComponentActivity() {
             startUpdateDownload(available.info)
         }
 
+        override fun onShutdownApp() {
+            refreshStoreBackedState()
+            settings.setUserShutdownRequested(true)
+            CollectorAutoStart.cancelScheduled(applicationContext)
+            CollectorServiceController.shutdown(this@MainActivity)
+            finishAndRemoveTask()
+        }
+
         override fun onStartJournal() {
             startDiagnostics("journal")
         }
@@ -338,6 +346,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         store = currentStore()
         settings = CollectorSettings(applicationContext, store)
+        settings.clearUserShutdownRequestIfSet()
         stateProvider = DashboardStateProvider(applicationContext, { BydCollectorApplication.store(applicationContext) }, settings)
         debugBatchText = settings.debugBatchSize().toString()
         mqttDraft = MqttDraft(

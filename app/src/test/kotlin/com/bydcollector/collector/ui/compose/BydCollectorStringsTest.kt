@@ -58,4 +58,20 @@ class BydCollectorStringsTest {
         assertEquals("Operation failed", en.dbMaintenanceFailed)
         assertEquals("Archive:", en.dbMaintenanceArchivePath)
     }
+
+    @Test
+    fun shutdownAndRuntimeLabelsAreLocalized() {
+        val uk = strings(UiLanguage.UK)
+        val en = strings(UiLanguage.EN)
+
+        assertEquals("Підтримка роботи", uk.keepAlive)
+        assertEquals("Робота застосунку", uk.appRuntime)
+        assertEquals("Виключити", uk.shutdown)
+        assertEquals("Завершити роботу застосунку до наступного відкриття", uk.shutdownDescription)
+
+        assertEquals("Keep alive", en.keepAlive)
+        assertEquals("App runtime", en.appRuntime)
+        assertEquals("Shutdown", en.shutdown)
+        assertEquals("Stop the app until it is opened again", en.shutdownDescription)
+    }
 }
