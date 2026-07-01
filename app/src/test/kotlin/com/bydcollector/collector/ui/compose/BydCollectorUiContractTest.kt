@@ -7,6 +7,17 @@ import kotlin.test.assertTrue
 
 class BydCollectorUiContractTest {
     @Test
+    fun topBarSubtitleUsesTelemetryAndVersionCopy() {
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val strings = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorStrings.kt").readText()
+
+        assertTrue(app.contains("appVersionName"))
+        assertTrue(app.contains("text = \"\${strings.topBarSubtitle} | v\$appVersionName\""))
+        assertTrue(strings.contains("topBarSubtitle = \"Збирання телеметрії авто\""))
+        assertTrue(strings.contains("topBarSubtitle = \"Auto telemetry collection\""))
+    }
+
+    @Test
     fun tactileControlsKeepPressedAndPendingContracts() {
         val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
@@ -51,6 +62,8 @@ class BydCollectorUiContractTest {
         assertInOrder(app, "strings.dbMaintenanceArchivePendingWarning", "strings.dbMaintenanceConfirmTemplate")
         assertInOrder(app, "strings.dbMaintenanceConfirmTemplate", "strings.operationCannotBeStopped")
         assertInOrder(app, "strings.operationCannotBeStopped", "strings.interruptionDataLossRisk")
+        assertTrue(app.contains("color = p.yellow, fontSize = 14.sp"))
+        assertTrue(app.contains("strings.dbMaintenanceArchivePendingWarning, color = p.yellow"))
         assertTrue(app.contains("fontSize = 15.sp"))
         assertTrue(app.contains("CircularProgressIndicator("))
         assertTrue(app.contains("Modifier.size(28.dp)"))
@@ -83,11 +96,20 @@ class BydCollectorUiContractTest {
         assertTrue(strings.contains("val appRuntime: String"))
         assertTrue(strings.contains("val shutdown: String"))
         assertTrue(strings.contains("val shutdownDescription: String"))
-        assertTrue(app.contains("SectionCard(strings.keepAlive, Modifier.weight(1f))"))
-        assertTrue(app.contains("SectionCard(strings.appRuntime, Modifier.weight(1f))"))
+        assertTrue(strings.contains("val activateTailscale: String"))
+        assertTrue(strings.contains("val activateTailscaleDescription: String"))
+        assertTrue(strings.contains("Перевіряти наявність Tailscale та активувати VPN"))
+        assertTrue(strings.contains("Check for Tailscale and activate VPN"))
+        assertTrue(app.contains("val optionsCardHeight = 264.dp"))
+        assertTrue(app.contains("SectionCard(strings.keepAlive, Modifier.weight(1f).height(optionsCardHeight))"))
+        assertTrue(app.contains("SectionCard(strings.appRuntime, Modifier.weight(1f).height(optionsCardHeight))"))
+        assertFalse(app.contains("AppRuntimeBottomSpacer()"))
+        assertFalse(app.contains("Spacer(Modifier.height(92.dp))"))
+        assertFalse(app.contains("SwitchRow(strings.activateTailscale"))
         assertInOrder(app, "SwitchRow(strings.keepWifi", "SwitchRow(strings.restoreCollector")
+        assertInOrder(app, "SectionCard(strings.appRuntime", "TailscaleRuntimeRow(")
+        assertInOrder(app, "TailscaleRuntimeRow(", "UpdateSettingsRow(")
         assertInOrder(app, "UpdateSettingsRow(", "ShutdownSettingsRow(")
-        assertInOrder(app, "ShutdownSettingsRow(", "AppRuntimeBottomSpacer(")
         assertTrue(app.contains("ShutdownIcon(color = p.red"))
         assertTrue(app.contains("val buttonBackground = if (pressed) p.redSoft else p.redSoft.copy(alpha = 0.56f)"))
         assertTrue(app.contains(".background(buttonBackground, Rounded8)"))

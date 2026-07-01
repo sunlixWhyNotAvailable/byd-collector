@@ -108,6 +108,7 @@ class DashboardStateProvider(
             keepMobileDataEnabled = keepAliveConfig.keepMobileData,
             keepBluetoothEnabled = keepAliveConfig.keepBluetooth,
             recoverCollectorServiceEnabled = keepAliveConfig.recoverCollectorService,
+            tailscaleActivationEnabled = settings.isTailscaleActivationEnabled(),
             keepAliveEnabled = keepAliveConfig.anyEnabled,
             keepAliveStatus = if (keepAliveConfig.anyEnabled) "enabled" else "disabled",
             keepAliveLogPullCommand = DiagnosticLogRecorder.keepAliveLogPullCommand(),

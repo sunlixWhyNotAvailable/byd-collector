@@ -12,7 +12,7 @@ class UserShutdownContractTest {
 
         assertTrue(settings.contains("fun isUserShutdownRequested(): Boolean"))
         assertTrue(settings.contains("fun setUserShutdownRequested(enabled: Boolean)"))
-        assertTrue(settings.contains("fun clearUserShutdownRequestIfSet()"))
+        assertTrue(settings.contains("fun clearUserShutdownRequestIfSet(): Boolean"))
         assertTrue(settings.contains("const val KEY_USER_SHUTDOWN = \"userShutdown\""))
         assertTrue(settings.contains("putBoolean(KEY_USER_SHUTDOWN, enabled).commit()"))
     }
@@ -23,7 +23,10 @@ class UserShutdownContractTest {
         val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
 
         assertTrue(autoStart.contains("if (settings.isUserShutdownRequested()) return false"))
-        assertTrue(activity.contains("settings.clearUserShutdownRequestIfSet()"))
+        assertTrue(activity.contains("val clearedUserShutdown = settings.clearUserShutdownRequestIfSet()"))
+        assertTrue(activity.contains("if (clearedUserShutdown)"))
+        assertTrue(activity.contains("settings.clearRuntimeManualStops()"))
+        assertTrue(activity.contains("CollectorAutoStart.recoverFromForeground(applicationContext, settings, currentStore())"))
         assertTrue(activity.indexOf("settings.clearUserShutdownRequestIfSet()") < activity.indexOf("startRuntimeUpdateAutoCheck()"))
     }
 

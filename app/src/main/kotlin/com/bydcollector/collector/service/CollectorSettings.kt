@@ -36,10 +36,43 @@ class CollectorSettings(
         )
     }
 
-    fun clearUserShutdownRequestIfSet() {
-        if (isUserShutdownRequested()) {
-            setUserShutdownRequested(false)
-        }
+    fun clearUserShutdownRequestIfSet(): Boolean {
+        if (!isUserShutdownRequested()) return false
+        setUserShutdownRequested(false)
+        return true
+    }
+
+    fun isMainManuallyStopped(): Boolean = prefs.getBoolean(KEY_MAIN_MANUAL_STOP, false)
+
+    fun setMainManuallyStopped(stopped: Boolean) {
+        prefs.edit().putBoolean(KEY_MAIN_MANUAL_STOP, stopped).apply()
+    }
+
+    fun isDebugManuallyStopped(): Boolean = prefs.getBoolean(KEY_DEBUG_MANUAL_STOP, false)
+
+    fun setDebugManuallyStopped(stopped: Boolean) {
+        prefs.edit().putBoolean(KEY_DEBUG_MANUAL_STOP, stopped).apply()
+    }
+
+    fun isMqttManuallyStopped(): Boolean = prefs.getBoolean(KEY_MQTT_MANUAL_STOP, false)
+
+    fun setMqttManuallyStopped(stopped: Boolean) {
+        prefs.edit().putBoolean(KEY_MQTT_MANUAL_STOP, stopped).apply()
+    }
+
+    fun isInfluxManuallyStopped(): Boolean = prefs.getBoolean(KEY_INFLUX_MANUAL_STOP, false)
+
+    fun setInfluxManuallyStopped(stopped: Boolean) {
+        prefs.edit().putBoolean(KEY_INFLUX_MANUAL_STOP, stopped).apply()
+    }
+
+    fun clearRuntimeManualStops() {
+        prefs.edit()
+            .putBoolean(KEY_MAIN_MANUAL_STOP, false)
+            .putBoolean(KEY_DEBUG_MANUAL_STOP, false)
+            .putBoolean(KEY_MQTT_MANUAL_STOP, false)
+            .putBoolean(KEY_INFLUX_MANUAL_STOP, false)
+            .apply()
     }
 
     fun isPollingEnabled(): Boolean = prefs.getBoolean(KEY_POLLING_ENABLED, false)
@@ -265,6 +298,16 @@ class CollectorSettings(
         )
     }
 
+    fun isTailscaleActivationEnabled(): Boolean = prefs.getBoolean(KEY_TAILSCALE_ACTIVATION, false)
+
+    fun setTailscaleActivationEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_TAILSCALE_ACTIVATION, enabled).apply()
+        store?.recordEvent(
+            category = if (enabled) "tailscale_activation_enabled" else "tailscale_activation_disabled",
+            message = "Tailscale activation ${if (enabled) "enabled" else "disabled"}"
+        )
+    }
+
     fun dbMaintenanceStatus(): DbMaintenanceRuntimeStatus {
         return DbMaintenanceRuntimeStatus(
             operation = DbMaintenanceOperation.fromKey(prefs.getString(KEY_DB_MAINTENANCE_OPERATION, null)),
@@ -434,6 +477,10 @@ class CollectorSettings(
         const val PREFS_NAME = "collector_settings"
         const val KEY_AUTO_START = "autoStart"
         const val KEY_USER_SHUTDOWN = "userShutdown"
+        const val KEY_MAIN_MANUAL_STOP = "mainManualStop"
+        const val KEY_DEBUG_MANUAL_STOP = "debugManualStop"
+        const val KEY_MQTT_MANUAL_STOP = "mqttManualStop"
+        const val KEY_INFLUX_MANUAL_STOP = "influxManualStop"
         const val KEY_POLLING_ENABLED = "pollingEnabled"
         const val KEY_DEBUG_POLLING_ENABLED = "debugPollingEnabled"
         const val KEY_DEBUG_AUTO_START = "debugAutoStart"
@@ -465,6 +512,7 @@ class CollectorSettings(
         const val KEY_INFLUX_CATEGORIES = "influxCategories"
         const val KEY_UPDATE_AUTO_CHECK = "updateAutoCheck"
         const val KEY_UPDATE_LAST_CHECK_AT_MS = "updateLastCheckAtMs"
+        const val KEY_TAILSCALE_ACTIVATION = "tailscaleActivation"
         const val KEY_DB_MAINTENANCE_OPERATION = "dbMaintenanceOperation"
         const val KEY_DB_MAINTENANCE_RUNNING = "dbMaintenanceRunning"
         const val KEY_DB_MAINTENANCE_COMPLETED = "dbMaintenanceCompleted"

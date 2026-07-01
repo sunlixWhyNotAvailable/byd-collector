@@ -34,6 +34,9 @@ object CollectorAutoStart {
             return
         }
 
+        if (clearsManualStops(action)) {
+            settings.clearRuntimeManualStops()
+        }
         if (settings.isAutoStartEnabled()) {
             //auto-start means main polling should become enabled again after device/process recovery
             ensurePollingEnabled(settings)
@@ -156,6 +159,12 @@ object CollectorAutoStart {
         if (!settings.isPollingEnabled()) {
             settings.setPollingEnabled(true)
         }
+    }
+
+    private fun clearsManualStops(action: String): Boolean {
+        return action != ACTION_RETRY_AUTO_START &&
+            action != ACTION_WATCHDOG_AUTO_START &&
+            action != ACTION_KEEP_ALIVE_RECOVERY
     }
 
     private fun syncDebugAutoStart(settings: CollectorSettings) {

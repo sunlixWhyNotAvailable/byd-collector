@@ -51,8 +51,6 @@ object NormalizedFieldCatalog {
     val acWindLevel = number("ac_wind_level_raw", NormalizedCategory.CLIMATE, "level", "Fan speed", null, "measurement", listOf("ac_wind_level"), "decoded_number_non_negative", mqttDefaultEnabled = false)
     val driverDoorLock = bool("ota_lf_door_lock", NormalizedCategory.BODY, "Driver door lock", null, listOf("ota_lf_door_lock"), "door_lock_state_locked", mqttDefaultEnabled = false)
     val passengerDoorLock = bool("rf_door_lock_raw", NormalizedCategory.BODY, "Passenger door lock", null, listOf("bodywork_rf_door_lock_status"), "door_lock_state_locked", mqttDefaultEnabled = false)
-    val rearLeftDoorLock = bool("lr_door_lock_raw", NormalizedCategory.BODY, "Rear left door lock", null, listOf("bodywork_lr_door_lock_status"), "door_lock_state_locked", mqttDefaultEnabled = false)
-    val rearRightDoorLock = bool("rr_door_lock_raw", NormalizedCategory.BODY, "Rear right door lock", null, listOf("bodywork_rr_door_lock_status"), "door_lock_state_locked", mqttDefaultEnabled = false)
     val driverDoor = bool("driver_door_open", NormalizedCategory.BODY, "Driver door", "door", listOf("bodywork_left_hand_front_door"), "zero_closed_nonzero_open")
     val passengerDoor = bool("passenger_door_open", NormalizedCategory.BODY, "Passenger door", "door", listOf("bodywork_right_hand_front_door"), "zero_closed_nonzero_open")
     val leftRearDoor = bool("left_rear_door_open", NormalizedCategory.BODY, "Rear left door", "door", listOf("bodywork_left_hand_rear_door"), "zero_closed_nonzero_open")
@@ -100,7 +98,6 @@ object NormalizedFieldCatalog {
     val radarLeftRear = number("radar_1025_neg_1728053146_5", NormalizedCategory.SAFETY, "cm", "Radar left rear", "distance", "measurement", listOf("radar_1025_-1728053146_5"), "decoded_number_non_negative", mqttDefaultEnabled = false)
     val radarRightRear = number("radar_1025_neg_1728053145_5", NormalizedCategory.SAFETY, "cm", "Radar right rear", "distance", "measurement", listOf("radar_1025_-1728053145_5"), "decoded_number_non_negative", mqttDefaultEnabled = false)
     val radarRight = number("radar_1025_neg_1728053144_5", NormalizedCategory.SAFETY, "cm", "Radar right", "distance", "measurement", listOf("radar_1025_-1728053144_5"), "decoded_number_non_negative", mqttDefaultEnabled = false)
-    val maxChargePowerAllow = number("max_charge_power_allow_raw", NormalizedCategory.BATTERY, "kW", "Max charge power allow raw", "power", "measurement", listOf("statistic_max_charge_power_allow"), "decoded_number_non_negative")
     val batteryAverageTemp = number("battery_average_temp_raw", NormalizedCategory.BATTERY, "°C", "Battery average temperature", "temperature", "measurement", listOf("statistic_average_battery_temp"), "raw_temp_c_offset_40")
     val chargerConnected = bool("charger_connected_raw", NormalizedCategory.BATTERY, "Charger connected raw", "plug", listOf("charging_1009_89128973_5"), "zero_false_nonzero_true")
     val maxDischargePowerAllow = number("max_discharge_power_allow_raw", NormalizedCategory.BATTERY, "kW", "Max discharge power allow raw", "power", "measurement", listOf("statistic_1014_877658120_5"), "decoded_number_non_negative")
@@ -133,8 +130,6 @@ object NormalizedFieldCatalog {
         acWindLevel,
         driverDoorLock,
         passengerDoorLock,
-        rearLeftDoorLock,
-        rearRightDoorLock,
         driverDoor,
         passengerDoor,
         leftRearDoor,
@@ -182,7 +177,6 @@ object NormalizedFieldCatalog {
         radarLeftRear,
         radarRightRear,
         radarRight,
-        maxChargePowerAllow,
         batteryAverageTemp,
         chargerConnected,
         maxDischargePowerAllow

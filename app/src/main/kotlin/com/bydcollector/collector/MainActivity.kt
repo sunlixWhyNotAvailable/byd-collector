@@ -19,6 +19,7 @@ import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
 import com.bydcollector.collector.influx.InfluxActionResult
 import com.bydcollector.collector.influx.InfluxActions
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
+import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
 import com.bydcollector.collector.maintenance.DbMaintenanceUiState
 import com.bydcollector.collector.mqtt.HaMqttActions
 import com.bydcollector.collector.mqtt.MqttActionResult
@@ -69,6 +70,7 @@ class MainActivity : ComponentActivity() {
     private var influxDraft by mutableStateOf(InfluxDraft())
     private var updateUiState by mutableStateOf<UpdateUiState>(UpdateUiState.Hidden)
     private var pendingMaintenanceOperation by mutableStateOf<DbMaintenanceOperation?>(null)
+    private var maintenanceLaunchOperation by mutableStateOf<DbMaintenanceOperation?>(null)
     private var backgroundSetupPromptVisible by mutableStateOf(false)
     private var backgroundSetupPromptAutoLaunch = false
 
@@ -96,6 +98,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onStartMain() {
             refreshStoreBackedState()
+            settings.setMainManuallyStopped(false)
             settings.setPollingEnabled(true)
             CollectorServiceController.start(this@MainActivity)
             refresh()
@@ -103,6 +106,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onStopMain() {
             refreshStoreBackedState()
+            settings.setMainManuallyStopped(true)
             settings.setPollingEnabled(false)
             CollectorServiceController.stop(this@MainActivity)
             refresh()
@@ -111,6 +115,7 @@ class MainActivity : ComponentActivity() {
         override fun onToggleMainAutoStart(enabled: Boolean) {
             refreshStoreBackedState()
             if (settings.isAutoStartEnabled() != enabled) {
+                if (enabled) settings.setMainManuallyStopped(false)
                 settings.setAutoStartEnabled(enabled)
                 val message = if (enabled) {
                     CollectorSettings.AUTO_START_ENABLED_UK
@@ -145,16 +150,40 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onConfirmDatabaseMaintenance() {
-            when (pendingMaintenanceOperation) {
+            val operation = pendingMaintenanceOperation ?: return
+            maintenanceLaunchOperation = operation
+            pendingMaintenanceOperation = null
+            settings.setDbMaintenanceStatus(
+                DbMaintenanceRuntimeStatus(
+                    operation = operation,
+                    running = true,
+                    completed = false,
+                    stepIndex = 1,
+                    stepCount = operation.stepsUk.size,
+                    messageUk = operation.stepsUk.first(),
+                    messageEn = operation.stepsEn.first()
+                )
+            )
+            runCatching {
+                when (operation) {
                 DbMaintenanceOperation.COMPACT -> CollectorServiceController.compactDatabase(this@MainActivity)
                 DbMaintenanceOperation.ARCHIVE -> CollectorServiceController.archiveDatabase(this@MainActivity)
-                null -> return
+                }
+            }.onFailure { error ->
+                settings.setDbMaintenanceStatus(
+                    settings.dbMaintenanceStatus().copy(
+                        running = false,
+                        completed = false,
+                        error = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                    )
+                )
+                maintenanceLaunchOperation = null
             }
             refresh()
         }
 
         override fun onDismissDatabaseMaintenance() {
-            if (dashboardState?.dbMaintenanceStatus?.running == true) return
+            if (dashboardState?.dbMaintenanceStatus?.running == true || maintenanceLaunchOperation != null) return
             pendingMaintenanceOperation = null
             settings.clearDbMaintenanceStatus()
             refresh()
@@ -163,6 +192,7 @@ class MainActivity : ComponentActivity() {
         override fun onStartDebug() {
             refreshStoreBackedState()
             settings.setDebugBatchSize(debugBatchText.toIntOrNull()?.coerceAtLeast(1) ?: 1)
+            settings.setDebugManuallyStopped(false)
             settings.setDebugPollingEnabled(true)
             CollectorServiceController.startDebug(this@MainActivity)
             refresh()
@@ -170,6 +200,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onStopDebug() {
             refreshStoreBackedState()
+            settings.setDebugManuallyStopped(true)
             settings.setDebugPollingEnabled(false)
             CollectorServiceController.stopDebug(this@MainActivity)
             refresh()
@@ -177,6 +208,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onToggleDebugAutoStart(enabled: Boolean) {
             if (settings.isDebugAutoStartEnabled() != enabled) {
+                if (enabled) settings.setDebugManuallyStopped(false)
                 settings.setDebugAutoStartEnabled(enabled && settings.isAutoStartEnabled())
                 refresh()
             }
@@ -195,6 +227,7 @@ class MainActivity : ComponentActivity() {
         override fun onStartMqtt() {
             refreshStoreBackedState()
             saveMqttDraft()
+            settings.setMqttManuallyStopped(false)
             settings.setMqttEnabled(true)
             CollectorServiceController.startMqttExport(this@MainActivity)
             refresh()
@@ -202,6 +235,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onStopMqtt() {
             refreshStoreBackedState()
+            settings.setMqttManuallyStopped(true)
             settings.setMqttEnabled(false)
             CollectorServiceController.stopMqttExport(this@MainActivity)
             refresh()
@@ -214,6 +248,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onToggleMqttAutoStart(enabled: Boolean) {
+            if (enabled) settings.setMqttManuallyStopped(false)
             settings.setMqttAutoStartEnabled(enabled)
             refresh()
         }
@@ -231,6 +266,7 @@ class MainActivity : ComponentActivity() {
         override fun onStartInflux() {
             refreshStoreBackedState()
             saveInfluxDraft()
+            settings.setInfluxManuallyStopped(false)
             settings.setInfluxEnabled(true)
             CollectorServiceController.startInfluxExport(this@MainActivity)
             refresh()
@@ -238,6 +274,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onStopInflux() {
             refreshStoreBackedState()
+            settings.setInfluxManuallyStopped(true)
             settings.setInfluxEnabled(false)
             CollectorServiceController.stopInfluxExport(this@MainActivity)
             refresh()
@@ -256,6 +293,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onToggleInfluxAutoStart(enabled: Boolean) {
+            if (enabled) settings.setInfluxManuallyStopped(false)
             settings.setInfluxAutoStartEnabled(enabled)
             refresh()
         }
@@ -295,6 +333,12 @@ class MainActivity : ComponentActivity() {
             refreshStoreBackedState()
             settings.setRecoverCollectorServiceEnabled(enabled)
             CollectorServiceController.reconcileKeepAlive(this@MainActivity)
+            refresh()
+        }
+
+        override fun onToggleTailscaleActivation(enabled: Boolean) {
+            refreshStoreBackedState()
+            settings.setTailscaleActivationEnabled(enabled)
             refresh()
         }
 
@@ -346,7 +390,11 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         store = currentStore()
         settings = CollectorSettings(applicationContext, store)
-        settings.clearUserShutdownRequestIfSet()
+        val clearedUserShutdown = settings.clearUserShutdownRequestIfSet()
+        if (clearedUserShutdown) {
+            settings.clearRuntimeManualStops()
+            CollectorAutoStart.recoverFromForeground(applicationContext, settings, currentStore())
+        }
         stateProvider = DashboardStateProvider(applicationContext, { BydCollectorApplication.store(applicationContext) }, settings)
         debugBatchText = settings.debugBatchSize().toString()
         mqttDraft = MqttDraft(
@@ -832,6 +880,9 @@ class MainActivity : ComponentActivity() {
         val runtime = dashboardState?.dbMaintenanceStatus
         val runtimeOperation = runtime?.operation
         if (runtimeOperation != null && (runtime.running || runtime.completed || runtime.error != null)) {
+            if (runtime.completed || runtime.error != null) {
+                maintenanceLaunchOperation = null
+            }
             return DbMaintenanceUiState(
                 operation = runtimeOperation,
                 running = runtime.running,
@@ -842,6 +893,17 @@ class MainActivity : ComponentActivity() {
                 messageEn = runtime.messageEn,
                 error = runtime.error,
                 archivePath = runtime.archivePath
+            )
+        }
+        maintenanceLaunchOperation?.let { operation ->
+            return DbMaintenanceUiState(
+                operation = operation,
+                running = true,
+                completed = false,
+                stepIndex = 1,
+                stepCount = operation.stepsUk.size,
+                messageUk = operation.stepsUk.first(),
+                messageEn = operation.stepsEn.first()
             )
         }
         return pendingMaintenanceOperation?.let { DbMaintenanceUiState(operation = it) }

@@ -11,6 +11,9 @@ import java.util.concurrent.TimeUnit;
 //keeps selected dilink radios/service recovery alive from shell while the app process may be backgrounded
 public final class KeepAliveDaemon {
     private static final String PACKAGE_NAME = "com.bydcollector.collector";
+    private static final String USER_SHUTDOWN_COMMAND = "settings get global bydcollector_user_shutdown";
+    private static final String START_COLLECTOR_SERVICE_COMMAND =
+            "am start-foreground-service -a com.bydcollector.collector.action.START -n com.bydcollector.collector/.service.CollectorService";
     private static final String RECOVER_COLLECTOR_COMMAND =
             "am broadcast -a com.bydcollector.collector.action.KEEP_ALIVE_RECOVERY " +
                     "-n com.bydcollector.collector/com.bydcollector.collector.system.KeepAliveRecoveryReceiver";
@@ -20,6 +23,7 @@ public final class KeepAliveDaemon {
             "settings get global bydcollector_keep_mobile_data",
             "settings get global bydcollector_keep_bluetooth",
             "settings get global bydcollector_recover_collector_service",
+            USER_SHUTDOWN_COMMAND,
             "svc wifi enable",
             "svc data enable",
             "svc bluetooth enable",
@@ -28,6 +32,7 @@ public final class KeepAliveDaemon {
             "dumpsys power | grep mWakefulness",
             "pidof com.bydcollector.collector",
             "dumpsys activity services com.bydcollector.collector/.service.CollectorService",
+            START_COLLECTOR_SERVICE_COMMAND,
             RECOVER_COLLECTOR_COMMAND
     };
 
@@ -111,17 +116,21 @@ public final class KeepAliveDaemon {
     }
 
     private static void recoverCollectorServiceIfNeeded() {
+        if (isEnabled(USER_SHUTDOWN_COMMAND)) {
+            log("collector_recovery_blocked_user_shutdown");
+            return;
+        }
         ShellResult service = run("dumpsys activity services com.bydcollector.collector/.service.CollectorService", 5_000L);
         if (service.ok && service.output.contains("com.bydcollector.collector/.service.CollectorService")) {
             log("collector_service_alive");
             return;
         }
 
-        //asks the app-side receiver to choose the correct recovery mode instead of starting internals directly
-        runAndLog(
-                "collector_service_recovery_requested",
-                RECOVER_COLLECTOR_COMMAND
-        );
+        ShellResult directStart = run(START_COLLECTOR_SERVICE_COMMAND, 10_000L);
+        log("collector_service_direct_start_requested ok=" + directStart.ok + " elapsed_ms=" + directStart.elapsedMs + " output=" + sanitize(directStart.output));
+        if (!directStart.ok) {
+            runAndLog("collector_service_recovery_broadcast_requested", RECOVER_COLLECTOR_COMMAND);
+        }
     }
 
     private static void runAndLog(String event, String command) {

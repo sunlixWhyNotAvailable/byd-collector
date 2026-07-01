@@ -50,6 +50,7 @@ data class DashboardState(
     val keepMobileDataEnabled: Boolean,
     val keepBluetoothEnabled: Boolean,
     val recoverCollectorServiceEnabled: Boolean,
+    val tailscaleActivationEnabled: Boolean,
     val keepAliveEnabled: Boolean,
     val keepAliveStatus: String,
     val keepAliveLogPullCommand: String,

@@ -2,12 +2,13 @@ package com.bydcollector.collector.keepalive
 
 //builds the only shell commands the keep-alive supervisor is allowed to send over local adb
 object KeepAliveShellPlanner {
-    fun mirrorSettingsCommands(config: KeepAliveConfig): List<String> {
+    fun mirrorSettingsCommands(config: KeepAliveConfig, userShutdown: Boolean): List<String> {
         return listOf(
             "settings put global bydcollector_keep_wifi ${flag(config.keepWifi)}",
             "settings put global bydcollector_keep_mobile_data ${flag(config.keepMobileData)}",
             "settings put global bydcollector_keep_bluetooth ${flag(config.keepBluetooth)}",
-            "settings put global bydcollector_recover_collector_service ${flag(config.recoverCollectorService)}"
+            "settings put global bydcollector_recover_collector_service ${flag(config.recoverCollectorService)}",
+            "settings put global bydcollector_user_shutdown ${flag(userShutdown)}"
         )
     }
 

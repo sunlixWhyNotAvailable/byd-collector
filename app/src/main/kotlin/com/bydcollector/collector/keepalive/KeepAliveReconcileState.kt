@@ -5,18 +5,22 @@ class KeepAliveReconcileState(
     private val aliveTtlMs: Long
 ) {
     private var lastAppliedConfig: KeepAliveConfig? = null
+    private var lastAppliedUserShutdown: Boolean? = null
     private var lastAliveAtMs: Long = 0L
 
     fun currentConfigEnabled(): Boolean = lastAppliedConfig?.anyEnabled == true
 
-    fun configChanged(config: KeepAliveConfig): Boolean = config != lastAppliedConfig
+    fun configChanged(config: KeepAliveConfig, userShutdown: Boolean): Boolean {
+        return config != lastAppliedConfig || userShutdown != lastAppliedUserShutdown
+    }
 
     fun shouldStopDaemonForDisabledConfig(configChanged: Boolean): Boolean {
         return configChanged || currentConfigEnabled()
     }
 
-    fun markConfigApplied(config: KeepAliveConfig) {
+    fun markConfigApplied(config: KeepAliveConfig, userShutdown: Boolean) {
         lastAppliedConfig = config
+        lastAppliedUserShutdown = userShutdown
     }
 
     fun markAlive(nowMs: Long) {

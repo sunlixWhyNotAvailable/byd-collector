@@ -1,5 +1,6 @@
 package com.bydcollector.collector.keepalive
 
+import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -14,7 +15,8 @@ class KeepAliveShellPlannerTest {
                 keepMobileData = false,
                 keepBluetooth = true,
                 recoverCollectorService = false
-            )
+            ),
+            userShutdown = false
         )
 
         assertEquals(
@@ -22,10 +24,36 @@ class KeepAliveShellPlannerTest {
                 "settings put global bydcollector_keep_wifi 1",
                 "settings put global bydcollector_keep_mobile_data 0",
                 "settings put global bydcollector_keep_bluetooth 1",
-                "settings put global bydcollector_recover_collector_service 0"
+                "settings put global bydcollector_recover_collector_service 0",
+                "settings put global bydcollector_user_shutdown 0"
             ),
             commands
         )
+    }
+
+    @Test
+    fun daemonMirrorsShutdownGateForShellRecovery() {
+        val commands = KeepAliveShellPlanner.mirrorSettingsCommands(
+            KeepAliveConfig(
+                keepWifi = true,
+                keepMobileData = true,
+                keepBluetooth = true,
+                recoverCollectorService = true
+            ),
+            userShutdown = false
+        )
+
+        assertTrue(commands.contains("settings put global bydcollector_user_shutdown 0"))
+    }
+
+    @Test
+    fun daemonRecoveryCommandsStayExactAndWhitelisted() {
+        val javaSource = sourceFile("com/bydcollector/collector/keepalive/KeepAliveDaemon.java").readText()
+
+        assertTrue(javaSource.contains("am start-foreground-service -a com.bydcollector.collector.action.START -n com.bydcollector.collector/.service.CollectorService"))
+        assertTrue(javaSource.contains("am broadcast -a com.bydcollector.collector.action.KEEP_ALIVE_RECOVERY"))
+        assertTrue(javaSource.contains("settings get global bydcollector_user_shutdown"))
+        assertTrue(javaSource.contains("collector_recovery_blocked_user_shutdown"))
     }
 
     @Test
@@ -68,5 +96,12 @@ class KeepAliveShellPlannerTest {
             "tail -n 40 /data/local/tmp/bydcollector_keepalive.log 2>/dev/null || true",
             KeepAliveShellPlanner.daemonLogTailCommand()
         )
+    }
+
+    private fun sourceFile(path: String): File {
+        return listOf(
+            File("src/main/java/$path"),
+            File("app/src/main/java/$path")
+        ).firstOrNull { it.isFile } ?: error("Missing source file: $path")
     }
 }

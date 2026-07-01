@@ -37,6 +37,7 @@ import com.bydcollector.collector.keepalive.KeepAliveSupervisor
 import com.bydcollector.collector.influx.HttpInfluxClient
 import com.bydcollector.collector.influx.InfluxActionResult
 import com.bydcollector.collector.influx.InfluxExportCoordinator
+import com.bydcollector.collector.ha.TailscaleActivator
 import com.bydcollector.collector.maintenance.DbMaintenanceCoordinator
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.mqtt.HaMqttConfig
@@ -124,23 +125,26 @@ class CollectorService : Service() {
         }
         when (action) {
             ACTION_STOP -> {
+                settings.setMainManuallyStopped(true)
                 settings.setPollingEnabled(false)
                 reconcileCollection()
             }
             ACTION_START_DEBUG -> {
+                settings.setDebugManuallyStopped(false)
                 settings.setDebugPollingEnabled(true)
                 reconcileCollection(DEBUG_REASON_MANUAL)
             }
             ACTION_STOP_DEBUG -> {
+                settings.setDebugManuallyStopped(true)
                 settings.setDebugPollingEnabled(false)
                 settings.setDebugAutoStartEnabled(false)
                 reconcileCollection()
             }
             ACTION_RECONCILE_KEEP_ALIVE -> reconcileKeepAliveOnly()
-            ACTION_START_MQTT_EXPORT -> startMqttExport()
-            ACTION_STOP_MQTT_EXPORT -> stopMqttExport()
-            ACTION_START_INFLUX_EXPORT -> startInfluxExport()
-            ACTION_STOP_INFLUX_EXPORT -> stopInfluxExport()
+            ACTION_START_MQTT_EXPORT -> startMqttExport(clearManualStop = true)
+            ACTION_STOP_MQTT_EXPORT -> stopMqttExport(manualStop = true)
+            ACTION_START_INFLUX_EXPORT -> startInfluxExport(clearManualStop = true)
+            ACTION_STOP_INFLUX_EXPORT -> stopInfluxExport(manualStop = true)
             ACTION_COMPACT_DATABASE -> startDatabaseMaintenance(DbMaintenanceOperation.COMPACT)
             ACTION_ARCHIVE_DATABASE -> startDatabaseMaintenance(DbMaintenanceOperation.ARCHIVE)
             ACTION_START -> reconcileCollection()
@@ -218,37 +222,39 @@ class CollectorService : Service() {
         try {
             val mainEnabled = settings.isPollingEnabled()
             val debugEnabled = settings.isDebugPollingEnabled()
+            val mainAllowed = mainEnabled && !settings.isMainManuallyStopped()
+            val debugAllowed = debugEnabled && !settings.isDebugManuallyStopped()
             val keepAliveConfig = settings.keepAliveConfig()
             val keepAliveEnabled = keepAliveConfig.anyEnabled
             //stops the foreground service only after keep-alive settings have been mirrored to the shell delegate
-            if (!mainEnabled && !debugEnabled && !keepAliveEnabled) {
+            if (!mainAllowed && !debugAllowed && !keepAliveEnabled) {
                 store.recordEvent("service_start_skipped", "Polling and keep-alive disabled")
                 stopMain("polling_disabled")
                 stopDebug("debug_disabled")
                 stopAfterKeepAliveReconcile(keepAliveConfig)
                 return
             }
-            val initialNotificationText = notificationText(mainEnabled, debugEnabled, keepAliveEnabled)
+            val initialNotificationText = notificationText(mainAllowed, debugAllowed, keepAliveEnabled)
             lastNotificationText = initialNotificationText
             startForeground(NOTIFICATION_ID, buildNotification(initialNotificationText))
             acquireWakeLock()
             //keeps network/bluetooth policy independent from whether telemetry polling itself is active
             keepAliveSupervisor.reconcile(keepAliveConfig)
 
-            if (mainEnabled) {
+            if (mainAllowed) {
                 startMainIfNeeded()
             } else {
                 stopMain("polling_disabled")
             }
 
-            if (debugEnabled) {
+            if (debugAllowed) {
                 startDebugIfNeeded(debugStartReason)
             } else {
                 stopDebug("debug_disabled")
             }
 
-            if (settings.isMqttAutoStartEnabled()) startMqttExport()
-            if (settings.isInfluxAutoStartEnabled()) startInfluxExport()
+            if (settings.isMqttAutoStartEnabled() && !settings.isMqttManuallyStopped()) startMqttExport(clearManualStop = false)
+            if (settings.isInfluxAutoStartEnabled() && !settings.isInfluxManuallyStopped()) startInfluxExport(clearManualStop = false)
 
             CollectorAutoStart.scheduleWatchdog(applicationContext, settings, store)
         } catch (error: RuntimeException) {
@@ -562,8 +568,8 @@ class CollectorService : Service() {
             if (snapshot.mainEnabled || snapshot.debugEnabled || settings.keepAliveConfig().anyEnabled) {
                 reconcileCollection()
             }
-            if (snapshot.mqttEnabled) startMqttExport()
-            if (snapshot.influxEnabled) startInfluxExport()
+            if (snapshot.mqttEnabled && !settings.isMqttManuallyStopped()) startMqttExport(clearManualStop = false)
+            if (snapshot.influxEnabled && !settings.isInfluxManuallyStopped()) startInfluxExport(clearManualStop = false)
             if (!snapshot.mqttEnabled && !snapshot.influxEnabled) stopIfNoActiveRuntime()
         } finally {
             restoringRuntime.set(false)
@@ -628,9 +634,11 @@ class CollectorService : Service() {
         }
     }
 
-    private fun startMqttExport() {
+    private fun startMqttExport(clearManualStop: Boolean = true) {
         if (maintenanceBlocksRuntimeStart()) return
+        if (clearManualStop) settings.setMqttManuallyStopped(false)
         settings.setMqttEnabled(true)
+        activateTailscaleIfEnabled("mqtt")
         ensureForegroundForChannel("MQTT export running")
         mqttRuntimeActive.set(true)
         executeMqtt("mqtt_start_error") {
@@ -638,20 +646,33 @@ class CollectorService : Service() {
         }
     }
 
-    private fun stopMqttExport() {
+    private fun stopMqttExport(manualStop: Boolean = true) {
+        if (manualStop) settings.setMqttManuallyStopped(true)
         settings.setMqttEnabled(false)
         disconnectOfflineAsync()
         mqttRuntimeActive.set(false)
         stopIfNoActiveRuntime()
     }
 
-    private fun startInfluxExport() {
+    private fun startInfluxExport(clearManualStop: Boolean = true) {
         if (maintenanceBlocksRuntimeStart()) return
+        if (clearManualStop) settings.setInfluxManuallyStopped(false)
         settings.setInfluxEnabled(true)
+        activateTailscaleIfEnabled("influx")
         ensureForegroundForChannel("Influx export running")
         executeInflux("influx_start_error") {
             influxCoordinator.startExport()
         }
+    }
+
+    private fun activateTailscaleIfEnabled(channel: String) {
+        if (!settings.isTailscaleActivationEnabled()) return
+        val result = TailscaleActivator.activate(applicationContext)
+        store.recordEvent(
+            category = if (result.ok) "tailscale_activation_requested" else "tailscale_activation_failed",
+            message = result.message,
+            detail = "channel=$channel"
+        )
     }
 
     private fun ensureForegroundForChannel(text: String) {
@@ -660,7 +681,8 @@ class CollectorService : Service() {
         acquireWakeLock()
     }
 
-    private fun stopInfluxExport() {
+    private fun stopInfluxExport(manualStop: Boolean = true) {
+        if (manualStop) settings.setInfluxManuallyStopped(true)
         settings.setInfluxEnabled(false)
         executeInflux("influx_stop_error") {
             influxCoordinator.stopExport()
