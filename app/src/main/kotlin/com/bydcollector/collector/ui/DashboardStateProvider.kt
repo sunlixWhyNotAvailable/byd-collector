@@ -34,7 +34,8 @@ class DashboardStateProvider(
     fun load(
         includeTelemetryDetails: Boolean = true,
         includeDebugStatus: Boolean = false,
-        includeVehicleKpis: Boolean = false
+        includeVehicleKpis: Boolean = false,
+        vehicleKpiLanguage: VehicleKpiLanguage = VehicleKpiLanguage.UK
     ): DashboardState {
         val store = storeProvider()
         val serviceRunning = CollectorService.isRunning()
@@ -57,8 +58,8 @@ class DashboardStateProvider(
         val influxConfig = settings.influxConfig()
         val influxState = store.influxExportState()
         val vehicleKpis = if (includeVehicleKpis) {
-            //kpi mapping is kept off lightweight tabs to avoid wide normalized reads during every refresh
-            VehicleKpiMapper.from(store.normalizedCurrentState())
+            //vehicle kpi reads are lightweight normalized-current reads used by the foreground refresh loop
+            VehicleKpiMapper.from(store.normalizedCurrentState(), vehicleKpiLanguage)
         } else {
             VehicleKpis()
         }

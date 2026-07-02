@@ -301,11 +301,22 @@ class CollectorSettings(
     fun isTailscaleActivationEnabled(): Boolean = prefs.getBoolean(KEY_TAILSCALE_ACTIVATION, false)
 
     fun setTailscaleActivationEnabled(enabled: Boolean) {
+        if (enabled) clearTailscaleActivationAttempt()
         prefs.edit().putBoolean(KEY_TAILSCALE_ACTIVATION, enabled).apply()
         store?.recordEvent(
             category = if (enabled) "tailscale_activation_enabled" else "tailscale_activation_disabled",
             message = "Tailscale activation ${if (enabled) "enabled" else "disabled"}"
         )
+    }
+
+    fun tailscaleActivationLastAttemptAtMs(): Long = prefs.getLong(KEY_TAILSCALE_ACTIVATION_LAST_ATTEMPT_AT_MS, 0L)
+
+    fun setTailscaleActivationLastAttemptAtMs(value: Long) {
+        prefs.edit().putLong(KEY_TAILSCALE_ACTIVATION_LAST_ATTEMPT_AT_MS, value).apply()
+    }
+
+    fun clearTailscaleActivationAttempt() {
+        prefs.edit().remove(KEY_TAILSCALE_ACTIVATION_LAST_ATTEMPT_AT_MS).apply()
     }
 
     fun dbMaintenanceStatus(): DbMaintenanceRuntimeStatus {
@@ -318,12 +329,22 @@ class CollectorSettings(
             messageUk = prefs.getString(KEY_DB_MAINTENANCE_MESSAGE_UK, "") ?: "",
             messageEn = prefs.getString(KEY_DB_MAINTENANCE_MESSAGE_EN, "") ?: "",
             error = prefs.getString(KEY_DB_MAINTENANCE_ERROR, null),
-            archivePath = prefs.getString(KEY_DB_MAINTENANCE_ARCHIVE_PATH, null)
+            archivePath = prefs.getString(KEY_DB_MAINTENANCE_ARCHIVE_PATH, null),
+            startedAtMs = prefs.getLong(KEY_DB_MAINTENANCE_STARTED_AT_MS, 0L),
+            updatedAtMs = prefs.getLong(KEY_DB_MAINTENANCE_UPDATED_AT_MS, 0L)
         )
     }
 
-    fun setDbMaintenanceStatus(status: DbMaintenanceRuntimeStatus) {
-        prefs.edit().apply {
+    fun setDbMaintenanceStatus(status: DbMaintenanceRuntimeStatus, synchronous: Boolean = false) {
+        val previous = dbMaintenanceStatus()
+        val now = System.currentTimeMillis()
+        val startedAt = when {
+            status.startedAtMs > 0L -> status.startedAtMs
+            previous.running && previous.operation == status.operation && previous.startedAtMs > 0L -> previous.startedAtMs
+            status.running -> now
+            else -> 0L
+        }
+        val editor = prefs.edit().apply {
             status.operation?.let { putString(KEY_DB_MAINTENANCE_OPERATION, it.key) }
                 ?: remove(KEY_DB_MAINTENANCE_OPERATION)
             putBoolean(KEY_DB_MAINTENANCE_RUNNING, status.running)
@@ -335,8 +356,35 @@ class CollectorSettings(
             status.error?.let { putString(KEY_DB_MAINTENANCE_ERROR, it) } ?: remove(KEY_DB_MAINTENANCE_ERROR)
             status.archivePath?.let { putString(KEY_DB_MAINTENANCE_ARCHIVE_PATH, it) }
                 ?: remove(KEY_DB_MAINTENANCE_ARCHIVE_PATH)
-            apply()
+            putLong(KEY_DB_MAINTENANCE_STARTED_AT_MS, startedAt)
+            putLong(KEY_DB_MAINTENANCE_UPDATED_AT_MS, now)
         }
+        if (synchronous) editor.commit() else editor.apply()
+    }
+
+    fun recoverInterruptedDbMaintenanceIfNeeded(source: String): Boolean {
+        val status = dbMaintenanceStatus()
+        val operation = status.operation ?: return false
+        if (!status.running) return false
+        val now = System.currentTimeMillis()
+        if (status.updatedAtMs > 0L && now - status.updatedAtMs < DB_MAINTENANCE_RECOVERY_GRACE_MS) {
+            return false
+        }
+        setDbMaintenanceStatus(
+            status.copy(
+                running = false,
+                completed = false,
+                stepCount = status.stepCount.takeIf { it > 0 } ?: operation.stepsUk.size,
+                error = "Interrupted before completion"
+            ),
+            synchronous = true
+        )
+        store?.recordEvent(
+            category = "database_maintenance_interrupted",
+            message = "Database maintenance interrupted before completion",
+            detail = "source=$source operation=${operation.key} step=${status.stepIndex}/${status.stepCount} updated_at_ms=${status.updatedAtMs}"
+        )
+        return true
     }
 
     fun clearDbMaintenanceStatus() {
@@ -350,6 +398,8 @@ class CollectorSettings(
             .remove(KEY_DB_MAINTENANCE_MESSAGE_EN)
             .remove(KEY_DB_MAINTENANCE_ERROR)
             .remove(KEY_DB_MAINTENANCE_ARCHIVE_PATH)
+            .remove(KEY_DB_MAINTENANCE_STARTED_AT_MS)
+            .remove(KEY_DB_MAINTENANCE_UPDATED_AT_MS)
             .apply()
     }
 
@@ -513,6 +563,7 @@ class CollectorSettings(
         const val KEY_UPDATE_AUTO_CHECK = "updateAutoCheck"
         const val KEY_UPDATE_LAST_CHECK_AT_MS = "updateLastCheckAtMs"
         const val KEY_TAILSCALE_ACTIVATION = "tailscaleActivation"
+        const val KEY_TAILSCALE_ACTIVATION_LAST_ATTEMPT_AT_MS = "tailscaleActivationLastAttemptAtMs"
         const val KEY_DB_MAINTENANCE_OPERATION = "dbMaintenanceOperation"
         const val KEY_DB_MAINTENANCE_RUNNING = "dbMaintenanceRunning"
         const val KEY_DB_MAINTENANCE_COMPLETED = "dbMaintenanceCompleted"
@@ -522,6 +573,9 @@ class CollectorSettings(
         const val KEY_DB_MAINTENANCE_MESSAGE_EN = "dbMaintenanceMessageEn"
         const val KEY_DB_MAINTENANCE_ERROR = "dbMaintenanceError"
         const val KEY_DB_MAINTENANCE_ARCHIVE_PATH = "dbMaintenanceArchivePath"
+        const val KEY_DB_MAINTENANCE_STARTED_AT_MS = "dbMaintenanceStartedAtMs"
+        const val KEY_DB_MAINTENANCE_UPDATED_AT_MS = "dbMaintenanceUpdatedAtMs"
+        const val DB_MAINTENANCE_RECOVERY_GRACE_MS = 15_000L
         const val DEFAULT_DEBUG_BATCH_SIZE = 500
         const val SAFE_DEBUG_AUTOSTART_BATCH_SIZE = 500
         const val MAX_DEBUG_BATCH_SIZE = 6100

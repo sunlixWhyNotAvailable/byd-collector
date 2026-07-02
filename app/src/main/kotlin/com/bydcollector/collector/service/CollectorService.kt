@@ -69,6 +69,7 @@ class CollectorService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var sessionId: Long? = null
     private var debugPoller: DirectDebugRoundRobinPoller? = null
+    private val debugPollerLock = Any()
     private var normalizedStateChangedCallback: ((Set<String>) -> Unit)? = null
     private val debugStartExecutor = namedSingleThreadExecutor("byd-debug-start")
     private val maintenanceExecutor = namedSingleThreadExecutor("byd-db-maintenance")
@@ -120,6 +121,7 @@ class CollectorService : Service() {
             suppressStartAfterUserShutdown(action)
             return START_NOT_STICKY
         }
+        recoverInterruptedMaintenanceIfNeeded(action)
         if (maintenanceActive.get() && action != ACTION_COMPACT_DATABASE && action != ACTION_ARCHIVE_DATABASE) {
             return START_STICKY
         }
@@ -267,7 +269,7 @@ class CollectorService : Service() {
             val keepAliveConfig = settings.keepAliveConfig()
             val keepAliveEnabled = keepAliveConfig.anyEnabled
             val mainRunning = poller.isRunning()
-            val debugRunning = debugPoller?.isRunning() == true
+            val debugRunning = isDebugPollerRunning()
             //allows the service to exist solely for keep-alive toggles when collection is intentionally stopped
             if (!mainRunning && !debugRunning && !keepAliveEnabled) {
                 store.recordEvent("keep_alive_reconcile_stopped", "Keep-alive disabled and no active collector runtime")
@@ -325,7 +327,7 @@ class CollectorService : Service() {
 
     private fun startDebugIfNeeded(reason: String) {
         if (maintenanceBlocksRuntimeStart()) return
-        if (debugPoller?.isRunning() == true) return
+        if (isDebugPollerRunning()) return
         if (!debugStartInProgress.compareAndSet(false, true)) return
         debugStartExecutor.execute {
             try {
@@ -341,7 +343,7 @@ class CollectorService : Service() {
                     updateNotification("Polling error: ${pollingErrorSummary(launch.message)}")
                     return@execute
                 }
-                if (!settings.isDebugPollingEnabled()) return@execute
+                if (!settings.isDebugPollingEnabled() || settings.isDebugManuallyStopped()) return@execute
                 val requestedBatchSize = settings.debugBatchSize()
                 //caps automatic debug work so a reboot does not immediately start a huge round-robin load
                 val batchSize = if (reason == DEBUG_REASON_MANUAL) {
@@ -369,8 +371,24 @@ class CollectorService : Service() {
                         }
                     }
                 )
-                debugPoller = nextPoller
-                nextPoller.start(batchSize)
+                val started = synchronized(debugPollerLock) {
+                    if (
+                        !settings.isDebugPollingEnabled() ||
+                        settings.isDebugManuallyStopped() ||
+                        maintenanceBlocksRuntimeStart() ||
+                        debugPoller?.isRunning() == true
+                    ) {
+                        false
+                    } else {
+                        nextPoller.start(batchSize)
+                        debugPoller = nextPoller
+                        true
+                    }
+                }
+                if (!started) {
+                    nextPoller.shutdown("debug_start_cancelled")
+                    return@execute
+                }
                 debugRunning.set(true)
                 store.recordEvent(
                     "debug_polling_started",
@@ -510,9 +528,20 @@ class CollectorService : Service() {
     }
 
     private fun stopDebug(reason: String) {
-        debugPoller?.shutdown(reason)
-        debugPoller = null
+        detachDebugPoller()?.shutdown(reason)
         debugRunning.set(false)
+    }
+
+    private fun isDebugPollerRunning(): Boolean {
+        return synchronized(debugPollerLock) { debugPoller?.isRunning() == true }
+    }
+
+    private fun detachDebugPoller(): DirectDebugRoundRobinPoller? {
+        return synchronized(debugPollerLock) {
+            val current = debugPoller
+            debugPoller = null
+            current
+        }
     }
 
     private data class RuntimeSnapshot(
@@ -533,10 +562,9 @@ class CollectorService : Service() {
 
     private fun stopRuntimeForMaintenance() {
         if (!poller.stopAndJoin(2_000L)) error("Main poller did not stop for database maintenance")
-        if (debugPoller?.shutdownAndAwait("database_maintenance", 2_000L) == false) {
+        if (detachDebugPoller()?.shutdownAndAwait("database_maintenance", 2_000L) == false) {
             error("Debug poller did not stop for database maintenance")
         }
-        debugPoller = null
         mainPollingRunning.set(false)
         debugRunning.set(false)
         sessionId?.let { openedSessionId ->
@@ -614,7 +642,7 @@ class CollectorService : Service() {
         val text = if (result.ok) {
             notificationText(
                 mainEnabled = true,
-                debugEnabled = debugPoller?.isRunning() == true,
+                debugEnabled = isDebugPollerRunning(),
                 keepAliveEnabled = settings.keepAliveConfig().anyEnabled
             )
         } else {
@@ -667,6 +695,17 @@ class CollectorService : Service() {
 
     private fun activateTailscaleIfEnabled(channel: String) {
         if (!settings.isTailscaleActivationEnabled()) return
+        val now = System.currentTimeMillis()
+        val lastAttempt = settings.tailscaleActivationLastAttemptAtMs()
+        if (lastAttempt > 0L && now - lastAttempt < TAILSCALE_ACTIVATION_THROTTLE_MS) {
+            store.recordEvent(
+                category = "tailscale_activation_throttled",
+                message = "Tailscale activation skipped by throttle",
+                detail = "channel=$channel age_ms=${now - lastAttempt}"
+            )
+            return
+        }
+        settings.setTailscaleActivationLastAttemptAtMs(now)
         val result = TailscaleActivator.activate(applicationContext)
         store.recordEvent(
             category = if (result.ok) "tailscale_activation_requested" else "tailscale_activation_failed",
@@ -692,7 +731,7 @@ class CollectorService : Service() {
 
     private fun stopIfNoActiveRuntime() {
         val mainRunning = poller.isRunning()
-        val debugRunningNow = debugPoller?.isRunning() == true
+        val debugRunningNow = isDebugPollerRunning()
         val keepAliveEnabled = settings.keepAliveConfig().anyEnabled
         if (mainRunning || debugRunningNow || keepAliveEnabled || settings.isMqttEnabled() || settings.isInfluxEnabled()) {
             return
@@ -895,6 +934,7 @@ class CollectorService : Service() {
 
     private fun startDatabaseMaintenance(operation: DbMaintenanceOperation) {
         if (!maintenanceActive.compareAndSet(false, true)) return
+        maintenanceRunningInProcess.set(true)
         val snapshot = runtimeSnapshot()
         ensureForegroundForChannel("Database maintenance")
         try {
@@ -903,10 +943,12 @@ class CollectorService : Service() {
                     maintenanceCoordinator.run(operation) { restoreRuntimeAfterMaintenance(snapshot) }
                 } finally {
                     maintenanceActive.set(false)
+                    maintenanceRunningInProcess.set(false)
                 }
             }
         } catch (error: RejectedExecutionException) {
             maintenanceActive.set(false)
+            maintenanceRunningInProcess.set(false)
             store.recordEvent(
                 "database_maintenance_rejected",
                 "Database maintenance action rejected",
@@ -916,7 +958,19 @@ class CollectorService : Service() {
     }
 
     private fun maintenanceBlocksRuntimeStart(): Boolean {
-        return maintenanceActive.get() && !restoringRuntime.get()
+        if (restoringRuntime.get()) return false
+        if (maintenanceActive.get()) return true
+        if (settings.dbMaintenanceStatus().running) {
+            settings.recoverInterruptedDbMaintenanceIfNeeded("runtime_start_guard")
+            return false
+        }
+        return false
+    }
+
+    private fun recoverInterruptedMaintenanceIfNeeded(action: String) {
+        if (action == ACTION_COMPACT_DATABASE || action == ACTION_ARCHIVE_DATABASE) return
+        if (maintenanceActive.get()) return
+        settings.recoverInterruptedDbMaintenanceIfNeeded("service_start:$action")
     }
 
     private fun oneShotMqttCoordinator(): MqttPublishCoordinator {
@@ -1037,16 +1091,19 @@ class CollectorService : Service() {
         private const val CHANNEL_ID = "collector"
         private const val NOTIFICATION_ID = 1001
         private const val STATUS_HEARTBEAT_INTERVAL_MS = 30_000L
+        private const val TAILSCALE_ACTIVATION_THROTTLE_MS = 5 * 60 * 1000L
         private const val TAG = "BYDCollectorService"
         private const val DEBUG_REASON_AUTOSTART = "autostart"
         private const val DEBUG_REASON_MANUAL = "manual"
         private val running = AtomicBoolean(false)
         private val mainPollingRunning = AtomicBoolean(false)
         private val debugRunning = AtomicBoolean(false)
+        private val maintenanceRunningInProcess = AtomicBoolean(false)
 
         fun isRunning(): Boolean = running.get()
         fun isMainPollingRunning(): Boolean = mainPollingRunning.get()
         fun isDebugRunning(): Boolean = debugRunning.get()
+        fun isMaintenanceRunningInProcess(): Boolean = maintenanceRunningInProcess.get()
 
         fun startIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
             action = ACTION_START

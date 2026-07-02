@@ -74,4 +74,15 @@ class BydCollectorStringsTest {
         assertEquals("Shutdown", en.shutdown)
         assertEquals("Stop the app until it is opened again", en.shutdownDescription)
     }
+
+    @Test
+    fun kpiLabelsLiveInUiStrings() {
+        val uk = strings(UiLanguage.UK)
+        val en = strings(UiLanguage.EN)
+
+        assertEquals("Пробіг", uk.kpiOdometer)
+        assertEquals("Odometer", en.kpiOdometer)
+        assertEquals("Запас ходу", uk.kpiRange)
+        assertEquals("Range", en.kpiRange)
+    }
 }

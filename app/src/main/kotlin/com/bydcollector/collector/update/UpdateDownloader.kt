@@ -11,6 +11,7 @@ import java.io.File
 
 class UpdateDownloader(private val context: Context) {
     fun enqueue(info: UpdateInfo): Long {
+        GitHubReleaseTrust.requireTrustedApkDownloadUrl(info.downloadUrl, info.downloadContentType)
         val apkFileName = updateApkName(info.version)
         deleteOldUpdateApks(
             context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS),
@@ -31,6 +32,13 @@ class UpdateDownloader(private val context: Context) {
         return manager.enqueue(request)
     }
 
+    fun downloadedFile(info: UpdateInfo): File {
+        return File(
+            context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS),
+            updateApkName(info.version)
+        )
+    }
+
     fun progress(downloadId: Long): Int {
         val manager = context.getSystemService(DownloadManager::class.java)
         val query = DownloadManager.Query().setFilterById(downloadId)
@@ -48,10 +56,8 @@ class UpdateDownloader(private val context: Context) {
     }
 
     fun install(info: UpdateInfo) {
-        val file = File(
-            context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS),
-            updateApkName(info.version)
-        )
+        GitHubReleaseTrust.requireTrustedApkDownloadUrl(info.downloadUrl, info.downloadContentType)
+        val file = downloadedFile(info)
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
         val intent = Intent(Intent.ACTION_VIEW)
             .setDataAndType(uri, APK_MIME)
@@ -74,7 +80,7 @@ class UpdateDownloader(private val context: Context) {
     companion object {
         private const val APK_MIME = "application/vnd.android.package-archive"
 
-        internal fun updateApkName(version: String): String = "bydcollector-$version.apk"
+        internal fun updateApkName(version: String): String = "bydcollector-${GitHubReleaseTrust.sanitizeFileToken(version)}.apk"
 
         internal fun deleteOldUpdateApks(downloadDir: File?, keepFileName: String) {
             if (downloadDir == null || !downloadDir.exists()) return

@@ -13,7 +13,7 @@ class CollectorServiceMaintenanceContractTest {
 
         assertTrue(source.contains("private val maintenanceActive = AtomicBoolean(false)"))
         assertTrue(stop.contains("if (!poller.stopAndJoin(2_000L)) error("))
-        assertTrue(stop.contains("debugPoller?.shutdownAndAwait(\"database_maintenance\", 2_000L) == false"))
+        assertTrue(stop.contains("detachDebugPoller()?.shutdownAndAwait(\"database_maintenance\", 2_000L) == false"))
         assertTrue(stop.contains("error(\"Debug poller did not stop for database maintenance\")"))
         assertFalse(stop.contains("settings.setPollingEnabled(false)"))
         assertFalse(stop.contains("settings.setDebugPollingEnabled(false)"))
@@ -33,6 +33,49 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(start.contains("maintenanceActive.set(false)"))
         assertTrue(source.contains("if (maintenanceActive.get() && action != ACTION_COMPACT_DATABASE && action != ACTION_ARCHIVE_DATABASE)"))
         assertTrue(source.contains("private fun maintenanceBlocksRuntimeStart(): Boolean"))
+    }
+
+    @Test
+    fun maintenanceStatusHasSynchronousPersistenceAndInterruptedRecovery() {
+        val settings = sourceFile("com/bydcollector/collector/service/CollectorSettings.kt").readText()
+
+        assertTrue(settings.contains("fun setDbMaintenanceStatus(status: DbMaintenanceRuntimeStatus, synchronous: Boolean = false)"))
+        assertTrue(settings.contains("if (synchronous) editor.commit() else editor.apply()"))
+        assertTrue(settings.contains("fun recoverInterruptedDbMaintenanceIfNeeded(source: String): Boolean"))
+        assertTrue(settings.contains("previous.running && previous.operation == status.operation && previous.startedAtMs > 0L"))
+        assertTrue(settings.contains("DB_MAINTENANCE_RECOVERY_GRACE_MS = 15_000L"))
+        assertTrue(settings.contains("now - status.updatedAtMs < DB_MAINTENANCE_RECOVERY_GRACE_MS"))
+        assertTrue(settings.contains("running = false"))
+        assertTrue(settings.contains("completed = false"))
+        assertTrue(settings.contains("error = \"Interrupted before completion\""))
+    }
+
+    @Test
+    fun maintenanceStatusStoresUpdateTimestamps() {
+        val model = sourceFile("com/bydcollector/collector/maintenance/DbMaintenanceModels.kt").readText()
+        val settings = sourceFile("com/bydcollector/collector/service/CollectorSettings.kt").readText()
+
+        assertTrue(model.contains("val startedAtMs: Long = 0L"))
+        assertTrue(model.contains("val updatedAtMs: Long = 0L"))
+        assertTrue(settings.contains("KEY_DB_MAINTENANCE_STARTED_AT_MS"))
+        assertTrue(settings.contains("KEY_DB_MAINTENANCE_UPDATED_AT_MS"))
+    }
+
+    @Test
+    fun staleMaintenanceIsRecoveredFromActivityAndServiceButNotForMaintenanceIntent() {
+        val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+
+        assertTrue(activity.contains("if (!CollectorService.isMaintenanceRunningInProcess())"))
+        assertTrue(activity.contains("settings.recoverInterruptedDbMaintenanceIfNeeded(\"activity_start\")"))
+        assertTrue(service.contains("private val maintenanceRunningInProcess = AtomicBoolean(false)"))
+        assertTrue(service.contains("fun isMaintenanceRunningInProcess(): Boolean = maintenanceRunningInProcess.get()"))
+        assertTrue(service.contains("maintenanceRunningInProcess.set(true)"))
+        assertTrue(service.contains("maintenanceRunningInProcess.set(false)"))
+        assertTrue(service.contains("private fun recoverInterruptedMaintenanceIfNeeded(action: String)"))
+        assertTrue(service.contains("if (action == ACTION_COMPACT_DATABASE || action == ACTION_ARCHIVE_DATABASE) return"))
+        assertTrue(service.contains("settings.recoverInterruptedDbMaintenanceIfNeeded(\"service_start:${'$'}action\")"))
+        assertTrue(service.contains("settings.dbMaintenanceStatus().running"))
     }
 
     @Test

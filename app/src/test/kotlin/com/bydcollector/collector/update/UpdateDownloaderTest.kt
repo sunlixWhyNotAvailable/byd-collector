@@ -19,4 +19,11 @@ class UpdateDownloaderTest {
         assertTrue(currentApk.exists())
         assertTrue(unrelated.exists())
     }
+
+    @Test
+    fun localApkNameSanitizesVersionToken() {
+        assertFalse(UpdateDownloader.updateApkName("../v1.3.4").contains("/"))
+        assertFalse(UpdateDownloader.updateApkName("..\\v1.3.4").contains("\\"))
+        assertTrue(UpdateDownloader.updateApkName("v1.3.4").endsWith(".apk"))
+    }
 }

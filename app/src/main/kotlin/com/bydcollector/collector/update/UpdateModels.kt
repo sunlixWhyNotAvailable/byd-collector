@@ -3,7 +3,8 @@ package com.bydcollector.collector.update
 data class UpdateInfo(
     val version: String,
     val downloadUrl: String,
-    val releaseNotes: String
+    val releaseNotes: String,
+    val downloadContentType: String? = null
 )
 
 sealed interface UpdateCheckResult {

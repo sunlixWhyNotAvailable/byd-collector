@@ -35,6 +35,35 @@ class VehicleKpiMapperTest {
     }
 
     @Test
+    fun mapsBatteryDischargePowerUnitsForEnglish() {
+        val kpis = VehicleKpiMapper.from(
+            rows = listOf(
+                state("battery_charge_power_kw", 0.0),
+                state("battery_discharge_power_kw", 35.8)
+            ),
+            language = VehicleKpiLanguage.EN
+        )
+
+        assertEquals("Discharging", kpis.batteryPowerLabelEn)
+        assertEquals("-35.8 kW", kpis.batteryPowerKw)
+    }
+
+    @Test
+    fun mapsDistanceAndCellVoltageUnitsForEnglish() {
+        val kpis = VehicleKpiMapper.from(
+            rows = listOf(
+                state("odometer_km", 1234.0),
+                state("battery_highest_cell_voltage_raw", 3.314),
+                state("battery_lowest_cell_voltage_raw", 3.312)
+            ),
+            language = VehicleKpiLanguage.EN
+        )
+
+        assertEquals("1 234 km", kpis.odometerKm)
+        assertEquals("2 mV", kpis.cellVoltageDeltaMv)
+    }
+
+    @Test
     fun missingOrInvalidBatteryHealthValuesFailClosed() {
         val missing = VehicleKpiMapper.from(emptyList())
         val invalidDelta = VehicleKpiMapper.from(

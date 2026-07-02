@@ -45,7 +45,7 @@ private val DarkPalette = BydPalette(
     muted = Color(0xFFAAB8CA),
     active = Color(0xFF173A5C),
     activeSoft = Color(0xFF20344A),
-    accent = Color(0xFF2F86F6),
+    accent = Color(0xFF1F6FD8),
     accentText = Color(0xFFFFFFFF),
     green = Color(0xFF54D898),
     greenSoft = Color(0xFF123C2B),
@@ -73,13 +73,13 @@ private val LightPalette = BydPalette(
     muted = Color(0xFF526274),
     active = Color(0xFFD9EAFE),
     activeSoft = Color(0xFFE7F1FF),
-    accent = Color(0xFF2F86F6),
+    accent = Color(0xFF1F6FD8),
     accentText = Color(0xFFFFFFFF),
-    green = Color(0xFF36CF88),
+    green = Color(0xFF147A55),
     greenSoft = Color(0xFFD8F4E7),
-    yellow = Color(0xFFF1C04C),
+    yellow = Color(0xFF7A5A00),
     yellowSoft = Color(0xFFFFF1C9),
-    red = Color(0xFFFF7C7C),
+    red = Color(0xFFB42318),
     redSoft = Color(0xFFFFE1E1),
     disabled = Color(0xFFE1E7EF),
     switchOff = Color(0xFFDDE4EE),
@@ -97,4 +97,3 @@ fun BydCollectorTheme(dark: Boolean, content: @Composable () -> Unit) {
         content()
     }
 }
-

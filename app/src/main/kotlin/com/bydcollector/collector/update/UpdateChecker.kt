@@ -33,7 +33,8 @@ class UpdateChecker(
 
     private fun fetchLatestRelease(): String {
         //keep github url outside ui so release target is build-time configurable
-        val connection = (URL(BuildConfig.UPDATE_RELEASES_API_URL).openConnection() as HttpURLConnection).apply {
+        val trustedUrl = GitHubReleaseTrust.requireTrustedApiUrl(BuildConfig.UPDATE_RELEASES_API_URL)
+        val connection = (URL(trustedUrl).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = 10_000
             readTimeout = 10_000

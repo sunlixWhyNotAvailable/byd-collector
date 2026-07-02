@@ -6,8 +6,13 @@ import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
+enum class VehicleKpiLanguage { UK, EN }
+
 object VehicleKpiMapper {
-    fun from(rows: List<StoredNormalizedState>): VehicleKpis {
+    fun from(
+        rows: List<StoredNormalizedState>,
+        language: VehicleKpiLanguage = VehicleKpiLanguage.UK
+    ): VehicleKpis {
         val byKey = rows.associateBy { it.fieldKey }
         val chargePower = byKey.number("battery_charge_power_kw")
         val dischargePower = byKey.number("battery_discharge_power_kw")
@@ -19,15 +24,15 @@ object VehicleKpiMapper {
         val power = if (charging) chargePower else dischargePower
         return VehicleKpis(
             socPercent = byKey.percent("soc"),
-            odometerKm = byKey.km("odometer_km"),
+            odometerKm = byKey.km("odometer_km", language),
             cabinTempC = byKey.temp("inside_temp_c_raw"),
             sohPercent = byKey.percent("battery_soh_percent"),
             batteryPowerLabelUk = if (charging) "Заряджання" else "Розряджання",
             batteryPowerLabelEn = if (charging) "Charging" else "Discharging",
-            batteryPowerKw = power?.let { formatKw(if (charging) abs(it) else -abs(it)) } ?: "-",
-            remainingRangeKm = byKey.km("remaining_range_km"),
+            batteryPowerKw = power?.let { formatKw(if (charging) abs(it) else -abs(it), language) } ?: "-",
+            remainingRangeKm = byKey.km("remaining_range_km", language),
             batteryTempC = byKey.temp("battery_average_temp_raw"),
-            cellVoltageDeltaMv = deltaMv
+            cellVoltageDeltaMv = deltaMv?.let { formatMv(it, language) } ?: "-"
         )
     }
 
@@ -41,24 +46,31 @@ object VehicleKpiMapper {
         return number(fieldKey)?.roundToInt()?.let { "$it%" } ?: "-"
     }
 
-    private fun Map<String, StoredNormalizedState>.km(fieldKey: String): String {
-        return number(fieldKey)?.roundToInt()?.let { "${it.formatInt()} км" } ?: "-"
+    private fun Map<String, StoredNormalizedState>.km(fieldKey: String, language: VehicleKpiLanguage): String {
+        val unit = if (language == VehicleKpiLanguage.UK) "км" else "km"
+        return number(fieldKey)?.roundToInt()?.let { "${it.formatInt()} $unit" } ?: "-"
     }
 
     private fun Map<String, StoredNormalizedState>.temp(fieldKey: String): String {
         return number(fieldKey)?.roundToInt()?.let { "$it C" } ?: "-"
     }
 
-    private fun formatKw(value: Double): String {
+    private fun formatKw(value: Double, language: VehicleKpiLanguage): String {
         val rounded = String.format(Locale.US, "%.1f", value)
-        return "$rounded кВт"
+        val unit = if (language == VehicleKpiLanguage.UK) "кВт" else "kW"
+        return "$rounded $unit"
     }
 
-    private fun cellDeltaMv(highestCell: Double?, lowestCell: Double?): String {
-        if (highestCell == null || lowestCell == null) return "-"
+    private fun formatMv(value: Int, language: VehicleKpiLanguage): String {
+        val unit = if (language == VehicleKpiLanguage.UK) "мВ" else "mV"
+        return "$value $unit"
+    }
+
+    private fun cellDeltaMv(highestCell: Double?, lowestCell: Double?): Int? {
+        if (highestCell == null || lowestCell == null) return null
         val delta = highestCell - lowestCell
-        if (delta < 0.0 || delta > 1.0) return "-"
-        return "${(delta * 1000.0).roundToInt()} мВ"
+        if (delta < 0.0 || delta > 1.0) return null
+        return (delta * 1000.0).roundToInt()
     }
 
     private fun Int.formatInt(): String {

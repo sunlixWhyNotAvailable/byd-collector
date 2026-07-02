@@ -23,12 +23,14 @@ import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
 import com.bydcollector.collector.maintenance.DbMaintenanceUiState
 import com.bydcollector.collector.mqtt.HaMqttActions
 import com.bydcollector.collector.mqtt.MqttActionResult
+import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorServiceController
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.system.CollectorAutoStart
 import com.bydcollector.collector.ui.DashboardState
 import com.bydcollector.collector.ui.DashboardStateMerger
 import com.bydcollector.collector.ui.DashboardStateProvider
+import com.bydcollector.collector.ui.VehicleKpiLanguage
 import com.bydcollector.collector.ui.compose.AppTab
 import com.bydcollector.collector.ui.compose.BydCollectorActions
 import com.bydcollector.collector.ui.compose.BydCollectorApp
@@ -37,6 +39,7 @@ import com.bydcollector.collector.ui.compose.MqttDraft
 import com.bydcollector.collector.ui.compose.UiLanguage
 import com.bydcollector.collector.update.UpdateAutoCheckAction
 import com.bydcollector.collector.update.UpdateAutoCheckRuntime
+import com.bydcollector.collector.update.UpdateApkVerifier
 import com.bydcollector.collector.update.UpdateChecker
 import com.bydcollector.collector.update.UpdateCheckResult
 import com.bydcollector.collector.update.UpdateDownloader
@@ -54,6 +57,7 @@ class MainActivity : ComponentActivity() {
     private val updateExecutor = namedSingleThreadExecutor("byd-update")
     private val updateChecker by lazy { UpdateChecker(settings) }
     private val updateDownloader by lazy { UpdateDownloader(applicationContext) }
+    private val updateApkVerifier by lazy { UpdateApkVerifier(applicationContext) }
     private var startupBackgroundLaunchPosted = false
     private var startupAdbSelfCheckPosted = false
     @Volatile private var refreshInFlight = false
@@ -80,6 +84,7 @@ class MainActivity : ComponentActivity() {
             handler.postDelayed(this, DASHBOARD_REFRESH_INTERVAL_MS)
         }
     }
+    private val updateAutoCheckTimerTask = Runnable { onUpdateAutoCheckTimerElapsed() }
 
     //maps every ui command to persisted settings plus service intents so process restarts keep the same intent
     private val uiActions = object : BydCollectorActions {
@@ -162,7 +167,8 @@ class MainActivity : ComponentActivity() {
                     stepCount = operation.stepsUk.size,
                     messageUk = operation.stepsUk.first(),
                     messageEn = operation.stepsEn.first()
-                )
+                ),
+                synchronous = true
             )
             runCatching {
                 when (operation) {
@@ -390,6 +396,9 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         store = currentStore()
         settings = CollectorSettings(applicationContext, store)
+        if (!CollectorService.isMaintenanceRunningInProcess()) {
+            settings.recoverInterruptedDbMaintenanceIfNeeded("activity_start")
+        }
         val clearedUserShutdown = settings.clearUserShutdownRequestIfSet()
         if (clearedUserShutdown) {
             settings.clearRuntimeManualStops()
@@ -463,7 +472,7 @@ class MainActivity : ComponentActivity() {
         }
         dashboardExecutor.shutdownNow()
         updateExecutor.shutdownNow()
-        handler.removeCallbacks(::onUpdateAutoCheckTimerElapsed)
+        handler.removeCallbacks(updateAutoCheckTimerTask)
         super.onDestroy()
     }
 
@@ -487,13 +496,15 @@ class MainActivity : ComponentActivity() {
         //loads only the heavy dashboard slices needed by the visible tab to keep ui refresh cheap
         val includeTelemetryDetails = tab == AppTab.MAIN || tab == AppTab.ALL_PARAMETERS || tab == AppTab.LOGS
         val includeDebugStatus = tab == AppTab.ALL_PARAMETERS || tab == AppTab.LOGS
-        val includeVehicleKpis = tab == AppTab.ALL_PARAMETERS
+        val includeVehicleKpis = foreground || tab == AppTab.ALL_PARAMETERS
+        val kpiLanguage = if (uiLanguage == UiLanguage.UK) VehicleKpiLanguage.UK else VehicleKpiLanguage.EN
         dashboardExecutor.execute {
             val result = runCatching {
                 stateProvider.load(
                     includeTelemetryDetails = includeTelemetryDetails,
                     includeDebugStatus = includeDebugStatus,
-                    includeVehicleKpis = includeVehicleKpis
+                    includeVehicleKpis = includeVehicleKpis,
+                    vehicleKpiLanguage = kpiLanguage
                 )
             }
             runOnUiThread {
@@ -727,8 +738,8 @@ class MainActivity : ComponentActivity() {
             UpdateAutoCheckAction.None -> Unit
             UpdateAutoCheckAction.Run -> runAutomaticUpdateCheck()
             is UpdateAutoCheckAction.Schedule -> {
-                handler.removeCallbacks(::onUpdateAutoCheckTimerElapsed)
-                handler.postDelayed(::onUpdateAutoCheckTimerElapsed, action.delayMs)
+                handler.removeCallbacks(updateAutoCheckTimerTask)
+                handler.postDelayed(updateAutoCheckTimerTask, action.delayMs)
             }
         }
     }
@@ -774,6 +785,8 @@ class MainActivity : ComponentActivity() {
                         if (!destroyed) updateUiState = UpdateUiState.Downloading(info, progress)
                     }
                 }
+                val validation = updateApkVerifier.validate(updateDownloader.downloadedFile(info))
+                if (!validation.ok) error(validation.message)
                 downloadId
             }
             runOnUiThread {

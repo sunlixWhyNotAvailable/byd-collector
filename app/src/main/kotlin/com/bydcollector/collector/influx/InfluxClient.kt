@@ -38,28 +38,32 @@ class HttpInfluxClient : InfluxClient {
     ): InfluxActionResult {
         if (config.host.isBlank()) return InfluxActionResult.fail("influx_host_missing", "InfluxDB host is blank")
         return runCatching {
-            val connection = (URL(config.baseUrl + path).openConnection() as HttpURLConnection).apply {
-                requestMethod = method
-                connectTimeout = CONNECT_TIMEOUT_MS
-                readTimeout = READ_TIMEOUT_MS
-                setRequestProperty("User-Agent", "BYDCollector")
-                config.basicAuthHeader()?.let { setRequestProperty("Authorization", it) }
+            var connection: HttpURLConnection? = null
+            try {
+                connection = (URL(config.baseUrl + path).openConnection() as HttpURLConnection).apply {
+                    requestMethod = method
+                    connectTimeout = CONNECT_TIMEOUT_MS
+                    readTimeout = READ_TIMEOUT_MS
+                    setRequestProperty("User-Agent", "BYDCollector")
+                    config.basicAuthHeader()?.let { setRequestProperty("Authorization", it) }
+                    if (body != null) {
+                        doOutput = true
+                        setRequestProperty("Content-Type", "text/plain; charset=utf-8")
+                    }
+                }
                 if (body != null) {
-                    doOutput = true
-                    setRequestProperty("Content-Type", "text/plain; charset=utf-8")
+                    OutputStreamWriter(connection.outputStream, StandardCharsets.UTF_8).use { writer ->
+                        writer.write(body)
+                    }
                 }
-            }
-            if (body != null) {
-                OutputStreamWriter(connection.outputStream, StandardCharsets.UTF_8).use { writer ->
-                    writer.write(body)
+                val code = connection.responseCode
+                if (code in 200..299) {
+                    InfluxActionResult.ok("http $code")
+                } else {
+                    InfluxActionResult.fail("influx_http_error", "HTTP $code")
                 }
-            }
-            val code = connection.responseCode
-            connection.disconnect()
-            if (code in 200..299) {
-                InfluxActionResult.ok("http $code")
-            } else {
-                InfluxActionResult.fail("influx_http_error", "HTTP $code")
+            } finally {
+                connection?.disconnect()
             }
         }.getOrElse { error ->
             InfluxActionResult.fail("influx_network_error", "${error::class.java.simpleName}: ${error.message ?: "no message"}")

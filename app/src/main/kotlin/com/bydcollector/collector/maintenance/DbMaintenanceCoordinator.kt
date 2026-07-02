@@ -112,7 +112,8 @@ class DbMaintenanceCoordinator(
                 stepCount = operation.stepsUk.size,
                 messageUk = operation.stepsUk.getOrElse(step - 1) { "" },
                 messageEn = operation.stepsEn.getOrElse(step - 1) { "" }
-            )
+            ),
+            synchronous = true
         )
     }
 
@@ -127,7 +128,8 @@ class DbMaintenanceCoordinator(
                 messageUk = operation.stepsUk.last(),
                 messageEn = operation.stepsEn.last(),
                 archivePath = result.archivePath
-            )
+            ),
+            synchronous = true
         )
     }
 
@@ -140,7 +142,8 @@ class DbMaintenanceCoordinator(
                 completed = false,
                 stepCount = operation.stepsUk.size,
                 error = error
-            )
+            ),
+            synchronous = true
         )
     }
 

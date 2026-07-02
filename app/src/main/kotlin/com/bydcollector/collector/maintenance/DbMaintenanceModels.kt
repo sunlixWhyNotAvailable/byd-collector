@@ -56,7 +56,9 @@ data class DbMaintenanceRuntimeStatus(
     val messageUk: String = "",
     val messageEn: String = "",
     val error: String? = null,
-    val archivePath: String? = null
+    val archivePath: String? = null,
+    val startedAtMs: Long = 0L,
+    val updatedAtMs: Long = 0L
 )
 
 data class DbMaintenanceUiState(

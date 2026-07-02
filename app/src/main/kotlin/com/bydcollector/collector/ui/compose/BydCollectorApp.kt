@@ -31,10 +31,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -435,16 +440,16 @@ private fun VehicleKpiCard(state: DashboardState?, strings: UiStrings, language:
     val chargeLabel = if (language == UiLanguage.UK) kpi?.batteryPowerLabelUk else kpi?.batteryPowerLabelEn
     SectionCard(title = strings.currentVehicleState, modifier = modifier, bodyPadding = 14.dp) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            KpiTile("SOC", kpi?.socPercent ?: "-", modifier = Modifier.weight(1f))
-            KpiTile(if (language == UiLanguage.UK) "Пробіг" else "Odometer", kpi?.odometerKm ?: "-", modifier = Modifier.weight(1f))
-            KpiTile(if (language == UiLanguage.UK) "Темп. салону" else "Cabin temp", kpi?.cabinTempC ?: "-", modifier = Modifier.weight(1f))
-            KpiTile("SOH", kpi?.sohPercent ?: "-", modifier = Modifier.weight(1f))
+            KpiTile(strings.kpiSoc, kpi?.socPercent ?: "-", modifier = Modifier.weight(1f))
+            KpiTile(strings.kpiOdometer, kpi?.odometerKm ?: "-", modifier = Modifier.weight(1f))
+            KpiTile(strings.kpiCabinTemp, kpi?.cabinTempC ?: "-", modifier = Modifier.weight(1f))
+            KpiTile(strings.kpiSoh, kpi?.sohPercent ?: "-", modifier = Modifier.weight(1f))
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             KpiTile(chargeLabel ?: "-", kpi?.batteryPowerKw ?: "-", modifier = Modifier.weight(1f))
-            KpiTile(if (language == UiLanguage.UK) "Запас ходу" else "Range", kpi?.remainingRangeKm ?: "-", modifier = Modifier.weight(1f))
-            KpiTile(if (language == UiLanguage.UK) "Темп. батареї" else "Battery temp", kpi?.batteryTempC ?: "-", modifier = Modifier.weight(1f))
-            KpiTile(if (language == UiLanguage.UK) "Δ напруги комірки" else "Cell voltage Δ", kpi?.cellVoltageDeltaMv ?: "-", modifier = Modifier.weight(1f))
+            KpiTile(strings.kpiRange, kpi?.remainingRangeKm ?: "-", modifier = Modifier.weight(1f))
+            KpiTile(strings.kpiBatteryTemp, kpi?.batteryTempC ?: "-", modifier = Modifier.weight(1f))
+            KpiTile(strings.kpiCellDelta, kpi?.cellVoltageDeltaMv ?: "-", modifier = Modifier.weight(1f))
         }
     }
 }
@@ -667,13 +672,15 @@ private fun ExtraTab(
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         ScreenTitle(strings.extraTab, strings.extraSubtitle)
-        val optionsCardHeight = 264.dp
+        val optionsCardHeight = 312.dp
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             SectionCard(strings.keepAlive, Modifier.weight(1f).height(optionsCardHeight)) {
-                SwitchRow(strings.keepWifi, state?.keepWifiEnabled == true, actions::onToggleKeepWifi)
-                SwitchRow(strings.keepMobile, state?.keepMobileDataEnabled == true, actions::onToggleKeepMobile)
-                SwitchRow(strings.keepBluetooth, state?.keepBluetoothEnabled == true, actions::onToggleKeepBluetooth)
-                SwitchRow(strings.restoreCollector, state?.recoverCollectorServiceEnabled == true, actions::onToggleKeepCollector)
+                Column(Modifier.fillMaxWidth()) {
+                    SwitchRow(strings.keepWifi, state?.keepWifiEnabled == true, actions::onToggleKeepWifi)
+                    SwitchRow(strings.keepMobile, state?.keepMobileDataEnabled == true, actions::onToggleKeepMobile)
+                    SwitchRow(strings.keepBluetooth, state?.keepBluetoothEnabled == true, actions::onToggleKeepBluetooth)
+                    SwitchRow(strings.restoreCollector, state?.recoverCollectorServiceEnabled == true, actions::onToggleKeepCollector, divider = false)
+                }
             }
             SectionCard(strings.appRuntime, Modifier.weight(1f).height(optionsCardHeight)) {
                 TailscaleRuntimeRow(strings, state?.tailscaleActivationEnabled == true, actions::onToggleTailscaleActivation)
@@ -816,10 +823,16 @@ private fun ShutdownIconButton(onClick: () -> Unit) {
 }
 
 @Composable
-private fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
-    Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text(label, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-        BydSwitch(checked, onChange)
+private fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit, divider: Boolean = true) {
+    val p = LocalBydPalette.current
+    Column(Modifier.fillMaxWidth()) {
+        Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(label, color = p.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+            BydSwitch(checked, onChange)
+        }
+        if (divider) {
+            Box(Modifier.fillMaxWidth().height(1.dp).background(p.border))
+        }
     }
 }
 
@@ -1066,22 +1079,56 @@ private fun UpdateProgressBar(progress: Int) {
 
 @Composable
 private fun MarkdownPatchNotesText(text: String) {
+    val p = LocalBydPalette.current
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        text.lines().map { it.trimEnd() }.dropWhile { it.isBlank() }.forEach { line ->
-            when {
-                line.isBlank() -> Spacer(Modifier.height(6.dp))
-                line.startsWith("## ") -> Text(
-                    text = line.removePrefix("## ").trim(),
-                    color = LocalBydPalette.current.text,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold
+        ReleaseNotesMarkdown.parse(text).forEach { block ->
+            when (block) {
+                ReleaseNotesMarkdownBlock.Blank -> Spacer(Modifier.height(6.dp))
+                ReleaseNotesMarkdownBlock.Separator -> Box(Modifier.fillMaxWidth().height(1.dp).background(p.border))
+                is ReleaseNotesMarkdownBlock.Heading -> Text(
+                    text = block.spans.toAnnotatedString(),
+                    color = p.text,
+                    fontSize = when (block.level) {
+                        1 -> 16.sp
+                        2 -> 14.sp
+                        else -> 13.sp
+                    },
+                    fontWeight = FontWeight.Bold,
+                    lineHeight = 19.sp
                 )
-                else -> Text(
-                    text = line,
-                    color = LocalBydPalette.current.text,
+                is ReleaseNotesMarkdownBlock.Bullet -> Text(
+                    text = AnnotatedString("• ") + block.spans.toAnnotatedString(),
+                    color = p.text,
                     fontSize = 13.sp,
                     lineHeight = 18.sp
                 )
+                is ReleaseNotesMarkdownBlock.Paragraph -> Text(
+                    text = block.spans.toAnnotatedString(),
+                    color = p.text,
+                    fontSize = 13.sp,
+                    lineHeight = 18.sp
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun List<ReleaseNotesMarkdownSpan>.toAnnotatedString(): AnnotatedString {
+    val p = LocalBydPalette.current
+    return buildAnnotatedString {
+        forEach { span ->
+            when (span) {
+                is ReleaseNotesMarkdownSpan.Text -> append(span.value)
+                is ReleaseNotesMarkdownSpan.Bold -> withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(span.value) }
+                is ReleaseNotesMarkdownSpan.Code -> withStyle(
+                    SpanStyle(
+                        fontFamily = FontFamily.Monospace,
+                        background = p.disabled.copy(alpha = 0.72f)
+                    )
+                ) {
+                    append(span.value)
+                }
             }
         }
     }
