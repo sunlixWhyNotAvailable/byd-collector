@@ -123,7 +123,12 @@ class CollectorService : Service() {
             return START_NOT_STICKY
         }
         recoverInterruptedMaintenanceIfNeeded(action)
-        if (maintenanceActive.get() && action != ACTION_COMPACT_DATABASE && action != ACTION_ARCHIVE_DATABASE) {
+        if (
+            maintenanceActive.get() &&
+            action != ACTION_COMPACT_DATABASE &&
+            action != ACTION_ARCHIVE_DATABASE &&
+            action != ACTION_CANCEL_DATABASE_MAINTENANCE
+        ) {
             return START_STICKY
         }
         when (action) {
@@ -150,6 +155,7 @@ class CollectorService : Service() {
             ACTION_STOP_INFLUX_EXPORT -> stopInfluxExport(manualStop = true)
             ACTION_COMPACT_DATABASE -> startDatabaseMaintenance(DbMaintenanceOperation.COMPACT)
             ACTION_ARCHIVE_DATABASE -> startDatabaseMaintenance(DbMaintenanceOperation.ARCHIVE)
+            ACTION_CANCEL_DATABASE_MAINTENANCE -> cancelDatabaseMaintenance()
             ACTION_START -> reconcileCollection()
         }
         return START_STICKY
@@ -941,6 +947,7 @@ class CollectorService : Service() {
     private fun startDatabaseMaintenance(operation: DbMaintenanceOperation) {
         if (!maintenanceActive.compareAndSet(false, true)) return
         maintenanceRunningInProcess.set(true)
+        CollectorAutoStart.cancelScheduled(applicationContext)
         val snapshot = runtimeSnapshot()
         ensureForegroundForChannel("Database maintenance")
         try {
@@ -961,6 +968,10 @@ class CollectorService : Service() {
                 "${error::class.java.simpleName}: ${error.message ?: "no message"}"
             )
         }
+    }
+
+    private fun cancelDatabaseMaintenance() {
+        maintenanceCoordinator.requestCancel()
     }
 
     private fun maintenanceBlocksRuntimeStart(): Boolean {
@@ -1079,6 +1090,7 @@ class CollectorService : Service() {
         val ACTION_STOP_INFLUX_EXPORT: String = "${BuildConfig.ACTION_PREFIX}.action.STOP_INFLUX_EXPORT"
         val ACTION_COMPACT_DATABASE: String = "${BuildConfig.ACTION_PREFIX}.action.COMPACT_DATABASE"
         val ACTION_ARCHIVE_DATABASE: String = "${BuildConfig.ACTION_PREFIX}.action.ARCHIVE_DATABASE"
+        val ACTION_CANCEL_DATABASE_MAINTENANCE: String = "${BuildConfig.ACTION_PREFIX}.action.CANCEL_DATABASE_MAINTENANCE"
         private const val CHANNEL_ID = "collector"
         private const val NOTIFICATION_ID = 1001
         private const val STATUS_HEARTBEAT_INTERVAL_MS = 30_000L
@@ -1142,6 +1154,10 @@ class CollectorService : Service() {
 
         fun archiveDatabaseIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
             action = ACTION_ARCHIVE_DATABASE
+        }
+
+        fun cancelDatabaseMaintenanceIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
+            action = ACTION_CANCEL_DATABASE_MAINTENANCE
         }
     }
 }

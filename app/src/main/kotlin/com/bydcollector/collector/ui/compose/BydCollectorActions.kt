@@ -32,6 +32,7 @@ interface BydCollectorActions {
     fun onOpenCompactDatabase()
     fun onOpenArchiveDatabase()
     fun onConfirmDatabaseMaintenance()
+    fun onCancelDatabaseMaintenance()
     fun onDismissDatabaseMaintenance()
 
     fun onStartDebug()

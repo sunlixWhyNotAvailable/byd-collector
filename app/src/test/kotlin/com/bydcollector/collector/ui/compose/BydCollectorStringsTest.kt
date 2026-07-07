@@ -32,6 +32,7 @@ class BydCollectorStringsTest {
         assertEquals("Архівація бази", uk.archiveDatabase)
         assertEquals("Так", uk.yes)
         assertEquals("Ні", uk.no)
+        assertEquals("Скасувати", uk.cancel)
         assertEquals("Крок", uk.step)
         assertEquals("Буде тимчасово зупинено основний збір, всі дані, MQTT та InfluxDB.", uk.dbMaintenanceStopWarning)
         assertEquals("У черзі: MQTT %d, InfluxDB %d.", uk.dbMaintenancePendingTemplate)
@@ -41,12 +42,14 @@ class BydCollectorStringsTest {
         assertEquals("Переривання процесу створює ризик втрати даних!", uk.interruptionDataLossRisk)
         assertEquals("Операцію завершено", uk.dbMaintenanceComplete)
         assertEquals("Операцію не виконано", uk.dbMaintenanceFailed)
+        assertEquals("Операцію скасовано.", uk.dbMaintenanceCancelled)
         assertEquals("Архів:", uk.dbMaintenanceArchivePath)
 
         assertEquals("Database compact", en.compactDatabase)
         assertEquals("Database archive", en.archiveDatabase)
         assertEquals("Yes", en.yes)
         assertEquals("No", en.no)
+        assertEquals("Cancel", en.cancel)
         assertEquals("Step", en.step)
         assertEquals("Main collection, all data, MQTT, and InfluxDB will be temporarily stopped.", en.dbMaintenanceStopWarning)
         assertEquals("Queued: MQTT %d, InfluxDB %d.", en.dbMaintenancePendingTemplate)
@@ -56,6 +59,7 @@ class BydCollectorStringsTest {
         assertEquals("Process interruption creates data corruption risk!", en.interruptionDataLossRisk)
         assertEquals("Operation complete", en.dbMaintenanceComplete)
         assertEquals("Operation failed", en.dbMaintenanceFailed)
+        assertEquals("The operation was cancelled.", en.dbMaintenanceCancelled)
         assertEquals("Archive:", en.dbMaintenanceArchivePath)
     }
 

@@ -12,6 +12,7 @@ class KeepAliveRecoveryReceiver : BroadcastReceiver() {
         if (action != CollectorAutoStart.ACTION_KEEP_ALIVE_RECOVERY) return
 
         val appContext = context.applicationContext
+        if (CollectorSettings.isDbMaintenanceRunning(appContext)) return
         val store = BydCollectorApplication.store(appContext)
         val settings = CollectorSettings(appContext, store)
         store.recordEvent(

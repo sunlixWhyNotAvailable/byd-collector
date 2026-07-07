@@ -143,6 +143,7 @@ fun BydCollectorApp(
                         mqttPending = state?.mqttPendingCount ?: 0L,
                         influxPending = state?.influxPendingRows ?: 0L,
                         onConfirm = actions::onConfirmDatabaseMaintenance,
+                        onCancel = actions::onCancelDatabaseMaintenance,
                         onDismiss = actions::onDismissDatabaseMaintenance
                     )
                 }
@@ -961,6 +962,7 @@ private fun DatabaseMaintenanceDialog(
     mqttPending: Long,
     influxPending: Long,
     onConfirm: () -> Unit,
+    onCancel: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val p = LocalBydPalette.current
@@ -1005,14 +1007,18 @@ private fun DatabaseMaintenanceDialog(
                 }
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                ActionButton(
-                    strings.yes,
-                    onConfirm,
-                    primary = true,
-                    enabled = !state.running && !state.completed && state.error == null,
-                    modifier = Modifier.weight(1f)
-                )
-                ActionButton(strings.no, onDismiss, enabled = !state.running, modifier = Modifier.weight(1f))
+                when {
+                    state.error != null || state.completed -> {
+                        ActionButton(strings.ok, onDismiss, modifier = Modifier.weight(1f))
+                    }
+                    state.running -> {
+                        ActionButton(strings.cancel, onCancel, enabled = state.cancelAvailable, modifier = Modifier.weight(1f))
+                    }
+                    else -> {
+                        ActionButton(strings.yes, onConfirm, primary = true, modifier = Modifier.weight(1f))
+                        ActionButton(strings.no, onDismiss, modifier = Modifier.weight(1f))
+                    }
+                }
             }
         }
     }
@@ -1081,6 +1087,7 @@ private fun localizedDbMaintenanceError(strings: UiStrings, error: String): Stri
     return when {
         "interrupted before completion" in normalized -> strings.dbMaintenanceInterrupted
         "already running" in normalized -> strings.dbMaintenanceAlreadyRunning
+        "cancelled" in normalized -> strings.dbMaintenanceCancelled
         else -> strings.dbMaintenanceGenericError
     }
 }

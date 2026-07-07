@@ -26,8 +26,9 @@ class BydCollectorUiContractTest {
         assertTrue(components.contains("fontSize = 12.sp"))
         assertTrue(components.contains("val visualPressed = pressed || press.visualPressed"))
         assertTrue(components.contains("primary && visualPressed -> p.active"))
-        assertTrue(components.contains("primary -> p.activeSoft"))
-        assertTrue(components.contains("primary -> p.text"))
+        assertTrue(components.contains("primary -> p.accent"))
+        assertTrue(components.contains("primary -> p.accentText"))
+        assertFalse(components.contains("primary -> p.activeSoft"))
         assertTrue(components.contains("visualPressed -> p.activeSoft"))
         assertTrue(components.contains("pending: Boolean = false"))
         assertTrue(components.contains("animateDpAsState("))
@@ -71,6 +72,10 @@ class BydCollectorUiContractTest {
         assertTrue(app.contains("CircularProgressIndicator("))
         assertTrue(app.contains("Modifier.size(28.dp)"))
         assertTrue(app.contains("\"\${strings.step} \${state.stepIndex}/\${state.stepCount}\""))
+        assertTrue(app.contains("onCancel: () -> Unit"))
+        assertTrue(app.contains("state.error != null || state.completed"))
+        assertTrue(app.contains("ActionButton(strings.ok, onDismiss"))
+        assertTrue(app.contains("ActionButton(strings.cancel, onCancel, enabled = state.cancelAvailable"))
         assertInOrder(app, "strings.yes", "strings.no")
     }
 

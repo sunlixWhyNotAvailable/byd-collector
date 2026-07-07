@@ -26,6 +26,10 @@ class TelemetryStoreLifecycleContractTest {
         val applicationText = sourceFile("com/bydcollector/collector/BydCollectorApplication.kt").readText()
         assertTrue(applicationText.contains("TelemetryDatabaseHelper(applicationContext)"))
         assertTrue(applicationText.contains("TelemetryStore(applicationContext"))
+        val onCreate = applicationText.substringAfter("override fun onCreate()").substringBefore("override fun onTerminate()")
+        assertFalse(onCreate.contains("TelemetryDatabaseHelper("))
+        assertFalse(onCreate.contains("TelemetryStore("))
+        assertTrue(applicationText.contains("private fun store(): TelemetryStore"))
 
         val serviceText = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
         assertTrue(serviceText.contains("debugStore.close()"))

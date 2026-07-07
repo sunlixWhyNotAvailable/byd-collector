@@ -86,4 +86,8 @@ object CollectorServiceController {
             context.startService(intent)
         }
     }
+
+    fun cancelDatabaseMaintenance(context: Context) {
+        context.startService(CollectorService.cancelDatabaseMaintenanceIntent(context))
+    }
 }

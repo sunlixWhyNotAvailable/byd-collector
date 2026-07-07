@@ -260,14 +260,14 @@ fun ActionButton(
     val bg = when {
         !enabled -> p.disabled.copy(alpha = 0.55f)
         primary && visualPressed -> p.active
-        primary -> p.activeSoft
+        primary -> p.accent
         visualPressed -> p.activeSoft
         else -> p.surface
     }
     val border = if (primary && enabled) p.accent else p.borderStrong
     val fg = when {
         !enabled -> p.muted.copy(alpha = 0.65f)
-        primary -> p.text
+        primary -> p.accentText
         else -> p.text
     }
     Box(

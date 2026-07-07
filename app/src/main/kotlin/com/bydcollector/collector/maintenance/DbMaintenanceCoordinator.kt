@@ -19,17 +19,34 @@ class DbMaintenanceCoordinator(
     private val onStoreReopened: (TelemetryStore) -> Unit
 ) {
     private val running = AtomicBoolean(false)
+    private val cancelRequested = AtomicBoolean(false)
+    private val cancelAllowed = AtomicBoolean(false)
+    private val cancelLock = Any()
+
+    fun requestCancel(): Boolean {
+        return synchronized(cancelLock) {
+            if (!cancelAllowed.get()) {
+                false
+            } else {
+                cancelRequested.set(true)
+                true
+            }
+        }
+    }
 
     fun run(operation: DbMaintenanceOperation, restoreRuntime: () -> Unit): DbMaintenanceResult {
         if (!running.compareAndSet(false, true)) {
             return DbMaintenanceResult(false, "Database maintenance already running")
         }
 
+        cancelRequested.set(false)
         var restored = false
         var skipRestore = false
         return try {
-            publish(operation, 1)
+            publish(operation, 1, cancelAvailable = true)
             stopRuntime()
+            closeCancelWindowAndCheck(operation)
+            publish(operation, 1, cancelAvailable = false)
             val result = when (operation) {
                 DbMaintenanceOperation.COMPACT -> compact(operation)
                 DbMaintenanceOperation.ARCHIVE -> archive(operation)
@@ -39,6 +56,9 @@ class DbMaintenanceCoordinator(
             restored = true
             publishComplete(operation, result)
             result
+        } catch (cancelled: DbMaintenanceCancelled) {
+            publishCancelled(operation)
+            DbMaintenanceResult(false, "Cancelled")
         } catch (error: TerminalArchiveFailure) {
             skipRestore = true
             val message = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
@@ -53,6 +73,7 @@ class DbMaintenanceCoordinator(
                 runCatching { restoreRuntime() }
                     .onFailure { publishError(operation, "${it::class.java.simpleName}: ${it.message ?: "restore failed"}") }
             }
+            setCancelAvailable(false)
             running.set(false)
         }
     }
@@ -102,7 +123,19 @@ class DbMaintenanceCoordinator(
         onStoreReopened(newStore)
     }
 
-    private fun publish(operation: DbMaintenanceOperation, step: Int) {
+    private fun checkCancelled(operation: DbMaintenanceOperation) {
+        if (cancelRequested.get()) throw DbMaintenanceCancelled(operation)
+    }
+
+    private fun closeCancelWindowAndCheck(operation: DbMaintenanceOperation) {
+        synchronized(cancelLock) {
+            cancelAllowed.set(false)
+            checkCancelled(operation)
+        }
+    }
+
+    private fun publish(operation: DbMaintenanceOperation, step: Int, cancelAvailable: Boolean = false) {
+        setCancelAvailable(cancelAvailable)
         settings.setDbMaintenanceStatus(
             DbMaintenanceRuntimeStatus(
                 operation = operation,
@@ -111,7 +144,8 @@ class DbMaintenanceCoordinator(
                 stepIndex = step,
                 stepCount = operation.stepsUk.size,
                 messageUk = operation.stepsUk.getOrElse(step - 1) { "" },
-                messageEn = operation.stepsEn.getOrElse(step - 1) { "" }
+                messageEn = operation.stepsEn.getOrElse(step - 1) { "" },
+                cancelAvailable = cancelAvailable
             ),
             synchronous = true
         )
@@ -127,7 +161,29 @@ class DbMaintenanceCoordinator(
                 stepCount = operation.stepsUk.size,
                 messageUk = operation.stepsUk.last(),
                 messageEn = operation.stepsEn.last(),
-                archivePath = result.archivePath
+                archivePath = result.archivePath,
+                cancelAvailable = false
+            ),
+            synchronous = true
+        )
+    }
+
+    private fun setCancelAvailable(value: Boolean) {
+        synchronized(cancelLock) {
+            cancelAllowed.set(value)
+        }
+    }
+
+    private fun publishCancelled(operation: DbMaintenanceOperation) {
+        val status = settings.dbMaintenanceStatus()
+        settings.setDbMaintenanceStatus(
+            status.copy(
+                operation = operation,
+                running = false,
+                completed = false,
+                stepCount = operation.stepsUk.size,
+                error = "Cancelled",
+                cancelAvailable = false
             ),
             synchronous = true
         )
@@ -141,7 +197,8 @@ class DbMaintenanceCoordinator(
                 running = false,
                 completed = false,
                 stepCount = operation.stepsUk.size,
-                error = error
+                error = error,
+                cancelAvailable = false
             ),
             synchronous = true
         )
@@ -153,3 +210,5 @@ class DbMaintenanceCoordinator(
 }
 
 private class TerminalArchiveFailure(message: String) : RuntimeException(message)
+private class DbMaintenanceCancelled(operation: DbMaintenanceOperation) :
+    RuntimeException("Database maintenance cancelled: ${operation.key}")

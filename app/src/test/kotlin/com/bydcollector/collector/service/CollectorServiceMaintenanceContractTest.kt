@@ -31,7 +31,7 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(start.contains("val snapshot = runtimeSnapshot()"))
         assertTrue(start.contains("restoreRuntimeAfterMaintenance(snapshot)"))
         assertTrue(start.contains("maintenanceActive.set(false)"))
-        assertTrue(source.contains("if (maintenanceActive.get() && action != ACTION_COMPACT_DATABASE && action != ACTION_ARCHIVE_DATABASE)"))
+        assertTrue(source.contains("action != ACTION_CANCEL_DATABASE_MAINTENANCE"))
         assertTrue(source.contains("private fun maintenanceBlocksRuntimeStart(): Boolean"))
     }
 
@@ -62,6 +62,21 @@ class CollectorServiceMaintenanceContractTest {
     }
 
     @Test
+    fun maintenanceStatusStoresCancelAvailabilityAndProvidesPrefsOnlyRunningGuard() {
+        val model = sourceFile("com/bydcollector/collector/maintenance/DbMaintenanceModels.kt").readText()
+        val settings = sourceFile("com/bydcollector/collector/service/CollectorSettings.kt").readText()
+
+        assertTrue(model.contains("val cancelAvailable: Boolean = false"))
+        assertTrue(settings.contains("KEY_DB_MAINTENANCE_CANCEL_AVAILABLE"))
+        assertTrue(settings.contains("cancelAvailable = prefs.getBoolean(KEY_DB_MAINTENANCE_CANCEL_AVAILABLE, false)"))
+        assertTrue(settings.contains("putBoolean(KEY_DB_MAINTENANCE_CANCEL_AVAILABLE, status.cancelAvailable)"))
+        assertTrue(settings.contains("fun isDbMaintenanceRunning(context: Context): Boolean"))
+        assertTrue(settings.contains("context.applicationContext"))
+        assertTrue(settings.contains("getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)"))
+        assertTrue(settings.contains("getBoolean(KEY_DB_MAINTENANCE_RUNNING, false)"))
+    }
+
+    @Test
     fun staleMaintenanceIsRecoveredFromActivityAndServiceButNotForMaintenanceIntent() {
         val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
         val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
@@ -85,6 +100,52 @@ class CollectorServiceMaintenanceContractTest {
 
         assertTrue(stop.contains("mqttCoordinator.disconnectForMaintenance()"))
         assertFalse(stop.contains("disconnectOfflineAsync()"))
+    }
+
+    @Test
+    fun databaseMaintenanceCancelsScheduledAutostartAndAutostartSkipsDbWhileRunning() {
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val autoStart = sourceFile("com/bydcollector/collector/system/CollectorAutoStart.kt").readText()
+        val keepAliveReceiver = sourceFile("com/bydcollector/collector/system/KeepAliveRecoveryReceiver.kt").readText()
+        val startMaintenance = service.substringAfter("private fun startDatabaseMaintenance").substringBefore("private fun cancelDatabaseMaintenance")
+        val handleBroadcast = autoStart.substringAfter("fun handleBroadcast").substringBefore("fun recoverFromForeground")
+        val recoverFromForeground = autoStart.substringAfter("fun recoverFromForeground").substringBefore("fun scheduleRestartAfterTaskRemoved")
+        val taskRemoved = autoStart.substringAfter("fun scheduleRestartAfterTaskRemoved").substringBefore("fun scheduleRestartAfterUiClosed")
+        val uiClosed = autoStart.substringAfter("fun scheduleRestartAfterUiClosed").substringBefore("fun scheduleWatchdog")
+        val watchdog = autoStart.substringAfter("fun scheduleWatchdog").substringBefore("fun cancelScheduled")
+
+        assertTrue(startMaintenance.contains("CollectorAutoStart.cancelScheduled(applicationContext)"))
+        assertInOrder(handleBroadcast, "CollectorSettings.isDbMaintenanceRunning(appContext)", "BydCollectorApplication.store(appContext)")
+        assertTrue(handleBroadcast.contains("if (CollectorSettings.isDbMaintenanceRunning(appContext)) return"))
+        assertTrue(recoverFromForeground.contains("if (CollectorSettings.isDbMaintenanceRunning(appContext) || !shouldRunService(settings)) return"))
+        assertTrue(taskRemoved.contains("if (CollectorSettings.isDbMaintenanceRunning(appContext)) return"))
+        assertTrue(uiClosed.contains("if (CollectorSettings.isDbMaintenanceRunning(appContext)) return"))
+        assertTrue(watchdog.contains("if (CollectorSettings.isDbMaintenanceRunning(appContext)) return"))
+        assertInOrder(keepAliveReceiver, "CollectorSettings.isDbMaintenanceRunning(appContext)", "BydCollectorApplication.store(appContext)")
+        assertTrue(keepAliveReceiver.contains("if (CollectorSettings.isDbMaintenanceRunning(appContext)) return"))
+    }
+
+    @Test
+    fun maintenanceSupportsCooperativeCancelOnlyBeforeCriticalStages() {
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val coordinator = sourceFile("com/bydcollector/collector/maintenance/DbMaintenanceCoordinator.kt").readText()
+        val controller = sourceFile("com/bydcollector/collector/service/CollectorServiceController.kt").readText()
+
+        assertTrue(service.contains("ACTION_CANCEL_DATABASE_MAINTENANCE"))
+        assertTrue(service.contains("maintenanceCoordinator.requestCancel()"))
+        assertTrue(controller.contains("fun cancelDatabaseMaintenance(context: Context)"))
+        assertTrue(coordinator.contains("fun requestCancel(): Boolean"))
+        assertTrue(coordinator.contains("private val cancelRequested = AtomicBoolean(false)"))
+        assertTrue(coordinator.contains("private val cancelAllowed = AtomicBoolean(false)"))
+        assertTrue(coordinator.contains("private val cancelLock = Any()"))
+        assertTrue(coordinator.contains("synchronized(cancelLock)"))
+        assertTrue(coordinator.contains("private fun closeCancelWindowAndCheck(operation: DbMaintenanceOperation)"))
+        assertTrue(coordinator.contains("private class DbMaintenanceCancelled"))
+        assertTrue(coordinator.contains("publishCancelled(operation)"))
+        assertInOrder(coordinator, "publish(operation, 1, cancelAvailable = true)", "stopRuntime()")
+        assertInOrder(coordinator, "closeCancelWindowAndCheck(operation)", "DbMaintenanceOperation.COMPACT -> compact(operation)")
+        assertInOrder(coordinator, "closeCancelWindowAndCheck(operation)", "DbMaintenanceOperation.ARCHIVE -> archive(operation)")
+        assertFalse(coordinator.contains("shutdownNow()"))
     }
 
     @Test
@@ -123,5 +184,13 @@ class CollectorServiceMaintenanceContractTest {
             File("src/main/kotlin/$path"),
             File("app/src/main/kotlin/$path")
         ).firstOrNull { it.isFile } ?: error("Missing source file: $path")
+    }
+
+    private fun assertInOrder(source: String, first: String, second: String) {
+        val firstIndex = source.indexOf(first)
+        val secondIndex = source.indexOf(second)
+        assertTrue(firstIndex >= 0, "Missing first token: $first")
+        assertTrue(secondIndex >= 0, "Missing second token: $second")
+        assertTrue(firstIndex < secondIndex, "Expected `$first` before `$second`")
     }
 }

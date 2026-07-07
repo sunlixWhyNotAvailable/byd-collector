@@ -6,9 +6,11 @@ import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.debug.DirectDebugStatus
 import com.bydcollector.collector.data.local.HealthSnapshot
+import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.remote.DirectBridgeManager
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
+import com.bydcollector.collector.influx.InfluxExportStateSnapshot
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.system.RequiredAccessChecker
@@ -37,17 +39,18 @@ class DashboardStateProvider(
         includeVehicleKpis: Boolean = false,
         vehicleKpiLanguage: VehicleKpiLanguage = VehicleKpiLanguage.UK
     ): DashboardState {
-        val store = storeProvider()
         val serviceRunning = CollectorService.isRunning()
         val mainPollingRunning = CollectorService.isMainPollingRunning()
+        val maintenanceStatus = settings.dbMaintenanceStatus()
+        val store = if (maintenanceStatus.running) null else storeProvider()
         val nowMs = SystemClock.elapsedRealtime()
         val healthRunningChanged = healthCacheRunning != mainPollingRunning
         //uses main polling state for health so keep-alive-only service runs do not look like active collection
-        val health = healthCache.get(nowMs = nowMs, force = healthRunningChanged) {
+        val health = if (store == null) maintenanceHealthSnapshot(mainPollingRunning) else healthCache.get(nowMs = nowMs, force = healthRunningChanged) {
             healthCacheRunning = mainPollingRunning
             store.healthSnapshot(running = mainPollingRunning)
         }
-        val debugStatus = if (includeDebugStatus) {
+        val debugStatus = if (!maintenanceStatus.running && includeDebugStatus) {
             //opens the debug db only on heavy tabs because status scans can be expensive on the tablet
             DirectDebugStore(context).use { debugStore -> debugStore.status() }
         } else {
@@ -56,8 +59,8 @@ class DashboardStateProvider(
         val keepAliveConfig = settings.keepAliveConfig()
         val mqttConfig = settings.mqttConfig()
         val influxConfig = settings.influxConfig()
-        val influxState = store.influxExportState()
-        val vehicleKpis = if (includeVehicleKpis) {
+        val influxState = store?.influxExportState() ?: maintenanceInfluxState()
+        val vehicleKpis = if (includeVehicleKpis && store != null) {
             //vehicle kpi reads are lightweight normalized-current reads used by the foreground refresh loop
             VehicleKpiMapper.from(store.normalizedCurrentState(), vehicleKpiLanguage)
         } else {
@@ -83,7 +86,7 @@ class DashboardStateProvider(
             requestCount = health.requestCount,
             databasePath = health.databasePath,
             databaseSizeBytes = health.databaseSizeBytes,
-            dbMaintenanceStatus = settings.dbMaintenanceStatus(),
+            dbMaintenanceStatus = maintenanceStatus,
             latestSoc = health.latestSoc,
             latestSpeed = health.latestSpeed,
             latestCharging = health.latestCharging,
@@ -165,6 +168,54 @@ class DashboardStateProvider(
             recentEvents = health.recentEvents.map { event ->
                 event.copy(timestamp = DisplayTimeFormatter.formatNullable(event.timestamp) ?: event.timestamp)
             }
+        )
+    }
+
+    private fun maintenanceHealthSnapshot(running: Boolean): HealthSnapshot {
+        val dbFile = context.getDatabasePath(TelemetryDatabaseHelper.DATABASE_NAME)
+        return HealthSnapshot(
+            running = running,
+            activeSessionId = null,
+            lastSuccessAt = null,
+            lastError = null,
+            lastErrorAt = null,
+            lastPollStatus = null,
+            pollCount = 0L,
+            valueRowCount = 0L,
+            ecRowCount = 0L,
+            normalizedCurrentCount = 0L,
+            normalizedHistoryCount = 0L,
+            mqttLastError = null,
+            mqttLastPublishedAt = null,
+            mqttPendingCount = 0L,
+            mqttRetryFailureCount = 0,
+            mqttNextRetryAt = null,
+            mqttRetryLastFailureAt = null,
+            mqttRetryLastSuccessAt = null,
+            lastEcImport = null,
+            lastEcImportStatus = null,
+            elapsedMs = null,
+            requestCount = null,
+            databasePath = dbFile.absolutePath,
+            databaseSizeBytes = dbFile.takeIf { it.exists() }?.length() ?: 0L,
+            latestSoc = null,
+            latestSpeed = null,
+            latestCharging = null,
+            recentEvents = emptyList()
+        )
+    }
+
+    private fun maintenanceInfluxState(): InfluxExportStateSnapshot {
+        return InfluxExportStateSnapshot(
+            status = "maintenance",
+            mode = null,
+            pendingRows = 0L,
+            oldestPendingAt = null,
+            nextRetryAt = null,
+            lastSuccessAt = null,
+            lastErrorAt = null,
+            lastError = null,
+            exportedRowsTotal = 0L
         )
     }
 

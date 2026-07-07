@@ -148,6 +148,7 @@ data class UiStrings(
     val successful: String,
     val missing: String,
     val ok: String,
+    val cancel: String,
     val idle: String,
     val stopped: String,
     val messages: String,
@@ -164,6 +165,7 @@ data class UiStrings(
     val dbMaintenanceFailed: String,
     val dbMaintenanceInterrupted: String,
     val dbMaintenanceAlreadyRunning: String,
+    val dbMaintenanceCancelled: String,
     val dbMaintenanceGenericError: String,
     val dbMaintenanceArchivePath: String
 )
@@ -293,6 +295,7 @@ fun strings(language: UiLanguage): UiStrings {
             successful = "успішно",
             missing = "відсутні",
             ok = "OK",
+            cancel = "Скасувати",
             idle = "очікування",
             stopped = "зупинено",
             messages = "повідомлень",
@@ -309,6 +312,7 @@ fun strings(language: UiLanguage): UiStrings {
             dbMaintenanceFailed = "Операцію не виконано",
             dbMaintenanceInterrupted = "Операцію перервано до завершення.",
             dbMaintenanceAlreadyRunning = "Операція вже виконується.",
+            dbMaintenanceCancelled = "Операцію скасовано.",
             dbMaintenanceGenericError = "Операцію не виконано. Деталі записані в логах.",
             dbMaintenanceArchivePath = "Архів:"
         )
@@ -436,6 +440,7 @@ fun strings(language: UiLanguage): UiStrings {
             successful = "success",
             missing = "missing",
             ok = "OK",
+            cancel = "Cancel",
             idle = "idle",
             stopped = "stopped",
             messages = "messages",
@@ -452,6 +457,7 @@ fun strings(language: UiLanguage): UiStrings {
             dbMaintenanceFailed = "Operation failed",
             dbMaintenanceInterrupted = "The operation was interrupted before completion.",
             dbMaintenanceAlreadyRunning = "The operation is already running.",
+            dbMaintenanceCancelled = "The operation was cancelled.",
             dbMaintenanceGenericError = "The operation failed. Details were written to logs.",
             dbMaintenanceArchivePath = "Archive:"
         )

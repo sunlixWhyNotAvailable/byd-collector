@@ -191,6 +191,11 @@ class MainActivity : ComponentActivity() {
             refresh()
         }
 
+        override fun onCancelDatabaseMaintenance() {
+            CollectorServiceController.cancelDatabaseMaintenance(this@MainActivity)
+            refresh()
+        }
+
         override fun onDismissDatabaseMaintenance() {
             if (dashboardState?.dbMaintenanceStatus?.running == true || maintenanceLaunchOperation != null) return
             pendingMaintenanceOperation = null
@@ -458,7 +463,11 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         destroyed = true
         //asks the watchdog path to recover service work if the user closes only the activity
-        if (::settings.isInitialized && ::store.isInitialized) {
+        if (
+            ::settings.isInitialized &&
+            ::store.isInitialized &&
+            !CollectorSettings.isDbMaintenanceRunning(applicationContext)
+        ) {
             refreshStoreBackedState()
             CollectorAutoStart.scheduleRestartAfterUiClosed(applicationContext, settings, currentStore())
         }
@@ -930,7 +939,8 @@ class MainActivity : ComponentActivity() {
                 messageUk = runtime.messageUk,
                 messageEn = runtime.messageEn,
                 error = runtime.error,
-                archivePath = runtime.archivePath
+                archivePath = runtime.archivePath,
+                cancelAvailable = runtime.cancelAvailable
             )
         }
         maintenanceLaunchOperation?.let { operation ->

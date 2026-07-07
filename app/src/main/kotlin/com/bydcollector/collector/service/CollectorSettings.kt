@@ -331,7 +331,8 @@ class CollectorSettings(
             error = prefs.getString(KEY_DB_MAINTENANCE_ERROR, null),
             archivePath = prefs.getString(KEY_DB_MAINTENANCE_ARCHIVE_PATH, null),
             startedAtMs = prefs.getLong(KEY_DB_MAINTENANCE_STARTED_AT_MS, 0L),
-            updatedAtMs = prefs.getLong(KEY_DB_MAINTENANCE_UPDATED_AT_MS, 0L)
+            updatedAtMs = prefs.getLong(KEY_DB_MAINTENANCE_UPDATED_AT_MS, 0L),
+            cancelAvailable = prefs.getBoolean(KEY_DB_MAINTENANCE_CANCEL_AVAILABLE, false)
         )
     }
 
@@ -358,6 +359,7 @@ class CollectorSettings(
                 ?: remove(KEY_DB_MAINTENANCE_ARCHIVE_PATH)
             putLong(KEY_DB_MAINTENANCE_STARTED_AT_MS, startedAt)
             putLong(KEY_DB_MAINTENANCE_UPDATED_AT_MS, now)
+            putBoolean(KEY_DB_MAINTENANCE_CANCEL_AVAILABLE, status.cancelAvailable)
         }
         if (synchronous) editor.commit() else editor.apply()
     }
@@ -400,6 +402,7 @@ class CollectorSettings(
             .remove(KEY_DB_MAINTENANCE_ARCHIVE_PATH)
             .remove(KEY_DB_MAINTENANCE_STARTED_AT_MS)
             .remove(KEY_DB_MAINTENANCE_UPDATED_AT_MS)
+            .remove(KEY_DB_MAINTENANCE_CANCEL_AVAILABLE)
             .apply()
     }
 
@@ -575,6 +578,7 @@ class CollectorSettings(
         const val KEY_DB_MAINTENANCE_ARCHIVE_PATH = "dbMaintenanceArchivePath"
         const val KEY_DB_MAINTENANCE_STARTED_AT_MS = "dbMaintenanceStartedAtMs"
         const val KEY_DB_MAINTENANCE_UPDATED_AT_MS = "dbMaintenanceUpdatedAtMs"
+        const val KEY_DB_MAINTENANCE_CANCEL_AVAILABLE = "dbMaintenanceCancelAvailable"
         const val DB_MAINTENANCE_RECOVERY_GRACE_MS = 15_000L
         const val DEFAULT_DEBUG_BATCH_SIZE = 500
         const val SAFE_DEBUG_AUTOSTART_BATCH_SIZE = 500
@@ -582,5 +586,11 @@ class CollectorSettings(
         const val DEFAULT_MQTT_PORT = 1883
         const val AUTO_START_ENABLED_UK = "Автозапуск активовано"
         const val AUTO_START_DISABLED_UK = "Автозапуск деактивовано"
+
+        fun isDbMaintenanceRunning(context: Context): Boolean {
+            return context.applicationContext
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getBoolean(KEY_DB_MAINTENANCE_RUNNING, false)
+        }
     }
 }

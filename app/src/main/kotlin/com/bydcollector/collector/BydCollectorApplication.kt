@@ -9,24 +9,22 @@ import com.bydcollector.collector.update.UpdateAutoCheckRuntime
 
 //starts process-scoped app bookkeeping before either CollectorService or MainActivity is created
 class BydCollectorApplication : Application() {
-    lateinit var telemetryStore: TelemetryStore
-        private set
+    private var telemetryStore: TelemetryStore? = null
 
     override fun onCreate() {
         super.onCreate()
-        telemetryStore = TelemetryStore(applicationContext, TelemetryDatabaseHelper(applicationContext))
-        val settings = CollectorSettings(this, telemetryStore)
+        val settings = CollectorSettings(this)
         UpdateAutoCheckRuntime.onRuntimeStarted(settings.isUpdateAutoCheckEnabled())
     }
 
     override fun onTerminate() {
-        if (::telemetryStore.isInitialized) telemetryStore.close()
+        telemetryStore?.close()
         super.onTerminate()
     }
 
     @Synchronized
     fun closeTelemetryStoreForMaintenance() {
-        if (::telemetryStore.isInitialized) telemetryStore.close()
+        telemetryStore?.close()
     }
 
     @Synchronized
@@ -40,7 +38,13 @@ class BydCollectorApplication : Application() {
 
     companion object {
         fun store(context: Context): TelemetryStore {
-            return (context.applicationContext as BydCollectorApplication).telemetryStore
+            return (context.applicationContext as BydCollectorApplication).store()
         }
+    }
+
+    @Synchronized
+    private fun store(): TelemetryStore {
+        return telemetryStore ?: TelemetryStore(applicationContext, TelemetryDatabaseHelper(applicationContext))
+            .also { telemetryStore = it }
     }
 }

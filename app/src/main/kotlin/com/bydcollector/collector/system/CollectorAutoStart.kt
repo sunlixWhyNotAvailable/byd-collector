@@ -25,6 +25,7 @@ object CollectorAutoStart {
 
     fun handleBroadcast(context: Context, action: String, retryAttempt: Int = 0) {
         val appContext = context.applicationContext
+        if (CollectorSettings.isDbMaintenanceRunning(appContext)) return
         val store = BydCollectorApplication.store(appContext)
         val settings = CollectorSettings(appContext, store)
         if (!shouldRunService(settings)) {
@@ -65,15 +66,16 @@ object CollectorAutoStart {
     }
 
     fun recoverFromForeground(context: Context, settings: CollectorSettings, store: TelemetryStore) {
-        if (!shouldRunService(settings)) return
+        val appContext = context.applicationContext
+        if (CollectorSettings.isDbMaintenanceRunning(appContext) || !shouldRunService(settings)) return
         if (settings.isAutoStartEnabled()) ensurePollingEnabled(settings)
         if (CollectorService.isRunning()) {
-            requestServiceReconcile(context.applicationContext, settings, store, "foreground_auto_start_recovery")
+            requestServiceReconcile(appContext, settings, store, "foreground_auto_start_recovery")
             return
         }
 
         attemptStart(
-            context = context.applicationContext,
+            context = appContext,
             store = store,
             keepAliveOnly = !settings.isAutoStartEnabled() && settings.keepAliveConfig().anyEnabled,
             category = "foreground_auto_start_recovery",
@@ -89,6 +91,8 @@ object CollectorAutoStart {
         settings: CollectorSettings,
         store: TelemetryStore
     ) {
+        val appContext = context.applicationContext
+        if (CollectorSettings.isDbMaintenanceRunning(appContext)) return
         if (!shouldRunService(settings)) {
             store.recordEvent(
                 "task_removed_no_autostart",
@@ -99,7 +103,7 @@ object CollectorAutoStart {
 
         if (settings.isAutoStartEnabled()) ensurePollingEnabled(settings)
         scheduleRetry(
-            context = context.applicationContext,
+            context = appContext,
             store = store,
             retryAttempt = 0,
             delayMs = TASK_REMOVED_RETRY_DELAY_MS,
@@ -112,16 +116,18 @@ object CollectorAutoStart {
         settings: CollectorSettings,
         store: TelemetryStore
     ) {
+        val appContext = context.applicationContext
+        if (CollectorSettings.isDbMaintenanceRunning(appContext)) return
         if (!shouldRunService(settings)) return
         if (settings.isAutoStartEnabled()) ensurePollingEnabled(settings)
         if (CollectorService.isRunning()) {
-            requestServiceReconcile(context.applicationContext, settings, store, "ui_closed_restart")
-            scheduleWatchdog(context.applicationContext, settings, store)
+            requestServiceReconcile(appContext, settings, store, "ui_closed_restart")
+            scheduleWatchdog(appContext, settings, store)
             return
         }
 
         scheduleRetry(
-            context = context.applicationContext,
+            context = appContext,
             store = store,
             retryAttempt = 0,
             delayMs = TASK_REMOVED_RETRY_DELAY_MS,
@@ -130,12 +136,13 @@ object CollectorAutoStart {
     }
 
     fun scheduleWatchdog(context: Context, settings: CollectorSettings, store: TelemetryStore) {
+        val appContext = context.applicationContext
+        if (CollectorSettings.isDbMaintenanceRunning(appContext)) return
         if (!shouldRunService(settings)) {
-            cancelWatchdog(context.applicationContext)
+            cancelWatchdog(appContext)
             return
         }
 
-        val appContext = context.applicationContext
         //periodically re-enters the same decision path because dilink can kill background work silently
         appContext.getSystemService(AlarmManager::class.java).set(
             AlarmManager.ELAPSED_REALTIME_WAKEUP,
