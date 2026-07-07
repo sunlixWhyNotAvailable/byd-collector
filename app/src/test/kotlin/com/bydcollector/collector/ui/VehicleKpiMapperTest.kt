@@ -29,8 +29,7 @@ class VehicleKpiMapperTest {
             )
         )
 
-        assertEquals("Розряджання", kpis.batteryPowerLabelUk)
-        assertEquals("Discharging", kpis.batteryPowerLabelEn)
+        assertEquals(false, kpis.batteryPowerCharging)
         assertEquals("-35.8 кВт", kpis.batteryPowerKw)
     }
 
@@ -44,8 +43,21 @@ class VehicleKpiMapperTest {
             language = VehicleKpiLanguage.EN
         )
 
-        assertEquals("Discharging", kpis.batteryPowerLabelEn)
+        assertEquals(false, kpis.batteryPowerCharging)
         assertEquals("-35.8 kW", kpis.batteryPowerKw)
+    }
+
+    @Test
+    fun mapsTemperatureWithDegreeSymbol() {
+        val kpis = VehicleKpiMapper.from(
+            listOf(
+                state("inside_temp_c_raw", 22.0),
+                state("battery_average_temp_raw", 28.0)
+            )
+        )
+
+        assertEquals("22 °C", kpis.cabinTempC)
+        assertEquals("28 °C", kpis.batteryTempC)
     }
 
     @Test

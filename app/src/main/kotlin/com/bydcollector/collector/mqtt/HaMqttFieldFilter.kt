@@ -8,7 +8,7 @@ object HaMqttFieldFilter {
 
     fun isPublishable(field: NormalizedFieldDefinition, config: HaMqttConfig): Boolean {
         if (!config.isCategoryEnabled(field.category.mqttKey)) return false
-        return field.mqttDefaultEnabled || field.category.mqttKey == HaMqttConfig.DRIVER_ASSIST_CATEGORY
+        return field.mqttDefaultEnabled
     }
 
     fun publishableRows(

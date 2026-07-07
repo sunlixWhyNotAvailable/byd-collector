@@ -24,6 +24,7 @@ import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.normalized.NormalizedWriteSummary
+import com.bydcollector.collector.data.normalized.PollingErrorSummaries
 import com.bydcollector.collector.data.normalized.VehicleStateNormalizer
 import com.bydcollector.collector.data.polling.PollPersistenceCoordinator
 import com.bydcollector.collector.data.polling.SuccessfulPollObserver
@@ -340,7 +341,7 @@ class CollectorService : Service() {
                 )
                 if (!launch.ok) {
                     store.recordEvent("debug_polling_start_error", "Debug direct helper unavailable", launch.message)
-                    updateNotification("Polling error: ${pollingErrorSummary(launch.message)}")
+                    updateNotification("Polling error: ${PollingErrorSummaries.summary(launch.message)}")
                     return@execute
                 }
                 if (!settings.isDebugPollingEnabled() || settings.isDebugManuallyStopped()) return@execute
@@ -412,7 +413,7 @@ class CollectorService : Service() {
         val detail = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
         Log.e(TAG, "Collector start failed", error)
         store.recordEvent("service_start_error", "Collector service start failed", detail)
-        lastNotificationText = "Polling error: service start failed"
+        lastNotificationText = "Polling error: ${PollingErrorSummaries.summary("service_start_error")}"
         runCatching {
             getSystemService(NotificationManager::class.java).notify(
                 NOTIFICATION_ID,
@@ -646,7 +647,7 @@ class CollectorService : Service() {
                 keepAliveEnabled = settings.keepAliveConfig().anyEnabled
             )
         } else {
-            "Polling error: ${pollingErrorSummary(result.category)}"
+            "Polling error: ${PollingErrorSummaries.summary(result.category)}"
         }
         updateNotification(text)
         publishStatusHeartbeat(result, force = !result.ok)
@@ -822,38 +823,15 @@ class CollectorService : Service() {
     private fun executeMqtt(
         errorCategory: String,
         action: () -> MqttActionResult
-    ) {
-        val generation = mqttWorkGeneration.get()
-        val executor = synchronized(mqttExecutorLock) { mqttExecutor }
-        try {
-            executor.execute {
-                //drops stale work submitted before an offline/reset boundary
-                if (generation != mqttWorkGeneration.get()) return@execute
-                runCatching { action() }
-                    .onSuccess { result ->
-                        if (!result.ok) {
-                            store.recordEvent(
-                                errorCategory,
-                                "MQTT async action failed",
-                                "${result.category}: ${result.message}"
-                            )
-                        }
-                    }
-                    .onFailure { error ->
-                        store.recordEvent(
-                            errorCategory,
-                            "MQTT async action failed",
-                            "${error::class.java.simpleName}: ${error.message ?: "no message"}"
-                        )
-                    }
-            }
-        } catch (error: RejectedExecutionException) {
-            store.recordEvent(
-                errorCategory,
-                "MQTT async action rejected",
-                "${error::class.java.simpleName}: ${error.message ?: "no message"}"
-            )
-        }
+    ) = executeChannel(
+        channelName = "MQTT",
+        errorCategory = errorCategory,
+        executorLock = mqttExecutorLock,
+        executor = { mqttExecutor },
+        generation = mqttWorkGeneration,
+        action = action
+    ) { result ->
+        ChannelActionStatus(result.ok, result.category, result.message)
     }
 
     private fun resetMqttExecutorForOffline(): ExecutorService {
@@ -883,28 +861,50 @@ class CollectorService : Service() {
     private fun executeInflux(
         errorCategory: String,
         action: () -> InfluxActionResult
+    ) = executeChannel(
+        channelName = "Influx",
+        errorCategory = errorCategory,
+        executorLock = influxExecutorLock,
+        executor = { influxExecutor },
+        generation = influxWorkGeneration,
+        lowPriority = true,
+        action = action
+    ) { result ->
+        ChannelActionStatus(result.ok, result.category, result.message)
+    }
+
+    private fun <T> executeChannel(
+        channelName: String,
+        errorCategory: String,
+        executorLock: Any,
+        executor: () -> ExecutorService,
+        generation: AtomicLong,
+        lowPriority: Boolean = false,
+        action: () -> T,
+        status: (T) -> ChannelActionStatus
     ) {
-        val generation = influxWorkGeneration.get()
-        val executor = synchronized(influxExecutorLock) { influxExecutor }
+        val submittedGeneration = generation.get()
+        val selectedExecutor = synchronized(executorLock) { executor() }
         try {
-            executor.execute {
-                Thread.currentThread().priority = Thread.MIN_PRIORITY
-                //drops stale export work after the channel executor has been replaced
-                if (generation != influxWorkGeneration.get()) return@execute
+            selectedExecutor.execute {
+                if (lowPriority) Thread.currentThread().priority = Thread.MIN_PRIORITY
+                //drops stale work submitted before a channel executor reset
+                if (submittedGeneration != generation.get()) return@execute
                 runCatching { action() }
                     .onSuccess { result ->
-                        if (!result.ok) {
+                        val state = status(result)
+                        if (!state.ok) {
                             store.recordEvent(
                                 errorCategory,
-                                "Influx async action failed",
-                                "${result.category}: ${result.message}"
+                                "$channelName async action failed",
+                                "${state.category}: ${state.message}"
                             )
                         }
                     }
                     .onFailure { error ->
                         store.recordEvent(
                             errorCategory,
-                            "Influx async action failed",
+                            "$channelName async action failed",
                             "${error::class.java.simpleName}: ${error.message ?: "no message"}"
                         )
                     }
@@ -912,11 +912,17 @@ class CollectorService : Service() {
         } catch (error: RejectedExecutionException) {
             store.recordEvent(
                 errorCategory,
-                "Influx async action rejected",
+                "$channelName async action rejected",
                 "${error::class.java.simpleName}: ${error.message ?: "no message"}"
             )
         }
     }
+
+    private data class ChannelActionStatus(
+        val ok: Boolean,
+        val category: String,
+        val message: String
+    )
 
     private fun shutdownInfluxExecutor() {
         synchronized(influxExecutorLock) {
@@ -1021,21 +1027,6 @@ class CollectorService : Service() {
                 "Collector notification update failed",
                 "${error::class.java.simpleName}: ${error.message ?: "no message"}"
             )
-        }
-    }
-
-    private fun pollingErrorSummary(category: String?): String {
-        return when (category) {
-            "adb_authorization_required" -> "ADB not authorized"
-            "adb_authorization_unavailable" -> "ADB unavailable"
-            "adb_authorization_timeout" -> "ADB authorization timeout"
-            "helper_launch_failed",
-            "helper_unavailable",
-            "helper_launch_backoff" -> "Direct telemetry unavailable"
-            "autoservice_snapshot_empty",
-            "autoservice_partial_failure" -> "Direct telemetry error"
-            "service_start_error" -> "service start failed"
-            else -> category ?: "unknown"
         }
     }
 

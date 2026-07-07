@@ -6,7 +6,6 @@ enum class NormalizedCategory(val mqttKey: String, val staleAfterMs: Long) {
     BODY("body", 30_000L),
     CLIMATE("climate", 30_000L),
     SAFETY("safety", 30_000L),
-    DRIVER_ASSIST("driver_assist", 10_000L),
     COLLECTOR("collector", 60_000L)
 }
 

@@ -88,6 +88,19 @@ class CollectorServiceMaintenanceContractTest {
     }
 
     @Test
+    fun mqttAndInfluxUseSharedChannelExecutorHelper() {
+        val source = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+
+        assertTrue(source.contains("private fun <T> executeChannel("))
+        assertTrue(source.contains("private data class ChannelActionStatus("))
+        assertTrue(source.contains("Thread.MIN_PRIORITY"))
+        assertFalse(source.contains("val generation = mqttWorkGeneration.get()"))
+        assertFalse(source.contains("val generation = influxWorkGeneration.get()"))
+        assertFalse(source.contains("\"MQTT async action rejected\",\n                \"${'$'}{error::class.java.simpleName}"))
+        assertFalse(source.contains("\"Influx async action rejected\",\n                \"${'$'}{error::class.java.simpleName}"))
+    }
+
+    @Test
     fun archiveFailureWithMissingOriginalDoesNotReopenFreshDatabase() {
         val source = sourceFile("com/bydcollector/collector/maintenance/DbMaintenanceCoordinator.kt").readText()
         val run = source.substringAfter("fun run(").substringBefore("private fun compact")

@@ -27,8 +27,7 @@ object VehicleKpiMapper {
             odometerKm = byKey.km("odometer_km", language),
             cabinTempC = byKey.temp("inside_temp_c_raw"),
             sohPercent = byKey.percent("battery_soh_percent"),
-            batteryPowerLabelUk = if (charging) "Заряджання" else "Розряджання",
-            batteryPowerLabelEn = if (charging) "Charging" else "Discharging",
+            batteryPowerCharging = charging,
             batteryPowerKw = power?.let { formatKw(if (charging) abs(it) else -abs(it), language) } ?: "-",
             remainingRangeKm = byKey.km("remaining_range_km", language),
             batteryTempC = byKey.temp("battery_average_temp_raw"),
@@ -52,7 +51,7 @@ object VehicleKpiMapper {
     }
 
     private fun Map<String, StoredNormalizedState>.temp(fieldKey: String): String {
-        return number(fieldKey)?.roundToInt()?.let { "$it C" } ?: "-"
+        return number(fieldKey)?.roundToInt()?.let { "$it °C" } ?: "-"
     }
 
     private fun formatKw(value: Double, language: VehicleKpiLanguage): String {

@@ -25,6 +25,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -65,6 +66,7 @@ fun BydCollectorApp(
     updateAutoCheckEnabled: Boolean = true,
     updateUiState: UpdateUiState = UpdateUiState.Hidden,
     databaseMaintenanceUiState: DbMaintenanceUiState? = null,
+    switchConfirmationVersion: Int = 0,
     actions: BydCollectorActions,
     backgroundSetupPromptVisible: Boolean = false,
     onOpenBackgroundSettingsFromPrompt: () -> Unit = {},
@@ -74,74 +76,76 @@ fun BydCollectorApp(
     //renders the operational dashboard directly; this app intentionally has no landing/marketing screen
     BydCollectorTheme(darkTheme) {
         val p = LocalBydPalette.current
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(p.background)
-        ) {
-            Column(
+        CompositionLocalProvider(LocalSwitchConfirmationVersion provides switchConfirmationVersion) {
+            Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(horizontal = 18.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+                    .background(p.background)
             ) {
-                TopHeader(
-                    state = state,
-                    language = language,
-                    darkTheme = darkTheme,
-                    appVersionName = appVersionName,
-                    strings = s,
-                    actions = actions
-                )
-                DashboardSurface(
+                Column(
                     modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
+                        .fillMaxSize()
+                        .padding(horizontal = 18.dp, vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Box(
+                    TopHeader(
+                        state = state,
+                        language = language,
+                        darkTheme = darkTheme,
+                        appVersionName = appVersionName,
+                        strings = s,
+                        actions = actions
+                    )
+                    DashboardSurface(
                         modifier = Modifier
-                            .fillMaxWidth()
                             .weight(1f)
+                            .fillMaxWidth()
                     ) {
-                        //keeps tabs mounted from one state snapshot so service/runtime facts stay consistent
-                        when (activeTab) {
-                            AppTab.MAIN -> MainTab(state, s, actions)
-                            AppTab.ALL_PARAMETERS -> AllParametersTab(state, s, language, debugBatchText, actions)
-                            AppTab.HA -> HaTab(state, s, mqttDraft, influxDraft, actions)
-                            AppTab.EXTRA -> ExtraTab(state, s, updateAutoCheckEnabled, actions)
-                            AppTab.LOGS -> LogsTab(state, s, actions)
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f)
+                        ) {
+                            //keeps tabs mounted from one state snapshot so service/runtime facts stay consistent
+                            when (activeTab) {
+                                AppTab.MAIN -> MainTab(state, s, actions)
+                                AppTab.ALL_PARAMETERS -> AllParametersTab(state, s, language, debugBatchText, actions)
+                                AppTab.HA -> HaTab(state, s, mqttDraft, influxDraft, actions)
+                                AppTab.EXTRA -> ExtraTab(state, s, updateAutoCheckEnabled, actions)
+                                AppTab.LOGS -> LogsTab(state, s, actions)
+                            }
                         }
                     }
+                    BottomTabs(activeTab = activeTab, strings = s, actions = actions)
                 }
-                BottomTabs(activeTab = activeTab, strings = s, actions = actions)
-            }
-            if (backgroundSetupPromptVisible) {
-                //blocks underlying controls while the dilink background-app instruction is visible
-                BackgroundAppsSetupPrompt(
-                    strings = s,
-                    onOpenSettings = onOpenBackgroundSettingsFromPrompt,
-                    onDismiss = onDismissBackgroundSetupPrompt
-                )
-            }
-            if (updateUiState != UpdateUiState.Hidden) {
-                //uses the same modal layer as background setup so update flow cannot trigger other controls
-                UpdateCheckDialog(
-                    strings = s,
-                    appVersionName = appVersionName,
-                    state = updateUiState,
-                    onDismiss = actions::onDismissUpdateDialog,
-                    onUpdate = actions::onInstallUpdate
-                )
-            }
-            if (databaseMaintenanceUiState != null) {
-                DatabaseMaintenanceDialog(
-                    strings = s,
-                    state = databaseMaintenanceUiState,
-                    mqttPending = state?.mqttPendingCount ?: 0L,
-                    influxPending = state?.influxPendingRows ?: 0L,
-                    onConfirm = actions::onConfirmDatabaseMaintenance,
-                    onDismiss = actions::onDismissDatabaseMaintenance
-                )
+                if (backgroundSetupPromptVisible) {
+                    //blocks underlying controls while the dilink background-app instruction is visible
+                    BackgroundAppsSetupPrompt(
+                        strings = s,
+                        onOpenSettings = onOpenBackgroundSettingsFromPrompt,
+                        onDismiss = onDismissBackgroundSetupPrompt
+                    )
+                }
+                if (updateUiState != UpdateUiState.Hidden) {
+                    //uses the same modal layer as background setup so update flow cannot trigger other controls
+                    UpdateCheckDialog(
+                        strings = s,
+                        appVersionName = appVersionName,
+                        state = updateUiState,
+                        onDismiss = actions::onDismissUpdateDialog,
+                        onUpdate = actions::onInstallUpdate
+                    )
+                }
+                if (databaseMaintenanceUiState != null) {
+                    DatabaseMaintenanceDialog(
+                        strings = s,
+                        state = databaseMaintenanceUiState,
+                        mqttPending = state?.mqttPendingCount ?: 0L,
+                        influxPending = state?.influxPendingRows ?: 0L,
+                        onConfirm = actions::onConfirmDatabaseMaintenance,
+                        onDismiss = actions::onDismissDatabaseMaintenance
+                    )
+                }
             }
         }
     }
@@ -428,16 +432,16 @@ private fun AllParametersTab(
                     NumericInput(debugBatchText, actions::onDebugBatchChanged, modifier = Modifier.width(60.dp))
                 }
             }
-            VehicleKpiCard(state, strings, language, Modifier.weight(2f).height(262.dp))
+            VehicleKpiCard(state, strings, Modifier.weight(2f).height(262.dp))
         }
         DebugDatabaseCard(state, strings, Modifier.fillMaxWidth())
     }
 }
 
 @Composable
-private fun VehicleKpiCard(state: DashboardState?, strings: UiStrings, language: UiLanguage, modifier: Modifier) {
+private fun VehicleKpiCard(state: DashboardState?, strings: UiStrings, modifier: Modifier) {
     val kpi = state?.vehicleKpis
-    val chargeLabel = if (language == UiLanguage.UK) kpi?.batteryPowerLabelUk else kpi?.batteryPowerLabelEn
+    val chargeLabel = if (kpi?.batteryPowerCharging == true) strings.kpiCharging else strings.kpiDischarging
     SectionCard(title = strings.currentVehicleState, modifier = modifier, bodyPadding = 14.dp) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             KpiTile(strings.kpiSoc, kpi?.socPercent ?: "-", modifier = Modifier.weight(1f))
@@ -676,10 +680,27 @@ private fun ExtraTab(
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             SectionCard(strings.keepAlive, Modifier.weight(1f).height(optionsCardHeight)) {
                 Column(Modifier.fillMaxWidth()) {
-                    SwitchRow(strings.keepWifi, state?.keepWifiEnabled == true, actions::onToggleKeepWifi)
-                    SwitchRow(strings.keepMobile, state?.keepMobileDataEnabled == true, actions::onToggleKeepMobile)
-                    SwitchRow(strings.keepBluetooth, state?.keepBluetoothEnabled == true, actions::onToggleKeepBluetooth)
-                    SwitchRow(strings.restoreCollector, state?.recoverCollectorServiceEnabled == true, actions::onToggleKeepCollector, divider = false)
+                    SwitchRow(
+                        strings.keepWifi,
+                        state?.keepWifiEnabled == true,
+                        actions::onToggleKeepWifi
+                    )
+                    SwitchRow(
+                        strings.keepMobile,
+                        state?.keepMobileDataEnabled == true,
+                        actions::onToggleKeepMobile
+                    )
+                    SwitchRow(
+                        strings.keepBluetooth,
+                        state?.keepBluetoothEnabled == true,
+                        actions::onToggleKeepBluetooth
+                    )
+                    SwitchRow(
+                        strings.restoreCollector,
+                        state?.recoverCollectorServiceEnabled == true,
+                        actions::onToggleKeepCollector,
+                        divider = false
+                    )
                 }
             }
             SectionCard(strings.appRuntime, Modifier.weight(1f).height(optionsCardHeight)) {
@@ -808,14 +829,18 @@ private fun ShutdownIconButton(onClick: () -> Unit) {
     val p = LocalBydPalette.current
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
-    val buttonBackground = if (pressed) p.redSoft else p.redSoft.copy(alpha = 0.56f)
+    val press = rememberForcedPressClick(enabled = true, onClick = onClick)
+    val visualPressed = pressed || press.visualPressed
+    val buttonBackground = if (visualPressed) p.redSoft else p.redSoft.copy(alpha = 0.56f)
     Box(
         modifier = Modifier
             .size(42.dp)
-            .pressScaleModifier(interactionSource)
+            .pressScaleModifier(interactionSource, forcePressed = press.visualPressed)
             .background(buttonBackground, Rounded8)
             .border(1.dp, p.red.copy(alpha = 0.72f), Rounded8)
-            .clickable(interactionSource = interactionSource, indication = null) { onClick() },
+            .clickable(enabled = !press.locked, interactionSource = interactionSource, indication = null) {
+                press.onClick()
+            },
         contentAlignment = Alignment.Center
     ) {
         ShutdownIcon(color = p.red, modifier = Modifier.size(23.dp))
@@ -823,7 +848,12 @@ private fun ShutdownIconButton(onClick: () -> Unit) {
 }
 
 @Composable
-private fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit, divider: Boolean = true) {
+private fun SwitchRow(
+    label: String,
+    checked: Boolean,
+    onChange: (Boolean) -> Unit,
+    divider: Boolean = true
+) {
     val p = LocalBydPalette.current
     Column(Modifier.fillMaxWidth()) {
         Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -902,7 +932,7 @@ private fun UpdateCheckDialog(
                             Spacer(Modifier.height(10.dp))
                             AvailableUpdateNotes(strings, state.info)
                         }
-                        is UpdateUiState.Error -> Text("${strings.updateError}: ${state.message}", color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                        is UpdateUiState.Error -> Text("${strings.updateError}: ${localizedUpdateError(strings, state.message)}", color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                         UpdateUiState.Hidden -> Text(strings.checkingForUpdate, color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                     }
                 }
@@ -964,7 +994,7 @@ private fun DatabaseMaintenanceDialog(
             ) {
                 when {
                     state.running -> DatabaseMaintenanceRunningBody(strings, state)
-                    state.error != null -> Text("${strings.dbMaintenanceFailed}: ${state.error}", color = p.red, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                    state.error != null -> Text("${strings.dbMaintenanceFailed}: ${localizedDbMaintenanceError(strings, state.error)}", color = p.red, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                     state.completed -> {
                         Text(strings.dbMaintenanceComplete, color = p.green, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                         state.archivePath?.let {
@@ -1024,6 +1054,35 @@ private fun DatabaseMaintenanceRunningBody(strings: UiStrings, state: DbMaintena
 private fun localizedMaintenanceMessage(strings: UiStrings, state: DbMaintenanceUiState): String {
     return if (strings.step == "Крок") state.messageUk.ifBlank { state.operation.stepsUk.getOrNull((state.stepIndex - 1).coerceAtLeast(0)) ?: "" }
     else state.messageEn.ifBlank { state.operation.stepsEn.getOrNull((state.stepIndex - 1).coerceAtLeast(0)) ?: "" }
+}
+
+private fun localizedUpdateError(strings: UiStrings, message: String): String {
+    val normalized = message.lowercase()
+    return when {
+        "unable to resolve host" in normalized ||
+            "failed to connect" in normalized ||
+            "timeout" in normalized ||
+            "network" in normalized ||
+            "no address associated" in normalized -> strings.updateNetworkUnavailable
+        "download" in normalized || "missing" in normalized -> strings.updateDownloadFailed
+        "apk" in normalized ||
+            "package" in normalized ||
+            "versioncode" in normalized ||
+            "certificate" in normalized ||
+            "digest" in normalized ||
+            "verification" in normalized -> strings.updateVerificationFailed
+        "activitynotfound" in normalized || "installer" in normalized -> strings.updateInstallFailed
+        else -> strings.updateGenericError
+    }
+}
+
+private fun localizedDbMaintenanceError(strings: UiStrings, error: String): String {
+    val normalized = error.lowercase()
+    return when {
+        "interrupted before completion" in normalized -> strings.dbMaintenanceInterrupted
+        "already running" in normalized -> strings.dbMaintenanceAlreadyRunning
+        else -> strings.dbMaintenanceGenericError
+    }
 }
 
 private fun operationTitle(strings: UiStrings, operation: DbMaintenanceOperation): String {
@@ -1248,13 +1307,14 @@ private fun BottomTabs(activeTab: AppTab, strings: UiStrings, actions: BydCollec
         tabs.forEach { (tab, pair) ->
             val selected = tab == activeTab
             val interactionSource = remember { MutableInteractionSource() }
+            val press = rememberForcedPressClick(enabled = true) { actions.onTabSelected(tab) }
             Row(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxHeight()
-                    .pressScaleModifier(interactionSource)
+                    .pressScaleModifier(interactionSource, forcePressed = press.visualPressed)
                     .background(if (selected) p.active else p.surface, Rounded8)
-                    .clickableNoRipple(interactionSource) { actions.onTabSelected(tab) }
+                    .clickableNoRipple(interactionSource, press.visualPressed, enabled = !press.locked) { press.onClick() }
                     .borderSafe(if (selected) p.accent else p.surface)
                     .padding(horizontal = 10.dp),
                 horizontalArrangement = Arrangement.Center,
@@ -1275,9 +1335,15 @@ private fun BottomTabs(activeTab: AppTab, strings: UiStrings, actions: BydCollec
     }
 }
 
-private fun Modifier.clickableNoRipple(interactionSource: MutableInteractionSource, onClick: () -> Unit): Modifier =
+private fun Modifier.clickableNoRipple(
+    interactionSource: MutableInteractionSource,
+    forcePressed: Boolean = false,
+    enabled: Boolean = true,
+    onClick: () -> Unit
+): Modifier =
     this.then(
         Modifier.clickable(
+            enabled = enabled,
             interactionSource = interactionSource,
             indication = null,
             onClick = onClick

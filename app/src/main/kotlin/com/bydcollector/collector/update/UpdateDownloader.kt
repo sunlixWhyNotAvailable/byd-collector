@@ -8,6 +8,8 @@ import android.net.Uri
 import android.os.Environment
 import androidx.core.content.FileProvider
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 
 class UpdateDownloader(private val context: Context) {
     fun enqueue(info: UpdateInfo): Long {
@@ -55,15 +57,22 @@ class UpdateDownloader(private val context: Context) {
         }
     }
 
-    fun install(info: UpdateInfo) {
+    fun copyDownloadedApkForInstall(info: UpdateInfo): File {
+        return copyToVerifiedCache(
+            sourceFile = downloadedFile(info),
+            cacheDir = File(context.cacheDir, "updates"),
+            version = info.version
+        )
+    }
+
+    fun install(info: UpdateInfo, file: File) {
         GitHubReleaseTrust.requireTrustedApkDownloadUrl(info.downloadUrl, info.downloadContentType)
-        val file = downloadedFile(info)
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
         val intent = Intent(Intent.ACTION_VIEW)
             .setDataAndType(uri, APK_MIME)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        //open package installer for the downloaded apk
+        //open package installer for the verified private apk copy
         context.startActivity(intent)
     }
 
@@ -81,6 +90,28 @@ class UpdateDownloader(private val context: Context) {
         private const val APK_MIME = "application/vnd.android.package-archive"
 
         internal fun updateApkName(version: String): String = "bydcollector-${GitHubReleaseTrust.sanitizeFileToken(version)}.apk"
+
+        internal fun copyToVerifiedCache(sourceFile: File, cacheDir: File, version: String): File {
+            require(sourceFile.isFile) { "downloaded APK is missing" }
+            if (!cacheDir.exists() && !cacheDir.mkdirs()) {
+                error("Cannot create verified update cache")
+            }
+            val target = cacheDir.resolve(updateApkName(version))
+            cacheDir.listFiles()
+                ?.filter { file ->
+                    file.isFile &&
+                        file.name.startsWith("bydcollector-") &&
+                        file.name.endsWith(".apk") &&
+                        file.name != target.name
+                }
+                ?.forEach { file -> runCatching { file.delete() } }
+            FileInputStream(sourceFile).use { input ->
+                FileOutputStream(target, false).use { output ->
+                    input.copyTo(output)
+                }
+            }
+            return target
+        }
 
         internal fun deleteOldUpdateApks(downloadDir: File?, keepFileName: String) {
             if (downloadDir == null || !downloadDir.exists()) return

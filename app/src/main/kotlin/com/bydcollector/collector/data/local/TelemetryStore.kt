@@ -8,6 +8,7 @@ import android.util.Log
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.data.normalized.NormalizedStateStore
 import com.bydcollector.collector.data.normalized.NormalizedWriteSummary
+import com.bydcollector.collector.data.normalized.PollingErrorSummaries
 import com.bydcollector.collector.data.normalized.StoredNormalizedState
 import com.bydcollector.collector.data.polling.PollStorage
 import com.bydcollector.collector.mqtt.HaMqttMessage
@@ -885,7 +886,7 @@ class TelemetryStore(
             } else {
                 val category = cursor.getString(2)
                 val message = cursor.getString(3)
-                "Polling error: ${pollingErrorSummary(category, message)} at $ts"
+                "Polling error: ${PollingErrorSummaries.summary(category, message)} at $ts"
             }
         }
     }
@@ -1122,20 +1123,6 @@ class TelemetryStore(
         val value = this ?: return null
         if (value.length <= maxLength) return value
         return value.take(maxLength) + "...[truncated ${value.length - maxLength} chars]"
-    }
-
-    private fun pollingErrorSummary(category: String?, message: String?): String {
-        return when (category) {
-            "network_error", "timeout" -> "Direct telemetry unavailable"
-            "http_error", "di_success_false", "parse_error" -> "Direct telemetry error"
-            "adb_authorization_required" -> "ADB not authorized"
-            "adb_authorization_unavailable" -> "ADB unavailable"
-            "adb_authorization_timeout" -> "ADB authorization timeout"
-            "bridge_launch_failed", "bridge_unavailable",
-            "helper_launch_failed", "helper_unavailable", "helper_launch_backoff",
-            "autoservice_snapshot_empty" -> "Direct vehicle helper unavailable"
-            else -> category ?: "unknown"
-        } + message?.takeIf { it.isNotBlank() }?.let { ": $it" }.orEmpty()
     }
 
     private fun targetTypeForTopic(topic: String): String {

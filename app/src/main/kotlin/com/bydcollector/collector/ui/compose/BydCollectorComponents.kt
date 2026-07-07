@@ -27,8 +27,13 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -46,20 +51,71 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
 
 private val CardShape = RoundedCornerShape(8.dp)
 private val ControlShape = RoundedCornerShape(7.dp)
 private val PillShape = RoundedCornerShape(50)
+private const val FORCED_PRESS_DELAY_MS = 100L
+private const val SWITCH_CENTER_DELAY_MS = 120L
+private const val SWITCH_CONFIRM_TIMEOUT_MS = 2_000L
+
+val LocalSwitchConfirmationVersion = staticCompositionLocalOf { 0 }
+
+data class ForcedPressClick(
+    val visualPressed: Boolean,
+    val locked: Boolean,
+    val onClick: () -> Unit
+)
+
+private data class SwitchPendingState(
+    val from: Boolean,
+    val target: Boolean,
+    val startedAtVersion: Int? = null,
+    val token: Int
+)
+
+@Composable
+fun rememberForcedPressClick(
+    enabled: Boolean,
+    onClick: () -> Unit
+): ForcedPressClick {
+    val latestOnClick by rememberUpdatedState(onClick)
+    var visualPressed by remember { mutableStateOf(false) }
+    var locked by remember { mutableStateOf(false) }
+    var clickToken by remember { mutableStateOf(0) }
+
+    //delays actions briefly so every button visibly acknowledges the tap first
+    LaunchedEffect(clickToken) {
+        if (clickToken == 0) return@LaunchedEffect
+        delay(FORCED_PRESS_DELAY_MS)
+        visualPressed = false
+        locked = false
+        latestOnClick()
+    }
+
+    return ForcedPressClick(
+        visualPressed = visualPressed,
+        locked = locked,
+        onClick = {
+            if (!enabled || locked) return@ForcedPressClick
+            locked = true
+            visualPressed = true
+            clickToken += 1
+        }
+    )
+}
 
 @Composable
 fun Modifier.pressScaleModifier(
     interactionSource: MutableInteractionSource,
-    enabled: Boolean = true
+    enabled: Boolean = true,
+    forcePressed: Boolean = false
 ): Modifier {
     val pressed by interactionSource.collectIsPressedAsState()
     //gives buttons/tabs physical feedback without changing their measured layout size
     val scale by animateFloatAsState(
-        targetValue = if (pressed && enabled) 0.97f else 1f,
+        targetValue = if ((pressed || forcePressed) && enabled) 0.97f else 1f,
         animationSpec = tween(durationMillis = 90)
     )
     return this.graphicsLayer {
@@ -199,27 +255,31 @@ fun ActionButton(
     val p = LocalBydPalette.current
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
+    val press = rememberForcedPressClick(enabled, onClick)
+    val visualPressed = pressed || press.visualPressed
     val bg = when {
         !enabled -> p.disabled.copy(alpha = 0.55f)
-        primary && pressed -> p.accent.copy(alpha = 0.72f)
-        primary -> p.accent
-        pressed -> p.activeSoft
+        primary && visualPressed -> p.active
+        primary -> p.activeSoft
+        visualPressed -> p.activeSoft
         else -> p.surface
     }
     val border = if (primary && enabled) p.accent else p.borderStrong
     val fg = when {
         !enabled -> p.muted.copy(alpha = 0.65f)
-        primary -> p.accentText
+        primary -> p.text
         else -> p.text
     }
     Box(
         modifier = modifier
             .height(42.dp)
-            .pressScaleModifier(interactionSource, enabled)
+            .pressScaleModifier(interactionSource, enabled, forcePressed = press.visualPressed)
             .clip(ControlShape)
             .background(bg)
             .border(1.dp, border, ControlShape)
-            .clickable(enabled = enabled, interactionSource = interactionSource, indication = null) { onClick() }
+            .clickable(enabled = enabled && !press.locked, interactionSource = interactionSource, indication = null) {
+                press.onClick()
+            }
             .padding(horizontal = 12.dp),
         contentAlignment = Alignment.Center
     ) {
@@ -245,17 +305,52 @@ fun BydSwitch(
     val p = LocalBydPalette.current
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
+    val confirmationVersion = LocalSwitchConfirmationVersion.current
+    val latestConfirmationVersion by rememberUpdatedState(confirmationVersion)
+    var localPending by remember { mutableStateOf<SwitchPendingState?>(null) }
+    var token by remember { mutableStateOf(0) }
+    val pendingState = localPending
+    val visuallyPending = pending || pendingState != null
+    val visualChecked = pendingState?.from ?: checked
+
+    //centers the knob before executing the setting change, then waits for a real refreshed state
+    LaunchedEffect(pendingState?.token) {
+        val current = pendingState ?: return@LaunchedEffect
+        delay(SWITCH_CENTER_DELAY_MS)
+        localPending = current.copy(startedAtVersion = latestConfirmationVersion)
+        val applied = runCatching { onCheckedChange(current.target) }.isSuccess
+        if (!applied) {
+            localPending = null
+            return@LaunchedEffect
+        }
+        delay(SWITCH_CONFIRM_TIMEOUT_MS)
+        if (localPending?.token == current.token) {
+            localPending = null
+        }
+    }
+
+    //confirms only when refreshed backing state reaches the requested target
+    LaunchedEffect(confirmationVersion, checked) {
+        val current = localPending ?: return@LaunchedEffect
+        val startedAt = current.startedAtVersion ?: return@LaunchedEffect
+        if (confirmationVersion <= startedAt) return@LaunchedEffect
+        if (checked != current.target) return@LaunchedEffect
+        localPending = null
+    }
+
     val track = when {
         !enabled -> p.disabled
         pressed -> p.activeSoft
         pending -> p.activeSoft
+        pendingState != null -> p.activeSoft
         checked -> p.accent
         else -> p.switchOff
     }
     val thumbOffset by animateDpAsState(
         targetValue = when {
             pending -> 12.dp
-            checked -> 25.dp
+            pendingState != null -> 12.dp
+            visualChecked -> 25.dp
             else -> 0.dp
         },
         animationSpec = tween(durationMillis = 120)
@@ -266,8 +361,10 @@ fun BydSwitch(
             .clip(PillShape)
             .background(track)
             .border(1.dp, if (checked) p.accent else p.border, PillShape)
-            .clickable(enabled = enabled, interactionSource = interactionSource, indication = null) {
-                onCheckedChange(!checked)
+            .clickable(enabled = enabled && localPending == null, interactionSource = interactionSource, indication = null) {
+                val target = !checked
+                token += 1
+                localPending = SwitchPendingState(from = checked, target = target, token = token)
             }
             .padding(3.dp),
         contentAlignment = Alignment.CenterStart
@@ -277,7 +374,7 @@ fun BydSwitch(
                 .padding(start = thumbOffset)
                 .size(25.dp)
                 .clip(PillShape)
-                .background(p.switchThumb)
+                .background(if (visualChecked || visuallyPending) p.switchThumbOn else p.switchThumbOff)
         )
     }
 }
@@ -485,10 +582,12 @@ fun CategoryChip(
     val p = LocalBydPalette.current
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
+    val press = rememberForcedPressClick(enabled, onClick)
+    val visualPressed = pressed || press.visualPressed
     val bg = when {
         !enabled -> p.disabled.copy(alpha = 0.35f)
         selected -> p.active
-        pressed -> p.activeSoft
+        visualPressed -> p.activeSoft
         else -> p.surface
     }
     val fg = when {
@@ -499,11 +598,13 @@ fun CategoryChip(
     Box(
         modifier = modifier
             .height(38.dp)
-            .pressScaleModifier(interactionSource, enabled)
+            .pressScaleModifier(interactionSource, enabled, forcePressed = press.visualPressed)
             .clip(ControlShape)
             .background(bg)
             .border(1.dp, if (selected) p.accent else p.border, ControlShape)
-            .clickable(enabled = enabled, interactionSource = interactionSource, indication = null) { onClick() }
+            .clickable(enabled = enabled && !press.locked, interactionSource = interactionSource, indication = null) {
+                press.onClick()
+            }
             .padding(horizontal = 10.dp),
         contentAlignment = Alignment.CenterStart
     ) {
@@ -547,19 +648,23 @@ private fun SegmentButton(text: String, selected: Boolean, onClick: () -> Unit, 
     val p = LocalBydPalette.current
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
+    val press = rememberForcedPressClick(enabled = true, onClick = onClick)
+    val visualPressed = pressed || press.visualPressed
     Box(
         modifier = modifier
             .fillMaxHeight()
-            .pressScaleModifier(interactionSource)
+            .pressScaleModifier(interactionSource, forcePressed = press.visualPressed)
             .clip(PillShape)
             .background(
                 when {
                     selected -> p.accent
-                    pressed -> p.activeSoft
+                    visualPressed -> p.activeSoft
                     else -> Color.Transparent
                 }
             )
-            .clickable(interactionSource = interactionSource, indication = null) { onClick() },
+            .clickable(enabled = !press.locked, interactionSource = interactionSource, indication = null) {
+                press.onClick()
+            },
         contentAlignment = Alignment.Center
     ) {
         Text(

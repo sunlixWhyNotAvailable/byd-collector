@@ -46,6 +46,7 @@ import com.bydcollector.collector.update.UpdateDownloader
 import com.bydcollector.collector.update.UpdateInfo
 import com.bydcollector.collector.update.UpdateUiState
 import com.bydcollector.collector.util.namedSingleThreadExecutor
+import java.io.File
 
 //coordinates the user-facing compose shell while CollectorService owns long-running vehicle work
 class MainActivity : ComponentActivity() {
@@ -75,8 +76,10 @@ class MainActivity : ComponentActivity() {
     private var updateUiState by mutableStateOf<UpdateUiState>(UpdateUiState.Hidden)
     private var pendingMaintenanceOperation by mutableStateOf<DbMaintenanceOperation?>(null)
     private var maintenanceLaunchOperation by mutableStateOf<DbMaintenanceOperation?>(null)
+    private var dashboardRefreshVersion by mutableStateOf(0)
     private var backgroundSetupPromptVisible by mutableStateOf(false)
     private var backgroundSetupPromptAutoLaunch = false
+    @Volatile private var refreshAgainAfterCurrent = false
 
     private val refreshTask = object : Runnable {
         override fun run() {
@@ -315,31 +318,19 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onToggleKeepWifi(enabled: Boolean) {
-            refreshStoreBackedState()
-            settings.setKeepWifiEnabled(enabled)
-            CollectorServiceController.reconcileKeepAlive(this@MainActivity)
-            refresh()
+            updateKeepAliveSetting(enabled) { settings.setKeepWifiEnabled(it) }
         }
 
         override fun onToggleKeepMobile(enabled: Boolean) {
-            refreshStoreBackedState()
-            settings.setKeepMobileDataEnabled(enabled)
-            CollectorServiceController.reconcileKeepAlive(this@MainActivity)
-            refresh()
+            updateKeepAliveSetting(enabled) { settings.setKeepMobileDataEnabled(it) }
         }
 
         override fun onToggleKeepBluetooth(enabled: Boolean) {
-            refreshStoreBackedState()
-            settings.setKeepBluetoothEnabled(enabled)
-            CollectorServiceController.reconcileKeepAlive(this@MainActivity)
-            refresh()
+            updateKeepAliveSetting(enabled) { settings.setKeepBluetoothEnabled(it) }
         }
 
         override fun onToggleKeepCollector(enabled: Boolean) {
-            refreshStoreBackedState()
-            settings.setRecoverCollectorServiceEnabled(enabled)
-            CollectorServiceController.reconcileKeepAlive(this@MainActivity)
-            refresh()
+            updateKeepAliveSetting(enabled) { settings.setRecoverCollectorServiceEnabled(it) }
         }
 
         override fun onToggleTailscaleActivation(enabled: Boolean) {
@@ -437,6 +428,7 @@ class MainActivity : ComponentActivity() {
                 updateAutoCheckEnabled = settings.isUpdateAutoCheckEnabled(),
                 updateUiState = updateUiState,
                 databaseMaintenanceUiState = currentMaintenanceUiState(),
+                switchConfirmationVersion = dashboardRefreshVersion,
                 actions = uiActions,
                 backgroundSetupPromptVisible = backgroundSetupPromptVisible,
                 onOpenBackgroundSettingsFromPrompt = ::onOpenBackgroundSettingsFromPrompt,
@@ -490,7 +482,11 @@ class MainActivity : ComponentActivity() {
 
     private fun refresh() {
         refreshStoreBackedState()
-        if (refreshInFlight || destroyed) return
+        if (destroyed) return
+        if (refreshInFlight) {
+            refreshAgainAfterCurrent = true
+            return
+        }
         refreshInFlight = true
         val tab = activeTab
         //loads only the heavy dashboard slices needed by the visible tab to keep ui refresh cheap
@@ -531,8 +527,23 @@ class MainActivity : ComponentActivity() {
                             "${error::class.java.simpleName}: ${error.message ?: "no message"}"
                         )
                     }
+                dashboardRefreshVersion += 1
+                if (refreshAgainAfterCurrent && !destroyed) {
+                    refreshAgainAfterCurrent = false
+                    refresh()
+                }
             }
         }
+    }
+
+    private fun updateKeepAliveSetting(
+        enabled: Boolean,
+        applySetting: (Boolean) -> Unit
+    ) {
+        refreshStoreBackedState()
+        applySetting(enabled)
+        CollectorServiceController.reconcileKeepAlive(this@MainActivity)
+        refresh()
     }
 
     private fun maybeRunStartupSetup(): Boolean {
@@ -785,14 +796,28 @@ class MainActivity : ComponentActivity() {
                         if (!destroyed) updateUiState = UpdateUiState.Downloading(info, progress)
                     }
                 }
-                val validation = updateApkVerifier.validate(updateDownloader.downloadedFile(info))
+                val verifiedFile = updateDownloader.copyDownloadedApkForInstall(info)
+                val validation = updateApkVerifier.validate(verifiedFile)
                 if (!validation.ok) error(validation.message)
-                downloadId
+                VerifiedUpdateDownload(
+                    info = info,
+                    file = verifiedFile,
+                    sha256 = validation.sha256 ?: error("APK digest unavailable")
+                )
             }
             runOnUiThread {
                 if (destroyed) return@runOnUiThread
                 result
-                    .onSuccess { updateDownloader.install(info) }
+                    .onSuccess { verified ->
+                        val finalValidation = updateApkVerifier.validate(verified.file)
+                        if (!finalValidation.ok || finalValidation.sha256 != verified.sha256) {
+                            updateUiState = UpdateUiState.Error(
+                                if (!finalValidation.ok) finalValidation.message else "APK digest changed before install"
+                            )
+                            return@onSuccess
+                        }
+                        updateDownloader.install(verified.info, verified.file)
+                    }
                     .onFailure { error ->
                         updateUiState = UpdateUiState.Error(error.message ?: error::class.java.simpleName)
                     }
@@ -953,3 +978,9 @@ class MainActivity : ComponentActivity() {
         private const val DASHBOARD_REFRESH_INTERVAL_MS = 5_000L
     }
 }
+
+private data class VerifiedUpdateDownload(
+    val info: UpdateInfo,
+    val file: File,
+    val sha256: String
+)

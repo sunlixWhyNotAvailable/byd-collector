@@ -24,15 +24,18 @@ class BydCollectorUiContractTest {
 
         assertTrue(components.contains("height(42.dp)"))
         assertTrue(components.contains("fontSize = 12.sp"))
-        assertTrue(components.contains("val pressed by interactionSource.collectIsPressedAsState()"))
-        assertTrue(components.contains("primary && pressed -> p.accent.copy(alpha = 0.72f)"))
-        assertTrue(components.contains("pressed -> p.activeSoft"))
+        assertTrue(components.contains("val visualPressed = pressed || press.visualPressed"))
+        assertTrue(components.contains("primary && visualPressed -> p.active"))
+        assertTrue(components.contains("primary -> p.activeSoft"))
+        assertTrue(components.contains("primary -> p.text"))
+        assertTrue(components.contains("visualPressed -> p.activeSoft"))
         assertTrue(components.contains("pending: Boolean = false"))
         assertTrue(components.contains("animateDpAsState("))
         assertTrue(components.contains("targetValue = when {"))
         assertTrue(components.contains("pending -> 12.dp"))
         assertTrue(components.contains(".size(width = 56.dp, height = 32.dp)"))
-        assertTrue(app.contains(".pressScaleModifier(interactionSource)"))
+        assertTrue(components.contains(".background(if (visualChecked || visuallyPending) p.switchThumbOn else p.switchThumbOff)"))
+        assertTrue(app.contains(".pressScaleModifier(interactionSource, forcePressed = press.visualPressed)"))
         assertTrue(app.contains(".background(if (selected) p.active else p.surface, Rounded8)"))
     }
 
@@ -53,7 +56,7 @@ class BydCollectorUiContractTest {
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
 
         assertInOrder(app, "ActionButton(strings.backgroundSetupOpen", "ActionButton(strings.backgroundSetupDismiss")
-        assertInOrder(app, "ActionButton(\n                    text = strings.update", "ActionButton(strings.close")
+        assertInOrder(app, "text = strings.update", "ActionButton(strings.close")
         assertTrue(app.contains("DatabaseMaintenanceDialog("))
         assertTrue(app.contains(".width(560.dp)"))
         assertTrue(app.contains("if (!state.running && !state.completed && state.error == null) 340.dp else 300.dp"))
@@ -106,17 +109,57 @@ class BydCollectorUiContractTest {
         assertFalse(app.contains("AppRuntimeBottomSpacer()"))
         assertFalse(app.contains("Spacer(Modifier.height(92.dp))"))
         assertFalse(app.contains("SwitchRow(strings.activateTailscale"))
-        assertTrue(app.contains("SwitchRow(strings.restoreCollector, state?.recoverCollectorServiceEnabled == true, actions::onToggleKeepCollector, divider = false)"))
+        assertTrue(app.contains("strings.restoreCollector"))
+        assertFalse(app.contains("pending = KeepAlivePendingSwitch.COLLECTOR in keepAlivePendingSwitches"))
         assertTrue(app.contains("if (divider)"))
         assertTrue(app.contains(".background(p.border)"))
-        assertInOrder(app, "SwitchRow(strings.keepWifi", "SwitchRow(strings.restoreCollector")
+        assertInOrder(app, "strings.keepWifi", "strings.restoreCollector")
         assertInOrder(app, "SectionCard(strings.appRuntime", "TailscaleRuntimeRow(")
         assertInOrder(app, "TailscaleRuntimeRow(", "UpdateSettingsRow(")
         assertInOrder(app, "UpdateSettingsRow(", "ShutdownSettingsRow(")
         assertTrue(app.contains("ShutdownIcon(color = p.red"))
-        assertTrue(app.contains("val buttonBackground = if (pressed) p.redSoft else p.redSoft.copy(alpha = 0.56f)"))
+        assertTrue(app.contains("val buttonBackground = if (visualPressed) p.redSoft else p.redSoft.copy(alpha = 0.56f)"))
         assertTrue(app.contains(".background(buttonBackground, Rounded8)"))
         assertTrue(app.contains("actions::onShutdownApp"))
+    }
+
+    @Test
+    fun allSwitchesUseUniversalPendingConfirmation() {
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val actions = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorActions.kt").readText()
+        val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
+        val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+
+        assertFalse(actions.contains("enum class KeepAlivePendingSwitch"))
+        assertFalse(app.contains("keepAlivePendingSwitches"))
+        assertFalse(activity.contains("keepAlivePendingTargets"))
+        assertFalse(activity.contains("clearResolvedKeepAlivePending"))
+        assertTrue(components.contains("LocalSwitchConfirmationVersion"))
+        assertTrue(components.contains("SWITCH_CENTER_DELAY_MS"))
+        assertTrue(components.contains("SWITCH_CONFIRM_TIMEOUT_MS"))
+        assertTrue(components.contains("pending -> 12.dp"))
+        assertTrue(components.contains("onCheckedChange(current.target)"))
+        assertTrue(components.contains("if (checked != current.target) return@LaunchedEffect"))
+        assertTrue(activity.contains("private var dashboardRefreshVersion by mutableStateOf(0)"))
+        assertTrue(activity.contains("private var refreshAgainAfterCurrent = false"))
+        assertTrue(app.contains("switchConfirmationVersion: Int = 0"))
+        assertTrue(activity.contains("switchConfirmationVersion = dashboardRefreshVersion"))
+    }
+
+    @Test
+    fun buttonLikeControlsForceVisualPressBeforeAction() {
+        val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+
+        assertTrue(components.contains("FORCED_PRESS_DELAY_MS"))
+        assertTrue(components.contains("rememberForcedPressClick"))
+        assertTrue(components.contains("delay(FORCED_PRESS_DELAY_MS)"))
+        assertTrue(components.contains("latestOnClick()"))
+        assertTrue(components.contains("visualPressed"))
+        assertTrue(components.contains(".clickable(enabled = enabled && !press.locked"))
+        assertTrue(app.contains("pressScaleModifier(interactionSource, forcePressed = press.visualPressed"))
+        assertTrue(app.contains("clickableNoRipple(interactionSource, press.visualPressed"))
+        assertTrue(app.contains("ShutdownIconButton(onClick = actions::onShutdownApp)"))
     }
 
     private fun assertInOrder(source: String, first: String, second: String) {

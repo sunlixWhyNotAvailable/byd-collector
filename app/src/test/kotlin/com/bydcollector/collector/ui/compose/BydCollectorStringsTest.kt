@@ -84,5 +84,13 @@ class BydCollectorStringsTest {
         assertEquals("Odometer", en.kpiOdometer)
         assertEquals("Запас ходу", uk.kpiRange)
         assertEquals("Range", en.kpiRange)
+        assertEquals("Заряджання", uk.kpiCharging)
+        assertEquals("Розряджання", uk.kpiDischarging)
+        assertEquals("Charging", en.kpiCharging)
+        assertEquals("Discharging", en.kpiDischarging)
+        assertEquals("Немає з'єднання. Перевірте мережу або VPN.", uk.updateNetworkUnavailable)
+        assertEquals("No connection. Check the network or VPN.", en.updateNetworkUnavailable)
+        assertEquals("Операцію перервано до завершення.", uk.dbMaintenanceInterrupted)
+        assertEquals("The operation was interrupted before completion.", en.dbMaintenanceInterrupted)
     }
 }

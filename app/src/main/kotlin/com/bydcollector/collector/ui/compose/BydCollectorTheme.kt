@@ -27,7 +27,8 @@ data class BydPalette(
     val redSoft: Color,
     val disabled: Color,
     val switchOff: Color,
-    val switchThumb: Color,
+    val switchThumbOn: Color,
+    val switchThumbOff: Color,
     val pathField: Color,
     val pathText: Color,
     val pathBorder: Color
@@ -55,7 +56,8 @@ private val DarkPalette = BydPalette(
     redSoft = Color(0xFF4C252A),
     disabled = Color(0xFF394453),
     switchOff = Color(0xFF374150),
-    switchThumb = Color(0xFFDDEAF7),
+    switchThumbOn = Color(0xFFD9ECFF),
+    switchThumbOff = Color(0xFFD8E3EE),
     pathField = Color(0xFF0C1219),
     pathText = Color(0xFFA7B5C8),
     pathBorder = Color(0xFF2B3A4C)
@@ -83,7 +85,8 @@ private val LightPalette = BydPalette(
     redSoft = Color(0xFFFFE1E1),
     disabled = Color(0xFFE1E7EF),
     switchOff = Color(0xFFDDE4EE),
-    switchThumb = Color(0xFFD8E3EE),
+    switchThumbOn = Color(0xFFD9ECFF),
+    switchThumbOff = Color(0xFFD8E3EE),
     pathField = Color(0xFFF7FAFD),
     pathText = Color(0xFF526274),
     pathBorder = Color(0xFFC9D6E6)

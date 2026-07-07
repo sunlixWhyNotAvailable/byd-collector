@@ -20,11 +20,24 @@ class UpdateApkVerifierContractTest {
     }
 
     @Test
-    fun activityValidatesDownloadedApkBeforeInstall() {
+    fun activityValidatesPrivateApkCopyAndChecksDigestBeforeInstall() {
         val source = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
 
-        assertTrue(source.contains("updateApkVerifier.validate("))
-        assertInOrder(source, "updateApkVerifier.validate(", "updateDownloader.install(")
+        assertTrue(source.contains("copyDownloadedApkForInstall("))
+        assertTrue(source.contains("val validation = updateApkVerifier.validate(verifiedFile)"))
+        assertTrue(source.contains("finalValidation.sha256 != verified.sha256"))
+        assertInOrder(source, "copyDownloadedApkForInstall(", "updateApkVerifier.validate(verifiedFile)")
+        assertInOrder(source, "finalValidation.sha256 != verified.sha256", "updateDownloader.install(")
+    }
+
+    @Test
+    fun verifierReturnsFileShaAndLogsInstalledPackageInfoFailure() {
+        val source = sourceFile("com/bydcollector/collector/update/UpdateApkVerifier.kt").readText()
+
+        assertTrue(source.contains("val sha256: String?"))
+        assertTrue(source.contains("private fun fileSha256(file: File): String"))
+        assertTrue(source.contains("Log.w(TAG, \"installed package info unavailable\", error)"))
+        assertTrue(source.contains("UpdateApkValidation.ok(sha256)"))
     }
 
     private fun sourceFile(path: String): File {

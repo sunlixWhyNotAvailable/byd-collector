@@ -21,11 +21,9 @@ object UpdateVersionComparator {
 
     private fun segments(value: String): List<Int> {
         //guard build suffixes from changing semantic version order
-        val semanticPrefix = value.stripPrefix("v").takeWhile { it.isDigit() || it == '.' }
+        val semanticPrefix = value.removePrefix("v").takeWhile { it.isDigit() || it == '.' }
         return segmentRegex.findAll(semanticPrefix)
             .map { it.value.toInt() }
             .toList()
     }
-
-    private fun String.stripPrefix(prefix: String): String = removePrefix(prefix)
 }

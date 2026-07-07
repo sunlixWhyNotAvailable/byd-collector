@@ -75,6 +75,8 @@ data class UiStrings(
     val kpiOdometer: String,
     val kpiCabinTemp: String,
     val kpiSoh: String,
+    val kpiCharging: String,
+    val kpiDischarging: String,
     val kpiRange: String,
     val kpiBatteryTemp: String,
     val kpiCellDelta: String,
@@ -123,6 +125,11 @@ data class UiStrings(
     val update: String,
     val close: String,
     val updateError: String,
+    val updateNetworkUnavailable: String,
+    val updateDownloadFailed: String,
+    val updateVerificationFailed: String,
+    val updateInstallFailed: String,
+    val updateGenericError: String,
     val startJournal: String,
     val stopJournal: String,
     val startLogcat: String,
@@ -155,6 +162,9 @@ data class UiStrings(
     val interruptionDataLossRisk: String,
     val dbMaintenanceComplete: String,
     val dbMaintenanceFailed: String,
+    val dbMaintenanceInterrupted: String,
+    val dbMaintenanceAlreadyRunning: String,
+    val dbMaintenanceGenericError: String,
     val dbMaintenanceArchivePath: String
 )
 
@@ -210,6 +220,8 @@ fun strings(language: UiLanguage): UiStrings {
             kpiOdometer = "Пробіг",
             kpiCabinTemp = "Темп. салону",
             kpiSoh = "SOH",
+            kpiCharging = "Заряджання",
+            kpiDischarging = "Розряджання",
             kpiRange = "Запас ходу",
             kpiBatteryTemp = "Темп. батареї",
             kpiCellDelta = "Δ напруги комірки",
@@ -258,6 +270,11 @@ fun strings(language: UiLanguage): UiStrings {
             update = "Оновити",
             close = "Закрити",
             updateError = "Помилка перевірки оновлення",
+            updateNetworkUnavailable = "Немає з'єднання. Перевірте мережу або VPN.",
+            updateDownloadFailed = "Не вдалося завантажити оновлення.",
+            updateVerificationFailed = "Файл оновлення не пройшов перевірку.",
+            updateInstallFailed = "Не вдалося відкрити встановлення оновлення.",
+            updateGenericError = "Не вдалося перевірити або встановити оновлення.",
             startJournal = "Старт журналу",
             stopJournal = "Стоп журналу",
             startLogcat = "Старт logcat",
@@ -290,6 +307,9 @@ fun strings(language: UiLanguage): UiStrings {
             interruptionDataLossRisk = "Переривання процесу створює ризик втрати даних!",
             dbMaintenanceComplete = "Операцію завершено",
             dbMaintenanceFailed = "Операцію не виконано",
+            dbMaintenanceInterrupted = "Операцію перервано до завершення.",
+            dbMaintenanceAlreadyRunning = "Операція вже виконується.",
+            dbMaintenanceGenericError = "Операцію не виконано. Деталі записані в логах.",
             dbMaintenanceArchivePath = "Архів:"
         )
 
@@ -343,6 +363,8 @@ fun strings(language: UiLanguage): UiStrings {
             kpiOdometer = "Odometer",
             kpiCabinTemp = "Cabin temp",
             kpiSoh = "SOH",
+            kpiCharging = "Charging",
+            kpiDischarging = "Discharging",
             kpiRange = "Range",
             kpiBatteryTemp = "Battery temp",
             kpiCellDelta = "Cell voltage Δ",
@@ -391,6 +413,11 @@ fun strings(language: UiLanguage): UiStrings {
             update = "Update",
             close = "Close",
             updateError = "Update check error",
+            updateNetworkUnavailable = "No connection. Check the network or VPN.",
+            updateDownloadFailed = "Could not download the update.",
+            updateVerificationFailed = "The update file failed verification.",
+            updateInstallFailed = "Could not open update installation.",
+            updateGenericError = "Could not check or install the update.",
             startJournal = "Start journal",
             stopJournal = "Stop journal",
             startLogcat = "Start logcat",
@@ -423,6 +450,9 @@ fun strings(language: UiLanguage): UiStrings {
             interruptionDataLossRisk = "Process interruption creates data corruption risk!",
             dbMaintenanceComplete = "Operation complete",
             dbMaintenanceFailed = "Operation failed",
+            dbMaintenanceInterrupted = "The operation was interrupted before completion.",
+            dbMaintenanceAlreadyRunning = "The operation is already running.",
+            dbMaintenanceGenericError = "The operation failed. Details were written to logs.",
             dbMaintenanceArchivePath = "Archive:"
         )
     }

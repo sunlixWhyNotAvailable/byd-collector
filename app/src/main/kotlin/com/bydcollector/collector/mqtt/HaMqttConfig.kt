@@ -23,7 +23,6 @@ data class HaMqttConfig(
         const val DEFAULT_TOPIC_PREFIX = "bydcollector"
         const val DEFAULT_DISCOVERY_PREFIX = "homeassistant"
         const val DEFAULT_CLIENT_ID = "bydcollector_sealion_07"
-        const val DRIVER_ASSIST_CATEGORY = "driver_assist"
         val DEFAULT_CATEGORIES = HaIntegrationCategories.defaults
         val VISIBLE_CATEGORIES = HaIntegrationCategories.visible.toSet()
     }
