@@ -29,6 +29,7 @@ data class DashboardState(
     val dbMaintenanceStatus: DbMaintenanceRuntimeStatus,
     val archiveStorageLimitGb: Int,
     val archiveStorageSnapshot: ArchiveStorageSnapshot,
+    val archiveStorageScanPending: Boolean,
     val archiveStorageJobStatus: ArchiveStorageJobStatus,
     val latestSoc: String?,
     val latestSpeed: String?,

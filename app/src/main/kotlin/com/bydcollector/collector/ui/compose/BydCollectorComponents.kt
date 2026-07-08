@@ -470,7 +470,7 @@ fun ReadOnlyPathField(text: String, modifier: Modifier = Modifier) {
             .background(p.pathField)
             .border(1.dp, p.pathBorder, ControlShape)
             .padding(10.dp),
-        contentAlignment = Alignment.CenterStart
+        contentAlignment = Alignment.Center
     ) {
         Text(
             text = text,
@@ -478,8 +478,10 @@ fun ReadOnlyPathField(text: String, modifier: Modifier = Modifier) {
             fontSize = 13.sp,
             fontFamily = FontFamily.Monospace,
             fontWeight = FontWeight.Normal,
+            textAlign = TextAlign.Center,
             maxLines = 1,
-            overflow = TextOverflow.Ellipsis
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.fillMaxWidth()
         )
     }
 }

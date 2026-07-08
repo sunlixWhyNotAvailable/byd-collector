@@ -109,6 +109,12 @@ class BydCollectorStringsTest {
         assertEquals("Тека архівів", uk.archiveRoot)
         assertEquals("Видалити вибране", uk.deleteSelected)
         assertEquals("Видалити вибрані архіви?", uk.deleteArchivesQuestion)
+        assertEquals("МБ", uk.megabytesUnit)
+        assertEquals("ГБ", uk.gigabytesUnit)
+        assertEquals("обчислюємо...", uk.archiveCalculating)
+        assertEquals("Нові спочатку", uk.archiveSortNewestFirst)
+        assertEquals("Старі спочатку", uk.archiveSortOldestFirst)
+        assertEquals("(%d арх.)", uk.archiveCountShortTemplate)
 
         assertEquals("Active database", en.activeDatabase)
         assertEquals("Archives", en.archiveStorage)
@@ -116,5 +122,11 @@ class BydCollectorStringsTest {
         assertEquals("Archive folder", en.archiveRoot)
         assertEquals("Delete selected", en.deleteSelected)
         assertEquals("Delete selected archives?", en.deleteArchivesQuestion)
+        assertEquals("MB", en.megabytesUnit)
+        assertEquals("GB", en.gigabytesUnit)
+        assertEquals("calculating...", en.archiveCalculating)
+        assertEquals("Newest first", en.archiveSortNewestFirst)
+        assertEquals("Oldest first", en.archiveSortOldestFirst)
+        assertEquals("(%d arch.)", en.archiveCountShortTemplate)
     }
 }

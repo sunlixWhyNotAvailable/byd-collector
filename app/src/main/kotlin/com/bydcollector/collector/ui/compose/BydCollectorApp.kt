@@ -48,6 +48,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.bydcollector.collector.R
 import com.bydcollector.collector.maintenance.ArchiveEntryStatus
+import com.bydcollector.collector.maintenance.ArchiveStorageSnapshot
 import com.bydcollector.collector.maintenance.ArchiveStorageEntry
 import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
 import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
@@ -57,7 +58,6 @@ import com.bydcollector.collector.ui.DashboardState
 import com.bydcollector.collector.update.UpdateInfo
 import com.bydcollector.collector.update.UpdateUiState
 import java.util.Locale
-import kotlin.math.roundToLong
 
 @Composable
 fun BydCollectorApp(
@@ -397,7 +397,7 @@ private fun MainStatusCard(state: DashboardState?, strings: UiStrings, actions: 
             StatusRow("MQTT", compactChannelStatusText(state?.mqttStatus, strings), channelStatusKind(state?.mqttStatus, state?.mqttEnabled == true), modifier = Modifier.weight(1f))
             StatusRow("InfluxDB", compactChannelStatusText(state?.influxStatus, strings), channelStatusKind(state?.influxStatus, state?.influxEnabled == true), modifier = Modifier.weight(1f))
         }
-        ActionButton(strings.archiveDatabase, actions::onOpenArchiveDatabase, modifier = Modifier.fillMaxWidth())
+        ActionButton(strings.archiveDatabase, actions::onOpenArchiveDatabase, primary = true, modifier = Modifier.fillMaxWidth())
     }
 }
 
@@ -405,7 +405,7 @@ private fun MainStatusCard(state: DashboardState?, strings: UiStrings, actions: 
 private fun MainDatabaseCard(state: DashboardState?, strings: UiStrings, modifier: Modifier) {
     SectionCard(title = strings.database, modifier = modifier.height(142.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-            InfoRow(strings.size, formatBytes(state?.databaseSizeBytes ?: 0L), modifier = Modifier.weight(0.84f), divider = true)
+            InfoRow(strings.size, UiSizeFormatter.bytes(state?.databaseSizeBytes ?: 0L, strings), modifier = Modifier.weight(0.84f), divider = true)
             ReadOnlyPathField(state?.databasePath ?: "-", modifier = Modifier.weight(1.06f))
         }
     }
@@ -483,7 +483,7 @@ private fun VehicleKpiCard(state: DashboardState?, strings: UiStrings, modifier:
 private fun DebugDatabaseCard(state: DashboardState?, strings: UiStrings, modifier: Modifier) {
     SectionCard(title = strings.database, modifier = modifier.height(196.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-            InfoRow(strings.size, formatBytes(state?.debugDatabaseSizeBytes ?: 0L), modifier = Modifier.weight(0.84f), divider = true)
+            InfoRow(strings.size, UiSizeFormatter.bytes(state?.debugDatabaseSizeBytes ?: 0L, strings), modifier = Modifier.weight(0.84f), divider = true)
             ReadOnlyPathField(state?.debugDatabasePath ?: "-", modifier = Modifier.weight(1.06f))
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -1180,7 +1180,15 @@ private fun StorageTab(
     val listKey = entries.joinToString("|") { it.id }
     var selectedIds by remember(listKey) { mutableStateOf(emptySet<String>()) }
     val limitGb = state?.archiveStorageLimitGb ?: 2
+    var draftLimitGb by remember(limitGb) { mutableStateOf(limitGb) }
+    var newestFirst by remember { mutableStateOf(true) }
+    val sortedEntries = if (newestFirst) {
+        entries.sortedWith(compareByDescending<ArchiveStorageEntry> { it.createdAtMs }.thenBy { it.id })
+    } else {
+        entries.sortedWith(compareBy<ArchiveStorageEntry> { it.createdAtMs }.thenBy { it.id })
+    }
     val job = state?.archiveStorageJobStatus
+    val topCardHeight = 164.dp
 
     Column(
         modifier = Modifier
@@ -1190,39 +1198,76 @@ private fun StorageTab(
     ) {
         ScreenTitle(strings.storageTab, strings.storageSubtitle)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            SectionCard(strings.activeDatabase, modifier = Modifier.weight(1f).height(142.dp)) {
-                InfoRow(strings.size, formatBytes(snapshot?.activeDatabaseSizeBytes ?: state?.databaseSizeBytes ?: 0L), divider = true)
+            SectionCard(strings.activeDatabase, modifier = Modifier.weight(0.6f).height(topCardHeight)) {
+                Row(
+                    Modifier.fillMaxWidth().height(34.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        strings.size,
+                        color = LocalBydPalette.current.text,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        UiSizeFormatter.bytes(snapshot?.activeDatabaseSizeBytes ?: state?.databaseSizeBytes ?: 0L, strings),
+                        color = LocalBydPalette.current.text,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        textAlign = TextAlign.End,
+                        modifier = Modifier.weight(1f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Box(Modifier.fillMaxWidth().height(1.dp).background(LocalBydPalette.current.border))
+                Spacer(Modifier.height(4.dp))
                 ReadOnlyPathField(snapshot?.activeDatabasePath ?: state?.databasePath ?: "-")
             }
-            SectionCard(strings.archiveStorageLimit, modifier = Modifier.weight(1f).height(142.dp)) {
+            SectionCard(strings.archiveStorageLimit, modifier = Modifier.weight(0.4f).height(topCardHeight)) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                    ActionButton("-", { actions.onSetArchiveStorageLimitGb(limitGb - 1) }, enabled = limitGb > 1, modifier = Modifier.width(42.dp))
-                    ReadOnlyPathField("$limitGb GB", modifier = Modifier.weight(1f))
-                    ActionButton("+", { actions.onSetArchiveStorageLimitGb(limitGb + 1) }, primary = true, enabled = limitGb < 10, modifier = Modifier.width(42.dp))
+                    ActionButton("-", { draftLimitGb = (draftLimitGb - 1).coerceAtLeast(1) }, enabled = draftLimitGb > 1, modifier = Modifier.width(42.dp))
+                    ReadOnlyPathField(UiSizeFormatter.gigabytes(draftLimitGb, strings), modifier = Modifier.weight(0.7f))
+                    ActionButton("+", { draftLimitGb = (draftLimitGb + 1).coerceAtMost(10) }, enabled = draftLimitGb < 10, modifier = Modifier.width(42.dp))
+                    ActionButton(strings.ok, { actions.onSetArchiveStorageLimitGb(draftLimitGb) }, primary = true, enabled = draftLimitGb != limitGb, modifier = Modifier.weight(1f))
                 }
                 Text(strings.archiveStorageLimitHint, color = LocalBydPalette.current.muted, fontSize = 12.sp, lineHeight = 16.sp)
             }
         }
-        SectionCard(strings.archiveStorage, modifier = Modifier.fillMaxWidth()) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                InfoRow(strings.size, formatBytes(snapshot?.archiveBytes ?: 0L), modifier = Modifier.weight(0.75f), divider = false)
-                InfoRow(strings.archiveCount, entries.size.toString(), modifier = Modifier.weight(0.55f), divider = false)
-                ActionButton(strings.archiveStorageRefresh, actions::onReconcileArchiveStorage, modifier = Modifier.weight(0.8f))
-                ActionButton(
-                    strings.deleteSelected,
-                    { onRequestDelete(selectedIds.toList()) },
-                    enabled = selectedIds.isNotEmpty(),
-                    modifier = Modifier.weight(0.85f)
-                )
+        SectionCard(
+            strings.archiveStorage,
+            modifier = Modifier.fillMaxWidth(),
+            trailing = {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (state?.archiveStorageScanPending == true) {
+                        StatusPill(strings.archiveCalculating, StatusKind.WAITING, compact = true)
+                    }
+                    StatusPill(archiveUsageText(snapshot, strings), archiveUsageKind(snapshot), compact = true)
+                    Text(
+                        String.format(strings.archiveCountShortTemplate, entries.size),
+                        color = LocalBydPalette.current.muted,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
             }
-            ReadOnlyPathField(snapshot?.archiveRootPath ?: "-")
+        ) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                ReadOnlyPathField(snapshot?.archiveRootPath ?: "-", modifier = Modifier.weight(0.5f))
+                ActionButton(strings.archiveStorageRefresh, actions::onReconcileArchiveStorage, modifier = Modifier.weight(0.25f))
+                val sortLabel = if (newestFirst) strings.archiveSortNewestFirst else strings.archiveSortOldestFirst
+                ActionButton(sortLabel, { newestFirst = !newestFirst }, modifier = Modifier.weight(0.25f))
+            }
             job?.takeIf { it.running }?.let {
                 ArchiveStorageInlineStatus(strings, it)
             }
             if (entries.isEmpty()) {
                 Text(strings.archiveStorageEmpty, color = LocalBydPalette.current.muted, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
             } else {
-                entries.forEach { entry ->
+                sortedEntries.forEach { entry ->
                     ArchiveEntryRow(
                         entry = entry,
                         strings = strings,
@@ -1234,6 +1279,15 @@ private fun StorageTab(
                                 selectedIds + entry.id
                             }
                         }
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    ActionButton(strings.deleteSelected,
+                        { onRequestDelete(selectedIds.toList()) },
+                        primary = true,
+                        enabled = selectedIds.isNotEmpty(),
+                        modifier = Modifier.width(320.dp)
                     )
                 }
             }
@@ -1288,12 +1342,27 @@ private fun ArchiveEntryRow(
         }
         Column(modifier = Modifier.weight(1f)) {
             Text(entry.displayName, color = p.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(entry.path, color = p.pathText, fontSize = 12.sp, fontFamily = FontFamily.Monospace, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
-        Text(formatBytes(entry.sizeBytes), color = p.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+        Text(UiSizeFormatter.bytes(entry.sizeBytes, strings), color = p.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
         StatusPill(archiveStatusLabel(strings, entry.status), archiveStatusKind(entry.status), compact = true)
     }
     Box(Modifier.fillMaxWidth().height(1.dp).background(p.border))
+}
+
+private fun archiveUsageText(snapshot: ArchiveStorageSnapshot?, strings: UiStrings): String {
+    val archiveBytes = snapshot?.archiveBytes ?: 0L
+    val limitBytes = snapshot?.archiveLimitBytes ?: 0L
+    return "${UiSizeFormatter.bytes(archiveBytes, strings)}/${UiSizeFormatter.bytes(limitBytes, strings)}"
+}
+
+private fun archiveUsageKind(snapshot: ArchiveStorageSnapshot?): StatusKind {
+    val limitBytes = snapshot?.archiveLimitBytes ?: 0L
+    val ratio = if (limitBytes <= 0L) 0.0 else (snapshot?.archiveBytes ?: 0L).toDouble() / limitBytes.toDouble()
+    return when {
+        ratio <= 0.5 -> StatusKind.OK
+        ratio <= 0.9 -> StatusKind.WARNING
+        else -> StatusKind.ERROR
+    }
 }
 
 private fun localizedDbMaintenanceError(strings: UiStrings, error: String): String {
@@ -1469,7 +1538,7 @@ private fun LogsMetricsGrid(state: DashboardState?, strings: UiStrings) {
                 status = if (state?.running == true) strings.running else strings.waiting,
                 kind = if (state?.running == true) StatusKind.OK else StatusKind.WAITING,
                 rows = listOf(
-                    strings.size to formatBytes(state?.databaseSizeBytes ?: 0L),
+                    strings.size to UiSizeFormatter.bytes(state?.databaseSizeBytes ?: 0L, strings),
                     strings.rows to formatCount(state?.valueRowCount ?: 0L),
                     strings.lastSuccess to (state?.lastSuccessAt ?: "-"),
                     strings.lastError to (state?.lastErrorAt ?: "-"),
@@ -1482,7 +1551,7 @@ private fun LogsMetricsGrid(state: DashboardState?, strings: UiStrings) {
                 status = if (state?.debugPollingRunning == true) strings.running else strings.waiting,
                 kind = if (state?.debugPollingRunning == true) StatusKind.OK else StatusKind.WAITING,
                 rows = listOf(
-                    strings.size to formatBytes(state?.debugDatabaseSizeBytes ?: 0L),
+                    strings.size to UiSizeFormatter.bytes(state?.debugDatabaseSizeBytes ?: 0L, strings),
                     strings.rows to formatCount(state?.debugReadingCount ?: 0L),
                     strings.lastSuccess to (state?.debugLastReadingAt ?: "-"),
                     strings.lastError to (state?.debugLastErrorAt ?: state?.debugLastError ?: "-"),
@@ -1600,12 +1669,6 @@ private fun Modifier.clickableNoRipple(
 @Composable
 private fun Modifier.borderSafe(color: androidx.compose.ui.graphics.Color): Modifier =
     this.then(Modifier.border(1.dp, color, Rounded8))
-
-private fun formatBytes(bytes: Long): String {
-    if (bytes <= 0L) return "0 MB"
-    val mb = bytes / 1024.0 / 1024.0
-    return if (mb < 10.0) String.format(Locale.US, "%.1f MB", mb) else "${mb.roundToLong()} MB"
-}
 
 private fun formatCount(value: Long): String = "%,d".format(Locale.US, value).replace(",", " ")
 

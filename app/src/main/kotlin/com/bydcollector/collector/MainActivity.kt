@@ -156,6 +156,7 @@ class MainActivity : ComponentActivity() {
             val operation = pendingMaintenanceOperation ?: return
             maintenanceLaunchOperation = operation
             pendingMaintenanceOperation = null
+            stateProvider.invalidateArchiveStorageSnapshot()
             settings.setDbMaintenanceStatus(
                 DbMaintenanceRuntimeStatus(
                     operation = operation,
@@ -198,17 +199,20 @@ class MainActivity : ComponentActivity() {
         override fun onSetArchiveStorageLimitGb(value: Int) {
             refreshStoreBackedState()
             settings.setArchiveStorageLimitGb(value)
+            stateProvider.invalidateArchiveStorageSnapshot()
             CollectorServiceController.reconcileArchiveStorage(this@MainActivity)
             refresh()
         }
 
         override fun onDeleteArchives(ids: List<String>) {
             if (ids.isEmpty()) return
+            stateProvider.invalidateArchiveStorageSnapshot()
             CollectorServiceController.deleteArchives(this@MainActivity, ids)
             refresh()
         }
 
         override fun onReconcileArchiveStorage() {
+            stateProvider.invalidateArchiveStorageSnapshot()
             CollectorServiceController.reconcileArchiveStorage(this@MainActivity)
             refresh()
         }
@@ -483,6 +487,9 @@ class MainActivity : ComponentActivity() {
         }
         dashboardExecutor.shutdownNow()
         updateExecutor.shutdownNow()
+        if (::stateProvider.isInitialized) {
+            stateProvider.close()
+        }
         handler.removeCallbacks(updateAutoCheckTimerTask)
         super.onDestroy()
     }
@@ -519,7 +526,8 @@ class MainActivity : ComponentActivity() {
                     includeTelemetryDetails = includeTelemetryDetails,
                     includeDebugStatus = includeDebugStatus,
                     includeVehicleKpis = includeVehicleKpis,
-                    vehicleKpiLanguage = kpiLanguage
+                    vehicleKpiLanguage = kpiLanguage,
+                    includeArchiveStorageDetails = activeTab == AppTab.STORAGE
                 )
             }
             runOnUiThread {

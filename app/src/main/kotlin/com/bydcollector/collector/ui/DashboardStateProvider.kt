@@ -11,7 +11,6 @@ import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.remote.DirectBridgeManager
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
 import com.bydcollector.collector.influx.InfluxExportStateSnapshot
-import com.bydcollector.collector.maintenance.ArchiveStorageManager
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.system.RequiredAccessChecker
@@ -33,13 +32,18 @@ class DashboardStateProvider(
 
     private val healthCache = TimedCache<HealthSnapshot>(ttlMs = 15_000L)
     private val requiredAccessCache = TimedCache<List<RequiredAccessRow>>(ttlMs = 30_000L)
+    private val archiveStorageCache = ArchiveStorageSnapshotCache(
+        archiveRoot = File(context.filesDir, "db_archive"),
+        activeDatabaseFile = context.getDatabasePath(TelemetryDatabaseHelper.DATABASE_NAME)
+    )
     private var healthCacheRunning: Boolean? = null
 
     fun load(
         includeTelemetryDetails: Boolean = true,
         includeDebugStatus: Boolean = false,
         includeVehicleKpis: Boolean = false,
-        vehicleKpiLanguage: VehicleKpiLanguage = VehicleKpiLanguage.UK
+        vehicleKpiLanguage: VehicleKpiLanguage = VehicleKpiLanguage.UK,
+        includeArchiveStorageDetails: Boolean = false
     ): DashboardState {
         val serviceRunning = CollectorService.isRunning()
         val mainPollingRunning = CollectorService.isMainPollingRunning()
@@ -62,10 +66,10 @@ class DashboardStateProvider(
         val mqttConfig = settings.mqttConfig()
         val influxConfig = settings.influxConfig()
         val archiveStorageLimitGb = settings.archiveStorageLimitGb()
-        val archiveStorageSnapshot = ArchiveStorageManager(
-            archiveRoot = File(context.filesDir, "db_archive"),
-            activeDatabaseFile = context.getDatabasePath(TelemetryDatabaseHelper.DATABASE_NAME)
-        ).snapshot(archiveStorageLimitGb * 1024L * 1024L * 1024L)
+        val archiveStorageResult = archiveStorageCache.snapshot(
+            limitBytes = archiveStorageLimitGb * 1024L * 1024L * 1024L,
+            includeDetails = includeArchiveStorageDetails
+        )
         val archiveStorageJobStatus = settings.archiveStorageJobStatus()
         val influxState = store?.influxExportState() ?: maintenanceInfluxState()
         val vehicleKpis = if (includeVehicleKpis && store != null) {
@@ -96,7 +100,8 @@ class DashboardStateProvider(
             databaseSizeBytes = health.databaseSizeBytes,
             dbMaintenanceStatus = maintenanceStatus,
             archiveStorageLimitGb = archiveStorageLimitGb,
-            archiveStorageSnapshot = archiveStorageSnapshot,
+            archiveStorageSnapshot = archiveStorageResult.snapshot,
+            archiveStorageScanPending = archiveStorageResult.pending,
             archiveStorageJobStatus = archiveStorageJobStatus,
             latestSoc = health.latestSoc,
             latestSpeed = health.latestSpeed,
@@ -180,6 +185,14 @@ class DashboardStateProvider(
                 event.copy(timestamp = DisplayTimeFormatter.formatNullable(event.timestamp) ?: event.timestamp)
             }
         )
+    }
+
+    fun invalidateArchiveStorageSnapshot() {
+        archiveStorageCache.invalidate()
+    }
+
+    fun close() {
+        archiveStorageCache.close()
     }
 
     private fun maintenanceHealthSnapshot(running: Boolean): HealthSnapshot {
