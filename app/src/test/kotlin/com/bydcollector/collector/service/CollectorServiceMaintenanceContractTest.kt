@@ -73,7 +73,7 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(settings.contains("fun isDbMaintenanceRunning(context: Context): Boolean"))
         assertTrue(settings.contains("context.applicationContext"))
         assertTrue(settings.contains("getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)"))
-        assertTrue(settings.contains("getBoolean(KEY_DB_MAINTENANCE_RUNNING, false)"))
+        assertTrue(settings.contains("operation != null && prefs.getBoolean(KEY_DB_MAINTENANCE_RUNNING, false)"))
     }
 
     @Test
@@ -88,7 +88,8 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(service.contains("maintenanceRunningInProcess.set(true)"))
         assertTrue(service.contains("maintenanceRunningInProcess.set(false)"))
         assertTrue(service.contains("private fun recoverInterruptedMaintenanceIfNeeded(action: String)"))
-        assertTrue(service.contains("if (action == ACTION_COMPACT_DATABASE || action == ACTION_ARCHIVE_DATABASE) return"))
+        assertTrue(service.contains("if (action == ACTION_ARCHIVE_DATABASE) return"))
+        assertFalse(service.contains("ACTION_COMPACT_DATABASE"))
         assertTrue(service.contains("settings.recoverInterruptedDbMaintenanceIfNeeded(\"service_start:${'$'}action\")"))
         assertTrue(service.contains("settings.dbMaintenanceStatus().running"))
     }
@@ -143,9 +144,27 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(coordinator.contains("private class DbMaintenanceCancelled"))
         assertTrue(coordinator.contains("publishCancelled(operation)"))
         assertInOrder(coordinator, "publish(operation, 1, cancelAvailable = true)", "stopRuntime()")
-        assertInOrder(coordinator, "closeCancelWindowAndCheck(operation)", "DbMaintenanceOperation.COMPACT -> compact(operation)")
-        assertInOrder(coordinator, "closeCancelWindowAndCheck(operation)", "DbMaintenanceOperation.ARCHIVE -> archive(operation)")
+        assertInOrder(coordinator, "closeCancelWindowAndCheck(operation)", "val result = archive(operation)")
         assertFalse(coordinator.contains("shutdownNow()"))
+    }
+
+    @Test
+    fun archiveStorageRunsOnSeparateWorkerAndCompactActionIsRemoved() {
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val controller = sourceFile("com/bydcollector/collector/service/CollectorServiceController.kt").readText()
+        val settings = sourceFile("com/bydcollector/collector/service/CollectorSettings.kt").readText()
+
+        assertTrue(service.contains("private val archiveStorageExecutor = namedSingleThreadExecutor(\"byd-archive-storage\")"))
+        assertTrue(service.contains("enqueueArchiveStorageMaintenance(result.archivePath)"))
+        assertTrue(service.contains("ACTION_RECONCILE_ARCHIVE_STORAGE"))
+        assertTrue(service.contains("ACTION_DELETE_ARCHIVES"))
+        assertTrue(service.contains("ArchiveStorageManager("))
+        assertTrue(controller.contains("fun reconcileArchiveStorage(context: Context)"))
+        assertTrue(controller.contains("fun deleteArchives(context: Context, ids: List<String>)"))
+        assertTrue(settings.contains("fun archiveStorageLimitGb(): Int"))
+        assertTrue(settings.contains("fun archiveStorageJobStatus(): ArchiveStorageJobStatus"))
+        assertFalse(service.contains("ACTION_COMPACT_DATABASE"))
+        assertFalse(controller.contains("fun compactDatabase"))
     }
 
     @Test
@@ -164,7 +183,7 @@ class CollectorServiceMaintenanceContractTest {
     @Test
     fun archiveFailureWithMissingOriginalDoesNotReopenFreshDatabase() {
         val source = sourceFile("com/bydcollector/collector/maintenance/DbMaintenanceCoordinator.kt").readText()
-        val run = source.substringAfter("fun run(").substringBefore("private fun compact")
+        val run = source.substringAfter("fun run(").substringBefore("private fun archive")
         val archive = source.substringAfter("private fun archive").substringBefore("private fun reopenAndRebind")
         val missingOriginalBranch = archive.substringAfter("if (!databaseFile.exists())").substringBefore("reopenAndRebind()")
 

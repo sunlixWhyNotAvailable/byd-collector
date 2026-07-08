@@ -27,7 +27,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
@@ -45,6 +47,10 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.bydcollector.collector.R
+import com.bydcollector.collector.maintenance.ArchiveEntryStatus
+import com.bydcollector.collector.maintenance.ArchiveStorageEntry
+import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
+import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.maintenance.DbMaintenanceUiState
 import com.bydcollector.collector.ui.DashboardState
@@ -76,6 +82,7 @@ fun BydCollectorApp(
     //renders the operational dashboard directly; this app intentionally has no landing/marketing screen
     BydCollectorTheme(darkTheme) {
         val p = LocalBydPalette.current
+        var pendingArchiveDeleteIds by remember { mutableStateOf<List<String>>(emptyList()) }
         CompositionLocalProvider(LocalSwitchConfirmationVersion provides switchConfirmationVersion) {
             Box(
                 modifier = Modifier
@@ -111,6 +118,7 @@ fun BydCollectorApp(
                                 AppTab.MAIN -> MainTab(state, s, actions)
                                 AppTab.ALL_PARAMETERS -> AllParametersTab(state, s, language, debugBatchText, actions)
                                 AppTab.HA -> HaTab(state, s, mqttDraft, influxDraft, actions)
+                                AppTab.STORAGE -> StorageTab(state, s, actions) { ids -> pendingArchiveDeleteIds = ids }
                                 AppTab.EXTRA -> ExtraTab(state, s, updateAutoCheckEnabled, actions)
                                 AppTab.LOGS -> LogsTab(state, s, actions)
                             }
@@ -146,6 +154,21 @@ fun BydCollectorApp(
                         onCancel = actions::onCancelDatabaseMaintenance,
                         onDismiss = actions::onDismissDatabaseMaintenance
                     )
+                }
+                if (pendingArchiveDeleteIds.isNotEmpty()) {
+                    ArchiveDeleteDialog(
+                        strings = s,
+                        count = pendingArchiveDeleteIds.size,
+                        onConfirm = {
+                            actions.onDeleteArchives(pendingArchiveDeleteIds)
+                            pendingArchiveDeleteIds = emptyList()
+                        },
+                        onDismiss = { pendingArchiveDeleteIds = emptyList() }
+                    )
+                }
+                val archiveJob = state?.archiveStorageJobStatus
+                if (archiveJob?.running == true && archiveJob.mode == ArchiveStorageJobMode.DELETE) {
+                    ArchiveStorageProgressDialog(strings = s, status = archiveJob)
                 }
             }
         }
@@ -374,10 +397,7 @@ private fun MainStatusCard(state: DashboardState?, strings: UiStrings, actions: 
             StatusRow("MQTT", compactChannelStatusText(state?.mqttStatus, strings), channelStatusKind(state?.mqttStatus, state?.mqttEnabled == true), modifier = Modifier.weight(1f))
             StatusRow("InfluxDB", compactChannelStatusText(state?.influxStatus, strings), channelStatusKind(state?.influxStatus, state?.influxEnabled == true), modifier = Modifier.weight(1f))
         }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            ActionButton(strings.compactDatabase, actions::onOpenCompactDatabase, modifier = Modifier.weight(1f))
-            ActionButton(strings.archiveDatabase, actions::onOpenArchiveDatabase, modifier = Modifier.weight(1f))
-        }
+        ActionButton(strings.archiveDatabase, actions::onOpenArchiveDatabase, modifier = Modifier.fillMaxWidth())
     }
 }
 
@@ -1082,6 +1102,200 @@ private fun localizedUpdateError(strings: UiStrings, message: String): String {
     }
 }
 
+@Composable
+private fun ArchiveDeleteDialog(
+    strings: UiStrings,
+    count: Int,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val p = LocalBydPalette.current
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(p.background.copy(alpha = 0.82f))
+            .padding(28.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        ModalInputBlocker()
+        Column(
+            modifier = Modifier
+                .width(440.dp)
+                .background(p.panel, Rounded8)
+                .border(1.dp, p.borderStrong, Rounded8)
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Text(strings.deleteSelected, color = p.text, fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
+            Text(String.format(strings.selectedArchivesTemplate, count), color = p.muted, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            Text(strings.deleteArchivesQuestion, color = p.text, fontSize = 14.sp, lineHeight = 19.sp, fontWeight = FontWeight.SemiBold)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                ActionButton(strings.yes, onConfirm, primary = true, modifier = Modifier.weight(1f))
+                ActionButton(strings.no, onDismiss, modifier = Modifier.weight(1f))
+            }
+        }
+    }
+}
+
+@Composable
+private fun ArchiveStorageProgressDialog(strings: UiStrings, status: ArchiveStorageJobStatus) {
+    val p = LocalBydPalette.current
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(p.background.copy(alpha = 0.82f))
+            .padding(28.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        ModalInputBlocker()
+        Column(
+            modifier = Modifier
+                .width(440.dp)
+                .background(p.panel, Rounded8)
+                .border(1.dp, p.borderStrong, Rounded8)
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Text(strings.deleteSelected, color = p.text, fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                CircularProgressIndicator(modifier = Modifier.size(28.dp), color = p.accent, strokeWidth = 3.dp)
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("${strings.step} ${status.stepIndex}/${status.stepCount}", color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                    Text(localizedArchiveStorageMessage(strings, status), color = p.muted, fontSize = 14.sp, lineHeight = 19.sp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StorageTab(
+    state: DashboardState?,
+    strings: UiStrings,
+    actions: BydCollectorActions,
+    onRequestDelete: (List<String>) -> Unit
+) {
+    val snapshot = state?.archiveStorageSnapshot
+    val entries = snapshot?.entries.orEmpty()
+    val listKey = entries.joinToString("|") { it.id }
+    var selectedIds by remember(listKey) { mutableStateOf(emptySet<String>()) }
+    val limitGb = state?.archiveStorageLimitGb ?: 2
+    val job = state?.archiveStorageJobStatus
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        ScreenTitle(strings.storageTab, strings.storageSubtitle)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            SectionCard(strings.activeDatabase, modifier = Modifier.weight(1f).height(142.dp)) {
+                InfoRow(strings.size, formatBytes(snapshot?.activeDatabaseSizeBytes ?: state?.databaseSizeBytes ?: 0L), divider = true)
+                ReadOnlyPathField(snapshot?.activeDatabasePath ?: state?.databasePath ?: "-")
+            }
+            SectionCard(strings.archiveStorageLimit, modifier = Modifier.weight(1f).height(142.dp)) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    ActionButton("-", { actions.onSetArchiveStorageLimitGb(limitGb - 1) }, enabled = limitGb > 1, modifier = Modifier.width(42.dp))
+                    ReadOnlyPathField("$limitGb GB", modifier = Modifier.weight(1f))
+                    ActionButton("+", { actions.onSetArchiveStorageLimitGb(limitGb + 1) }, primary = true, enabled = limitGb < 10, modifier = Modifier.width(42.dp))
+                }
+                Text(strings.archiveStorageLimitHint, color = LocalBydPalette.current.muted, fontSize = 12.sp, lineHeight = 16.sp)
+            }
+        }
+        SectionCard(strings.archiveStorage, modifier = Modifier.fillMaxWidth()) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                InfoRow(strings.size, formatBytes(snapshot?.archiveBytes ?: 0L), modifier = Modifier.weight(0.75f), divider = false)
+                InfoRow(strings.archiveCount, entries.size.toString(), modifier = Modifier.weight(0.55f), divider = false)
+                ActionButton(strings.archiveStorageRefresh, actions::onReconcileArchiveStorage, modifier = Modifier.weight(0.8f))
+                ActionButton(
+                    strings.deleteSelected,
+                    { onRequestDelete(selectedIds.toList()) },
+                    enabled = selectedIds.isNotEmpty(),
+                    modifier = Modifier.weight(0.85f)
+                )
+            }
+            ReadOnlyPathField(snapshot?.archiveRootPath ?: "-")
+            job?.takeIf { it.running }?.let {
+                ArchiveStorageInlineStatus(strings, it)
+            }
+            if (entries.isEmpty()) {
+                Text(strings.archiveStorageEmpty, color = LocalBydPalette.current.muted, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            } else {
+                entries.forEach { entry ->
+                    ArchiveEntryRow(
+                        entry = entry,
+                        strings = strings,
+                        selected = selectedIds.contains(entry.id),
+                        onToggle = {
+                            selectedIds = if (selectedIds.contains(entry.id)) {
+                                selectedIds - entry.id
+                            } else {
+                                selectedIds + entry.id
+                            }
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ArchiveStorageInlineStatus(strings: UiStrings, status: ArchiveStorageJobStatus) {
+    val p = LocalBydPalette.current
+    Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        CircularProgressIndicator(modifier = Modifier.size(24.dp), color = p.accent, strokeWidth = 3.dp)
+        Text(
+            text = localizedArchiveStorageMessage(strings, status),
+            color = p.muted,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f)
+        )
+        status.itemId?.let {
+            Text(it, color = p.pathText, fontSize = 13.sp, fontFamily = FontFamily.Monospace, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+        }
+    }
+}
+
+@Composable
+private fun ArchiveEntryRow(
+    entry: ArchiveStorageEntry,
+    strings: UiStrings,
+    selected: Boolean,
+    onToggle: () -> Unit
+) {
+    val p = LocalBydPalette.current
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(46.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .size(32.dp)
+                .background(if (selected) p.active else p.surface, Rounded8)
+                .border(1.dp, if (selected) p.accent else p.borderStrong, Rounded8)
+                .clickable(enabled = entry.deletable, onClick = onToggle),
+            contentAlignment = Alignment.Center
+        ) {
+            if (selected) Text("✓", color = p.text, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+        }
+        Column(modifier = Modifier.weight(1f)) {
+            Text(entry.displayName, color = p.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(entry.path, color = p.pathText, fontSize = 12.sp, fontFamily = FontFamily.Monospace, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        Text(formatBytes(entry.sizeBytes), color = p.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+        StatusPill(archiveStatusLabel(strings, entry.status), archiveStatusKind(entry.status), compact = true)
+    }
+    Box(Modifier.fillMaxWidth().height(1.dp).background(p.border))
+}
+
 private fun localizedDbMaintenanceError(strings: UiStrings, error: String): String {
     val normalized = error.lowercase()
     return when {
@@ -1094,9 +1308,34 @@ private fun localizedDbMaintenanceError(strings: UiStrings, error: String): Stri
 
 private fun operationTitle(strings: UiStrings, operation: DbMaintenanceOperation): String {
     return when (operation) {
-        DbMaintenanceOperation.COMPACT -> strings.compactDatabase
         DbMaintenanceOperation.ARCHIVE -> strings.archiveDatabase
     }
+}
+
+private fun archiveStatusLabel(strings: UiStrings, status: ArchiveEntryStatus): String {
+    return when (status) {
+        ArchiveEntryStatus.RAW_DIRECTORY -> strings.archiveStatusRaw
+        ArchiveEntryStatus.COMPRESSED_ZIP -> strings.archiveStatusZip
+        ArchiveEntryStatus.TMP -> strings.archiveStatusTmp
+    }
+}
+
+private fun archiveStatusKind(status: ArchiveEntryStatus): StatusKind {
+    return when (status) {
+        ArchiveEntryStatus.RAW_DIRECTORY -> StatusKind.WARNING
+        ArchiveEntryStatus.COMPRESSED_ZIP -> StatusKind.OK
+        ArchiveEntryStatus.TMP -> StatusKind.WAITING
+    }
+}
+
+private fun localizedArchiveStorageMessage(strings: UiStrings, status: ArchiveStorageJobStatus): String {
+    val fallback = when (status.mode) {
+        ArchiveStorageJobMode.DELETE -> strings.deletingArchive
+        ArchiveStorageJobMode.COMPRESS -> strings.archiveDatabase
+        ArchiveStorageJobMode.RETENTION -> strings.archiveStorage
+        null -> strings.archiveStorage
+    }
+    return if (strings.step == "Крок") status.messageUk.ifBlank { fallback } else status.messageEn.ifBlank { fallback }
 }
 
 @Composable
@@ -1298,6 +1537,7 @@ private fun BottomTabs(activeTab: AppTab, strings: UiStrings, actions: BydCollec
         AppTab.MAIN to (strings.mainTab to BottomTabIcon.HOME),
         AppTab.ALL_PARAMETERS to (strings.allTab to BottomTabIcon.DATABASE),
         AppTab.HA to (strings.haTab to BottomTabIcon.HA),
+        AppTab.STORAGE to (strings.storageTab to BottomTabIcon.STORAGE),
         AppTab.EXTRA to (strings.extraTab to BottomTabIcon.GEAR),
         AppTab.LOGS to (strings.logsTab to BottomTabIcon.LOGS)
     )

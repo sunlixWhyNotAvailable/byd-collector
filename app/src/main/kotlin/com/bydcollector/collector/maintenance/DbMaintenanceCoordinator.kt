@@ -47,10 +47,7 @@ class DbMaintenanceCoordinator(
             stopRuntime()
             closeCancelWindowAndCheck(operation)
             publish(operation, 1, cancelAvailable = false)
-            val result = when (operation) {
-                DbMaintenanceOperation.COMPACT -> compact(operation)
-                DbMaintenanceOperation.ARCHIVE -> archive(operation)
-            }
+            val result = archive(operation)
             publish(operation, operation.stepsUk.size)
             restoreRuntime()
             restored = true
@@ -76,10 +73,6 @@ class DbMaintenanceCoordinator(
             setCancelAvailable(false)
             running.set(false)
         }
-    }
-
-    private fun compact(operation: DbMaintenanceOperation): DbMaintenanceResult {
-        return storeProvider().compactRawHistory { step -> publish(operation, step) }
     }
 
     private fun archive(operation: DbMaintenanceOperation): DbMaintenanceResult {

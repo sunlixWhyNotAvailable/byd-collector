@@ -5,6 +5,8 @@ import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.ha.HaIntegrationCategories
 import com.bydcollector.collector.influx.InfluxConfig
 import com.bydcollector.collector.keepalive.KeepAliveConfig
+import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
+import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
 import com.bydcollector.collector.mqtt.HaMqttConfig
@@ -319,6 +321,68 @@ class CollectorSettings(
         prefs.edit().remove(KEY_TAILSCALE_ACTIVATION_LAST_ATTEMPT_AT_MS).apply()
     }
 
+    fun archiveStorageLimitGb(): Int = prefs.getInt(KEY_ARCHIVE_STORAGE_LIMIT_GB, DEFAULT_ARCHIVE_STORAGE_LIMIT_GB)
+        .coerceIn(MIN_ARCHIVE_STORAGE_LIMIT_GB, MAX_ARCHIVE_STORAGE_LIMIT_GB)
+
+    fun setArchiveStorageLimitGb(value: Int) {
+        val safeValue = value.coerceIn(MIN_ARCHIVE_STORAGE_LIMIT_GB, MAX_ARCHIVE_STORAGE_LIMIT_GB)
+        prefs.edit().putInt(KEY_ARCHIVE_STORAGE_LIMIT_GB, safeValue).apply()
+        store?.recordEvent(
+            category = "archive_storage_limit_changed",
+            message = "Archive storage limit changed",
+            detail = "limit_gb=$safeValue"
+        )
+    }
+
+    fun archiveStorageJobStatus(): ArchiveStorageJobStatus {
+        val mode = prefs.getString(KEY_ARCHIVE_STORAGE_JOB_MODE, null)
+            ?.let { runCatching { ArchiveStorageJobMode.valueOf(it) }.getOrNull() }
+        return ArchiveStorageJobStatus(
+            mode = mode,
+            running = prefs.getBoolean(KEY_ARCHIVE_STORAGE_JOB_RUNNING, false),
+            stepIndex = prefs.getInt(KEY_ARCHIVE_STORAGE_JOB_STEP_INDEX, 0),
+            stepCount = prefs.getInt(KEY_ARCHIVE_STORAGE_JOB_STEP_COUNT, 0),
+            messageUk = prefs.getString(KEY_ARCHIVE_STORAGE_JOB_MESSAGE_UK, "") ?: "",
+            messageEn = prefs.getString(KEY_ARCHIVE_STORAGE_JOB_MESSAGE_EN, "") ?: "",
+            itemId = prefs.getString(KEY_ARCHIVE_STORAGE_JOB_ITEM_ID, null),
+            error = prefs.getString(KEY_ARCHIVE_STORAGE_JOB_ERROR, null),
+            updatedAtMs = prefs.getLong(KEY_ARCHIVE_STORAGE_JOB_UPDATED_AT_MS, 0L)
+        )
+    }
+
+    fun setArchiveStorageJobStatus(status: ArchiveStorageJobStatus, synchronous: Boolean = false) {
+        val now = System.currentTimeMillis()
+        val editor = prefs.edit().apply {
+            status.mode?.let { putString(KEY_ARCHIVE_STORAGE_JOB_MODE, it.name) }
+                ?: remove(KEY_ARCHIVE_STORAGE_JOB_MODE)
+            putBoolean(KEY_ARCHIVE_STORAGE_JOB_RUNNING, status.running)
+            putInt(KEY_ARCHIVE_STORAGE_JOB_STEP_INDEX, status.stepIndex)
+            putInt(KEY_ARCHIVE_STORAGE_JOB_STEP_COUNT, status.stepCount)
+            putString(KEY_ARCHIVE_STORAGE_JOB_MESSAGE_UK, status.messageUk)
+            putString(KEY_ARCHIVE_STORAGE_JOB_MESSAGE_EN, status.messageEn)
+            status.itemId?.let { putString(KEY_ARCHIVE_STORAGE_JOB_ITEM_ID, it) }
+                ?: remove(KEY_ARCHIVE_STORAGE_JOB_ITEM_ID)
+            status.error?.let { putString(KEY_ARCHIVE_STORAGE_JOB_ERROR, it) }
+                ?: remove(KEY_ARCHIVE_STORAGE_JOB_ERROR)
+            putLong(KEY_ARCHIVE_STORAGE_JOB_UPDATED_AT_MS, status.updatedAtMs.takeIf { it > 0L } ?: now)
+        }
+        if (synchronous) editor.commit() else editor.apply()
+    }
+
+    fun clearArchiveStorageJobStatus() {
+        prefs.edit()
+            .remove(KEY_ARCHIVE_STORAGE_JOB_MODE)
+            .remove(KEY_ARCHIVE_STORAGE_JOB_RUNNING)
+            .remove(KEY_ARCHIVE_STORAGE_JOB_STEP_INDEX)
+            .remove(KEY_ARCHIVE_STORAGE_JOB_STEP_COUNT)
+            .remove(KEY_ARCHIVE_STORAGE_JOB_MESSAGE_UK)
+            .remove(KEY_ARCHIVE_STORAGE_JOB_MESSAGE_EN)
+            .remove(KEY_ARCHIVE_STORAGE_JOB_ITEM_ID)
+            .remove(KEY_ARCHIVE_STORAGE_JOB_ERROR)
+            .remove(KEY_ARCHIVE_STORAGE_JOB_UPDATED_AT_MS)
+            .apply()
+    }
+
     fun dbMaintenanceStatus(): DbMaintenanceRuntimeStatus {
         return DbMaintenanceRuntimeStatus(
             operation = DbMaintenanceOperation.fromKey(prefs.getString(KEY_DB_MAINTENANCE_OPERATION, null)),
@@ -365,6 +429,16 @@ class CollectorSettings(
     }
 
     fun recoverInterruptedDbMaintenanceIfNeeded(source: String): Boolean {
+        val operationKey = prefs.getString(KEY_DB_MAINTENANCE_OPERATION, null)
+        if (prefs.getBoolean(KEY_DB_MAINTENANCE_RUNNING, false) && DbMaintenanceOperation.fromKey(operationKey) == null) {
+            clearDbMaintenanceStatus(synchronous = true)
+            store?.recordEvent(
+                category = "database_maintenance_unknown_cleared",
+                message = "Unknown database maintenance state cleared",
+                detail = "source=$source operation=$operationKey"
+            )
+            return true
+        }
         val status = dbMaintenanceStatus()
         val operation = status.operation ?: return false
         if (!status.running) return false
@@ -389,8 +463,8 @@ class CollectorSettings(
         return true
     }
 
-    fun clearDbMaintenanceStatus() {
-        prefs.edit()
+    fun clearDbMaintenanceStatus(synchronous: Boolean = false) {
+        val editor = prefs.edit()
             .remove(KEY_DB_MAINTENANCE_OPERATION)
             .remove(KEY_DB_MAINTENANCE_RUNNING)
             .remove(KEY_DB_MAINTENANCE_COMPLETED)
@@ -403,7 +477,7 @@ class CollectorSettings(
             .remove(KEY_DB_MAINTENANCE_STARTED_AT_MS)
             .remove(KEY_DB_MAINTENANCE_UPDATED_AT_MS)
             .remove(KEY_DB_MAINTENANCE_CANCEL_AVAILABLE)
-            .apply()
+        if (synchronous) editor.commit() else editor.apply()
     }
 
     fun lastUpdateCheckAtMs(): Long = prefs.getLong(KEY_UPDATE_LAST_CHECK_AT_MS, 0L)
@@ -567,6 +641,16 @@ class CollectorSettings(
         const val KEY_UPDATE_LAST_CHECK_AT_MS = "updateLastCheckAtMs"
         const val KEY_TAILSCALE_ACTIVATION = "tailscaleActivation"
         const val KEY_TAILSCALE_ACTIVATION_LAST_ATTEMPT_AT_MS = "tailscaleActivationLastAttemptAtMs"
+        const val KEY_ARCHIVE_STORAGE_LIMIT_GB = "archiveStorageLimitGb"
+        const val KEY_ARCHIVE_STORAGE_JOB_MODE = "archiveStorageJobMode"
+        const val KEY_ARCHIVE_STORAGE_JOB_RUNNING = "archiveStorageJobRunning"
+        const val KEY_ARCHIVE_STORAGE_JOB_STEP_INDEX = "archiveStorageJobStepIndex"
+        const val KEY_ARCHIVE_STORAGE_JOB_STEP_COUNT = "archiveStorageJobStepCount"
+        const val KEY_ARCHIVE_STORAGE_JOB_MESSAGE_UK = "archiveStorageJobMessageUk"
+        const val KEY_ARCHIVE_STORAGE_JOB_MESSAGE_EN = "archiveStorageJobMessageEn"
+        const val KEY_ARCHIVE_STORAGE_JOB_ITEM_ID = "archiveStorageJobItemId"
+        const val KEY_ARCHIVE_STORAGE_JOB_ERROR = "archiveStorageJobError"
+        const val KEY_ARCHIVE_STORAGE_JOB_UPDATED_AT_MS = "archiveStorageJobUpdatedAtMs"
         const val KEY_DB_MAINTENANCE_OPERATION = "dbMaintenanceOperation"
         const val KEY_DB_MAINTENANCE_RUNNING = "dbMaintenanceRunning"
         const val KEY_DB_MAINTENANCE_COMPLETED = "dbMaintenanceCompleted"
@@ -580,6 +664,9 @@ class CollectorSettings(
         const val KEY_DB_MAINTENANCE_UPDATED_AT_MS = "dbMaintenanceUpdatedAtMs"
         const val KEY_DB_MAINTENANCE_CANCEL_AVAILABLE = "dbMaintenanceCancelAvailable"
         const val DB_MAINTENANCE_RECOVERY_GRACE_MS = 15_000L
+        const val DEFAULT_ARCHIVE_STORAGE_LIMIT_GB = 2
+        const val MIN_ARCHIVE_STORAGE_LIMIT_GB = 1
+        const val MAX_ARCHIVE_STORAGE_LIMIT_GB = 10
         const val DEFAULT_DEBUG_BATCH_SIZE = 500
         const val SAFE_DEBUG_AUTOSTART_BATCH_SIZE = 500
         const val MAX_DEBUG_BATCH_SIZE = 6100
@@ -588,9 +675,9 @@ class CollectorSettings(
         const val AUTO_START_DISABLED_UK = "Автозапуск деактивовано"
 
         fun isDbMaintenanceRunning(context: Context): Boolean {
-            return context.applicationContext
-                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .getBoolean(KEY_DB_MAINTENANCE_RUNNING, false)
+            val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val operation = DbMaintenanceOperation.fromKey(prefs.getString(KEY_DB_MAINTENANCE_OPERATION, null))
+            return operation != null && prefs.getBoolean(KEY_DB_MAINTENANCE_RUNNING, false)
         }
     }
 }

@@ -28,6 +28,19 @@ class DashboardStateProviderMaintenanceContractTest {
         assertTrue(load.contains("if (includeVehicleKpis && store != null)"))
     }
 
+    @Test
+    fun providerLoadsArchiveStorageSnapshotWithoutOpeningActiveStoreDuringMaintenance() {
+        val source = sourceFile("com/bydcollector/collector/ui/DashboardStateProvider.kt").readText()
+        val load = source.substringAfter("fun load(").substringBefore("private fun maintenanceHealthSnapshot")
+
+        assertTrue(source.contains("ArchiveStorageManager("))
+        assertTrue(load.contains("archiveRoot = File(context.filesDir, \"db_archive\")"))
+        assertTrue(load.contains("settings.archiveStorageLimitGb()"))
+        assertTrue(load.contains("settings.archiveStorageJobStatus()"))
+        assertInOrder(load, "val maintenanceStatus = settings.dbMaintenanceStatus()", "val archiveStorageSnapshot = ArchiveStorageManager(")
+        assertInOrder(load, "val store = if (maintenanceStatus.running) null else storeProvider()", "val archiveStorageSnapshot = ArchiveStorageManager(")
+    }
+
     private fun sourceFile(path: String): File {
         return listOf(
             File("src/main/kotlin/$path"),

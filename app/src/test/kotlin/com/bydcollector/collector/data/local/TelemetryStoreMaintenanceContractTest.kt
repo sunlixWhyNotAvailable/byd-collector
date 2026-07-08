@@ -7,33 +7,12 @@ import kotlin.test.assertTrue
 
 class TelemetryStoreMaintenanceContractTest {
     @Test
-    fun compactRawHistoryDeletesOnlyRawHistoryAndVacuumRunsOutsideTransaction() {
+    fun compactRawHistoryIsNotExposedAsProductionMaintenance() {
         val source = sourceFile("com/bydcollector/collector/data/local/TelemetryStore.kt").readText()
-        val compact = source.substringAfter("fun compactRawHistory").substringBefore("fun checkpointForArchive")
 
-        assertTrue(compact.contains("DbMaintenanceResult"))
-        assertTrue(compact.contains("onStage(2)"))
-        assertTrue(compact.contains("UPDATE vehicle_state_current SET source_poll_id = NULL"))
-        assertTrue(compact.contains("UPDATE vehicle_state_history SET source_poll_id = NULL"))
-        assertTrue(compact.contains("onStage(3)"))
-        assertTrue(compact.contains("DELETE FROM poll_values"))
-        assertTrue(compact.contains("DELETE FROM vehicle_snapshots"))
-        assertTrue(compact.contains("DELETE FROM parameter_observations"))
-        assertTrue(compact.contains("DELETE FROM polls"))
-        assertTrue(compact.contains("UPDATE ec_import_runs SET session_id = NULL"))
-        assertTrue(compact.contains("UPDATE ec_energy_consumption SET first_seen_session_id = NULL, last_seen_session_id = NULL"))
-        assertTrue(compact.indexOf("UPDATE ec_import_runs SET session_id = NULL") < compact.indexOf("DELETE FROM collection_sessions"))
-        assertTrue(compact.indexOf("UPDATE ec_energy_consumption SET first_seen_session_id = NULL, last_seen_session_id = NULL") < compact.indexOf("DELETE FROM collection_sessions"))
-        assertTrue(compact.contains("DELETE FROM collection_sessions"))
-        assertTrue(compact.contains("setTransactionSuccessful()"))
-        assertTrue(compact.contains("endTransaction()"))
-        assertTrue(compact.contains("onStage(4)"))
-        assertTrue(compact.indexOf("endTransaction()") < compact.indexOf("VACUUM"))
-        assertFalse(compact.contains("DELETE FROM normalized_field_catalog"))
-        assertFalse(compact.contains("DELETE FROM mqtt_outbox"))
-        assertFalse(compact.contains("DELETE FROM influx_export_cursor"))
-        assertFalse(compact.contains("DELETE FROM collector_events"))
-        assertFalse(compact.contains("DELETE FROM ec_energy_consumption"))
+        assertFalse(source.contains("fun compactRawHistory"))
+        assertFalse(source.contains("DbMaintenanceResult"))
+        assertFalse(source.contains("VACUUM"))
     }
 
     @Test

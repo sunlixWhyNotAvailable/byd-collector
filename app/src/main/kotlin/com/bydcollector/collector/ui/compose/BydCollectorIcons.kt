@@ -12,6 +12,7 @@ enum class BottomTabIcon {
     HOME,
     DATABASE,
     HA,
+    STORAGE,
     GEAR,
     LOGS
 }
@@ -41,6 +42,7 @@ private fun BottomTabIcon.drawableRes(): Int = when (this) {
     BottomTabIcon.HOME -> R.drawable.ic_tab_home
     BottomTabIcon.DATABASE -> R.drawable.ic_tab_all_data
     BottomTabIcon.HA -> R.drawable.ic_tab_ha_link
+    BottomTabIcon.STORAGE -> R.drawable.ic_tab_storage
     BottomTabIcon.GEAR -> R.drawable.ic_tab_options
     BottomTabIcon.LOGS -> R.drawable.ic_tab_logs
 }

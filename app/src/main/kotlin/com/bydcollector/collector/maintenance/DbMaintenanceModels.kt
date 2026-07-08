@@ -5,23 +5,6 @@ enum class DbMaintenanceOperation(
     val stepsUk: List<String>,
     val stepsEn: List<String>
 ) {
-    COMPACT(
-        key = "compact",
-        stepsUk = listOf(
-            "Зупиняємо збір та експорт",
-            "Відʼєднуємо raw історію від нормалізованих даних",
-            "Видаляємо raw історію",
-            "Стискаємо базу даних",
-            "Відновлюємо попередній стан"
-        ),
-        stepsEn = listOf(
-            "Stopping collection and export",
-            "Detaching raw history from normalized data",
-            "Deleting raw history",
-            "Compacting database",
-            "Restoring previous state"
-        )
-    ),
     ARCHIVE(
         key = "archive",
         stepsUk = listOf(

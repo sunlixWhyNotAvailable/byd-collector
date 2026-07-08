@@ -69,15 +69,6 @@ object CollectorServiceController {
         context.startService(CollectorService.stopInfluxExportIntent(context))
     }
 
-    fun compactDatabase(context: Context) {
-        val intent = CollectorService.compactDatabaseIntent(context)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.startForegroundService(intent)
-        } else {
-            context.startService(intent)
-        }
-    }
-
     fun archiveDatabase(context: Context) {
         val intent = CollectorService.archiveDatabaseIntent(context)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -89,5 +80,23 @@ object CollectorServiceController {
 
     fun cancelDatabaseMaintenance(context: Context) {
         context.startService(CollectorService.cancelDatabaseMaintenanceIntent(context))
+    }
+
+    fun reconcileArchiveStorage(context: Context) {
+        val intent = CollectorService.reconcileArchiveStorageIntent(context)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
+    }
+
+    fun deleteArchives(context: Context, ids: List<String>) {
+        val intent = CollectorService.deleteArchivesIntent(context, ArrayList(ids))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
     }
 }

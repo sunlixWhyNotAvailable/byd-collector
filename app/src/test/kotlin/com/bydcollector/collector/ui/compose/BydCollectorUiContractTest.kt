@@ -45,11 +45,11 @@ class BydCollectorUiContractTest {
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
 
         assertFalse(app.contains("MainChannelsCard("))
-        assertTrue(app.contains("ActionButton(strings.compactDatabase, actions::onOpenCompactDatabase"))
-        assertTrue(app.contains("ActionButton(strings.archiveDatabase, actions::onOpenArchiveDatabase"))
+        assertTrue(app.contains("ActionButton(strings.archiveDatabase, actions::onOpenArchiveDatabase, modifier = Modifier.fillMaxWidth())"))
+        assertFalse(app.contains("strings.compactDatabase"))
+        assertFalse(app.contains("onOpenCompactDatabase"))
         assertInOrder(app, "StatusRow(strings.mainPolling", "strings.allParameters")
         assertInOrder(app, "StatusRow(\"MQTT\"", "StatusRow(\"InfluxDB\"")
-        assertInOrder(app, "ActionButton(strings.compactDatabase", "ActionButton(strings.archiveDatabase")
     }
 
     @Test
@@ -88,9 +88,30 @@ class BydCollectorUiContractTest {
         assertFalse(icons.contains("Canvas("))
         assertTrue(icons.contains("BottomTabIcon.HA -> R.drawable.ic_tab_ha_link"))
         assertTrue(icons.contains("BottomTabIcon.DATABASE -> R.drawable.ic_tab_all_data"))
+        assertTrue(icons.contains("BottomTabIcon.STORAGE -> R.drawable.ic_tab_storage"))
         assertTrue(icons.contains("painterResource(id = icon.drawableRes())"))
         assertTrue(icons.contains("fun ShutdownIcon("))
         assertTrue(icons.contains("R.drawable.ic_shutdown"))
+    }
+
+    @Test
+    fun storageTabExposesArchiveManagementWithoutCompact() {
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val actions = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorActions.kt").readText()
+        val strings = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorStrings.kt").readText()
+
+        assertTrue(strings.contains("STORAGE"))
+        assertTrue(strings.contains("val storageTab: String"))
+        assertTrue(strings.contains("storageTab = \"Сховище\""))
+        assertTrue(strings.contains("storageTab = \"Storage\""))
+        assertTrue(app.contains("AppTab.STORAGE -> StorageTab("))
+        assertTrue(app.contains("AppTab.STORAGE to (strings.storageTab to BottomTabIcon.STORAGE)"))
+        assertTrue(app.contains("ArchiveDeleteDialog("))
+        assertTrue(app.contains("ArchiveStorageProgressDialog("))
+        assertTrue(actions.contains("fun onSetArchiveStorageLimitGb(value: Int)"))
+        assertTrue(actions.contains("fun onDeleteArchives(ids: List<String>)"))
+        assertTrue(actions.contains("fun onReconcileArchiveStorage()"))
+        assertFalse(strings.contains("compactDatabase"))
     }
 
     @Test

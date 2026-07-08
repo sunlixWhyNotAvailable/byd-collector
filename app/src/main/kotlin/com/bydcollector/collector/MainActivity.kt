@@ -147,11 +147,6 @@ class MainActivity : ComponentActivity() {
             showBackgroundSetupPrompt(autoLaunch = false)
         }
 
-        override fun onOpenCompactDatabase() {
-            pendingMaintenanceOperation = DbMaintenanceOperation.COMPACT
-            refresh()
-        }
-
         override fun onOpenArchiveDatabase() {
             pendingMaintenanceOperation = DbMaintenanceOperation.ARCHIVE
             refresh()
@@ -174,10 +169,7 @@ class MainActivity : ComponentActivity() {
                 synchronous = true
             )
             runCatching {
-                when (operation) {
-                DbMaintenanceOperation.COMPACT -> CollectorServiceController.compactDatabase(this@MainActivity)
-                DbMaintenanceOperation.ARCHIVE -> CollectorServiceController.archiveDatabase(this@MainActivity)
-                }
+                CollectorServiceController.archiveDatabase(this@MainActivity)
             }.onFailure { error ->
                 settings.setDbMaintenanceStatus(
                     settings.dbMaintenanceStatus().copy(
@@ -200,6 +192,24 @@ class MainActivity : ComponentActivity() {
             if (dashboardState?.dbMaintenanceStatus?.running == true || maintenanceLaunchOperation != null) return
             pendingMaintenanceOperation = null
             settings.clearDbMaintenanceStatus()
+            refresh()
+        }
+
+        override fun onSetArchiveStorageLimitGb(value: Int) {
+            refreshStoreBackedState()
+            settings.setArchiveStorageLimitGb(value)
+            CollectorServiceController.reconcileArchiveStorage(this@MainActivity)
+            refresh()
+        }
+
+        override fun onDeleteArchives(ids: List<String>) {
+            if (ids.isEmpty()) return
+            CollectorServiceController.deleteArchives(this@MainActivity, ids)
+            refresh()
+        }
+
+        override fun onReconcileArchiveStorage() {
+            CollectorServiceController.reconcileArchiveStorage(this@MainActivity)
             refresh()
         }
 

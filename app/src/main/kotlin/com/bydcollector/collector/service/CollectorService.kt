@@ -39,6 +39,9 @@ import com.bydcollector.collector.influx.HttpInfluxClient
 import com.bydcollector.collector.influx.InfluxActionResult
 import com.bydcollector.collector.influx.InfluxExportCoordinator
 import com.bydcollector.collector.ha.TailscaleActivator
+import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
+import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
+import com.bydcollector.collector.maintenance.ArchiveStorageManager
 import com.bydcollector.collector.maintenance.DbMaintenanceCoordinator
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.mqtt.HaMqttConfig
@@ -74,6 +77,7 @@ class CollectorService : Service() {
     private var normalizedStateChangedCallback: ((Set<String>) -> Unit)? = null
     private val debugStartExecutor = namedSingleThreadExecutor("byd-debug-start")
     private val maintenanceExecutor = namedSingleThreadExecutor("byd-db-maintenance")
+    private val archiveStorageExecutor = namedSingleThreadExecutor("byd-archive-storage")
     private val mainHandler = Handler(Looper.getMainLooper())
     private val mqttExecutorLock = Any()
     private var mqttExecutor: ExecutorService = namedSingleThreadExecutor("byd-mqtt")
@@ -85,6 +89,7 @@ class CollectorService : Service() {
     private val mqttRuntimeActive = AtomicBoolean(false)
     private val mqttOfflineQueued = AtomicBoolean(false)
     private val maintenanceActive = AtomicBoolean(false)
+    private val archiveStorageActive = AtomicBoolean(false)
     private val restoringRuntime = AtomicBoolean(false)
     private var lastStatusHeartbeatAtMs: Long = -STATUS_HEARTBEAT_INTERVAL_MS
     private var lastNotificationText: String? = null
@@ -125,7 +130,6 @@ class CollectorService : Service() {
         recoverInterruptedMaintenanceIfNeeded(action)
         if (
             maintenanceActive.get() &&
-            action != ACTION_COMPACT_DATABASE &&
             action != ACTION_ARCHIVE_DATABASE &&
             action != ACTION_CANCEL_DATABASE_MAINTENANCE
         ) {
@@ -153,9 +157,16 @@ class CollectorService : Service() {
             ACTION_STOP_MQTT_EXPORT -> stopMqttExport(manualStop = true)
             ACTION_START_INFLUX_EXPORT -> startInfluxExport(clearManualStop = true)
             ACTION_STOP_INFLUX_EXPORT -> stopInfluxExport(manualStop = true)
-            ACTION_COMPACT_DATABASE -> startDatabaseMaintenance(DbMaintenanceOperation.COMPACT)
             ACTION_ARCHIVE_DATABASE -> startDatabaseMaintenance(DbMaintenanceOperation.ARCHIVE)
             ACTION_CANCEL_DATABASE_MAINTENANCE -> cancelDatabaseMaintenance()
+            ACTION_RECONCILE_ARCHIVE_STORAGE -> {
+                ensureForegroundForChannel("Archive storage")
+                enqueueArchiveStorageMaintenance(null)
+            }
+            ACTION_DELETE_ARCHIVES -> {
+                ensureForegroundForChannel("Archive storage")
+                enqueueArchiveDelete(intent?.getStringArrayListExtra(EXTRA_ARCHIVE_IDS).orEmpty())
+            }
             ACTION_START -> reconcileCollection()
         }
         return START_STICKY
@@ -166,6 +177,7 @@ class CollectorService : Service() {
         keepAliveSupervisor.shutdown()
         debugStartExecutor.shutdownNow()
         maintenanceExecutor.shutdownNow()
+        archiveStorageExecutor.shutdownNow()
         shutdownMqttExecutor()
         shutdownInfluxExecutor()
         mainPollingRunning.set(false)
@@ -740,7 +752,7 @@ class CollectorService : Service() {
         val mainRunning = poller.isRunning()
         val debugRunningNow = isDebugPollerRunning()
         val keepAliveEnabled = settings.keepAliveConfig().anyEnabled
-        if (mainRunning || debugRunningNow || keepAliveEnabled || settings.isMqttEnabled() || settings.isInfluxEnabled()) {
+        if (mainRunning || debugRunningNow || keepAliveEnabled || settings.isMqttEnabled() || settings.isInfluxEnabled() || archiveStorageActive.get()) {
             return
         }
         releaseWakeLock()
@@ -953,7 +965,10 @@ class CollectorService : Service() {
         try {
             maintenanceExecutor.execute {
                 try {
-                    maintenanceCoordinator.run(operation) { restoreRuntimeAfterMaintenance(snapshot) }
+                    val result = maintenanceCoordinator.run(operation) { restoreRuntimeAfterMaintenance(snapshot) }
+                    if (result.ok && result.archivePath != null) {
+                        enqueueArchiveStorageMaintenance(result.archivePath)
+                    }
                 } finally {
                     maintenanceActive.set(false)
                     maintenanceRunningInProcess.set(false)
@@ -974,6 +989,79 @@ class CollectorService : Service() {
         maintenanceCoordinator.requestCancel()
     }
 
+    private fun enqueueArchiveStorageMaintenance(preferredArchivePath: String?) {
+        enqueueArchiveStorageWork("archive_storage_rejected") {
+            val manager = archiveStorageManager()
+            val limitBytes = settings.archiveStorageLimitGb() * 1024L * 1024L * 1024L
+            preferredArchivePath
+                ?.let(::File)
+                ?.takeIf { it.isDirectory }
+                ?.let { manager.compressRawArchiveDirectory(it, ::publishArchiveStorageStatus) }
+            manager.compressPendingRawArchives(::publishArchiveStorageStatus)
+            manager.enforceRetention(limitBytes, ::publishArchiveStorageStatus)
+        }
+    }
+
+    private fun enqueueArchiveDelete(ids: List<String>) {
+        enqueueArchiveStorageWork("archive_storage_delete_rejected") {
+            val manager = archiveStorageManager()
+            val limitBytes = settings.archiveStorageLimitGb() * 1024L * 1024L * 1024L
+            manager.deleteArchiveIds(ids, ::publishArchiveStorageStatus)
+            manager.enforceRetention(limitBytes, ::publishArchiveStorageStatus)
+        }
+    }
+
+    private fun enqueueArchiveStorageWork(errorCategory: String, work: () -> Unit) {
+        if (!archiveStorageActive.compareAndSet(false, true)) return
+        try {
+            archiveStorageExecutor.execute {
+                try {
+                    runCatching { work() }
+                        .onFailure { error ->
+                            settings.setArchiveStorageJobStatus(
+                                ArchiveStorageJobStatus(
+                                    mode = ArchiveStorageJobMode.RETENTION,
+                                    running = false,
+                                    error = "${error::class.java.simpleName}: ${error.message ?: "no message"}",
+                                    updatedAtMs = System.currentTimeMillis()
+                                ),
+                                synchronous = true
+                            )
+                            store.recordEvent(
+                                "archive_storage_error",
+                                "Archive storage action failed",
+                                "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                            )
+                        }
+                    if (settings.archiveStorageJobStatus().error == null) {
+                        settings.clearArchiveStorageJobStatus()
+                    }
+                } finally {
+                    archiveStorageActive.set(false)
+                    mainHandler.post { stopIfNoActiveRuntime() }
+                }
+            }
+        } catch (error: RejectedExecutionException) {
+            archiveStorageActive.set(false)
+            store.recordEvent(
+                errorCategory,
+                "Archive storage action rejected",
+                "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+            )
+        }
+    }
+
+    private fun archiveStorageManager(): ArchiveStorageManager {
+        return ArchiveStorageManager(
+            archiveRoot = File(applicationContext.filesDir, "db_archive"),
+            activeDatabaseFile = store.databaseFile()
+        )
+    }
+
+    private fun publishArchiveStorageStatus(status: ArchiveStorageJobStatus) {
+        settings.setArchiveStorageJobStatus(status, synchronous = true)
+    }
+
     private fun maintenanceBlocksRuntimeStart(): Boolean {
         if (restoringRuntime.get()) return false
         if (maintenanceActive.get()) return true
@@ -985,7 +1073,7 @@ class CollectorService : Service() {
     }
 
     private fun recoverInterruptedMaintenanceIfNeeded(action: String) {
-        if (action == ACTION_COMPACT_DATABASE || action == ACTION_ARCHIVE_DATABASE) return
+        if (action == ACTION_ARCHIVE_DATABASE) return
         if (maintenanceActive.get()) return
         settings.recoverInterruptedDbMaintenanceIfNeeded("service_start:$action")
     }
@@ -1088,9 +1176,11 @@ class CollectorService : Service() {
         val ACTION_STOP_MQTT_EXPORT: String = "${BuildConfig.ACTION_PREFIX}.action.STOP_MQTT_EXPORT"
         val ACTION_START_INFLUX_EXPORT: String = "${BuildConfig.ACTION_PREFIX}.action.START_INFLUX_EXPORT"
         val ACTION_STOP_INFLUX_EXPORT: String = "${BuildConfig.ACTION_PREFIX}.action.STOP_INFLUX_EXPORT"
-        val ACTION_COMPACT_DATABASE: String = "${BuildConfig.ACTION_PREFIX}.action.COMPACT_DATABASE"
         val ACTION_ARCHIVE_DATABASE: String = "${BuildConfig.ACTION_PREFIX}.action.ARCHIVE_DATABASE"
         val ACTION_CANCEL_DATABASE_MAINTENANCE: String = "${BuildConfig.ACTION_PREFIX}.action.CANCEL_DATABASE_MAINTENANCE"
+        val ACTION_RECONCILE_ARCHIVE_STORAGE: String = "${BuildConfig.ACTION_PREFIX}.action.RECONCILE_ARCHIVE_STORAGE"
+        val ACTION_DELETE_ARCHIVES: String = "${BuildConfig.ACTION_PREFIX}.action.DELETE_ARCHIVES"
+        const val EXTRA_ARCHIVE_IDS = "archiveIds"
         private const val CHANNEL_ID = "collector"
         private const val NOTIFICATION_ID = 1001
         private const val STATUS_HEARTBEAT_INTERVAL_MS = 30_000L
@@ -1148,16 +1238,21 @@ class CollectorService : Service() {
             action = ACTION_STOP_INFLUX_EXPORT
         }
 
-        fun compactDatabaseIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
-            action = ACTION_COMPACT_DATABASE
-        }
-
         fun archiveDatabaseIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
             action = ACTION_ARCHIVE_DATABASE
         }
 
         fun cancelDatabaseMaintenanceIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
             action = ACTION_CANCEL_DATABASE_MAINTENANCE
+        }
+
+        fun reconcileArchiveStorageIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
+            action = ACTION_RECONCILE_ARCHIVE_STORAGE
+        }
+
+        fun deleteArchivesIntent(context: Context, ids: ArrayList<String>): Intent = Intent(context, CollectorService::class.java).apply {
+            action = ACTION_DELETE_ARCHIVES
+            putStringArrayListExtra(EXTRA_ARCHIVE_IDS, ids)
         }
     }
 }

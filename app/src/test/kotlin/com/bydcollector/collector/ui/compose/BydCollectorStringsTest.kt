@@ -16,9 +16,11 @@ class BydCollectorStringsTest {
         val en = strings(UiLanguage.EN)
 
         assertEquals("Всі дані", uk.allTab)
+        assertEquals("Сховище", uk.storageTab)
         assertEquals("Налаштування", uk.extraTab)
         assertEquals("Всі дані", uk.allParameters)
         assertEquals("All data", en.allTab)
+        assertEquals("Storage", en.storageTab)
         assertEquals("Options", en.extraTab)
         assertEquals("All data", en.allParameters)
     }
@@ -28,7 +30,6 @@ class BydCollectorStringsTest {
         val uk = strings(UiLanguage.UK)
         val en = strings(UiLanguage.EN)
 
-        assertEquals("Стиснення бази", uk.compactDatabase)
         assertEquals("Архівація бази", uk.archiveDatabase)
         assertEquals("Так", uk.yes)
         assertEquals("Ні", uk.no)
@@ -45,7 +46,6 @@ class BydCollectorStringsTest {
         assertEquals("Операцію скасовано.", uk.dbMaintenanceCancelled)
         assertEquals("Архів:", uk.dbMaintenanceArchivePath)
 
-        assertEquals("Database compact", en.compactDatabase)
         assertEquals("Database archive", en.archiveDatabase)
         assertEquals("Yes", en.yes)
         assertEquals("No", en.no)
@@ -96,5 +96,25 @@ class BydCollectorStringsTest {
         assertEquals("No connection. Check the network or VPN.", en.updateNetworkUnavailable)
         assertEquals("Операцію перервано до завершення.", uk.dbMaintenanceInterrupted)
         assertEquals("The operation was interrupted before completion.", en.dbMaintenanceInterrupted)
+    }
+
+    @Test
+    fun storageLabelsAreLocalized() {
+        val uk = strings(UiLanguage.UK)
+        val en = strings(UiLanguage.EN)
+
+        assertEquals("Поточна база", uk.activeDatabase)
+        assertEquals("Архіви", uk.archiveStorage)
+        assertEquals("Ліміт архівів, ГБ", uk.archiveStorageLimit)
+        assertEquals("Тека архівів", uk.archiveRoot)
+        assertEquals("Видалити вибране", uk.deleteSelected)
+        assertEquals("Видалити вибрані архіви?", uk.deleteArchivesQuestion)
+
+        assertEquals("Active database", en.activeDatabase)
+        assertEquals("Archives", en.archiveStorage)
+        assertEquals("Archive limit, GB", en.archiveStorageLimit)
+        assertEquals("Archive folder", en.archiveRoot)
+        assertEquals("Delete selected", en.deleteSelected)
+        assertEquals("Delete selected archives?", en.deleteArchivesQuestion)
     }
 }

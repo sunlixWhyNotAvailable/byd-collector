@@ -1,6 +1,8 @@
 package com.bydcollector.collector.ui
 
 import com.bydcollector.collector.data.local.CollectorEvent
+import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
+import com.bydcollector.collector.maintenance.ArchiveStorageSnapshot
 import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
 import com.bydcollector.collector.system.RequiredAccessRow
 
@@ -25,6 +27,9 @@ data class DashboardState(
     val databasePath: String,
     val databaseSizeBytes: Long,
     val dbMaintenanceStatus: DbMaintenanceRuntimeStatus,
+    val archiveStorageLimitGb: Int,
+    val archiveStorageSnapshot: ArchiveStorageSnapshot,
+    val archiveStorageJobStatus: ArchiveStorageJobStatus,
     val latestSoc: String?,
     val latestSpeed: String?,
     val latestCharging: String?,

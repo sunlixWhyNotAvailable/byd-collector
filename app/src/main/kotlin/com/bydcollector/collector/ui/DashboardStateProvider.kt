@@ -11,11 +11,13 @@ import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.remote.DirectBridgeManager
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
 import com.bydcollector.collector.influx.InfluxExportStateSnapshot
+import com.bydcollector.collector.maintenance.ArchiveStorageManager
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.system.RequiredAccessChecker
 import com.bydcollector.collector.system.RequiredAccessRow
 import com.bydcollector.collector.util.TimedCache
+import java.io.File
 
 //assembles one immutable dashboard snapshot from settings, service flags, sqlite health, and diagnostics
 class DashboardStateProvider(
@@ -59,6 +61,12 @@ class DashboardStateProvider(
         val keepAliveConfig = settings.keepAliveConfig()
         val mqttConfig = settings.mqttConfig()
         val influxConfig = settings.influxConfig()
+        val archiveStorageLimitGb = settings.archiveStorageLimitGb()
+        val archiveStorageSnapshot = ArchiveStorageManager(
+            archiveRoot = File(context.filesDir, "db_archive"),
+            activeDatabaseFile = context.getDatabasePath(TelemetryDatabaseHelper.DATABASE_NAME)
+        ).snapshot(archiveStorageLimitGb * 1024L * 1024L * 1024L)
+        val archiveStorageJobStatus = settings.archiveStorageJobStatus()
         val influxState = store?.influxExportState() ?: maintenanceInfluxState()
         val vehicleKpis = if (includeVehicleKpis && store != null) {
             //vehicle kpi reads are lightweight normalized-current reads used by the foreground refresh loop
@@ -87,6 +95,9 @@ class DashboardStateProvider(
             databasePath = health.databasePath,
             databaseSizeBytes = health.databaseSizeBytes,
             dbMaintenanceStatus = maintenanceStatus,
+            archiveStorageLimitGb = archiveStorageLimitGb,
+            archiveStorageSnapshot = archiveStorageSnapshot,
+            archiveStorageJobStatus = archiveStorageJobStatus,
             latestSoc = health.latestSoc,
             latestSpeed = health.latestSpeed,
             latestCharging = health.latestCharging,
