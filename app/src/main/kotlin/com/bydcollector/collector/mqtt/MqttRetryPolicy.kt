@@ -1,7 +1,6 @@
 package com.bydcollector.collector.mqtt
 
 import java.time.OffsetDateTime
-import kotlin.math.roundToLong
 
 data class MqttRetryState(
     val failureCount: Int,
@@ -18,17 +17,11 @@ interface MqttRetryStateStore {
 }
 
 class MqttRetryPolicy(
-    private val delaysMs: List<Long> = listOf(5_000L, 15_000L, 30_000L, 60_000L, 120_000L, 300_000L)
+    private val retryDelayMs: Long = FIXED_RETRY_DELAY_MS
 ) {
     fun delayForFailure(failureCount: Int): Long {
         if (failureCount <= 0) return 0L
-        return delaysMs[(failureCount - 1).coerceAtMost(delaysMs.lastIndex)]
-    }
-
-    fun withJitter(baseDelayMs: Long, topicOrReason: String): Long {
-        val offsetPermille = Math.floorMod(topicOrReason.hashCode(), 201) - 100
-        val jittered = (baseDelayMs * (1_000 + offsetPermille) / 1_000.0).roundToLong()
-        return jittered.coerceIn(MIN_DELAY_MS, MAX_DELAY_MS)
+        return retryDelayMs
     }
 
     fun failureCountAfterSuccess(): Int = 0
@@ -48,7 +41,6 @@ class MqttRetryPolicy(
     }
 
     private companion object {
-        const val MIN_DELAY_MS = 1_000L
-        const val MAX_DELAY_MS = 300_000L
+        const val FIXED_RETRY_DELAY_MS = 30_000L
     }
 }

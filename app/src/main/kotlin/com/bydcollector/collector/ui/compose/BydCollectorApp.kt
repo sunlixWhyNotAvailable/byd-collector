@@ -1188,7 +1188,7 @@ private fun StorageTab(
         entries.sortedWith(compareBy<ArchiveStorageEntry> { it.createdAtMs }.thenBy { it.id })
     }
     val job = state?.archiveStorageJobStatus
-    val topCardHeight = 164.dp
+    val topCardHeight = 176.dp
 
     Column(
         modifier = Modifier
@@ -1224,7 +1224,7 @@ private fun StorageTab(
                     )
                 }
                 Box(Modifier.fillMaxWidth().height(1.dp).background(LocalBydPalette.current.border))
-                Spacer(Modifier.height(4.dp))
+                Spacer(Modifier.height(10.dp))
                 ReadOnlyPathField(snapshot?.activeDatabasePath ?: state?.databasePath ?: "-")
             }
             SectionCard(strings.archiveStorageLimit, modifier = Modifier.weight(0.4f).height(topCardHeight)) {
@@ -1604,9 +1604,9 @@ private fun LogCard(title: String, status: String, kind: StatusKind, rows: List<
 private fun BottomTabs(activeTab: AppTab, strings: UiStrings, actions: BydCollectorActions) {
     val tabs = listOf(
         AppTab.MAIN to (strings.mainTab to BottomTabIcon.HOME),
-        AppTab.ALL_PARAMETERS to (strings.allTab to BottomTabIcon.DATABASE),
+        AppTab.ALL_PARAMETERS to (strings.allTab to BottomTabIcon.STORAGE),
         AppTab.HA to (strings.haTab to BottomTabIcon.HA),
-        AppTab.STORAGE to (strings.storageTab to BottomTabIcon.STORAGE),
+        AppTab.STORAGE to (strings.storageTab to BottomTabIcon.DATABASE),
         AppTab.EXTRA to (strings.extraTab to BottomTabIcon.GEAR),
         AppTab.LOGS to (strings.logsTab to BottomTabIcon.LOGS)
     )

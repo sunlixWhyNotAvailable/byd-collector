@@ -182,8 +182,7 @@ class MqttPublishCoordinator(
 
     private fun recordRetryFailure(error: String, stateBeforeFailure: MqttRetryState): String {
         val nextFailureCount = stateBeforeFailure.failureCount + 1
-        val baseDelayMs = retryPolicy.delayForFailure(nextFailureCount)
-        val delayMs = retryPolicy.withJitter(baseDelayMs, error)
+        val delayMs = retryPolicy.delayForFailure(nextFailureCount)
         val failedAt = clock.nowIso()
         val nextAttemptAt = plusMillis(failedAt, delayMs)
         retryStateStore.recordRetryFailure(error, failedAt, nextAttemptAt)

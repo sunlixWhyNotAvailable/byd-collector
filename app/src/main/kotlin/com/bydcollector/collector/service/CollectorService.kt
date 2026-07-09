@@ -38,7 +38,10 @@ import com.bydcollector.collector.keepalive.KeepAliveSupervisor
 import com.bydcollector.collector.influx.HttpInfluxClient
 import com.bydcollector.collector.influx.InfluxActionResult
 import com.bydcollector.collector.influx.InfluxExportCoordinator
+import com.bydcollector.collector.ha.HaEndpoint
+import com.bydcollector.collector.ha.SocketHaEndpointProbe
 import com.bydcollector.collector.ha.TailscaleActivator
+import com.bydcollector.collector.ha.TailscaleActivationGate
 import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
 import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.ArchiveStorageManager
@@ -66,6 +69,7 @@ class CollectorService : Service() {
     private lateinit var poller: TelemetryPoller
     private lateinit var debugStore: DirectDebugStore
     private lateinit var keepAliveSupervisor: KeepAliveSupervisor
+    private lateinit var tailscaleGate: TailscaleActivationGate
     private lateinit var vehicleStateNormalizer: VehicleStateNormalizer
     private lateinit var mqttCoordinator: MqttPublishCoordinator
     private lateinit var influxCoordinator: InfluxExportCoordinator
@@ -101,6 +105,14 @@ class CollectorService : Service() {
         settings = CollectorSettings(applicationContext, store)
         debugStore = DirectDebugStore(applicationContext, DirectDebugDatabaseHelper(applicationContext))
         keepAliveSupervisor = KeepAliveSupervisor(applicationContext, store)
+        val endpointProbe = SocketHaEndpointProbe()
+        tailscaleGate = TailscaleActivationGate(
+            isEnabled = { settings.isTailscaleActivationEnabled() },
+            lastAttemptAtMs = { settings.tailscaleActivationLastAttemptAtMs() },
+            setLastAttemptAtMs = { settings.setTailscaleActivationLastAttemptAtMs(it) },
+            isReachable = endpointProbe::isReachable,
+            activate = { TailscaleActivator.activate(applicationContext) }
+        )
         vehicleStateNormalizer = VehicleStateNormalizer()
         mqttCoordinator = createMqttCoordinator(PahoMqttClientFacade())
         influxCoordinator = createInfluxCoordinator()
@@ -685,7 +697,6 @@ class CollectorService : Service() {
         if (maintenanceBlocksRuntimeStart()) return
         if (clearManualStop) settings.setMqttManuallyStopped(false)
         settings.setMqttEnabled(true)
-        activateTailscaleIfEnabled("mqtt")
         ensureForegroundForChannel("MQTT export running")
         mqttRuntimeActive.set(true)
         executeMqtt("mqtt_start_error") {
@@ -705,31 +716,24 @@ class CollectorService : Service() {
         if (maintenanceBlocksRuntimeStart()) return
         if (clearManualStop) settings.setInfluxManuallyStopped(false)
         settings.setInfluxEnabled(true)
-        activateTailscaleIfEnabled("influx")
         ensureForegroundForChannel("Influx export running")
         executeInflux("influx_start_error") {
             influxCoordinator.startExport()
         }
     }
 
-    private fun activateTailscaleIfEnabled(channel: String) {
-        if (!settings.isTailscaleActivationEnabled()) return
-        val now = System.currentTimeMillis()
-        val lastAttempt = settings.tailscaleActivationLastAttemptAtMs()
-        if (lastAttempt > 0L && now - lastAttempt < TAILSCALE_ACTIVATION_THROTTLE_MS) {
-            store.recordEvent(
-                category = "tailscale_activation_throttled",
-                message = "Tailscale activation skipped by throttle",
-                detail = "channel=$channel age_ms=${now - lastAttempt}"
-            )
-            return
+    private fun maybeActivateTailscaleAfterHaFailure(channel: String) {
+        val endpoint = when (channel) {
+            "mqtt" -> settings.mqttConfig().let { HaEndpoint(channel, it.host, it.port) }
+            "influx" -> settings.influxConfig().let { HaEndpoint(channel, it.host, it.port) }
+            else -> return
         }
-        settings.setTailscaleActivationLastAttemptAtMs(now)
-        val result = TailscaleActivator.activate(applicationContext)
+        val decision = tailscaleGate.maybeActivate(endpoint)
+        if (decision.category == "tailscale_activation_disabled") return
         store.recordEvent(
-            category = if (result.ok) "tailscale_activation_requested" else "tailscale_activation_failed",
-            message = result.message,
-            detail = "channel=$channel"
+            category = decision.category,
+            message = decision.message,
+            detail = "channel=$channel host=${endpoint.host} port=${endpoint.port}"
         )
     }
 
@@ -742,7 +746,7 @@ class CollectorService : Service() {
     private fun stopInfluxExport(manualStop: Boolean = true) {
         if (manualStop) settings.setInfluxManuallyStopped(true)
         settings.setInfluxEnabled(false)
-        executeInflux("influx_stop_error") {
+        executeInflux("influx_stop_error", activateTailscaleOnFailure = false) {
             influxCoordinator.stopExport()
         }
         stopIfNoActiveRuntime()
@@ -840,6 +844,7 @@ class CollectorService : Service() {
 
     private fun executeMqtt(
         errorCategory: String,
+        activateTailscaleOnFailure: Boolean = true,
         action: () -> MqttActionResult
     ) = executeChannel(
         channelName = "MQTT",
@@ -847,7 +852,12 @@ class CollectorService : Service() {
         executorLock = mqttExecutorLock,
         executor = { mqttExecutor },
         generation = mqttWorkGeneration,
-        action = action
+        action = action,
+        onFailedAction = if (activateTailscaleOnFailure) {
+            { maybeActivateTailscaleAfterHaFailure("mqtt") }
+        } else {
+            null
+        }
     ) { result ->
         ChannelActionStatus(result.ok, result.category, result.message)
     }
@@ -878,6 +888,7 @@ class CollectorService : Service() {
 
     private fun executeInflux(
         errorCategory: String,
+        activateTailscaleOnFailure: Boolean = true,
         action: () -> InfluxActionResult
     ) = executeChannel(
         channelName = "Influx",
@@ -886,7 +897,12 @@ class CollectorService : Service() {
         executor = { influxExecutor },
         generation = influxWorkGeneration,
         lowPriority = true,
-        action = action
+        action = action,
+        onFailedAction = if (activateTailscaleOnFailure) {
+            { maybeActivateTailscaleAfterHaFailure("influx") }
+        } else {
+            null
+        }
     ) { result ->
         ChannelActionStatus(result.ok, result.category, result.message)
     }
@@ -899,6 +915,7 @@ class CollectorService : Service() {
         generation: AtomicLong,
         lowPriority: Boolean = false,
         action: () -> T,
+        onFailedAction: (() -> Unit)? = null,
         status: (T) -> ChannelActionStatus
     ) {
         val submittedGeneration = generation.get()
@@ -913,11 +930,12 @@ class CollectorService : Service() {
                         val state = status(result)
                         if (!state.ok) {
                             store.recordEvent(
-                                errorCategory,
-                                "$channelName async action failed",
-                                "${state.category}: ${state.message}"
-                            )
-                        }
+                            errorCategory,
+                            "$channelName async action failed",
+                            "${state.category}: ${state.message}"
+                        )
+                        onFailedAction?.invoke()
+                    }
                     }
                     .onFailure { error ->
                         store.recordEvent(
@@ -1184,7 +1202,6 @@ class CollectorService : Service() {
         private const val CHANNEL_ID = "collector"
         private const val NOTIFICATION_ID = 1001
         private const val STATUS_HEARTBEAT_INTERVAL_MS = 30_000L
-        private const val TAILSCALE_ACTIVATION_THROTTLE_MS = 5 * 60 * 1000L
         private const val TAG = "BYDCollectorService"
         private const val DEBUG_REASON_AUTOSTART = "autostart"
         private const val DEBUG_REASON_MANUAL = "manual"
