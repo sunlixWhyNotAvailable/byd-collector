@@ -2,7 +2,7 @@ package com.bydcollector.collector.data.normalized
 
 //semantic catalog that maps curated raw keys to stable fields exposed to dashboard, mqtt, and influx
 object NormalizedFieldCatalog {
-    const val CATALOG_VERSION = "normalized-direct-v8-20260627-charge-current"
+    const val CATALOG_VERSION = "normalized-direct-v9-20260710-bydopenapi-enums"
 
     val soc = number(
         fieldKey = "soc",
@@ -44,11 +44,11 @@ object NormalizedFieldCatalog {
     val remainingRangeKm = number("remaining_range_km", NormalizedCategory.BATTERY, "km", "EV range", "distance", "measurement", listOf("statistic_elec_driving_range_yun"), "decoded_number_non_negative")
     val odometerKm = number("odometer_km", NormalizedCategory.MOTION, "km", "Odometer", "distance", "total_increasing", listOf("statistic_1014_1246765072_5"), "raw_number_deci_non_negative")
     val speedKmh = number("speed_kmh", NormalizedCategory.MOTION, "km/h", "Speed", "speed", "measurement", listOf("speed_1013_-1807745016_7"), "decoded_speed_kmh")
-    val chargingState = rawEnum("charging_state", NormalizedCategory.BATTERY, "Charging state", "charging_1009_1231032336_5")
-    val chargeGunConnected = bool("charge_gun_connected_raw", NormalizedCategory.BATTERY, "Charging gun", "plug", listOf("charging_1009_876609586_5"), "zero_false_nonzero_true")
+    val chargingState = textEnum("charging_state", NormalizedCategory.BATTERY, "Charging state", "charging_1009_1231032336_5", "charging_battery_state_openapi")
+    val chargeGunConnected = bool("charge_gun_connected_raw", NormalizedCategory.BATTERY, "Charging gun connected", "plug", listOf("charging_1009_876609586_5"), "charging_gun_connected_openapi")
     val acPower = bool("ac_power", NormalizedCategory.CLIMATE, "Climate", null, listOf("ac_1000_1077936144_5"), "zero_false_nonzero_true")
     val driverTempSetpoint = number("driver_temp_setpoint_raw", NormalizedCategory.CLIMATE, "°C", "Driver temperature setting", "temperature", "measurement", listOf("ac_1000_1077936168_5"), "raw_temperature_c", mqttDefaultEnabled = false)
-    val acWindLevel = number("ac_wind_level_raw", NormalizedCategory.CLIMATE, "level", "Fan speed", null, "measurement", listOf("ac_wind_level"), "decoded_number_non_negative", mqttDefaultEnabled = false)
+    val acWindLevel = number("ac_wind_level_raw", NormalizedCategory.CLIMATE, "level", "Fan speed", null, "measurement", listOf("ac_wind_level"), "ac_wind_level_0_7", mqttDefaultEnabled = false)
     val driverDoorLock = bool("ota_lf_door_lock", NormalizedCategory.BODY, "Driver door lock", null, listOf("ota_lf_door_lock"), "door_lock_state_locked", mqttDefaultEnabled = false)
     val passengerDoorLock = bool("rf_door_lock_raw", NormalizedCategory.BODY, "Passenger door lock", null, listOf("bodywork_rf_door_lock_status"), "door_lock_state_locked", mqttDefaultEnabled = false)
     val driverDoor = bool("driver_door_open", NormalizedCategory.BODY, "Driver door", "door", listOf("bodywork_left_hand_front_door"), "zero_closed_nonzero_open")
@@ -71,10 +71,10 @@ object NormalizedFieldCatalog {
     val tireTempRf = number("tire_temp_rf_raw", NormalizedCategory.SAFETY, "°C", "Passenger tire temperature", "temperature", "measurement", listOf("instrument_1007_1246797860_5"), "decoded_number_raw")
     val tireTempLr = number("tire_temp_lr_raw", NormalizedCategory.SAFETY, "°C", "Rear left tire temperature", "temperature", "measurement", listOf("instrument_1007_1246797872_5"), "decoded_number_raw")
     val tireTempRr = number("tire_temp_rr_raw", NormalizedCategory.SAFETY, "°C", "Rear right tire temperature", "temperature", "measurement", listOf("instrument_1007_1246797884_5"), "decoded_number_raw")
-    val tireStateLf = rawEnum("tyre_state_lf", NormalizedCategory.SAFETY, "Driver tire status", "tyre_1016_-1728052957_5")
-    val tireStateRf = rawEnum("tyre_state_rf", NormalizedCategory.SAFETY, "Passenger tire status", "tyre_1016_-1728052953_5")
-    val tireStateLr = rawEnum("tyre_state_lr", NormalizedCategory.SAFETY, "Rear left tire status", "tyre_1016_-1728052949_5")
-    val tireStateRr = rawEnum("tyre_state_rr", NormalizedCategory.SAFETY, "Rear right tire status", "tyre_1016_-1728052945_5")
+    val tireStateLf = textEnum("tyre_state_lf", NormalizedCategory.SAFETY, "Driver tire status", "tyre_1016_-1728052957_5", "tyre_pressure_state_openapi")
+    val tireStateRf = textEnum("tyre_state_rf", NormalizedCategory.SAFETY, "Passenger tire status", "tyre_1016_-1728052953_5", "tyre_pressure_state_openapi")
+    val tireStateLr = textEnum("tyre_state_lr", NormalizedCategory.SAFETY, "Rear left tire status", "tyre_1016_-1728052949_5", "tyre_pressure_state_openapi")
+    val tireStateRr = textEnum("tyre_state_rr", NormalizedCategory.SAFETY, "Rear right tire status", "tyre_1016_-1728052945_5", "tyre_pressure_state_openapi")
     val frontMotorSpeed = number("front_motor_speed_raw", NormalizedCategory.MOTION, "RPM", "Front motor speed", null, "measurement", listOf("engine_front_motor_speed"), "decoded_number_raw")
     val acCompressorMode = bool("ac_compressor_mode_raw", NormalizedCategory.CLIMATE, "AC compressor mode raw", null, listOf("ac_compressor_mode"), "zero_false_nonzero_true", mqttDefaultEnabled = false)
     val passengerTempSetpoint = number("passenger_temp_setpoint_raw", NormalizedCategory.CLIMATE, "°C", "Passenger temperature setpoint", "temperature", "measurement", listOf("ac_1000_1077936176_5"), "raw_temperature_c", mqttDefaultEnabled = false)
@@ -87,7 +87,7 @@ object NormalizedFieldCatalog {
     val rearMotorIpmTemp = number("rear_motor_ipm_temp_raw", NormalizedCategory.MOTION, "°C", "Rear motor IPM temperature raw", "temperature", "measurement", listOf("gb_rear_motor_ipm_temp"), "decoded_number_raw")
     val frontMotorBusVoltage = number("front_motor_bus_voltage_raw", NormalizedCategory.MOTION, "V", "Front motor bus voltage raw", "voltage", "measurement", listOf("gb_1039_1169162248_5"), "decoded_voltage_v")
     val rearMotorBusVoltage = number("rear_motor_bus_voltage_raw", NormalizedCategory.MOTION, "V", "Rear motor bus voltage raw", "voltage", "measurement", listOf("gb_rear_motor_bus_voltage"), "decoded_voltage_v")
-    val gearAutoMode = rawEnum("gear_auto_mode_raw", NormalizedCategory.MOTION, "Gear auto mode raw", "gearbox_1011_555745336_5")
+    val gearAutoMode = textEnum("gear_auto_mode_raw", NormalizedCategory.MOTION, "Gear auto mode", "gearbox_1011_555745336_5", "gearbox_auto_mode_openapi")
     val pm25Inside = number("pm25_inside", NormalizedCategory.CLIMATE, "µg/m³", "PM2.5 inside", null, "measurement", listOf("pm2p5_value_in"), "decoded_number_non_negative")
     val pm25Outside = number("pm25_outside", NormalizedCategory.CLIMATE, "µg/m³", "PM2.5 outside", null, "measurement", listOf("pm2p5_value_out"), "decoded_number_non_negative")
     val radarLeftFront = number("radar_1025_neg_1728053151_5", NormalizedCategory.SAFETY, "cm", "Radar left front", "distance", "measurement", listOf("radar_1025_-1728053151_5"), "decoded_number_non_negative", mqttDefaultEnabled = false)
@@ -99,7 +99,7 @@ object NormalizedFieldCatalog {
     val radarRightRear = number("radar_1025_neg_1728053145_5", NormalizedCategory.SAFETY, "cm", "Radar right rear", "distance", "measurement", listOf("radar_1025_-1728053145_5"), "decoded_number_non_negative", mqttDefaultEnabled = false)
     val radarRight = number("radar_1025_neg_1728053144_5", NormalizedCategory.SAFETY, "cm", "Radar right", "distance", "measurement", listOf("radar_1025_-1728053144_5"), "decoded_number_non_negative", mqttDefaultEnabled = false)
     val batteryAverageTemp = number("battery_average_temp_raw", NormalizedCategory.BATTERY, "°C", "Battery average temperature", "temperature", "measurement", listOf("statistic_average_battery_temp"), "raw_temp_c_offset_40")
-    val chargerConnected = bool("charger_connected_raw", NormalizedCategory.BATTERY, "Charger connected raw", "plug", listOf("charging_1009_89128973_5"), "zero_false_nonzero_true")
+    val chargerConnected = bool("charger_connected_raw", NormalizedCategory.BATTERY, "Charger connected", "plug", listOf("charging_1009_89128973_5"), "charger_connected_openapi")
     val maxDischargePowerAllow = number("max_discharge_power_allow_raw", NormalizedCategory.BATTERY, "kW", "Max discharge power allow raw", "power", "measurement", listOf("statistic_1014_877658120_5"), "decoded_number_non_negative")
 
     val fields: List<NormalizedFieldDefinition> = listOf(
@@ -182,21 +182,24 @@ object NormalizedFieldCatalog {
         maxDischargePowerAllow
     )
 
-    private fun rawEnum(
+    private fun textEnum(
         fieldKey: String,
         category: NormalizedCategory,
         displayName: String,
-        sourceKey: String
+        sourceKey: String,
+        normalizerId: String
     ): NormalizedFieldDefinition {
-        return number(
+        return NormalizedFieldDefinition(
             fieldKey = fieldKey,
             category = category,
+            valueType = NormalizedValueType.TEXT,
             unit = null,
             displayName = displayName,
             deviceClass = null,
             stateClass = null,
+            entityPlatform = "sensor",
             sourceKeys = listOf(sourceKey),
-            normalizerId = "decoded_number_raw",
+            normalizerId = normalizerId,
             mqttDefaultEnabled = false
         )
     }

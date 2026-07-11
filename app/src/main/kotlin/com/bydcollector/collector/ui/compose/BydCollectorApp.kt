@@ -1224,7 +1224,6 @@ private fun StorageTab(
                     )
                 }
                 Box(Modifier.fillMaxWidth().height(1.dp).background(LocalBydPalette.current.border))
-                Spacer(Modifier.height(10.dp))
                 ReadOnlyPathField(snapshot?.activeDatabasePath ?: state?.databasePath ?: "-")
             }
             SectionCard(strings.archiveStorageLimit, modifier = Modifier.weight(0.4f).height(topCardHeight)) {

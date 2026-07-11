@@ -229,6 +229,68 @@ class VehicleStateNormalizerTest {
     }
 
     @Test
+    fun openApiEnumsProduceStableSemanticText() {
+        val fieldsByKey = NormalizedFieldCatalog.fields.associateBy { it.fieldKey }
+        val output = VehicleStateNormalizer(
+            catalog = listOf(
+                fieldsByKey.getValue("gear_auto_mode_raw"),
+                fieldsByKey.getValue("charging_state"),
+                fieldsByKey.getValue("tyre_state_lf")
+            )
+        ).normalize(
+            pollId = 69L,
+            observedAt = "2026-07-10T12:00:00+03:00",
+            readings = listOf(
+                PollReading("gearbox_1011_555745336_5", "4"),
+                PollReading("charging_1009_1231032336_5", "3"),
+                PollReading("tyre_1016_-1728052957_5", "2")
+            )
+        )
+
+        assertEquals("D", output.single { it.field.fieldKey == "gear_auto_mode_raw" }.value.text)
+        assertEquals("discharging", output.single { it.field.fieldKey == "charging_state" }.value.text)
+        assertEquals("underpressure", output.single { it.field.fieldKey == "tyre_state_lf" }.value.text)
+        output.forEach {
+            assertEquals(NormalizedValueType.TEXT, it.value.type)
+            assertEquals(NormalizedQuality.OK, it.quality)
+        }
+    }
+
+    @Test
+    fun openApiConnectionStatesAndFanLevelRejectUnknownValues() {
+        val fieldsByKey = NormalizedFieldCatalog.fields.associateBy { it.fieldKey }
+        val fields = listOf(
+            fieldsByKey.getValue("charge_gun_connected_raw"),
+            fieldsByKey.getValue("charger_connected_raw"),
+            fieldsByKey.getValue("ac_wind_level_raw")
+        )
+        val valid = VehicleStateNormalizer(catalog = fields).normalize(
+            pollId = 70L,
+            observedAt = "2026-07-10T12:00:01+03:00",
+            readings = listOf(
+                PollReading("charging_1009_876609586_5", "1"),
+                PollReading("charging_1009_89128973_5", "1"),
+                PollReading("ac_wind_level", "7")
+            )
+        )
+        val invalid = VehicleStateNormalizer(catalog = fields).normalize(
+            pollId = 71L,
+            observedAt = "2026-07-10T12:00:02+03:00",
+            readings = listOf(
+                PollReading("charging_1009_876609586_5", "0"),
+                PollReading("charging_1009_89128973_5", "2"),
+                PollReading("ac_wind_level", "8")
+            )
+        )
+
+        assertEquals(false, valid.single { it.field.fieldKey == "charge_gun_connected_raw" }.value.bool)
+        assertEquals(true, valid.single { it.field.fieldKey == "charger_connected_raw" }.value.bool)
+        assertEquals(7.0, valid.single { it.field.fieldKey == "ac_wind_level_raw" }.value.number)
+        valid.forEach { assertEquals(NormalizedQuality.OK, it.quality) }
+        invalid.forEach { assertEquals(NormalizedQuality.INVALID, it.quality) }
+    }
+
+    @Test
     fun invalidAndMissingDecodedPreferredValuesKeepExistingQualityBehavior() {
         val invalid = VehicleStateNormalizer(
             catalog = listOf(NormalizedFieldCatalog.speedKmh)
@@ -281,7 +343,7 @@ class VehicleStateNormalizerTest {
     fun catalogVersionAndExpansionWaveExposeRepresentativeFields() {
         val fieldsByKey = NormalizedFieldCatalog.fields.associateBy { it.fieldKey }
 
-        assertEquals("normalized-direct-v8-20260627-charge-current", NormalizedFieldCatalog.CATALOG_VERSION)
+        assertEquals("normalized-direct-v9-20260710-bydopenapi-enums", NormalizedFieldCatalog.CATALOG_VERSION)
         assertEquals(77, NormalizedFieldCatalog.fields.size)
         assertEquals(emptyList(), NormalizedFieldCatalog.fields.filter { field ->
             field.sourceKeys.any {
@@ -318,7 +380,7 @@ class VehicleStateNormalizerTest {
     }
 
     @Test
-    fun rawEnumAndDriverAssistFieldsAreNotMqttDefaultEnabled() {
+    fun semanticEnumAndDriverAssistFieldsAreNotMqttDefaultEnabled() {
         val fieldsByKey = NormalizedFieldCatalog.fields.associateBy { it.fieldKey }
 
         listOf(
@@ -331,6 +393,9 @@ class VehicleStateNormalizerTest {
         ).forEach { fieldKey ->
             assertFalse(fieldsByKey.getValue(fieldKey).mqttDefaultEnabled, fieldKey)
         }
+        assertEquals(NormalizedValueType.TEXT, fieldsByKey.getValue("gear_auto_mode_raw").valueType)
+        assertEquals(NormalizedValueType.TEXT, fieldsByKey.getValue("charging_state").valueType)
+        assertEquals(NormalizedValueType.TEXT, fieldsByKey.getValue("tyre_state_lf").valueType)
     }
 
     @Test

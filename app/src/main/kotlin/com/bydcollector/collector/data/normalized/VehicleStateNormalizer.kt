@@ -99,6 +99,7 @@ class VehicleStateNormalizer(
             "decoded_current_a" -> normalizeDecodedNumber(field, reading) { it in -1000.0..1000.0 }
             "decoded_voltage_v" -> normalizeDecodedNumber(field, reading) { it in 0.0..1000.0 }
             "decoded_number_non_negative" -> normalizeDecodedNumber(field, reading) { it >= 0.0 }
+            "ac_wind_level_0_7" -> normalizeDecodedNumber(field, reading) { it in 0.0..7.0 && it == it.toInt().toDouble() }
             "decoded_number_deci_non_negative" -> normalizeDecodedNumber(field, reading, scale = 0.1) { it >= 0.0 }
             "decoded_number_raw" -> normalizeDecodedNumber(field, reading) { true }
             "raw_number_deci_non_negative" -> normalizeNumber(field, rawOnly(reading), scale = 0.1) { it >= 0.0 }
@@ -110,6 +111,11 @@ class VehicleStateNormalizer(
             "zero_false_nonzero_true",
             "nonzero_true" -> normalizeBoolean(field, rawOnly(reading))
             "door_lock_state_locked" -> normalizeDoorLockState(rawOnly(reading))
+            "charging_gun_connected_openapi" -> normalizeMappedBoolean(rawOnly(reading), CHARGING_GUN_CONNECTED)
+            "charger_connected_openapi" -> normalizeMappedBoolean(rawOnly(reading), CHARGER_CONNECTED)
+            "gearbox_auto_mode_openapi" -> normalizeEnumText(rawOnly(reading), GEARBOX_AUTO_MODE)
+            "charging_battery_state_openapi" -> normalizeEnumText(rawOnly(reading), CHARGING_BATTERY_STATE)
+            "tyre_pressure_state_openapi" -> normalizeEnumText(rawOnly(reading), TYRE_PRESSURE_STATE)
             "decoded_bool_nonzero_true",
             "decoded_zero_false_nonzero_true" -> normalizeBoolean(field, decodedPreferred(reading))
             else -> NormalizedQuality.UNSUPPORTED to emptyValue(field.valueType)
@@ -158,9 +164,8 @@ class VehicleStateNormalizer(
         if (rawValue == null) {
             return NormalizedQuality.MISSING to emptyValue(NormalizedValueType.BOOLEAN)
         }
-        val number = parseNumber(rawValue)
-        val state = number?.toInt()
-        if (number == null || state == null || number != state.toDouble()) {
+        val state = parseInteger(rawValue)
+        if (state == null) {
             return NormalizedQuality.INVALID to emptyValue(NormalizedValueType.BOOLEAN)
         }
         return when (state) {
@@ -175,6 +180,36 @@ class VehicleStateNormalizer(
             0 -> NormalizedQuality.MISSING to emptyValue(NormalizedValueType.BOOLEAN)
             else -> NormalizedQuality.INVALID to emptyValue(NormalizedValueType.BOOLEAN)
         }
+    }
+
+    private fun normalizeMappedBoolean(
+        rawValue: String?,
+        mapping: Map<Int, Boolean>
+    ): Pair<NormalizedQuality, NormalizedValue> {
+        if (rawValue == null) {
+            return NormalizedQuality.MISSING to emptyValue(NormalizedValueType.BOOLEAN)
+        }
+        val value = parseInteger(rawValue)?.let(mapping::get)
+            ?: return NormalizedQuality.INVALID to emptyValue(NormalizedValueType.BOOLEAN)
+        return NormalizedQuality.OK to NormalizedValue(
+            type = NormalizedValueType.BOOLEAN,
+            bool = value
+        )
+    }
+
+    private fun normalizeEnumText(
+        rawValue: String?,
+        mapping: Map<Int, String>
+    ): Pair<NormalizedQuality, NormalizedValue> {
+        if (rawValue == null) {
+            return NormalizedQuality.MISSING to emptyValue(NormalizedValueType.TEXT)
+        }
+        val value = parseInteger(rawValue)?.let(mapping::get)
+            ?: return NormalizedQuality.INVALID to emptyValue(NormalizedValueType.TEXT)
+        return NormalizedQuality.OK to NormalizedValue(
+            type = NormalizedValueType.TEXT,
+            text = value
+        )
     }
 
     private fun normalizeDecodedNumber(
@@ -253,6 +288,12 @@ class VehicleStateNormalizer(
         return parsed.takeIf { !it.isNaN() && !it.isInfinite() }
     }
 
+    private fun parseInteger(rawValue: String?): Int? {
+        val number = parseNumber(rawValue) ?: return null
+        val integer = number.toInt()
+        return integer.takeIf { number == integer.toDouble() }
+    }
+
     private fun stableDouble(value: Double): Double {
         //normalizes numeric precision so tiny double noise does not create fake history changes
         return String.format(Locale.US, "%.6f", value)
@@ -301,5 +342,41 @@ class VehicleStateNormalizer(
             "derived_hv_charge_power_kw",
             "derived_hv_discharge_power_kw"
         )
+        val GEARBOX_AUTO_MODE = mapOf(
+            1 to "P",
+            2 to "R",
+            3 to "N",
+            4 to "D",
+            5 to "M",
+            6 to "S"
+        )
+        val CHARGING_BATTERY_STATE = mapOf(
+            0 to "ready",
+            1 to "charging",
+            2 to "charge_finished",
+            3 to "discharging",
+            4 to "charge_terminated",
+            5 to "fault_c10",
+            6 to "fault_charging_gun",
+            7 to "fault_charger",
+            8 to "fault_ac",
+            9 to "scheduled",
+            10 to "discharging_cbu",
+            11 to "timeout",
+            12 to "discharge_finished"
+        )
+        val TYRE_PRESSURE_STATE = mapOf(
+            0 to "normal",
+            1 to "overpressure",
+            2 to "underpressure"
+        )
+        val CHARGING_GUN_CONNECTED = mapOf(
+            1 to false,
+            2 to true,
+            3 to true,
+            4 to true,
+            5 to true
+        )
+        val CHARGER_CONNECTED = mapOf(0 to false, 1 to true)
     }
 }

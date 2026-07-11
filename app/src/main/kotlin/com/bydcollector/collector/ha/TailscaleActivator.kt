@@ -1,7 +1,8 @@
 package com.bydcollector.collector.ha
 
 import android.content.Context
-import android.content.Intent
+import com.bydcollector.collector.adb.AdbLocalClient
+import java.io.File
 
 object TailscaleActivator {
     fun packageCandidates(): List<String> = listOf("com.tailscale.ipn")
@@ -12,15 +13,24 @@ object TailscaleActivator {
             .mapNotNull { packageName -> context.packageManager.getLaunchIntentForPackage(packageName) }
             .firstOrNull()
             ?: return TailscaleActivationResult(false, "tailscale_not_installed")
+        val component = launchIntent.component
+            ?: return TailscaleActivationResult(false, "tailscale_launcher_missing")
 
-        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        return runCatching {
-            context.startActivity(launchIntent)
-            TailscaleActivationResult(true, "tailscale_launch_requested")
-        }.getOrElse { error ->
-            TailscaleActivationResult(false, "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+        val result = AdbLocalClient(File(context.filesDir, "adb_keys")).execShell(
+            launchCommand(component.packageName, component.className)
+        )
+        return if (result.ok) {
+            TailscaleActivationResult(true, "tailscale_launch_requested_via_adb")
+        } else {
+            TailscaleActivationResult(
+                false,
+                "tailscale_adb_launch_failed: ${result.error ?: result.output.trim().ifEmpty { "no detail" }}"
+            )
         }
     }
+
+    fun launchCommand(packageName: String, className: String): String =
+        "am start -n $packageName/$className"
 }
 
 data class TailscaleActivationResult(

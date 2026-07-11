@@ -11,4 +11,12 @@ class TailscaleActivatorTest {
             TailscaleActivator.packageCandidates()
         )
     }
+
+    @Test
+    fun launchCommandUsesShellActivityStart() {
+        assertEquals(
+            "am start -n com.tailscale.ipn/com.tailscale.ipn.MainActivity",
+            TailscaleActivator.launchCommand("com.tailscale.ipn", "com.tailscale.ipn.MainActivity")
+        )
+    }
 }
