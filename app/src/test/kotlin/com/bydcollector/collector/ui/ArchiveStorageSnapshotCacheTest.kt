@@ -11,24 +11,26 @@ class ArchiveStorageSnapshotCacheTest {
     fun storageScanRunsOnlyWhenRequestedAndCachesForTtl() {
         val root = Files.createTempDirectory("byd-archive-cache").toFile()
         val active = root.resolve("bydcollector_telemetry.db").apply { writeText("active") }
+        val debug = root.resolve("bydcollector_debug_round_robin.db").apply { writeText("debug") }
         val archiveRoot = root.resolve("db_archive").apply { mkdirs() }
         var now = 1_000L
         var scans = 0
         val cache = ArchiveStorageSnapshotCache(
             archiveRoot = archiveRoot,
-            activeDatabaseFile = active,
+            mainDatabaseFile = active,
+            debugDatabaseFile = debug,
             ttlMs = 30_000L,
             clock = { now },
             executor = { command -> command.run() }
         ) { limitBytes ->
             scans += 1
-            com.bydcollector.collector.maintenance.ArchiveStorageManager(archiveRoot, active).snapshot(limitBytes)
+            com.bydcollector.collector.maintenance.ArchiveStorageManager(archiveRoot, active, debug).snapshot(limitBytes)
         }
 
         val idle = cache.snapshot(limitBytes = 2L * 1024 * 1024 * 1024, includeDetails = false)
         assertEquals(0, scans)
         assertFalse(idle.pending)
-        assertEquals(active.absolutePath, idle.snapshot.activeDatabasePath)
+        assertEquals(active.length() + debug.length(), idle.snapshot.activeDatabaseSizeBytes)
 
         val first = cache.snapshot(limitBytes = 2L * 1024 * 1024 * 1024, includeDetails = true)
         assertEquals(1, scans)
@@ -50,19 +52,21 @@ class ArchiveStorageSnapshotCacheTest {
     fun pendingStaysTrueWhileBackgroundScanIsStillRunning() {
         val root = Files.createTempDirectory("byd-archive-cache-running").toFile()
         val active = root.resolve("bydcollector_telemetry.db").apply { writeText("active") }
+        val debug = root.resolve("bydcollector_debug_round_robin.db").apply { writeText("debug") }
         val archiveRoot = root.resolve("db_archive").apply { mkdirs() }
         val commands = mutableListOf<Runnable>()
         val now = 1_000L
         var scans = 0
         val cache = ArchiveStorageSnapshotCache(
             archiveRoot = archiveRoot,
-            activeDatabaseFile = active,
+            mainDatabaseFile = active,
+            debugDatabaseFile = debug,
             ttlMs = 30_000L,
             clock = { now },
             executor = { command -> commands += command }
         ) { limitBytes ->
             scans += 1
-            com.bydcollector.collector.maintenance.ArchiveStorageManager(archiveRoot, active).snapshot(limitBytes)
+            com.bydcollector.collector.maintenance.ArchiveStorageManager(archiveRoot, active, debug).snapshot(limitBytes)
         }
 
         val first = cache.snapshot(limitBytes = 2L * 1024 * 1024 * 1024, includeDetails = true)

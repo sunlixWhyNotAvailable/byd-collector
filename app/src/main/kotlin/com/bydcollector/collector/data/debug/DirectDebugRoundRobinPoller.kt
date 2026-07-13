@@ -121,7 +121,7 @@ class DirectDebugRoundRobinPoller(
     }
 
     companion object {
-        const val INTERVAL_MS = 1_000L
+        const val INTERVAL_MS = 500L
         const val MAX_OVERLOAD_BACKOFF_MS = 30_000L
 
         fun nextSleepMs(cycleElapsedMs: Long): Long {

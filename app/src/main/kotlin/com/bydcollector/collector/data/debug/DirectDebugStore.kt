@@ -2,7 +2,7 @@ package com.bydcollector.collector.data.debug
 
 import android.content.ContentValues
 import android.content.Context
-import com.bydcollector.collector.BuildConfig
+import android.util.Log
 import com.bydcollector.collector.data.direct.DirectHelperReadResult
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
@@ -208,9 +208,23 @@ class DirectDebugStore(
         )
     }
 
-    fun pullCommand(): String {
-        return DirectDebugStore.pullCommand()
+    fun checkpointForArchive() {
+        runCatching {
+            helper.writableDatabase.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", emptyArray()).use { cursor ->
+                while (cursor.moveToNext()) Unit
+            }
+        }.onFailure { error ->
+            Log.w(TAG, "debug database WAL checkpoint failed before archive", error)
+        }
     }
+
+    fun verifyWritableDatabase(): Boolean {
+        helper.writableDatabase.rawQuery("PRAGMA quick_check", emptyArray()).use { cursor ->
+            return cursor.moveToFirst() && cursor.getString(0) == "ok"
+        }
+    }
+
+    fun databaseFile() = context.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME)
 
     private fun ensureCandidates(parameters: List<DirectDebugParameter>) {
         parameters.forEach { parameter ->
@@ -411,10 +425,6 @@ class DirectDebugStore(
     }
 
     companion object {
-        private const val WINDOWS_PULL_ROOT = "D:\\Work_folder\\!test\\byd web\\manual_pulls"
-
-        fun pullCommand(): String {
-            return "adb exec-out run-as ${BuildConfig.APPLICATION_ID} cat databases/${DirectDebugDatabaseHelper.DATABASE_NAME} > \"$WINDOWS_PULL_ROOT\\bydcollector_debug_db\\${DirectDebugDatabaseHelper.DATABASE_NAME}\""
-        }
+        private const val TAG = "BYDCollectorDebugStore"
     }
 }

@@ -2,6 +2,7 @@ package com.bydcollector.collector.service
 
 import java.io.File
 import kotlin.test.Test
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class RuntimeManualStopContractTest {
@@ -42,6 +43,32 @@ class RuntimeManualStopContractTest {
         assertTrue(service.contains("startInfluxExport(clearManualStop = true)"))
         assertTrue(autoStart.contains("settings.clearRuntimeManualStops()"))
         assertTrue(activity.contains("settings.clearRuntimeManualStops()"))
+    }
+
+    @Test
+    fun stopActionsDoNotChangePersistedAutoStartPreferences() {
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val stopDebug = service.substringAfter("ACTION_STOP_DEBUG -> {").substringBefore("ACTION_RECONCILE_KEEP_ALIVE")
+        val stopMain = service.substringAfter("ACTION_STOP -> {").substringBefore("ACTION_START_DEBUG")
+        val stopMqtt = service.substringAfter("private fun stopMqttExport").substringBefore("private fun startInfluxExport")
+        val stopInflux = service.substringAfter("private fun stopInfluxExport").substringBefore("private fun stopIfNoActiveRuntime")
+
+        assertFalse(stopMain.contains("setAutoStartEnabled"))
+        assertFalse(stopDebug.contains("setDebugAutoStartEnabled"))
+        assertFalse(stopMqtt.contains("setMqttAutoStartEnabled"))
+        assertFalse(stopInflux.contains("setInfluxAutoStartEnabled"))
+
+        val activityStops = listOf(
+            activity.substringAfter("override fun onStopMain()").substringBefore("override fun onToggleMainAutoStart"),
+            activity.substringAfter("override fun onStopDebug()").substringBefore("override fun onToggleDebugAutoStart"),
+            activity.substringAfter("override fun onStopMqtt()").substringBefore("override fun onTestMqtt"),
+            activity.substringAfter("override fun onStopInflux()").substringBefore("override fun onTestInflux")
+        ).joinToString("\n")
+        assertFalse(activityStops.contains("setAutoStartEnabled"))
+        assertFalse(activityStops.contains("setDebugAutoStartEnabled"))
+        assertFalse(activityStops.contains("setMqttAutoStartEnabled"))
+        assertFalse(activityStops.contains("setInfluxAutoStartEnabled"))
     }
 
     private fun sourceFile(path: String): File {

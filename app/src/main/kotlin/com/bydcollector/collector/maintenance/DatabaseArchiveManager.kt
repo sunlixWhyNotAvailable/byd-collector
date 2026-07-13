@@ -19,7 +19,7 @@ object DatabaseArchiveManager {
     )
 
     fun archive(databaseFile: File, archiveRoot: File, timestamp: String): ArchiveResult {
-        val archiveDirectory = File(archiveRoot, "bydcollector_telemetry_$timestamp")
+        val archiveDirectory = File(archiveRoot, "${databaseFile.nameWithoutExtension}_$timestamp")
         val movedFiles = mutableListOf<File>()
 
         if (!databaseFile.exists()) {

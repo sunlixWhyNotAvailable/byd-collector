@@ -10,7 +10,8 @@ import java.util.zip.ZipOutputStream
 
 class ArchiveStorageManager(
     private val archiveRoot: File,
-    private val activeDatabaseFile: File,
+    private val mainDatabaseFile: File,
+    private val debugDatabaseFile: File,
     private val clock: () -> Long = { System.currentTimeMillis() }
 ) {
     fun snapshot(limitBytes: Long): ArchiveStorageSnapshot {
@@ -21,8 +22,8 @@ class ArchiveStorageManager(
             .sortedWith(compareByDescending<ArchiveStorageEntry> { it.createdAtMs }.thenBy { it.id })
         return ArchiveStorageSnapshot(
             archiveRootPath = archiveRoot.absolutePath,
-            activeDatabasePath = activeDatabaseFile.absolutePath,
-            activeDatabaseSizeBytes = activeDatabaseFile.takeIf { it.exists() }?.length() ?: 0L,
+            mainDatabaseSizeBytes = mainDatabaseFile.takeIf { it.exists() }?.length() ?: 0L,
+            debugDatabaseSizeBytes = debugDatabaseFile.takeIf { it.exists() }?.length() ?: 0L,
             archiveBytes = entries.sumOf { it.sizeBytes },
             archiveLimitBytes = limitBytes,
             entries = entries
@@ -77,12 +78,18 @@ class ArchiveStorageManager(
         onStatus: (ArchiveStorageJobStatus) -> Unit = {}
     ): Int {
         val entries = snapshot(limitBytes).entries.filter { it.deletable }
-        if (entries.size <= 1) return 0
-        val newest = entries.maxByOrNull { it.createdAtMs }?.id
+        val protectedIds = entries
+            .groupBy { archiveFamily(it.id) }
+            .filterKeys { it != null }
+            .values
+            .mapNotNull { familyEntries ->
+                familyEntries.maxWithOrNull(compareBy<ArchiveStorageEntry> { it.createdAtMs }.thenBy { it.id })?.id
+            }
+            .toSet()
         var total = entries.sumOf { it.sizeBytes }
         var deleted = 0
         entries
-            .filter { it.id != newest }
+            .filter { it.id !in protectedIds }
             .sortedBy { it.createdAtMs }
             .forEach { entry ->
                 if (total <= limitBytes) return@forEach
@@ -177,7 +184,13 @@ class ArchiveStorageManager(
         }.getOrDefault(false)
     }
 
-    private fun isArchiveName(name: String): Boolean = name.startsWith("bydcollector_telemetry_")
+    private fun isArchiveName(name: String): Boolean = archiveFamily(name) != null
+
+    private fun archiveFamily(name: String): String? = when {
+        name.startsWith(MAIN_ARCHIVE_PREFIX) -> MAIN_ARCHIVE_PREFIX
+        name.startsWith(DEBUG_ARCHIVE_PREFIX) -> DEBUG_ARCHIVE_PREFIX
+        else -> null
+    }
 
     private fun sizeOf(file: File): Long {
         return when {
@@ -207,5 +220,10 @@ class ArchiveStorageManager(
             error = error,
             updatedAtMs = clock()
         )
+    }
+
+    companion object {
+        const val MAIN_ARCHIVE_PREFIX = "bydcollector_telemetry_"
+        const val DEBUG_ARCHIVE_PREFIX = "bydcollector_debug_round_robin_"
     }
 }

@@ -30,6 +30,7 @@ interface BydCollectorActions {
     fun onGrantAdb()
     fun onOpenBackgroundApps()
     fun onOpenArchiveDatabase()
+    fun onOpenArchiveDebugDatabase()
     fun onConfirmDatabaseMaintenance()
     fun onCancelDatabaseMaintenance()
     fun onDismissDatabaseMaintenance()

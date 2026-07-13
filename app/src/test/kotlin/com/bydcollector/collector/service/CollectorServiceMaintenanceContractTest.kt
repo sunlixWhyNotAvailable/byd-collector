@@ -29,10 +29,11 @@ class CollectorServiceMaintenanceContractTest {
         assertFalse(source.contains("maintenanceRuntimeSnapshot"))
         assertTrue(start.contains("if (!maintenanceActive.compareAndSet(false, true))"))
         assertTrue(start.contains("val snapshot = runtimeSnapshot()"))
-        assertTrue(start.contains("restoreRuntimeAfterMaintenance(snapshot)"))
+        assertTrue(start.contains("restoreRuntimeAfterMaintenance(operation, snapshot)"))
         assertTrue(start.contains("maintenanceActive.set(false)"))
         assertTrue(source.contains("action != ACTION_CANCEL_DATABASE_MAINTENANCE"))
-        assertTrue(source.contains("private fun maintenanceBlocksRuntimeStart(): Boolean"))
+        assertTrue(source.contains("private fun maintenanceBlocksRuntimeStart(debugRuntime: Boolean = false): Boolean"))
+        assertTrue(source.contains("activeMaintenanceOperation == DbMaintenanceOperation.ARCHIVE"))
     }
 
     @Test
@@ -88,7 +89,7 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(service.contains("maintenanceRunningInProcess.set(true)"))
         assertTrue(service.contains("maintenanceRunningInProcess.set(false)"))
         assertTrue(service.contains("private fun recoverInterruptedMaintenanceIfNeeded(action: String)"))
-        assertTrue(service.contains("if (action == ACTION_ARCHIVE_DATABASE) return"))
+        assertTrue(service.contains("if (action == ACTION_ARCHIVE_DATABASE || action == ACTION_ARCHIVE_DEBUG_DATABASE) return"))
         assertFalse(service.contains("ACTION_COMPACT_DATABASE"))
         assertTrue(service.contains("settings.recoverInterruptedDbMaintenanceIfNeeded(\"service_start:${'$'}action\")"))
         assertTrue(service.contains("settings.dbMaintenanceStatus().running"))
@@ -143,7 +144,7 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(coordinator.contains("private fun closeCancelWindowAndCheck(operation: DbMaintenanceOperation)"))
         assertTrue(coordinator.contains("private class DbMaintenanceCancelled"))
         assertTrue(coordinator.contains("publishCancelled(operation)"))
-        assertInOrder(coordinator, "publish(operation, 1, cancelAvailable = true)", "stopRuntime()")
+        assertInOrder(coordinator, "publish(operation, 1, cancelAvailable = true)", "stopRuntime(operation)")
         assertInOrder(coordinator, "closeCancelWindowAndCheck(operation)", "val result = archive(operation)")
         assertFalse(coordinator.contains("shutdownNow()"))
     }
@@ -165,6 +166,27 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(settings.contains("fun archiveStorageJobStatus(): ArchiveStorageJobStatus"))
         assertFalse(service.contains("ACTION_COMPACT_DATABASE"))
         assertFalse(controller.contains("fun compactDatabase"))
+    }
+
+    @Test
+    fun debugArchiveStopsAndRestoresOnlyRoundRobinRuntime() {
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val coordinator = sourceFile("com/bydcollector/collector/maintenance/DbMaintenanceCoordinator.kt").readText()
+        val stop = service.substringAfter("private fun stopRuntimeForMaintenance").substringBefore("private fun restoreRuntimeAfterMaintenance")
+        val debugBranch = stop.substringAfter("if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE)").substringBefore("if (!poller.stopAndJoin")
+
+        assertTrue(service.contains("ACTION_ARCHIVE_DEBUG_DATABASE"))
+        assertTrue(debugBranch.contains("shutdownAndAwait(\"debug_database_maintenance\", 2_000L)"))
+        assertFalse(debugBranch.contains("poller.stopAndJoin"))
+        assertFalse(debugBranch.contains("mqttCoordinator"))
+        assertFalse(debugBranch.contains("resetInfluxExecutorForMaintenance"))
+        assertTrue(coordinator.contains("private fun archiveDebug(operation: DbMaintenanceOperation)"))
+        assertTrue(coordinator.contains("debugStore.checkpointForArchive()"))
+        assertTrue(coordinator.contains("check(newStore.verifyWritableDatabase())"))
+        assertTrue(service.contains("snapshot.debugRunning &&"))
+        assertTrue(service.contains("maintenanceBlocksRuntimeStart(debugRuntime = true)"))
+        assertTrue(service.contains("activeMaintenanceOperation != DbMaintenanceOperation.DEBUG_ARCHIVE || debugRuntime"))
+        assertInOrder(service, "maintenanceActive.set(false)", "if (restoreAfterMaintenance)")
     }
 
     @Test

@@ -8,6 +8,11 @@ import kotlin.test.assertTrue
 
 class TelemetryPollerTest {
     @Test
+    fun defaultIntervalIsHalfSecond() {
+        assertEquals(500L, TelemetryPoller.DEFAULT_INTERVAL_MS)
+    }
+
+    @Test
     fun slowPollSkipsSleepAndDoesNotOverlap() {
         val clock = FakeClock()
         val runner = object : PollCycleRunner {

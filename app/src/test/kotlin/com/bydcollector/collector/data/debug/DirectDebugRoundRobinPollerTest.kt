@@ -46,9 +46,14 @@ class DirectDebugRoundRobinPollerTest {
 
     @Test
     fun debugPollerBacksOffWhenCycleOverrunsInterval() {
-        assertEquals(600L, DirectDebugRoundRobinPoller.nextSleepMs(cycleElapsedMs = 400L))
+        assertEquals(100L, DirectDebugRoundRobinPoller.nextSleepMs(cycleElapsedMs = 400L))
         assertEquals(1_500L, DirectDebugRoundRobinPoller.nextSleepMs(cycleElapsedMs = 1_500L))
         assertEquals(DirectDebugRoundRobinPoller.MAX_OVERLOAD_BACKOFF_MS, DirectDebugRoundRobinPoller.nextSleepMs(cycleElapsedMs = 54_000L))
+    }
+
+    @Test
+    fun debugIntervalIsHalfSecond() {
+        assertEquals(500L, DirectDebugRoundRobinPoller.INTERVAL_MS)
     }
 
     @Test

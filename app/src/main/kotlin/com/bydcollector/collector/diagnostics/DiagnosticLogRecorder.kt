@@ -12,7 +12,6 @@ import java.util.concurrent.TimeUnit
 
 //captures a small support bundle without making dashboard refresh perform zip work
 object DiagnosticLogRecorder {
-    private const val WINDOWS_PULL_ROOT = "D:\\Work_folder\\!test\\byd web\\manual_pulls"
     private const val DIAGNOSTICS_DIR = "diagnostics"
     private const val LATEST_ZIP_NAME = "bydcollector_diagnostics_latest.zip"
     private const val EVENTS_SNAPSHOT_NAME = "collector_events_snapshot.txt"
@@ -44,9 +43,6 @@ object DiagnosticLogRecorder {
                 appendLine("started_at=${timestamp()}")
                 appendLine("package=${BuildConfig.APPLICATION_ID}")
                 appendLine("log_dir=${runDir.absolutePath}")
-                appendLine("log_pull_command=${logPullCommandText()}")
-                appendLine("db_pull_command=${dbPullCommandText()}")
-                appendLine("keep_alive_log_pull_command=${keepAliveLogPullCommand()}")
             },
             Charsets.UTF_8
         )
@@ -84,30 +80,6 @@ object DiagnosticLogRecorder {
         return runDir
     }
 
-    fun logDirectoryPath(context: Context): String = logRoot(context).absolutePath
-
-    fun activeLogPath(context: Context): String = (activeRunDir ?: logRoot(context)).absolutePath
-
-    fun logPullCommand(context: Context): String {
-        return logPullCommandText()
-    }
-
-    fun dbPullCommand(): String {
-        return dbPullCommandText()
-    }
-
-    fun keepAliveLogPullCommand(): String {
-        return "adb pull $KEEP_ALIVE_LOG_PATH \"$WINDOWS_PULL_ROOT\\bydcollector_logs\\bydcollector_keepalive.log\""
-    }
-
-    private fun logPullCommandText(): String {
-        return "adb exec-out run-as ${BuildConfig.APPLICATION_ID} cat files/$DIAGNOSTICS_DIR/$LATEST_ZIP_NAME > \"$WINDOWS_PULL_ROOT\\bydcollector_logs\\$LATEST_ZIP_NAME\""
-    }
-
-    private fun dbPullCommandText(): String {
-        return "adb exec-out run-as ${BuildConfig.APPLICATION_ID} cat databases/${TelemetryDatabaseHelper.DATABASE_NAME} > \"$WINDOWS_PULL_ROOT\\bydcollector_db\\${TelemetryDatabaseHelper.DATABASE_NAME}\""
-    }
-
     private fun logRoot(context: Context): File {
         return File(context.filesDir, DIAGNOSTICS_DIR).apply {
             mkdirs()
@@ -118,7 +90,7 @@ object DiagnosticLogRecorder {
 
     private fun writeKeepAliveLogNote(runDir: File) {
         File(runDir, KEEP_ALIVE_LOG_SNAPSHOT_NAME).writeText(
-            "Use ${keepAliveLogPullCommand()} to retrieve the keep-alive delegate log.\n",
+            "source_path=$KEEP_ALIVE_LOG_PATH\n",
             Charsets.UTF_8
         )
     }

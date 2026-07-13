@@ -23,6 +23,25 @@ enum class DbMaintenanceOperation(
             "Verifying new database",
             "Restoring previous state"
         )
+    ),
+    DEBUG_ARCHIVE(
+        key = "debug_archive",
+        stepsUk = listOf(
+            "Зупиняємо round-robin збір",
+            "Закриваємо тестову базу даних",
+            "Переносимо тестову базу в архів",
+            "Створюємо нову тестову базу",
+            "Перевіряємо нову тестову базу",
+            "Відновлюємо round-robin збір"
+        ),
+        stepsEn = listOf(
+            "Stopping round-robin collection",
+            "Closing test database",
+            "Moving test database to archive",
+            "Creating new test database",
+            "Verifying new test database",
+            "Restoring round-robin collection"
+        )
     );
 
     companion object {

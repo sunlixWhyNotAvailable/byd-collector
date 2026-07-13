@@ -78,6 +78,15 @@ object CollectorServiceController {
         }
     }
 
+    fun archiveDebugDatabase(context: Context) {
+        val intent = CollectorService.archiveDebugDatabaseIntent(context)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
+    }
+
     fun cancelDatabaseMaintenance(context: Context) {
         context.startService(CollectorService.cancelDatabaseMaintenanceIntent(context))
     }

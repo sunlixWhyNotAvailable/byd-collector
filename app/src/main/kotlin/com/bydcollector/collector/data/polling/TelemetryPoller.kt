@@ -71,6 +71,6 @@ class TelemetryPoller(
     }
 
     companion object {
-        const val DEFAULT_INTERVAL_MS = 1_000L
+        const val DEFAULT_INTERVAL_MS = 500L
     }
 }

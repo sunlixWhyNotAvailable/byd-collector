@@ -46,7 +46,7 @@ class BydCollectorStringsTest {
         assertEquals("Операцію скасовано.", uk.dbMaintenanceCancelled)
         assertEquals("Архів:", uk.dbMaintenanceArchivePath)
 
-        assertEquals("Database archive", en.archiveDatabase)
+        assertEquals("Archive database", en.archiveDatabase)
         assertEquals("Yes", en.yes)
         assertEquals("No", en.no)
         assertEquals("Cancel", en.cancel)
@@ -103,7 +103,8 @@ class BydCollectorStringsTest {
         val uk = strings(UiLanguage.UK)
         val en = strings(UiLanguage.EN)
 
-        assertEquals("Поточна база", uk.activeDatabase)
+        assertEquals("Поточні бази", uk.activeDatabase)
+        assertEquals("%s: основна %s + тестова %s", uk.activeDatabaseSizeTemplate)
         assertEquals("Архіви", uk.archiveStorage)
         assertEquals("Ліміт архівів, ГБ", uk.archiveStorageLimit)
         assertEquals("Тека архівів", uk.archiveRoot)
@@ -116,7 +117,8 @@ class BydCollectorStringsTest {
         assertEquals("Старі спочатку", uk.archiveSortOldestFirst)
         assertEquals("(%d арх.)", uk.archiveCountShortTemplate)
 
-        assertEquals("Active database", en.activeDatabase)
+        assertEquals("Active databases", en.activeDatabase)
+        assertEquals("%s: main %s + test %s", en.activeDatabaseSizeTemplate)
         assertEquals("Archives", en.archiveStorage)
         assertEquals("Archive limit, GB", en.archiveStorageLimit)
         assertEquals("Archive folder", en.archiveRoot)

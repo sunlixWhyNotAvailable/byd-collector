@@ -9,6 +9,7 @@ class DbMaintenanceModelsTest {
     fun operationsResolveFromKeys() {
         assertNull(DbMaintenanceOperation.fromKey("compact"))
         assertEquals(DbMaintenanceOperation.ARCHIVE, DbMaintenanceOperation.fromKey("archive"))
+        assertEquals(DbMaintenanceOperation.DEBUG_ARCHIVE, DbMaintenanceOperation.fromKey("debug_archive"))
         assertNull(DbMaintenanceOperation.fromKey(null))
         assertNull(DbMaintenanceOperation.fromKey("other"))
     }
@@ -27,5 +28,12 @@ class DbMaintenanceModelsTest {
     @Test
     fun uiStateDefaultsToOperationStepCount() {
         assertEquals(6, DbMaintenanceUiState(DbMaintenanceOperation.ARCHIVE).stepCount)
+        assertEquals(6, DbMaintenanceUiState(DbMaintenanceOperation.DEBUG_ARCHIVE).stepCount)
+    }
+
+    @Test
+    fun debugArchiveStepsDescribeRoundRobinOnly() {
+        assertEquals("Зупиняємо round-robin збір", DbMaintenanceOperation.DEBUG_ARCHIVE.stepsUk.first())
+        assertEquals("Restoring round-robin collection", DbMaintenanceOperation.DEBUG_ARCHIVE.stepsEn.last())
     }
 }

@@ -12,7 +12,7 @@ class DashboardStateProviderMaintenanceContractTest {
         val load = source.substringAfter("fun load(").substringBefore("private fun formatTrailingTimestamp")
 
         assertTrue(source.contains("private val storeProvider: () -> TelemetryStore"))
-        assertTrue(load.contains("val store = if (maintenanceStatus.running) null else storeProvider()"))
+        assertTrue(load.contains("val store = if (mainMaintenanceRunning) null else storeProvider()"))
         assertFalse(source.contains("private val store: TelemetryStore,"))
     }
 
@@ -21,7 +21,9 @@ class DashboardStateProviderMaintenanceContractTest {
         val source = sourceFile("com/bydcollector/collector/ui/DashboardStateProvider.kt").readText()
         val load = source.substringAfter("fun load(").substringBefore("private fun formatTrailingTimestamp")
 
-        assertInOrder(load, "val maintenanceStatus = settings.dbMaintenanceStatus()", "val store = if (maintenanceStatus.running) null else storeProvider()")
+        assertInOrder(load, "val maintenanceStatus = settings.dbMaintenanceStatus()", "val store = if (mainMaintenanceRunning) null else storeProvider()")
+        assertTrue(load.contains("maintenanceStatus.operation == DbMaintenanceOperation.ARCHIVE"))
+        assertTrue(load.contains("maintenanceStatus.operation == DbMaintenanceOperation.DEBUG_ARCHIVE"))
         assertTrue(source.contains("private fun maintenanceHealthSnapshot("))
         assertTrue(source.contains("private fun maintenanceInfluxState()"))
         assertTrue(load.contains("val influxState = store?.influxExportState() ?: maintenanceInfluxState()"))
@@ -44,7 +46,7 @@ class DashboardStateProviderMaintenanceContractTest {
         assertTrue(load.contains("includeDetails = includeArchiveStorageDetails"))
         assertTrue(load.contains("archiveStorageScanPending = archiveStorageResult.pending"))
         assertInOrder(load, "val maintenanceStatus = settings.dbMaintenanceStatus()", "val archiveStorageResult = archiveStorageCache.snapshot(")
-        assertInOrder(load, "val store = if (maintenanceStatus.running) null else storeProvider()", "val archiveStorageResult = archiveStorageCache.snapshot(")
+        assertInOrder(load, "val store = if (mainMaintenanceRunning) null else storeProvider()", "val archiveStorageResult = archiveStorageCache.snapshot(")
     }
 
     private fun sourceFile(path: String): File {

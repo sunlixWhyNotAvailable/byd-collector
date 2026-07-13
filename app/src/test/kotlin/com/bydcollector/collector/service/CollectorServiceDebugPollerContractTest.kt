@@ -16,7 +16,7 @@ class CollectorServiceDebugPollerContractTest {
         assertTrue(start.contains("synchronized(debugPollerLock)"))
         assertTrue(start.contains("!settings.isDebugPollingEnabled()"))
         assertTrue(start.contains("settings.isDebugManuallyStopped()"))
-        assertTrue(start.contains("maintenanceBlocksRuntimeStart()"))
+        assertTrue(start.contains("maintenanceBlocksRuntimeStart(debugRuntime = true)"))
         assertTrue(stop.contains("detachDebugPoller()"))
         assertTrue(maintenance.contains("detachDebugPoller()"))
     }

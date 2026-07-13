@@ -18,8 +18,8 @@
 - normalized vehicle state for SOC, charging, battery, doors, tires, climate, speed, odometer, radar distance sensors and related fields
 - Home Assistant MQTT Discovery and live-state publishing
 - `InfluxDB v1` export for historical telemetry
-- database shrink and archive
-- automatic Tailscale app start
+- main and debug round-robin database archive with shared storage retention
+- automatic delayed Tailscale app start and background return
 
 ## Installation
 
@@ -40,7 +40,7 @@ Enum values are treated as field-specific. Unknown fields and unsupported values
 
 BYD Collector can publish MQTT Discovery config and live state topics for Home Assistant. MQTT is intended for current vehicle state, while InfluxDB is intended for longer-term historical telemetry.
 Personally for HA purposes influxDB seems like more viable options since when using in combination with Grafana you can get correct car state in connection with time. While MQTT only sends CURRENT state of the car (which means if you have missing data due to e.g. no HA connection, you're going to lose some statistics).
-Also important notice, I've tested with this in pair with Tailscale. Currently you need to bring up Tailscale app manually to active VPN connection. To aumotate things you can either use auto-start apps or use built-in feature (currently looking to improve this).
+When enabled, the built-in Tailscale policy reacts to an unreachable configured HA endpoint, waits for network availability, opens Tailscale through local ADB, and returns it to the background after launch.
 
 ## Tested
 
@@ -48,8 +48,7 @@ Tested on *Chinese version* of `BYD Sea Lion 07 EV 2025`, `DiLink 5.0`
 
 ## TO DO
 
-- improve Tailscale discovery and activation pipeline
 - add Telegram send messages integration
 - improve influxDB reupload
-- add user notification when db is too big to pull and delete old db
+- add user notification when database storage approaches its configured limit
 - explore possibility of collecting data when the car is turned off (already confirmed the dilink is alive and watchdog/heartbeat process can exist)

@@ -68,7 +68,10 @@ object CollectorAutoStart {
     fun recoverFromForeground(context: Context, settings: CollectorSettings, store: TelemetryStore) {
         val appContext = context.applicationContext
         if (CollectorSettings.isDbMaintenanceRunning(appContext) || !shouldRunService(settings)) return
-        if (settings.isAutoStartEnabled()) ensurePollingEnabled(settings)
+        if (settings.isAutoStartEnabled()) {
+            ensurePollingEnabled(settings)
+            syncDebugAutoStart(settings)
+        }
         if (CollectorService.isRunning()) {
             requestServiceReconcile(appContext, settings, store, "foreground_auto_start_recovery")
             return

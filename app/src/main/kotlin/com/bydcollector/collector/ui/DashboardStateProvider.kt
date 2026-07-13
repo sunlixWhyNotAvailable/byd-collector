@@ -11,6 +11,7 @@ import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.remote.DirectBridgeManager
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
 import com.bydcollector.collector.influx.InfluxExportStateSnapshot
+import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.system.RequiredAccessChecker
@@ -34,7 +35,8 @@ class DashboardStateProvider(
     private val requiredAccessCache = TimedCache<List<RequiredAccessRow>>(ttlMs = 30_000L)
     private val archiveStorageCache = ArchiveStorageSnapshotCache(
         archiveRoot = File(context.filesDir, "db_archive"),
-        activeDatabaseFile = context.getDatabasePath(TelemetryDatabaseHelper.DATABASE_NAME)
+        mainDatabaseFile = context.getDatabasePath(TelemetryDatabaseHelper.DATABASE_NAME),
+        debugDatabaseFile = context.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME)
     )
     private var healthCacheRunning: Boolean? = null
 
@@ -48,7 +50,9 @@ class DashboardStateProvider(
         val serviceRunning = CollectorService.isRunning()
         val mainPollingRunning = CollectorService.isMainPollingRunning()
         val maintenanceStatus = settings.dbMaintenanceStatus()
-        val store = if (maintenanceStatus.running) null else storeProvider()
+        val mainMaintenanceRunning = maintenanceStatus.running && maintenanceStatus.operation == DbMaintenanceOperation.ARCHIVE
+        val debugMaintenanceRunning = maintenanceStatus.running && maintenanceStatus.operation == DbMaintenanceOperation.DEBUG_ARCHIVE
+        val store = if (mainMaintenanceRunning) null else storeProvider()
         val nowMs = SystemClock.elapsedRealtime()
         val healthRunningChanged = healthCacheRunning != mainPollingRunning
         //uses main polling state for health so keep-alive-only service runs do not look like active collection
@@ -56,7 +60,7 @@ class DashboardStateProvider(
             healthCacheRunning = mainPollingRunning
             store.healthSnapshot(running = mainPollingRunning)
         }
-        val debugStatus = if (!maintenanceStatus.running && includeDebugStatus) {
+        val debugStatus = if (!debugMaintenanceRunning && includeDebugStatus) {
             //opens the debug db only on heavy tabs because status scans can be expensive on the tablet
             DirectDebugStore(context).use { debugStore -> debugStore.status() }
         } else {
@@ -107,9 +111,6 @@ class DashboardStateProvider(
             latestSpeed = health.latestSpeed,
             latestCharging = health.latestCharging,
             logRecording = DiagnosticLogRecorder.isRecording(),
-            logDirectoryPath = DiagnosticLogRecorder.logDirectoryPath(context),
-            logPullCommand = DiagnosticLogRecorder.logPullCommand(context),
-            dbPullCommand = DiagnosticLogRecorder.dbPullCommand(),
             debugPollingEnabled = settings.isDebugPollingEnabled(),
             debugPollingRunning = CollectorService.isDebugRunning(),
             debugAutoStartEnabled = settings.isDebugAutoStartEnabled(),
@@ -123,7 +124,6 @@ class DashboardStateProvider(
             debugLastError = debugStatus.lastError,
             debugErrorCount = debugStatus.errorCount,
             debugLastSessionId = debugStatus.lastSessionId,
-            debugDbPullCommand = DirectDebugStore.pullCommand(),
             keepWifiEnabled = keepAliveConfig.keepWifi,
             keepMobileDataEnabled = keepAliveConfig.keepMobileData,
             keepBluetoothEnabled = keepAliveConfig.keepBluetooth,
@@ -131,7 +131,6 @@ class DashboardStateProvider(
             tailscaleActivationEnabled = settings.isTailscaleActivationEnabled(),
             keepAliveEnabled = keepAliveConfig.anyEnabled,
             keepAliveStatus = if (keepAliveConfig.anyEnabled) "enabled" else "disabled",
-            keepAliveLogPullCommand = DiagnosticLogRecorder.keepAliveLogPullCommand(),
             mqttEnabled = mqttConfig.enabled,
             mqttAutoStartEnabled = settings.isMqttAutoStartEnabled(),
             mqttHost = mqttConfig.host,

@@ -455,7 +455,7 @@ private fun AllParametersTab(
             }
             VehicleKpiCard(state, strings, Modifier.weight(2f).height(262.dp))
         }
-        DebugDatabaseCard(state, strings, Modifier.fillMaxWidth())
+        DebugDatabaseCard(state, strings, actions, Modifier.fillMaxWidth())
     }
 }
 
@@ -480,8 +480,8 @@ private fun VehicleKpiCard(state: DashboardState?, strings: UiStrings, modifier:
 }
 
 @Composable
-private fun DebugDatabaseCard(state: DashboardState?, strings: UiStrings, modifier: Modifier) {
-    SectionCard(title = strings.database, modifier = modifier.height(196.dp)) {
+private fun DebugDatabaseCard(state: DashboardState?, strings: UiStrings, actions: BydCollectorActions, modifier: Modifier) {
+    SectionCard(title = strings.database, modifier = modifier.height(226.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
             InfoRow(strings.size, UiSizeFormatter.bytes(state?.debugDatabaseSizeBytes ?: 0L, strings), modifier = Modifier.weight(0.84f), divider = true)
             ReadOnlyPathField(state?.debugDatabasePath ?: "-", modifier = Modifier.weight(1.06f))
@@ -489,6 +489,15 @@ private fun DebugDatabaseCard(state: DashboardState?, strings: UiStrings, modifi
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             InfoRow(strings.success, state?.debugLastReadingAt ?: "-", modifier = Modifier.weight(1f), divider = false)
             InfoRow(strings.error, state?.debugLastErrorAt ?: state?.debugLastError ?: "-", modifier = Modifier.weight(1f), divider = false)
+        }
+        Row(Modifier.fillMaxWidth()) {
+            Spacer(Modifier.weight(1.15f))
+            ActionButton(
+                strings.archiveDatabase,
+                actions::onOpenArchiveDebugDatabase,
+                primary = true,
+                modifier = Modifier.weight(1f)
+            )
         }
     }
 }
@@ -1053,11 +1062,18 @@ private fun DatabaseMaintenanceConfirmBody(
 ) {
     val p = LocalBydPalette.current
     val pending = mqttPending + influxPending
-    Text(strings.dbMaintenanceStopWarning, color = p.text, fontSize = 14.sp, lineHeight = 19.sp, fontWeight = FontWeight.SemiBold)
-    if (pending > 0) {
+    val debugArchive = state.operation == DbMaintenanceOperation.DEBUG_ARCHIVE
+    Text(
+        if (debugArchive) strings.dbMaintenanceDebugStopWarning else strings.dbMaintenanceStopWarning,
+        color = p.text,
+        fontSize = 14.sp,
+        lineHeight = 19.sp,
+        fontWeight = FontWeight.SemiBold
+    )
+    if (!debugArchive && pending > 0) {
         Text(String.format(strings.dbMaintenancePendingTemplate, mqttPending, influxPending), color = p.yellow, fontSize = 14.sp, lineHeight = 19.sp)
     }
-    if (state.operation == DbMaintenanceOperation.ARCHIVE && pending > 0) {
+    if (!debugArchive && pending > 0) {
         Text(strings.dbMaintenanceArchivePendingWarning, color = p.yellow, fontSize = 14.sp, lineHeight = 19.sp)
     }
     Text(String.format(strings.dbMaintenanceConfirmTemplate, operationTitle(strings, state.operation)), color = p.text, fontSize = 14.sp, lineHeight = 19.sp, fontWeight = FontWeight.SemiBold)
@@ -1188,7 +1204,7 @@ private fun StorageTab(
         entries.sortedWith(compareBy<ArchiveStorageEntry> { it.createdAtMs }.thenBy { it.id })
     }
     val job = state?.archiveStorageJobStatus
-    val topCardHeight = 176.dp
+    val topCardHeight = 156.dp
 
     Column(
         modifier = Modifier
@@ -1213,18 +1229,21 @@ private fun StorageTab(
                         overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        UiSizeFormatter.bytes(snapshot?.activeDatabaseSizeBytes ?: state?.databaseSizeBytes ?: 0L, strings),
+                        String.format(
+                            strings.activeDatabaseSizeTemplate,
+                            UiSizeFormatter.bytes(snapshot?.activeDatabaseSizeBytes ?: ((state?.databaseSizeBytes ?: 0L) + (state?.debugDatabaseSizeBytes ?: 0L)), strings),
+                            UiSizeFormatter.bytes(snapshot?.mainDatabaseSizeBytes ?: state?.databaseSizeBytes ?: 0L, strings),
+                            UiSizeFormatter.bytes(snapshot?.debugDatabaseSizeBytes ?: state?.debugDatabaseSizeBytes ?: 0L, strings)
+                        ),
                         color = LocalBydPalette.current.text,
                         fontSize = 14.sp,
                         fontWeight = FontWeight.SemiBold,
                         textAlign = TextAlign.End,
-                        modifier = Modifier.weight(1f),
+                        modifier = Modifier.weight(2.8f),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
                 }
-                Box(Modifier.fillMaxWidth().height(1.dp).background(LocalBydPalette.current.border))
-                ReadOnlyPathField(snapshot?.activeDatabasePath ?: state?.databasePath ?: "-")
             }
             SectionCard(strings.archiveStorageLimit, modifier = Modifier.weight(0.4f).height(topCardHeight)) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1377,6 +1396,7 @@ private fun localizedDbMaintenanceError(strings: UiStrings, error: String): Stri
 private fun operationTitle(strings: UiStrings, operation: DbMaintenanceOperation): String {
     return when (operation) {
         DbMaintenanceOperation.ARCHIVE -> strings.archiveDatabase
+        DbMaintenanceOperation.DEBUG_ARCHIVE -> strings.archiveDebugDatabase
     }
 }
 

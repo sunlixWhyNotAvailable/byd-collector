@@ -24,12 +24,15 @@ data class ArchiveStorageEntry(
 
 data class ArchiveStorageSnapshot(
     val archiveRootPath: String,
-    val activeDatabasePath: String,
-    val activeDatabaseSizeBytes: Long,
+    val mainDatabaseSizeBytes: Long,
+    val debugDatabaseSizeBytes: Long,
     val archiveBytes: Long,
     val archiveLimitBytes: Long,
     val entries: List<ArchiveStorageEntry>
-)
+) {
+    val activeDatabaseSizeBytes: Long
+        get() = mainDatabaseSizeBytes + debugDatabaseSizeBytes
+}
 
 data class ArchiveStorageJobStatus(
     val mode: ArchiveStorageJobMode? = null,

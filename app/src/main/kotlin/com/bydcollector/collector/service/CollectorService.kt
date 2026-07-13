@@ -82,6 +82,7 @@ class CollectorService : Service() {
     private val debugStartExecutor = namedSingleThreadExecutor("byd-debug-start")
     private val maintenanceExecutor = namedSingleThreadExecutor("byd-db-maintenance")
     private val archiveStorageExecutor = namedSingleThreadExecutor("byd-archive-storage")
+    private val tailscaleExecutor = namedSingleThreadExecutor("byd-tailscale")
     private val mainHandler = Handler(Looper.getMainLooper())
     private val mqttExecutorLock = Any()
     private var mqttExecutor: ExecutorService = namedSingleThreadExecutor("byd-mqtt")
@@ -93,7 +94,10 @@ class CollectorService : Service() {
     private val mqttRuntimeActive = AtomicBoolean(false)
     private val mqttOfflineQueued = AtomicBoolean(false)
     private val maintenanceActive = AtomicBoolean(false)
+    @Volatile
+    private var activeMaintenanceOperation: DbMaintenanceOperation? = null
     private val archiveStorageActive = AtomicBoolean(false)
+    private val tailscaleSequenceActive = AtomicBoolean(false)
     private val restoringRuntime = AtomicBoolean(false)
     private var lastStatusHeartbeatAtMs: Long = -STATUS_HEARTBEAT_INTERVAL_MS
     private var lastNotificationText: String? = null
@@ -111,7 +115,7 @@ class CollectorService : Service() {
             lastAttemptAtMs = { settings.tailscaleActivationLastAttemptAtMs() },
             setLastAttemptAtMs = { settings.setTailscaleActivationLastAttemptAtMs(it) },
             isReachable = endpointProbe::isReachable,
-            activate = { TailscaleActivator.activate(applicationContext) }
+            activate = { scheduleTailscaleActivation() }
         )
         vehicleStateNormalizer = VehicleStateNormalizer()
         mqttCoordinator = createMqttCoordinator(PahoMqttClientFacade())
@@ -122,9 +126,12 @@ class CollectorService : Service() {
             context = applicationContext,
             settings = settings,
             storeProvider = { store },
+            debugStoreProvider = { debugStore },
             application = applicationContext as BydCollectorApplication,
-            stopRuntime = { stopRuntimeForMaintenance() },
-            onStoreReopened = { rebuildStoreBackedRuntime(it) }
+            stopRuntime = { stopRuntimeForMaintenance(it) },
+            onStoreReopened = { rebuildStoreBackedRuntime(it) },
+            closeDebugStore = { debugStore.close() },
+            onDebugStoreReopened = { debugStore = it }
         )
         createNotificationChannel()
     }
@@ -142,7 +149,7 @@ class CollectorService : Service() {
         recoverInterruptedMaintenanceIfNeeded(action)
         if (
             maintenanceActive.get() &&
-            action != ACTION_ARCHIVE_DATABASE &&
+            activeMaintenanceOperation == DbMaintenanceOperation.ARCHIVE &&
             action != ACTION_CANCEL_DATABASE_MAINTENANCE
         ) {
             return START_STICKY
@@ -161,7 +168,6 @@ class CollectorService : Service() {
             ACTION_STOP_DEBUG -> {
                 settings.setDebugManuallyStopped(true)
                 settings.setDebugPollingEnabled(false)
-                settings.setDebugAutoStartEnabled(false)
                 reconcileCollection()
             }
             ACTION_RECONCILE_KEEP_ALIVE -> reconcileKeepAliveOnly()
@@ -170,6 +176,7 @@ class CollectorService : Service() {
             ACTION_START_INFLUX_EXPORT -> startInfluxExport(clearManualStop = true)
             ACTION_STOP_INFLUX_EXPORT -> stopInfluxExport(manualStop = true)
             ACTION_ARCHIVE_DATABASE -> startDatabaseMaintenance(DbMaintenanceOperation.ARCHIVE)
+            ACTION_ARCHIVE_DEBUG_DATABASE -> startDatabaseMaintenance(DbMaintenanceOperation.DEBUG_ARCHIVE)
             ACTION_CANCEL_DATABASE_MAINTENANCE -> cancelDatabaseMaintenance()
             ACTION_RECONCILE_ARCHIVE_STORAGE -> {
                 ensureForegroundForChannel("Archive storage")
@@ -190,6 +197,7 @@ class CollectorService : Service() {
         debugStartExecutor.shutdownNow()
         maintenanceExecutor.shutdownNow()
         archiveStorageExecutor.shutdownNow()
+        tailscaleExecutor.shutdownNow()
         shutdownMqttExecutor()
         shutdownInfluxExecutor()
         mainPollingRunning.set(false)
@@ -357,7 +365,7 @@ class CollectorService : Service() {
     }
 
     private fun startDebugIfNeeded(reason: String) {
-        if (maintenanceBlocksRuntimeStart()) return
+        if (maintenanceBlocksRuntimeStart(debugRuntime = true)) return
         if (isDebugPollerRunning()) return
         if (!debugStartInProgress.compareAndSet(false, true)) return
         debugStartExecutor.execute {
@@ -406,7 +414,7 @@ class CollectorService : Service() {
                     if (
                         !settings.isDebugPollingEnabled() ||
                         settings.isDebugManuallyStopped() ||
-                        maintenanceBlocksRuntimeStart() ||
+                        maintenanceBlocksRuntimeStart(debugRuntime = true) ||
                         debugPoller?.isRunning() == true
                     ) {
                         false
@@ -579,7 +587,8 @@ class CollectorService : Service() {
         val mainEnabled: Boolean,
         val debugEnabled: Boolean,
         val mqttEnabled: Boolean,
-        val influxEnabled: Boolean
+        val influxEnabled: Boolean,
+        val debugRunning: Boolean
     )
 
     private fun runtimeSnapshot(): RuntimeSnapshot {
@@ -587,11 +596,19 @@ class CollectorService : Service() {
             mainEnabled = settings.isPollingEnabled(),
             debugEnabled = settings.isDebugPollingEnabled(),
             mqttEnabled = settings.isMqttEnabled(),
-            influxEnabled = settings.isInfluxEnabled()
+            influxEnabled = settings.isInfluxEnabled(),
+            debugRunning = isDebugPollerRunning()
         )
     }
 
-    private fun stopRuntimeForMaintenance() {
+    private fun stopRuntimeForMaintenance(operation: DbMaintenanceOperation) {
+        if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
+            if (detachDebugPoller()?.shutdownAndAwait("debug_database_maintenance", 2_000L) == false) {
+                error("Debug poller did not stop for database maintenance")
+            }
+            debugRunning.set(false)
+            return
+        }
         if (!poller.stopAndJoin(2_000L)) error("Main poller did not stop for database maintenance")
         if (detachDebugPoller()?.shutdownAndAwait("database_maintenance", 2_000L) == false) {
             error("Debug poller did not stop for database maintenance")
@@ -609,7 +626,7 @@ class CollectorService : Service() {
         resetInfluxExecutorForMaintenance()
     }
 
-    private fun restoreRuntimeAfterMaintenance(snapshot: RuntimeSnapshot) {
+    private fun restoreRuntimeAfterMaintenance(operation: DbMaintenanceOperation, snapshot: RuntimeSnapshot) {
         restoringRuntime.set(true)
         try {
             if (settings.isUserShutdownRequested()) {
@@ -618,6 +635,16 @@ class CollectorService : Service() {
                 settings.setMqttEnabled(false)
                 settings.setInfluxEnabled(false)
                 stopServiceAfterUserShutdown()
+                return
+            }
+            if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
+                if (
+                    snapshot.debugRunning &&
+                    settings.isDebugPollingEnabled() &&
+                    !settings.isDebugManuallyStopped()
+                ) {
+                    startDebugIfNeeded(DEBUG_REASON_AUTOSTART)
+                }
                 return
             }
             settings.setPollingEnabled(snapshot.mainEnabled)
@@ -735,6 +762,38 @@ class CollectorService : Service() {
             message = decision.message,
             detail = "channel=$channel host=${endpoint.host} port=${endpoint.port}"
         )
+    }
+
+    private fun scheduleTailscaleActivation(): com.bydcollector.collector.ha.TailscaleActivationResult {
+        if (!tailscaleSequenceActive.compareAndSet(false, true)) {
+            return com.bydcollector.collector.ha.TailscaleActivationResult(false, "tailscale_sequence_already_running")
+        }
+        return try {
+            tailscaleExecutor.execute {
+                try {
+                    TailscaleActivator.runDelayedSequence(
+                        isEnabled = { settings.isTailscaleActivationEnabled() },
+                        sleeper = { Thread.sleep(it) },
+                        activate = { TailscaleActivator.activate(applicationContext) },
+                        minimize = { TailscaleActivator.minimize(applicationContext) },
+                        onEvent = { category, message ->
+                            runCatching { store.recordEvent(category, message) }
+                        }
+                    )
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                } finally {
+                    tailscaleSequenceActive.set(false)
+                }
+            }
+            com.bydcollector.collector.ha.TailscaleActivationResult(true, "tailscale_activation_scheduled")
+        } catch (error: RejectedExecutionException) {
+            tailscaleSequenceActive.set(false)
+            com.bydcollector.collector.ha.TailscaleActivationResult(
+                false,
+                "tailscale_sequence_rejected: ${error.message ?: "no message"}"
+            )
+        }
     }
 
     private fun ensureForegroundForChannel(text: String) {
@@ -976,23 +1035,34 @@ class CollectorService : Service() {
 
     private fun startDatabaseMaintenance(operation: DbMaintenanceOperation) {
         if (!maintenanceActive.compareAndSet(false, true)) return
+        activeMaintenanceOperation = operation
         maintenanceRunningInProcess.set(true)
-        CollectorAutoStart.cancelScheduled(applicationContext)
+        if (operation == DbMaintenanceOperation.ARCHIVE) {
+            CollectorAutoStart.cancelScheduled(applicationContext)
+        }
         val snapshot = runtimeSnapshot()
         ensureForegroundForChannel("Database maintenance")
+        var restoreAfterMaintenance = false
         try {
             maintenanceExecutor.execute {
                 try {
-                    val result = maintenanceCoordinator.run(operation) { restoreRuntimeAfterMaintenance(snapshot) }
+                    val result = maintenanceCoordinator.run(operation) {
+                        restoreAfterMaintenance = true
+                    }
                     if (result.ok && result.archivePath != null) {
                         enqueueArchiveStorageMaintenance(result.archivePath)
                     }
                 } finally {
+                    activeMaintenanceOperation = null
                     maintenanceActive.set(false)
                     maintenanceRunningInProcess.set(false)
+                    if (restoreAfterMaintenance) {
+                        restoreRuntimeAfterMaintenance(operation, snapshot)
+                    }
                 }
             }
         } catch (error: RejectedExecutionException) {
+            activeMaintenanceOperation = null
             maintenanceActive.set(false)
             maintenanceRunningInProcess.set(false)
             store.recordEvent(
@@ -1072,7 +1142,8 @@ class CollectorService : Service() {
     private fun archiveStorageManager(): ArchiveStorageManager {
         return ArchiveStorageManager(
             archiveRoot = File(applicationContext.filesDir, "db_archive"),
-            activeDatabaseFile = store.databaseFile()
+            mainDatabaseFile = store.databaseFile(),
+            debugDatabaseFile = applicationContext.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME)
         )
     }
 
@@ -1080,9 +1151,11 @@ class CollectorService : Service() {
         settings.setArchiveStorageJobStatus(status, synchronous = true)
     }
 
-    private fun maintenanceBlocksRuntimeStart(): Boolean {
+    private fun maintenanceBlocksRuntimeStart(debugRuntime: Boolean = false): Boolean {
         if (restoringRuntime.get()) return false
-        if (maintenanceActive.get()) return true
+        if (maintenanceActive.get()) {
+            return activeMaintenanceOperation != DbMaintenanceOperation.DEBUG_ARCHIVE || debugRuntime
+        }
         if (settings.dbMaintenanceStatus().running) {
             settings.recoverInterruptedDbMaintenanceIfNeeded("runtime_start_guard")
             return false
@@ -1091,7 +1164,7 @@ class CollectorService : Service() {
     }
 
     private fun recoverInterruptedMaintenanceIfNeeded(action: String) {
-        if (action == ACTION_ARCHIVE_DATABASE) return
+        if (action == ACTION_ARCHIVE_DATABASE || action == ACTION_ARCHIVE_DEBUG_DATABASE) return
         if (maintenanceActive.get()) return
         settings.recoverInterruptedDbMaintenanceIfNeeded("service_start:$action")
     }
@@ -1195,6 +1268,7 @@ class CollectorService : Service() {
         val ACTION_START_INFLUX_EXPORT: String = "${BuildConfig.ACTION_PREFIX}.action.START_INFLUX_EXPORT"
         val ACTION_STOP_INFLUX_EXPORT: String = "${BuildConfig.ACTION_PREFIX}.action.STOP_INFLUX_EXPORT"
         val ACTION_ARCHIVE_DATABASE: String = "${BuildConfig.ACTION_PREFIX}.action.ARCHIVE_DATABASE"
+        val ACTION_ARCHIVE_DEBUG_DATABASE: String = "${BuildConfig.ACTION_PREFIX}.action.ARCHIVE_DEBUG_DATABASE"
         val ACTION_CANCEL_DATABASE_MAINTENANCE: String = "${BuildConfig.ACTION_PREFIX}.action.CANCEL_DATABASE_MAINTENANCE"
         val ACTION_RECONCILE_ARCHIVE_STORAGE: String = "${BuildConfig.ACTION_PREFIX}.action.RECONCILE_ARCHIVE_STORAGE"
         val ACTION_DELETE_ARCHIVES: String = "${BuildConfig.ACTION_PREFIX}.action.DELETE_ARCHIVES"
@@ -1257,6 +1331,10 @@ class CollectorService : Service() {
 
         fun archiveDatabaseIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
             action = ACTION_ARCHIVE_DATABASE
+        }
+
+        fun archiveDebugDatabaseIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
+            action = ACTION_ARCHIVE_DEBUG_DATABASE
         }
 
         fun cancelDatabaseMaintenanceIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {

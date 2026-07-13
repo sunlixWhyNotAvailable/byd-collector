@@ -2,6 +2,7 @@ package com.bydcollector.collector.maintenance
 
 import android.content.Context
 import com.bydcollector.collector.BydCollectorApplication
+import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.service.CollectorSettings
 import java.io.File
@@ -14,9 +15,12 @@ class DbMaintenanceCoordinator(
     private val context: Context,
     private val settings: CollectorSettings,
     private val storeProvider: () -> TelemetryStore,
+    private val debugStoreProvider: () -> DirectDebugStore,
     private val application: BydCollectorApplication,
-    private val stopRuntime: () -> Unit,
-    private val onStoreReopened: (TelemetryStore) -> Unit
+    private val stopRuntime: (DbMaintenanceOperation) -> Unit,
+    private val onStoreReopened: (TelemetryStore) -> Unit,
+    private val closeDebugStore: () -> Unit,
+    private val onDebugStoreReopened: (DirectDebugStore) -> Unit
 ) {
     private val running = AtomicBoolean(false)
     private val cancelRequested = AtomicBoolean(false)
@@ -44,7 +48,7 @@ class DbMaintenanceCoordinator(
         var skipRestore = false
         return try {
             publish(operation, 1, cancelAvailable = true)
-            stopRuntime()
+            stopRuntime(operation)
             closeCancelWindowAndCheck(operation)
             publish(operation, 1, cancelAvailable = false)
             val result = archive(operation)
@@ -75,7 +79,12 @@ class DbMaintenanceCoordinator(
         }
     }
 
-    private fun archive(operation: DbMaintenanceOperation): DbMaintenanceResult {
+    private fun archive(operation: DbMaintenanceOperation): DbMaintenanceResult = when (operation) {
+        DbMaintenanceOperation.ARCHIVE -> archiveMain(operation)
+        DbMaintenanceOperation.DEBUG_ARCHIVE -> archiveDebug(operation)
+    }
+
+    private fun archiveMain(operation: DbMaintenanceOperation): DbMaintenanceResult {
         val store = storeProvider()
         val databaseFile = store.databaseFile()
         var reopened = false
@@ -114,6 +123,45 @@ class DbMaintenanceCoordinator(
     private fun reopenAndRebind() {
         val newStore = application.reopenTelemetryStoreForMaintenance()
         onStoreReopened(newStore)
+    }
+
+    private fun archiveDebug(operation: DbMaintenanceOperation): DbMaintenanceResult {
+        val debugStore = debugStoreProvider()
+        val databaseFile = debugStore.databaseFile()
+        var reopened = false
+        debugStore.checkpointForArchive()
+        publish(operation, 2)
+        closeDebugStore()
+        try {
+            publish(operation, 3)
+            val archive = DatabaseArchiveManager.archive(
+                databaseFile = databaseFile,
+                archiveRoot = File(context.filesDir, "db_archive"),
+                timestamp = timestamp()
+            )
+            if (!archive.ok) {
+                if (!databaseFile.exists()) {
+                    throw TerminalArchiveFailure("Debug database archive failed and original database was not restored: ${archive.error ?: "unknown"}")
+                }
+                reopenDebugAndRebind()
+                reopened = true
+                error(archive.error ?: "Debug database archive failed")
+            }
+            publish(operation, 4)
+            val newStore = reopenDebugAndRebind()
+            reopened = true
+            publish(operation, 5)
+            check(newStore.verifyWritableDatabase()) { "New debug database quick_check failed" }
+            return DbMaintenanceResult(true, "Debug database archived", archive.archiveDirectory.absolutePath)
+        } finally {
+            if (!reopened && databaseFile.exists()) {
+                runCatching { reopenDebugAndRebind() }
+            }
+        }
+    }
+
+    private fun reopenDebugAndRebind(): DirectDebugStore {
+        return DirectDebugStore(context).also(onDebugStoreReopened)
     }
 
     private fun checkCancelled(operation: DbMaintenanceOperation) {

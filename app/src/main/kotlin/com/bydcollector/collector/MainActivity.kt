@@ -152,6 +152,11 @@ class MainActivity : ComponentActivity() {
             refresh()
         }
 
+        override fun onOpenArchiveDebugDatabase() {
+            pendingMaintenanceOperation = DbMaintenanceOperation.DEBUG_ARCHIVE
+            refresh()
+        }
+
         override fun onConfirmDatabaseMaintenance() {
             val operation = pendingMaintenanceOperation ?: return
             maintenanceLaunchOperation = operation
@@ -170,7 +175,10 @@ class MainActivity : ComponentActivity() {
                 synchronous = true
             )
             runCatching {
-                CollectorServiceController.archiveDatabase(this@MainActivity)
+                when (operation) {
+                    DbMaintenanceOperation.ARCHIVE -> CollectorServiceController.archiveDatabase(this@MainActivity)
+                    DbMaintenanceOperation.DEBUG_ARCHIVE -> CollectorServiceController.archiveDebugDatabase(this@MainActivity)
+                }
             }.onFailure { error ->
                 settings.setDbMaintenanceStatus(
                     settings.dbMaintenanceStatus().copy(

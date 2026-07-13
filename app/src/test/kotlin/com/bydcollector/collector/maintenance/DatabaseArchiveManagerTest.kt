@@ -71,4 +71,18 @@ class DatabaseArchiveManagerTest {
         assertEquals(emptyList(), result.movedFiles)
         assertTrue(database.exists())
     }
+
+    @Test
+    fun debugDatabaseUsesItsOwnArchivePrefix() {
+        val root = createTempDirectory().toFile()
+        val database = File(root, "bydcollector_debug_round_robin.db").apply { writeText("debug") }
+
+        val result = DatabaseArchiveManager.archive(database, File(root, "archive"), "20260713_120000")
+
+        assertTrue(result.ok, result.error)
+        assertEquals(
+            File(root, "archive/bydcollector_debug_round_robin_20260713_120000"),
+            result.archiveDirectory
+        )
+    }
 }

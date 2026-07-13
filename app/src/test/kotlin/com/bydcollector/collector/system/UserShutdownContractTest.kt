@@ -54,6 +54,10 @@ class UserShutdownContractTest {
         assertTrue(service.contains("KeepAliveConfig(false, false, false, false)"))
         assertTrue(autoStart.contains("fun cancelScheduled(context: Context)"))
         assertFalse(service.contains("settings.setAutoStartEnabled(false)"))
+        assertFalse(service.contains("settings.setDebugAutoStartEnabled(false)"))
+        assertFalse(service.contains("settings.setMqttAutoStartEnabled(false)"))
+        assertFalse(service.contains("settings.setInfluxAutoStartEnabled(false)"))
+        assertTrue(autoStart.contains("syncDebugAutoStart(settings)"))
     }
 
     @Test
