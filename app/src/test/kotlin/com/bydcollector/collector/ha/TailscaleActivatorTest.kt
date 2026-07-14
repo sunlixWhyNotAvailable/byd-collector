@@ -30,6 +30,7 @@ class TailscaleActivatorTest {
     @Test
     fun delayedSequenceLaunchesThenMinimizes() {
         val calls = mutableListOf<String>()
+        var delayMessage = ""
 
         val result = TailscaleActivator.runDelayedSequence(
             isEnabled = { true },
@@ -42,21 +43,25 @@ class TailscaleActivatorTest {
                 calls += "home"
                 TailscaleActivationResult(true, "minimized")
             },
-            onEvent = { category, _ -> calls += category }
+            onEvent = { category, message ->
+                calls += category
+                if (category == "tailscale_launch_delayed") delayMessage = message
+            }
         )
 
         assertEquals(
             listOf(
                 "tailscale_launch_delayed",
-                "sleep:5000",
+                "sleep:10000",
                 "launch",
                 "tailscale_launch_succeeded",
-                "sleep:5000",
+                "sleep:10000",
                 "home",
                 "tailscale_minimize_succeeded"
             ),
             calls
         )
+        assertEquals("Tailscale launch delayed by 10 seconds", delayMessage)
         assertTrue(result.launched)
         assertTrue(result.minimized)
     }

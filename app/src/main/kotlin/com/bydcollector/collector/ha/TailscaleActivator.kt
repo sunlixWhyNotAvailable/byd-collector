@@ -5,8 +5,8 @@ import com.bydcollector.collector.adb.AdbLocalClient
 import java.io.File
 
 object TailscaleActivator {
-    const val LAUNCH_DELAY_MS = 5_000L
-    const val MINIMIZE_DELAY_MS = 5_000L
+    const val LAUNCH_DELAY_MS = 10_000L
+    const val MINIMIZE_DELAY_MS = 10_000L
 
     fun packageCandidates(): List<String> = listOf("com.tailscale.ipn")
 
@@ -51,7 +51,10 @@ object TailscaleActivator {
         minimize: () -> TailscaleActivationResult,
         onEvent: (String, String) -> Unit
     ): TailscaleSequenceResult {
-        onEvent("tailscale_launch_delayed", "Tailscale launch delayed by 5 seconds")
+        onEvent(
+            "tailscale_launch_delayed",
+            "Tailscale launch delayed by ${LAUNCH_DELAY_MS / 1_000} seconds"
+        )
         sleeper(LAUNCH_DELAY_MS)
         if (!isEnabled()) {
             onEvent("tailscale_launch_cancelled", "Tailscale activation disabled before launch")
