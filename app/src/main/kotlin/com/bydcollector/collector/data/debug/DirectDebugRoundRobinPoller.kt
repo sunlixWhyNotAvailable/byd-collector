@@ -1,6 +1,8 @@
 package com.bydcollector.collector.data.debug
 
 import com.bydcollector.collector.data.direct.DirectHelperReadResult
+import com.bydcollector.collector.data.direct.DirectBatchDiagnostics
+import com.bydcollector.collector.data.direct.DirectHelperBatchResult
 import com.bydcollector.collector.data.direct.DirectVehicleHelper
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
@@ -99,16 +101,28 @@ class DirectDebugRoundRobinPoller(
         val startedElapsed = clock.elapsedRealtimeMs()
         val batch = cursor.nextBatch(batchSize)
         cycleNumber += 1
-        val reads = batch.map { parameter ->
-            val result = runCatching { helper.read(parameter.toDirectFidEntry()) }
-                .getOrElse { error ->
-                    DirectHelperReadResult(
-                        status = -950,
-                        raw = null,
-                        error = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
-                    )
-                }
-            parameter to result
+        val entries = batch.map { it.toDirectFidEntry() }
+        val batchResult = runCatching { helper.readBatch(entries) }.getOrElse { error ->
+            val message = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+            DirectHelperBatchResult(
+                results = List(batch.size) { DirectHelperReadResult(-950, null, message) },
+                diagnostics = DirectBatchDiagnostics(
+                    mode = "poller_error",
+                    nativeAvailable = false,
+                    nativeGroupCount = 0,
+                    fallbackGroupCount = 0,
+                    fallbackReadCount = 0,
+                    groupFailureCount = 0,
+                    helperElapsedMs = 0,
+                    returnedCount = 0,
+                    error = message
+                )
+            )
+        }
+        val reads = batch.mapIndexed { index, parameter ->
+            parameter to batchResult.results.getOrElse(index) {
+                DirectHelperReadResult(-951, null, "batch result missing at index $index")
+            }
         }
         return store.recordCycle(
             sessionId = sessionId,
@@ -117,7 +131,7 @@ class DirectDebugRoundRobinPoller(
             reads = reads,
             startedAt = startedAt,
             elapsedMs = clock.elapsedRealtimeMs() - startedElapsed
-        )
+        ).copy(batchDiagnostics = batchResult.diagnostics)
     }
 
     companion object {

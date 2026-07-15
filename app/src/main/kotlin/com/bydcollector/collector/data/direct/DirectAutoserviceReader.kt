@@ -10,9 +10,11 @@ class DirectAutoserviceReader(
     private val entries: List<DirectFidEntry> = DirectFidRegistry.entries
 ) {
     fun readSnapshot(): DirectAutoserviceSnapshot {
-        //reads every configured entry once so partial autoservice failures can be stored with the poll
-        val fields = entries.map { entry ->
-            val result = helper.read(entry)
+        val batch = helper.readBatch(entries)
+        val fields = entries.mapIndexed { index, entry ->
+            val result = batch.results.getOrElse(index) {
+                DirectHelperReadResult(-913, null, "batch result missing at index $index")
+            }
             val raw = result.raw
             DirectAutoserviceField(
                 entry = entry,
@@ -22,12 +24,13 @@ class DirectAutoserviceReader(
                 error = result.error
             )
         }
-        return DirectAutoserviceSnapshot(fields)
+        return DirectAutoserviceSnapshot(fields, batch.diagnostics)
     }
 }
 
 data class DirectAutoserviceSnapshot(
-    val fields: List<DirectAutoserviceField>
+    val fields: List<DirectAutoserviceField>,
+    val batchDiagnostics: DirectBatchDiagnostics
 ) {
     private val errorFields: List<DirectAutoserviceField> = fields
         .filter { it.status != 0 || it.raw == null }
@@ -66,6 +69,17 @@ data class DirectAutoserviceSnapshot(
         json.put("field_count", fields.size)
         json.put("reading_count", readings.size)
         json.put("error_count", errors.size)
+        json.put("batch", JSONObject().apply {
+            put("mode", batchDiagnostics.mode)
+            put("native_available", batchDiagnostics.nativeAvailable)
+            put("native_groups", batchDiagnostics.nativeGroupCount)
+            put("fallback_groups", batchDiagnostics.fallbackGroupCount)
+            put("fallback_reads", batchDiagnostics.fallbackReadCount)
+            put("group_failures", batchDiagnostics.groupFailureCount)
+            put("helper_elapsed_ms", batchDiagnostics.helperElapsedMs)
+            put("returned_count", batchDiagnostics.returnedCount)
+            if (batchDiagnostics.error != null) put("error", batchDiagnostics.error)
+        })
         if (includeFields) {
             //full field json is diagnostic-only because storing every failed field can get large
             json.put("fields", JSONArray().also { array ->

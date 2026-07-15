@@ -40,6 +40,7 @@ class PollPersistenceCoordinator(
 ) : PollCycleRunner {
     private var lastPersistedFailureKey: String? = null
     private var lastPersistedFailureAtMs: Long = Long.MIN_VALUE
+    private var lastDiagnosticKey: String? = null
 
     override fun pollOnce(sessionId: Long): PollCycleResult {
         val parameters = store.getActiveCatalogParameters()
@@ -67,6 +68,7 @@ class PollPersistenceCoordinator(
                         ),
                         parameters = parameters
                     )
+                    persistDiagnosticTransition(result)
                     try {
                         successfulPollObserver?.onSuccessfulPoll(sessionId, pollId, timestamp, result.readings)
                     } catch (error: RuntimeException) {
@@ -121,6 +123,21 @@ class PollPersistenceCoordinator(
                 logError("Failed to record database write failure", eventError)
             }
             PollCycleResult(null, ok = false, category = "db_write_error", elapsedMs = 0, requestCount = DIRECT_REQUEST_COUNT)
+        }
+    }
+
+    private fun persistDiagnosticTransition(result: TelemetryReadResult.Success) {
+        val key = result.diagnosticKey ?: return
+        if (key == lastDiagnosticKey) return
+        try {
+            store.recordEvent(
+                "direct_read_mode",
+                "Direct telemetry read mode changed",
+                result.diagnosticMessage
+            )
+            lastDiagnosticKey = key
+        } catch (error: RuntimeException) {
+            logError("Failed to record direct read mode", error)
         }
     }
 

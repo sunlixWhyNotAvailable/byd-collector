@@ -11,7 +11,9 @@ sealed class TelemetryReadResult {
         override val elapsedMs: Long,
         val readings: List<PollReading>,
         val warningCategory: String? = null,
-        val warningMessage: String? = null
+        val warningMessage: String? = null,
+        val diagnosticKey: String? = null,
+        val diagnosticMessage: String? = null
     ) : TelemetryReadResult()
 
     data class Failure(

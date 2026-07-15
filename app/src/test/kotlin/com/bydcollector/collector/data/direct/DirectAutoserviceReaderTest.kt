@@ -17,21 +17,26 @@ class DirectAutoserviceReaderTest {
             }
         }
         val helper = object : DirectVehicleHelper {
-            val readKeys = mutableListOf<String>()
+            var batchCalls = 0
             override fun isAlive(): Boolean = true
-            override fun read(entry: DirectFidEntry): DirectHelperReadResult {
-                readKeys += entry.key
-                return results.getValue(entry.key)
+            override fun read(entry: DirectFidEntry): DirectHelperReadResult = error("scalar read must not be used")
+            override fun readBatch(entries: List<DirectFidEntry>): DirectHelperBatchResult {
+                batchCalls++
+                return DirectHelperBatchResult(
+                    results = entries.map { results.getValue(it.key) },
+                    diagnostics = testDiagnostics(entries.size)
+                )
             }
         }
 
         val snapshot = DirectAutoserviceReader(helper).readSnapshot()
 
-        assertEquals(DirectFidRegistry.entries.map { it.key }, helper.readKeys)
+        assertEquals(1, helper.batchCalls)
         assertEquals("81.5", snapshot.readings.first { it.rawKey == "charging_charge_current" }.descValue)
         assertEquals("858", snapshot.readings.first { it.rawKey == "statistic_max_charge_power_allow" }.descValue)
         assertTrue(snapshot.errors.any { it.startsWith("engine_front_motor_speed:status=-10013") })
         assertTrue(snapshot.toJson().contains("\"source\":\"direct_autoservice_helper\""))
+        assertTrue(snapshot.toJson().contains("\"mode\":\"native\""))
     }
 
     @Test
@@ -53,4 +58,30 @@ class DirectAutoserviceReaderTest {
         assertFalse(compact.contains("\"fields\""))
         assertTrue(snapshot.errorSummary(maxSamples = 3).contains("omitted=17"))
     }
+
+    @Test
+    fun diagnosticStateKeyIgnoresPerCycleGroupCounts() {
+        val first = testDiagnostics(77)
+        val rotatedDebugCycle = first.copy(
+            nativeGroupCount = 14,
+            fallbackGroupCount = 3,
+            fallbackReadCount = 25,
+            groupFailureCount = 3,
+            returnedCount = 500,
+            error = "different rotating group failure"
+        )
+
+        assertEquals(first.stateKey, rotatedDebugCycle.stateKey)
+    }
+
+    private fun testDiagnostics(count: Int) = DirectBatchDiagnostics(
+        mode = "native",
+        nativeAvailable = true,
+        nativeGroupCount = 16,
+        fallbackGroupCount = 0,
+        fallbackReadCount = 0,
+        groupFailureCount = 0,
+        helperElapsedMs = 2,
+        returnedCount = count
+    )
 }

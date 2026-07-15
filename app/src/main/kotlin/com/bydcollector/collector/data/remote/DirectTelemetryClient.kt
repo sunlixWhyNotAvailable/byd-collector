@@ -55,7 +55,9 @@ class DirectTelemetryClient(
                 elapsedMs = clock.elapsedRealtimeMs() - startedAt,
                 readings = snapshot.readings,
                 warningCategory = warningMessage?.let { "autoservice_partial_failure" },
-                warningMessage = warningMessage
+                warningMessage = warningMessage,
+                diagnosticKey = snapshot.batchDiagnostics.stateKey,
+                diagnosticMessage = snapshot.batchDiagnostics.summary()
             )
         }
     }

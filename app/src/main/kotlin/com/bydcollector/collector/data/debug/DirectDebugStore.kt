@@ -4,6 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.util.Log
 import com.bydcollector.collector.data.direct.DirectHelperReadResult
+import com.bydcollector.collector.data.direct.DirectBatchDiagnostics
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import java.io.Closeable
@@ -46,7 +47,8 @@ data class DirectDebugCycleSummary(
     val okCount: Int,
     val changedCount: Int,
     val errorCount: Int,
-    val elapsedMs: Long
+    val elapsedMs: Long,
+    val batchDiagnostics: DirectBatchDiagnostics? = null
 )
 
 data class DirectDebugStatus(

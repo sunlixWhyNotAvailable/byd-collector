@@ -89,7 +89,7 @@ object DirectBridgeManager {
             "rm -f ${CollectorHelperProtocol.LOCK_PATH}; "
         return cleanup +
             "CLASSPATH=$quotedApk setsid app_process /system/bin --nice-name=${CollectorHelperProtocol.PROCESS_NAME} " +
-            "${CollectorHelperProtocol.HELPER_CLASS} $appUid </dev/null >${CollectorHelperProtocol.LOG_PATH} 2>&1 & " +
+            "${CollectorHelperProtocol.HELPER_CLASS} $appUid $quotedApk </dev/null >${CollectorHelperProtocol.LOG_PATH} 2>&1 & " +
             "for i in 1 2 3; do service list 2>/dev/null | grep -q ${CollectorHelperProtocol.SERVICE_NAME} && break; sleep 1; done"
     }
 

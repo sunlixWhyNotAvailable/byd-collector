@@ -397,12 +397,24 @@ class CollectorService : Service() {
                         "reason=$reason requested=$requestedBatchSize effective=$batchSize"
                     )
                 }
+                var lastDebugReadModeKey: String? = null
                 val nextPoller = DirectDebugRoundRobinPoller(
                     parameters = parameters,
                     helper = helper,
                     store = debugStore,
                     onCycle = { summary ->
                         debugRunning.set(true)
+                        summary.batchDiagnostics?.let { diagnostics ->
+                            if (diagnostics.stateKey != lastDebugReadModeKey) {
+                                runCatching {
+                                    store.recordEvent(
+                                        "debug_direct_read_mode",
+                                        "Debug telemetry read mode changed",
+                                        diagnostics.summary()
+                                    )
+                                }.onSuccess { lastDebugReadModeKey = diagnostics.stateKey }
+                            }
+                        }
                         if (summary.errorCount > 0 && summary.okCount == 0) {
                             updateNotification("Polling error: debug helper returned errors")
                         } else {

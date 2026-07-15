@@ -86,6 +86,38 @@ class PollPersistenceCoordinatorTest {
         )
     }
 
+    @Test
+    fun readModeDiagnosticIsRecordedOnlyWhenStateChanges() {
+        val store = FakePollStorage()
+        val coordinator = PollPersistenceCoordinator(
+            store = store,
+            client = FakeTelemetryClient(
+                TelemetryReadResult.Success(
+                    rawBody = "{}",
+                    elapsedMs = 12,
+                    readings = listOf(PollReading(rawKey = "SOC", rawValue = "72")),
+                    diagnosticKey = "native|true|16|0|0|0|",
+                    diagnosticMessage = "mode=native native_groups=16 helper_elapsed_ms=2 returned=77"
+                )
+            ),
+            clock = FakeClock(now = "2026-07-15T10:00:00Z")
+        )
+
+        coordinator.pollOnce(sessionId = 7L)
+        coordinator.pollOnce(sessionId = 7L)
+
+        assertEquals(
+            listOf(
+                FakeEvent(
+                    category = "direct_read_mode",
+                    message = "Direct telemetry read mode changed",
+                    detail = "mode=native native_groups=16 helper_elapsed_ms=2 returned=77"
+                )
+            ),
+            store.events
+        )
+    }
+
     private class FakePollStorage : PollStorage {
         val actions = mutableListOf<String>()
         val events = mutableListOf<FakeEvent>()

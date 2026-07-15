@@ -11,15 +11,16 @@
 
 ## Current Features
 
-- direct local vehicle telemetry collection through Android local ADB and a narrow app_process helper
+- direct local vehicle telemetry collection through Android local ADB and a protocol-versioned app_process helper with an APK-owned read-only address whitelist
 - SQLite storage for raw poll values, collection sessions, normalized current state, history, MQTT state, and diagnostics
-- curated main polling set for useful vehicle parameters
-- separate debug round-robin polling for research parameters
+- grouped native int/float polling for the curated main set, with ordered results and in-helper scalar fallback
+- grouped native debug round-robin polling for research parameters, on the same 500 ms cadence and fallback contract
 - normalized vehicle state for SOC, charging, battery, doors, tires, climate, speed, odometer, radar distance sensors and related fields
 - Home Assistant MQTT Discovery and live-state publishing
 - `InfluxDB v1` export for historical telemetry
 - main and debug round-robin database archive with shared storage retention
 - automatic delayed Tailscale app start and background return
+- transition-only diagnostics for native, mixed-fallback, and scalar-fallback read modes
 
 ## Installation
 

@@ -65,6 +65,8 @@ class DirectDebugRoundRobinPollerTest {
         assertTrue(source.contains("executor.awaitTermination(timeoutMs, TimeUnit.MILLISECONDS)"))
         assertTrue(source.contains("fun shutdown(reason: String = \"shutdown\")"))
         assertTrue(source.contains("shutdownAndAwait(reason, 0L)"))
+        assertTrue(source.contains("helper.readBatch(entries)"))
+        assertTrue(!source.contains("helper.read(parameter.toDirectFidEntry())"))
     }
 
     @Test
