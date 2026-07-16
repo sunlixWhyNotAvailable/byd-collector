@@ -1344,7 +1344,7 @@ private fun ArchiveEntryRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .height(46.dp),
+            .height(48.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp)
     ) {

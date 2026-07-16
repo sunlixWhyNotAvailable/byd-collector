@@ -346,10 +346,17 @@ fun BydSwitch(
         checked -> p.accent
         else -> p.switchOff
     }
+    val thumbSize by animateDpAsState(
+        targetValue = when {
+            visuallyPending -> 22.dp
+            visualChecked -> 25.dp
+            else -> 19.dp
+        },
+        animationSpec = tween(durationMillis = 120)
+    )
     val thumbOffset by animateDpAsState(
         targetValue = when {
-            pending -> 12.dp
-            pendingState != null -> 12.dp
+            visuallyPending -> 14.dp
             visualChecked -> 25.dp
             else -> 0.dp
         },
@@ -372,7 +379,7 @@ fun BydSwitch(
         Box(
             modifier = Modifier
                 .padding(start = thumbOffset)
-                .size(25.dp)
+                .size(thumbSize)
                 .clip(PillShape)
                 .background(if (visualChecked || visuallyPending) p.switchThumbOn else p.switchThumbOff)
         )

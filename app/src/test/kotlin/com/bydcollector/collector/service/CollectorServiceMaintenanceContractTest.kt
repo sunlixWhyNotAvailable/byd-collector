@@ -172,6 +172,8 @@ class CollectorServiceMaintenanceContractTest {
     fun debugArchiveStopsAndRestoresOnlyRoundRobinRuntime() {
         val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
         val coordinator = sourceFile("com/bydcollector/collector/maintenance/DbMaintenanceCoordinator.kt").readText()
+        val run = coordinator.substringAfter("fun run(").substringBefore("private fun archive")
+        val archiveDebug = coordinator.substringAfter("private fun archiveDebug").substringBefore("private fun reopenDebugAndRebind")
         val stop = service.substringAfter("private fun stopRuntimeForMaintenance").substringBefore("private fun restoreRuntimeAfterMaintenance")
         val debugBranch = stop.substringAfter("if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE)").substringBefore("if (!poller.stopAndJoin")
 
@@ -187,6 +189,32 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(service.contains("maintenanceBlocksRuntimeStart(debugRuntime = true)"))
         assertTrue(service.contains("activeMaintenanceOperation != DbMaintenanceOperation.DEBUG_ARCHIVE || debugRuntime"))
         assertInOrder(service, "maintenanceActive.set(false)", "if (restoreAfterMaintenance)")
+        assertInOrder(
+            "$run\n$archiveDebug",
+            "stopRuntime(operation)",
+            "debugStore.checkpointForArchive()",
+            "closeDebugStore()",
+            "val archive = DatabaseArchiveManager.archive(",
+            "val newStore = reopenDebugAndRebind()",
+            "check(newStore.verifyWritableDatabase())"
+        )
+    }
+
+    @Test
+    fun mainArchiveStopsCheckpointsClosesArchivesReopensAndQuickChecksInOrder() {
+        val coordinator = sourceFile("com/bydcollector/collector/maintenance/DbMaintenanceCoordinator.kt").readText()
+        val run = coordinator.substringAfter("fun run(").substringBefore("private fun archive")
+        val archiveMain = coordinator.substringAfter("private fun archiveMain").substringBefore("private fun reopenAndRebind")
+
+        assertInOrder(
+            "$run\n$archiveMain",
+            "stopRuntime(operation)",
+            "store.checkpointForArchive()",
+            "application.closeTelemetryStoreForMaintenance()",
+            "val archive = DatabaseArchiveManager.archive(",
+            "val newStore = application.reopenTelemetryStoreForMaintenance()",
+            "check(newStore.verifyWritableDatabase())"
+        )
     }
 
     @Test
@@ -227,11 +255,17 @@ class CollectorServiceMaintenanceContractTest {
         ).firstOrNull { it.isFile } ?: error("Missing source file: $path")
     }
 
-    private fun assertInOrder(source: String, first: String, second: String) {
-        val firstIndex = source.indexOf(first)
-        val secondIndex = source.indexOf(second)
-        assertTrue(firstIndex >= 0, "Missing first token: $first")
-        assertTrue(secondIndex >= 0, "Missing second token: $second")
-        assertTrue(firstIndex < secondIndex, "Expected `$first` before `$second`")
+    private fun assertInOrder(source: String, vararg tokens: String) {
+        var previousIndex = -1
+        var previousToken: String? = null
+        for (token in tokens) {
+            val index = source.indexOf(token, previousIndex + 1)
+            assertTrue(index >= 0, "Missing token: $token")
+            if (previousToken != null) {
+                assertTrue(index > previousIndex, "Expected `$token` after `$previousToken`")
+            }
+            previousIndex = index
+            previousToken = token
+        }
     }
 }

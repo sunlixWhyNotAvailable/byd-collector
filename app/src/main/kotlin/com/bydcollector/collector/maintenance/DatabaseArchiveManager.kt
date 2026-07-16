@@ -2,7 +2,11 @@ package com.bydcollector.collector.maintenance
 
 import java.io.File
 
-object DatabaseArchiveManager {
+/**
+ * Moves a checkpointed, closed SQLite database file set into an archive directory.
+ * [DbMaintenanceCoordinator] owns the lifecycle; callers must checkpoint and close the database first.
+ */
+internal object DatabaseArchiveManager {
     data class ArchiveResult(
         val ok: Boolean,
         val archiveDirectory: File,
@@ -50,9 +54,17 @@ object DatabaseArchiveManager {
         return ArchiveResult(true, archiveDirectory, movedFiles.toList())
     }
 
-    private fun rollback(databaseFile: File, movedFiles: List<File>): Boolean {
-        return movedFiles.asReversed().all { moved ->
-            moved.renameTo(File(databaseFile.parentFile, moved.name))
+    internal fun rollback(
+        databaseFile: File,
+        movedFiles: List<File>,
+        moveFile: (File, File) -> Boolean = { source, target -> source.renameTo(target) }
+    ): Boolean {
+        var rollbackOk = true
+        for (moved in movedFiles.asReversed()) {
+            if (!moveFile(moved, File(databaseFile.parentFile, moved.name))) {
+                rollbackOk = false
+            }
         }
+        return rollbackOk
     }
 }

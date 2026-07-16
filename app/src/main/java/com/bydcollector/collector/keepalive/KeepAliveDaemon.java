@@ -12,10 +12,8 @@ import java.util.concurrent.TimeUnit;
 public final class KeepAliveDaemon {
     private static final String PACKAGE_NAME = "com.bydcollector.collector";
     private static final String USER_SHUTDOWN_COMMAND = "settings get global bydcollector_user_shutdown";
-    private static final String START_COLLECTOR_SERVICE_COMMAND =
-            "am start-foreground-service -a com.bydcollector.collector.action.START -n com.bydcollector.collector/.service.CollectorService";
     private static final String RECOVER_COLLECTOR_COMMAND =
-            "am broadcast -a com.bydcollector.collector.action.KEEP_ALIVE_RECOVERY " +
+            "am broadcast --include-stopped-packages -a com.bydcollector.collector.action.KEEP_ALIVE_RECOVERY " +
                     "-n com.bydcollector.collector/com.bydcollector.collector.system.KeepAliveRecoveryReceiver";
     //limits the shell delegate to fixed maintenance commands instead of accepting arbitrary app input
     private static final String[] ALLOWED_COMMANDS = new String[]{
@@ -32,7 +30,6 @@ public final class KeepAliveDaemon {
             "dumpsys power | grep mWakefulness",
             "pidof com.bydcollector.collector",
             "dumpsys activity services com.bydcollector.collector/.service.CollectorService",
-            START_COLLECTOR_SERVICE_COMMAND,
             RECOVER_COLLECTOR_COMMAND
     };
 
@@ -120,17 +117,15 @@ public final class KeepAliveDaemon {
             log("collector_recovery_blocked_user_shutdown");
             return;
         }
-        ShellResult service = run("dumpsys activity services com.bydcollector.collector/.service.CollectorService", 5_000L);
-        if (service.ok && service.output.contains("com.bydcollector.collector/.service.CollectorService")) {
-            log("collector_service_alive");
-            return;
-        }
+        ShellResult process = run("pidof " + PACKAGE_NAME, 5_000L);
+        log(process.ok && !process.output.isEmpty() ? "collector_process_present" : "collector_process_missing");
 
-        ShellResult directStart = run(START_COLLECTOR_SERVICE_COMMAND, 10_000L);
-        log("collector_service_direct_start_requested ok=" + directStart.ok + " elapsed_ms=" + directStart.elapsedMs + " output=" + sanitize(directStart.output));
-        if (!directStart.ok) {
-            runAndLog("collector_service_recovery_broadcast_requested", RECOVER_COLLECTOR_COMMAND);
-        }
+        ShellResult service = run("dumpsys activity services com.bydcollector.collector/.service.CollectorService", 5_000L);
+        log(service.ok && service.output.contains("com.bydcollector.collector/.service.CollectorService")
+                ? "collector_service_record_present"
+                : "collector_service_record_missing");
+
+        runAndLog("collector_service_recovery_broadcast_requested", RECOVER_COLLECTOR_COMMAND);
     }
 
     private static void runAndLog(String event, String command) {

@@ -85,4 +85,30 @@ class DatabaseArchiveManagerTest {
             result.archiveDirectory
         )
     }
+
+    @Test
+    fun rollbackAttemptsEveryMovedFileAfterRestoreFailure() {
+        val database = File("active/bydcollector_telemetry.db")
+        val movedFiles = listOf(
+            File("archive/bydcollector_telemetry.db"),
+            File("archive/bydcollector_telemetry.db-wal"),
+            File("archive/bydcollector_telemetry.db-shm")
+        )
+        val attempts = mutableListOf<String>()
+
+        val rollbackOk = DatabaseArchiveManager.rollback(database, movedFiles) { source, _ ->
+            attempts += source.name
+            source.name != "bydcollector_telemetry.db-wal"
+        }
+
+        assertFalse(rollbackOk)
+        assertEquals(
+            listOf(
+                "bydcollector_telemetry.db-shm",
+                "bydcollector_telemetry.db-wal",
+                "bydcollector_telemetry.db"
+            ),
+            attempts
+        )
+    }
 }

@@ -19,6 +19,7 @@
 - Home Assistant MQTT Discovery and live-state publishing
 - `InfluxDB v1` export for historical telemetry
 - main and debug round-robin database archive with shared storage retention
+- shell-side keep-alive recovery with an explicit Shutdown gate and idempotent service reconcile
 - automatic delayed Tailscale app start and background return
 - transition-only diagnostics for native, mixed-fallback, and scalar-fallback read modes
 
