@@ -4,7 +4,6 @@ import com.bydcollector.collector.data.local.CollectorEvent
 import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.ArchiveStorageSnapshot
 import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
-import com.bydcollector.collector.system.RequiredAccessRow
 
 data class DashboardState(
     val running: Boolean,
@@ -94,8 +93,8 @@ data class DashboardState(
     val influxExportedRowsTotal: Long,
     val normalizedCurrentCount: Long,
     val normalizedHistoryCount: Long,
-    val requiredAccessRows: List<RequiredAccessRow>,
-    val directBridgeStatus: String?,
+    val permissionsGranted: Boolean,
+    val adbAuthorized: Boolean,
     val vehicleKpis: VehicleKpis,
     val recentEvents: List<CollectorEvent>
 )

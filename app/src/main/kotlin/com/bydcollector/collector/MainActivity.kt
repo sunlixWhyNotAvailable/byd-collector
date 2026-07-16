@@ -14,6 +14,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.bydcollector.collector.adb.AdbAuthorizationManager
+import com.bydcollector.collector.adb.AccessCheckMode
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
 import com.bydcollector.collector.influx.InfluxActionResult
@@ -106,6 +107,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onStartMain() {
             refreshStoreBackedState()
+            requestAccessCheck("start_main", AccessCheckMode.NORMAL)
             settings.setMainManuallyStopped(false)
             settings.setPollingEnabled(true)
             CollectorServiceController.start(this@MainActivity)
@@ -227,6 +229,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onStartDebug() {
             refreshStoreBackedState()
+            requestAccessCheck("start_debug", AccessCheckMode.NORMAL)
             settings.setDebugBatchSize(debugBatchText.toIntOrNull()?.coerceAtLeast(1) ?: 1)
             settings.setDebugManuallyStopped(false)
             settings.setDebugPollingEnabled(true)
@@ -262,6 +265,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onStartMqtt() {
             refreshStoreBackedState()
+            requestAccessCheck("start_mqtt", AccessCheckMode.NORMAL)
             saveMqttDraft()
             settings.setMqttManuallyStopped(false)
             settings.setMqttEnabled(true)
@@ -301,6 +305,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onStartInflux() {
             refreshStoreBackedState()
+            requestAccessCheck("start_influx", AccessCheckMode.NORMAL)
             saveInfluxDraft()
             settings.setInfluxManuallyStopped(false)
             settings.setInfluxEnabled(true)
@@ -601,8 +606,8 @@ class MainActivity : ComponentActivity() {
             startupAdbSelfCheckPosted = true
             scheduleAdbSelfCheck(
                 source = "after_background",
-                delayMs = DELAYED_ADB_AUTH_AFTER_BACKGROUND_MS,
-                allowAutoPrompt = true
+                delayMs = STARTUP_ADB_SELF_CHECK_DELAY_MS,
+                mode = AccessCheckMode.COLD_START
             )
             return true
         }
@@ -715,7 +720,7 @@ class MainActivity : ComponentActivity() {
             "Starting local ADB RSA authorization request",
             "source=$source"
         )
-        scheduleAdbAuthorization(source = source, delayMs = 0L)
+        requestAccessCheck(source, AccessCheckMode.FORCE)
     }
 
     private fun maybeRunStartupAdbSelfCheck(source: String) {
@@ -724,35 +729,33 @@ class MainActivity : ComponentActivity() {
         scheduleAdbSelfCheck(
             source = source,
             delayMs = STARTUP_ADB_SELF_CHECK_DELAY_MS,
-            allowAutoPrompt = true
+            mode = AccessCheckMode.COLD_START
         )
     }
 
-    private fun scheduleAdbAuthorization(source: String, delayMs: Long) {
-        handler.postDelayed({
-            currentStore().recordEvent(
-                "adb_authorization_delayed",
-                "Starting delayed ADB authorization",
-                "source=$source"
-            )
-            AdbAuthorizationManager.requestAuthorization(applicationContext, currentStore())
-        }, delayMs)
-    }
-
-    private fun scheduleAdbSelfCheck(source: String, delayMs: Long, allowAutoPrompt: Boolean) {
+    private fun scheduleAdbSelfCheck(source: String, delayMs: Long, mode: AccessCheckMode) {
         handler.postDelayed({
             currentStore().recordEvent(
                 "startup_adb_self_check_started",
                 "Starting startup ADB authorization self-check",
-                "source=$source allow_auto_prompt=$allowAutoPrompt"
+                "source=$source mode=${mode.name.lowercase()}"
             )
-            AdbAuthorizationManager.selfCheck(
-                context = applicationContext,
-                store = currentStore(),
-                allowAutoPrompt = allowAutoPrompt,
-                source = source
-            )
+            requestAccessCheck(source, mode)
         }, delayMs)
+    }
+
+    private fun requestAccessCheck(source: String, mode: AccessCheckMode) {
+        AdbAuthorizationManager.request(
+            context = applicationContext,
+            store = currentStore(),
+            source = source,
+            mode = mode,
+            onComplete = {
+                handler.post {
+                    if (!destroyed) refresh()
+                }
+            }
+        )
     }
 
     private fun startRuntimeUpdateAutoCheck() {
@@ -985,6 +988,7 @@ class MainActivity : ComponentActivity() {
 
     private fun startDiagnostics(source: String) {
         refreshStoreBackedState()
+        requestAccessCheck("start_$source", AccessCheckMode.NORMAL)
         try {
             val dir = DiagnosticLogRecorder.start(applicationContext)
             currentStore().recordEvent("log_recording_started", "Diagnostic log recording started", "source=$source path=${dir.absolutePath}")
@@ -1009,8 +1013,7 @@ class MainActivity : ComponentActivity() {
         private const val STARTUP_SETUP_PREFS = "startup_setup"
         private const val KEY_BACKGROUND_SETTINGS_VERSION = "background_settings_version"
         private const val KEY_BACKGROUND_SETTINGS_PENDING_RETURN = "background_settings_pending_return"
-        private const val DELAYED_ADB_AUTH_AFTER_BACKGROUND_MS = 2_500L
-        private const val STARTUP_ADB_SELF_CHECK_DELAY_MS = 900L
+        private const val STARTUP_ADB_SELF_CHECK_DELAY_MS = 600L
         private const val DASHBOARD_REFRESH_INTERVAL_MS = 5_000L
     }
 }

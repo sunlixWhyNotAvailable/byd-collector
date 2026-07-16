@@ -2,79 +2,62 @@ package com.bydcollector.collector.data.remote
 
 import android.content.Context
 import android.os.Process
-import android.os.SystemClock
+import com.bydcollector.collector.adb.AdbCancellation
 import com.bydcollector.collector.adb.AdbLocalClient
+import com.bydcollector.collector.adb.AdbOperationCancelledException
 import com.bydcollector.collector.data.direct.DirectVehicleHelper
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.direct.CollectorHelperProtocol
-import java.io.File
-
-internal class DirectBridgeStatusCache(
-    private val ttlMs: Long
-) {
-    private var cachedStatus: CachedStatus? = null
-
-    fun status(nowMs: Long, force: Boolean = false, helperAlive: () -> Boolean, authorizationStatus: () -> String?): String? {
-        if (helperAlive()) return "ready"
-        val cached = cachedStatus
-        if (!force && cached != null && nowMs - cached.loadedAtMs < ttlMs) return cached.value
-        return authorizationStatus().also { value -> cachedStatus = CachedStatus(value, nowMs) }
-    }
-
-    private data class CachedStatus(
-        val value: String?,
-        val loadedAtMs: Long
-    )
-}
+import java.util.concurrent.locks.ReentrantLock
 
 //starts and verifies the shell-owned binder helper that reads autoservice for the app uid
 object DirectBridgeManager {
-    private const val STATUS_TTL_MS = 30_000L
-    private val statusCache = DirectBridgeStatusCache(STATUS_TTL_MS)
+    private val launchLock = ReentrantLock()
 
-    fun status(context: Context, forceRefresh: Boolean = false): String? {
-        return statusCache.status(
-            nowMs = SystemClock.elapsedRealtime(),
-            force = forceRefresh,
-            helperAlive = { DirectVehicleHelperClient().isAlive() },
-            authorizationStatus = {
-                val appContext = context.applicationContext
-                val authorization = AdbLocalClient(File(appContext.filesDir, "adb_keys")).checkAuthorization()
-                when (authorization.category) {
-                    "adb_authorization_connected" -> "ready"
-                    "adb_authorization_required" -> "needs Grant ADB"
-                    "adb_authorization_unavailable",
-                    "adb_authorization_timeout",
-                    "adb_authorization_error" -> "unavailable"
-                    else -> "unavailable"
-                }
-            }
-        )
-    }
+    fun status(): String = if (DirectVehicleHelperClient().isAlive()) "ready" else "unavailable"
 
     fun ensureRunning(
         context: Context,
         adbClient: AdbLocalClient,
-        helper: DirectVehicleHelper = DirectVehicleHelperClient()
+        helper: DirectVehicleHelper = DirectVehicleHelperClient(),
+        cancellation: AdbCancellation = AdbCancellation()
     ): DirectBridgeResult {
-        //avoids relaunching when the current helper binder already accepts this app uid
-        if (helper.isAlive()) return DirectBridgeResult(ok = true, message = "Direct helper already running")
-
-        val launch = adbClient.execShell(launchCommand(context), timeoutMs = 15_000)
-        if (!launch.ok) {
-            return DirectBridgeResult(
-                ok = false,
-                message = launch.error ?: launch.output.ifBlank { "Direct helper launch failed" }
-            )
+        cancellation.throwIfCancelled()
+        try {
+            launchLock.lockInterruptibly()
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw AdbOperationCancelledException()
         }
+        try {
+            cancellation.throwIfCancelled()
+            //rechecks under the launch lock so concurrent callers cannot kill a freshly started helper
+            if (helper.isAlive()) return DirectBridgeResult(ok = true, message = "Direct helper already running")
 
-        repeat(12) {
-            Thread.sleep(250)
-            if (helper.isAlive()) {
-                return DirectBridgeResult(ok = true, message = "Direct helper started")
+            val launch = adbClient.execShell(launchCommand(context), timeoutMs = 15_000)
+            if (!launch.ok) {
+                return DirectBridgeResult(
+                    ok = false,
+                    message = launch.error ?: launch.output.ifBlank { "Direct helper launch failed" }
+                )
             }
+
+            repeat(12) {
+                try {
+                    Thread.sleep(250)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw AdbOperationCancelledException()
+                }
+                cancellation.throwIfCancelled()
+                if (helper.isAlive()) {
+                    return DirectBridgeResult(ok = true, message = "Direct helper started")
+                }
+            }
+            return DirectBridgeResult(ok = false, message = "Direct helper did not register Binder service after launch")
+        } finally {
+            launchLock.unlock()
         }
-        return DirectBridgeResult(ok = false, message = "Direct helper did not register Binder service after launch")
     }
 
     fun launchCommand(context: Context): String {

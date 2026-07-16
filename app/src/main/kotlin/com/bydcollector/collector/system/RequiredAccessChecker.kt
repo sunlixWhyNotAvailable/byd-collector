@@ -6,7 +6,6 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Environment
 import com.bydcollector.collector.BuildConfig
-import com.bydcollector.collector.adb.AdbAuthorizationManager
 
 data class RequiredAccessRow(
     val key: String,
@@ -16,26 +15,6 @@ data class RequiredAccessRow(
 )
 
 object RequiredAccessChecker {
-    fun displayCheck(context: Context): List<RequiredAccessRow> {
-        val appContext = context.applicationContext
-        val storageEnabled = hasStorageReadAccess(appContext)
-        val adbEnabled = AdbAuthorizationManager.isAdbGranted(context)
-        return listOf(
-            RequiredAccessRow(
-                key = "storage",
-                label = "Storage",
-                enabled = storageEnabled,
-                detail = compactGrantStatus(storageEnabled)
-            ),
-            RequiredAccessRow(
-                key = "adb",
-                label = "ADB",
-                enabled = adbEnabled,
-                detail = compactGrantStatus(adbEnabled)
-            )
-        )
-    }
-
     fun check(context: Context): List<RequiredAccessRow> {
         val appContext = context.applicationContext
         val storageEnabled = hasStorageReadAccess(appContext)
@@ -73,9 +52,5 @@ object RequiredAccessChecker {
         } else {
             context.checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
         }
-    }
-
-    private fun compactGrantStatus(enabled: Boolean): String {
-        return if (enabled) "granted" else "not granted"
     }
 }

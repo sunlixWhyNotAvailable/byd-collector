@@ -26,10 +26,10 @@ object KeepAliveShellPlanner {
     fun daemonLaunchCommand(apkPath: String): String {
         val quotedApk = shellQuote(apkPath)
         //uses app_process so the same apk contains the shell-side daemon class
-        return "pidof bydcollector_keepalive >/dev/null 2>&1 || " +
+        return "if ! pidof bydcollector_keepalive >/dev/null 2>&1; then " +
             "CLASSPATH=$quotedApk setsid app_process /system/bin --nice-name=bydcollector_keepalive " +
             "com.bydcollector.collector.keepalive.KeepAliveDaemon </dev/null " +
-            ">>/data/local/tmp/bydcollector_keepalive.log 2>&1 & sleep 1"
+            ">>/data/local/tmp/bydcollector_keepalive.log 2>&1 & fi; sleep 1"
     }
 
     private fun flag(value: Boolean): Int = if (value) 1 else 0

@@ -20,6 +20,13 @@ class CollectorSettings(
 
     fun isAutoStartEnabled(): Boolean = prefs.getBoolean(KEY_AUTO_START, false)
 
+    fun hasActiveAccessWork(): Boolean {
+        return (isPollingEnabled() && !isMainManuallyStopped()) ||
+            (isDebugPollingEnabled() && !isDebugManuallyStopped()) ||
+            (isMqttEnabled() && !isMqttManuallyStopped()) ||
+            (isInfluxEnabled() && !isInfluxManuallyStopped())
+    }
+
     fun setAutoStartEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_AUTO_START, enabled).apply()
         store?.recordEvent(

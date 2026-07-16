@@ -64,6 +64,9 @@ class KeepAliveShellPlannerTest {
         assertTrue(command.contains("setsid app_process /system/bin --nice-name=bydcollector_keepalive"))
         assertTrue(command.contains("com.bydcollector.collector.keepalive.KeepAliveDaemon"))
         assertTrue(command.contains(">>/data/local/tmp/bydcollector_keepalive.log 2>&1"))
+        assertTrue(command.startsWith("if ! pidof bydcollector_keepalive >/dev/null 2>&1; then "))
+        assertTrue(command.endsWith("2>&1 & fi; sleep 1"))
+        assertFalse(command.contains("|| CLASSPATH="))
         assertFalse(command.contains("</dev/null >/data/local/tmp/bydcollector_keepalive.log 2>&1"))
     }
 

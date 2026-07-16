@@ -7,6 +7,8 @@ import android.content.Intent
 import android.os.SystemClock
 import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.BuildConfig
+import com.bydcollector.collector.adb.AdbAuthorizationManager
+import com.bydcollector.collector.adb.AccessCheckMode
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorServiceController
@@ -42,6 +44,14 @@ object CollectorAutoStart {
             //auto-start means main polling should become enabled again after device/process recovery
             ensurePollingEnabled(settings)
             syncDebugAutoStart(settings)
+        }
+        if (clearsManualStops(action) && settings.isAutoStartEnabled() && settings.hasActiveAccessWork()) {
+            AdbAuthorizationManager.request(
+                context = appContext,
+                store = store,
+                source = "broadcast_${action.substringAfterLast('.')}",
+                mode = AccessCheckMode.NORMAL
+            )
         }
         if (CollectorService.isRunning()) {
             //reconciles an already-running service instead of assuming its previous flags are still correct

@@ -1,162 +1,188 @@
 package com.bydcollector.collector.adb
 
 import android.content.Context
+import android.os.SystemClock
 import com.bydcollector.collector.BuildConfig
+import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.remote.DirectBridgeManager
 import com.bydcollector.collector.system.RequiredAccessChecker
 import java.io.File
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.Executors
+import java.util.concurrent.FutureTask
 
-//coordinates user-approved local adb setup before any direct autoservice helper work can run
+enum class AccessCheckMode {
+    NORMAL,
+    COLD_START,
+    FORCE
+}
+
+data class AccessRuntimeSnapshot(
+    val permissionsGranted: Boolean = false,
+    val adbAuthorized: Boolean = false
+)
+
+//coordinates local access checks and guarantees that a force request replaces all older work
 object AdbAuthorizationManager {
-    private val running = AtomicBoolean(false)
+    private val coordinator = AdbPipelineCoordinator()
+    private val repairThrottle = AccessRepairThrottle(REPAIR_COOLDOWN_MS)
 
-    fun isAdbGranted(context: Context): Boolean {
-        return context.applicationContext
-            .getSharedPreferences(ADB_PREFS, Context.MODE_PRIVATE)
-            .getString(KEY_LAST_AUTH_CATEGORY, null) == "adb_authorization_connected"
-    }
+    @Volatile
+    private var runtimeSnapshot = AccessRuntimeSnapshot()
 
-    fun selfCheck(
+    fun currentSnapshot(): AccessRuntimeSnapshot = runtimeSnapshot
+
+    fun request(
         context: Context,
         store: TelemetryStore,
-        allowAutoPrompt: Boolean,
-        source: String
+        source: String,
+        mode: AccessCheckMode,
+        onComplete: ((AccessRuntimeSnapshot) -> Unit)? = null
     ) {
-        //serializes adb auth because concurrent rsa handshakes can confuse the system prompt state
-        if (!running.compareAndSet(false, true)) {
+        val appContext = context.applicationContext
+        val submitted = coordinator.submit(mode) { lease ->
+            runCheck(appContext, store, source, mode, lease, onComplete)
+        }
+        if (!submitted) {
             store.recordEvent(
                 "adb_self_check_in_progress",
-                "ADB self-check is already running",
-                "source=$source"
+                "ADB access self-check is already running",
+                "source=$source mode=${mode.name.lowercase()}"
             )
-            return
         }
+    }
 
-        val appContext = context.applicationContext
+    private fun runCheck(
+        appContext: Context,
+        store: TelemetryStore,
+        source: String,
+        mode: AccessCheckMode,
+        lease: AdbPipelineLease,
+        onComplete: ((AccessRuntimeSnapshot) -> Unit)?
+    ) {
         store.recordEvent(
             "adb_self_check_started",
-            "ADB authorization self-check started",
-            "source=$source target=127.0.0.1:5555,127.0.0.1:1439"
+            "ADB access self-check started",
+            "source=$source mode=${mode.name.lowercase()}"
         )
 
-        Thread(
-            {
-                try {
-                    val client = AdbLocalClient(
-                        keyDir = File(appContext.filesDir, "adb_keys"),
-                        eventSink = { category, message, detail ->
-                            store.recordEvent(category, message, detail)
-                        }
-                    )
-                    val checkResult = client.checkAuthorization()
-                    rememberAuthorizationResult(appContext, checkResult.category)
-                    store.recordEvent(
-                        "adb_self_check_result",
-                        checkResult.message,
-                        "source=$source category=${checkResult.category} ${checkResult.detail.orEmpty()}".trim()
-                    )
-
-                    when (checkResult.category) {
-                        "adb_authorization_connected" -> {
-                            store.recordEvent(
-                                "adb_self_check_authorized",
-                                "ADB key is already authorized",
-                                "source=$source ${checkResult.detail.orEmpty()}".trim()
-                            )
-                            completeShellSetup(appContext, store, client, source)
-                        }
-                        "adb_authorization_required" -> maybeSendOneShotAutoPrompt(
-                            appContext = appContext,
-                            store = store,
-                            client = client,
-                            source = source,
-                            allowAutoPrompt = allowAutoPrompt
-                        )
-                    }
-                } catch (error: Exception) {
-                    store.recordEvent(
-                        "adb_self_check_error",
-                        "ADB authorization self-check failed",
-                        "source=$source ${error::class.java.simpleName}: ${error.message ?: "no message"}"
-                    )
-                    rememberAuthorizationResult(appContext, "adb_self_check_error")
-                } finally {
-                    running.set(false)
-                }
-            },
-            "bydcollector-adb-self-check"
-        ).start()
-    }
-
-    fun requestAuthorization(context: Context, store: TelemetryStore) {
-        if (!running.compareAndSet(false, true)) {
-            store.recordEvent(
-                "adb_authorization_in_progress",
-                "ADB authorization request is already running"
+        try {
+            val cancellation = lease.cancellation
+            var permissionsGranted = !RequiredAccessChecker.hasMissingRequiredAccess(appContext)
+            var helperReady = helperReadyAfterRebind(cancellation)
+            var adbAuthorized = runtimeSnapshot.adbAuthorized
+            val repairNeeded = !permissionsGranted || !helperReady
+            val repairAllowed = repairNeeded && (
+                mode == AccessCheckMode.FORCE || repairThrottle.tryAcquire(SystemClock.elapsedRealtime())
             )
-            return
-        }
 
-        val appContext = context.applicationContext
-        store.recordEvent(
-            "adb_authorization_started",
-            "ADB authorization request started",
-            "target=127.0.0.1:5555"
-        )
+            if (mode == AccessCheckMode.FORCE || !adbAuthorized || repairAllowed) {
+                val client = adbClient(appContext, store, cancellation)
+                val authorization = authorize(appContext, store, client, source, mode)
+                cancellation.throwIfCancelled()
+                adbAuthorized = authorization.category == "adb_authorization_connected"
+                store.recordEvent(
+                    "adb_self_check_result",
+                    authorization.message,
+                    "source=$source mode=${mode.name.lowercase()} category=${authorization.category} ${authorization.detail.orEmpty()}".trim()
+                )
 
-        Thread(
-            {
-                try {
-                    val client = AdbLocalClient(
-                        keyDir = File(appContext.filesDir, "adb_keys"),
-                        eventSink = { category, message, detail ->
-                            store.recordEvent(category, message, detail)
-                        }
+                if (adbAuthorized && repairAllowed) {
+                    runRepair(
+                        appContext = appContext,
+                        store = store,
+                        client = client,
+                        source = source,
+                        helperReady = helperReady,
+                        cancellation = cancellation
                     )
-                    val result = client.requestAuthorization()
-                    rememberAuthorizationResult(appContext, result.category)
-                    store.recordEvent(result.category, result.message, result.detail)
-                    if (result.category == "adb_authorization_connected") {
-                        completeShellSetup(appContext, store, client, "grant_button")
-                    }
-                } catch (error: Exception) {
+                    permissionsGranted = !RequiredAccessChecker.hasMissingRequiredAccess(appContext)
+                    helperReady = DirectVehicleHelperClient().isAlive()
+                } else if (repairNeeded && !repairAllowed) {
                     store.recordEvent(
-                        "adb_authorization_error",
-                        "ADB authorization request failed",
-                        "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                        "adb_repair_rate_limited",
+                        "ADB access repair skipped by cooldown",
+                        "source=$source cooldown_ms=$REPAIR_COOLDOWN_MS"
                     )
-                    rememberAuthorizationResult(appContext, "adb_authorization_error")
-                } finally {
-                    running.set(false)
                 }
-            },
-            "bydcollector-adb-auth"
-        ).start()
+            }
+
+            cancellation.throwIfCancelled()
+            val completed = AccessRuntimeSnapshot(
+                permissionsGranted = permissionsGranted,
+                adbAuthorized = adbAuthorized
+            )
+            if (!coordinator.publishIfCurrent(lease) {
+                    runtimeSnapshot = completed
+                    onComplete?.invoke(completed)
+                }
+            ) return
+
+            store.recordEvent(
+                "required_access_self_check_result",
+                "Required access self-check completed",
+                "source=$source permissions=${completed.permissionsGranted} adb=${completed.adbAuthorized} helper=$helperReady"
+            )
+        } catch (_: AdbOperationCancelledException) {
+            store.recordEvent(
+                "adb_self_check_cancelled",
+                "ADB access self-check cancelled",
+                "source=$source mode=${mode.name.lowercase()}"
+            )
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            store.recordEvent(
+                "adb_self_check_cancelled",
+                "ADB access self-check interrupted",
+                "source=$source mode=${mode.name.lowercase()}"
+            )
+        } catch (error: Exception) {
+            val failed = AccessRuntimeSnapshot(
+                permissionsGranted = runCatching {
+                    !RequiredAccessChecker.hasMissingRequiredAccess(appContext)
+                }.getOrDefault(false),
+                adbAuthorized = false
+            )
+            if (coordinator.publishIfCurrent(lease) {
+                    runtimeSnapshot = failed
+                    onComplete?.invoke(failed)
+                }
+            ) {
+                store.recordEvent(
+                    "adb_self_check_error",
+                    "ADB access self-check failed",
+                    "source=$source ${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                )
+            }
+        }
     }
 
-    private fun maybeSendOneShotAutoPrompt(
+    private fun authorize(
         appContext: Context,
         store: TelemetryStore,
         client: AdbLocalClient,
         source: String,
-        allowAutoPrompt: Boolean
-    ) {
+        mode: AccessCheckMode
+    ): AdbAuthorizationResult {
+        if (mode == AccessCheckMode.FORCE) return client.requestAuthorization()
+
+        val check = client.checkAuthorization()
+        if (check.category != "adb_authorization_required" || mode != AccessCheckMode.COLD_START) {
+            return check
+        }
+
         val fingerprint = client.keyFingerprint()
         val prefs = appContext.getSharedPreferences(ADB_PREFS, Context.MODE_PRIVATE)
-        val promptedFingerprint = prefs.getString(KEY_AUTO_PROMPTED_KEY_FINGERPRINT, null)
-        val promptedVersion = prefs.getInt(KEY_AUTO_PROMPTED_APP_VERSION, -1)
-        val alreadyPromptedForCurrentKeyAndVersion =
-            promptedFingerprint == fingerprint && promptedVersion == BuildConfig.VERSION_CODE
-        //limits automatic rsa prompts to one per app version/key; manual grant stays available afterwards
-        if (!allowAutoPrompt || alreadyPromptedForCurrentKeyAndVersion) {
+        val alreadyPrompted =
+            prefs.getString(KEY_AUTO_PROMPTED_KEY_FINGERPRINT, null) == fingerprint &&
+                prefs.getInt(KEY_AUTO_PROMPTED_APP_VERSION, -1) == BuildConfig.VERSION_CODE
+        if (alreadyPrompted) {
             store.recordEvent(
                 "adb_auto_prompt_skipped",
-                "ADB key is not authorized; waiting for manual Grant ADB",
-                "source=$source key=${fingerprint.take(16)} prompted=$alreadyPromptedForCurrentKeyAndVersion version=${BuildConfig.VERSION_CODE}"
+                "ADB automatic RSA prompt already used for this key and version",
+                "source=$source key=${fingerprint.take(16)} version=${BuildConfig.VERSION_CODE}"
             )
-            return
+            return check
         }
 
         prefs.edit()
@@ -165,93 +191,154 @@ object AdbAuthorizationManager {
             .apply()
         store.recordEvent(
             "adb_auto_prompt_once_started",
-            "ADB key is not authorized; sending one automatic RSA public key prompt",
+            "Sending one automatic RSA public key prompt",
             "source=$source key=${fingerprint.take(16)}"
         )
-
-        val promptResult = client.requestAuthorization()
-        rememberAuthorizationResult(appContext, promptResult.category)
-        store.recordEvent(
-            promptResult.category,
-            promptResult.message,
-            "source=$source ${promptResult.detail.orEmpty()}".trim()
-        )
-        if (promptResult.category == "adb_authorization_connected") {
-            completeShellSetup(appContext, store, client, source)
-        }
+        return client.requestAuthorization()
     }
 
-    private fun completeShellSetup(
+    private fun runRepair(
         appContext: Context,
         store: TelemetryStore,
         client: AdbLocalClient,
-        source: String
+        source: String,
+        helperReady: Boolean,
+        cancellation: AdbCancellation
     ) {
-        //uses local adb only for app-required grants and helper startup; vehicle reads stay read-only
         RequiredAccessChecker.missingShellGrantCommands(appContext).forEachIndexed { index, command ->
+            cancellation.throwIfCancelled()
             store.recordEvent(
                 "adb_permission_grant_started",
                 "Granting missing required access through local ADB",
                 "source=$source index=$index command=$command"
             )
             val result = client.execShell(command, timeoutMs = 10_000)
-            val detail = buildString {
-                append("source=").append(source)
-                append(" elapsed_ms=").append(result.elapsedMs)
-                result.error?.let { append(" error=").append(it) }
-                if (result.output.isNotBlank()) append(" output=").append(result.output.take(500))
-            }
-            if (result.ok) {
-                store.recordEvent(
-                    "adb_permission_grant_success",
-                    "Required access grant command completed",
-                    detail
-                )
-            } else {
-                store.recordEvent(
-                    "adb_permission_grant_failed",
-                    "Required access grant command failed",
-                    detail
-                )
-            }
+            store.recordEvent(
+                if (result.ok) "adb_permission_grant_success" else "adb_permission_grant_failed",
+                if (result.ok) "Required access grant command completed" else "Required access grant command failed",
+                "source=$source elapsed_ms=${result.elapsedMs} error=${result.error.orEmpty()} output=${result.output.take(500)}"
+            )
         }
 
-        val accessRows = RequiredAccessChecker.check(appContext)
-        store.recordEvent(
-            "required_access_self_check_result",
-            "Required access self-check completed after Grant ADB",
-            accessRows.joinToString(separator = "; ") { row ->
-                "${row.key}=${if (row.enabled) "enabled" else "disabled"} ${row.detail}"
-            }
-        )
-
-        val bridgeResult = DirectBridgeManager.ensureRunning(appContext, client)
-        if (bridgeResult.ok) {
-            store.recordEvent(
-                "direct_helper_ready",
-                "Direct autoservice helper is ready",
-                "source=$source ${bridgeResult.message}"
+        if (!helperReady) {
+            val bridge = DirectBridgeManager.ensureRunning(
+                context = appContext,
+                adbClient = client,
+                cancellation = cancellation
             )
-        } else {
             store.recordEvent(
-                "direct_helper_unavailable",
-                "Direct autoservice helper is unavailable",
-                "source=$source ${bridgeResult.message}"
+                if (bridge.ok) "direct_helper_ready" else "direct_helper_unavailable",
+                if (bridge.ok) "Direct autoservice helper is ready" else "Direct autoservice helper is unavailable",
+                "source=$source ${bridge.message}"
             )
         }
     }
 
-    private fun rememberAuthorizationResult(appContext: Context, category: String) {
-        appContext.getSharedPreferences(ADB_PREFS, Context.MODE_PRIVATE)
-            .edit()
-            .putString(KEY_LAST_AUTH_CATEGORY, category)
-            .putLong(KEY_LAST_AUTH_CHECK_AT_MS, System.currentTimeMillis())
-            .apply()
+    private fun helperReadyAfterRebind(cancellation: AdbCancellation): Boolean {
+        if (DirectVehicleHelperClient().isAlive()) return true
+        try {
+            Thread.sleep(HELPER_REBIND_WAIT_MS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw AdbOperationCancelledException()
+        }
+        cancellation.throwIfCancelled()
+        return DirectVehicleHelperClient().isAlive()
+    }
+
+    private fun adbClient(
+        appContext: Context,
+        store: TelemetryStore,
+        cancellation: AdbCancellation
+    ): AdbLocalClient {
+        return AdbLocalClient(
+            keyDir = File(appContext.filesDir, "adb_keys"),
+            eventSink = { category, message, detail -> store.recordEvent(category, message, detail) },
+            cancellation = cancellation
+        )
     }
 
     private const val ADB_PREFS = "adb_authorization"
     private const val KEY_AUTO_PROMPTED_KEY_FINGERPRINT = "adb_auto_prompt_key_fingerprint"
     private const val KEY_AUTO_PROMPTED_APP_VERSION = "adb_auto_prompt_app_version"
-    private const val KEY_LAST_AUTH_CATEGORY = "adb_last_auth_category"
-    private const val KEY_LAST_AUTH_CHECK_AT_MS = "adb_last_auth_check_at_ms"
+    private const val HELPER_REBIND_WAIT_MS = 1_000L
+    private const val REPAIR_COOLDOWN_MS = 60_000L
+}
+
+internal class AccessRepairThrottle(private val intervalMs: Long) {
+    private var lastAttemptAtMs: Long? = null
+
+    @Synchronized
+    fun tryAcquire(nowMs: Long): Boolean {
+        val last = lastAttemptAtMs
+        if (last != null && nowMs - last < intervalMs) return false
+        lastAttemptAtMs = nowMs
+        return true
+    }
+}
+
+internal class AdbPipelineCoordinator {
+    private val lock = Any()
+    private val executor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "bydcollector-adb-access").apply { isDaemon = true }
+    }
+    private val replacementExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "bydcollector-adb-replace").apply { isDaemon = true }
+    }
+    private var generation = 0L
+    private var active: AdbPipelineLease? = null
+
+    fun submit(mode: AccessCheckMode, block: (AdbPipelineLease) -> Unit): Boolean {
+        synchronized(lock) {
+            val previous = active
+            val replace = mode == AccessCheckMode.FORCE ||
+                (mode == AccessCheckMode.COLD_START && previous?.mode == AccessCheckMode.NORMAL)
+            if (previous != null && !replace) return false
+
+            val lease = AdbPipelineLease(++generation, mode)
+            val task = FutureTask<Unit> {
+                try {
+                    val shouldRun = synchronized(lock) {
+                        active === lease && !lease.cancellation.isCancelled
+                    }
+                    if (shouldRun) block(lease)
+                } finally {
+                    synchronized(lock) {
+                        if (active === lease) active = null
+                    }
+                }
+            }
+            lease.task = task
+            active = lease
+            if (previous == null) {
+                executor.execute(task)
+            } else {
+                replacementExecutor.execute {
+                    previous.cancel()
+                    synchronized(lock) {
+                        if (active === lease) executor.execute(task)
+                    }
+                }
+            }
+            return true
+        }
+    }
+
+    fun publishIfCurrent(lease: AdbPipelineLease, publish: () -> Unit): Boolean {
+        synchronized(lock) {
+            if (active !== lease || lease.cancellation.isCancelled) return false
+            publish()
+            return true
+        }
+    }
+}
+
+internal class AdbPipelineLease(val generation: Long, val mode: AccessCheckMode) {
+    val cancellation = AdbCancellation()
+    lateinit var task: FutureTask<Unit>
+
+    fun cancel() {
+        cancellation.cancel()
+        task.cancel(true)
+    }
 }

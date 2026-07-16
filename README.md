@@ -52,4 +52,3 @@ Tested on *Chinese version* of `BYD Sea Lion 07 EV 2025`, `DiLink 5.0`
 - add Telegram send messages integration
 - improve influxDB reupload
 - add user notification when database storage approaches its configured limit
-- explore possibility of collecting data when the car is turned off (already confirmed the dilink is alive and watchdog/heartbeat process can exist)

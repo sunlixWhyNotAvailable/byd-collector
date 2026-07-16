@@ -2,20 +2,18 @@ package com.bydcollector.collector.ui
 
 import android.content.Context
 import android.os.SystemClock
+import com.bydcollector.collector.adb.AdbAuthorizationManager
 import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.debug.DirectDebugStatus
 import com.bydcollector.collector.data.local.HealthSnapshot
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
-import com.bydcollector.collector.data.remote.DirectBridgeManager
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
 import com.bydcollector.collector.influx.InfluxExportStateSnapshot
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorSettings
-import com.bydcollector.collector.system.RequiredAccessChecker
-import com.bydcollector.collector.system.RequiredAccessRow
 import com.bydcollector.collector.util.TimedCache
 import java.io.File
 
@@ -32,7 +30,6 @@ class DashboardStateProvider(
     ) : this(context, { store }, settings)
 
     private val healthCache = TimedCache<HealthSnapshot>(ttlMs = 15_000L)
-    private val requiredAccessCache = TimedCache<List<RequiredAccessRow>>(ttlMs = 30_000L)
     private val archiveStorageCache = ArchiveStorageSnapshotCache(
         archiveRoot = File(context.filesDir, "db_archive"),
         mainDatabaseFile = context.getDatabasePath(TelemetryDatabaseHelper.DATABASE_NAME),
@@ -82,6 +79,7 @@ class DashboardStateProvider(
         } else {
             VehicleKpis()
         }
+        val accessSnapshot = AdbAuthorizationManager.currentSnapshot()
         return DashboardState(
             running = mainPollingRunning,
             serviceRunning = serviceRunning,
@@ -177,8 +175,8 @@ class DashboardStateProvider(
             influxExportedRowsTotal = influxState.exportedRowsTotal,
             normalizedCurrentCount = health.normalizedCurrentCount,
             normalizedHistoryCount = health.normalizedHistoryCount,
-            requiredAccessRows = requiredAccessCache.get(nowMs) { RequiredAccessChecker.displayCheck(context) },
-            directBridgeStatus = DirectBridgeManager.status(context),
+            permissionsGranted = accessSnapshot.permissionsGranted,
+            adbAuthorized = accessSnapshot.adbAuthorized,
             vehicleKpis = vehicleKpis,
             recentEvents = health.recentEvents.map { event ->
                 event.copy(timestamp = DisplayTimeFormatter.formatNullable(event.timestamp) ?: event.timestamp)

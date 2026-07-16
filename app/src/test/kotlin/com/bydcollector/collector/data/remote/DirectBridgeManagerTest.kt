@@ -3,6 +3,7 @@ package com.bydcollector.collector.data.remote
 import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 class DirectBridgeManagerTest {
     @Test
@@ -23,5 +24,21 @@ class DirectBridgeManagerTest {
         assert(command.indexOf("rm -f /data/local/tmp/bydcollector_helper.lock") < command.indexOf("setsid app_process"))
         assertFalse(command.contains("DirectVehicleBridgeServer"))
         assertFalse(command.contains("19837"))
+    }
+
+    @Test
+    fun helperLaunchIsSerializedAndRecheckedInsideTheLock() {
+        val source = java.io.File(
+            "app/src/main/kotlin/com/bydcollector/collector/data/remote/DirectBridgeManager.kt"
+        ).takeIf { it.isFile } ?: java.io.File(
+            "src/main/kotlin/com/bydcollector/collector/data/remote/DirectBridgeManager.kt"
+        )
+        val text = source.readText()
+        val ensure = text.substringAfter("fun ensureRunning(").substringBefore("fun launchCommand(context")
+
+        assertTrue(text.contains("private val launchLock = ReentrantLock()"))
+        assertTrue(ensure.contains("launchLock.lockInterruptibly()"))
+        assertTrue(ensure.indexOf("launchLock.lockInterruptibly()") < ensure.indexOf("if (helper.isAlive())"))
+        assertTrue(ensure.contains("launchLock.unlock()"))
     }
 }

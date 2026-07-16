@@ -284,12 +284,12 @@ private fun TopHeader(
                     kind = if (state?.running == true) StatusKind.OK else StatusKind.WAITING
                 )
                 StatusPill(
-                    text = "${strings.adb}: ${if (hasAccess(state, "adb")) strings.ok else strings.missing}",
-                    kind = if (hasAccess(state, "adb")) StatusKind.OK else StatusKind.ERROR
+                    text = "${strings.adb}: ${if (state?.adbAuthorized == true) strings.ok else strings.missing}",
+                    kind = if (state?.adbAuthorized == true) StatusKind.OK else StatusKind.ERROR
                 )
                 StatusPill(
-                    text = "${strings.permissions}: ${if (hasAllAccess(state)) strings.ok else strings.missing}",
-                    kind = if (hasAllAccess(state)) StatusKind.OK else StatusKind.ERROR
+                    text = "${strings.permissions}: ${if (state?.permissionsGranted == true) strings.ok else strings.missing}",
+                    kind = if (state?.permissionsGranted == true) StatusKind.OK else StatusKind.ERROR
                 )
                 SegmentedControl(
                     left = strings.uk,
@@ -1693,15 +1693,6 @@ private fun formatCount(value: Long): String = "%,d".format(Locale.US, value).re
 
 private fun errorCount(state: DashboardState?): String {
     return if (state?.lastErrorAt != null || state?.lastError != null) "1" else "0"
-}
-
-private fun hasAccess(state: DashboardState?, key: String): Boolean {
-    return state?.requiredAccessRows?.firstOrNull { it.key.equals(key, ignoreCase = true) }?.enabled == true
-}
-
-private fun hasAllAccess(state: DashboardState?): Boolean {
-    val rows = state?.requiredAccessRows ?: return false
-    return rows.isNotEmpty() && rows.all { it.enabled }
 }
 
 private fun compactChannelStatusText(status: String?, strings: UiStrings): String {

@@ -16,6 +16,7 @@ import android.util.Log
 import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.BuildConfig
 import com.bydcollector.collector.adb.AdbAuthorizationManager
+import com.bydcollector.collector.adb.AccessCheckMode
 import com.bydcollector.collector.adb.AdbLocalClient
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.debug.DirectDebugParameterAsset
@@ -101,6 +102,15 @@ class CollectorService : Service() {
     private val restoringRuntime = AtomicBoolean(false)
     private var lastStatusHeartbeatAtMs: Long = -STATUS_HEARTBEAT_INTERVAL_MS
     private var lastNotificationText: String? = null
+    private var accessSelfCheckScheduled = false
+    private val accessSelfCheckTask = object : Runnable {
+        override fun run() {
+            accessSelfCheckScheduled = false
+            if (!settings.hasActiveAccessWork()) return
+            requestAccessSelfCheck("runtime_watchdog")
+            scheduleAccessSelfCheck()
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -134,6 +144,9 @@ class CollectorService : Service() {
             onDebugStoreReopened = { debugStore = it }
         )
         createNotificationChannel()
+        if (settings.isAutoStartEnabled() && settings.hasActiveAccessWork()) {
+            requestAccessSelfCheck("runtime_supervisor_start")
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -188,10 +201,13 @@ class CollectorService : Service() {
             }
             ACTION_START -> reconcileCollection()
         }
+        reconcileAccessSelfCheckSchedule()
         return START_STICKY
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacks(accessSelfCheckTask)
+        accessSelfCheckScheduled = false
         stopCollection("service_destroyed")
         keepAliveSupervisor.shutdown()
         debugStartExecutor.shutdownNow()
@@ -613,6 +629,30 @@ class CollectorService : Service() {
         )
     }
 
+    private fun requestAccessSelfCheck(source: String) {
+        AdbAuthorizationManager.request(
+            context = applicationContext,
+            store = store,
+            source = source,
+            mode = AccessCheckMode.NORMAL
+        )
+    }
+
+    private fun reconcileAccessSelfCheckSchedule() {
+        if (!settings.hasActiveAccessWork()) {
+            mainHandler.removeCallbacks(accessSelfCheckTask)
+            accessSelfCheckScheduled = false
+            return
+        }
+        scheduleAccessSelfCheck()
+    }
+
+    private fun scheduleAccessSelfCheck() {
+        if (accessSelfCheckScheduled) return
+        accessSelfCheckScheduled = true
+        mainHandler.postDelayed(accessSelfCheckTask, ACCESS_SELF_CHECK_INTERVAL_MS)
+    }
+
     private fun stopRuntimeForMaintenance(operation: DbMaintenanceOperation) {
         if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
             if (detachDebugPoller()?.shutdownAndAwait("debug_database_maintenance", 2_000L) == false) {
@@ -864,8 +904,8 @@ class CollectorService : Service() {
             availability = "online",
             polling = poller.isRunning(),
             collectorStatus = if (result.ok) "polling" else "polling_error",
-            adb = if (AdbAuthorizationManager.isAdbGranted(applicationContext)) "authorized" else "not_authorized",
-            helper = DirectBridgeManager.status(applicationContext, forceRefresh = !result.ok) ?: "unknown",
+            adb = if (AdbAuthorizationManager.currentSnapshot().adbAuthorized) "authorized" else "not_authorized",
+            helper = DirectBridgeManager.status(),
             lastSuccessAt = health.lastSuccessAt,
             lastError = if (result.ok) health.lastError else health.lastError ?: result.category,
             categories = mqttCategoryStatus()
@@ -1288,6 +1328,7 @@ class CollectorService : Service() {
         private const val CHANNEL_ID = "collector"
         private const val NOTIFICATION_ID = 1001
         private const val STATUS_HEARTBEAT_INTERVAL_MS = 30_000L
+        private const val ACCESS_SELF_CHECK_INTERVAL_MS = 5 * 60_000L
         private const val TAG = "BYDCollectorService"
         private const val DEBUG_REASON_AUTOSTART = "autostart"
         private const val DEBUG_REASON_MANUAL = "manual"

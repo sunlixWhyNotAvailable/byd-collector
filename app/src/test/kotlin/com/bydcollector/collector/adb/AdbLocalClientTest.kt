@@ -8,6 +8,7 @@ import java.nio.ByteOrder
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -66,6 +67,48 @@ class AdbLocalClientTest {
                 "ADB public key should use collector's own key comment"
             )
         }
+    }
+
+    @Test
+    fun cancellationClosesAnActiveAuthorizationSocket() {
+        BlockingAdbServer().use { server ->
+            val cancellation = AdbCancellation()
+            val cancelled = AtomicBoolean(false)
+            val finished = CountDownLatch(1)
+            val client = AdbLocalClient(
+                keyDir = Files.createTempDirectory("bydcollector-adb-test").toFile(),
+                endpoints = listOf(AdbEndpoint("127.0.0.1", server.port)),
+                cancellation = cancellation
+            )
+
+            thread(name = "adb-cancellation-test") {
+                try {
+                    client.checkAuthorization()
+                } catch (_: AdbOperationCancelledException) {
+                    cancelled.set(true)
+                } finally {
+                    finished.countDown()
+                }
+            }
+
+            assertTrue(server.awaitAccepted(), "client should connect before cancellation")
+            cancellation.cancel()
+            assertTrue(finished.await(2, TimeUnit.SECONDS), "cancelled ADB call should terminate promptly")
+            assertTrue(cancelled.get())
+        }
+    }
+
+    @Test
+    fun invalidPersistentKeyIsNotAutomaticallyReplaced() {
+        val keyDir = Files.createTempDirectory("bydcollector-adb-test").toFile()
+        val privateFile = keyDir.resolve("adb_key.priv")
+        val invalidKey = byteArrayOf(1, 2, 3, 4)
+        privateFile.writeBytes(invalidKey)
+
+        val client = AdbLocalClient(keyDir = keyDir)
+
+        assertFailsWith<IllegalStateException> { client.keyFingerprint() }
+        assertTrue(privateFile.readBytes().contentEquals(invalidKey))
     }
 
     private class BrokenAdbServer : AutoCloseable {
@@ -144,6 +187,32 @@ class AdbLocalClientTest {
         fun awaitPublicKey(): Boolean = publicKeySent.await(3, TimeUnit.SECONDS)
 
         override fun close() {
+            server.close()
+        }
+    }
+
+    private class BlockingAdbServer : AutoCloseable {
+        private val server = ServerSocket(0)
+        private val accepted = CountDownLatch(1)
+        private val release = CountDownLatch(1)
+        val port: Int = server.localPort
+
+        init {
+            thread(name = "blocking-adb-test-server", isDaemon = true) {
+                runCatching {
+                    server.accept().use { socket ->
+                        readAdbPacket(socket.getInputStream())
+                        accepted.countDown()
+                        release.await(5, TimeUnit.SECONDS)
+                    }
+                }
+            }
+        }
+
+        fun awaitAccepted(): Boolean = accepted.await(3, TimeUnit.SECONDS)
+
+        override fun close() {
+            release.countDown()
             server.close()
         }
     }

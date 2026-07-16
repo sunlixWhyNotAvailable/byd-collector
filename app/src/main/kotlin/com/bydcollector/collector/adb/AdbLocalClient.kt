@@ -8,6 +8,7 @@ import java.math.BigInteger
 import java.net.ConnectException
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -24,14 +25,17 @@ import java.security.spec.PKCS8EncodedKeySpec
 import java.security.spec.RSAPublicKeySpec
 import java.security.spec.X509EncodedKeySpec
 import java.util.Base64
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
 
 //implements the small local adb client needed on dilink without depending on an external adb server
 class AdbLocalClient(
     private val keyDir: File,
     private val eventSink: ((category: String, message: String, detail: String?) -> Unit)? = null,
-    private val endpoints: List<AdbEndpoint> = LOCAL_ADB_ENDPOINTS
+    private val endpoints: List<AdbEndpoint> = LOCAL_ADB_ENDPOINTS,
+    private val cancellation: AdbCancellation = AdbCancellation()
 ) {
     init {
         require(endpoints.all { it.isLoopbackHost() }) {
@@ -44,8 +48,9 @@ class AdbLocalClient(
         timeoutMs: Int = SHELL_TIMEOUT_MS,
         allowAuthorizationPrompt: Boolean = false
     ): AdbShellResult {
+        cancellation.throwIfCancelled()
         //keeps shell calls serialized with auth so one adb socket owns the rsa prompt/handshake sequence
-        if (!AUTH_LOCK.tryLock(AUTH_LOCK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+        if (!tryAcquireAuthLock()) {
             return AdbShellResult(
                 ok = false,
                 output = "",
@@ -78,7 +83,7 @@ class AdbLocalClient(
         allowAuthorizationPrompt: Boolean
     ): AdbShellResult {
         return try {
-            openLocalAdbSocket(endpoint).use { socket ->
+            useLocalAdbSocket(endpoint) { socket ->
                 val input = socket.getInputStream()
                 val output = socket.getOutputStream()
                 val authResult = connectAuthorized(socket, input, output, allowAuthorizationPrompt)
@@ -92,7 +97,10 @@ class AdbLocalClient(
                 }
                 runShell(socket, input, output, command, timeoutMs)
             }
+        } catch (error: AdbOperationCancelledException) {
+            throw error
         } catch (error: Exception) {
+            cancellation.throwIfCancelled()
             AdbShellResult(
                 ok = false,
                 output = "",
@@ -120,7 +128,8 @@ class AdbLocalClient(
         allowAuthorizationPrompt: Boolean,
         timeoutMessage: String
     ): AdbAuthorizationResult {
-        if (!AUTH_LOCK.tryLock(AUTH_LOCK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+        cancellation.throwIfCancelled()
+        if (!tryAcquireAuthLock()) {
             return AdbAuthorizationResult(
                 category = "adb_authorization_unavailable",
                 message = "ADB auth lock timeout",
@@ -150,11 +159,13 @@ class AdbLocalClient(
         timeoutMessage: String
     ): AdbAuthorizationResult {
         return try {
-            openLocalAdbSocket(endpoint).use { socket ->
+            useLocalAdbSocket(endpoint) { socket ->
                 val input = socket.getInputStream()
                 val output = socket.getOutputStream()
                 connectAuthorized(socket, input, output, allowAuthorizationPrompt)
             }
+        } catch (error: AdbOperationCancelledException) {
+            throw error
         } catch (error: ConnectException) {
             AdbAuthorizationResult(
                 category = "adb_authorization_unavailable",
@@ -167,7 +178,15 @@ class AdbLocalClient(
                 message = timeoutMessage,
                 detail = "target=${endpoint.host}:${endpoint.port} ${error.message ?: "timeout"}"
             )
+        } catch (error: SocketException) {
+            cancellation.throwIfCancelled()
+            AdbAuthorizationResult(
+                category = "adb_authorization_error",
+                message = "ADB authorization check failed",
+                detail = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+            )
         } catch (error: Exception) {
+            cancellation.throwIfCancelled()
             AdbAuthorizationResult(
                 category = "adb_authorization_error",
                 message = "ADB authorization check failed",
@@ -184,7 +203,9 @@ class AdbLocalClient(
 
     private fun openLocalAdbSocket(endpoint: AdbEndpoint): Socket {
         val socket = Socket()
+        cancellation.register(socket)
         try {
+            cancellation.throwIfCancelled()
             //normalizes local adb endpoints to loopback because the app must never shell out to remote hosts
             val socketAddress = when (endpoint.port) {
                 5555 -> InetSocketAddress("127.0.0.1", 5555)
@@ -202,12 +223,32 @@ class AdbLocalClient(
             return socket
         } catch (error: Exception) {
             runCatching { socket.close() }
+            cancellation.unregister(socket)
+            cancellation.throwIfCancelled()
             eventSink?.invoke(
                 "adb_socket_unavailable",
                 "Local ADB endpoint is not reachable",
                 "target=${endpoint.host}:${endpoint.port} ${error::class.java.simpleName}: ${error.message ?: "no message"}"
             )
             throw error
+        }
+    }
+
+    private inline fun <T> useLocalAdbSocket(endpoint: AdbEndpoint, block: (Socket) -> T): T {
+        val socket = openLocalAdbSocket(endpoint)
+        return try {
+            socket.use(block)
+        } finally {
+            cancellation.unregister(socket)
+        }
+    }
+
+    private fun tryAcquireAuthLock(): Boolean {
+        return try {
+            AUTH_LOCK.tryLock(AUTH_LOCK_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw AdbOperationCancelledException()
         }
     }
 
@@ -223,6 +264,7 @@ class AdbLocalClient(
         output: OutputStream,
         allowAuthorizationPrompt: Boolean
     ): AdbAuthorizationResult {
+        cancellation.throwIfCancelled()
         val keyPair = loadOrCreateKeyPair()
         writePacket(output, COMMAND_CNXN, ADB_VERSION, ADB_MAX_DATA, ADB_BANNER.toByteArray())
         eventSink?.invoke(
@@ -235,6 +277,7 @@ class AdbLocalClient(
         var publicKeySent = false
         //tries signature auth first so already-approved installs avoid showing the rsa prompt again
         while (true) {
+            cancellation.throwIfCancelled()
             val response = try {
                 readPacket(input)
             } catch (error: SocketTimeoutException) {
@@ -337,6 +380,7 @@ class AdbLocalClient(
         val outputBuilder = StringBuilder()
         val deadline = startedAt + timeoutMs
         while (System.currentTimeMillis() < deadline) {
+            cancellation.throwIfCancelled()
             socket.soTimeout = (deadline - System.currentTimeMillis()).coerceIn(100, timeoutMs.toLong()).toInt()
             val packet = readPacket(input)
             when (packet.command) {
@@ -398,7 +442,7 @@ class AdbLocalClient(
         //keeps the same adb identity across app updates so the user grant remains stable
         migrateLegacyAdbKeyIfPresent(privateFile, publicFile)
         if (privateFile.exists()) {
-            runCatching {
+            return try {
                 val keyFactory = KeyFactory.getInstance("RSA")
                 val privateKey = keyFactory.generatePrivate(PKCS8EncodedKeySpec(privateFile.readBytes()))
                 val publicKey = if (publicFile.exists()) {
@@ -406,7 +450,9 @@ class AdbLocalClient(
                 } else {
                     derivePublicKey(keyFactory, privateKey).also { publicFile.writeBytes(it.encoded) }
                 }
-                return KeyPair(publicKey, privateKey)
+                KeyPair(publicKey, privateKey)
+            } catch (error: Exception) {
+                throw IllegalStateException("Stored ADB key is invalid; refusing automatic replacement", error)
             }
         }
 
@@ -577,6 +623,40 @@ class AdbLocalClient(
         )
     }
 }
+
+class AdbCancellation {
+    private val cancelled = AtomicBoolean(false)
+    private val sockets = ConcurrentHashMap.newKeySet<Socket>()
+
+    val isCancelled: Boolean
+        get() = cancelled.get()
+
+    fun cancel() {
+        if (!cancelled.compareAndSet(false, true)) return
+        sockets.toList().forEach { socket -> runCatching { socket.close() } }
+    }
+
+    internal fun register(socket: Socket) {
+        throwIfCancelled()
+        sockets += socket
+        if (cancelled.get() && sockets.remove(socket)) {
+            runCatching { socket.close() }
+            throw AdbOperationCancelledException()
+        }
+    }
+
+    internal fun unregister(socket: Socket) {
+        sockets -= socket
+    }
+
+    fun throwIfCancelled() {
+        if (cancelled.get() || Thread.currentThread().isInterrupted) {
+            throw AdbOperationCancelledException()
+        }
+    }
+}
+
+class AdbOperationCancelledException : RuntimeException("ADB operation cancelled")
 
 data class AdbEndpoint(
     val host: String,
