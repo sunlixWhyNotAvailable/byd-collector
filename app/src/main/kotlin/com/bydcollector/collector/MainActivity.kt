@@ -75,6 +75,7 @@ class MainActivity : ComponentActivity() {
     private var mqttDraft by mutableStateOf(MqttDraft())
     private var influxDraft by mutableStateOf(InfluxDraft())
     private var updateUiState by mutableStateOf<UpdateUiState>(UpdateUiState.Hidden)
+    private var updateUiGeneration = 0L
     private var pendingMaintenanceOperation by mutableStateOf<DbMaintenanceOperation?>(null)
     private var maintenanceLaunchOperation by mutableStateOf<DbMaintenanceOperation?>(null)
     private var dashboardRefreshVersion by mutableStateOf(0)
@@ -382,6 +383,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onDismissUpdateDialog() {
+            updateUiGeneration += 1L
             updateUiState = UpdateUiState.Hidden
         }
 
@@ -802,6 +804,7 @@ class MainActivity : ComponentActivity() {
         //guard duplicate update checks while github request is running
         if (updateCheckInFlight || destroyed) return
         updateCheckInFlight = true
+        val uiGeneration = ++updateUiGeneration
         if (force) {
             updateUiState = UpdateUiState.Checking
         }
@@ -809,7 +812,7 @@ class MainActivity : ComponentActivity() {
             val result = updateChecker.check(force)
             runOnUiThread {
                 updateCheckInFlight = false
-                if (destroyed || !foreground) return@runOnUiThread
+                if (destroyed || !foreground || uiGeneration != updateUiGeneration) return@runOnUiThread
                 updateUiState = when (result) {
                     is UpdateCheckResult.Available -> UpdateUiState.Available(result.info)
                     UpdateCheckResult.UpToDate -> if (force) UpdateUiState.UpToDate else UpdateUiState.Hidden
@@ -820,6 +823,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startUpdateDownload(info: UpdateInfo) {
+        val uiGeneration = ++updateUiGeneration
         updateUiState = UpdateUiState.Downloading(info, 0)
         updateExecutor.execute {
             val result = runCatching {
@@ -831,7 +835,9 @@ class MainActivity : ComponentActivity() {
                     progress = updateDownloader.progress(downloadId)
                     if (progress < 0) error("Update download failed")
                     runOnUiThread {
-                        if (!destroyed) updateUiState = UpdateUiState.Downloading(info, progress)
+                        if (!destroyed && uiGeneration == updateUiGeneration) {
+                            updateUiState = UpdateUiState.Downloading(info, progress)
+                        }
                     }
                 }
                 val verifiedFile = updateDownloader.copyDownloadedApkForInstall(info)
@@ -849,15 +855,19 @@ class MainActivity : ComponentActivity() {
                     .onSuccess { verified ->
                         val finalValidation = updateApkVerifier.validate(verified.file)
                         if (!finalValidation.ok || finalValidation.sha256 != verified.sha256) {
-                            updateUiState = UpdateUiState.Error(
-                                if (!finalValidation.ok) finalValidation.message else "APK digest changed before install"
-                            )
+                            if (uiGeneration == updateUiGeneration) {
+                                updateUiState = UpdateUiState.Error(
+                                    if (!finalValidation.ok) finalValidation.message else "APK digest changed before install"
+                                )
+                            }
                             return@onSuccess
                         }
                         updateDownloader.install(verified.info, verified.file)
                     }
                     .onFailure { error ->
-                        updateUiState = UpdateUiState.Error(error.message ?: error::class.java.simpleName)
+                        if (uiGeneration == updateUiGeneration) {
+                            updateUiState = UpdateUiState.Error(error.message ?: error::class.java.simpleName)
+                        }
                     }
             }
         }
