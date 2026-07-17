@@ -2,6 +2,7 @@ package com.bydcollector.collector.ha
 
 import android.content.Context
 import com.bydcollector.collector.adb.AdbLocalClient
+import com.bydcollector.collector.adb.AdbShellResult
 import java.io.File
 
 object TailscaleActivator {
@@ -33,15 +34,10 @@ object TailscaleActivator {
     }
 
     fun minimize(context: Context): TailscaleActivationResult {
-        val result = AdbLocalClient(File(context.filesDir, "adb_keys")).execShell(homeCommand())
-        return if (result.ok) {
-            TailscaleActivationResult(true, "tailscale_minimized_via_adb")
-        } else {
-            TailscaleActivationResult(
-                false,
-                "tailscale_adb_minimize_failed: ${result.error ?: result.output.trim().ifEmpty { "no detail" }}"
-            )
-        }
+        val result = AdbLocalClient(File(context.filesDir, "adb_keys")).execShell(
+            guardedHomeCommand(packageCandidates().single())
+        )
+        return interpretMinimizeResult(result)
     }
 
     internal fun runDelayedSequence(
@@ -71,7 +67,11 @@ object TailscaleActivator {
         sleeper(MINIMIZE_DELAY_MS)
         val home = minimize()
         onEvent(
-            if (home.ok) "tailscale_minimize_succeeded" else "tailscale_minimize_failed",
+            when {
+                home.message == MINIMIZE_SKIPPED_NOT_FOREGROUND -> MINIMIZE_SKIPPED_NOT_FOREGROUND
+                home.ok -> "tailscale_minimize_succeeded"
+                else -> "tailscale_minimize_failed"
+            },
             home.message
         )
         return TailscaleSequenceResult(launched = true, minimized = home.ok)
@@ -81,6 +81,24 @@ object TailscaleActivator {
         "am start -n $packageName/$className"
 
     fun homeCommand(): String = "input keyevent KEYCODE_HOME"
+
+    fun guardedHomeCommand(packageName: String): String =
+        "if dumpsys activity activities | grep -m 1 -E 'mResumedActivity|topResumedActivity' | grep -q '$packageName/'; " +
+            "then ${homeCommand()} && echo $HOME_SENT_MARKER; else echo $NOT_FOREGROUND_MARKER; fi"
+
+    internal fun interpretMinimizeResult(result: AdbShellResult): TailscaleActivationResult = when {
+        !result.ok -> TailscaleActivationResult(
+            false,
+            "tailscale_adb_minimize_failed: ${result.error ?: result.output.trim().ifEmpty { "no detail" }}"
+        )
+        HOME_SENT_MARKER in result.output -> TailscaleActivationResult(true, "tailscale_minimized_via_adb")
+        NOT_FOREGROUND_MARKER in result.output -> TailscaleActivationResult(false, MINIMIZE_SKIPPED_NOT_FOREGROUND)
+        else -> TailscaleActivationResult(false, "tailscale_foreground_check_unrecognized")
+    }
+
+    internal const val MINIMIZE_SKIPPED_NOT_FOREGROUND = "tailscale_minimize_skipped_not_foreground"
+    private const val HOME_SENT_MARKER = "BYDCOLLECTOR_TAILSCALE_HOME_SENT"
+    private const val NOT_FOREGROUND_MARKER = "BYDCOLLECTOR_TAILSCALE_NOT_FOREGROUND"
 }
 
 data class TailscaleActivationResult(

@@ -1,5 +1,6 @@
 package com.bydcollector.collector.ha
 
+import com.bydcollector.collector.adb.AdbShellResult
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -25,6 +26,36 @@ class TailscaleActivatorTest {
     @Test
     fun homeCommandUsesAndroidHomeKey() {
         assertEquals("input keyevent KEYCODE_HOME", TailscaleActivator.homeCommand())
+    }
+
+    @Test
+    fun guardedHomeCommandRequiresTailscaleForeground() {
+        assertEquals(
+            "if dumpsys activity activities | grep -m 1 -E 'mResumedActivity|topResumedActivity' | " +
+                "grep -q 'com.tailscale.ipn/'; then input keyevent KEYCODE_HOME && " +
+                "echo BYDCOLLECTOR_TAILSCALE_HOME_SENT; else echo BYDCOLLECTOR_TAILSCALE_NOT_FOREGROUND; fi",
+            TailscaleActivator.guardedHomeCommand("com.tailscale.ipn")
+        )
+    }
+
+    @Test
+    fun foregroundResultSendsHomeAndOtherForegroundSkipsIt() {
+        val minimized = TailscaleActivator.interpretMinimizeResult(
+            AdbShellResult(true, "BYDCOLLECTOR_TAILSCALE_HOME_SENT", null, 1L)
+        )
+        val skipped = TailscaleActivator.interpretMinimizeResult(
+            AdbShellResult(true, "BYDCOLLECTOR_TAILSCALE_NOT_FOREGROUND", null, 1L)
+        )
+        val unrecognized = TailscaleActivator.interpretMinimizeResult(
+            AdbShellResult(true, "", null, 1L)
+        )
+
+        assertTrue(minimized.ok)
+        assertEquals("tailscale_minimized_via_adb", minimized.message)
+        assertFalse(skipped.ok)
+        assertEquals(TailscaleActivator.MINIMIZE_SKIPPED_NOT_FOREGROUND, skipped.message)
+        assertFalse(unrecognized.ok)
+        assertEquals("tailscale_foreground_check_unrecognized", unrecognized.message)
     }
 
     @Test
@@ -83,6 +114,24 @@ class TailscaleActivatorTest {
         assertFalse(result.launched)
         assertFalse(result.minimized)
         assertFalse(minimized)
+    }
+
+    @Test
+    fun changedForegroundSkipsHomeWithDistinctEvent() {
+        val events = mutableListOf<String>()
+        val result = TailscaleActivator.runDelayedSequence(
+            isEnabled = { true },
+            sleeper = {},
+            activate = { TailscaleActivationResult(true, "launched") },
+            minimize = {
+                TailscaleActivationResult(false, TailscaleActivator.MINIMIZE_SKIPPED_NOT_FOREGROUND)
+            },
+            onEvent = { category, _ -> events += category }
+        )
+
+        assertTrue(result.launched)
+        assertFalse(result.minimized)
+        assertEquals(TailscaleActivator.MINIMIZE_SKIPPED_NOT_FOREGROUND, events.last())
     }
 
     @Test
