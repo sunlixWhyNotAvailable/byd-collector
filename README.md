@@ -15,7 +15,7 @@
 - SQLite storage for raw poll values, collection sessions, normalized current state, history, MQTT state, and diagnostics
 - grouped native int/float polling for the curated main set, with ordered results and in-helper scalar fallback
 - grouped native debug round-robin polling for research parameters, on the same 500 ms cadence and fallback contract
-- normalized vehicle state for SOC, charging, battery, doors, tires, climate, speed, odometer, radar distance sensors and related fields
+- normalized vehicle state for three SOC sources, remaining/trip/cumulative battery energy, charging, doors, tires, climate, speed, odometer, radar distance sensors and related fields
 - Home Assistant MQTT Discovery and live-state publishing
 - `InfluxDB v1` export for historical telemetry
 - main and debug round-robin database archive with shared storage retention
@@ -30,7 +30,7 @@ After first launch:
 1. Open BYD Collector.
 2. Grant ADB access when Android shows the RSA authorization prompt.
 3. Set `Disable background Apps -> BYD Collector = OFF` in the BYD system settings.
-4. Start telemetry collection from the app.
+4. Start telemetry collection from the app and enable the automatic starts you need.
 5. Configure MQTT and/or InfluxDB if needed.
 
 ## Data Model
@@ -52,4 +52,6 @@ Tested on *Chinese version* of `BYD Sea Lion 07 EV 2025`, `DiLink 5.0`
 
 - add Telegram send messages integration
 - improve influxDB reupload
+- change polling collection to callback collection on parameters change
+- add parameter saving when the car is turned down
 - add user notification when database storage approaches its configured limit

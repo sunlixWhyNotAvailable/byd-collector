@@ -75,7 +75,12 @@ class InfluxExportCoordinatorTest {
 
         assertTrue(result.ok)
         assertEquals(99, store.cursor("soc").lastExportedHistoryId)
-        assertTrue(store.cursors.isNotEmpty())
+        assertTrue(store.cursors.keys.containsAll(setOf(
+            "soc_internal",
+            "battery_remaining_energy_kwh",
+            "trip_energy_kwh",
+            "cumulative_energy_kwh"
+        )))
     }
 
     private fun coordinator(

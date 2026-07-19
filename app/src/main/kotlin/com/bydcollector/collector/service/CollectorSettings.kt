@@ -114,22 +114,6 @@ class CollectorSettings(
         )
     }
 
-    fun debugBatchSize(): Int = prefs.getInt(KEY_DEBUG_BATCH_SIZE, DEFAULT_DEBUG_BATCH_SIZE)
-        .coerceIn(1, MAX_DEBUG_BATCH_SIZE)
-
-    //keeps debug autostart safer than manual debug because it may run without the user watching the tablet
-    fun debugAutostartBatchSize(): Int = debugBatchSize().coerceAtMost(SAFE_DEBUG_AUTOSTART_BATCH_SIZE)
-
-    fun setDebugBatchSize(value: Int) {
-        val safeValue = value.coerceIn(1, MAX_DEBUG_BATCH_SIZE)
-        prefs.edit().putInt(KEY_DEBUG_BATCH_SIZE, safeValue).apply()
-        store?.recordEvent(
-            category = "debug_batch_size_updated",
-            message = "Debug batch size updated",
-            detail = "batch_size=$safeValue"
-        )
-    }
-
     fun mqttConfig(): HaMqttConfig {
         //builds an immutable snapshot so async mqtt work uses one consistent set of settings
         return HaMqttConfig(
@@ -618,7 +602,6 @@ class CollectorSettings(
         const val KEY_POLLING_ENABLED = "pollingEnabled"
         const val KEY_DEBUG_POLLING_ENABLED = "debugPollingEnabled"
         const val KEY_DEBUG_AUTO_START = "debugAutoStart"
-        const val KEY_DEBUG_BATCH_SIZE = "debugBatchSize"
         const val KEY_KEEP_WIFI = "keepWifi"
         const val KEY_KEEP_MOBILE_DATA = "keepMobileData"
         const val KEY_KEEP_BLUETOOTH = "keepBluetooth"
@@ -674,9 +657,6 @@ class CollectorSettings(
         const val DEFAULT_ARCHIVE_STORAGE_LIMIT_GB = 2
         const val MIN_ARCHIVE_STORAGE_LIMIT_GB = 1
         const val MAX_ARCHIVE_STORAGE_LIMIT_GB = 10
-        const val DEFAULT_DEBUG_BATCH_SIZE = 500
-        const val SAFE_DEBUG_AUTOSTART_BATCH_SIZE = 500
-        const val MAX_DEBUG_BATCH_SIZE = 6100
         const val DEFAULT_MQTT_PORT = 1883
         const val AUTO_START_ENABLED_UK = "Автозапуск активовано"
         const val AUTO_START_DISABLED_UK = "Автозапуск деактивовано"

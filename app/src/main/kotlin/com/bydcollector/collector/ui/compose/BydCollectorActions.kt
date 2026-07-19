@@ -41,7 +41,6 @@ interface BydCollectorActions {
     fun onStartDebug()
     fun onStopDebug()
     fun onToggleDebugAutoStart(enabled: Boolean)
-    fun onDebugBatchChanged(value: String)
 
     fun onToggleSharedCategories(enabled: Boolean)
     fun onStartMqtt()

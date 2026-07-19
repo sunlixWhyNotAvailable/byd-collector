@@ -340,11 +340,48 @@ class VehicleStateNormalizerTest {
     }
 
     @Test
+    fun normalizesInternalSocAndEnergyWithoutAssumingMonotonicCounters() {
+        val fieldsByKey = NormalizedFieldCatalog.fields.associateBy { it.fieldKey }
+        val fields = listOf(
+            fieldsByKey.getValue("soc_internal"),
+            fieldsByKey.getValue("battery_remaining_energy_kwh"),
+            fieldsByKey.getValue("trip_energy_kwh"),
+            fieldsByKey.getValue("cumulative_energy_kwh")
+        )
+        val output = VehicleStateNormalizer(catalog = fields).normalize(
+            pollId = 72L,
+            observedAt = "2026-07-19T12:00:00+03:00",
+            readings = listOf(
+                PollReading("statistic_remaining_battery_power", "827", "82.7"),
+                PollReading("power_battery_remain_electricity", java.lang.Float.floatToIntBits(51.25f).toString(), "51.25"),
+                PollReading("statistic_statistic_this_trip_total_elec_consumption", java.lang.Float.floatToIntBits(-0.75f).toString(), "-0.75"),
+                PollReading("statistic_total_elec_consumption", java.lang.Float.floatToIntBits(-4.5f).toString(), "-4.5")
+            )
+        )
+
+        assertEquals(82.7, output.single { it.field.fieldKey == "soc_internal" }.value.number)
+        assertEquals(51.25, output.single { it.field.fieldKey == "battery_remaining_energy_kwh" }.value.number)
+        assertEquals(-0.75, output.single { it.field.fieldKey == "trip_energy_kwh" }.value.number)
+        assertEquals(-4.5, output.single { it.field.fieldKey == "cumulative_energy_kwh" }.value.number)
+        output.forEach { assertEquals(NormalizedQuality.OK, it.quality) }
+
+        val invalid = VehicleStateNormalizer(catalog = fields.take(2)).normalize(
+            pollId = 73L,
+            observedAt = "2026-07-19T12:00:01+03:00",
+            readings = listOf(
+                PollReading("statistic_remaining_battery_power", "1001", "100.1"),
+                PollReading("power_battery_remain_electricity", java.lang.Float.floatToIntBits(-1f).toString(), "-1")
+            )
+        )
+        invalid.forEach { assertEquals(NormalizedQuality.INVALID, it.quality) }
+    }
+
+    @Test
     fun catalogVersionAndExpansionWaveExposeRepresentativeFields() {
         val fieldsByKey = NormalizedFieldCatalog.fields.associateBy { it.fieldKey }
 
-        assertEquals("normalized-direct-v9-20260710-bydopenapi-enums", NormalizedFieldCatalog.CATALOG_VERSION)
-        assertEquals(77, NormalizedFieldCatalog.fields.size)
+        assertEquals("normalized-direct-v10-20260719-energy-soc", NormalizedFieldCatalog.CATALOG_VERSION)
+        assertEquals(81, NormalizedFieldCatalog.fields.size)
         assertEquals(emptyList(), NormalizedFieldCatalog.fields.filter { field ->
             field.sourceKeys.any {
                 it.startsWith("adas_") ||
@@ -377,6 +414,36 @@ class VehicleStateNormalizerTest {
         assertFalse(fieldsByKey.containsKey("remaining_battery_power_raw"))
         assertFalse(fieldsByKey.containsKey("max_charge_current_allow_raw"))
         assertFalse(fieldsByKey.getValue("radar_1025_neg_1728053151_5").mqttDefaultEnabled)
+
+        val socInternal = fieldsByKey.getValue("soc_internal")
+        assertEquals(NormalizedCategory.BATTERY, socInternal.category)
+        assertEquals("%", socInternal.unit)
+        assertEquals("battery", socInternal.deviceClass)
+        assertEquals("measurement", socInternal.stateClass)
+        assertEquals(listOf("statistic_remaining_battery_power"), socInternal.sourceKeys)
+        assertEquals("decoded_percent_0_100", socInternal.normalizerId)
+
+        val remainingEnergy = fieldsByKey.getValue("battery_remaining_energy_kwh")
+        assertEquals("kWh", remainingEnergy.unit)
+        assertEquals("energy_storage", remainingEnergy.deviceClass)
+        assertEquals("measurement", remainingEnergy.stateClass)
+        assertEquals(listOf("power_battery_remain_electricity"), remainingEnergy.sourceKeys)
+        assertEquals("decoded_number_non_negative", remainingEnergy.normalizerId)
+
+        val tripEnergy = fieldsByKey.getValue("trip_energy_kwh")
+        assertEquals("energy", tripEnergy.deviceClass)
+        assertEquals(null, tripEnergy.stateClass)
+        assertEquals("decoded_number_raw", tripEnergy.normalizerId)
+
+        val cumulativeEnergy = fieldsByKey.getValue("cumulative_energy_kwh")
+        assertEquals("energy", cumulativeEnergy.deviceClass)
+        assertEquals("total", cumulativeEnergy.stateClass)
+        assertEquals("decoded_number_raw", cumulativeEnergy.normalizerId)
+
+        listOf(socInternal, remainingEnergy, tripEnergy, cumulativeEnergy).forEach {
+            assertEquals(NormalizedCategory.BATTERY, it.category)
+            assertTrue(it.mqttDefaultEnabled)
+        }
     }
 
     @Test

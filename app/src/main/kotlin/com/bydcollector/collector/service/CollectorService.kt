@@ -400,20 +400,7 @@ class CollectorService : Service() {
                     return@execute
                 }
                 if (!settings.isDebugPollingEnabled() || settings.isDebugManuallyStopped()) return@execute
-                val requestedBatchSize = settings.debugBatchSize()
-                //caps automatic debug work so a reboot does not immediately start a huge round-robin load
-                val batchSize = if (reason == DEBUG_REASON_MANUAL) {
-                    requestedBatchSize
-                } else {
-                    settings.debugAutostartBatchSize()
-                }
-                if (batchSize != requestedBatchSize) {
-                    store.recordEvent(
-                        "debug_autostart_batch_clamped",
-                        "Debug autostart batch clamped",
-                        "reason=$reason requested=$requestedBatchSize effective=$batchSize"
-                    )
-                }
+                val batchSize = parameters.size
                 var lastDebugReadModeKey: String? = null
                 val nextPoller = DirectDebugRoundRobinPoller(
                     parameters = parameters,

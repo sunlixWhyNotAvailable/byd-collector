@@ -2,7 +2,7 @@ package com.bydcollector.collector.data.normalized
 
 //semantic catalog that maps curated raw keys to stable fields exposed to dashboard, mqtt, and influx
 object NormalizedFieldCatalog {
-    const val CATALOG_VERSION = "normalized-direct-v9-20260710-bydopenapi-enums"
+    const val CATALOG_VERSION = "normalized-direct-v10-20260719-energy-soc"
 
     val soc = number(
         fieldKey = "soc",
@@ -24,6 +24,10 @@ object NormalizedFieldCatalog {
         sourceKeys = listOf("statistic_1014_1134559272_5"),
         normalizerId = "decoded_percent_0_100"
     )
+    val socInternal = number("soc_internal", NormalizedCategory.BATTERY, "%", "Battery SOC internal", "battery", "measurement", listOf("statistic_remaining_battery_power"), "decoded_percent_0_100")
+    val batteryRemainingEnergy = number("battery_remaining_energy_kwh", NormalizedCategory.BATTERY, "kWh", "Battery remaining energy", "energy_storage", "measurement", listOf("power_battery_remain_electricity"), "decoded_number_non_negative")
+    val tripEnergy = number("trip_energy_kwh", NormalizedCategory.BATTERY, "kWh", "Trip energy", "energy", null, listOf("statistic_statistic_this_trip_total_elec_consumption"), "decoded_number_raw")
+    val cumulativeEnergy = number("cumulative_energy_kwh", NormalizedCategory.BATTERY, "kWh", "Cumulative energy", "energy", "total", listOf("statistic_total_elec_consumption"), "decoded_number_raw")
 
     val batterySoh = number("battery_soh_percent", NormalizedCategory.BATTERY, "%", "Battery SOH", "battery", "measurement", listOf("statistic_1014_1145045032_5"), "decoded_percent_0_100")
     val hvBatteryVoltage = number("hv_battery_voltage_v", NormalizedCategory.BATTERY, "V", "HV battery voltage", "voltage", "measurement", listOf("charging_charge_battery_volt"), "decoded_voltage_v")
@@ -105,6 +109,10 @@ object NormalizedFieldCatalog {
     val fields: List<NormalizedFieldDefinition> = listOf(
         soc,
         socEstimate,
+        socInternal,
+        batteryRemainingEnergy,
+        tripEnergy,
+        cumulativeEnergy,
         batterySoh,
         hvBatteryVoltage,
         chargeCurrent,

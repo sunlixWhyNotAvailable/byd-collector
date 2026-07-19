@@ -37,7 +37,6 @@ data class DashboardState(
     val debugPollingEnabled: Boolean,
     val debugPollingRunning: Boolean,
     val debugAutoStartEnabled: Boolean,
-    val debugBatchSize: Int,
     val debugParameterCount: Int,
     val debugDatabasePath: String,
     val debugDatabaseSizeBytes: Long,

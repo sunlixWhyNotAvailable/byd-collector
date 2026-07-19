@@ -65,7 +65,6 @@ fun BydCollectorApp(
     activeTab: AppTab,
     language: UiLanguage,
     darkTheme: Boolean,
-    debugBatchText: String,
     mqttDraft: MqttDraft,
     influxDraft: InfluxDraft,
     appVersionName: String = "",
@@ -116,7 +115,7 @@ fun BydCollectorApp(
                             //keeps tabs mounted from one state snapshot so service/runtime facts stay consistent
                             when (activeTab) {
                                 AppTab.MAIN -> MainTab(state, s, actions)
-                                AppTab.ALL_PARAMETERS -> AllParametersTab(state, s, language, debugBatchText, actions)
+                                AppTab.ALL_PARAMETERS -> AllParametersTab(state, s, language, actions)
                                 AppTab.HA -> HaTab(state, s, mqttDraft, influxDraft, actions)
                                 AppTab.STORAGE -> StorageTab(state, s, actions) { ids -> pendingArchiveDeleteIds = ids }
                                 AppTab.EXTRA -> ExtraTab(state, s, updateAutoCheckEnabled, actions)
@@ -416,7 +415,6 @@ private fun AllParametersTab(
     state: DashboardState?,
     strings: UiStrings,
     language: UiLanguage,
-    debugBatchText: String,
     actions: BydCollectorActions
 ) {
     Column(
@@ -450,7 +448,7 @@ private fun AllParametersTab(
                 }
                 Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text(strings.parametersPerCycle, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                    NumericInput(debugBatchText, actions::onDebugBatchChanged, modifier = Modifier.width(60.dp))
+                    NumericInput(state?.debugParameterCount?.toString().orEmpty(), modifier = Modifier.width(60.dp))
                 }
             }
             VehicleKpiCard(state, strings, Modifier.weight(2f).height(262.dp))

@@ -124,14 +124,17 @@ class DirectDebugRoundRobinPollerTest {
 
         val rows = DirectDebugParameterAsset.parse(asset.readText(Charsets.UTF_8))
 
-        assertEquals("wide-poll-session-20260605_161751-curated-main77-roundrobin6436-charge-current-v2", DirectDebugParameterAsset.SOURCE_VERSION)
-        assertEquals(6436, rows.size)
+        assertEquals("wide-poll-session-20260605_161751-curated-main81-roundrobin6432-energy-soc-v1", DirectDebugParameterAsset.SOURCE_VERSION)
+        assertEquals(6432, rows.size)
         assertTrue(rows.none { it.key == "statistic_1014_1145045040_5" })
         assertTrue(rows.none { it.key == "charging_charge_current" })
         assertTrue(rows.any { it.key == "charging_charging_charge_current_not_convert" })
         assertTrue(rows.any { it.key == "charging_1009_842006544_5" })
         assertTrue(rows.any { it.key == "power_low_voltage" })
-        assertTrue(rows.any { it.key == "statistic_remaining_battery_power" })
+        assertTrue(rows.none { it.key == "statistic_remaining_battery_power" })
+        assertTrue(rows.none { it.key == "power_battery_remain_electricity" })
+        assertTrue(rows.none { it.key == "statistic_statistic_this_trip_total_elec_consumption" })
+        assertTrue(rows.none { it.key == "statistic_total_elec_consumption" })
         assertTrue(rows.any { it.key == "statistic_1014_877658152_5" })
         assertEquals(
             DirectDebugParameterAsset.EXPECTED_HEADER,

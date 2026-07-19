@@ -39,6 +39,39 @@ class HaDiscoveryBuilderTest {
     }
 
     @Test
+    fun discoveryPublishesInternalSocAndEnergyWithExactStateClasses() {
+        val fieldsByKey = NormalizedFieldCatalog.fields.associateBy { it.fieldKey }
+        val messages = HaDiscoveryBuilder.discoveryMessages(
+            config = config(),
+            fields = listOf(
+                fieldsByKey.getValue("soc_internal"),
+                fieldsByKey.getValue("battery_remaining_energy_kwh"),
+                fieldsByKey.getValue("trip_energy_kwh"),
+                fieldsByKey.getValue("cumulative_energy_kwh")
+            )
+        ).associateBy { it.topic.substringBeforeLast("/config").substringAfterLast('/') }
+
+        assertEquals(4, messages.size)
+        val soc = JSONObject(messages.getValue("soc_internal").payload)
+        assertEquals("battery", soc.getString("device_class"))
+        assertEquals("measurement", soc.getString("state_class"))
+        assertEquals("%", soc.getString("unit_of_measurement"))
+
+        val remaining = JSONObject(messages.getValue("battery_remaining_energy_kwh").payload)
+        assertEquals("energy_storage", remaining.getString("device_class"))
+        assertEquals("measurement", remaining.getString("state_class"))
+        assertEquals("kWh", remaining.getString("unit_of_measurement"))
+
+        val trip = JSONObject(messages.getValue("trip_energy_kwh").payload)
+        assertEquals("energy", trip.getString("device_class"))
+        assertFalse(trip.has("state_class"))
+
+        val cumulative = JSONObject(messages.getValue("cumulative_energy_kwh").payload)
+        assertEquals("energy", cumulative.getString("device_class"))
+        assertEquals("total", cumulative.getString("state_class"))
+    }
+
+    @Test
     fun discoverySkipsDisabledCategories() {
         val messages = HaDiscoveryBuilder.discoveryMessages(
             config = config(enabledCategories = setOf("motion")),

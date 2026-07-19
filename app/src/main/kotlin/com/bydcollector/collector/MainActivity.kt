@@ -71,7 +71,6 @@ class MainActivity : ComponentActivity() {
     private var activeTab by mutableStateOf(AppTab.MAIN)
     private var uiLanguage by mutableStateOf(UiLanguage.UK)
     private var darkTheme by mutableStateOf(true)
-    private var debugBatchText by mutableStateOf("")
     private var mqttDraft by mutableStateOf(MqttDraft())
     private var influxDraft by mutableStateOf(InfluxDraft())
     private var updateUiState by mutableStateOf<UpdateUiState>(UpdateUiState.Hidden)
@@ -231,7 +230,6 @@ class MainActivity : ComponentActivity() {
         override fun onStartDebug() {
             refreshStoreBackedState()
             requestAccessCheck("start_debug", AccessCheckMode.NORMAL)
-            settings.setDebugBatchSize(debugBatchText.toIntOrNull()?.coerceAtLeast(1) ?: 1)
             settings.setDebugManuallyStopped(false)
             settings.setDebugPollingEnabled(true)
             CollectorServiceController.startDebug(this@MainActivity)
@@ -252,11 +250,6 @@ class MainActivity : ComponentActivity() {
                 settings.setDebugAutoStartEnabled(enabled && settings.isAutoStartEnabled())
                 refresh()
             }
-        }
-
-        override fun onDebugBatchChanged(value: String) {
-            debugBatchText = value
-            value.toIntOrNull()?.let { settings.setDebugBatchSize(it.coerceAtLeast(1)) }
         }
 
         override fun onToggleSharedCategories(enabled: Boolean) {
@@ -430,7 +423,6 @@ class MainActivity : ComponentActivity() {
             CollectorAutoStart.recoverFromForeground(applicationContext, settings, currentStore())
         }
         stateProvider = DashboardStateProvider(applicationContext, { BydCollectorApplication.store(applicationContext) }, settings)
-        debugBatchText = settings.debugBatchSize().toString()
         mqttDraft = MqttDraft(
             host = settings.mqttHost(),
             port = settings.mqttPort().toString(),
@@ -455,7 +447,6 @@ class MainActivity : ComponentActivity() {
                 activeTab = activeTab,
                 language = uiLanguage,
                 darkTheme = darkTheme,
-                debugBatchText = debugBatchText,
                 mqttDraft = mqttDraft,
                 influxDraft = influxDraft,
                 appVersionName = BuildConfig.VERSION_NAME,

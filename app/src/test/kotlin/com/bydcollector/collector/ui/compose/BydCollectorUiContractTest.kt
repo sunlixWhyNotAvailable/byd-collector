@@ -58,6 +58,22 @@ class BydCollectorUiContractTest {
     }
 
     @Test
+    fun roundRobinCountIsActualAndReadOnly() {
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val actions = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorActions.kt").readText()
+        val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
+
+        assertTrue(app.contains("NumericInput(state?.debugParameterCount?.toString().orEmpty()"))
+        assertFalse(actions.contains("onDebugBatchChanged"))
+        assertFalse(activity.contains("debugBatchText"))
+        assertFalse(activity.contains("setDebugBatchSize"))
+        val numericInput = components.substringAfter("fun NumericInput(").substringBefore("fun CategoryChip(")
+        assertTrue(numericInput.contains("Text("))
+        assertFalse(numericInput.contains("BasicTextField("))
+    }
+
+    @Test
     fun dialogButtonOrderAndMaintenanceCopyStayFixed() {
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
 

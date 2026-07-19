@@ -3,6 +3,7 @@ package com.bydcollector.collector.ui
 import android.content.Context
 import android.os.SystemClock
 import com.bydcollector.collector.adb.AdbAuthorizationManager
+import com.bydcollector.collector.data.debug.DirectDebugParameterAsset
 import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.debug.DirectDebugStatus
@@ -36,6 +37,7 @@ class DashboardStateProvider(
         debugDatabaseFile = context.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME)
     )
     private var healthCacheRunning: Boolean? = null
+    private val debugParameterCount by lazy { DirectDebugParameterAsset.load(context).size }
 
     fun load(
         includeTelemetryDetails: Boolean = true,
@@ -112,8 +114,7 @@ class DashboardStateProvider(
             debugPollingEnabled = settings.isDebugPollingEnabled(),
             debugPollingRunning = CollectorService.isDebugRunning(),
             debugAutoStartEnabled = settings.isDebugAutoStartEnabled(),
-            debugBatchSize = settings.debugBatchSize(),
-            debugParameterCount = debugStatus.candidateCount,
+            debugParameterCount = debugParameterCount,
             debugDatabasePath = debugStatus.databasePath,
             debugDatabaseSizeBytes = debugStatus.databaseSizeBytes,
             debugReadingCount = debugStatus.readingCount,

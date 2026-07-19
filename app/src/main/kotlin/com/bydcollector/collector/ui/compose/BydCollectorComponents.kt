@@ -542,40 +542,25 @@ fun TextInput(
 @Composable
 fun NumericInput(
     value: String,
-    onValueChange: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val p = LocalBydPalette.current
-    //filters to digits at entry so batch-size parsing never sees symbols or whitespace
     Box(
         modifier = modifier
             .height(42.dp)
             .clip(ControlShape)
-            .background(p.pathField)
+            .background(p.disabled.copy(alpha = 0.30f))
             .border(1.dp, p.pathBorder, ControlShape)
             .padding(horizontal = 10.dp),
         contentAlignment = Alignment.CenterEnd
     ) {
-        BasicTextField(
-            value = value,
-            onValueChange = { candidate ->
-                onValueChange(candidate.filter { it.isDigit() })
-            },
-            singleLine = true,
-            textStyle = TextStyle(
-                color = p.text,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Bold,
-                textAlign = TextAlign.End
-            ),
-            cursorBrush = SolidColor(p.accent),
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            modifier = Modifier.fillMaxWidth(),
-            decorationBox = { innerTextField ->
-                Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
-                    innerTextField()
-                }
-            }
+        Text(
+            text = value,
+            color = p.muted.copy(alpha = 0.6f),
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold,
+            textAlign = TextAlign.End,
+            modifier = Modifier.fillMaxWidth()
         )
     }
 }

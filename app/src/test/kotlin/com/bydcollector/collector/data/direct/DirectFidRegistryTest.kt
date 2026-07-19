@@ -11,13 +11,13 @@ class DirectFidRegistryTest {
     fun registryContainsAllWidePollDynamicReadFields() {
         val entries = DirectFidRegistry.entries
 
-        assertEquals(77, entries.size)
+        assertEquals(81, entries.size)
         assertEquals(entries.size, entries.map { it.key }.distinct().size)
         assertEquals(
             entries.size,
             entries.map { Triple(it.dev, it.fid, it.tx) }.distinct().size
         )
-        assertEquals("autoservice-fid-direct-20260627-curated-77-charge-current-v2", DirectFidRegistry.CATALOG_VERSION)
+        assertEquals("autoservice-fid-direct-20260719-curated-81-energy-soc-v1", DirectFidRegistry.CATALOG_VERSION)
         assertNotNull(entries.firstOrNull { it.key == "statistic_1014_1134559272_5" && it.dev == 1014 && it.fid == 1134559272 && it.tx == 5 })
         assertNotNull(entries.firstOrNull { it.key == "statistic_1014_1145045040_5" && it.dev == 1014 && it.fid == 1145045040 && it.tx == 5 })
         assertNotNull(entries.firstOrNull { it.key == "charging_charge_battery_volt" && it.dev == 1009 && it.fid == 1145045000 && it.tx == 5 })
@@ -29,7 +29,10 @@ class DirectFidRegistryTest {
         assertNotNull(entries.firstOrNull { it.key == "statistic_1014_877658120_5" && it.dev == 1014 && it.fid == 877658120 && it.tx == 5 })
         assertNotNull(entries.firstOrNull { it.key == "statistic_1014_1145045032_5" && it.dev == 1014 && it.fid == 1145045032 && it.tx == 5 })
         assertTrue(entries.none { it.key == "power_low_voltage" })
-        assertTrue(entries.none { it.key == "statistic_remaining_battery_power" })
+        assertNotNull(entries.firstOrNull { it.key == "statistic_remaining_battery_power" && it.dev == 1014 && it.fid == 1148190760 && it.tx == 5 })
+        assertNotNull(entries.firstOrNull { it.key == "power_battery_remain_electricity" && it.dev == 1005 && it.fid == 882901008 && it.tx == 7 })
+        assertNotNull(entries.firstOrNull { it.key == "statistic_statistic_this_trip_total_elec_consumption" && it.dev == 1014 && it.fid == 1246801976 && it.tx == 7 })
+        assertNotNull(entries.firstOrNull { it.key == "statistic_total_elec_consumption" && it.dev == 1014 && it.fid == 1032871984 && it.tx == 7 })
         assertTrue(entries.none { it.key == "statistic_1014_877658152_5" })
         assertTrue(entries.none { it.key.startsWith("adas_") })
         assertTrue(entries.none { it.key == "charging_1009_842006544_5" })
@@ -76,5 +79,27 @@ class DirectFidRegistryTest {
         assertEquals(null, DirectValueDecoders.decode(displaySoc, 255))
         assertEquals("95", DirectValueDecoders.decode(soh, 95))
         assertEquals(null, DirectValueDecoders.decode(soh, 255))
+    }
+
+    @Test
+    fun promotedEnergyAndSocDecodersPreserveNetValues() {
+        val remainingEnergy = DirectFidRegistry.entries.first { it.key == "power_battery_remain_electricity" }
+        val tripEnergy = DirectFidRegistry.entries.first { it.key == "statistic_statistic_this_trip_total_elec_consumption" }
+        val cumulativeEnergy = DirectFidRegistry.entries.first { it.key == "statistic_total_elec_consumption" }
+        val internalSoc = DirectFidRegistry.entries.first { it.key == "statistic_remaining_battery_power" }
+
+        assertEquals(DirectValueDecoder.FLOAT_KWH, remainingEnergy.decoder)
+        assertEquals("80.5", DirectValueDecoders.decode(remainingEnergy, java.lang.Float.floatToRawIntBits(80.5f)))
+        assertEquals(null, DirectValueDecoders.decode(remainingEnergy, java.lang.Float.floatToRawIntBits(-0.1f)))
+        assertEquals(DirectValueDecoder.FLOAT_RAW, tripEnergy.decoder)
+        assertEquals("-0.2", DirectValueDecoders.decode(tripEnergy, java.lang.Float.floatToRawIntBits(-0.2f)))
+        assertEquals(DirectValueDecoder.FLOAT_RAW, cumulativeEnergy.decoder)
+        assertEquals(
+            3029.3,
+            DirectValueDecoders.decode(cumulativeEnergy, java.lang.Float.floatToRawIntBits(3029.3f))!!.toDouble(),
+            0.001
+        )
+        assertEquals(DirectValueDecoder.INT_SCALED, internalSoc.decoder)
+        assertEquals("73.8", DirectValueDecoders.decode(internalSoc, 738))
     }
 }
