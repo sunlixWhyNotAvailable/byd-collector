@@ -125,6 +125,7 @@ class CollectorService : Service() {
             lastAttemptAtMs = { settings.tailscaleActivationLastAttemptAtMs() },
             setLastAttemptAtMs = { settings.setTailscaleActivationLastAttemptAtMs(it) },
             isReachable = endpointProbe::isReachable,
+            processCheck = { TailscaleActivator.checkProcess(applicationContext) },
             activate = { scheduleTailscaleActivation() }
         )
         vehicleStateNormalizer = VehicleStateNormalizer()
@@ -826,8 +827,10 @@ class CollectorService : Service() {
                     TailscaleActivator.runDelayedSequence(
                         isEnabled = { settings.isTailscaleActivationEnabled() },
                         sleeper = { Thread.sleep(it) },
-                        activate = { TailscaleActivator.activate(applicationContext) },
-                        minimize = { TailscaleActivator.minimize(applicationContext) },
+                        launch = { TailscaleActivator.launchIfNeeded(applicationContext) },
+                        restoreForeground = { target ->
+                            TailscaleActivator.restoreForeground(applicationContext, target)
+                        },
                         onEvent = { category, message ->
                             runCatching { store.recordEvent(category, message) }
                         }

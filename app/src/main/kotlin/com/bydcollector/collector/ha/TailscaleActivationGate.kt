@@ -11,6 +11,7 @@ class TailscaleActivationGate(
     private val lastAttemptAtMs: () -> Long,
     private val setLastAttemptAtMs: (Long) -> Unit,
     private val isReachable: (HaEndpoint) -> Boolean,
+    private val processCheck: () -> TailscaleProcessCheck,
     private val activate: () -> TailscaleActivationResult,
     private val nowMs: () -> Long = { System.currentTimeMillis() },
     private val throttleMs: Long = DEFAULT_THROTTLE_MS
@@ -24,6 +25,22 @@ class TailscaleActivationGate(
         }
         if (isReachable(endpoint)) {
             return TailscaleGateDecision(false, "tailscale_activation_skipped_ha_reachable", "HA endpoint reachable")
+        }
+
+        val process = processCheck()
+        if (!process.checked) {
+            return TailscaleGateDecision(
+                false,
+                "tailscale_activation_process_check_failed",
+                process.message
+            )
+        }
+        if (process.running) {
+            return TailscaleGateDecision(
+                false,
+                "tailscale_activation_skipped_running",
+                process.message
+            )
         }
 
         val now = nowMs()

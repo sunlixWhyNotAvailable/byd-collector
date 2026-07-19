@@ -20,7 +20,7 @@
 - `InfluxDB v1` export for historical telemetry
 - main and debug round-robin database archive with shared storage retention
 - shell-side keep-alive recovery with an explicit Shutdown gate and idempotent service reconcile
-- automatic delayed Tailscale app start and background return
+- process-aware delayed Tailscale start with exact foreground task/Home restoration
 - transition-only diagnostics for native, mixed-fallback, and scalar-fallback read modes
 
 ## Installation
@@ -42,7 +42,7 @@ Enum values are treated as field-specific. Unknown fields and unsupported values
 
 BYD Collector can publish MQTT Discovery config and live state topics for Home Assistant. MQTT is intended for current vehicle state, while InfluxDB is intended for longer-term historical telemetry.
 Personally for HA purposes influxDB seems like more viable options since when using in combination with Grafana you can get correct car state in connection with time. While MQTT only sends CURRENT state of the car (which means if you have missing data due to e.g. no HA connection, you're going to lose some statistics).
-When enabled, the built-in Tailscale policy reacts to an unreachable configured HA endpoint, waits for network availability, opens Tailscale through local ADB, and returns it to the background after launch.
+When enabled, the built-in Tailscale policy reacts to an unreachable configured HA endpoint and waits 10 seconds before a technical launch. A running Tailscale process is left untouched. After a real launch, Collector restores the previous main-display task or Home only while Tailscale is still foreground, so a user-selected foreground app is not minimized.
 
 ## Tested
 
