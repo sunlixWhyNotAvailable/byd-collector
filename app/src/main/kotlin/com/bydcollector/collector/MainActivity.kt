@@ -62,6 +62,11 @@ class MainActivity : ComponentActivity() {
     private val updateApkVerifier by lazy { UpdateApkVerifier(applicationContext) }
     private var startupBackgroundLaunchPosted = false
     private var startupAdbSelfCheckPosted = false
+    private var startupAdbSelfCheckSource = "startup"
+    private var startupAccessFlowCompleted = false
+    private var startupUpdateAutoCheckStarted = false
+    private var mainWindowHasFocus = false
+    private var archiveDeletePromptVisible = false
     @Volatile private var refreshInFlight = false
     @Volatile private var updateCheckInFlight = false
     @Volatile private var foreground = false
@@ -88,6 +93,7 @@ class MainActivity : ComponentActivity() {
             handler.postDelayed(this, DASHBOARD_REFRESH_INTERVAL_MS)
         }
     }
+    private val startupAdbSelfCheckTask = Runnable { runStartupAdbSelfCheckIfReady() }
     private val updateAutoCheckTimerTask = Runnable { onUpdateAutoCheckTimerElapsed() }
 
     //maps every ui command to persisted settings plus service intents so process restarts keep the same intent
@@ -204,6 +210,7 @@ class MainActivity : ComponentActivity() {
             pendingMaintenanceOperation = null
             settings.clearDbMaintenanceStatus()
             refresh()
+            maybeContinueStartupAccessFlow()
         }
 
         override fun onSetArchiveStorageLimitGb(value: Int) {
@@ -367,7 +374,9 @@ class MainActivity : ComponentActivity() {
 
         override fun onToggleUpdateAutoCheck(enabled: Boolean) {
             settings.setUpdateAutoCheckEnabled(enabled)
-            handleUpdateAutoCheckAction(UpdateAutoCheckRuntime.onAutoCheckEnabledChanged(enabled))
+            if (startupAccessFlowCompleted) {
+                handleUpdateAutoCheckAction(UpdateAutoCheckRuntime.onAutoCheckEnabledChanged(enabled))
+            }
             refresh()
         }
 
@@ -440,7 +449,6 @@ class MainActivity : ComponentActivity() {
             database = settings.influxDatabase(),
             measurement = settings.influxMeasurement()
         )
-        startRuntimeUpdateAutoCheck()
         setContent {
             BydCollectorApp(
                 state = dashboardState,
@@ -457,7 +465,11 @@ class MainActivity : ComponentActivity() {
                 actions = uiActions,
                 backgroundSetupPromptVisible = backgroundSetupPromptVisible,
                 onOpenBackgroundSettingsFromPrompt = ::onOpenBackgroundSettingsFromPrompt,
-                onDismissBackgroundSetupPrompt = ::onDismissBackgroundSetupPrompt
+                onDismissBackgroundSetupPrompt = ::onDismissBackgroundSetupPrompt,
+                onArchiveDeletePromptVisibilityChanged = { visible ->
+                    archiveDeletePromptVisible = visible
+                    if (!visible) maybeContinueStartupAccessFlow()
+                }
             )
         }
     }
@@ -466,16 +478,20 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         foreground = true
         refresh()
-        val setupHandled = maybeRunStartupSetup()
-        if (!setupHandled) {
-            maybeRunStartupAdbSelfCheck("startup")
-        }
-        runPendingStartupUpdateCheckIfReady()
+        maybeContinueStartupAccessFlow()
+        if (startupUpdateAutoCheckStarted) runPendingStartupUpdateCheckIfReady()
         handler.postDelayed(refreshTask, DASHBOARD_REFRESH_INTERVAL_MS)
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        mainWindowHasFocus = hasFocus
+        if (hasFocus && ::settings.isInitialized) maybeContinueStartupAccessFlow()
     }
 
     override fun onPause() {
         foreground = false
+        mainWindowHasFocus = false
         handler.removeCallbacks(refreshTask)
         super.onPause()
     }
@@ -497,6 +513,7 @@ class MainActivity : ComponentActivity() {
             stateProvider.close()
         }
         handler.removeCallbacks(updateAutoCheckTimerTask)
+        handler.removeCallbacks(startupAdbSelfCheckTask)
         super.onDestroy()
     }
 
@@ -551,6 +568,7 @@ class MainActivity : ComponentActivity() {
                             preserveDebugStatus = !includeDebugStatus,
                             preserveVehicleKpis = !includeVehicleKpis
                         )
+                        maybeContinueStartupAccessFlow()
                     }
                     .onFailure { error ->
                         Log.e(TAG, "Dashboard refresh failed", error)
@@ -593,21 +611,16 @@ class MainActivity : ComponentActivity() {
                 "version=${BuildConfig.VERSION_CODE}"
             )
             currentStore().recordEvent(
-                "adb_authorization_delayed_after_background",
-                "Scheduling delayed ADB self-check after background setup"
+                "adb_authorization_ready_after_background",
+                "Background setup completed; ADB self-check may continue"
             )
-            startupAdbSelfCheckPosted = true
-            scheduleAdbSelfCheck(
-                source = "after_background",
-                delayMs = STARTUP_ADB_SELF_CHECK_DELAY_MS,
-                mode = AccessCheckMode.COLD_START
-            )
-            return true
+            startupAdbSelfCheckSource = "after_background"
+            return false
         }
 
-        if (startupBackgroundLaunchPosted) return true
         val checkedVersion = prefs.getInt(KEY_BACKGROUND_SETTINGS_VERSION, -1)
         if (checkedVersion == BuildConfig.VERSION_CODE) return false
+        if (startupBackgroundLaunchPosted) return true
 
         startupBackgroundLaunchPosted = true
         currentStore().recordEvent(
@@ -634,7 +647,7 @@ class MainActivity : ComponentActivity() {
                 eventKey = "startup_background_settings_unavailable",
                 message = "Background settings could not be opened from setup prompt"
             )
-            maybeRunStartupAdbSelfCheck("startup")
+            maybeContinueStartupAccessFlow()
         }
     }
 
@@ -647,8 +660,8 @@ class MainActivity : ComponentActivity() {
                 eventKey = "startup_background_settings_prompt_dismissed",
                 message = "Background settings setup prompt dismissed"
             )
-            maybeRunStartupAdbSelfCheck("startup")
         }
+        maybeContinueStartupAccessFlow()
     }
 
     private fun markStartupBackgroundSetupHandled(eventKey: String, message: String) {
@@ -713,46 +726,100 @@ class MainActivity : ComponentActivity() {
             "Starting local ADB RSA authorization request",
             "source=$source"
         )
-        requestAccessCheck(source, AccessCheckMode.FORCE)
+        requestAccessCheck(source, AccessCheckMode.FORCE, ::completeStartupAccessFlow)
+    }
+
+    private fun maybeContinueStartupAccessFlow() {
+        if (destroyed) return
+        if (startupAccessFlowCompleted) {
+            maybeStartRuntimeUpdateAutoCheck()
+            return
+        }
+        if (startupAdbSelfCheckPosted) return
+        if (startupUiBlocked()) return
+        if (maybeRunStartupSetup()) return
+        if (startupUiBlocked()) return
+        maybeRunStartupAdbSelfCheck(startupAdbSelfCheckSource)
+    }
+
+    private fun startupUiBlocked(): Boolean {
+        val maintenance = settings.dbMaintenanceStatus()
+        val databaseMaintenanceVisible = pendingMaintenanceOperation != null ||
+            maintenanceLaunchOperation != null ||
+            (maintenance.operation != null && (maintenance.running || maintenance.completed || maintenance.error != null))
+        return startupAccessPromptBlocked(
+            foreground = foreground,
+            windowFocused = mainWindowHasFocus,
+            backgroundPromptVisible = backgroundSetupPromptVisible,
+            updateDialogVisible = updateUiState != UpdateUiState.Hidden,
+            databaseMaintenanceVisible = databaseMaintenanceVisible,
+            archiveStorageRunning = settings.archiveStorageJobStatus().running,
+            archiveDeletePromptVisible = archiveDeletePromptVisible
+        )
     }
 
     private fun maybeRunStartupAdbSelfCheck(source: String) {
         if (startupAdbSelfCheckPosted) return
         startupAdbSelfCheckPosted = true
-        scheduleAdbSelfCheck(
-            source = source,
-            delayMs = STARTUP_ADB_SELF_CHECK_DELAY_MS,
-            mode = AccessCheckMode.COLD_START
+        startupAdbSelfCheckSource = source
+        handler.removeCallbacks(startupAdbSelfCheckTask)
+        handler.postDelayed(startupAdbSelfCheckTask, STARTUP_ADB_SELF_CHECK_DELAY_MS)
+    }
+
+    private fun runStartupAdbSelfCheckIfReady() {
+        if (destroyed || startupAccessFlowCompleted) return
+        if (startupUiBlocked()) {
+            startupAdbSelfCheckPosted = false
+            return
+        }
+        currentStore().recordEvent(
+            "startup_adb_self_check_started",
+            "Starting startup ADB authorization self-check",
+            "source=$startupAdbSelfCheckSource mode=${AccessCheckMode.COLD_START.name.lowercase()}"
         )
+        val submitted = requestAccessCheck(
+            source = startupAdbSelfCheckSource,
+            mode = AccessCheckMode.COLD_START,
+            afterComplete = ::completeStartupAccessFlow
+        )
+        if (!submitted) startupAdbSelfCheckPosted = false
     }
 
-    private fun scheduleAdbSelfCheck(source: String, delayMs: Long, mode: AccessCheckMode) {
-        handler.postDelayed({
-            currentStore().recordEvent(
-                "startup_adb_self_check_started",
-                "Starting startup ADB authorization self-check",
-                "source=$source mode=${mode.name.lowercase()}"
-            )
-            requestAccessCheck(source, mode)
-        }, delayMs)
-    }
-
-    private fun requestAccessCheck(source: String, mode: AccessCheckMode) {
-        AdbAuthorizationManager.request(
+    private fun requestAccessCheck(
+        source: String,
+        mode: AccessCheckMode,
+        afterComplete: (() -> Unit)? = null
+    ): Boolean {
+        return AdbAuthorizationManager.request(
             context = applicationContext,
             store = currentStore(),
             source = source,
             mode = mode,
             onComplete = {
                 handler.post {
-                    if (!destroyed) refresh()
+                    if (!destroyed) {
+                        refresh()
+                        afterComplete?.invoke()
+                    }
                 }
             }
         )
     }
 
+    private fun completeStartupAccessFlow() {
+        if (startupAccessFlowCompleted) return
+        startupAccessFlowCompleted = true
+        maybeStartRuntimeUpdateAutoCheck()
+    }
+
+    private fun maybeStartRuntimeUpdateAutoCheck() {
+        if (startupUpdateAutoCheckStarted || startupUiBlocked()) return
+        startupUpdateAutoCheckStarted = true
+        startRuntimeUpdateAutoCheck()
+    }
+
     private fun startRuntimeUpdateAutoCheck() {
-        //starts the 30s clock at activity runtime creation, even before the app is foregrounded
+        //schedules the process-aged 30s update check only after startup access dialogs are finished
         handleUpdateAutoCheckAction(
             UpdateAutoCheckRuntime.onRuntimeStarted(settings.isUpdateAutoCheckEnabled())
         )
@@ -787,13 +854,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun runAutomaticUpdateCheck() {
-        if (!foreground || destroyed || !settings.isUpdateAutoCheckEnabled()) return
+        if (!startupAccessFlowCompleted || !foreground || destroyed || !settings.isUpdateAutoCheckEnabled()) return
         runUpdateCheck(force = false)
     }
 
     private fun runUpdateCheck(force: Boolean) {
         //guard duplicate update checks while github request is running
-        if (updateCheckInFlight || destroyed) return
+        if (!startupAccessFlowCompleted || updateCheckInFlight || destroyed) return
         updateCheckInFlight = true
         val uiGeneration = ++updateUiGeneration
         if (force) {
@@ -1024,3 +1091,19 @@ private data class VerifiedUpdateDownload(
     val file: File,
     val sha256: String
 )
+
+internal fun startupAccessPromptBlocked(
+    foreground: Boolean,
+    windowFocused: Boolean,
+    backgroundPromptVisible: Boolean,
+    updateDialogVisible: Boolean,
+    databaseMaintenanceVisible: Boolean,
+    archiveStorageRunning: Boolean,
+    archiveDeletePromptVisible: Boolean
+): Boolean = !foreground ||
+    !windowFocused ||
+    backgroundPromptVisible ||
+    updateDialogVisible ||
+    databaseMaintenanceVisible ||
+    archiveStorageRunning ||
+    archiveDeletePromptVisible

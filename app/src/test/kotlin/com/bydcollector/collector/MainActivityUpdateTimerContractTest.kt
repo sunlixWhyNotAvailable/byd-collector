@@ -9,10 +9,20 @@ class MainActivityUpdateTimerContractTest {
     @Test
     fun updateAutoCheckUsesStableRunnableForPostAndRemove() {
         val source = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val onCreate = source.substringAfter("override fun onCreate").substringBefore("override fun onResume")
+        val accessComplete = source.substringAfter("private fun completeStartupAccessFlow()")
+            .substringBefore("private fun maybeStartRuntimeUpdateAutoCheck()")
+        val updateStartGate = source.substringAfter("private fun maybeStartRuntimeUpdateAutoCheck()")
+            .substringBefore("private fun startRuntimeUpdateAutoCheck()")
 
         assertTrue(source.contains("private val updateAutoCheckTimerTask = Runnable { onUpdateAutoCheckTimerElapsed() }"))
         assertTrue(source.contains("handler.removeCallbacks(updateAutoCheckTimerTask)"))
         assertTrue(source.contains("handler.postDelayed(updateAutoCheckTimerTask, action.delayMs)"))
+        assertFalse(onCreate.contains("startRuntimeUpdateAutoCheck()"))
+        assertTrue(accessComplete.contains("maybeStartRuntimeUpdateAutoCheck()"))
+        assertTrue(updateStartGate.contains("if (startupUpdateAutoCheckStarted || startupUiBlocked()) return"))
+        assertTrue(updateStartGate.contains("startRuntimeUpdateAutoCheck()"))
+        assertTrue(source.contains("if (!startupAccessFlowCompleted || updateCheckInFlight || destroyed) return"))
         assertFalse(source.contains("handler.removeCallbacks(::onUpdateAutoCheckTimerElapsed)"))
         assertFalse(source.contains("handler.postDelayed(::onUpdateAutoCheckTimerElapsed"))
     }

@@ -2,7 +2,6 @@ package com.bydcollector.collector.adb
 
 import android.content.Context
 import android.os.SystemClock
-import com.bydcollector.collector.BuildConfig
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.remote.DirectBridgeManager
@@ -10,6 +9,7 @@ import com.bydcollector.collector.system.RequiredAccessChecker
 import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.FutureTask
+import java.util.concurrent.atomic.AtomicBoolean
 
 enum class AccessCheckMode {
     NORMAL,
@@ -26,6 +26,7 @@ data class AccessRuntimeSnapshot(
 object AdbAuthorizationManager {
     private val coordinator = AdbPipelineCoordinator()
     private val repairThrottle = AccessRepairThrottle(REPAIR_COOLDOWN_MS)
+    private val automaticPromptAttemptedInProcess = AtomicBoolean(false)
 
     @Volatile
     private var runtimeSnapshot = AccessRuntimeSnapshot()
@@ -38,7 +39,7 @@ object AdbAuthorizationManager {
         source: String,
         mode: AccessCheckMode,
         onComplete: ((AccessRuntimeSnapshot) -> Unit)? = null
-    ) {
+    ): Boolean {
         val appContext = context.applicationContext
         val submitted = coordinator.submit(mode) { lease ->
             runCheck(appContext, store, source, mode, lease, onComplete)
@@ -50,6 +51,7 @@ object AdbAuthorizationManager {
                 "source=$source mode=${mode.name.lowercase()}"
             )
         }
+        return submitted
     }
 
     private fun runCheck(
@@ -78,7 +80,7 @@ object AdbAuthorizationManager {
 
             if (mode == AccessCheckMode.FORCE || !adbAuthorized || repairAllowed) {
                 val client = adbClient(appContext, store, cancellation)
-                val authorization = authorize(appContext, store, client, source, mode)
+                val authorization = authorize(store, client, source, mode)
                 cancellation.throwIfCancelled()
                 adbAuthorized = authorization.category == "adb_authorization_connected"
                 store.recordEvent(
@@ -158,7 +160,6 @@ object AdbAuthorizationManager {
     }
 
     private fun authorize(
-        appContext: Context,
         store: TelemetryStore,
         client: AdbLocalClient,
         source: String,
@@ -171,24 +172,16 @@ object AdbAuthorizationManager {
             return check
         }
 
-        val fingerprint = client.keyFingerprint()
-        val prefs = appContext.getSharedPreferences(ADB_PREFS, Context.MODE_PRIVATE)
-        val alreadyPrompted =
-            prefs.getString(KEY_AUTO_PROMPTED_KEY_FINGERPRINT, null) == fingerprint &&
-                prefs.getInt(KEY_AUTO_PROMPTED_APP_VERSION, -1) == BuildConfig.VERSION_CODE
-        if (alreadyPrompted) {
+        if (!automaticPromptAttemptedInProcess.compareAndSet(false, true)) {
             store.recordEvent(
                 "adb_auto_prompt_skipped",
-                "ADB automatic RSA prompt already used for this key and version",
-                "source=$source key=${fingerprint.take(16)} version=${BuildConfig.VERSION_CODE}"
+                "ADB automatic RSA prompt already attempted in this app process",
+                "source=$source"
             )
             return check
         }
 
-        prefs.edit()
-            .putString(KEY_AUTO_PROMPTED_KEY_FINGERPRINT, fingerprint)
-            .putInt(KEY_AUTO_PROMPTED_APP_VERSION, BuildConfig.VERSION_CODE)
-            .apply()
+        val fingerprint = client.keyFingerprint()
         store.recordEvent(
             "adb_auto_prompt_once_started",
             "Sending one automatic RSA public key prompt",
@@ -258,9 +251,6 @@ object AdbAuthorizationManager {
         )
     }
 
-    private const val ADB_PREFS = "adb_authorization"
-    private const val KEY_AUTO_PROMPTED_KEY_FINGERPRINT = "adb_auto_prompt_key_fingerprint"
-    private const val KEY_AUTO_PROMPTED_APP_VERSION = "adb_auto_prompt_app_version"
     private const val HELPER_REBIND_WAIT_MS = 1_000L
     private const val REPAIR_COOLDOWN_MS = 60_000L
 }

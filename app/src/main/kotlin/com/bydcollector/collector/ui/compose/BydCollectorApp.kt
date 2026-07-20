@@ -75,7 +75,8 @@ fun BydCollectorApp(
     actions: BydCollectorActions,
     backgroundSetupPromptVisible: Boolean = false,
     onOpenBackgroundSettingsFromPrompt: () -> Unit = {},
-    onDismissBackgroundSetupPrompt: () -> Unit = {}
+    onDismissBackgroundSetupPrompt: () -> Unit = {},
+    onArchiveDeletePromptVisibilityChanged: (Boolean) -> Unit = {}
 ) {
     val s = strings(language)
     //renders the operational dashboard directly; this app intentionally has no landing/marketing screen
@@ -117,7 +118,10 @@ fun BydCollectorApp(
                                 AppTab.MAIN -> MainTab(state, s, actions)
                                 AppTab.ALL_PARAMETERS -> AllParametersTab(state, s, language, actions)
                                 AppTab.HA -> HaTab(state, s, mqttDraft, influxDraft, actions)
-                                AppTab.STORAGE -> StorageTab(state, s, actions) { ids -> pendingArchiveDeleteIds = ids }
+                                AppTab.STORAGE -> StorageTab(state, s, actions) { ids ->
+                                    pendingArchiveDeleteIds = ids
+                                    onArchiveDeletePromptVisibilityChanged(ids.isNotEmpty())
+                                }
                                 AppTab.EXTRA -> ExtraTab(state, s, updateAutoCheckEnabled, actions)
                                 AppTab.LOGS -> LogsTab(state, s, actions)
                             }
@@ -159,10 +163,15 @@ fun BydCollectorApp(
                         strings = s,
                         count = pendingArchiveDeleteIds.size,
                         onConfirm = {
-                            actions.onDeleteArchives(pendingArchiveDeleteIds)
+                            val ids = pendingArchiveDeleteIds
                             pendingArchiveDeleteIds = emptyList()
+                            actions.onDeleteArchives(ids)
+                            onArchiveDeletePromptVisibilityChanged(false)
                         },
-                        onDismiss = { pendingArchiveDeleteIds = emptyList() }
+                        onDismiss = {
+                            pendingArchiveDeleteIds = emptyList()
+                            onArchiveDeletePromptVisibilityChanged(false)
+                        }
                     )
                 }
                 val archiveJob = state?.archiveStorageJobStatus
