@@ -75,8 +75,7 @@ fun BydCollectorApp(
     actions: BydCollectorActions,
     backgroundSetupPromptVisible: Boolean = false,
     onOpenBackgroundSettingsFromPrompt: () -> Unit = {},
-    onDismissBackgroundSetupPrompt: () -> Unit = {},
-    onArchiveDeletePromptVisibilityChanged: (Boolean) -> Unit = {}
+    onDismissBackgroundSetupPrompt: () -> Unit = {}
 ) {
     val s = strings(language)
     //renders the operational dashboard directly; this app intentionally has no landing/marketing screen
@@ -120,7 +119,6 @@ fun BydCollectorApp(
                                 AppTab.HA -> HaTab(state, s, mqttDraft, influxDraft, actions)
                                 AppTab.STORAGE -> StorageTab(state, s, actions) { ids ->
                                     pendingArchiveDeleteIds = ids
-                                    onArchiveDeletePromptVisibilityChanged(ids.isNotEmpty())
                                 }
                                 AppTab.EXTRA -> ExtraTab(state, s, updateAutoCheckEnabled, actions)
                                 AppTab.LOGS -> LogsTab(state, s, actions)
@@ -166,11 +164,9 @@ fun BydCollectorApp(
                             val ids = pendingArchiveDeleteIds
                             pendingArchiveDeleteIds = emptyList()
                             actions.onDeleteArchives(ids)
-                            onArchiveDeletePromptVisibilityChanged(false)
                         },
                         onDismiss = {
                             pendingArchiveDeleteIds = emptyList()
-                            onArchiveDeletePromptVisibilityChanged(false)
                         }
                     )
                 }

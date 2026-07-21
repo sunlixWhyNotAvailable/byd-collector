@@ -6,36 +6,27 @@ import kotlin.test.assertTrue
 
 class StartupAccessPromptGateTest {
     @Test
-    fun focusedForegroundActivityWithoutDialogsAllowsStartupAccess() {
+    fun focusedForegroundActivityWithoutHardSystemFlowAllowsStartupAccess() {
         assertFalse(blocked())
     }
 
     @Test
-    fun everyActivityOrCollectorDialogConditionBlocksStartupAccess() {
+    fun lifecycleAndHardSystemFlowsBlockStartupAccess() {
         assertTrue(blocked(foreground = false))
         assertTrue(blocked(windowFocused = false))
         assertTrue(blocked(backgroundPromptVisible = true))
-        assertTrue(blocked(updateDialogVisible = true))
-        assertTrue(blocked(databaseMaintenanceVisible = true))
-        assertTrue(blocked(archiveStorageRunning = true))
-        assertTrue(blocked(archiveDeletePromptVisible = true))
+        assertTrue(blocked(runtimePermissionRequestInFlight = true))
     }
 
     private fun blocked(
         foreground: Boolean = true,
         windowFocused: Boolean = true,
         backgroundPromptVisible: Boolean = false,
-        updateDialogVisible: Boolean = false,
-        databaseMaintenanceVisible: Boolean = false,
-        archiveStorageRunning: Boolean = false,
-        archiveDeletePromptVisible: Boolean = false
-    ): Boolean = startupAccessPromptBlocked(
+        runtimePermissionRequestInFlight: Boolean = false
+    ): Boolean = startupHardFlowBlocked(
         foreground = foreground,
         windowFocused = windowFocused,
         backgroundPromptVisible = backgroundPromptVisible,
-        updateDialogVisible = updateDialogVisible,
-        databaseMaintenanceVisible = databaseMaintenanceVisible,
-        archiveStorageRunning = archiveStorageRunning,
-        archiveDeletePromptVisible = archiveDeletePromptVisible
+        runtimePermissionRequestInFlight = runtimePermissionRequestInFlight
     )
 }

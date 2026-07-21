@@ -28,10 +28,11 @@
 Download and install the latest APK from GitHub Releases
 After first launch:
 1. Open BYD Collector.
-2. Grant ADB access when Android shows the RSA authorization prompt.
-3. Set `Disable background Apps -> BYD Collector = OFF` in the BYD system settings.
-4. Start telemetry collection from the app and enable the automatic starts you need.
-5. Configure MQTT and/or InfluxDB if needed.
+2. Set `Disable background Apps -> BYD Collector = OFF` when prompted.
+3. Complete any Android runtime permission prompts when present.
+4. Grant ADB access when Android shows the RSA authorization prompt.
+5. Start telemetry collection from the app and enable the automatic starts you need.
+6. Configure MQTT and/or InfluxDB if needed.
 
 ## Data Model
 
