@@ -2,6 +2,7 @@ package com.bydcollector.collector.ui.compose
 
 import java.io.File
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -148,8 +149,15 @@ class BydCollectorUiContractTest {
         assertTrue(app.contains("StatusPill(strings.archiveCalculating, StatusKind.WAITING"))
         assertTrue(app.contains("StatusPill(archiveUsageText(snapshot, strings), archiveUsageKind(snapshot), compact = true)"))
         assertTrue(app.contains("String.format(strings.archiveCountShortTemplate, entries.size)"))
-        assertTrue(app.contains("ReadOnlyPathField(snapshot?.archiveRootPath ?: \"-\", modifier = Modifier.weight(0.5f))"))
+        assertTrue(app.contains("ReadOnlyPathField(snapshot?.archiveRootPath ?: \"-\", modifier = Modifier.weight(1f))"))
+        assertTrue(app.contains("ArchiveShareIconButton("))
+        assertTrue(app.contains(".size(42.dp)"))
+        assertTrue(app.contains("selectedEntries.all { it.status == ArchiveEntryStatus.COMPRESSED_ZIP }"))
+        assertTrue(app.contains("job?.running != true"))
+        assertTrue(app.contains("!CollectorService.isArchiveStorageActive()"))
+        assertTrue(app.contains("actions.onShareArchives(selectedArchiveIds)"))
         assertTrue(app.contains("ActionButton(sortLabel,"))
+        assertTrue(app.contains("modifier = Modifier.width(180.dp)"))
         assertTrue(app.contains("ActionButton(strings.deleteSelected"))
         val archiveEntryRow = app.substringAfter("private fun ArchiveEntryRow(").substringBefore("private fun archiveUsageText")
         assertTrue(archiveEntryRow.contains(".height(48.dp)"))
@@ -159,13 +167,25 @@ class BydCollectorUiContractTest {
         assertTrue(app.contains("UiSizeFormatter.bytes("))
         assertTrue(actions.contains("fun onSetArchiveStorageLimitGb(value: Int)"))
         assertTrue(actions.contains("fun onDeleteArchives(ids: List<String>)"))
-        assertTrue(actions.contains("fun onReconcileArchiveStorage()"))
+        assertTrue(actions.contains("fun onShareArchives(ids: List<String>)"))
+        assertFalse(actions.contains("fun onReconcileArchiveStorage()"))
+        assertFalse(strings.contains("archiveStorageRefresh"))
         assertFalse(strings.contains("compactDatabase"))
         assertTrue(strings.contains("activeDatabase = \"Поточні бази\""))
         assertTrue(strings.contains("activeDatabase = \"Active databases\""))
         assertTrue(actions.contains("fun onOpenArchiveDebugDatabase()"))
         assertTrue(app.contains("actions::onOpenArchiveDebugDatabase"))
         assertTrue(app.contains("DbMaintenanceOperation.DEBUG_ARCHIVE -> strings.archiveDebugDatabase"))
+    }
+
+    @Test
+    fun tabsAreLazyWhileUpdateNotesKeepBoundedVerticalScroll() {
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+
+        assertTrue(app.contains("private fun TabLazyColumn(content: LazyListScope.() -> Unit)"))
+        assertEquals(6, Regex("TabLazyColumn \\{").findAll(app).count())
+        assertEquals(1, Regex("\\.verticalScroll\\(").findAll(app).count())
+        assertTrue(app.contains(".verticalScroll(releaseNotesScroll)"))
     }
 
     @Test

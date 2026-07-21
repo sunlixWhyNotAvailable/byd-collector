@@ -51,7 +51,7 @@ class MainActivityMaintenanceContractTest {
         assertTrue(source.contains("CollectorServiceController.archiveDatabase(this@MainActivity)"))
         assertTrue(actions.contains("fun onSetArchiveStorageLimitGb(value: Int)"))
         assertTrue(actions.contains("fun onDeleteArchives(ids: List<String>)"))
-        assertTrue(actions.contains("fun onReconcileArchiveStorage()"))
+        assertTrue(actions.contains("fun onShareArchives(ids: List<String>)"))
         assertTrue(source.contains("includeArchiveStorageDetails = activeTab == AppTab.STORAGE"))
         assertTrue(source.contains("stateProvider.invalidateArchiveStorageSnapshot()"))
         assertTrue(source.contains("stateProvider.close()"))
@@ -76,6 +76,29 @@ class MainActivityMaintenanceContractTest {
         assertFalse(source.contains("setAction"))
         assertFalse(source.contains("setActionsBatch"))
         assertFalse(source.contains("TX_WRITE"))
+    }
+
+    @Test
+    fun archiveSharingUsesFreshZipResolutionAndReadOnlyContentUris() {
+        val source = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val paths = File("src/main/res/xml/update_file_paths.xml").takeIf { it.isFile }
+            ?: File("app/src/main/res/xml/update_file_paths.xml")
+
+        assertTrue(source.contains("ArchiveStorageManager("))
+        assertTrue(source.contains(".resolveShareZipFiles(requestedIds)"))
+        assertTrue(source.contains("FileProvider.getUriForFile("))
+        assertTrue(source.contains("Intent.ACTION_SEND else Intent.ACTION_SEND_MULTIPLE"))
+        assertTrue(source.contains("type = \"application/zip\""))
+        assertTrue(source.contains("Intent.FLAG_GRANT_READ_URI_PERMISSION"))
+        assertTrue(source.contains("putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))"))
+        assertTrue(source.contains("clipData = ClipData.newUri("))
+        assertTrue(source.contains("clip.addItem(ClipData.Item(it))"))
+        assertTrue(source.contains("val lease = CollectorService.archiveShareLeaseRegistry.acquire(requestedIds)"))
+        assertTrue(source.contains("lease?.let(CollectorService.archiveShareLeaseRegistry::release)"))
+        assertTrue(source.contains("archiveShareInFlight.compareAndSet(false, true)"))
+        assertTrue(source.contains("CollectorService.isArchiveStorageActive()"))
+        assertFalse(source.contains("zipDirectory"))
+        assertTrue(paths.readText().contains("<files-path name=\"database_archives\" path=\"db_archive/\" />"))
     }
 
     private fun sourceFile(path: String): File {

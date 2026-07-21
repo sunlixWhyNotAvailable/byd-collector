@@ -46,3 +46,13 @@ private fun BottomTabIcon.drawableRes(): Int = when (this) {
     BottomTabIcon.GEAR -> R.drawable.ic_tab_options
     BottomTabIcon.LOGS -> R.drawable.ic_tab_logs
 }
+
+@Composable
+fun ShareIcon(contentDescription: String, color: Color, modifier: Modifier = Modifier) {
+    Icon(
+        painter = painterResource(id = R.drawable.ic_share),
+        contentDescription = contentDescription,
+        tint = color,
+        modifier = modifier
+    )
+}

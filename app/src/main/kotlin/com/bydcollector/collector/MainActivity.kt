@@ -1,5 +1,7 @@
 package com.bydcollector.collector
 
+import android.content.ActivityNotFoundException
+import android.content.ClipData
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -10,18 +12,22 @@ import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.core.content.FileProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.bydcollector.collector.adb.AdbAuthorizationManager
 import com.bydcollector.collector.adb.AccessCheckMode
 import com.bydcollector.collector.data.local.TelemetryStore
+import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
 import com.bydcollector.collector.influx.InfluxActionResult
 import com.bydcollector.collector.influx.InfluxActions
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
 import com.bydcollector.collector.maintenance.DbMaintenanceUiState
+import com.bydcollector.collector.maintenance.ArchiveStorageManager
+import com.bydcollector.collector.maintenance.ArchiveShareLeaseRegistry
 import com.bydcollector.collector.mqtt.HaMqttActions
 import com.bydcollector.collector.mqtt.MqttActionResult
 import com.bydcollector.collector.service.CollectorService
@@ -38,6 +44,7 @@ import com.bydcollector.collector.ui.compose.BydCollectorApp
 import com.bydcollector.collector.ui.compose.InfluxDraft
 import com.bydcollector.collector.ui.compose.MqttDraft
 import com.bydcollector.collector.ui.compose.UiLanguage
+import com.bydcollector.collector.ui.compose.strings
 import com.bydcollector.collector.update.UpdateAutoCheckAction
 import com.bydcollector.collector.update.UpdateAutoCheckRuntime
 import com.bydcollector.collector.update.UpdateApkVerifier
@@ -48,6 +55,8 @@ import com.bydcollector.collector.update.UpdateInfo
 import com.bydcollector.collector.update.UpdateUiState
 import com.bydcollector.collector.util.namedSingleThreadExecutor
 import java.io.File
+import java.util.ArrayList
+import java.util.concurrent.atomic.AtomicBoolean
 
 //coordinates the user-facing compose shell while CollectorService owns long-running vehicle work
 class MainActivity : ComponentActivity() {
@@ -70,6 +79,7 @@ class MainActivity : ComponentActivity() {
     @Volatile private var updateCheckInFlight = false
     @Volatile private var foreground = false
     @Volatile private var destroyed = false
+    private val archiveShareInFlight = AtomicBoolean(false)
 
     private var dashboardState by mutableStateOf<DashboardState?>(null)
     private var activeTab by mutableStateOf(AppTab.MAIN)
@@ -226,10 +236,8 @@ class MainActivity : ComponentActivity() {
             refresh()
         }
 
-        override fun onReconcileArchiveStorage() {
-            stateProvider.invalidateArchiveStorageSnapshot()
-            CollectorServiceController.reconcileArchiveStorage(this@MainActivity)
-            refresh()
+        override fun onShareArchives(ids: List<String>) {
+            shareArchives(ids)
         }
 
         override fun onStartDebug() {
@@ -516,6 +524,124 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun currentStore(): TelemetryStore = BydCollectorApplication.store(applicationContext)
+
+    private fun shareArchives(ids: List<String>) {
+        if (!archiveShareInFlight.compareAndSet(false, true)) return
+        val requestedIds = ids.toList()
+        if (CollectorService.isArchiveStorageActive()) {
+            failArchiveShare(requestedIds, null, "archive_job_active")
+            return
+        }
+        val lease = CollectorService.archiveShareLeaseRegistry.acquire(requestedIds)
+        try {
+            dashboardExecutor.execute {
+                if (CollectorService.isArchiveStorageActive()) {
+                    failArchiveShare(requestedIds, lease, "archive_job_started")
+                    return@execute
+                }
+                val files = runCatching {
+                    ArchiveStorageManager(
+                        archiveRoot = File(filesDir, "db_archive"),
+                        mainDatabaseFile = currentStore().databaseFile(),
+                        debugDatabaseFile = getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME)
+                    ).resolveShareZipFiles(requestedIds)
+                }.getOrNull()
+                if (files == null) {
+                    failArchiveShare(requestedIds, lease, "invalid_or_stale_selection")
+                    return@execute
+                }
+                val uris = runCatching {
+                    files.map { file ->
+                        FileProvider.getUriForFile(
+                            this@MainActivity,
+                            "${BuildConfig.APPLICATION_ID}.fileprovider",
+                            file
+                        )
+                    }
+                }.getOrElse {
+                    failArchiveShare(requestedIds, lease, "uri_resolution_failed:${it::class.java.simpleName}")
+                    return@execute
+                }
+                handler.post {
+                    if (destroyed) {
+                        CollectorService.archiveShareLeaseRegistry.release(lease)
+                        archiveShareInFlight.set(false)
+                    } else {
+                        openArchiveShareChooser(requestedIds, uris, lease)
+                    }
+                }
+            }
+        } catch (error: RuntimeException) {
+            failArchiveShare(requestedIds, lease, "executor_rejected:${error::class.java.simpleName}")
+        }
+    }
+
+    private fun openArchiveShareChooser(
+        ids: List<String>,
+        uris: List<Uri>,
+        lease: ArchiveShareLeaseRegistry.Lease
+    ) {
+        try {
+            check(uris.isNotEmpty())
+            val sendIntent = Intent(
+                if (uris.size == 1) Intent.ACTION_SEND else Intent.ACTION_SEND_MULTIPLE
+            ).apply {
+                type = "application/zip"
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                if (uris.size == 1) {
+                    putExtra(Intent.EXTRA_STREAM, uris.first())
+                } else {
+                    putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
+                }
+                clipData = ClipData.newUri(
+                    contentResolver,
+                    strings(uiLanguage).shareSelectedArchives,
+                    uris.first()
+                ).also { clip ->
+                    uris.drop(1).forEach { clip.addItem(ClipData.Item(it)) }
+                }
+            }
+            startActivity(Intent.createChooser(sendIntent, strings(uiLanguage).shareSelectedArchives))
+            currentStore().recordEvent(
+                "archive_share_chooser_opened",
+                "Archive share chooser opened",
+                "count=${ids.size}"
+            )
+        } catch (error: ActivityNotFoundException) {
+            failArchiveShare(ids, lease, "no_share_target")
+            return
+        } catch (error: RuntimeException) {
+            failArchiveShare(ids, lease, "chooser_failed:${error::class.java.simpleName}")
+            return
+        } finally {
+            archiveShareInFlight.set(false)
+        }
+    }
+
+    private fun failArchiveShare(
+        ids: List<String>,
+        lease: ArchiveShareLeaseRegistry.Lease?,
+        reason: String
+    ) {
+        lease?.let(CollectorService.archiveShareLeaseRegistry::release)
+        archiveShareInFlight.set(false)
+        currentStore().recordEvent(
+            "archive_share_failed",
+            "Archive share rejected",
+            "reason=$reason count=${ids.size}"
+        )
+        if (!destroyed) {
+            handler.post {
+                if (!destroyed) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        strings(uiLanguage).archiveShareFailed,
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        }
+    }
 
     private fun refreshStoreBackedState() {
         store = currentStore()

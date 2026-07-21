@@ -18,7 +18,7 @@
 - normalized vehicle state for three SOC sources, remaining/trip/cumulative battery energy, charging, doors, tires, climate, speed, odometer, radar distance sensors and related fields
 - Home Assistant MQTT Discovery and live-state publishing
 - `InfluxDB v1` export for historical telemetry
-- main and debug round-robin database archive with shared storage retention
+- main and debug round-robin database archives with shared storage retention and Android chooser sharing for completed ZIP archives
 - shell-side keep-alive recovery with an explicit Shutdown gate and idempotent service reconcile
 - process-aware delayed Tailscale start with exact foreground task/Home restoration
 - transition-only diagnostics for native, mixed-fallback, and scalar-fallback read modes

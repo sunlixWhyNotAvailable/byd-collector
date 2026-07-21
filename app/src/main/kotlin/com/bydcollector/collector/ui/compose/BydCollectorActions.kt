@@ -36,7 +36,7 @@ interface BydCollectorActions {
     fun onDismissDatabaseMaintenance()
     fun onSetArchiveStorageLimitGb(value: Int)
     fun onDeleteArchives(ids: List<String>)
-    fun onReconcileArchiveStorage()
+    fun onShareArchives(ids: List<String>)
 
     fun onStartDebug()
     fun onStopDebug()

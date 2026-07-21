@@ -46,6 +46,7 @@ import com.bydcollector.collector.ha.TailscaleActivationGate
 import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
 import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.ArchiveStorageManager
+import com.bydcollector.collector.maintenance.ArchiveShareLeaseRegistry
 import com.bydcollector.collector.maintenance.DbMaintenanceCoordinator
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.mqtt.HaMqttConfig
@@ -97,7 +98,6 @@ class CollectorService : Service() {
     private val maintenanceActive = AtomicBoolean(false)
     @Volatile
     private var activeMaintenanceOperation: DbMaintenanceOperation? = null
-    private val archiveStorageActive = AtomicBoolean(false)
     private val tailscaleSequenceActive = AtomicBoolean(false)
     private val restoringRuntime = AtomicBoolean(false)
     private var lastStatusHeartbeatAtMs: Long = -STATUS_HEARTBEAT_INTERVAL_MS
@@ -857,7 +857,7 @@ class CollectorService : Service() {
         val mainRunning = poller.isRunning()
         val debugRunningNow = isDebugPollerRunning()
         val keepAliveEnabled = settings.keepAliveConfig().anyEnabled
-        if (mainRunning || debugRunningNow || keepAliveEnabled || settings.isMqttEnabled() || settings.isInfluxEnabled() || archiveStorageActive.get()) {
+        if (mainRunning || debugRunningNow || keepAliveEnabled || settings.isMqttEnabled() || settings.isInfluxEnabled() || archiveStorageActiveInProcess.get()) {
             return
         }
         releaseWakeLock()
@@ -1136,13 +1136,14 @@ class CollectorService : Service() {
         enqueueArchiveStorageWork("archive_storage_delete_rejected") {
             val manager = archiveStorageManager()
             val limitBytes = settings.archiveStorageLimitGb() * 1024L * 1024L * 1024L
+            archiveShareLeaseRegistry.forceRelease(ids)
             manager.deleteArchiveIds(ids, ::publishArchiveStorageStatus)
             manager.enforceRetention(limitBytes, ::publishArchiveStorageStatus)
         }
     }
 
     private fun enqueueArchiveStorageWork(errorCategory: String, work: () -> Unit) {
-        if (!archiveStorageActive.compareAndSet(false, true)) return
+        if (!archiveStorageActiveInProcess.compareAndSet(false, true)) return
         try {
             archiveStorageExecutor.execute {
                 try {
@@ -1167,12 +1168,12 @@ class CollectorService : Service() {
                         settings.clearArchiveStorageJobStatus()
                     }
                 } finally {
-                    archiveStorageActive.set(false)
+                    archiveStorageActiveInProcess.set(false)
                     mainHandler.post { stopIfNoActiveRuntime() }
                 }
             }
         } catch (error: RejectedExecutionException) {
-            archiveStorageActive.set(false)
+            archiveStorageActiveInProcess.set(false)
             store.recordEvent(
                 errorCategory,
                 "Archive storage action rejected",
@@ -1185,7 +1186,8 @@ class CollectorService : Service() {
         return ArchiveStorageManager(
             archiveRoot = File(applicationContext.filesDir, "db_archive"),
             mainDatabaseFile = store.databaseFile(),
-            debugDatabaseFile = applicationContext.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME)
+            debugDatabaseFile = applicationContext.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME),
+            isRetentionProtected = archiveShareLeaseRegistry::isActive
         )
     }
 
@@ -1326,11 +1328,16 @@ class CollectorService : Service() {
         private val mainPollingRunning = AtomicBoolean(false)
         private val debugRunning = AtomicBoolean(false)
         private val maintenanceRunningInProcess = AtomicBoolean(false)
+        private val archiveStorageActiveInProcess = AtomicBoolean(false)
+        val archiveShareLeaseRegistry = ArchiveShareLeaseRegistry(
+            elapsedRealtimeMs = { SystemClock.elapsedRealtime() }
+        )
 
         fun isRunning(): Boolean = running.get()
         fun isMainPollingRunning(): Boolean = mainPollingRunning.get()
         fun isDebugRunning(): Boolean = debugRunning.get()
         fun isMaintenanceRunningInProcess(): Boolean = maintenanceRunningInProcess.get()
+        fun isArchiveStorageActive(): Boolean = archiveStorageActiveInProcess.get()
 
         fun startIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
             action = ACTION_START

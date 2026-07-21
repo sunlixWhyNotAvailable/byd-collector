@@ -1,11 +1,14 @@
 package com.bydcollector.collector.maintenance
 
 import java.io.File
+import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
+import java.util.zip.ZipOutputStream
 import kotlin.io.path.createTempDirectory
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class ArchiveStorageManagerTest {
@@ -122,6 +125,98 @@ class ArchiveStorageManagerTest {
         assertTrue(newDebug.exists())
     }
 
+    @Test
+    fun retentionSkipsProtectedArchives() {
+        val root = createTempDirectory().toFile()
+        val main = File(root, "bydcollector_telemetry.db").apply { writeText("main") }
+        val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+        val leased = archive(archiveRoot, "bydcollector_telemetry_20260713_010000.zip", 1_000L)
+        val deletable = archive(archiveRoot, "bydcollector_telemetry_20260713_020000.zip", 2_000L)
+        val newest = archive(archiveRoot, "bydcollector_telemetry_20260713_030000.zip", 3_000L)
+        val manager = ArchiveStorageManager(
+            archiveRoot,
+            main,
+            File(root, "bydcollector_debug_round_robin.db"),
+            isRetentionProtected = { it == leased.name }
+        )
+
+        assertEquals(1, manager.enforceRetention(limitBytes = leased.length() + newest.length()))
+
+        assertTrue(leased.exists())
+        assertFalse(deletable.exists())
+        assertTrue(newest.exists())
+    }
+
+    @Test
+    fun retentionRechecksProtectionImmediatelyBeforeDelete() {
+        val root = createTempDirectory().toFile()
+        val main = File(root, "bydcollector_telemetry.db").apply { writeText("main") }
+        val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+        val leasedDuringRetention = archive(archiveRoot, "bydcollector_telemetry_20260713_010000.zip", 1_000L)
+        val deletable = archive(archiveRoot, "bydcollector_telemetry_20260713_020000.zip", 2_000L)
+        val newest = archive(archiveRoot, "bydcollector_telemetry_20260713_030000.zip", 3_000L)
+        var leaseActive = false
+        val manager = ArchiveStorageManager(
+            archiveRoot,
+            main,
+            File(root, "bydcollector_debug_round_robin.db"),
+            isRetentionProtected = { it == leasedDuringRetention.name && leaseActive }
+        )
+
+        assertEquals(
+            1,
+            manager.enforceRetention(limitBytes = leasedDuringRetention.length() + newest.length()) { status ->
+                if (status.itemId == leasedDuringRetention.name) leaseActive = true
+            }
+        )
+
+        assertTrue(leasedDuringRetention.exists())
+        assertFalse(deletable.exists())
+        assertTrue(newest.exists())
+    }
+
+    @Test
+    fun shareZipResolutionIsFreshStrictAndPreservesRequestedOrder() {
+        val root = createTempDirectory().toFile()
+        val main = File(root, "bydcollector_telemetry.db").apply { writeText("main") }
+        val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+        val first = zip(archiveRoot, "bydcollector_telemetry_20260713_010000.zip")
+        val second = zip(archiveRoot, "bydcollector_debug_round_robin_20260713_020000.zip")
+        val manager = manager(archiveRoot, main)
+
+        assertEquals(listOf(second, first), manager.resolveShareZipFiles(listOf(second.name, first.name)))
+        first.delete()
+        assertNull(manager.resolveShareZipFiles(listOf(first.name)))
+    }
+
+    @Test
+    fun shareZipResolutionRejectsInvalidSelections() {
+        val root = createTempDirectory().toFile()
+        val main = File(root, "bydcollector_telemetry.db").apply { writeText("main") }
+        val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+        val valid = zip(archiveRoot, "bydcollector_telemetry_20260713_010000.zip")
+        val raw = File(archiveRoot, "bydcollector_telemetry_20260713_020000").apply { mkdirs() }
+        val tmp = File(archiveRoot, "bydcollector_telemetry_20260713_030000.zip.tmp").apply { writeText("tmp") }
+        val empty = File(archiveRoot, "bydcollector_telemetry_20260713_040000.zip").apply { createNewFile() }
+        val corrupt = File(archiveRoot, "bydcollector_telemetry_20260713_050000.zip").apply { writeText("not a zip") }
+        val nonZip = File(archiveRoot, "bydcollector_telemetry_20260713_060000.txt").apply { writeText("text") }
+        val zipDirectory = File(archiveRoot, "bydcollector_telemetry_20260713_070000.zip").apply { mkdirs() }
+        val manager = manager(archiveRoot, main)
+
+        listOf(
+            emptyList(),
+            listOf(valid.name, valid.name),
+            listOf("../${valid.name}"),
+            listOf("missing.zip"),
+            listOf(raw.name),
+            listOf(tmp.name),
+            listOf(empty.name),
+            listOf(corrupt.name),
+            listOf(nonZip.name),
+            listOf(zipDirectory.name)
+        ).forEach { ids -> assertNull(manager.resolveShareZipFiles(ids), "Expected rejection for $ids") }
+    }
+
     private fun manager(archiveRoot: File, main: File): ArchiveStorageManager {
         return ArchiveStorageManager(archiveRoot, main, File(main.parentFile, "bydcollector_debug_round_robin.db"))
     }
@@ -130,6 +225,16 @@ class ArchiveStorageManagerTest {
         return File(root, name).apply {
             writeText("archive-$name")
             setLastModified(modifiedAt)
+        }
+    }
+
+    private fun zip(root: File, name: String): File {
+        return File(root, name).also { file ->
+            ZipOutputStream(file.outputStream()).use { archive ->
+                archive.putNextEntry(ZipEntry("database.db"))
+                archive.write("database".toByteArray())
+                archive.closeEntry()
+            }
         }
     }
 }

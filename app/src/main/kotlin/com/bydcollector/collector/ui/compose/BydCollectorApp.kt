@@ -20,6 +20,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
@@ -54,6 +56,7 @@ import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
 import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.maintenance.DbMaintenanceUiState
+import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.ui.DashboardState
 import com.bydcollector.collector.update.UpdateInfo
 import com.bydcollector.collector.update.UpdateUiState
@@ -329,29 +332,35 @@ private fun TopHeader(
 private val Rounded8 = androidx.compose.foundation.shape.RoundedCornerShape(8.dp)
 
 @Composable
+private fun TabLazyColumn(content: LazyListScope.() -> Unit) {
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+        content = content
+    )
+}
+
+@Composable
 private fun MainTab(state: DashboardState?, strings: UiStrings, actions: BydCollectorActions) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        ScreenTitle(strings.mainTab, strings.mainSubtitle)
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            MainCollectionCard(
-                state = state,
-                strings = strings,
-                actions = actions,
-                modifier = Modifier.weight(1.15f)
-            )
-            MainStatusCard(
-                state = state,
-                strings = strings,
-                actions = actions,
-                modifier = Modifier.weight(1f)
-            )
+    TabLazyColumn {
+        item { ScreenTitle(strings.mainTab, strings.mainSubtitle) }
+        item {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                MainCollectionCard(
+                    state = state,
+                    strings = strings,
+                    actions = actions,
+                    modifier = Modifier.weight(1.15f)
+                )
+                MainStatusCard(
+                    state = state,
+                    strings = strings,
+                    actions = actions,
+                    modifier = Modifier.weight(1f)
+                )
+            }
         }
-        MainDatabaseCard(state, strings, modifier = Modifier.fillMaxWidth())
+        item { MainDatabaseCard(state, strings, modifier = Modifier.fillMaxWidth()) }
     }
 }
 
@@ -422,43 +431,40 @@ private fun AllParametersTab(
     language: UiLanguage,
     actions: BydCollectorActions
 ) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        ScreenTitle(strings.allTab, strings.allSubtitle)
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            SectionCard(
-                title = strings.controls,
-                trailing = {
-                    StatusPill(
-                        if (state?.debugPollingRunning == true) strings.running else strings.waiting,
-                        if (state?.debugPollingRunning == true) StatusKind.OK else StatusKind.WAITING,
-                        compact = true
-                    )
-                },
-                modifier = Modifier
-                    .weight(1f)
-                    .height(262.dp)
-            ) {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    ActionButton(strings.start, actions::onStartDebug, primary = true, enabled = state?.debugPollingRunning != true, modifier = Modifier.weight(1f))
-                    ActionButton(strings.stop, actions::onStopDebug, enabled = state?.debugPollingRunning == true, modifier = Modifier.weight(1f))
+    TabLazyColumn {
+        item { ScreenTitle(strings.allTab, strings.allSubtitle) }
+        item {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                SectionCard(
+                    title = strings.controls,
+                    trailing = {
+                        StatusPill(
+                            if (state?.debugPollingRunning == true) strings.running else strings.waiting,
+                            if (state?.debugPollingRunning == true) StatusKind.OK else StatusKind.WAITING,
+                            compact = true
+                        )
+                    },
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(262.dp)
+                ) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        ActionButton(strings.start, actions::onStartDebug, primary = true, enabled = state?.debugPollingRunning != true, modifier = Modifier.weight(1f))
+                        ActionButton(strings.stop, actions::onStopDebug, enabled = state?.debugPollingRunning == true, modifier = Modifier.weight(1f))
+                    }
+                    Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(strings.autoStart, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                        BydSwitch(state?.debugAutoStartEnabled == true, actions::onToggleDebugAutoStart, enabled = state?.autoStartEnabled == true)
+                    }
+                    Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(strings.parametersPerCycle, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                        NumericInput(state?.debugParameterCount?.toString().orEmpty(), modifier = Modifier.width(60.dp))
+                    }
                 }
-                Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(strings.autoStart, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                    BydSwitch(state?.debugAutoStartEnabled == true, actions::onToggleDebugAutoStart, enabled = state?.autoStartEnabled == true)
-                }
-                Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(strings.parametersPerCycle, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                    NumericInput(state?.debugParameterCount?.toString().orEmpty(), modifier = Modifier.width(60.dp))
-                }
+                VehicleKpiCard(state, strings, Modifier.weight(2f).height(262.dp))
             }
-            VehicleKpiCard(state, strings, Modifier.weight(2f).height(262.dp))
         }
-        DebugDatabaseCard(state, strings, actions, Modifier.fillMaxWidth())
+        item { DebugDatabaseCard(state, strings, actions, Modifier.fillMaxWidth()) }
     }
 }
 
@@ -513,21 +519,20 @@ private fun HaTab(
     influxDraft: InfluxDraft,
     actions: BydCollectorActions
 ) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        Row(Modifier.fillMaxWidth().height(36.dp), verticalAlignment = Alignment.CenterVertically) {
-            ScreenTitle(strings.haTab, strings.haSubtitle, modifier = Modifier.weight(1f))
-            Text(strings.sharedCategories, color = LocalBydPalette.current.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.width(10.dp))
-            BydSwitch(state?.haSharedCategoriesEnabled == true, actions::onToggleSharedCategories, enabled = state?.influxEnabled != true)
+    TabLazyColumn {
+        item {
+            Row(Modifier.fillMaxWidth().height(36.dp), verticalAlignment = Alignment.CenterVertically) {
+                ScreenTitle(strings.haTab, strings.haSubtitle, modifier = Modifier.weight(1f))
+                Text(strings.sharedCategories, color = LocalBydPalette.current.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.width(10.dp))
+                BydSwitch(state?.haSharedCategoriesEnabled == true, actions::onToggleSharedCategories, enabled = state?.influxEnabled != true)
+            }
         }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            MqttCard(state, strings, mqttDraft, actions, Modifier.weight(1f))
-            InfluxCard(state, strings, influxDraft, actions, Modifier.weight(1f))
+        item {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                MqttCard(state, strings, mqttDraft, actions, Modifier.weight(1f))
+                InfluxCard(state, strings, influxDraft, actions, Modifier.weight(1f))
+            }
         }
     }
 }
@@ -702,48 +707,45 @@ private fun ExtraTab(
     updateAutoCheckEnabled: Boolean,
     actions: BydCollectorActions
 ) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        ScreenTitle(strings.extraTab, strings.extraSubtitle)
-        val optionsCardHeight = 312.dp
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            SectionCard(strings.keepAlive, Modifier.weight(1f).height(optionsCardHeight)) {
-                Column(Modifier.fillMaxWidth()) {
-                    SwitchRow(
-                        strings.keepWifi,
-                        state?.keepWifiEnabled == true,
-                        actions::onToggleKeepWifi
-                    )
-                    SwitchRow(
-                        strings.keepMobile,
-                        state?.keepMobileDataEnabled == true,
-                        actions::onToggleKeepMobile
-                    )
-                    SwitchRow(
-                        strings.keepBluetooth,
-                        state?.keepBluetoothEnabled == true,
-                        actions::onToggleKeepBluetooth
-                    )
-                    SwitchRow(
-                        strings.restoreCollector,
-                        state?.recoverCollectorServiceEnabled == true,
-                        actions::onToggleKeepCollector,
-                        divider = false
-                    )
+    val optionsCardHeight = 312.dp
+    TabLazyColumn {
+        item { ScreenTitle(strings.extraTab, strings.extraSubtitle) }
+        item {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                SectionCard(strings.keepAlive, Modifier.weight(1f).height(optionsCardHeight)) {
+                    Column(Modifier.fillMaxWidth()) {
+                        SwitchRow(
+                            strings.keepWifi,
+                            state?.keepWifiEnabled == true,
+                            actions::onToggleKeepWifi
+                        )
+                        SwitchRow(
+                            strings.keepMobile,
+                            state?.keepMobileDataEnabled == true,
+                            actions::onToggleKeepMobile
+                        )
+                        SwitchRow(
+                            strings.keepBluetooth,
+                            state?.keepBluetoothEnabled == true,
+                            actions::onToggleKeepBluetooth
+                        )
+                        SwitchRow(
+                            strings.restoreCollector,
+                            state?.recoverCollectorServiceEnabled == true,
+                            actions::onToggleKeepCollector,
+                            divider = false
+                        )
+                    }
                 }
-            }
-            SectionCard(strings.appRuntime, Modifier.weight(1f).height(optionsCardHeight)) {
-                TailscaleRuntimeRow(strings, state?.tailscaleActivationEnabled == true, actions::onToggleTailscaleActivation)
-                UpdateSettingsRow(
-                    strings = strings,
-                    updateAutoCheckEnabled = updateAutoCheckEnabled,
-                    actions = actions
-                )
-                ShutdownSettingsRow(strings = strings, actions = actions)
+                SectionCard(strings.appRuntime, Modifier.weight(1f).height(optionsCardHeight)) {
+                    TailscaleRuntimeRow(strings, state?.tailscaleActivationEnabled == true, actions::onToggleTailscaleActivation)
+                    UpdateSettingsRow(
+                        strings = strings,
+                        updateAutoCheckEnabled = updateAutoCheckEnabled,
+                        actions = actions
+                    )
+                    ShutdownSettingsRow(strings = strings, actions = actions)
+                }
             }
         }
     }
@@ -877,6 +879,47 @@ private fun ShutdownIconButton(onClick: () -> Unit) {
         contentAlignment = Alignment.Center
     ) {
         ShutdownIcon(color = p.red, modifier = Modifier.size(23.dp))
+    }
+}
+
+@Composable
+private fun ArchiveShareIconButton(
+    enabled: Boolean,
+    contentDescription: String,
+    onClick: () -> Unit
+) {
+    val p = LocalBydPalette.current
+    val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
+    val press = rememberForcedPressClick(enabled = enabled, onClick = onClick)
+    val visualPressed = pressed || press.visualPressed
+    val background = when {
+        !enabled -> p.surface
+        visualPressed -> p.accent.copy(alpha = 0.72f)
+        else -> p.accent.copy(alpha = 0.12f)
+    }
+    Box(
+        modifier = Modifier
+            .size(42.dp)
+            .pressScaleModifier(interactionSource, forcePressed = press.visualPressed)
+            .background(background, Rounded8)
+            .border(1.dp, if (enabled) p.accent.copy(alpha = 0.85f) else p.borderStrong, Rounded8)
+            .clickable(
+                enabled = enabled && !press.locked,
+                interactionSource = interactionSource,
+                indication = null
+            ) { press.onClick() },
+        contentAlignment = Alignment.Center
+    ) {
+        ShareIcon(
+            contentDescription = contentDescription,
+            color = when {
+                !enabled -> p.muted.copy(alpha = 0.62f)
+                visualPressed -> p.accentText
+                else -> p.accent
+            },
+            modifier = Modifier.size(24.dp)
+        )
     }
 }
 
@@ -1207,109 +1250,119 @@ private fun StorageTab(
         entries.sortedWith(compareBy<ArchiveStorageEntry> { it.createdAtMs }.thenBy { it.id })
     }
     val job = state?.archiveStorageJobStatus
+    val selectedArchiveIds = sortedEntries.filter { selectedIds.contains(it.id) }.map { it.id }
+    val selectedEntries = entries.filter { selectedIds.contains(it.id) }
+    val shareEnabled = selectedIds.isNotEmpty() &&
+        selectedEntries.size == selectedIds.size &&
+        selectedEntries.all { it.status == ArchiveEntryStatus.COMPRESSED_ZIP } &&
+        job?.running != true &&
+        !CollectorService.isArchiveStorageActive()
     val topCardHeight = 156.dp
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        ScreenTitle(strings.storageTab, strings.storageSubtitle)
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            SectionCard(strings.activeDatabase, modifier = Modifier.weight(0.6f).height(topCardHeight)) {
-                Row(
-                    Modifier.fillMaxWidth().height(34.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        strings.size,
-                        color = LocalBydPalette.current.text,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.weight(1f),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        String.format(
-                            strings.activeDatabaseSizeTemplate,
-                            UiSizeFormatter.bytes(snapshot?.activeDatabaseSizeBytes ?: ((state?.databaseSizeBytes ?: 0L) + (state?.debugDatabaseSizeBytes ?: 0L)), strings),
-                            UiSizeFormatter.bytes(snapshot?.mainDatabaseSizeBytes ?: state?.databaseSizeBytes ?: 0L, strings),
-                            UiSizeFormatter.bytes(snapshot?.debugDatabaseSizeBytes ?: state?.debugDatabaseSizeBytes ?: 0L, strings)
-                        ),
-                        color = LocalBydPalette.current.text,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        textAlign = TextAlign.End,
-                        modifier = Modifier.weight(2.8f),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+    TabLazyColumn {
+        item { ScreenTitle(strings.storageTab, strings.storageSubtitle) }
+        item {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                SectionCard(strings.activeDatabase, modifier = Modifier.weight(0.6f).height(topCardHeight)) {
+                    Row(
+                        Modifier.fillMaxWidth().height(34.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            strings.size,
+                            color = LocalBydPalette.current.text,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.weight(1f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            String.format(
+                                strings.activeDatabaseSizeTemplate,
+                                UiSizeFormatter.bytes(snapshot?.activeDatabaseSizeBytes ?: ((state?.databaseSizeBytes ?: 0L) + (state?.debugDatabaseSizeBytes ?: 0L)), strings),
+                                UiSizeFormatter.bytes(snapshot?.mainDatabaseSizeBytes ?: state?.databaseSizeBytes ?: 0L, strings),
+                                UiSizeFormatter.bytes(snapshot?.debugDatabaseSizeBytes ?: state?.debugDatabaseSizeBytes ?: 0L, strings)
+                            ),
+                            color = LocalBydPalette.current.text,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            textAlign = TextAlign.End,
+                            modifier = Modifier.weight(2.8f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                 }
-            }
-            SectionCard(strings.archiveStorageLimit, modifier = Modifier.weight(0.4f).height(topCardHeight)) {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                    ActionButton("-", { draftLimitGb = (draftLimitGb - 1).coerceAtLeast(1) }, enabled = draftLimitGb > 1, modifier = Modifier.width(42.dp))
-                    ReadOnlyPathField(UiSizeFormatter.gigabytes(draftLimitGb, strings), modifier = Modifier.weight(0.7f))
-                    ActionButton("+", { draftLimitGb = (draftLimitGb + 1).coerceAtMost(10) }, enabled = draftLimitGb < 10, modifier = Modifier.width(42.dp))
-                    ActionButton(strings.ok, { actions.onSetArchiveStorageLimitGb(draftLimitGb) }, primary = true, enabled = draftLimitGb != limitGb, modifier = Modifier.weight(1f))
+                SectionCard(strings.archiveStorageLimit, modifier = Modifier.weight(0.4f).height(topCardHeight)) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        ActionButton("-", { draftLimitGb = (draftLimitGb - 1).coerceAtLeast(1) }, enabled = draftLimitGb > 1, modifier = Modifier.width(42.dp))
+                        ReadOnlyPathField(UiSizeFormatter.gigabytes(draftLimitGb, strings), modifier = Modifier.weight(0.7f))
+                        ActionButton("+", { draftLimitGb = (draftLimitGb + 1).coerceAtMost(10) }, enabled = draftLimitGb < 10, modifier = Modifier.width(42.dp))
+                        ActionButton(strings.ok, { actions.onSetArchiveStorageLimitGb(draftLimitGb) }, primary = true, enabled = draftLimitGb != limitGb, modifier = Modifier.weight(1f))
+                    }
+                    Text(strings.archiveStorageLimitHint, color = LocalBydPalette.current.muted, fontSize = 12.sp, lineHeight = 16.sp)
                 }
-                Text(strings.archiveStorageLimitHint, color = LocalBydPalette.current.muted, fontSize = 12.sp, lineHeight = 16.sp)
             }
         }
-        SectionCard(
-            strings.archiveStorage,
-            modifier = Modifier.fillMaxWidth(),
-            trailing = {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    if (state?.archiveStorageScanPending == true) {
-                        StatusPill(strings.archiveCalculating, StatusKind.WAITING, compact = true)
-                    }
-                    StatusPill(archiveUsageText(snapshot, strings), archiveUsageKind(snapshot), compact = true)
-                    Text(
-                        String.format(strings.archiveCountShortTemplate, entries.size),
-                        color = LocalBydPalette.current.muted,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                }
-            }
-        ) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                ReadOnlyPathField(snapshot?.archiveRootPath ?: "-", modifier = Modifier.weight(0.5f))
-                ActionButton(strings.archiveStorageRefresh, actions::onReconcileArchiveStorage, modifier = Modifier.weight(0.25f))
-                val sortLabel = if (newestFirst) strings.archiveSortNewestFirst else strings.archiveSortOldestFirst
-                ActionButton(sortLabel, { newestFirst = !newestFirst }, modifier = Modifier.weight(0.25f))
-            }
-            job?.takeIf { it.running }?.let {
-                ArchiveStorageInlineStatus(strings, it)
-            }
-            if (entries.isEmpty()) {
-                Text(strings.archiveStorageEmpty, color = LocalBydPalette.current.muted, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-            } else {
-                sortedEntries.forEach { entry ->
-                    ArchiveEntryRow(
-                        entry = entry,
-                        strings = strings,
-                        selected = selectedIds.contains(entry.id),
-                        onToggle = {
-                            selectedIds = if (selectedIds.contains(entry.id)) {
-                                selectedIds - entry.id
-                            } else {
-                                selectedIds + entry.id
-                            }
+        item {
+            SectionCard(
+                strings.archiveStorage,
+                modifier = Modifier.fillMaxWidth(),
+                trailing = {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        if (state?.archiveStorageScanPending == true) {
+                            StatusPill(strings.archiveCalculating, StatusKind.WAITING, compact = true)
                         }
-                    )
+                        StatusPill(archiveUsageText(snapshot, strings), archiveUsageKind(snapshot), compact = true)
+                        Text(
+                            String.format(strings.archiveCountShortTemplate, entries.size),
+                            color = LocalBydPalette.current.muted,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
                 }
-                Spacer(Modifier.height(6.dp))
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                    ActionButton(strings.deleteSelected,
-                        { onRequestDelete(selectedIds.toList()) },
-                        primary = true,
-                        enabled = selectedIds.isNotEmpty(),
-                        modifier = Modifier.width(320.dp)
+            ) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    ReadOnlyPathField(snapshot?.archiveRootPath ?: "-", modifier = Modifier.weight(1f))
+                    ArchiveShareIconButton(
+                        enabled = shareEnabled,
+                        contentDescription = strings.shareSelectedArchives,
+                        onClick = { actions.onShareArchives(selectedArchiveIds) }
                     )
+                    val sortLabel = if (newestFirst) strings.archiveSortNewestFirst else strings.archiveSortOldestFirst
+                    ActionButton(sortLabel, { newestFirst = !newestFirst }, modifier = Modifier.width(180.dp))
+                }
+                job?.takeIf { it.running }?.let {
+                    ArchiveStorageInlineStatus(strings, it)
+                }
+                if (entries.isEmpty()) {
+                    Text(strings.archiveStorageEmpty, color = LocalBydPalette.current.muted, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                } else {
+                    sortedEntries.forEach { entry ->
+                        ArchiveEntryRow(
+                            entry = entry,
+                            strings = strings,
+                            selected = selectedIds.contains(entry.id),
+                            onToggle = {
+                                selectedIds = if (selectedIds.contains(entry.id)) {
+                                    selectedIds - entry.id
+                                } else {
+                                    selectedIds + entry.id
+                                }
+                            }
+                        )
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        ActionButton(strings.deleteSelected,
+                            { onRequestDelete(selectedIds.toList()) },
+                            primary = true,
+                            enabled = selectedIds.isNotEmpty(),
+                            modifier = Modifier.width(320.dp)
+                        )
+                    }
                 }
             }
         }
@@ -1532,22 +1585,19 @@ private fun List<ReleaseNotesMarkdownSpan>.toAnnotatedString(): AnnotatedString 
 
 @Composable
 private fun LogsTab(state: DashboardState?, strings: UiStrings, actions: BydCollectorActions) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        ScreenTitle(strings.logsTab, strings.logsSubtitle)
-        SectionCard(strings.controls, Modifier.fillMaxWidth()) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                ActionButton(strings.startJournal, actions::onStartJournal, primary = true, enabled = state?.logRecording != true, modifier = Modifier.weight(0.35f))
-                ActionButton(strings.stopJournal, actions::onStopJournal, enabled = state?.logRecording == true, modifier = Modifier.weight(0.15f))
-                ActionButton(strings.startLogcat, actions::onStartLogcat, primary = true, enabled = state?.logRecording != true, modifier = Modifier.weight(0.35f))
-                ActionButton(strings.stopLogcat, actions::onStopLogcat, enabled = state?.logRecording == true, modifier = Modifier.weight(0.15f))
+    TabLazyColumn {
+        item { ScreenTitle(strings.logsTab, strings.logsSubtitle) }
+        item {
+            SectionCard(strings.controls, Modifier.fillMaxWidth()) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    ActionButton(strings.startJournal, actions::onStartJournal, primary = true, enabled = state?.logRecording != true, modifier = Modifier.weight(0.35f))
+                    ActionButton(strings.stopJournal, actions::onStopJournal, enabled = state?.logRecording == true, modifier = Modifier.weight(0.15f))
+                    ActionButton(strings.startLogcat, actions::onStartLogcat, primary = true, enabled = state?.logRecording != true, modifier = Modifier.weight(0.35f))
+                    ActionButton(strings.stopLogcat, actions::onStopLogcat, enabled = state?.logRecording == true, modifier = Modifier.weight(0.15f))
+                }
             }
         }
-        LogsMetricsGrid(state, strings)
+        item { LogsMetricsGrid(state, strings) }
     }
 }
 

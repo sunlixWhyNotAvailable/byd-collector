@@ -6,13 +6,15 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
 
 class ArchiveStorageManager(
     private val archiveRoot: File,
     private val mainDatabaseFile: File,
     private val debugDatabaseFile: File,
-    private val clock: () -> Long = { System.currentTimeMillis() }
+    private val clock: () -> Long = { System.currentTimeMillis() },
+    private val isRetentionProtected: (String) -> Boolean = { false }
 ) {
     fun snapshot(limitBytes: Long): ArchiveStorageSnapshot {
         archiveRoot.mkdirs()
@@ -89,17 +91,25 @@ class ArchiveStorageManager(
         var total = entries.sumOf { it.sizeBytes }
         var deleted = 0
         entries
-            .filter { it.id !in protectedIds }
+            .filter { it.id !in protectedIds && !isRetentionProtected(it.id) }
             .sortedBy { it.createdAtMs }
             .forEach { entry ->
                 if (total <= limitBytes) return@forEach
                 onStatus(status(ArchiveStorageJobMode.RETENTION, deleted + 1, entries.size, "Видаляємо старий архів", "Deleting old archive", entry.id))
-                if (deleteArchiveFile(entry.id)) {
+                if (!isRetentionProtected(entry.id) && deleteArchiveFile(entry.id)) {
                     total -= entry.sizeBytes
                     deleted += 1
                 }
             }
         return deleted
+    }
+
+    fun resolveShareZipFiles(ids: List<String>): List<File>? {
+        if (ids.isEmpty() || ids.size != ids.toSet().size) return null
+        return ids.map { id ->
+            val target = archiveChild(id) ?: return null
+            target.takeIf(::isShareableZip) ?: return null
+        }
     }
 
     fun deleteArchiveIds(
@@ -144,6 +154,12 @@ class ArchiveStorageManager(
         return isDirectArchiveChild(file) &&
             ((file.isDirectory && isArchiveName(file.name)) ||
                 (file.isFile && file.name.endsWith(".zip") && isArchiveName(file.name.removeSuffix(".zip"))))
+    }
+
+    private fun isShareableZip(file: File): Boolean {
+        if (!file.isFile || file.length() <= 0L || !file.name.endsWith(".zip")) return false
+        if (!isArchiveName(file.name.removeSuffix(".zip"))) return false
+        return runCatching { ZipFile(file).use { } }.isSuccess
     }
 
     private fun cleanupTmpFiles() {
