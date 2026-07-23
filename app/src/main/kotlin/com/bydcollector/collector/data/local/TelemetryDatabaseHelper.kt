@@ -47,6 +47,8 @@ class TelemetryDatabaseHelper(
 
     private fun dropKnownTables(db: SQLiteDatabase) {
         listOf(
+            "telegram_runtime_state",
+            "telegram_outbox",
             "influx_export_events",
             "influx_export_state",
             "influx_export_cursor",
@@ -445,7 +447,7 @@ class TelemetryDatabaseHelper(
 
     companion object {
         val DATABASE_NAME: String = BuildConfig.COLLECTOR_DATABASE_NAME
-        const val DATABASE_VERSION = 6
+        const val DATABASE_VERSION = 7
         const val SCHEMA_ASSET = "schema.sql"
     }
 }

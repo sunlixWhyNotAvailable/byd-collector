@@ -15,10 +15,14 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(stop.contains("if (!poller.stopAndJoin(2_000L)) error("))
         assertTrue(stop.contains("detachDebugPoller()?.shutdownAndAwait(\"database_maintenance\", 2_000L) == false"))
         assertTrue(stop.contains("error(\"Debug poller did not stop for database maintenance\")"))
+        assertTrue(stop.contains("resetTelegramExecutorForMaintenance(requireStopped = true)"))
+        assertTrue(source.contains("previous.awaitTermination(TELEGRAM_MAINTENANCE_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)"))
+        assertTrue(source.contains("check(stopped) { \"Telegram worker did not stop before database maintenance\" }"))
         assertFalse(stop.contains("settings.setPollingEnabled(false)"))
         assertFalse(stop.contains("settings.setDebugPollingEnabled(false)"))
         assertFalse(stop.contains("settings.setMqttEnabled(false)"))
         assertFalse(stop.contains("settings.setInfluxEnabled(false)"))
+        assertFalse(stop.contains("settings.setTelegramEnabled(false)"))
     }
 
     @Test

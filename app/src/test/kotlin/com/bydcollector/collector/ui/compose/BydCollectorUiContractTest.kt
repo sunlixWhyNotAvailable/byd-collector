@@ -79,7 +79,9 @@ class BydCollectorUiContractTest {
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
 
         assertInOrder(app, "ActionButton(strings.backgroundSetupOpen", "ActionButton(strings.backgroundSetupDismiss")
-        assertInOrder(app, "text = strings.update", "ActionButton(strings.close")
+        val updateDialog = app.substringAfter("private fun UpdateCheckDialog(")
+            .substringBefore("private fun DatabaseMaintenanceDialog(")
+        assertInOrder(updateDialog, "text = strings.update", "ActionButton(strings.close")
         assertTrue(app.contains("DatabaseMaintenanceDialog("))
         assertTrue(app.contains(".width(560.dp)"))
         assertTrue(app.contains("if (!state.running && !state.completed && state.error == null) 340.dp else 300.dp"))
@@ -98,7 +100,9 @@ class BydCollectorUiContractTest {
         assertTrue(app.contains("state.error != null || state.completed"))
         assertTrue(app.contains("ActionButton(strings.ok, onDismiss"))
         assertTrue(app.contains("ActionButton(strings.cancel, onCancel, enabled = state.cancelAvailable"))
-        assertInOrder(app, "strings.yes", "strings.no")
+        val maintenanceDialog = app.substringAfter("private fun DatabaseMaintenanceDialog(")
+            .substringBefore("private fun DatabaseMaintenanceConfirmBody(")
+        assertInOrder(maintenanceDialog, "strings.yes", "strings.no")
     }
 
     @Test
@@ -109,6 +113,7 @@ class BydCollectorUiContractTest {
         assertFalse(app.contains("\"driver_assist\" to strings.driverAssist"))
         assertFalse(icons.contains("Canvas("))
         assertTrue(icons.contains("BottomTabIcon.HA -> R.drawable.ic_tab_ha_link"))
+        assertTrue(icons.contains("BottomTabIcon.TELEGRAM -> R.drawable.ic_tab_telegram"))
         assertTrue(icons.contains("BottomTabIcon.DATABASE -> R.drawable.ic_tab_all_data"))
         assertTrue(icons.contains("BottomTabIcon.STORAGE -> R.drawable.ic_tab_storage"))
         assertTrue(icons.contains("painterResource(id = icon.drawableRes())"))
@@ -179,13 +184,62 @@ class BydCollectorUiContractTest {
     }
 
     @Test
-    fun tabsAreLazyWhileUpdateNotesKeepBoundedVerticalScroll() {
+    fun allTabsUseEagerScrollAndUpdateNotesKeepBoundedScroll() {
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
 
-        assertTrue(app.contains("private fun TabLazyColumn(content: LazyListScope.() -> Unit)"))
-        assertEquals(6, Regex("TabLazyColumn \\{").findAll(app).count())
-        assertEquals(1, Regex("\\.verticalScroll\\(").findAll(app).count())
+        assertTrue(app.contains("private fun TabScrollColumn(content: @Composable ColumnScope.() -> Unit)"))
+        assertEquals(7, Regex("TabScrollColumn \\{").findAll(app).count())
+        assertFalse(app.contains("LazyColumn("))
+        assertFalse(app.contains("LazyListScope"))
+        assertEquals(2, Regex("\\.verticalScroll\\(").findAll(app).count())
         assertTrue(app.contains(".verticalScroll(releaseNotesScroll)"))
+    }
+
+    @Test
+    fun secretFieldsLoadStoredValuesAndUseLocalVisibilityToggles() {
+        val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
+        val icons = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorIcons.kt").readText()
+        val strings = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorStrings.kt").readText()
+
+        assertTrue(activity.contains("password = settings.mqttPassword()"))
+        assertTrue(activity.contains("password = settings.influxPassword()"))
+        assertTrue(activity.contains("val botToken = settings.telegramBotToken()"))
+        assertTrue(activity.contains("botToken = botToken"))
+        assertTrue(components.contains("var passwordVisible by remember { mutableStateOf(false) }"))
+        assertFalse(components.contains("rememberSaveable"))
+        assertTrue(components.contains("password && !passwordVisible"))
+        assertTrue(components.contains("PasswordVisualTransformation()"))
+        assertTrue(components.contains("SecretVisibilityIcon("))
+        assertTrue(icons.contains("R.drawable.ic_visibility_off"))
+        assertTrue(icons.contains("R.drawable.ic_visibility"))
+        assertEquals(3, Regex("showPasswordContentDescription = strings.showSecret").findAll(app).count())
+        assertEquals(3, Regex("hidePasswordContentDescription = strings.hideSecret").findAll(app).count())
+        assertTrue(strings.contains("showSecret = \"Показати секрет\""))
+        assertTrue(strings.contains("hideSecret = \"Hide secret\""))
+    }
+
+    @Test
+    fun telegramTestRequiresPersistedTokenAndDistinguishesStorageFailure() {
+        val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val actions = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorActions.kt").readText()
+        val strings = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorStrings.kt").readText()
+
+        assertTrue(app.contains("enabled = config.botTokenSet && config.chatId.isNotBlank()"))
+        assertTrue(activity.contains("if (!settings.isTelegramBotTokenSet())"))
+        assertInOrder(activity, "if (!settings.isTelegramBotTokenSet())", "CollectorServiceController.testTelegram(this)")
+        assertTrue(activity.contains("setTelegramConnectionStatus(\"storage_error\""))
+        assertTrue(activity.contains("else TelegramTestStatus.STORAGE_ERROR"))
+        assertTrue(activity.contains("setTelegramConnectionStatus(\"storage_error\", \"clear_failed\")"))
+        assertTrue(activity.contains("if (!cleared) settings.setTelegramEnabled(false)"))
+        assertTrue(activity.contains("botToken = if (secretWriteFailed) settings.telegramBotToken()"))
+        assertTrue(activity.contains("if (enabledChanged || secretWriteFailed)"))
+        assertTrue(actions.contains("STORAGE_ERROR"))
+        assertTrue(app.contains("TelegramTestStatus.STORAGE_ERROR -> strings.storageError"))
+        assertTrue(strings.contains("storageError = \"помилка сховища\""))
+        assertTrue(strings.contains("storageError = \"storage error\""))
     }
 
     @Test

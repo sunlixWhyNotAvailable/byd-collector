@@ -2,7 +2,7 @@
 
 > This is personal side project for own purposes
 >  
-> Read-only Chinese BYD EV vehicle telemetry collector for DiLink 5.0, with direct local ADB/app_process data collection, SQLite storage, normalized vehicle state, MQTT/Home Assistant and InfluxDB export support
+> Read-only Chinese BYD EV vehicle telemetry collector for DiLink 5.0, with direct local ADB/app_process data collection, SQLite storage, normalized vehicle state, MQTT/Home Assistant and InfluxDB export support, and outbound Telegram notifications
 > 
 > The app reads vehicle telemetry locally, stores raw and normalized values in SQLite, and can export live state to Home Assistant through MQTT and historical state to InfluxDB
 > 
@@ -18,6 +18,8 @@
 - normalized vehicle state for three SOC sources, remaining/trip/cumulative battery energy, charging, doors, tires, climate, speed, odometer, radar distance sensors and related fields
 - Home Assistant MQTT Discovery and live-state publishing
 - `InfluxDB v1` export for historical telemetry
+- optional outbound-only Telegram Bot API notifications with editable event templates and a durable retry queue
+- Android Keystore-backed storage for MQTT, InfluxDB, and Telegram secrets, with stored passwords/tokens masked in the UI and explicit eye controls
 - main and debug round-robin database archives with shared storage retention and Android chooser sharing for completed ZIP archives
 - shell-side keep-alive recovery with an explicit Shutdown gate and idempotent service reconcile
 - process-aware delayed Tailscale start with exact foreground task/Home restoration
@@ -32,7 +34,7 @@ After first launch:
 3. Complete any Android runtime permission prompts when present.
 4. Grant ADB access when Android shows the RSA authorization prompt.
 5. Start telemetry collection from the app and enable the automatic starts you need.
-6. Configure MQTT and/or InfluxDB if needed.
+6. Configure MQTT, InfluxDB, and/or outbound Telegram notifications if needed.
 
 ## Data Model
 
@@ -45,13 +47,17 @@ BYD Collector can publish MQTT Discovery config and live state topics for Home A
 Personally for HA purposes influxDB seems like more viable options since when using in combination with Grafana you can get correct car state in connection with time. While MQTT only sends CURRENT state of the car (which means if you have missing data due to e.g. no HA connection, you're going to lose some statistics).
 When enabled, the built-in Tailscale policy reacts to an unreachable configured HA endpoint and waits 10 seconds before a technical launch. A running Tailscale process is left untouched. After a real launch, Collector restores the previous main-display task or Home only while Tailscale is still foreground, so a user-selected foreground app is not minimized.
 
+## Telegram notifications
+
+Telegram integration is optional and disabled by default. Each supported event is also disabled independently until selected by the user.
+The app sends plain text through the Telegram Bot API only; it does not accept Telegram commands, register webhooks, poll updates, or send media.
+
 ## Tested
 
 Tested on *Chinese version* of `BYD Sea Lion 07 EV 2025`, `DiLink 5.0`
 
 ## TO DO
 
-- add Telegram send messages integration
 - improve influxDB reupload
 - change polling collection to callback collection on parameters change
 - add parameter saving when the car is turned down

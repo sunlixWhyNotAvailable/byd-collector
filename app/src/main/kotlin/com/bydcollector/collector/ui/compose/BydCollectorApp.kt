@@ -9,6 +9,7 @@ import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -20,14 +21,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -38,16 +38,20 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.bydcollector.collector.R
 import com.bydcollector.collector.maintenance.ArchiveEntryStatus
 import com.bydcollector.collector.maintenance.ArchiveStorageSnapshot
@@ -70,6 +74,8 @@ fun BydCollectorApp(
     darkTheme: Boolean,
     mqttDraft: MqttDraft,
     influxDraft: InfluxDraft,
+    telegramUiState: TelegramUiState = TelegramUiState(),
+    telegramActions: TelegramUiActions = TelegramUiActions(),
     appVersionName: String = "",
     updateAutoCheckEnabled: Boolean = true,
     updateUiState: UpdateUiState = UpdateUiState.Hidden,
@@ -120,6 +126,7 @@ fun BydCollectorApp(
                                 AppTab.MAIN -> MainTab(state, s, actions)
                                 AppTab.ALL_PARAMETERS -> AllParametersTab(state, s, language, actions)
                                 AppTab.HA -> HaTab(state, s, mqttDraft, influxDraft, actions)
+                                AppTab.TELEGRAM -> TelegramTab(s, telegramUiState, telegramActions)
                                 AppTab.STORAGE -> StorageTab(state, s, actions) { ids ->
                                     pendingArchiveDeleteIds = ids
                                 }
@@ -331,10 +338,62 @@ private fun TopHeader(
 
 private val Rounded8 = androidx.compose.foundation.shape.RoundedCornerShape(8.dp)
 
+private data class TelegramMessageDefinition(
+    val type: TelegramMessageType,
+    val variableKeys: List<String>
+)
+
+private val TelegramMessageDefinitions = listOf(
+    TelegramMessageDefinition(
+        TelegramMessageType.CHARGING_STARTED,
+        listOf("soc", "battery_power_kw", "time")
+    ),
+    TelegramMessageDefinition(
+        TelegramMessageType.CHARGING_PROGRESS,
+        listOf("soc", "charge_added_percent", "charge_added_kwh", "battery_power_kw")
+    ),
+    TelegramMessageDefinition(
+        TelegramMessageType.CHARGED_TO_100,
+        listOf("soc", "remaining_energy_kwh", "range_km", "time")
+    ),
+    TelegramMessageDefinition(
+        TelegramMessageType.CHARGING_STOPPED,
+        listOf("soc", "charge_duration", "charge_added_percent", "charge_added_kwh", "time")
+    ),
+    TelegramMessageDefinition(
+        TelegramMessageType.CHARGE_GUN_CONNECTED,
+        listOf("soc", "time")
+    ),
+    TelegramMessageDefinition(
+        TelegramMessageType.CHARGE_GUN_DISCONNECTED,
+        listOf("soc", "time")
+    ),
+    TelegramMessageDefinition(
+        TelegramMessageType.LOW_12V_VOLTAGE,
+        listOf("battery_12v", "time")
+    ),
+    TelegramMessageDefinition(
+        TelegramMessageType.TELEMETRY_UNAVAILABLE,
+        listOf("last_data_time", "error", "time")
+    ),
+    TelegramMessageDefinition(
+        TelegramMessageType.TRIP_SUMMARY,
+        listOf("trip_distance_km", "trip_energy_kwh", "trip_duration", "soc_start", "soc_end", "time")
+    )
+)
+
+private data class TelegramNumberSetting(
+    val label: String,
+    val value: Int,
+    val range: IntRange,
+    val unit: String,
+    val onValueChange: (Int) -> Unit
+)
+
 @Composable
-private fun TabLazyColumn(content: LazyListScope.() -> Unit) {
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
+private fun TabScrollColumn(content: @Composable ColumnScope.() -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(10.dp),
         content = content
     )
@@ -342,25 +401,23 @@ private fun TabLazyColumn(content: LazyListScope.() -> Unit) {
 
 @Composable
 private fun MainTab(state: DashboardState?, strings: UiStrings, actions: BydCollectorActions) {
-    TabLazyColumn {
-        item { ScreenTitle(strings.mainTab, strings.mainSubtitle) }
-        item {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                MainCollectionCard(
-                    state = state,
-                    strings = strings,
-                    actions = actions,
-                    modifier = Modifier.weight(1.15f)
-                )
-                MainStatusCard(
-                    state = state,
-                    strings = strings,
-                    actions = actions,
-                    modifier = Modifier.weight(1f)
-                )
-            }
+    TabScrollColumn {
+        ScreenTitle(strings.mainTab, strings.mainSubtitle)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            MainCollectionCard(
+                state = state,
+                strings = strings,
+                actions = actions,
+                modifier = Modifier.weight(1.15f)
+            )
+            MainStatusCard(
+                state = state,
+                strings = strings,
+                actions = actions,
+                modifier = Modifier.weight(1f)
+            )
         }
-        item { MainDatabaseCard(state, strings, modifier = Modifier.fillMaxWidth()) }
+        MainDatabaseCard(state, strings, modifier = Modifier.fillMaxWidth())
     }
 }
 
@@ -431,11 +488,10 @@ private fun AllParametersTab(
     language: UiLanguage,
     actions: BydCollectorActions
 ) {
-    TabLazyColumn {
-        item { ScreenTitle(strings.allTab, strings.allSubtitle) }
-        item {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                SectionCard(
+    TabScrollColumn {
+        ScreenTitle(strings.allTab, strings.allSubtitle)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            SectionCard(
                     title = strings.controls,
                     trailing = {
                         StatusPill(
@@ -461,10 +517,9 @@ private fun AllParametersTab(
                         NumericInput(state?.debugParameterCount?.toString().orEmpty(), modifier = Modifier.width(60.dp))
                     }
                 }
-                VehicleKpiCard(state, strings, Modifier.weight(2f).height(262.dp))
-            }
+            VehicleKpiCard(state, strings, Modifier.weight(2f).height(262.dp))
         }
-        item { DebugDatabaseCard(state, strings, actions, Modifier.fillMaxWidth()) }
+        DebugDatabaseCard(state, strings, actions, Modifier.fillMaxWidth())
     }
 }
 
@@ -519,20 +574,16 @@ private fun HaTab(
     influxDraft: InfluxDraft,
     actions: BydCollectorActions
 ) {
-    TabLazyColumn {
-        item {
-            Row(Modifier.fillMaxWidth().height(36.dp), verticalAlignment = Alignment.CenterVertically) {
-                ScreenTitle(strings.haTab, strings.haSubtitle, modifier = Modifier.weight(1f))
-                Text(strings.sharedCategories, color = LocalBydPalette.current.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.width(10.dp))
-                BydSwitch(state?.haSharedCategoriesEnabled == true, actions::onToggleSharedCategories, enabled = state?.influxEnabled != true)
-            }
+    TabScrollColumn {
+        Row(Modifier.fillMaxWidth().height(36.dp), verticalAlignment = Alignment.CenterVertically) {
+            ScreenTitle(strings.haTab, strings.haSubtitle, modifier = Modifier.weight(1f))
+            Text(strings.sharedCategories, color = LocalBydPalette.current.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.width(10.dp))
+            BydSwitch(state?.haSharedCategoriesEnabled == true, actions::onToggleSharedCategories, enabled = state?.influxEnabled != true)
         }
-        item {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                MqttCard(state, strings, mqttDraft, actions, Modifier.weight(1f))
-                InfluxCard(state, strings, influxDraft, actions, Modifier.weight(1f))
-            }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            MqttCard(state, strings, mqttDraft, actions, Modifier.weight(1f))
+            InfluxCard(state, strings, influxDraft, actions, Modifier.weight(1f))
         }
     }
 }
@@ -669,7 +720,15 @@ private fun CredentialGridMqtt(strings: UiStrings, draft: MqttDraft, actions: By
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             TextInput(strings.username, draft.username, { actions.onMqttDraftChanged(draft.copy(username = it)) }, Modifier.weight(1f))
-            TextInput(strings.password, draft.password, { actions.onMqttDraftChanged(draft.copy(password = it)) }, Modifier.weight(1f), password = true)
+            TextInput(
+                strings.password,
+                draft.password,
+                { actions.onMqttDraftChanged(draft.copy(password = it)) },
+                Modifier.weight(1f),
+                password = true,
+                showPasswordContentDescription = strings.showSecret,
+                hidePasswordContentDescription = strings.hideSecret
+            )
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             TextInput(strings.clientId, draft.clientId, { actions.onMqttDraftChanged(draft.copy(clientId = it)) }, Modifier.weight(1f))
@@ -691,13 +750,386 @@ private fun CredentialGridInflux(strings: UiStrings, draft: InfluxDraft, actions
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             TextInput(strings.username, draft.username, { actions.onInfluxDraftChanged(draft.copy(username = it)) }, Modifier.weight(1f))
-            TextInput(strings.password, draft.password, { actions.onInfluxDraftChanged(draft.copy(password = it)) }, Modifier.weight(1f), password = true)
+            TextInput(
+                strings.password,
+                draft.password,
+                { actions.onInfluxDraftChanged(draft.copy(password = it)) },
+                Modifier.weight(1f),
+                password = true,
+                showPasswordContentDescription = strings.showSecret,
+                hidePasswordContentDescription = strings.hideSecret
+            )
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             TextInput(strings.databaseField, draft.database, { actions.onInfluxDraftChanged(draft.copy(database = it)) }, Modifier.weight(1f))
             TextInput(strings.measurement, draft.measurement, { actions.onInfluxDraftChanged(draft.copy(measurement = it)) }, Modifier.weight(1f))
         }
     }
+}
+
+@Composable
+private fun TelegramTab(
+    strings: UiStrings,
+    uiState: TelegramUiState,
+    actions: TelegramUiActions
+) {
+    var config by remember(uiState.config) { mutableStateOf(uiState.config) }
+    val updateConfig: (TelegramConfig) -> Unit = { next ->
+        config = next
+        actions.onConfigChanged(next)
+    }
+
+    TabScrollColumn {
+        ScreenTitle(strings.telegram.tab, strings.telegram.subtitle)
+        TelegramConnectionCard(
+            strings = strings,
+            config = config,
+            testStatus = uiState.testStatus,
+            onConfigChanged = updateConfig,
+            onClearBotToken = actions.onClearBotToken,
+            onTestConnection = actions.onTestConnection
+        )
+        TelegramMessageDefinitions.chunked(2).forEach { messages ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.Top
+            ) {
+                messages.forEach { message ->
+                    TelegramMessageCard(
+                        strings = strings,
+                        definition = message,
+                        config = config,
+                        onConfigChanged = updateConfig,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                if (messages.size == 1) Spacer(Modifier.weight(1f))
+            }
+        }
+    }
+}
+
+@Composable
+private fun TelegramConnectionCard(
+    strings: UiStrings,
+    config: TelegramConfig,
+    testStatus: TelegramTestStatus,
+    onConfigChanged: (TelegramConfig) -> Unit,
+    onClearBotToken: () -> Unit,
+    onTestConnection: () -> Unit
+) {
+    SectionCard(title = strings.telegram.connection, modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().height(42.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                strings.telegram.enable,
+                color = LocalBydPalette.current.text,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f)
+            )
+            BydSwitch(config.enabled, { onConfigChanged(config.copy(enabled = it)) })
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.Bottom
+        ) {
+            TextInput(
+                label = strings.telegram.botToken,
+                value = config.botToken,
+                onValueChange = { onConfigChanged(config.copy(botToken = it)) },
+                modifier = Modifier.weight(1f),
+                password = true,
+                placeholder = if (config.botTokenSet) "********" else "123456789:AA...",
+                showPasswordContentDescription = strings.showSecret,
+                hidePasswordContentDescription = strings.hideSecret,
+                clearContentDescription = strings.telegram.clearBotToken,
+                onClear = onClearBotToken,
+                showClearWhenEmpty = config.botTokenSet
+            )
+            TextInput(
+                label = strings.telegram.chatId,
+                value = config.chatId,
+                onValueChange = { onConfigChanged(config.copy(chatId = it)) },
+                modifier = Modifier.weight(1f),
+                placeholder = "-1001234567890"
+            )
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            ActionButton(
+                text = strings.testConnection,
+                onClick = onTestConnection,
+                primary = true,
+                enabled = config.botTokenSet && config.chatId.isNotBlank(),
+                modifier = Modifier.width(180.dp)
+            )
+            StatusPill(
+                text = telegramTestStatusText(testStatus, strings.telegram),
+                kind = telegramTestStatusKind(testStatus),
+                compact = true
+            )
+        }
+    }
+}
+
+@Composable
+private fun TelegramMessageCard(
+    strings: UiStrings,
+    definition: TelegramMessageDefinition,
+    config: TelegramConfig,
+    onConfigChanged: (TelegramConfig) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val localized = strings.telegram.messages.getValue(definition.type)
+    val messageConfig = config.messages[definition.type]
+        ?: TelegramMessageConfig(template = localized.defaultTemplate)
+    var template by remember(definition.type) {
+        mutableStateOf(
+            TextFieldValue(
+                text = messageConfig.template,
+                selection = TextRange(messageConfig.template.length)
+            )
+        )
+    }
+    var showVariablePicker by remember(definition.type) { mutableStateOf(false) }
+
+    LaunchedEffect(messageConfig.template) {
+        if (template.text != messageConfig.template) {
+            template = TextFieldValue(
+                text = messageConfig.template,
+                selection = TextRange(messageConfig.template.length)
+            )
+        }
+    }
+
+    fun updateMessage(next: TelegramMessageConfig) {
+        onConfigChanged(config.copy(messages = config.messages + (definition.type to next)))
+    }
+
+    SectionCard(
+        title = localized.title,
+        trailing = {
+            BydSwitch(messageConfig.enabled, { updateMessage(messageConfig.copy(enabled = it)) })
+        },
+        modifier = modifier
+    ) {
+        telegramNumberSetting(definition.type, config, strings.telegram, onConfigChanged)?.let { setting ->
+            TelegramNumberStepper(setting)
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                strings.telegram.messageTemplate,
+                color = LocalBydPalette.current.muted,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            ActionButton(
+                text = "{}",
+                onClick = { showVariablePicker = true },
+                modifier = Modifier.width(48.dp)
+            )
+        }
+        TextValueInput(
+            label = "",
+            value = template,
+            placeholder = strings.telegram.messagePlaceholder,
+            onValueChange = { next ->
+                template = next
+                updateMessage(messageConfig.copy(template = next.text))
+            },
+            multiline = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
+
+    if (showVariablePicker) {
+        TelegramVariableDialog(
+            strings = strings,
+            variables = definition.variableKeys.map { key ->
+                "{$key}" to strings.telegram.variableDescriptions.getValue(key)
+            },
+            onSelect = { token ->
+                val next = insertTelegramTemplateVariable(template, token)
+                template = next
+                updateMessage(messageConfig.copy(template = next.text))
+                showVariablePicker = false
+            },
+            onDismiss = { showVariablePicker = false }
+        )
+    }
+}
+
+@Composable
+private fun TelegramNumberStepper(setting: TelegramNumberSetting) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(7.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = setting.label,
+            color = LocalBydPalette.current.text,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.weight(1f),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        ActionButton(
+            text = "-",
+            onClick = { setting.onValueChange((setting.value - 1).coerceAtLeast(setting.range.first)) },
+            enabled = setting.value > setting.range.first,
+            modifier = Modifier.width(42.dp)
+        )
+        NumericInput(
+            value = if (setting.unit == "%") "${setting.value}%" else "${setting.value} ${setting.unit}",
+            modifier = Modifier.width(72.dp)
+        )
+        ActionButton(
+            text = "+",
+            onClick = { setting.onValueChange((setting.value + 1).coerceAtMost(setting.range.last)) },
+            enabled = setting.value < setting.range.last,
+            modifier = Modifier.width(42.dp)
+        )
+    }
+}
+
+private fun telegramNumberSetting(
+    type: TelegramMessageType,
+    config: TelegramConfig,
+    strings: TelegramStrings,
+    onConfigChanged: (TelegramConfig) -> Unit
+): TelegramNumberSetting? = when (type) {
+    TelegramMessageType.CHARGING_PROGRESS -> TelegramNumberSetting(
+        strings.chargeStep,
+        config.chargeStepPercent,
+        1..99,
+        "%"
+    ) { onConfigChanged(config.copy(chargeStepPercent = it)) }
+    TelegramMessageType.LOW_12V_VOLTAGE -> TelegramNumberSetting(
+        strings.low12vThreshold,
+        config.low12vThresholdVolts,
+        9..15,
+        "V"
+    ) { onConfigChanged(config.copy(low12vThresholdVolts = it)) }
+    TelegramMessageType.TELEMETRY_UNAVAILABLE -> TelegramNumberSetting(
+        strings.telemetryDelay,
+        config.telemetryUnavailableMinutes,
+        1..60,
+        strings.minuteUnit
+    ) { onConfigChanged(config.copy(telemetryUnavailableMinutes = it)) }
+    TelegramMessageType.TRIP_SUMMARY -> TelegramNumberSetting(
+        strings.tripDelay,
+        config.tripSummaryDelayMinutes,
+        1..60,
+        strings.minuteUnit
+    ) { onConfigChanged(config.copy(tripSummaryDelayMinutes = it)) }
+    else -> null
+}
+
+internal fun insertTelegramTemplateVariable(value: TextFieldValue, token: String): TextFieldValue {
+    val start = minOf(value.selection.start, value.selection.end).coerceIn(0, value.text.length)
+    val end = maxOf(value.selection.start, value.selection.end).coerceIn(start, value.text.length)
+    val text = value.text.replaceRange(start, end, token)
+    return TextFieldValue(text = text, selection = TextRange(start + token.length))
+}
+
+@Composable
+private fun TelegramVariableDialog(
+    strings: UiStrings,
+    variables: List<Pair<String, String>>,
+    onSelect: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val p = LocalBydPalette.current
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(p.background.copy(alpha = 0.82f))
+                .padding(28.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            ModalInputBlocker()
+            Column(
+                modifier = Modifier
+                    .width(560.dp)
+                    .background(p.panel, Rounded8)
+                    .border(1.dp, p.borderStrong, Rounded8)
+                    .padding(20.dp)
+            ) {
+                Text(
+                    strings.telegram.insertVariable,
+                    color = p.text,
+                    fontSize = 19.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(Modifier.height(12.dp))
+                variables.forEachIndexed { index, variable ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .clickable { onSelect(variable.first) }
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(16.dp)
+                    ) {
+                        Text(
+                            text = variable.first,
+                            color = p.accent,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            fontFamily = FontFamily.Monospace,
+                            modifier = Modifier.weight(0.45f)
+                        )
+                        Text(
+                            text = variable.second,
+                            color = p.text,
+                            fontSize = 13.sp,
+                            modifier = Modifier.weight(0.55f)
+                        )
+                    }
+                    if (index != variables.lastIndex) {
+                        Box(Modifier.fillMaxWidth().height(1.dp).background(p.border))
+                    }
+                }
+                Spacer(Modifier.height(14.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    ActionButton(strings.close, onDismiss, modifier = Modifier.width(140.dp))
+                }
+            }
+        }
+    }
+}
+
+private fun telegramTestStatusText(status: TelegramTestStatus, strings: TelegramStrings): String = when (status) {
+    TelegramTestStatus.NOT_TESTED -> strings.notTested
+    TelegramTestStatus.TESTING -> strings.testing
+    TelegramTestStatus.SUCCESS -> strings.connected
+    TelegramTestStatus.STORAGE_ERROR -> strings.storageError
+    TelegramTestStatus.FAILED -> strings.failed
+}
+
+private fun telegramTestStatusKind(status: TelegramTestStatus): StatusKind = when (status) {
+    TelegramTestStatus.NOT_TESTED, TelegramTestStatus.TESTING -> StatusKind.WAITING
+    TelegramTestStatus.SUCCESS -> StatusKind.OK
+    TelegramTestStatus.STORAGE_ERROR, TelegramTestStatus.FAILED -> StatusKind.ERROR
 }
 
 @Composable
@@ -708,44 +1140,42 @@ private fun ExtraTab(
     actions: BydCollectorActions
 ) {
     val optionsCardHeight = 312.dp
-    TabLazyColumn {
-        item { ScreenTitle(strings.extraTab, strings.extraSubtitle) }
-        item {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                SectionCard(strings.keepAlive, Modifier.weight(1f).height(optionsCardHeight)) {
-                    Column(Modifier.fillMaxWidth()) {
-                        SwitchRow(
-                            strings.keepWifi,
-                            state?.keepWifiEnabled == true,
-                            actions::onToggleKeepWifi
-                        )
-                        SwitchRow(
-                            strings.keepMobile,
-                            state?.keepMobileDataEnabled == true,
-                            actions::onToggleKeepMobile
-                        )
-                        SwitchRow(
-                            strings.keepBluetooth,
-                            state?.keepBluetoothEnabled == true,
-                            actions::onToggleKeepBluetooth
-                        )
-                        SwitchRow(
-                            strings.restoreCollector,
-                            state?.recoverCollectorServiceEnabled == true,
-                            actions::onToggleKeepCollector,
-                            divider = false
-                        )
-                    }
-                }
-                SectionCard(strings.appRuntime, Modifier.weight(1f).height(optionsCardHeight)) {
-                    TailscaleRuntimeRow(strings, state?.tailscaleActivationEnabled == true, actions::onToggleTailscaleActivation)
-                    UpdateSettingsRow(
-                        strings = strings,
-                        updateAutoCheckEnabled = updateAutoCheckEnabled,
-                        actions = actions
+    TabScrollColumn {
+        ScreenTitle(strings.extraTab, strings.extraSubtitle)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            SectionCard(strings.keepAlive, Modifier.weight(1f).height(optionsCardHeight)) {
+                Column(Modifier.fillMaxWidth()) {
+                    SwitchRow(
+                        strings.keepWifi,
+                        state?.keepWifiEnabled == true,
+                        actions::onToggleKeepWifi
                     )
-                    ShutdownSettingsRow(strings = strings, actions = actions)
+                    SwitchRow(
+                        strings.keepMobile,
+                        state?.keepMobileDataEnabled == true,
+                        actions::onToggleKeepMobile
+                    )
+                    SwitchRow(
+                        strings.keepBluetooth,
+                        state?.keepBluetoothEnabled == true,
+                        actions::onToggleKeepBluetooth
+                    )
+                    SwitchRow(
+                        strings.restoreCollector,
+                        state?.recoverCollectorServiceEnabled == true,
+                        actions::onToggleKeepCollector,
+                        divider = false
+                    )
                 }
+            }
+            SectionCard(strings.appRuntime, Modifier.weight(1f).height(optionsCardHeight)) {
+                TailscaleRuntimeRow(strings, state?.tailscaleActivationEnabled == true, actions::onToggleTailscaleActivation)
+                UpdateSettingsRow(
+                    strings = strings,
+                    updateAutoCheckEnabled = updateAutoCheckEnabled,
+                    actions = actions
+                )
+                ShutdownSettingsRow(strings = strings, actions = actions)
             }
         }
     }
@@ -1259,10 +1689,9 @@ private fun StorageTab(
         !CollectorService.isArchiveStorageActive()
     val topCardHeight = 156.dp
 
-    TabLazyColumn {
-        item { ScreenTitle(strings.storageTab, strings.storageSubtitle) }
-        item {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+    TabScrollColumn {
+        ScreenTitle(strings.storageTab, strings.storageSubtitle)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 SectionCard(strings.activeDatabase, modifier = Modifier.weight(0.6f).height(topCardHeight)) {
                     Row(
                         Modifier.fillMaxWidth().height(34.dp),
@@ -1303,10 +1732,8 @@ private fun StorageTab(
                     }
                     Text(strings.archiveStorageLimitHint, color = LocalBydPalette.current.muted, fontSize = 12.sp, lineHeight = 16.sp)
                 }
-            }
         }
-        item {
-            SectionCard(
+        SectionCard(
                 strings.archiveStorage,
                 modifier = Modifier.fillMaxWidth(),
                 trailing = {
@@ -1364,7 +1791,6 @@ private fun StorageTab(
                         )
                     }
                 }
-            }
         }
     }
 }
@@ -1585,19 +2011,17 @@ private fun List<ReleaseNotesMarkdownSpan>.toAnnotatedString(): AnnotatedString 
 
 @Composable
 private fun LogsTab(state: DashboardState?, strings: UiStrings, actions: BydCollectorActions) {
-    TabLazyColumn {
-        item { ScreenTitle(strings.logsTab, strings.logsSubtitle) }
-        item {
-            SectionCard(strings.controls, Modifier.fillMaxWidth()) {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    ActionButton(strings.startJournal, actions::onStartJournal, primary = true, enabled = state?.logRecording != true, modifier = Modifier.weight(0.35f))
-                    ActionButton(strings.stopJournal, actions::onStopJournal, enabled = state?.logRecording == true, modifier = Modifier.weight(0.15f))
-                    ActionButton(strings.startLogcat, actions::onStartLogcat, primary = true, enabled = state?.logRecording != true, modifier = Modifier.weight(0.35f))
-                    ActionButton(strings.stopLogcat, actions::onStopLogcat, enabled = state?.logRecording == true, modifier = Modifier.weight(0.15f))
-                }
+    TabScrollColumn {
+        ScreenTitle(strings.logsTab, strings.logsSubtitle)
+        SectionCard(strings.controls, Modifier.fillMaxWidth()) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                ActionButton(strings.startJournal, actions::onStartJournal, primary = true, enabled = state?.logRecording != true, modifier = Modifier.weight(0.35f))
+                ActionButton(strings.stopJournal, actions::onStopJournal, enabled = state?.logRecording == true, modifier = Modifier.weight(0.15f))
+                ActionButton(strings.startLogcat, actions::onStartLogcat, primary = true, enabled = state?.logRecording != true, modifier = Modifier.weight(0.35f))
+                ActionButton(strings.stopLogcat, actions::onStopLogcat, enabled = state?.logRecording == true, modifier = Modifier.weight(0.15f))
             }
         }
-        item { LogsMetricsGrid(state, strings) }
+        LogsMetricsGrid(state, strings)
     }
 }
 
@@ -1678,6 +2102,7 @@ private fun BottomTabs(activeTab: AppTab, strings: UiStrings, actions: BydCollec
         AppTab.MAIN to (strings.mainTab to BottomTabIcon.HOME),
         AppTab.ALL_PARAMETERS to (strings.allTab to BottomTabIcon.STORAGE),
         AppTab.HA to (strings.haTab to BottomTabIcon.HA),
+        AppTab.TELEGRAM to (strings.telegram.tab to BottomTabIcon.TELEGRAM),
         AppTab.STORAGE to (strings.storageTab to BottomTabIcon.DATABASE),
         AppTab.EXTRA to (strings.extraTab to BottomTabIcon.GEAR),
         AppTab.LOGS to (strings.logsTab to BottomTabIcon.LOGS)

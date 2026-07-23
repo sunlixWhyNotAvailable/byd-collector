@@ -43,6 +43,12 @@ import com.bydcollector.collector.ui.compose.BydCollectorActions
 import com.bydcollector.collector.ui.compose.BydCollectorApp
 import com.bydcollector.collector.ui.compose.InfluxDraft
 import com.bydcollector.collector.ui.compose.MqttDraft
+import com.bydcollector.collector.ui.compose.TelegramConfig
+import com.bydcollector.collector.ui.compose.TelegramMessageConfig
+import com.bydcollector.collector.ui.compose.TelegramMessageType
+import com.bydcollector.collector.ui.compose.TelegramTestStatus
+import com.bydcollector.collector.ui.compose.TelegramUiActions
+import com.bydcollector.collector.ui.compose.TelegramUiState
 import com.bydcollector.collector.ui.compose.UiLanguage
 import com.bydcollector.collector.ui.compose.strings
 import com.bydcollector.collector.update.UpdateAutoCheckAction
@@ -87,6 +93,7 @@ class MainActivity : ComponentActivity() {
     private var darkTheme by mutableStateOf(true)
     private var mqttDraft by mutableStateOf(MqttDraft())
     private var influxDraft by mutableStateOf(InfluxDraft())
+    private var telegramUiState by mutableStateOf(TelegramUiState())
     private var updateUiState by mutableStateOf<UpdateUiState>(UpdateUiState.Hidden)
     private var updateUiGeneration = 0L
     private var pendingMaintenanceOperation by mutableStateOf<DbMaintenanceOperation?>(null)
@@ -104,6 +111,17 @@ class MainActivity : ComponentActivity() {
     }
     private val startupAdbSelfCheckTask = Runnable { runStartupAdbSelfCheckIfReady() }
     private val updateAutoCheckTimerTask = Runnable { onUpdateAutoCheckTimerElapsed() }
+    private val telegramReconcileTask = Runnable {
+        if (!destroyed && ::settings.isInitialized) {
+            CollectorServiceController.reconcileTelegram(this@MainActivity)
+        }
+    }
+
+    private val telegramActions = TelegramUiActions(
+        onConfigChanged = ::onTelegramConfigChanged,
+        onClearBotToken = ::onClearTelegramBotToken,
+        onTestConnection = ::onTestTelegramConnection
+    )
 
     //maps every ui command to persisted settings plus service intents so process restarts keep the same intent
     private val uiActions = object : BydCollectorActions {
@@ -440,7 +458,7 @@ class MainActivity : ComponentActivity() {
             host = settings.mqttHost(),
             port = settings.mqttPort().toString(),
             username = settings.mqttUsername(),
-            password = "",
+            password = settings.mqttPassword(),
             clientId = settings.mqttClientId(),
             topicPrefix = settings.mqttTopicPrefix(),
             discoveryPrefix = settings.mqttDiscoveryPrefix()
@@ -449,10 +467,11 @@ class MainActivity : ComponentActivity() {
             host = settings.influxHost(),
             port = settings.influxPort().toString(),
             username = settings.influxUsername(),
-            password = "",
+            password = settings.influxPassword(),
             database = settings.influxDatabase(),
             measurement = settings.influxMeasurement()
         )
+        telegramUiState = loadTelegramUiState()
         startRuntimeUpdateAutoCheck()
         setContent {
             BydCollectorApp(
@@ -462,6 +481,8 @@ class MainActivity : ComponentActivity() {
                 darkTheme = darkTheme,
                 mqttDraft = mqttDraft,
                 influxDraft = influxDraft,
+                telegramUiState = telegramUiState,
+                telegramActions = telegramActions,
                 appVersionName = BuildConfig.VERSION_NAME,
                 updateAutoCheckEnabled = settings.isUpdateAutoCheckEnabled(),
                 updateUiState = updateUiState,
@@ -515,6 +536,7 @@ class MainActivity : ComponentActivity() {
         }
         handler.removeCallbacks(updateAutoCheckTimerTask)
         handler.removeCallbacks(startupAdbSelfCheckTask)
+        handler.removeCallbacks(telegramReconcileTask)
         super.onDestroy()
     }
 
@@ -650,6 +672,7 @@ class MainActivity : ComponentActivity() {
 
     private fun refresh() {
         refreshStoreBackedState()
+        syncTelegramUiRuntimeState()
         if (destroyed) return
         if (refreshInFlight) {
             refreshAgainAfterCurrent = true
@@ -1056,6 +1079,156 @@ class MainActivity : ComponentActivity() {
         settings.setInfluxMeasurement(influxDraft.measurement)
     }
 
+    private fun loadTelegramUiState(): TelegramUiState {
+        val localizedMessages = strings(uiLanguage).telegram.messages
+        val botToken = settings.telegramBotToken()
+        val messages = TelegramMessageType.entries.associateWith { type ->
+            TelegramMessageConfig(
+                enabled = settings.isTelegramEventEnabled(type.eventKey()),
+                template = settings.telegramTemplate(type.eventKey())
+                    ?: localizedMessages.getValue(type).defaultTemplate
+            )
+        }
+        return TelegramUiState(
+            config = TelegramConfig(
+                enabled = settings.isTelegramEnabled(),
+                botToken = botToken,
+                botTokenSet = botToken.isNotEmpty(),
+                chatId = settings.telegramChatId(),
+                chargeStepPercent = settings.telegramChargeStepPercent(),
+                low12vThresholdVolts = settings.telegramLowVoltageThreshold().toInt(),
+                telemetryUnavailableMinutes = settings.telegramUnavailableDelayMinutes(),
+                tripSummaryDelayMinutes = settings.telegramTripEndDelayMinutes(),
+                messages = messages
+            ),
+            testStatus = telegramTestStatus(settings.telegramConnectionStatus())
+        )
+    }
+
+    private fun onTelegramConfigChanged(config: TelegramConfig) {
+        refreshStoreBackedState()
+        val previous = telegramUiState.config
+        var tokenSet = settings.isTelegramBotTokenSet()
+        var secretWriteFailed = false
+
+        if (previous.enabled != config.enabled) settings.setTelegramEnabled(config.enabled)
+        if (previous.chatId != config.chatId) settings.setTelegramChatId(config.chatId)
+        if (config.botToken.isNotBlank() && config.botToken != previous.botToken) {
+            tokenSet = settings.setTelegramBotToken(config.botToken)
+            secretWriteFailed = !tokenSet
+        }
+        if (previous.chargeStepPercent != config.chargeStepPercent) {
+            settings.setTelegramChargeStepPercent(config.chargeStepPercent)
+        }
+        if (previous.low12vThresholdVolts != config.low12vThresholdVolts) {
+            settings.setTelegramLowVoltageThreshold(config.low12vThresholdVolts.toFloat())
+        }
+        if (previous.telemetryUnavailableMinutes != config.telemetryUnavailableMinutes) {
+            settings.setTelegramUnavailableDelayMinutes(config.telemetryUnavailableMinutes)
+        }
+        if (previous.tripSummaryDelayMinutes != config.tripSummaryDelayMinutes) {
+            settings.setTelegramTripEndDelayMinutes(config.tripSummaryDelayMinutes)
+        }
+        TelegramMessageType.entries.forEach { type ->
+            val oldMessage = previous.messages[type]
+            val newMessage = config.messages[type] ?: return@forEach
+            val eventKey = type.eventKey()
+            if (oldMessage?.enabled != newMessage.enabled) {
+                settings.setTelegramEventEnabled(eventKey, newMessage.enabled)
+            }
+            if (oldMessage?.template != newMessage.template || settings.telegramTemplate(eventKey) == null) {
+                settings.setTelegramTemplate(eventKey, newMessage.template)
+            }
+        }
+
+        val credentialsChanged = previous.chatId != config.chatId ||
+            (config.botToken.isNotBlank() && config.botToken != previous.botToken)
+        val nextTestStatus = when {
+            secretWriteFailed -> TelegramTestStatus.STORAGE_ERROR
+            credentialsChanged -> TelegramTestStatus.NOT_TESTED
+            else -> telegramUiState.testStatus
+        }
+        if (secretWriteFailed) {
+            settings.setTelegramConnectionStatus("storage_error", "keystore")
+            settings.setTelegramEnabled(false)
+        } else if (credentialsChanged) {
+            settings.setTelegramConnectionStatus("not_tested", null)
+        }
+        val effectiveConfig = config.copy(
+            enabled = if (secretWriteFailed) false else config.enabled,
+            botToken = if (secretWriteFailed) settings.telegramBotToken() else config.botToken,
+            botTokenSet = if (secretWriteFailed) settings.isTelegramBotTokenSet() else tokenSet
+        )
+        telegramUiState = telegramUiState.copy(
+            config = effectiveConfig,
+            testStatus = nextTestStatus
+        )
+        if (secretWriteFailed) {
+            currentStore().recordEvent(
+                "telegram_secret_write_failed",
+                "Telegram bot token could not be stored in Android Keystore"
+            )
+        }
+
+        val enabledChanged = previous.enabled != effectiveConfig.enabled
+        if (enabledChanged || secretWriteFailed) {
+            handler.removeCallbacks(telegramReconcileTask)
+            CollectorServiceController.reconcileTelegram(this)
+        } else if (credentialsChanged && effectiveConfig.enabled) {
+            handler.removeCallbacks(telegramReconcileTask)
+            handler.postDelayed(telegramReconcileTask, TELEGRAM_RECONCILE_DELAY_MS)
+        }
+    }
+
+    private fun onClearTelegramBotToken() {
+        refreshStoreBackedState()
+        val cleared = settings.clearTelegramBotToken()
+        if (!cleared) settings.setTelegramEnabled(false)
+        val persistedToken = settings.telegramBotToken()
+        telegramUiState = telegramUiState.copy(
+            config = telegramUiState.config.copy(
+                enabled = settings.isTelegramEnabled(),
+                botToken = persistedToken,
+                botTokenSet = persistedToken.isNotEmpty()
+            ),
+            testStatus = if (cleared) TelegramTestStatus.NOT_TESTED else TelegramTestStatus.STORAGE_ERROR
+        )
+        if (cleared) {
+            settings.setTelegramConnectionStatus("not_tested", null)
+        } else {
+            settings.setTelegramConnectionStatus("storage_error", "clear_failed")
+            currentStore().recordEvent(
+                "telegram_secret_clear_failed",
+                "Telegram bot token could not be cleared from Android Keystore"
+            )
+        }
+        handler.removeCallbacks(telegramReconcileTask)
+        CollectorServiceController.reconcileTelegram(this)
+    }
+
+    private fun onTestTelegramConnection() {
+        refreshStoreBackedState()
+        if (!settings.isTelegramBotTokenSet()) {
+            settings.setTelegramConnectionStatus("storage_error", "missing_persisted_token")
+            telegramUiState = telegramUiState.copy(testStatus = TelegramTestStatus.STORAGE_ERROR)
+            return
+        }
+        telegramUiState = telegramUiState.copy(testStatus = TelegramTestStatus.TESTING)
+        settings.setTelegramConnectionStatus("testing", null)
+        CollectorServiceController.testTelegram(this)
+    }
+
+    private fun syncTelegramUiRuntimeState() {
+        if (telegramUiState.config.messages.isEmpty()) return
+        telegramUiState = telegramUiState.copy(
+            config = telegramUiState.config.copy(
+                enabled = settings.isTelegramEnabled(),
+                botTokenSet = settings.isTelegramBotTokenSet()
+            ),
+            testStatus = telegramTestStatus(settings.telegramConnectionStatus())
+        )
+    }
+
     private fun runMqttChannelAction(label: String, action: () -> MqttActionResult) {
         refreshStoreBackedState()
         saveMqttDraft()
@@ -1183,7 +1356,28 @@ class MainActivity : ComponentActivity() {
         private const val KEY_BACKGROUND_SETTINGS_PENDING_RETURN = "background_settings_pending_return"
         private const val STARTUP_ADB_SELF_CHECK_DELAY_MS = 600L
         private const val DASHBOARD_REFRESH_INTERVAL_MS = 5_000L
+        private const val TELEGRAM_RECONCILE_DELAY_MS = 600L
     }
+}
+
+private fun TelegramMessageType.eventKey(): String = when (this) {
+    TelegramMessageType.CHARGING_STARTED -> "charging-started"
+    TelegramMessageType.CHARGING_PROGRESS -> "charging-progress"
+    TelegramMessageType.CHARGED_TO_100 -> "charged-full"
+    TelegramMessageType.CHARGING_STOPPED -> "charging-stopped"
+    TelegramMessageType.CHARGE_GUN_CONNECTED -> "charge-gun-connected"
+    TelegramMessageType.CHARGE_GUN_DISCONNECTED -> "charge-gun-disconnected"
+    TelegramMessageType.LOW_12V_VOLTAGE -> "low-12v"
+    TelegramMessageType.TELEMETRY_UNAVAILABLE -> "telemetry-unavailable"
+    TelegramMessageType.TRIP_SUMMARY -> "trip-summary"
+}
+
+private fun telegramTestStatus(value: String): TelegramTestStatus = when (value) {
+    "testing" -> TelegramTestStatus.TESTING
+    "success" -> TelegramTestStatus.SUCCESS
+    "storage_error" -> TelegramTestStatus.STORAGE_ERROR
+    "failed" -> TelegramTestStatus.FAILED
+    else -> TelegramTestStatus.NOT_TESTED
 }
 
 private data class VerifiedUpdateDownload(

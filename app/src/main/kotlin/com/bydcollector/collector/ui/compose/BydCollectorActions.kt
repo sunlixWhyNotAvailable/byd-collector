@@ -19,6 +19,54 @@ data class InfluxDraft(
     val measurement: String = ""
 )
 
+enum class TelegramMessageType {
+    CHARGING_STARTED,
+    CHARGING_PROGRESS,
+    CHARGED_TO_100,
+    CHARGING_STOPPED,
+    CHARGE_GUN_CONNECTED,
+    CHARGE_GUN_DISCONNECTED,
+    LOW_12V_VOLTAGE,
+    TELEMETRY_UNAVAILABLE,
+    TRIP_SUMMARY
+}
+
+data class TelegramMessageConfig(
+    val enabled: Boolean = false,
+    val template: String = ""
+)
+
+data class TelegramConfig(
+    val enabled: Boolean = false,
+    val botToken: String = "",
+    val botTokenSet: Boolean = false,
+    val chatId: String = "",
+    val chargeStepPercent: Int = 5,
+    val low12vThresholdVolts: Int = 12,
+    val telemetryUnavailableMinutes: Int = 1,
+    val tripSummaryDelayMinutes: Int = 2,
+    val messages: Map<TelegramMessageType, TelegramMessageConfig> = emptyMap()
+)
+
+enum class TelegramTestStatus {
+    NOT_TESTED,
+    TESTING,
+    SUCCESS,
+    STORAGE_ERROR,
+    FAILED
+}
+
+data class TelegramUiState(
+    val config: TelegramConfig = TelegramConfig(),
+    val testStatus: TelegramTestStatus = TelegramTestStatus.NOT_TESTED
+)
+
+data class TelegramUiActions(
+    val onConfigChanged: (TelegramConfig) -> Unit = {},
+    val onClearBotToken: () -> Unit = {},
+    val onTestConnection: () -> Unit = {}
+)
+
 interface BydCollectorActions {
     fun onTabSelected(tab: AppTab)
     fun onLanguageSelected(language: UiLanguage)

@@ -4,6 +4,7 @@ enum class AppTab {
     MAIN,
     ALL_PARAMETERS,
     HA,
+    TELEGRAM,
     STORAGE,
     EXTRA,
     LOGS
@@ -26,6 +27,36 @@ data class TabText(
     val subtitle: String
 )
 
+data class TelegramMessageStrings(
+    val title: String,
+    val defaultTemplate: String
+)
+
+data class TelegramStrings(
+    val tab: String,
+    val subtitle: String,
+    val connection: String,
+    val enable: String,
+    val botToken: String,
+    val chatId: String,
+    val notTested: String,
+    val testing: String,
+    val connected: String,
+    val storageError: String,
+    val failed: String,
+    val messageTemplate: String,
+    val messagePlaceholder: String,
+    val insertVariable: String,
+    val clearBotToken: String,
+    val chargeStep: String,
+    val low12vThreshold: String,
+    val telemetryDelay: String,
+    val tripDelay: String,
+    val minuteUnit: String,
+    val messages: Map<TelegramMessageType, TelegramMessageStrings>,
+    val variableDescriptions: Map<String, String>
+)
+
 data class UiStrings(
     val appSubtitle: String,
     val topBarSubtitle: String,
@@ -41,8 +72,11 @@ data class UiStrings(
     val start: String,
     val stop: String,
     val testConnection: String,
+    val showSecret: String,
+    val hideSecret: String,
     val autoStart: String,
     val controls: String,
+    val telegram: TelegramStrings,
     val mainTab: String,
     val allTab: String,
     val haTab: String,
@@ -197,6 +231,164 @@ data class UiStrings(
     val dbMaintenanceArchivePath: String
 )
 
+private val telegramUk = TelegramStrings(
+    tab = "Telegram",
+    subtitle = "Окремі події та власні шаблони повідомлень",
+    connection = "Підключення",
+    enable = "Увімкнути Telegram",
+    botToken = "Bot token",
+    chatId = "Chat ID",
+    notTested = "не перевірено",
+    testing = "перевіряємо",
+    connected = "зв'язок працює",
+    storageError = "помилка сховища",
+    failed = "помилка зв'язку",
+    messageTemplate = "Шаблон повідомлення",
+    messagePlaceholder = "Текст повідомлення",
+    insertVariable = "Вставити змінну",
+    clearBotToken = "Очистити Bot token",
+    chargeStep = "Крок заряду",
+    low12vThreshold = "Поріг напруги",
+    telemetryDelay = "Затримка сповіщення",
+    tripDelay = "Затримка підсумку",
+    minuteUnit = "хв",
+    messages = mapOf(
+        TelegramMessageType.CHARGING_STARTED to TelegramMessageStrings(
+            "Заряджання розпочато",
+            "Заряджання розпочато\nSOC: {soc}%\nПотужність: {battery_power_kw} кВт"
+        ),
+        TelegramMessageType.CHARGING_PROGRESS to TelegramMessageStrings(
+            "Прогрес заряджання",
+            "Заряд: {soc}%\nДодано: {charge_added_percent}% / {charge_added_kwh} кВт·год"
+        ),
+        TelegramMessageType.CHARGED_TO_100 to TelegramMessageStrings(
+            "Заряджено до 100%",
+            "Авто заряджено до 100%\nЕнергія: {remaining_energy_kwh} кВт·год\nЗапас ходу: {range_km} км"
+        ),
+        TelegramMessageType.CHARGING_STOPPED to TelegramMessageStrings(
+            "Заряджання зупинено",
+            "Заряджання зупинено\nSOC: {soc}%\nТривалість: {charge_duration}"
+        ),
+        TelegramMessageType.CHARGE_GUN_CONNECTED to TelegramMessageStrings(
+            "Зарядний кабель підключено",
+            "Зарядний кабель підключено\nSOC: {soc}%\nЧас: {time}"
+        ),
+        TelegramMessageType.CHARGE_GUN_DISCONNECTED to TelegramMessageStrings(
+            "Зарядний кабель відключено",
+            "Зарядний кабель відключено\nSOC: {soc}%\nЧас: {time}"
+        ),
+        TelegramMessageType.LOW_12V_VOLTAGE to TelegramMessageStrings(
+            "Низька напруга 12V",
+            "Низька напруга 12V\nНапруга: {battery_12v} В\nЧас: {time}"
+        ),
+        TelegramMessageType.TELEMETRY_UNAVAILABLE to TelegramMessageStrings(
+            "Телеметрія недоступна",
+            "Телеметрія недоступна\nОстанні дані: {last_data_time}\nПомилка: {error}"
+        ),
+        TelegramMessageType.TRIP_SUMMARY to TelegramMessageStrings(
+            "Підсумок поїздки",
+            "Поїздку завершено\nВідстань: {trip_distance_km} км за {trip_duration}\nSOC: {soc_start}% -> {soc_end}%\nЕнергія: {trip_energy_kwh} кВт·год"
+        )
+    ),
+    variableDescriptions = mapOf(
+        "soc" to "Поточний заряд батареї, %",
+        "battery_power_kw" to "Поточна потужність батареї, кВт",
+        "charge_added_percent" to "Доданий заряд, %",
+        "charge_added_kwh" to "Додана енергія, кВт·год",
+        "remaining_energy_kwh" to "Залишок енергії, кВт·год",
+        "range_km" to "Розрахунковий запас ходу, км",
+        "charge_duration" to "Тривалість заряджання",
+        "time" to "Час події",
+        "battery_12v" to "Напруга 12V батареї, В",
+        "last_data_time" to "Час останніх валідних даних",
+        "error" to "Короткий опис помилки",
+        "trip_distance_km" to "Відстань поїздки, км",
+        "trip_energy_kwh" to "Енергія поїздки, кВт·год",
+        "trip_duration" to "Тривалість поїздки",
+        "soc_start" to "SOC на початку поїздки, %",
+        "soc_end" to "SOC наприкінці поїздки, %"
+    )
+)
+
+private val telegramEn = TelegramStrings(
+    tab = "Telegram",
+    subtitle = "Independent events and custom message templates",
+    connection = "Connection",
+    enable = "Enable Telegram",
+    botToken = "Bot token",
+    chatId = "Chat ID",
+    notTested = "not tested",
+    testing = "testing",
+    connected = "connected",
+    storageError = "storage error",
+    failed = "connection failed",
+    messageTemplate = "Message template",
+    messagePlaceholder = "Message text",
+    insertVariable = "Insert variable",
+    clearBotToken = "Clear Bot token",
+    chargeStep = "Charge step",
+    low12vThreshold = "Voltage threshold",
+    telemetryDelay = "Notification delay",
+    tripDelay = "Summary delay",
+    minuteUnit = "min",
+    messages = mapOf(
+        TelegramMessageType.CHARGING_STARTED to TelegramMessageStrings(
+            "Charging started",
+            "Charging started\nSOC: {soc}%\nPower: {battery_power_kw} kW"
+        ),
+        TelegramMessageType.CHARGING_PROGRESS to TelegramMessageStrings(
+            "Charging progress",
+            "Charge: {soc}%\nAdded: {charge_added_percent}% / {charge_added_kwh} kWh"
+        ),
+        TelegramMessageType.CHARGED_TO_100 to TelegramMessageStrings(
+            "Charged to 100%",
+            "Vehicle charged to 100%\nEnergy: {remaining_energy_kwh} kWh\nRange: {range_km} km"
+        ),
+        TelegramMessageType.CHARGING_STOPPED to TelegramMessageStrings(
+            "Charging stopped",
+            "Charging stopped\nSOC: {soc}%\nDuration: {charge_duration}"
+        ),
+        TelegramMessageType.CHARGE_GUN_CONNECTED to TelegramMessageStrings(
+            "Charge gun connected",
+            "Charge gun connected\nSOC: {soc}%\nTime: {time}"
+        ),
+        TelegramMessageType.CHARGE_GUN_DISCONNECTED to TelegramMessageStrings(
+            "Charge gun disconnected",
+            "Charge gun disconnected\nSOC: {soc}%\nTime: {time}"
+        ),
+        TelegramMessageType.LOW_12V_VOLTAGE to TelegramMessageStrings(
+            "Low 12V voltage",
+            "Low 12V voltage\nVoltage: {battery_12v} V\nTime: {time}"
+        ),
+        TelegramMessageType.TELEMETRY_UNAVAILABLE to TelegramMessageStrings(
+            "Telemetry unavailable",
+            "Telemetry unavailable\nLast data: {last_data_time}\nError: {error}"
+        ),
+        TelegramMessageType.TRIP_SUMMARY to TelegramMessageStrings(
+            "Trip summary",
+            "Trip complete\nDistance: {trip_distance_km} km in {trip_duration}\nSOC: {soc_start}% -> {soc_end}%\nEnergy: {trip_energy_kwh} kWh"
+        )
+    ),
+    variableDescriptions = mapOf(
+        "soc" to "Current battery charge, %",
+        "battery_power_kw" to "Current battery power, kW",
+        "charge_added_percent" to "Added charge, %",
+        "charge_added_kwh" to "Added energy, kWh",
+        "remaining_energy_kwh" to "Remaining energy, kWh",
+        "range_km" to "Estimated range, km",
+        "charge_duration" to "Charging duration",
+        "time" to "Event time",
+        "battery_12v" to "12V battery voltage, V",
+        "last_data_time" to "Last valid data time",
+        "error" to "Short error description",
+        "trip_distance_km" to "Trip distance, km",
+        "trip_energy_kwh" to "Trip energy, kWh",
+        "trip_duration" to "Trip duration",
+        "soc_start" to "SOC at trip start, %",
+        "soc_end" to "SOC at trip end, %"
+    )
+)
+
 fun strings(language: UiLanguage): UiStrings {
     return when (language) {
         UiLanguage.UK -> UiStrings(
@@ -214,8 +406,11 @@ fun strings(language: UiLanguage): UiStrings {
             start = "Старт",
             stop = "Стоп",
             testConnection = "Тест зв'язку",
+            showSecret = "Показати секрет",
+            hideSecret = "Приховати секрет",
             autoStart = "Автоматичний запуск",
             controls = "Керування",
+            telegram = telegramUk,
             mainTab = "Головна",
             allTab = "Всі дані",
             haTab = "HA інтеграція",
@@ -385,8 +580,11 @@ fun strings(language: UiLanguage): UiStrings {
             start = "Start",
             stop = "Stop",
             testConnection = "Test connection",
+            showSecret = "Show secret",
+            hideSecret = "Hide secret",
             autoStart = "Automatic start",
             controls = "Controls",
+            telegram = telegramEn,
             mainTab = "Main",
             allTab = "All data",
             haTab = "HA integration",

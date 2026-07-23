@@ -69,6 +69,24 @@ object CollectorServiceController {
         context.startService(CollectorService.stopInfluxExportIntent(context))
     }
 
+    fun reconcileTelegram(context: Context) {
+        val intent = CollectorService.reconcileTelegramIntent(context)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
+    }
+
+    fun testTelegram(context: Context) {
+        val intent = CollectorService.testTelegramIntent(context)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
+    }
+
     fun archiveDatabase(context: Context) {
         val intent = CollectorService.archiveDatabaseIntent(context)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

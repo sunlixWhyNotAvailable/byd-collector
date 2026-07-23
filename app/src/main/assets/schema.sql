@@ -218,6 +218,28 @@ CREATE TABLE IF NOT EXISTS mqtt_outbox (
 CREATE INDEX IF NOT EXISTS idx_mqtt_outbox_due
 ON mqtt_outbox(next_attempt_at, priority, updated_at);
 
+CREATE TABLE IF NOT EXISTS telegram_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dedupe_key TEXT NOT NULL UNIQUE,
+    event_type TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    next_attempt_at_ms INTEGER NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at_ms INTEGER,
+    last_error TEXT,
+    blocked INTEGER NOT NULL DEFAULT 0 CHECK (blocked IN (0, 1))
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_outbox_due
+ON telegram_outbox(blocked, next_attempt_at_ms, id);
+
+CREATE TABLE IF NOT EXISTS telegram_runtime_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    state_json TEXT NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS mqtt_retry_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     failure_count INTEGER NOT NULL DEFAULT 0,

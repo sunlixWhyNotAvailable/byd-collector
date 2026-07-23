@@ -10,6 +10,7 @@ import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
 import com.bydcollector.collector.mqtt.HaMqttConfig
+import com.bydcollector.collector.security.KeystoreSecretStore
 
 //persistent user settings facade that also records operational events for later diagnostics
 class CollectorSettings(
@@ -17,6 +18,14 @@ class CollectorSettings(
     private val store: TelemetryStore? = null
 ) {
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val secretStore = KeystoreSecretStore(context)
+
+    init {
+        migrateLegacySecret(KEY_MQTT_USERNAME, SECRET_MQTT_USERNAME)
+        migrateLegacySecret(KEY_MQTT_PASSWORD, SECRET_MQTT_PASSWORD)
+        migrateLegacySecret(KEY_INFLUX_USERNAME, SECRET_INFLUX_USERNAME)
+        migrateLegacySecret(KEY_INFLUX_PASSWORD, SECRET_INFLUX_PASSWORD)
+    }
 
     fun isAutoStartEnabled(): Boolean = prefs.getBoolean(KEY_AUTO_START, false)
 
@@ -172,16 +181,16 @@ class CollectorSettings(
         prefs.edit().putInt(KEY_MQTT_PORT, port.coerceIn(1, 65535)).apply()
     }
 
-    fun mqttUsername(): String = prefs.getString(KEY_MQTT_USERNAME, "") ?: ""
+    fun mqttUsername(): String = secretValue(SECRET_MQTT_USERNAME, KEY_MQTT_USERNAME)
 
     fun setMqttUsername(username: String) {
-        prefs.edit().putString(KEY_MQTT_USERNAME, username).apply()
+        writeSecret(SECRET_MQTT_USERNAME, username, KEY_MQTT_USERNAME)
     }
 
-    fun mqttPassword(): String = prefs.getString(KEY_MQTT_PASSWORD, "") ?: ""
+    fun mqttPassword(): String = secretValue(SECRET_MQTT_PASSWORD, KEY_MQTT_PASSWORD)
 
     fun setMqttPassword(password: String) {
-        prefs.edit().putString(KEY_MQTT_PASSWORD, password).apply()
+        writeSecret(SECRET_MQTT_PASSWORD, password, KEY_MQTT_PASSWORD)
     }
 
     fun mqttClientId(): String {
@@ -310,6 +319,107 @@ class CollectorSettings(
 
     fun clearTailscaleActivationAttempt() {
         prefs.edit().remove(KEY_TAILSCALE_ACTIVATION_LAST_ATTEMPT_AT_MS).apply()
+    }
+
+    fun isTelegramEnabled(): Boolean = prefs.getBoolean(KEY_TELEGRAM_ENABLED, false)
+
+    fun setTelegramEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_TELEGRAM_ENABLED, enabled).apply()
+        store?.recordEvent(
+            category = if (enabled) "telegram_enabled" else "telegram_disabled",
+            message = "Telegram ${if (enabled) "enabled" else "disabled"}"
+        )
+    }
+
+    fun telegramChatId(): String = prefs.getString(KEY_TELEGRAM_CHAT_ID, "") ?: ""
+
+    fun setTelegramChatId(chatId: String) {
+        prefs.edit().putString(KEY_TELEGRAM_CHAT_ID, chatId.trim()).apply()
+    }
+
+    fun telegramBotToken(): String = secretStore.read(SECRET_TELEGRAM_BOT_TOKEN).orEmpty()
+
+    fun isTelegramBotTokenSet(): Boolean = telegramBotToken().isNotEmpty()
+
+    fun setTelegramBotToken(token: String): Boolean = writeSecret(SECRET_TELEGRAM_BOT_TOKEN, token.trim())
+
+    fun clearTelegramBotToken(): Boolean = secretStore.clear(SECRET_TELEGRAM_BOT_TOKEN)
+
+    fun isTelegramEventEnabled(eventKey: String): Boolean {
+        return prefs.getBoolean("$KEY_TELEGRAM_EVENT_PREFIX$eventKey", false)
+    }
+
+    fun setTelegramEventEnabled(eventKey: String, enabled: Boolean) {
+        prefs.edit().putBoolean("$KEY_TELEGRAM_EVENT_PREFIX$eventKey", enabled).apply()
+    }
+
+    fun telegramTemplate(eventKey: String): String? {
+        return prefs.getString("$KEY_TELEGRAM_TEMPLATE_PREFIX$eventKey", null)
+    }
+
+    fun setTelegramTemplate(eventKey: String, template: String) {
+        prefs.edit().putString("$KEY_TELEGRAM_TEMPLATE_PREFIX$eventKey", template).apply()
+    }
+
+    fun telegramChargeStepPercent(): Int {
+        return prefs.getInt(KEY_TELEGRAM_CHARGE_STEP, DEFAULT_TELEGRAM_CHARGE_STEP)
+            .coerceIn(MIN_TELEGRAM_CHARGE_STEP, MAX_TELEGRAM_CHARGE_STEP)
+    }
+
+    fun setTelegramChargeStepPercent(value: Int) {
+        prefs.edit().putInt(
+            KEY_TELEGRAM_CHARGE_STEP,
+            value.coerceIn(MIN_TELEGRAM_CHARGE_STEP, MAX_TELEGRAM_CHARGE_STEP)
+        ).apply()
+    }
+
+    fun telegramLowVoltageThreshold(): Float {
+        return prefs.getFloat(KEY_TELEGRAM_LOW_VOLTAGE, DEFAULT_TELEGRAM_LOW_VOLTAGE)
+            .coerceIn(MIN_TELEGRAM_LOW_VOLTAGE, MAX_TELEGRAM_LOW_VOLTAGE)
+    }
+
+    fun setTelegramLowVoltageThreshold(value: Float) {
+        prefs.edit().putFloat(
+            KEY_TELEGRAM_LOW_VOLTAGE,
+            value.coerceIn(MIN_TELEGRAM_LOW_VOLTAGE, MAX_TELEGRAM_LOW_VOLTAGE)
+        ).apply()
+    }
+
+    fun telegramUnavailableDelayMinutes(): Int {
+        return prefs.getInt(KEY_TELEGRAM_UNAVAILABLE_DELAY, DEFAULT_TELEGRAM_UNAVAILABLE_DELAY)
+            .coerceIn(MIN_TELEGRAM_DELAY_MINUTES, MAX_TELEGRAM_DELAY_MINUTES)
+    }
+
+    fun setTelegramUnavailableDelayMinutes(value: Int) {
+        prefs.edit().putInt(
+            KEY_TELEGRAM_UNAVAILABLE_DELAY,
+            value.coerceIn(MIN_TELEGRAM_DELAY_MINUTES, MAX_TELEGRAM_DELAY_MINUTES)
+        ).apply()
+    }
+
+    fun telegramTripEndDelayMinutes(): Int {
+        return prefs.getInt(KEY_TELEGRAM_TRIP_END_DELAY, DEFAULT_TELEGRAM_TRIP_END_DELAY)
+            .coerceIn(MIN_TELEGRAM_DELAY_MINUTES, MAX_TELEGRAM_DELAY_MINUTES)
+    }
+
+    fun setTelegramTripEndDelayMinutes(value: Int) {
+        prefs.edit().putInt(
+            KEY_TELEGRAM_TRIP_END_DELAY,
+            value.coerceIn(MIN_TELEGRAM_DELAY_MINUTES, MAX_TELEGRAM_DELAY_MINUTES)
+        ).apply()
+    }
+
+    fun telegramConnectionStatus(): String = prefs.getString(KEY_TELEGRAM_CONNECTION_STATUS, "not_tested")
+        ?: "not_tested"
+
+    fun telegramConnectionMessage(): String? = prefs.getString(KEY_TELEGRAM_CONNECTION_MESSAGE, null)
+
+    fun setTelegramConnectionStatus(status: String, message: String?) {
+        prefs.edit().apply {
+            putString(KEY_TELEGRAM_CONNECTION_STATUS, status)
+            if (message == null) remove(KEY_TELEGRAM_CONNECTION_MESSAGE)
+            else putString(KEY_TELEGRAM_CONNECTION_MESSAGE, message.take(300))
+        }.apply()
     }
 
     fun archiveStorageLimitGb(): Int = prefs.getInt(KEY_ARCHIVE_STORAGE_LIMIT_GB, DEFAULT_ARCHIVE_STORAGE_LIMIT_GB)
@@ -499,16 +609,16 @@ class CollectorSettings(
         prefs.edit().putString(KEY_INFLUX_DATABASE, database.ifBlank { InfluxConfig.DEFAULT_DATABASE }).apply()
     }
 
-    fun influxUsername(): String = prefs.getString(KEY_INFLUX_USERNAME, "") ?: ""
+    fun influxUsername(): String = secretValue(SECRET_INFLUX_USERNAME, KEY_INFLUX_USERNAME)
 
     fun setInfluxUsername(username: String) {
-        prefs.edit().putString(KEY_INFLUX_USERNAME, username).apply()
+        writeSecret(SECRET_INFLUX_USERNAME, username, KEY_INFLUX_USERNAME)
     }
 
-    fun influxPassword(): String = prefs.getString(KEY_INFLUX_PASSWORD, "") ?: ""
+    fun influxPassword(): String = secretValue(SECRET_INFLUX_PASSWORD, KEY_INFLUX_PASSWORD)
 
     fun setInfluxPassword(password: String) {
-        prefs.edit().putString(KEY_INFLUX_PASSWORD, password).apply()
+        writeSecret(SECRET_INFLUX_PASSWORD, password, KEY_INFLUX_PASSWORD)
     }
 
     fun influxMeasurement(): String {
@@ -591,6 +701,41 @@ class CollectorSettings(
         )
     }
 
+    private fun secretValue(name: String, legacyPreferenceKey: String): String {
+        return secretStore.read(name)
+            ?: runCatching { prefs.getString(legacyPreferenceKey, "") }.getOrNull()
+            .orEmpty()
+    }
+
+    private fun writeSecret(name: String, value: String, legacyPreferenceKey: String? = null): Boolean {
+        val written = if (value.isBlank()) {
+            secretStore.clear(name)
+        } else {
+            secretStore.write(name, value) && secretStore.read(name) == value
+        }
+        if (written && legacyPreferenceKey != null) {
+            prefs.edit().remove(legacyPreferenceKey).commit()
+        } else if (!written) {
+            store?.recordEvent(
+                category = "keystore_secret_write_failed",
+                message = "Credential could not be stored in Android Keystore",
+                detail = "secret=$name"
+            )
+        }
+        return written
+    }
+
+    private fun migrateLegacySecret(preferenceKey: String, secretName: String) {
+        if (!prefs.contains(preferenceKey)) return
+        val legacy = runCatching { prefs.getString(preferenceKey, null) }.getOrNull() ?: return
+        val migrated = if (legacy.isBlank()) {
+            secretStore.clear(secretName)
+        } else {
+            secretStore.write(secretName, legacy) && secretStore.read(secretName) == legacy
+        }
+        if (migrated) prefs.edit().remove(preferenceKey).commit()
+    }
+
     companion object {
         const val PREFS_NAME = "collector_settings"
         const val KEY_AUTO_START = "autoStart"
@@ -627,6 +772,21 @@ class CollectorSettings(
         const val KEY_INFLUX_PASSWORD = "influxPassword"
         const val KEY_INFLUX_MEASUREMENT = "influxMeasurement"
         const val KEY_INFLUX_CATEGORIES = "influxCategories"
+        const val KEY_TELEGRAM_ENABLED = "telegramEnabled"
+        const val KEY_TELEGRAM_CHAT_ID = "telegramChatId"
+        const val KEY_TELEGRAM_EVENT_PREFIX = "telegramEvent."
+        const val KEY_TELEGRAM_TEMPLATE_PREFIX = "telegramTemplate."
+        const val KEY_TELEGRAM_CHARGE_STEP = "telegramChargeStep"
+        const val KEY_TELEGRAM_LOW_VOLTAGE = "telegramLowVoltage"
+        const val KEY_TELEGRAM_UNAVAILABLE_DELAY = "telegramUnavailableDelay"
+        const val KEY_TELEGRAM_TRIP_END_DELAY = "telegramTripEndDelay"
+        const val KEY_TELEGRAM_CONNECTION_STATUS = "telegramConnectionStatus"
+        const val KEY_TELEGRAM_CONNECTION_MESSAGE = "telegramConnectionMessage"
+        const val SECRET_MQTT_USERNAME = "mqtt.username"
+        const val SECRET_MQTT_PASSWORD = "mqtt.password"
+        const val SECRET_INFLUX_USERNAME = "influx.username"
+        const val SECRET_INFLUX_PASSWORD = "influx.password"
+        const val SECRET_TELEGRAM_BOT_TOKEN = "telegram.bot_token"
         const val KEY_UPDATE_AUTO_CHECK = "updateAutoCheck"
         const val KEY_UPDATE_LAST_CHECK_AT_MS = "updateLastCheckAtMs"
         const val KEY_TAILSCALE_ACTIVATION = "tailscaleActivation"
@@ -658,6 +818,16 @@ class CollectorSettings(
         const val MIN_ARCHIVE_STORAGE_LIMIT_GB = 1
         const val MAX_ARCHIVE_STORAGE_LIMIT_GB = 10
         const val DEFAULT_MQTT_PORT = 1883
+        const val DEFAULT_TELEGRAM_CHARGE_STEP = 5
+        const val MIN_TELEGRAM_CHARGE_STEP = 1
+        const val MAX_TELEGRAM_CHARGE_STEP = 99
+        const val DEFAULT_TELEGRAM_LOW_VOLTAGE = 12.0f
+        const val MIN_TELEGRAM_LOW_VOLTAGE = 9.0f
+        const val MAX_TELEGRAM_LOW_VOLTAGE = 15.0f
+        const val DEFAULT_TELEGRAM_UNAVAILABLE_DELAY = 1
+        const val DEFAULT_TELEGRAM_TRIP_END_DELAY = 2
+        const val MIN_TELEGRAM_DELAY_MINUTES = 1
+        const val MAX_TELEGRAM_DELAY_MINUTES = 60
         const val AUTO_START_ENABLED_UK = "Автозапуск активовано"
         const val AUTO_START_DISABLED_UK = "Автозапуск деактивовано"
 

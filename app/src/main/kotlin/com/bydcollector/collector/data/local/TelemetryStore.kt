@@ -455,6 +455,169 @@ class TelemetryStore(
 
     override fun pendingCount(): Long = safeScalarLong("SELECT COUNT(*) FROM mqtt_outbox")
 
+    fun enqueueTelegramMessage(
+        dedupeKey: String,
+        eventType: String,
+        payload: String,
+        nowMs: Long
+    ): TelegramEnqueueResult {
+        val expired = helper.writableDatabase.delete(
+            "telegram_outbox",
+            "created_at_ms < ?",
+            arrayOf((nowMs - TELEGRAM_RETENTION_MS).toString())
+        )
+        if (telegramMessageExists(dedupeKey)) {
+            return TelegramEnqueueResult(inserted = false, expiredCount = expired, overflowCount = 0)
+        }
+        val pending = safeScalarLong("SELECT COUNT(*) FROM telegram_outbox")
+        val overflow = (pending - TELEGRAM_MAX_PENDING + 1L).coerceAtLeast(0L).toInt()
+        if (overflow > 0) {
+            helper.writableDatabase.delete(
+                "telegram_outbox",
+                "id IN (SELECT id FROM telegram_outbox ORDER BY id LIMIT ?)",
+                arrayOf(overflow.toString())
+            )
+        }
+        val inserted = helper.writableDatabase.insertWithOnConflict(
+            "telegram_outbox",
+            null,
+            ContentValues().apply {
+                put("dedupe_key", dedupeKey)
+                put("event_type", eventType)
+                put("payload", payload)
+                put("created_at_ms", nowMs)
+                put("next_attempt_at_ms", nowMs)
+            },
+            SQLiteDatabase.CONFLICT_IGNORE
+        ) != -1L
+        return TelegramEnqueueResult(inserted, expired, overflow)
+    }
+
+    fun dueTelegramMessages(nowMs: Long, limit: Int = 20): List<TelegramOutboxEntry> {
+        if (limit <= 0) return emptyList()
+        helper.readableDatabase.rawQuery(
+            """
+            SELECT id, dedupe_key, event_type, payload, attempt_count
+            FROM telegram_outbox
+            WHERE blocked = 0 AND next_attempt_at_ms <= ?
+            ORDER BY id
+            LIMIT ?
+            """.trimIndent(),
+            arrayOf(nowMs.toString(), limit.toString())
+        ).use { cursor ->
+            return buildList {
+                while (cursor.moveToNext()) {
+                    add(
+                        TelegramOutboxEntry(
+                            id = cursor.getLong(0),
+                            dedupeKey = cursor.getString(1),
+                            eventType = cursor.getString(2),
+                            payload = cursor.getString(3),
+                            attemptCount = cursor.getInt(4)
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    fun pruneTelegramMessages(nowMs: Long): Int {
+        return helper.writableDatabase.delete(
+            "telegram_outbox",
+            "created_at_ms < ?",
+            arrayOf((nowMs - TELEGRAM_RETENTION_MS).toString())
+        )
+    }
+
+    fun markTelegramDelivered(id: Long) {
+        helper.writableDatabase.delete("telegram_outbox", "id = ?", arrayOf(id.toString()))
+    }
+
+    fun markTelegramRetry(id: Long, error: String, attemptedAtMs: Long, nextAttemptAtMs: Long) {
+        helper.writableDatabase.update(
+            "telegram_outbox",
+            ContentValues().apply {
+                put("attempt_count", telegramAttemptCount(id) + 1)
+                put("last_attempt_at_ms", attemptedAtMs)
+                put("next_attempt_at_ms", nextAttemptAtMs)
+                put("last_error", error.truncateForStorage(MAX_ERROR_TEXT_LENGTH))
+                put("blocked", 0)
+            },
+            "id = ?",
+            arrayOf(id.toString())
+        )
+    }
+
+    fun markTelegramBlocked(id: Long, error: String, attemptedAtMs: Long) {
+        helper.writableDatabase.update(
+            "telegram_outbox",
+            ContentValues().apply {
+                put("attempt_count", telegramAttemptCount(id) + 1)
+                put("last_attempt_at_ms", attemptedAtMs)
+                put("last_error", error.truncateForStorage(MAX_ERROR_TEXT_LENGTH))
+                put("blocked", 1)
+            },
+            "id = ?",
+            arrayOf(id.toString())
+        )
+    }
+
+    fun unblockTelegramMessages(nowMs: Long) {
+        helper.writableDatabase.update(
+            "telegram_outbox",
+            ContentValues().apply {
+                put("blocked", 0)
+                put("next_attempt_at_ms", nowMs)
+            },
+            "blocked = 1",
+            emptyArray()
+        )
+    }
+
+    fun telegramQueueSnapshot(): TelegramQueueSnapshot {
+        helper.readableDatabase.rawQuery(
+            """
+            SELECT COUNT(*),
+                   COALESCE(SUM(CASE WHEN blocked = 1 THEN 1 ELSE 0 END), 0),
+                   MIN(CASE WHEN blocked = 0 THEN next_attempt_at_ms END)
+            FROM telegram_outbox
+            """.trimIndent(),
+            emptyArray()
+        ).use { cursor ->
+            if (!cursor.moveToFirst()) return TelegramQueueSnapshot(0, 0, null, null)
+            val lastError = helper.readableDatabase.rawQuery(
+                "SELECT last_error FROM telegram_outbox WHERE last_error IS NOT NULL ORDER BY last_attempt_at_ms DESC LIMIT 1",
+                emptyArray()
+            ).use { errorCursor -> if (errorCursor.moveToFirst()) errorCursor.getString(0) else null }
+            return TelegramQueueSnapshot(
+                pendingCount = cursor.getLong(0),
+                blockedCount = cursor.getLong(1),
+                nextAttemptAtMs = if (cursor.isNull(2)) null else cursor.getLong(2),
+                lastError = lastError
+            )
+        }
+    }
+
+    fun telegramRuntimeState(): String? {
+        helper.readableDatabase.rawQuery(
+            "SELECT state_json FROM telegram_runtime_state WHERE id = 1",
+            emptyArray()
+        ).use { cursor -> return if (cursor.moveToFirst()) cursor.getString(0) else null }
+    }
+
+    fun saveTelegramRuntimeState(stateJson: String, nowMs: Long) {
+        helper.writableDatabase.insertWithOnConflict(
+            "telegram_runtime_state",
+            null,
+            ContentValues().apply {
+                put("id", 1)
+                put("state_json", stateJson)
+                put("updated_at_ms", nowMs)
+            },
+            SQLiteDatabase.CONFLICT_REPLACE
+        )
+    }
+
     override fun ensureInfluxCursors(fieldKeys: Set<String>) {
         if (fieldKeys.isEmpty()) return
         val db = helper.writableDatabase
@@ -1036,6 +1199,22 @@ class TelemetryStore(
         }
     }
 
+    private fun telegramAttemptCount(id: Long): Int {
+        helper.readableDatabase.rawQuery(
+            "SELECT attempt_count FROM telegram_outbox WHERE id = ?",
+            arrayOf(id.toString())
+        ).use { cursor ->
+            return if (cursor.moveToFirst()) cursor.getInt(0) else 0
+        }
+    }
+
+    private fun telegramMessageExists(dedupeKey: String): Boolean {
+        helper.readableDatabase.rawQuery(
+            "SELECT 1 FROM telegram_outbox WHERE dedupe_key = ? LIMIT 1",
+            arrayOf(dedupeKey)
+        ).use { cursor -> return cursor.moveToFirst() }
+    }
+
     private fun scalarString(sql: String): String? {
         helper.readableDatabase.rawQuery(sql, emptyArray()).use { cursor ->
             return if (cursor.moveToFirst()) cursor.getString(0) else null
@@ -1119,5 +1298,7 @@ class TelemetryStore(
         private const val TAG = "BYDCollectorEvent"
         private const val MAX_ERROR_TEXT_LENGTH = 2_048
         private const val MAX_RAW_RESPONSE_BODY_LENGTH = 4_096
+        private const val TELEGRAM_MAX_PENDING = 1_000L
+        private const val TELEGRAM_RETENTION_MS = 30L * 24L * 60L * 60L * 1_000L
     }
 }

@@ -31,7 +31,7 @@ object CollectorAutoStart {
         val store = BydCollectorApplication.store(appContext)
         val settings = CollectorSettings(appContext, store)
         if (!shouldRunService(settings)) {
-            store.recordEvent("boot_auto_start_skipped", "Auto-start and keep-alive disabled", action)
+            store.recordEvent("boot_auto_start_skipped", "Auto-start, keep-alive, and Telegram disabled", action)
             cancelRetry(appContext)
             cancelWatchdog(appContext)
             return
@@ -64,7 +64,7 @@ object CollectorAutoStart {
         attemptStart(
             context = appContext,
             store = store,
-            keepAliveOnly = !settings.isAutoStartEnabled() && settings.keepAliveConfig().anyEnabled,
+            keepAliveOnly = keepAliveOnly(settings),
             category = if (action == ACTION_RETRY_AUTO_START) "boot_auto_start_retry" else "boot_auto_start_attempt",
             successCategory = "boot_auto_start_requested",
             failureCategory = "boot_auto_start_failure",
@@ -90,7 +90,7 @@ object CollectorAutoStart {
         attemptStart(
             context = appContext,
             store = store,
-            keepAliveOnly = !settings.isAutoStartEnabled() && settings.keepAliveConfig().anyEnabled,
+            keepAliveOnly = keepAliveOnly(settings),
             category = "foreground_auto_start_recovery",
             successCategory = "foreground_auto_start_requested",
             failureCategory = "foreground_auto_start_failure",
@@ -109,7 +109,7 @@ object CollectorAutoStart {
         if (!shouldRunService(settings)) {
             store.recordEvent(
                 "task_removed_no_autostart",
-                "Collector restart ignored after task removal because auto-start and keep-alive are disabled"
+                "Collector restart ignored after task removal because auto-start, keep-alive, and Telegram are disabled"
             )
             return
         }
@@ -197,8 +197,14 @@ object CollectorAutoStart {
 
     private fun shouldRunService(settings: CollectorSettings): Boolean {
         if (settings.isUserShutdownRequested()) return false
-        //keep-alive alone is enough reason to keep a foreground service even when polling is disabled
-        return settings.isAutoStartEnabled() || settings.keepAliveConfig().anyEnabled
+        //Telegram can drain its durable queue without forcing vehicle polling on.
+        return settings.isAutoStartEnabled() || settings.keepAliveConfig().anyEnabled || settings.isTelegramEnabled()
+    }
+
+    private fun keepAliveOnly(settings: CollectorSettings): Boolean {
+        return !settings.isAutoStartEnabled() &&
+            settings.keepAliveConfig().anyEnabled &&
+            !settings.isTelegramEnabled()
     }
 
     private fun attemptStart(
@@ -236,7 +242,7 @@ object CollectorAutoStart {
         action: String
     ) {
         val appContext = context.applicationContext
-        val keepAliveOnly = !settings.isAutoStartEnabled() && settings.keepAliveConfig().anyEnabled
+        val keepAliveOnly = keepAliveOnly(settings)
         try {
             store.recordEvent(
                 "auto_start_reconcile_requested",

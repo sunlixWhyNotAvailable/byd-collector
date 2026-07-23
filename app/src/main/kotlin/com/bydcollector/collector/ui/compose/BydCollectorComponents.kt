@@ -45,6 +45,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -501,9 +502,19 @@ fun TextInput(
     modifier: Modifier = Modifier,
     password: Boolean = false,
     enabled: Boolean = true,
-    keyboardType: KeyboardType = KeyboardType.Text
+    keyboardType: KeyboardType = KeyboardType.Text,
+    placeholder: String = "",
+    showPasswordContentDescription: String? = null,
+    hidePasswordContentDescription: String? = null,
+    clearContentDescription: String? = null,
+    onClear: (() -> Unit)? = null,
+    showClearWhenEmpty: Boolean = false
 ) {
     val p = LocalBydPalette.current
+    var passwordVisible by remember { mutableStateOf(false) }
+    val hasVisibilityToggle = password &&
+        showPasswordContentDescription != null &&
+        hidePasswordContentDescription != null
     Column(modifier = modifier) {
         //keeps labeled inputs compact so ha settings fit the tablet viewport
         Text(
@@ -515,27 +526,151 @@ fun TextInput(
             overflow = TextOverflow.Ellipsis
         )
         Spacer(Modifier.height(3.dp))
-        BasicTextField(
-            value = value,
-            onValueChange = onValueChange,
-            enabled = enabled,
-            singleLine = true,
-            textStyle = TextStyle(
-                color = if (enabled) p.text else p.muted.copy(alpha = 0.6f),
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Normal
-            ),
-            cursorBrush = SolidColor(p.accent),
-            visualTransformation = if (password) PasswordVisualTransformation() else VisualTransformation.None,
-            keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
+        Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(38.dp)
                 .clip(ControlShape)
                 .background(if (enabled) p.pathField else p.disabled.copy(alpha = 0.30f))
                 .border(1.dp, p.pathBorder, ControlShape)
-                .padding(horizontal = 10.dp, vertical = 8.dp)
+                .padding(start = 10.dp, end = if (onClear != null || hasVisibilityToggle) 3.dp else 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            BasicTextField(
+                value = value,
+                onValueChange = onValueChange,
+                enabled = enabled,
+                singleLine = true,
+                textStyle = TextStyle(
+                    color = if (enabled) p.text else p.muted.copy(alpha = 0.6f),
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Normal
+                ),
+                cursorBrush = SolidColor(p.accent),
+                visualTransformation = if (password && !passwordVisible) {
+                    PasswordVisualTransformation()
+                } else {
+                    VisualTransformation.None
+                },
+                keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
+                modifier = Modifier.weight(1f),
+                decorationBox = { innerTextField ->
+                    Box {
+                        if (value.isEmpty() && placeholder.isNotEmpty()) {
+                            Text(placeholder, color = p.muted, fontSize = 14.sp)
+                        }
+                        innerTextField()
+                    }
+                }
+            )
+            if (hasVisibilityToggle) {
+                PasswordVisibilityButton(
+                    visible = passwordVisible,
+                    contentDescription = if (passwordVisible) {
+                        hidePasswordContentDescription!!
+                    } else {
+                        showPasswordContentDescription!!
+                    },
+                    onClick = { passwordVisible = !passwordVisible }
+                )
+            }
+            if (onClear != null && clearContentDescription != null && (value.isNotEmpty() || showClearWhenEmpty)) {
+                ClearFieldButton(clearContentDescription, onClear)
+            }
+        }
+    }
+}
+
+@Composable
+fun TextValueInput(
+    label: String,
+    value: TextFieldValue,
+    onValueChange: (TextFieldValue) -> Unit,
+    modifier: Modifier = Modifier,
+    placeholder: String = "",
+    multiline: Boolean = false,
+    keyboardType: KeyboardType = KeyboardType.Text
+) {
+    val p = LocalBydPalette.current
+    Column(modifier = modifier) {
+        if (label.isNotEmpty()) {
+            Text(
+                text = label,
+                color = p.muted,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(Modifier.height(3.dp))
+        }
+        BasicTextField(
+            value = value,
+            onValueChange = onValueChange,
+            singleLine = !multiline,
+            maxLines = if (multiline) 6 else 1,
+            textStyle = TextStyle(
+                color = p.text,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Normal,
+                lineHeight = 19.sp
+            ),
+            cursorBrush = SolidColor(p.accent),
+            keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(if (multiline) 104.dp else 38.dp)
+                .clip(ControlShape)
+                .background(p.pathField)
+                .border(1.dp, p.pathBorder, ControlShape)
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            decorationBox = { innerTextField ->
+                Box {
+                    if (value.text.isEmpty() && placeholder.isNotEmpty()) {
+                        Text(placeholder, color = p.muted, fontSize = 14.sp)
+                    }
+                    innerTextField()
+                }
+            }
         )
+    }
+}
+
+@Composable
+private fun PasswordVisibilityButton(visible: Boolean, contentDescription: String, onClick: () -> Unit) {
+    val p = LocalBydPalette.current
+    val interactionSource = remember { MutableInteractionSource() }
+    val press = rememberForcedPressClick(enabled = true, onClick = onClick)
+    Box(
+        modifier = Modifier
+            .size(32.dp)
+            .pressScaleModifier(interactionSource, forcePressed = press.visualPressed)
+            .clip(PillShape)
+            .clickable(enabled = !press.locked, interactionSource = interactionSource, indication = null) {
+                press.onClick()
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        SecretVisibilityIcon(visible, contentDescription, p.muted, Modifier.size(18.dp))
+    }
+}
+
+@Composable
+private fun ClearFieldButton(contentDescription: String, onClick: () -> Unit) {
+    val p = LocalBydPalette.current
+    val interactionSource = remember { MutableInteractionSource() }
+    val press = rememberForcedPressClick(enabled = true, onClick = onClick)
+    Box(
+        modifier = Modifier
+            .size(32.dp)
+            .pressScaleModifier(interactionSource, forcePressed = press.visualPressed)
+            .clip(PillShape)
+            .clickable(enabled = !press.locked, interactionSource = interactionSource, indication = null) {
+                press.onClick()
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        ClearIcon(contentDescription, p.muted, Modifier.size(16.dp))
     }
 }
 

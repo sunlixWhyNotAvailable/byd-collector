@@ -57,10 +57,12 @@ import com.bydcollector.collector.mqtt.MqttClientFacade
 import com.bydcollector.collector.mqtt.MqttPublishCoordinator
 import com.bydcollector.collector.mqtt.PahoMqttClientFacade
 import com.bydcollector.collector.system.CollectorAutoStart
+import com.bydcollector.collector.telegram.TelegramCoordinator
 import com.bydcollector.collector.util.namedSingleThreadExecutor
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -75,6 +77,7 @@ class CollectorService : Service() {
     private lateinit var vehicleStateNormalizer: VehicleStateNormalizer
     private lateinit var mqttCoordinator: MqttPublishCoordinator
     private lateinit var influxCoordinator: InfluxExportCoordinator
+    private lateinit var telegramCoordinator: TelegramCoordinator
     private lateinit var maintenanceCoordinator: DbMaintenanceCoordinator
     private var wakeLock: PowerManager.WakeLock? = null
     private var sessionId: Long? = null
@@ -90,8 +93,11 @@ class CollectorService : Service() {
     private var mqttExecutor: ExecutorService = namedSingleThreadExecutor("byd-mqtt")
     private val influxExecutorLock = Any()
     private var influxExecutor: ExecutorService = namedSingleThreadExecutor("byd-influx")
+    private val telegramExecutorLock = Any()
+    private var telegramExecutor: ExecutorService = namedSingleThreadExecutor("byd-telegram")
     private val mqttWorkGeneration = AtomicLong(0L)
     private val influxWorkGeneration = AtomicLong(0L)
+    private val telegramWorkGeneration = AtomicLong(0L)
     private val debugStartInProgress = AtomicBoolean(false)
     private val mqttRuntimeActive = AtomicBoolean(false)
     private val mqttOfflineQueued = AtomicBoolean(false)
@@ -103,6 +109,21 @@ class CollectorService : Service() {
     private var lastStatusHeartbeatAtMs: Long = -STATUS_HEARTBEAT_INTERVAL_MS
     private var lastNotificationText: String? = null
     private var accessSelfCheckScheduled = false
+    @Volatile private var lastTelegramPollError: String? = null
+    private var telegramTickScheduled = false
+    private val telegramTickTask = object : Runnable {
+        override fun run() {
+            telegramTickScheduled = false
+            if (!settings.isTelegramEnabled()) return
+            executeTelegram("telegram_tick_error") {
+                telegramCoordinator.tick(
+                    mainCollectionExpected = settings.isPollingEnabled() && !settings.isMainManuallyStopped(),
+                    lastError = lastTelegramPollError
+                )
+            }
+            scheduleTelegramTick()
+        }
+    }
     private val accessSelfCheckTask = object : Runnable {
         override fun run() {
             accessSelfCheckScheduled = false
@@ -131,6 +152,7 @@ class CollectorService : Service() {
         vehicleStateNormalizer = VehicleStateNormalizer()
         mqttCoordinator = createMqttCoordinator(PahoMqttClientFacade())
         influxCoordinator = createInfluxCoordinator()
+        telegramCoordinator = createTelegramCoordinator()
         normalizedStateChangedCallback = { changedCategories -> publishChangedCategoriesAsync(changedCategories) }
         poller = createTelemetryPoller()
         maintenanceCoordinator = DbMaintenanceCoordinator(
@@ -189,6 +211,8 @@ class CollectorService : Service() {
             ACTION_STOP_MQTT_EXPORT -> stopMqttExport(manualStop = true)
             ACTION_START_INFLUX_EXPORT -> startInfluxExport(clearManualStop = true)
             ACTION_STOP_INFLUX_EXPORT -> stopInfluxExport(manualStop = true)
+            ACTION_RECONCILE_TELEGRAM -> reconcileTelegramRuntime(unblockBlocked = true)
+            ACTION_TEST_TELEGRAM -> testTelegramConnection()
             ACTION_ARCHIVE_DATABASE -> startDatabaseMaintenance(DbMaintenanceOperation.ARCHIVE)
             ACTION_ARCHIVE_DEBUG_DATABASE -> startDatabaseMaintenance(DbMaintenanceOperation.DEBUG_ARCHIVE)
             ACTION_CANCEL_DATABASE_MAINTENANCE -> cancelDatabaseMaintenance()
@@ -208,7 +232,9 @@ class CollectorService : Service() {
 
     override fun onDestroy() {
         mainHandler.removeCallbacks(accessSelfCheckTask)
+        mainHandler.removeCallbacks(telegramTickTask)
         accessSelfCheckScheduled = false
+        telegramTickScheduled = false
         stopCollection("service_destroyed")
         keepAliveSupervisor.shutdown()
         debugStartExecutor.shutdownNow()
@@ -217,6 +243,7 @@ class CollectorService : Service() {
         tailscaleExecutor.shutdownNow()
         shutdownMqttExecutor()
         shutdownInfluxExecutor()
+        shutdownTelegramExecutor()
         mainPollingRunning.set(false)
         running.set(false)
         if (::debugStore.isInitialized) {
@@ -264,6 +291,11 @@ class CollectorService : Service() {
                             readings = readings
                         )
                         val summary = store.applyNormalizedObservations(observations)
+                        if (settings.isTelegramEnabled()) {
+                            executeTelegram("telegram_event_error") {
+                                telegramCoordinator.onSuccessfulPoll(observations)
+                            }
+                        }
                         if (summary.changedCategories.isNotEmpty()) {
                             normalizedStateChangedCallback?.invoke(summary.changedCategories)
                         }
@@ -284,15 +316,16 @@ class CollectorService : Service() {
             val debugAllowed = debugEnabled && !settings.isDebugManuallyStopped()
             val keepAliveConfig = settings.keepAliveConfig()
             val keepAliveEnabled = keepAliveConfig.anyEnabled
+            val telegramEnabled = settings.isTelegramEnabled()
             //stops the foreground service only after keep-alive settings have been mirrored to the shell delegate
-            if (!mainAllowed && !debugAllowed && !keepAliveEnabled) {
-                store.recordEvent("service_start_skipped", "Polling and keep-alive disabled")
+            if (!mainAllowed && !debugAllowed && !keepAliveEnabled && !telegramEnabled) {
+                store.recordEvent("service_start_skipped", "Polling, keep-alive, and Telegram disabled")
                 stopMain("polling_disabled")
                 stopDebug("debug_disabled")
                 stopAfterKeepAliveReconcile(keepAliveConfig)
                 return
             }
-            val initialNotificationText = notificationText(mainAllowed, debugAllowed, keepAliveEnabled)
+            val initialNotificationText = notificationText(mainAllowed, debugAllowed, keepAliveEnabled, telegramEnabled)
             lastNotificationText = initialNotificationText
             startForeground(NOTIFICATION_ID, buildNotification(initialNotificationText))
             acquireWakeLock()
@@ -313,6 +346,7 @@ class CollectorService : Service() {
 
             if (settings.isMqttAutoStartEnabled() && !settings.isMqttManuallyStopped()) startMqttExport(clearManualStop = false)
             if (settings.isInfluxAutoStartEnabled() && !settings.isInfluxManuallyStopped()) startInfluxExport(clearManualStop = false)
+            if (telegramEnabled) reconcileTelegramRuntime()
 
             CollectorAutoStart.scheduleWatchdog(applicationContext, settings, store)
         } catch (error: RuntimeException) {
@@ -333,7 +367,7 @@ class CollectorService : Service() {
                 return
             }
 
-            val notification = notificationText(mainRunning, debugRunning, keepAliveEnabled)
+            val notification = notificationText(mainRunning, debugRunning, keepAliveEnabled, settings.isTelegramEnabled())
             lastNotificationText = notification
             startForeground(NOTIFICATION_ID, buildNotification(notification))
             acquireWakeLock()
@@ -422,7 +456,14 @@ class CollectorService : Service() {
                         if (summary.errorCount > 0 && summary.okCount == 0) {
                             updateNotification("Polling error: debug helper returned errors")
                         } else {
-                            updateNotification(notificationText(settings.isPollingEnabled(), true, settings.keepAliveConfig().anyEnabled))
+                            updateNotification(
+                                notificationText(
+                                    settings.isPollingEnabled(),
+                                    true,
+                                    settings.keepAliveConfig().anyEnabled,
+                                    settings.isTelegramEnabled()
+                                )
+                            )
                         }
                     }
                 )
@@ -521,6 +562,9 @@ class CollectorService : Service() {
         settings.setDebugPollingEnabled(false)
         settings.setMqttEnabled(false)
         settings.setInfluxEnabled(false)
+        mainHandler.removeCallbacks(telegramTickTask)
+        telegramTickScheduled = false
+        resetTelegramExecutorForMaintenance()
         store.recordEvent(
             "user_shutdown_deferred_for_maintenance",
             "User shutdown deferred until database maintenance completes",
@@ -540,6 +584,9 @@ class CollectorService : Service() {
         disconnectOfflineAsync()
         runCatching { influxCoordinator.stopExport() }
         resetInfluxExecutorForMaintenance()
+        mainHandler.removeCallbacks(telegramTickTask)
+        telegramTickScheduled = false
+        resetTelegramExecutorForMaintenance()
     }
 
     private fun stopServiceAfterUserShutdown() {
@@ -604,6 +651,7 @@ class CollectorService : Service() {
         val debugEnabled: Boolean,
         val mqttEnabled: Boolean,
         val influxEnabled: Boolean,
+        val telegramEnabled: Boolean,
         val debugRunning: Boolean
     )
 
@@ -613,6 +661,7 @@ class CollectorService : Service() {
             debugEnabled = settings.isDebugPollingEnabled(),
             mqttEnabled = settings.isMqttEnabled(),
             influxEnabled = settings.isInfluxEnabled(),
+            telegramEnabled = settings.isTelegramEnabled(),
             debugRunning = isDebugPollerRunning()
         )
     }
@@ -662,8 +711,11 @@ class CollectorService : Service() {
         mqttRuntimeActive.set(false)
         mqttOfflineQueued.set(false)
         mqttCoordinator.disconnectForMaintenance()
+        mainHandler.removeCallbacks(telegramTickTask)
+        telegramTickScheduled = false
         resetMqttExecutorForMaintenance()
         resetInfluxExecutorForMaintenance()
+        resetTelegramExecutorForMaintenance(requireStopped = true)
     }
 
     private fun restoreRuntimeAfterMaintenance(operation: DbMaintenanceOperation, snapshot: RuntimeSnapshot) {
@@ -691,7 +743,8 @@ class CollectorService : Service() {
             settings.setDebugPollingEnabled(snapshot.debugEnabled)
             settings.setMqttEnabled(snapshot.mqttEnabled)
             settings.setInfluxEnabled(snapshot.influxEnabled)
-            if (snapshot.mainEnabled || snapshot.debugEnabled || settings.keepAliveConfig().anyEnabled) {
+            settings.setTelegramEnabled(snapshot.telegramEnabled)
+            if (snapshot.mainEnabled || snapshot.debugEnabled || settings.keepAliveConfig().anyEnabled || snapshot.telegramEnabled) {
                 reconcileCollection()
             }
             if (snapshot.mqttEnabled && !settings.isMqttManuallyStopped()) startMqttExport(clearManualStop = false)
@@ -709,6 +762,7 @@ class CollectorService : Service() {
         keepAliveSupervisor = KeepAliveSupervisor(applicationContext, store)
         mqttCoordinator = createMqttCoordinator(PahoMqttClientFacade())
         influxCoordinator = createInfluxCoordinator()
+        telegramCoordinator = createTelegramCoordinator()
         poller = createTelemetryPoller()
     }
 
@@ -737,11 +791,13 @@ class CollectorService : Service() {
     }
 
     private fun handlePollCycleResult(result: com.bydcollector.collector.data.polling.PollCycleResult) {
+        lastTelegramPollError = if (result.ok) null else result.category
         val text = if (result.ok) {
             notificationText(
                 mainEnabled = true,
                 debugEnabled = isDebugPollerRunning(),
-                keepAliveEnabled = settings.keepAliveConfig().anyEnabled
+                keepAliveEnabled = settings.keepAliveConfig().anyEnabled,
+                telegramEnabled = settings.isTelegramEnabled()
             )
         } else {
             "Polling error: ${PollingErrorSummaries.summary(result.category)}"
@@ -853,11 +909,48 @@ class CollectorService : Service() {
         stopIfNoActiveRuntime()
     }
 
+    private fun reconcileTelegramRuntime(unblockBlocked: Boolean = false) {
+        if (maintenanceBlocksRuntimeStart()) return
+        if (!settings.isTelegramEnabled()) {
+            mainHandler.removeCallbacks(telegramTickTask)
+            telegramTickScheduled = false
+            executeTelegram("telegram_reset_error") {
+                telegramCoordinator.integrationDisabled()
+            }
+            stopIfNoActiveRuntime()
+            return
+        }
+        ensureForegroundForChannel("Telegram notifications enabled")
+        executeTelegram("telegram_start_error") {
+            if (unblockBlocked) telegramCoordinator.credentialsChanged()
+            telegramCoordinator.tick(
+                mainCollectionExpected = settings.isPollingEnabled() && !settings.isMainManuallyStopped(),
+                lastError = lastTelegramPollError
+            )
+        }
+        scheduleTelegramTick()
+        CollectorAutoStart.scheduleWatchdog(applicationContext, settings, store)
+    }
+
+    private fun testTelegramConnection() {
+        ensureForegroundForChannel("Testing Telegram connection")
+        executeTelegram("telegram_test_error") {
+            telegramCoordinator.testConnection()
+            mainHandler.post { stopIfNoActiveRuntime() }
+        }
+    }
+
+    private fun scheduleTelegramTick() {
+        if (telegramTickScheduled || !settings.isTelegramEnabled()) return
+        telegramTickScheduled = true
+        mainHandler.postDelayed(telegramTickTask, TELEGRAM_TICK_INTERVAL_MS)
+    }
+
     private fun stopIfNoActiveRuntime() {
         val mainRunning = poller.isRunning()
         val debugRunningNow = isDebugPollerRunning()
         val keepAliveEnabled = settings.keepAliveConfig().anyEnabled
-        if (mainRunning || debugRunningNow || keepAliveEnabled || settings.isMqttEnabled() || settings.isInfluxEnabled() || archiveStorageActiveInProcess.get()) {
+        if (mainRunning || debugRunningNow || keepAliveEnabled || settings.isMqttEnabled() || settings.isInfluxEnabled() || settings.isTelegramEnabled() || archiveStorageActiveInProcess.get()) {
             return
         }
         releaseWakeLock()
@@ -1008,6 +1101,17 @@ class CollectorService : Service() {
         ChannelActionStatus(result.ok, result.category, result.message)
     }
 
+    private fun executeTelegram(errorCategory: String, action: () -> Unit) = executeChannel(
+        channelName = "Telegram",
+        errorCategory = errorCategory,
+        executorLock = telegramExecutorLock,
+        executor = { telegramExecutor },
+        generation = telegramWorkGeneration,
+        action = action
+    ) {
+        ChannelActionStatus(true, "ok", "ok")
+    }
+
     private fun <T> executeChannel(
         channelName: String,
         errorCategory: String,
@@ -1112,6 +1216,30 @@ class CollectorService : Service() {
                 "Database maintenance action rejected",
                 "${error::class.java.simpleName}: ${error.message ?: "no message"}"
             )
+        }
+    }
+
+    private fun resetTelegramExecutorForMaintenance(requireStopped: Boolean = false) {
+        telegramWorkGeneration.incrementAndGet()
+        val previous = synchronized(telegramExecutorLock) {
+            val active = telegramExecutor
+            active.shutdownNow()
+            telegramExecutor = namedSingleThreadExecutor("byd-telegram")
+            active
+        }
+        if (!requireStopped) return
+        val stopped = try {
+            previous.awaitTermination(TELEGRAM_MAINTENANCE_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        check(stopped) { "Telegram worker did not stop before database maintenance" }
+    }
+
+    private fun shutdownTelegramExecutor() {
+        synchronized(telegramExecutorLock) {
+            telegramExecutor.shutdown()
         }
     }
 
@@ -1238,16 +1366,30 @@ class CollectorService : Service() {
         )
     }
 
-    private fun notificationText(mainEnabled: Boolean, debugEnabled: Boolean, keepAliveEnabled: Boolean): String {
-        return when {
+    private fun notificationText(
+        mainEnabled: Boolean,
+        debugEnabled: Boolean,
+        keepAliveEnabled: Boolean,
+        telegramEnabled: Boolean
+    ): String {
+        val base = when {
             mainEnabled && debugEnabled && keepAliveEnabled -> "Collector running + debug + keep-alive"
             mainEnabled && keepAliveEnabled -> "Collector running + keep-alive"
             debugEnabled && keepAliveEnabled -> "Debug polling running + keep-alive"
             keepAliveEnabled -> "Keep-alive running"
             mainEnabled && debugEnabled -> "Collector running + debug"
             debugEnabled -> "Debug polling running"
-            else -> "Collector running"
+            mainEnabled -> "Collector running"
+            else -> "Collector service running"
         }
+        return if (telegramEnabled) "$base + Telegram" else base
+    }
+
+    private fun createTelegramCoordinator(): TelegramCoordinator {
+        return TelegramCoordinator(
+            store = store,
+            settings = settings
+        )
     }
 
     private fun updateNotification(text: String) {
@@ -1311,6 +1453,8 @@ class CollectorService : Service() {
         val ACTION_STOP_MQTT_EXPORT: String = "${BuildConfig.ACTION_PREFIX}.action.STOP_MQTT_EXPORT"
         val ACTION_START_INFLUX_EXPORT: String = "${BuildConfig.ACTION_PREFIX}.action.START_INFLUX_EXPORT"
         val ACTION_STOP_INFLUX_EXPORT: String = "${BuildConfig.ACTION_PREFIX}.action.STOP_INFLUX_EXPORT"
+        val ACTION_RECONCILE_TELEGRAM: String = "${BuildConfig.ACTION_PREFIX}.action.RECONCILE_TELEGRAM"
+        val ACTION_TEST_TELEGRAM: String = "${BuildConfig.ACTION_PREFIX}.action.TEST_TELEGRAM"
         val ACTION_ARCHIVE_DATABASE: String = "${BuildConfig.ACTION_PREFIX}.action.ARCHIVE_DATABASE"
         val ACTION_ARCHIVE_DEBUG_DATABASE: String = "${BuildConfig.ACTION_PREFIX}.action.ARCHIVE_DEBUG_DATABASE"
         val ACTION_CANCEL_DATABASE_MAINTENANCE: String = "${BuildConfig.ACTION_PREFIX}.action.CANCEL_DATABASE_MAINTENANCE"
@@ -1321,6 +1465,8 @@ class CollectorService : Service() {
         private const val NOTIFICATION_ID = 1001
         private const val STATUS_HEARTBEAT_INTERVAL_MS = 30_000L
         private const val ACCESS_SELF_CHECK_INTERVAL_MS = 5 * 60_000L
+        private const val TELEGRAM_TICK_INTERVAL_MS = 15_000L
+        private const val TELEGRAM_MAINTENANCE_STOP_TIMEOUT_MS = 16_000L
         private const val TAG = "BYDCollectorService"
         private const val DEBUG_REASON_AUTOSTART = "autostart"
         private const val DEBUG_REASON_MANUAL = "manual"
@@ -1377,6 +1523,14 @@ class CollectorService : Service() {
 
         fun stopInfluxExportIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
             action = ACTION_STOP_INFLUX_EXPORT
+        }
+
+        fun reconcileTelegramIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
+            action = ACTION_RECONCILE_TELEGRAM
+        }
+
+        fun testTelegramIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
+            action = ACTION_TEST_TELEGRAM
         }
 
         fun archiveDatabaseIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {

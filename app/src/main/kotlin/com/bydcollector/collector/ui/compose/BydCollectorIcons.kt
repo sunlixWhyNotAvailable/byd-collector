@@ -12,6 +12,7 @@ enum class BottomTabIcon {
     HOME,
     DATABASE,
     HA,
+    TELEGRAM,
     STORAGE,
     GEAR,
     LOGS
@@ -42,9 +43,32 @@ private fun BottomTabIcon.drawableRes(): Int = when (this) {
     BottomTabIcon.HOME -> R.drawable.ic_tab_home
     BottomTabIcon.DATABASE -> R.drawable.ic_tab_all_data
     BottomTabIcon.HA -> R.drawable.ic_tab_ha_link
+    BottomTabIcon.TELEGRAM -> R.drawable.ic_tab_telegram
     BottomTabIcon.STORAGE -> R.drawable.ic_tab_storage
     BottomTabIcon.GEAR -> R.drawable.ic_tab_options
     BottomTabIcon.LOGS -> R.drawable.ic_tab_logs
+}
+
+@Composable
+fun ClearIcon(contentDescription: String, color: Color, modifier: Modifier = Modifier) {
+    Icon(
+        painter = painterResource(id = R.drawable.ic_clear),
+        contentDescription = contentDescription,
+        tint = color,
+        modifier = modifier
+    )
+}
+
+@Composable
+fun SecretVisibilityIcon(visible: Boolean, contentDescription: String, color: Color, modifier: Modifier = Modifier) {
+    Icon(
+        painter = painterResource(
+            id = if (visible) R.drawable.ic_visibility_off else R.drawable.ic_visibility
+        ),
+        contentDescription = contentDescription,
+        tint = color,
+        modifier = modifier
+    )
 }
 
 @Composable
