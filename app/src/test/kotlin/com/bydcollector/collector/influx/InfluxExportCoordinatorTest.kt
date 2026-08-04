@@ -60,6 +60,7 @@ class InfluxExportCoordinatorTest {
         coordinator.runOneCycle(force = true)
 
         assertEquals(300, client.writtenLines.single().size)
+        assertEquals(listOf(300), store.pendingBatchLimits)
         assertEquals(300, store.cursor("soc").lastExportedHistoryId)
         assertEquals(1, store.influxExportState().pendingRows)
     }
@@ -140,6 +141,7 @@ class InfluxExportCoordinatorTest {
     ) : InfluxExportStore {
         val cursors = linkedMapOf<String, InfluxCursor>()
         val cursorErrors = linkedMapOf<String, String>()
+        val pendingBatchLimits = mutableListOf<Int>()
         private var state = InfluxExportStateSnapshot(
             status = "stopped",
             mode = null,
@@ -167,13 +169,14 @@ class InfluxExportCoordinatorTest {
             )
         }
 
-        override fun pendingInfluxRows(fieldKey: String, afterHistoryId: Long, limit: Int): List<InfluxPendingHistoryRow> {
-            return rows.filter { it.fieldKey == fieldKey && it.id > afterHistoryId }.take(limit)
-        }
-
-        override fun influxCursors(fieldKeys: Set<String>): List<InfluxCursor> {
+        override fun pendingInfluxRows(fieldKeys: Set<String>, limit: Int): List<InfluxPendingHistoryRow> {
             ensureInfluxCursors(fieldKeys)
-            return fieldKeys.map { cursor(it) }
+            pendingBatchLimits += limit
+            return rows.asSequence()
+                .filter { it.fieldKey in fieldKeys && it.id > cursor(it.fieldKey).lastExportedHistoryId }
+                .sortedBy { it.id }
+                .take(limit)
+                .toList()
         }
 
         override fun updateInfluxCursorSuccess(fieldKey: String, historyId: Long, exportedAt: String) {

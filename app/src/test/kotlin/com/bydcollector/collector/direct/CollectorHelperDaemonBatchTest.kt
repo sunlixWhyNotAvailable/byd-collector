@@ -105,8 +105,13 @@ class CollectorHelperDaemonBatchTest {
 
             val whitelist = CollectorHelperDaemon.loadWhitelist(apk.absolutePath)
             val known = address(5, 1014, 1145045040)
+            val debugRows = DirectDebugParameterAsset.parse(asset.readText(Charsets.UTF_8))
+            val debugAddresses = debugRows.map { address(it.tx, it.dev, it.fid) }
 
             assertEquals(6513, whitelist.size)
+            assertEquals(6432, debugAddresses.size)
+            assertTrue(debugAddresses.size <= CollectorHelperProtocol.MAX_BATCH_SIZE)
+            assertNull(CollectorHelperDaemon.validateRows(debugAddresses, whitelist))
             assertNull(CollectorHelperDaemon.validateRows(listOf(known), whitelist))
             assertContains(
                 CollectorHelperDaemon.validateRows(listOf(address(8, 1014, 1145045040)), whitelist).orEmpty(),
@@ -121,7 +126,46 @@ class CollectorHelperDaemonBatchTest {
         }
     }
 
+    @Test
+    fun fullRoundRobinBatchFitsClientGateAndOversizedBatchIsRejectedByDaemonBoundary() {
+        val asset = listOf(
+            File("src/main/assets/${DirectDebugParameterAsset.ASSET_NAME}"),
+            File("app/src/main/assets/${DirectDebugParameterAsset.ASSET_NAME}")
+        ).firstOrNull { it.isFile } ?: error("Missing ${DirectDebugParameterAsset.ASSET_NAME}")
+        val client = sourceFile("com/bydcollector/collector/data/direct/DirectVehicleHelperClient.kt").readText()
+        val daemon = sourceFile("com/bydcollector/collector/direct/CollectorHelperDaemon.java").readText()
+        val rows = DirectDebugParameterAsset.parse(asset.readText(Charsets.UTF_8))
+
+        assertEquals(6432, rows.size)
+        assertEquals(10000, CollectorHelperProtocol.MAX_BATCH_SIZE)
+        assertTrue(client.contains("entries.isEmpty() || entries.size > CollectorHelperProtocol.MAX_BATCH_SIZE"))
+        assertTrue(client.contains("return synchronized(lock)"))
+        assertTrue(client.contains("data.writeInt(entries.size)"))
+        assertTrue(client.contains("binder.transact(CollectorHelperProtocol.TX_READ_BATCH, data, reply, 0)"))
+        val gateIndex = client.indexOf("entries.isEmpty() || entries.size > CollectorHelperProtocol.MAX_BATCH_SIZE")
+        val writeCountIndex = client.indexOf("data.writeInt(entries.size)")
+        val transactIndex = client.indexOf("binder.transact(CollectorHelperProtocol.TX_READ_BATCH, data, reply, 0)")
+        assertTrue(
+            gateIndex <
+                client.indexOf("return synchronized(lock)")
+        )
+        assertTrue(gateIndex < writeCountIndex)
+        assertTrue(writeCountIndex < transactIndex)
+        assertTrue(10001 > CollectorHelperProtocol.MAX_BATCH_SIZE)
+        assertTrue(daemon.contains("if (count < 1 || count > CollectorHelperProtocol.MAX_BATCH_SIZE)"))
+        assertTrue(daemon.contains("throw new IllegalArgumentException(\"invalid batch size: \" + count)"))
+    }
+
     private fun address(tx: Int, dev: Int, fid: Int) = CollectorHelperDaemon.Address(tx, dev, fid)
+
+    private fun sourceFile(path: String): File {
+        return listOf(
+            File("src/main/java/$path"),
+            File("app/src/main/java/$path"),
+            File("src/main/kotlin/$path"),
+            File("app/src/main/kotlin/$path")
+        ).firstOrNull { it.isFile } ?: error("Missing source file: $path")
+    }
 
     private fun unavailableNative(reason: String) = object : CollectorHelperDaemon.NativeReader {
         override fun isAvailable() = false

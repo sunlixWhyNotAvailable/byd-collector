@@ -291,7 +291,10 @@ class MainActivity : ComponentActivity() {
         override fun onStartMqtt() {
             refreshStoreBackedState()
             requestAccessCheck("start_mqtt", AccessCheckMode.NORMAL)
-            saveMqttDraft()
+            if (!saveMqttDraft()) {
+                refresh()
+                return
+            }
             settings.setMqttManuallyStopped(false)
             settings.setMqttEnabled(true)
             CollectorServiceController.startMqttExport(this@MainActivity)
@@ -331,7 +334,10 @@ class MainActivity : ComponentActivity() {
         override fun onStartInflux() {
             refreshStoreBackedState()
             requestAccessCheck("start_influx", AccessCheckMode.NORMAL)
-            saveInfluxDraft()
+            if (!saveInfluxDraft()) {
+                refresh()
+                return
+            }
             settings.setInfluxManuallyStopped(false)
             settings.setInfluxEnabled(true)
             CollectorServiceController.startInfluxExport(this@MainActivity)
@@ -1054,29 +1060,41 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun saveMqttDraft() {
+    private fun saveMqttDraft(): Boolean {
         //keeps saved passwords sticky while empty password fields mean "leave existing secret unchanged"
         settings.setMqttHost(mqttDraft.host)
         settings.setMqttPort(mqttDraft.port.toIntOrNull() ?: settings.mqttPort())
-        settings.setMqttUsername(mqttDraft.username)
-        if (mqttDraft.password.isNotBlank()) {
-            settings.setMqttPassword(mqttDraft.password)
-        }
+        val usernameStored = settings.setMqttUsername(mqttDraft.username)
+        val passwordStored = mqttDraft.password.isBlank() || settings.setMqttPassword(mqttDraft.password)
         settings.setMqttClientId(mqttDraft.clientId)
         settings.setMqttTopicPrefix(mqttDraft.topicPrefix)
         settings.setMqttDiscoveryPrefix(mqttDraft.discoveryPrefix)
+        val stored = usernameStored && passwordStored
+        if (!stored) {
+            mqttDraft = mqttDraft.copy(
+                username = settings.mqttUsername(),
+                password = settings.mqttPassword()
+            )
+        }
+        return stored
     }
 
-    private fun saveInfluxDraft() {
+    private fun saveInfluxDraft(): Boolean {
         //mirrors mqtt draft semantics so editing non-secret influx fields never clears the stored password
         settings.setInfluxHost(influxDraft.host)
         settings.setInfluxPort(influxDraft.port.toIntOrNull() ?: settings.influxPort())
-        settings.setInfluxUsername(influxDraft.username)
-        if (influxDraft.password.isNotBlank()) {
-            settings.setInfluxPassword(influxDraft.password)
-        }
+        val usernameStored = settings.setInfluxUsername(influxDraft.username)
+        val passwordStored = influxDraft.password.isBlank() || settings.setInfluxPassword(influxDraft.password)
         settings.setInfluxDatabase(influxDraft.database)
         settings.setInfluxMeasurement(influxDraft.measurement)
+        val stored = usernameStored && passwordStored
+        if (!stored) {
+            influxDraft = influxDraft.copy(
+                username = settings.influxUsername(),
+                password = settings.influxPassword()
+            )
+        }
+        return stored
     }
 
     private fun loadTelegramUiState(): TelegramUiState {
@@ -1098,7 +1116,7 @@ class MainActivity : ComponentActivity() {
                 chargeStepPercent = settings.telegramChargeStepPercent(),
                 low12vThresholdVolts = settings.telegramLowVoltageThreshold().toInt(),
                 telemetryUnavailableMinutes = settings.telegramUnavailableDelayMinutes(),
-                tripSummaryDelayMinutes = settings.telegramTripEndDelayMinutes(),
+                tripSummaryDelaySeconds = settings.telegramTripEndDelaySeconds(),
                 messages = messages
             ),
             testStatus = telegramTestStatus(settings.telegramConnectionStatus())
@@ -1126,8 +1144,8 @@ class MainActivity : ComponentActivity() {
         if (previous.telemetryUnavailableMinutes != config.telemetryUnavailableMinutes) {
             settings.setTelegramUnavailableDelayMinutes(config.telemetryUnavailableMinutes)
         }
-        if (previous.tripSummaryDelayMinutes != config.tripSummaryDelayMinutes) {
-            settings.setTelegramTripEndDelayMinutes(config.tripSummaryDelayMinutes)
+        if (previous.tripSummaryDelaySeconds != config.tripSummaryDelaySeconds) {
+            settings.setTelegramTripEndDelaySeconds(config.tripSummaryDelaySeconds)
         }
         TelegramMessageType.entries.forEach { type ->
             val oldMessage = previous.messages[type]
@@ -1231,7 +1249,10 @@ class MainActivity : ComponentActivity() {
 
     private fun runMqttChannelAction(label: String, action: () -> MqttActionResult) {
         refreshStoreBackedState()
-        saveMqttDraft()
+        if (!saveMqttDraft()) {
+            refresh()
+            return
+        }
         dashboardExecutor.execute {
             val result = runCatching { action() }
             runOnUiThread {
@@ -1263,7 +1284,10 @@ class MainActivity : ComponentActivity() {
 
     private fun runInfluxChannelAction(label: String, action: () -> InfluxActionResult) {
         refreshStoreBackedState()
-        saveInfluxDraft()
+        if (!saveInfluxDraft()) {
+            refresh()
+            return
+        }
         dashboardExecutor.execute {
             val result = runCatching { action() }
             runOnUiThread {

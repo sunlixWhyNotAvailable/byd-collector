@@ -19,7 +19,19 @@ class TelegramCoordinator(
     private val engine = TelegramEventEngine(TelegramEventState.fromJson(store.telegramRuntimeState()))
 
     fun onSuccessfulPoll(observations: List<NormalizedObservation>) {
-        handle(engine.onSuccessfulPoll(observations, eventConfig(), nowMs()))
+        val previousTripId = engine.state.tripId
+        val result = engine.onSuccessfulPoll(observations, eventConfig(), nowMs())
+        if (result.state.tripId != null && result.state.tripId != previousTripId) {
+            val deleted = store.deleteUndeliveredTelegramMessages(TelegramEventType.TRIP_SUMMARY.key)
+            if (deleted > 0) {
+                store.recordEvent(
+                    "telegram_trip_summaries_discarded",
+                    "Undelivered trip summaries discarded when a new trip started",
+                    "count=$deleted"
+                )
+            }
+        }
+        handle(result)
     }
 
     fun tick(mainCollectionExpected: Boolean, lastError: String?) {
@@ -55,7 +67,7 @@ class TelegramCoordinator(
                 store.recordEvent(
                     "telegram_connection_test_failed",
                     "Telegram connection test failed",
-                    "kind=${result.kind.name.lowercase()} status=${result.httpStatus ?: "none"}"
+                    failureDetail(result)
                 )
             }
         }
@@ -87,7 +99,7 @@ class TelegramCoordinator(
                     )
                 }
                 is TelegramSendResult.Failure -> {
-                    val error = "${result.kind.name.lowercase()}:${result.httpStatus ?: "none"}"
+                    val error = failureCode(result)
                     if (result.kind.retryable) {
                         val delay = retryPolicy.delayForFailure(entry.attemptCount + 1, result.retryAfterSeconds)
                         store.markTelegramRetry(entry.id, error, attemptedAt, attemptedAt + delay)
@@ -97,7 +109,7 @@ class TelegramCoordinator(
                     store.recordEvent(
                         "telegram_message_failed",
                         "Telegram message delivery failed",
-                        "event=${entry.eventType} kind=${result.kind.name.lowercase()}"
+                        "event=${entry.eventType} ${failureDetail(result)}"
                     )
                     break
                 }
@@ -146,7 +158,21 @@ class TelegramCoordinator(
             chargeStepPercent = settings.telegramChargeStepPercent(),
             lowVoltageThreshold = settings.telegramLowVoltageThreshold().toDouble(),
             unavailableDelayMs = settings.telegramUnavailableDelayMinutes() * 60_000L,
-            tripEndDelayMs = settings.telegramTripEndDelayMinutes() * 60_000L
+            tripEndDelayMs = settings.telegramTripEndDelaySeconds() * 1_000L
         )
+    }
+
+    private fun failureCode(result: TelegramSendResult.Failure): String {
+        return listOfNotNull(
+            result.kind.name.lowercase(),
+            result.httpStatus?.toString(),
+            result.exceptionClass
+        ).joinToString(":")
+    }
+
+    private fun failureDetail(result: TelegramSendResult.Failure): String {
+        return "kind=${result.kind.name.lowercase()} " +
+            "status=${result.httpStatus ?: "none"} " +
+            "exception=${result.exceptionClass ?: "none"}"
     }
 }

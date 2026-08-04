@@ -96,12 +96,7 @@ class InfluxExportCoordinator(
             return InfluxActionResult.ok("influx backoff active")
         }
 
-        val cursors = store.influxCursors(fieldKeys)
-        val rowsByField = cursors
-            .map { cursor -> cursor.fieldKey to store.pendingInfluxRows(cursor.fieldKey, cursor.lastExportedHistoryId, BATCH_LIMIT) }
-            .toMap()
-        //interleaves fields so one noisy signal cannot starve slower-changing fields during catch-up
-        val rows = roundRobin(rowsByField)
+        val rows = store.pendingInfluxRows(fieldKeys, BATCH_LIMIT)
         if (rows.isEmpty()) {
             store.updateInfluxExportState(
                 status = "running",
@@ -165,24 +160,6 @@ class InfluxExportCoordinator(
             .filter { field -> config.enabledCategories.contains(field.category.mqttKey) }
             .map { field -> field.fieldKey }
             .toSet()
-    }
-
-    private fun roundRobin(rowsByField: Map<String, List<InfluxPendingHistoryRow>>): List<InfluxPendingHistoryRow> {
-        val result = mutableListOf<InfluxPendingHistoryRow>()
-        var index = 0
-        while (result.size < BATCH_LIMIT) {
-            var added = false
-            rowsByField.values.forEach { rows ->
-                val row = rows.getOrNull(index)
-                if (row != null && result.size < BATCH_LIMIT) {
-                    result += row
-                    added = true
-                }
-            }
-            if (!added) break
-            index += 1
-        }
-        return result
     }
 
     private fun recordFailure(

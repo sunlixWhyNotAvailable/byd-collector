@@ -33,7 +33,8 @@ sealed interface TelegramSendResult {
         val kind: TelegramSendFailureKind,
         val httpStatus: Int? = null,
         val telegramErrorCode: Int? = null,
-        val retryAfterSeconds: Long? = null
+        val retryAfterSeconds: Long? = null,
+        val exceptionClass: String? = null
     ) : TelegramSendResult
 }
 
@@ -71,8 +72,11 @@ class TelegramHttpClient(
             val status = activeConnection.responseCode
             val response = responseBody(activeConnection, status)
             classify(status, response)
-        } catch (_: Exception) {
-            failure(TelegramSendFailureKind.NETWORK_ERROR)
+        } catch (error: Exception) {
+            failure(
+                TelegramSendFailureKind.NETWORK_ERROR,
+                exceptionClass = error::class.java.name
+            )
         } finally {
             connection?.disconnect()
         }
@@ -118,8 +122,9 @@ class TelegramHttpClient(
         kind: TelegramSendFailureKind,
         httpStatus: Int? = null,
         telegramErrorCode: Int? = null,
-        retryAfterSeconds: Long? = null
-    ) = TelegramSendResult.Failure(kind, httpStatus, telegramErrorCode, retryAfterSeconds)
+        retryAfterSeconds: Long? = null,
+        exceptionClass: String? = null
+    ) = TelegramSendResult.Failure(kind, httpStatus, telegramErrorCode, retryAfterSeconds, exceptionClass)
 
     private fun encode(value: String): String = URLEncoder.encode(value, "UTF-8")
 

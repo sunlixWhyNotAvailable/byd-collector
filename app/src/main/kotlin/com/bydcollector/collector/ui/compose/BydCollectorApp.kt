@@ -387,6 +387,7 @@ private data class TelegramNumberSetting(
     val value: Int,
     val range: IntRange,
     val unit: String,
+    val step: Int = 1,
     val onValueChange: (Int) -> Unit
 )
 
@@ -989,7 +990,9 @@ private fun TelegramNumberStepper(setting: TelegramNumberSetting) {
         )
         ActionButton(
             text = "-",
-            onClick = { setting.onValueChange((setting.value - 1).coerceAtLeast(setting.range.first)) },
+            onClick = {
+                setting.onValueChange((setting.value - setting.step).coerceAtLeast(setting.range.first))
+            },
             enabled = setting.value > setting.range.first,
             modifier = Modifier.width(42.dp)
         )
@@ -999,7 +1002,9 @@ private fun TelegramNumberStepper(setting: TelegramNumberSetting) {
         )
         ActionButton(
             text = "+",
-            onClick = { setting.onValueChange((setting.value + 1).coerceAtMost(setting.range.last)) },
+            onClick = {
+                setting.onValueChange((setting.value + setting.step).coerceAtMost(setting.range.last))
+            },
             enabled = setting.value < setting.range.last,
             modifier = Modifier.width(42.dp)
         )
@@ -1032,10 +1037,11 @@ private fun telegramNumberSetting(
     ) { onConfigChanged(config.copy(telemetryUnavailableMinutes = it)) }
     TelegramMessageType.TRIP_SUMMARY -> TelegramNumberSetting(
         strings.tripDelay,
-        config.tripSummaryDelayMinutes,
-        1..60,
-        strings.minuteUnit
-    ) { onConfigChanged(config.copy(tripSummaryDelayMinutes = it)) }
+        config.tripSummaryDelaySeconds,
+        5..300,
+        strings.secondUnit,
+        step = 5
+    ) { onConfigChanged(config.copy(tripSummaryDelaySeconds = it)) }
     else -> null
 }
 

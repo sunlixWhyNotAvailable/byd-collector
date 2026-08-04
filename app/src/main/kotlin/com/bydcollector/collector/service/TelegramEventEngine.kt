@@ -304,7 +304,14 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
             if (count >= CONFIRMATION_SAMPLES) {
                 val previous = state.gear
                 state = state.copy(gear = raw, gearCandidate = null, gearCandidateCount = 0)
-                if (previous == PARK && raw != PARK && state.tripId == null) startTrip(nowMs, odometer, soc)
+                if (previous == PARK && raw != PARK) {
+                    val parkedLongEnough = state.tripParkedSinceMs?.let {
+                        nowMs - it >= config.tripEndDelayMs
+                    } == true
+                    if (state.tripId == null || parkedLongEnough) {
+                        startTrip(nowMs, odometer, soc)
+                    }
+                }
                 if (raw == PARK && state.tripId != null) state = state.copy(tripParkedSinceMs = nowMs)
                 if (raw != PARK) state = state.copy(tripParkedSinceMs = null)
             }

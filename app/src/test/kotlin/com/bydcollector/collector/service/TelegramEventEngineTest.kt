@@ -17,7 +17,7 @@ class TelegramEventEngineTest {
         chargeStepPercent = 5,
         lowVoltageThreshold = 12.0,
         unavailableDelayMs = 60_000L,
-        tripEndDelayMs = 120_000L
+        tripEndDelayMs = 10_000L
     )
 
     @Test
@@ -80,10 +80,10 @@ class TelegramEventEngineTest {
         engine.onSuccessfulPoll(snapshot(gear = "D", odometer = 100.1), config, 1_000L)
         engine.onSuccessfulPoll(snapshot(gear = "P", odometer = 101.0), config, 2_000L)
         engine.onSuccessfulPoll(snapshot(gear = "P", odometer = 101.0), config, 2_500L)
-        assertTrue(engine.onSuccessfulPoll(snapshot(gear = "P", odometer = 101.0), config, 122_499L).events.isEmpty())
+        assertTrue(engine.onSuccessfulPoll(snapshot(gear = "P", odometer = 101.0), config, 12_499L).events.isEmpty())
         assertEquals(
             TelegramEventType.TRIP_SUMMARY,
-            engine.onSuccessfulPoll(snapshot(gear = "P", odometer = 101.0), config, 122_500L).events.single().type
+            engine.onSuccessfulPoll(snapshot(gear = "P", odometer = 101.0), config, 12_500L).events.single().type
         )
 
         assertTrue(engine.onTick(config, mainCollectionExpected = false, lastError = "offline", nowMs = 200_000L).events.isEmpty())
@@ -92,6 +92,24 @@ class TelegramEventEngineTest {
             TelegramEventType.TELEMETRY_UNAVAILABLE,
             engine.onTick(config, mainCollectionExpected = true, lastError = "offline", nowMs = 260_000L).events.single().type
         )
+    }
+
+    @Test
+    fun newTripAfterExpiredParkReplacesTheOldTripWithoutAStaleSummary() {
+        val engine = TelegramEventEngine()
+        engine.onSuccessfulPoll(snapshot(gear = "P", odometer = 100.0), config, 0L)
+        engine.onSuccessfulPoll(snapshot(gear = "D", odometer = 100.0), config, 500L)
+        engine.onSuccessfulPoll(snapshot(gear = "D", odometer = 100.1), config, 1_000L)
+        val previousTripId = engine.state.tripId
+        engine.onSuccessfulPoll(snapshot(gear = "P", odometer = 101.0), config, 2_000L)
+        engine.onSuccessfulPoll(snapshot(gear = "P", odometer = 101.0), config, 2_500L)
+
+        engine.onSuccessfulPoll(snapshot(gear = "D", odometer = 101.0), config, 20_000L)
+        val restarted = engine.onSuccessfulPoll(snapshot(gear = "D", odometer = 101.1), config, 20_500L)
+
+        assertTrue(restarted.events.isEmpty())
+        assertTrue(restarted.state.tripId != null)
+        assertTrue(restarted.state.tripId != previousTripId)
     }
 
     @Test

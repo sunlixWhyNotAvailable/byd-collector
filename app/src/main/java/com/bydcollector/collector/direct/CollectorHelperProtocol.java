@@ -14,7 +14,7 @@ public final class CollectorHelperProtocol {
 
     public static final int AUTO_TX_INT = 5;
     public static final int AUTO_TX_FLOAT = 7;
-    public static final int MAX_BATCH_SIZE = 6100;
+    public static final int MAX_BATCH_SIZE = 10000;
 
     public static final int STATUS_OK = 0;
     public static final int STATUS_INVALID_REQUEST = -910;

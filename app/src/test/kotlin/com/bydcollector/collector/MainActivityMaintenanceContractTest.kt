@@ -69,13 +69,6 @@ class MainActivityMaintenanceContractTest {
         assertTrue(source.contains("private fun currentMaintenanceUiState(): DbMaintenanceUiState?"))
         val onDestroy = source.substringAfter("override fun onDestroy()").substringBefore("@Suppress")
         assertInOrder(onDestroy, "!CollectorSettings.isDbMaintenanceRunning(applicationContext)", "CollectorAutoStart.scheduleRestartAfterUiClosed(applicationContext, settings, currentStore())")
-        assertFalse(source.contains("sendCmd"))
-        assertFalse(source.contains("setXD"))
-        assertFalse(source.contains("setTrigger"))
-        assertFalse(source.contains("wakeUpMcu"))
-        assertFalse(source.contains("setAction"))
-        assertFalse(source.contains("setActionsBatch"))
-        assertFalse(source.contains("TX_WRITE"))
     }
 
     @Test

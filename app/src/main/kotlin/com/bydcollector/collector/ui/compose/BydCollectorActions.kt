@@ -44,7 +44,7 @@ data class TelegramConfig(
     val chargeStepPercent: Int = 5,
     val low12vThresholdVolts: Int = 12,
     val telemetryUnavailableMinutes: Int = 1,
-    val tripSummaryDelayMinutes: Int = 2,
+    val tripSummaryDelaySeconds: Int = 10,
     val messages: Map<TelegramMessageType, TelegramMessageConfig> = emptyMap()
 )
 

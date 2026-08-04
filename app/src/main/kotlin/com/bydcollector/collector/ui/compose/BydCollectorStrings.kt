@@ -53,6 +53,7 @@ data class TelegramStrings(
     val telemetryDelay: String,
     val tripDelay: String,
     val minuteUnit: String,
+    val secondUnit: String,
     val messages: Map<TelegramMessageType, TelegramMessageStrings>,
     val variableDescriptions: Map<String, String>
 )
@@ -252,6 +253,7 @@ private val telegramUk = TelegramStrings(
     telemetryDelay = "Затримка сповіщення",
     tripDelay = "Затримка підсумку",
     minuteUnit = "хв",
+    secondUnit = "с",
     messages = mapOf(
         TelegramMessageType.CHARGING_STARTED to TelegramMessageStrings(
             "Заряджання розпочато",
@@ -331,6 +333,7 @@ private val telegramEn = TelegramStrings(
     telemetryDelay = "Notification delay",
     tripDelay = "Summary delay",
     minuteUnit = "min",
+    secondUnit = "sec",
     messages = mapOf(
         TelegramMessageType.CHARGING_STARTED to TelegramMessageStrings(
             "Charging started",

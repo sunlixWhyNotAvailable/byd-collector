@@ -243,6 +243,21 @@ class BydCollectorUiContractTest {
     }
 
     @Test
+    fun tripSummaryDelayUsesSecondsContract() {
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val actions = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorActions.kt").readText()
+        val strings = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorStrings.kt").readText()
+
+        assertTrue(actions.contains("tripSummaryDelaySeconds: Int = 10"))
+        assertTrue(app.contains("config.tripSummaryDelaySeconds"))
+        assertTrue(app.contains("5..300"))
+        assertTrue(app.contains("strings.secondUnit"))
+        assertTrue(app.contains("step = 5"))
+        assertTrue(strings.contains("secondUnit = \"с\""))
+        assertTrue(strings.contains("secondUnit = \"sec\""))
+    }
+
+    @Test
     fun optionsTabUsesPreviewRuntimeLayoutAndShutdownAction() {
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
         val actions = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorActions.kt").readText()

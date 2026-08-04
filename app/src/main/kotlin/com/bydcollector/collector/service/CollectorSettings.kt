@@ -21,10 +21,11 @@ class CollectorSettings(
     private val secretStore = KeystoreSecretStore(context)
 
     init {
-        migrateLegacySecret(KEY_MQTT_USERNAME, SECRET_MQTT_USERNAME)
-        migrateLegacySecret(KEY_MQTT_PASSWORD, SECRET_MQTT_PASSWORD)
-        migrateLegacySecret(KEY_INFLUX_USERNAME, SECRET_INFLUX_USERNAME)
-        migrateLegacySecret(KEY_INFLUX_PASSWORD, SECRET_INFLUX_PASSWORD)
+        migrateTripEndDelayToSeconds()
+        migrateLegacySecret(KEY_MQTT_USERNAME, SECRET_MQTT_USERNAME, KEY_MQTT_ENABLED)
+        migrateLegacySecret(KEY_MQTT_PASSWORD, SECRET_MQTT_PASSWORD, KEY_MQTT_ENABLED)
+        migrateLegacySecret(KEY_INFLUX_USERNAME, SECRET_INFLUX_USERNAME, KEY_INFLUX_ENABLED)
+        migrateLegacySecret(KEY_INFLUX_PASSWORD, SECRET_INFLUX_PASSWORD, KEY_INFLUX_ENABLED)
     }
 
     fun isAutoStartEnabled(): Boolean = prefs.getBoolean(KEY_AUTO_START, false)
@@ -181,17 +182,15 @@ class CollectorSettings(
         prefs.edit().putInt(KEY_MQTT_PORT, port.coerceIn(1, 65535)).apply()
     }
 
-    fun mqttUsername(): String = secretValue(SECRET_MQTT_USERNAME, KEY_MQTT_USERNAME)
+    fun mqttUsername(): String = secretValue(SECRET_MQTT_USERNAME)
 
-    fun setMqttUsername(username: String) {
-        writeSecret(SECRET_MQTT_USERNAME, username, KEY_MQTT_USERNAME)
-    }
+    fun setMqttUsername(username: String): Boolean =
+        writeSecret(SECRET_MQTT_USERNAME, username, KEY_MQTT_USERNAME, KEY_MQTT_ENABLED)
 
-    fun mqttPassword(): String = secretValue(SECRET_MQTT_PASSWORD, KEY_MQTT_PASSWORD)
+    fun mqttPassword(): String = secretValue(SECRET_MQTT_PASSWORD)
 
-    fun setMqttPassword(password: String) {
-        writeSecret(SECRET_MQTT_PASSWORD, password, KEY_MQTT_PASSWORD)
-    }
+    fun setMqttPassword(password: String): Boolean =
+        writeSecret(SECRET_MQTT_PASSWORD, password, KEY_MQTT_PASSWORD, KEY_MQTT_ENABLED)
 
     fun mqttClientId(): String {
         return prefs.getString(KEY_MQTT_CLIENT_ID, HaMqttConfig.DEFAULT_CLIENT_ID)
@@ -397,15 +396,15 @@ class CollectorSettings(
         ).apply()
     }
 
-    fun telegramTripEndDelayMinutes(): Int {
-        return prefs.getInt(KEY_TELEGRAM_TRIP_END_DELAY, DEFAULT_TELEGRAM_TRIP_END_DELAY)
-            .coerceIn(MIN_TELEGRAM_DELAY_MINUTES, MAX_TELEGRAM_DELAY_MINUTES)
+    fun telegramTripEndDelaySeconds(): Int {
+        return prefs.getInt(KEY_TELEGRAM_TRIP_END_DELAY_SECONDS, DEFAULT_TELEGRAM_TRIP_END_DELAY_SECONDS)
+            .coerceIn(MIN_TELEGRAM_TRIP_END_DELAY_SECONDS, MAX_TELEGRAM_TRIP_END_DELAY_SECONDS)
     }
 
-    fun setTelegramTripEndDelayMinutes(value: Int) {
+    fun setTelegramTripEndDelaySeconds(value: Int) {
         prefs.edit().putInt(
-            KEY_TELEGRAM_TRIP_END_DELAY,
-            value.coerceIn(MIN_TELEGRAM_DELAY_MINUTES, MAX_TELEGRAM_DELAY_MINUTES)
+            KEY_TELEGRAM_TRIP_END_DELAY_SECONDS,
+            value.coerceIn(MIN_TELEGRAM_TRIP_END_DELAY_SECONDS, MAX_TELEGRAM_TRIP_END_DELAY_SECONDS)
         ).apply()
     }
 
@@ -609,17 +608,15 @@ class CollectorSettings(
         prefs.edit().putString(KEY_INFLUX_DATABASE, database.ifBlank { InfluxConfig.DEFAULT_DATABASE }).apply()
     }
 
-    fun influxUsername(): String = secretValue(SECRET_INFLUX_USERNAME, KEY_INFLUX_USERNAME)
+    fun influxUsername(): String = secretValue(SECRET_INFLUX_USERNAME)
 
-    fun setInfluxUsername(username: String) {
-        writeSecret(SECRET_INFLUX_USERNAME, username, KEY_INFLUX_USERNAME)
-    }
+    fun setInfluxUsername(username: String): Boolean =
+        writeSecret(SECRET_INFLUX_USERNAME, username, KEY_INFLUX_USERNAME, KEY_INFLUX_ENABLED)
 
-    fun influxPassword(): String = secretValue(SECRET_INFLUX_PASSWORD, KEY_INFLUX_PASSWORD)
+    fun influxPassword(): String = secretValue(SECRET_INFLUX_PASSWORD)
 
-    fun setInfluxPassword(password: String) {
-        writeSecret(SECRET_INFLUX_PASSWORD, password, KEY_INFLUX_PASSWORD)
-    }
+    fun setInfluxPassword(password: String): Boolean =
+        writeSecret(SECRET_INFLUX_PASSWORD, password, KEY_INFLUX_PASSWORD, KEY_INFLUX_ENABLED)
 
     fun influxMeasurement(): String {
         return prefs.getString(KEY_INFLUX_MEASUREMENT, InfluxConfig.DEFAULT_MEASUREMENT)
@@ -701,21 +698,24 @@ class CollectorSettings(
         )
     }
 
-    private fun secretValue(name: String, legacyPreferenceKey: String): String {
-        return secretStore.read(name)
-            ?: runCatching { prefs.getString(legacyPreferenceKey, "") }.getOrNull()
-            .orEmpty()
-    }
+    private fun secretValue(name: String): String = secretStore.read(name).orEmpty()
 
-    private fun writeSecret(name: String, value: String, legacyPreferenceKey: String? = null): Boolean {
+    private fun writeSecret(
+        name: String,
+        value: String,
+        legacyPreferenceKey: String? = null,
+        integrationEnabledKey: String? = null
+    ): Boolean {
         val written = if (value.isBlank()) {
             secretStore.clear(name)
         } else {
             secretStore.write(name, value) && secretStore.read(name) == value
         }
-        if (written && legacyPreferenceKey != null) {
-            prefs.edit().remove(legacyPreferenceKey).commit()
-        } else if (!written) {
+        val editor = prefs.edit()
+        legacyPreferenceKey?.let(editor::remove)
+        if (!written) integrationEnabledKey?.let { editor.putBoolean(it, false) }
+        editor.commit()
+        if (!written) {
             store?.recordEvent(
                 category = "keystore_secret_write_failed",
                 message = "Credential could not be stored in Android Keystore",
@@ -725,15 +725,46 @@ class CollectorSettings(
         return written
     }
 
-    private fun migrateLegacySecret(preferenceKey: String, secretName: String) {
+    private fun migrateLegacySecret(preferenceKey: String, secretName: String, integrationEnabledKey: String) {
         if (!prefs.contains(preferenceKey)) return
-        val legacy = runCatching { prefs.getString(preferenceKey, null) }.getOrNull() ?: return
-        val migrated = if (legacy.isBlank()) {
-            secretStore.clear(secretName)
-        } else {
-            secretStore.write(secretName, legacy) && secretStore.read(secretName) == legacy
+        val legacyResult = runCatching { prefs.getString(preferenceKey, null) }
+        val legacy = legacyResult.getOrNull()
+        val existing = secretStore.read(secretName)
+        val migrated = when {
+            !existing.isNullOrBlank() -> true
+            legacyResult.isFailure -> false
+            legacy.isNullOrBlank() -> true
+            else -> secretStore.write(secretName, legacy) && secretStore.read(secretName) == legacy
         }
-        if (migrated) prefs.edit().remove(preferenceKey).commit()
+        prefs.edit().apply {
+            remove(preferenceKey)
+            if (!migrated) putBoolean(integrationEnabledKey, false)
+        }.commit()
+        if (!migrated) {
+            store?.recordEvent(
+                category = "keystore_secret_migration_failed",
+                message = "Legacy credential migration failed closed",
+                detail = "secret=$secretName"
+            )
+        }
+    }
+
+    private fun migrateTripEndDelayToSeconds() {
+        if (prefs.contains(KEY_TELEGRAM_TRIP_END_DELAY_SECONDS)) {
+            if (prefs.contains(KEY_TELEGRAM_TRIP_END_DELAY)) {
+                prefs.edit().remove(KEY_TELEGRAM_TRIP_END_DELAY).commit()
+            }
+            return
+        }
+        if (!prefs.contains(KEY_TELEGRAM_TRIP_END_DELAY)) return
+        val legacyMinutes = runCatching {
+            prefs.getInt(KEY_TELEGRAM_TRIP_END_DELAY, DEFAULT_TELEGRAM_UNAVAILABLE_DELAY)
+        }.getOrDefault(DEFAULT_TELEGRAM_UNAVAILABLE_DELAY)
+        val seconds = legacyTripDelaySeconds(legacyMinutes)
+        prefs.edit()
+            .putInt(KEY_TELEGRAM_TRIP_END_DELAY_SECONDS, seconds)
+            .remove(KEY_TELEGRAM_TRIP_END_DELAY)
+            .commit()
     }
 
     companion object {
@@ -780,6 +811,7 @@ class CollectorSettings(
         const val KEY_TELEGRAM_LOW_VOLTAGE = "telegramLowVoltage"
         const val KEY_TELEGRAM_UNAVAILABLE_DELAY = "telegramUnavailableDelay"
         const val KEY_TELEGRAM_TRIP_END_DELAY = "telegramTripEndDelay"
+        const val KEY_TELEGRAM_TRIP_END_DELAY_SECONDS = "telegramTripEndDelaySeconds"
         const val KEY_TELEGRAM_CONNECTION_STATUS = "telegramConnectionStatus"
         const val KEY_TELEGRAM_CONNECTION_MESSAGE = "telegramConnectionMessage"
         const val SECRET_MQTT_USERNAME = "mqtt.username"
@@ -825,11 +857,22 @@ class CollectorSettings(
         const val MIN_TELEGRAM_LOW_VOLTAGE = 9.0f
         const val MAX_TELEGRAM_LOW_VOLTAGE = 15.0f
         const val DEFAULT_TELEGRAM_UNAVAILABLE_DELAY = 1
-        const val DEFAULT_TELEGRAM_TRIP_END_DELAY = 2
+        const val DEFAULT_TELEGRAM_TRIP_END_DELAY_SECONDS = 10
+        const val MIN_TELEGRAM_TRIP_END_DELAY_SECONDS = 5
+        const val MAX_TELEGRAM_TRIP_END_DELAY_SECONDS = 300
         const val MIN_TELEGRAM_DELAY_MINUTES = 1
         const val MAX_TELEGRAM_DELAY_MINUTES = 60
         const val AUTO_START_ENABLED_UK = "Автозапуск активовано"
         const val AUTO_START_DISABLED_UK = "Автозапуск деактивовано"
+
+        internal fun legacyTripDelaySeconds(minutes: Int): Int {
+            return (minutes.toLong() * 60L)
+                .coerceIn(
+                    MIN_TELEGRAM_TRIP_END_DELAY_SECONDS.toLong(),
+                    MAX_TELEGRAM_TRIP_END_DELAY_SECONDS.toLong()
+                )
+                .toInt()
+        }
 
         fun isDbMaintenanceRunning(context: Context): Boolean {
             val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)

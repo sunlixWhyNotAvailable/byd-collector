@@ -14,12 +14,12 @@
 - direct local vehicle telemetry collection through Android local ADB and a protocol-versioned app_process helper with an APK-owned read-only address whitelist
 - SQLite storage for raw poll values, collection sessions, normalized current state, history, MQTT state, and diagnostics
 - grouped native int/float polling for the curated main set, with ordered results and in-helper scalar fallback
-- grouped native debug round-robin polling for research parameters, on the same 500 ms cadence and fallback contract
+- grouped native debug round-robin polling for the full research catalog in one batch, on the same 500 ms cadence and fallback contract
 - normalized vehicle state for three SOC sources, remaining/trip/cumulative battery energy, charging, doors, tires, climate, speed, odometer, radar distance sensors and related fields
 - Home Assistant MQTT Discovery and live-state publishing
-- `InfluxDB v1` export for historical telemetry
-- optional outbound-only Telegram Bot API notifications with editable event templates and a durable retry queue
-- Android Keystore-backed storage for MQTT, InfluxDB, and Telegram secrets, with stored passwords/tokens masked in the UI and explicit eye controls
+- `InfluxDB v1` export for historical telemetry, limited globally to 300 rows per export pass
+- optional outbound-only Telegram Bot API notifications with editable event templates, a durable retry queue, and trip-summary delay configured in seconds
+- Android Keystore-backed storage for MQTT, InfluxDB, and Telegram secrets, with fail-closed migration, masked fields, and explicit eye controls
 - main and debug round-robin database archives with shared storage retention and Android chooser sharing for completed ZIP archives
 - shell-side keep-alive recovery with an explicit Shutdown gate and idempotent service reconcile
 - process-aware delayed Tailscale start with exact foreground task/Home restoration
@@ -51,6 +51,7 @@ When enabled, the built-in Tailscale policy reacts to an unreachable configured 
 
 Telegram integration is optional and disabled by default. Each supported event is also disabled independently until selected by the user.
 The app sends plain text through the Telegram Bot API only; it does not accept Telegram commands, register webhooks, poll updates, or send media.
+Trip summaries default to 10 seconds after parking and can be configured from 5 to 300 seconds. Starting a new trip discards undelivered summaries from earlier trips so delayed messages do not arrive during the next drive.
 
 ## Tested
 

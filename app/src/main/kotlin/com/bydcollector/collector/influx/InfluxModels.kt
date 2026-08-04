@@ -52,8 +52,7 @@ data class InfluxCursor(
 interface InfluxExportStore {
     fun ensureInfluxCursors(fieldKeys: Set<String>)
     fun pendingInfluxSummary(fieldKeys: Set<String>): InfluxPendingSummary
-    fun pendingInfluxRows(fieldKey: String, afterHistoryId: Long, limit: Int): List<InfluxPendingHistoryRow>
-    fun influxCursors(fieldKeys: Set<String>): List<InfluxCursor>
+    fun pendingInfluxRows(fieldKeys: Set<String>, limit: Int): List<InfluxPendingHistoryRow>
     fun updateInfluxCursorSuccess(fieldKey: String, historyId: Long, exportedAt: String)
     fun updateInfluxCursorError(fieldKey: String, error: String, errorAt: String)
     fun influxExportState(): InfluxExportStateSnapshot

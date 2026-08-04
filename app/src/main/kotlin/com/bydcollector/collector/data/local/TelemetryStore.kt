@@ -12,7 +12,6 @@ import com.bydcollector.collector.data.normalized.PollingErrorSummaries
 import com.bydcollector.collector.data.normalized.StoredNormalizedState
 import com.bydcollector.collector.data.polling.PollStorage
 import com.bydcollector.collector.mqtt.HaMqttMessage
-import com.bydcollector.collector.influx.InfluxCursor
 import com.bydcollector.collector.influx.InfluxExportStateSnapshot
 import com.bydcollector.collector.influx.InfluxExportStore
 import com.bydcollector.collector.influx.InfluxPendingHistoryRow
@@ -493,6 +492,14 @@ class TelemetryStore(
         return TelegramEnqueueResult(inserted, expired, overflow)
     }
 
+    fun deleteUndeliveredTelegramMessages(eventType: String): Int {
+        return helper.writableDatabase.delete(
+            "telegram_outbox",
+            "event_type = ?",
+            arrayOf(eventType)
+        )
+    }
+
     fun dueTelegramMessages(nowMs: Long, limit: Int = 20): List<TelegramOutboxEntry> {
         if (limit <= 0) return emptyList()
         helper.readableDatabase.rawQuery(
@@ -657,48 +664,29 @@ class TelemetryStore(
         }
     }
 
-    override fun influxCursors(fieldKeys: Set<String>): List<InfluxCursor> {
-        if (fieldKeys.isEmpty()) return emptyList()
-        ensureInfluxCursors(fieldKeys)
-        val placeholders = fieldKeys.joinToString(",") { "?" }
-        helper.readableDatabase.rawQuery(
-            """
-            SELECT field_key, last_exported_history_id
-            FROM influx_export_cursor
-            WHERE field_key IN ($placeholders)
-            ORDER BY field_key
-            """.trimIndent(),
-            fieldKeys.toTypedArray()
-        ).use { cursor ->
-            return buildList {
-                while (cursor.moveToNext()) {
-                    add(
-                        InfluxCursor(
-                            fieldKey = cursor.getString(0),
-                            lastExportedHistoryId = cursor.getLong(1)
-                        )
-                    )
-                }
-            }
-        }
-    }
-
     override fun pendingInfluxRows(
-        fieldKey: String,
-        afterHistoryId: Long,
+        fieldKeys: Set<String>,
         limit: Int
     ): List<InfluxPendingHistoryRow> {
-        if (limit <= 0) return emptyList()
+        if (fieldKeys.isEmpty() || limit <= 0) return emptyList()
+        ensureInfluxCursors(fieldKeys)
+        val placeholders = fieldKeys.joinToString(",") { "?" }
+        val args = fieldKeys.toList() + limit.toString()
         helper.readableDatabase.rawQuery(
             """
-            SELECT id, field_key, category, value_type, value_text, value_number, value_bool,
-                   quality, unit, source_poll_id, source_keys, observed_at, changed_at
-            FROM vehicle_state_history
-            WHERE field_key = ? AND id > ?
-            ORDER BY id
+            SELECT history.id, history.field_key, history.category, history.value_type,
+                   history.value_text, history.value_number, history.value_bool,
+                   history.quality, history.unit, history.source_poll_id,
+                   history.source_keys, history.observed_at, history.changed_at
+            FROM vehicle_state_history AS history
+            INNER JOIN influx_export_cursor AS export_cursor
+                    ON export_cursor.field_key = history.field_key
+            WHERE history.field_key IN ($placeholders)
+              AND history.id > export_cursor.last_exported_history_id
+            ORDER BY history.id
             LIMIT ?
             """.trimIndent(),
-            arrayOf(fieldKey, afterHistoryId.toString(), limit.toString())
+            args.toTypedArray()
         ).use { cursor ->
             return buildList {
                 while (cursor.moveToNext()) {

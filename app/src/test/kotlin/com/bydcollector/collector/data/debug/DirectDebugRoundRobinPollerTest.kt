@@ -126,6 +126,7 @@ class DirectDebugRoundRobinPollerTest {
 
         assertEquals("wide-poll-session-20260605_161751-curated-main81-roundrobin6432-energy-soc-v1", DirectDebugParameterAsset.SOURCE_VERSION)
         assertEquals(6432, rows.size)
+        assertTrue(rows.size <= com.bydcollector.collector.direct.CollectorHelperProtocol.MAX_BATCH_SIZE)
         assertTrue(rows.none { it.key == "statistic_1014_1145045040_5" })
         assertTrue(rows.none { it.key == "charging_charge_current" })
         assertTrue(rows.any { it.key == "charging_charging_charge_current_not_convert" })

@@ -94,6 +94,7 @@ class TelegramHttpClientTest {
 
         assertEquals(TelegramSendFailureKind.NETWORK_ERROR, failure.kind)
         assertNull(failure.httpStatus)
+        assertEquals(IllegalStateException::class.java.name, failure.exceptionClass)
         assertFalse(failure.toString().contains(token))
         assertFalse(failure.toString().contains(chatId))
         assertFalse(failure.toString().contains("leaked"))
