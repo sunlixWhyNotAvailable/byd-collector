@@ -26,7 +26,7 @@ class UserShutdownContractTest {
         assertTrue(activity.contains("val clearedUserShutdown = settings.clearUserShutdownRequestIfSet()"))
         assertTrue(activity.contains("if (clearedUserShutdown)"))
         assertTrue(activity.contains("settings.clearRuntimeManualStops()"))
-        assertTrue(activity.contains("CollectorAutoStart.recoverFromForeground(applicationContext, settings, currentStore())"))
+        assertTrue(activity.contains("CollectorAutoStart.recoverFromForeground(applicationContext, settings, runtimeStore)"))
         assertTrue(activity.indexOf("settings.clearUserShutdownRequestIfSet()") < activity.indexOf("startRuntimeUpdateAutoCheck()"))
     }
 

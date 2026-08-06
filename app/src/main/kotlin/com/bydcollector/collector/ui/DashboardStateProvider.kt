@@ -2,12 +2,13 @@ package com.bydcollector.collector.ui
 
 import android.content.Context
 import android.os.SystemClock
+import android.util.Log
 import com.bydcollector.collector.adb.AdbAuthorizationManager
-import com.bydcollector.collector.data.debug.DirectDebugParameterAsset
-import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.debug.DirectDebugStatus
+import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.data.local.HealthSnapshot
+import com.bydcollector.collector.data.local.HealthSnapshotDetail
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
@@ -30,64 +31,123 @@ class DashboardStateProvider(
         settings: CollectorSettings
     ) : this(context, { store }, settings)
 
-    private val healthCache = TimedCache<HealthSnapshot>(ttlMs = 15_000L)
+    private val healthCaches = HealthSnapshotDetail.values().associateWith { detail ->
+        TimedCache<HealthSnapshot>(
+            ttlMs = when (detail) {
+                HealthSnapshotDetail.SUMMARY -> 1_000L
+                HealthSnapshotDetail.INTEGRATIONS -> 2_000L
+                HealthSnapshotDetail.FULL -> 5_000L
+            }
+        )
+    }
+    private val debugStatusCache = TimedCache<DirectDebugStatus>(ttlMs = 5_000L)
     private val archiveStorageCache = ArchiveStorageSnapshotCache(
         archiveRoot = File(context.filesDir, "db_archive"),
         mainDatabaseFile = context.getDatabasePath(TelemetryDatabaseHelper.DATABASE_NAME),
         debugDatabaseFile = context.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME)
     )
-    private var healthCacheRunning: Boolean? = null
-    private val debugParameterCount by lazy { DirectDebugParameterAsset.load(context).size }
+    private val healthCacheRunning = mutableMapOf<HealthSnapshotDetail, Boolean>()
+    private var archiveStorageJobActive = false
+
+    fun loadInitial(): DashboardState = load(DashboardLoadProfile.INITIAL)
 
     fun load(
-        includeTelemetryDetails: Boolean = true,
-        includeDebugStatus: Boolean = false,
-        includeVehicleKpis: Boolean = false,
-        vehicleKpiLanguage: VehicleKpiLanguage = VehicleKpiLanguage.UK,
-        includeArchiveStorageDetails: Boolean = false
+        profile: DashboardLoadProfile,
+        previous: DashboardState? = null,
+        vehicleKpiLanguage: VehicleKpiLanguage = VehicleKpiLanguage.UK
     ): DashboardState {
         val serviceRunning = CollectorService.isRunning()
         val mainPollingRunning = CollectorService.isMainPollingRunning()
         val maintenanceStatus = settings.dbMaintenanceStatus()
         val mainMaintenanceRunning = maintenanceStatus.running && maintenanceStatus.operation == DbMaintenanceOperation.ARCHIVE
         val debugMaintenanceRunning = maintenanceStatus.running && maintenanceStatus.operation == DbMaintenanceOperation.DEBUG_ARCHIVE
-        val store = if (mainMaintenanceRunning) null else storeProvider()
+        val store = if (profile.readsTelemetryStore && !mainMaintenanceRunning) storeProvider() else null
         val nowMs = SystemClock.elapsedRealtime()
-        val healthRunningChanged = healthCacheRunning != mainPollingRunning
-        //uses main polling state for health so keep-alive-only service runs do not look like active collection
-        val health = if (store == null) maintenanceHealthSnapshot(mainPollingRunning) else healthCache.get(nowMs = nowMs, force = healthRunningChanged) {
-            healthCacheRunning = mainPollingRunning
-            store.healthSnapshot(running = mainPollingRunning)
+        val healthDetailLoaded = profile.healthDetail?.takeIf { store != null }
+        val health = if (healthDetailLoaded != null) {
+            loadHealthSnapshot(store!!, mainPollingRunning, healthDetailLoaded, nowMs)
+        } else {
+            maintenanceHealthSnapshot(mainPollingRunning)
         }
-        val debugStatus = if (!debugMaintenanceRunning && includeDebugStatus) {
-            //opens the debug db only on heavy tabs because status scans can be expensive on the tablet
-            DirectDebugStore(context).use { debugStore -> debugStore.status() }
+        val debugStatusLoaded = profile.readsDebugStatus && !debugMaintenanceRunning
+        val debugStatus = if (debugStatusLoaded) {
+            debugStatusCache.get(nowMs = nowMs) {
+                DirectDebugStore(context).use { debugStore -> debugStore.status() }
+            }
         } else {
             lightweightDebugStatus()
         }
-        val keepAliveConfig = settings.keepAliveConfig()
-        val mqttConfig = settings.mqttConfig()
-        val influxConfig = settings.influxConfig()
+        val debugParameterCount = if (debugStatusLoaded) debugStatus.candidateCount else 0
+        val runtimeSettingsLoaded = profile.readsRuntimeSettings
+        val keepAliveConfig = if (runtimeSettingsLoaded) settings.keepAliveConfig() else null
+        val integrationSettingsLoaded = profile.readsIntegrationSettings
+        //credential drafts stay Activity-owned; this path intentionally never reads Keystore values
+        val mqttConfig = if (integrationSettingsLoaded) settings.mqttConfig(includeCredentials = false) else null
+        val influxConfig = if (integrationSettingsLoaded) settings.influxConfig(includeCredentials = false) else null
         val archiveStorageLimitGb = settings.archiveStorageLimitGb()
+        val archiveStorageJobStatus = settings.archiveStorageJobStatus()
+        val archiveJobActiveNow = archiveStorageJobStatus.running || CollectorService.isArchiveStorageActive()
+        if (archiveJobActiveNow != archiveStorageJobActive) {
+            archiveStorageCache.invalidate()
+            archiveStorageJobActive = archiveJobActiveNow
+        }
+        val archiveDetailsLoaded = profile.readsArchiveDetails && !archiveJobActiveNow
         val archiveStorageResult = archiveStorageCache.snapshot(
             limitBytes = archiveStorageLimitGb * 1024L * 1024L * 1024L,
-            includeDetails = includeArchiveStorageDetails
+            includeDetails = archiveDetailsLoaded
         )
-        val archiveStorageJobStatus = settings.archiveStorageJobStatus()
-        val influxState = store?.influxExportState() ?: maintenanceInfluxState()
-        val vehicleKpis = if (includeVehicleKpis && store != null) {
-            //vehicle kpi reads are lightweight normalized-current reads used by the foreground refresh loop
-            VehicleKpiMapper.from(store.normalizedCurrentState(), vehicleKpiLanguage)
+        if (archiveDetailsLoaded) {
+            archiveStorageResult.error?.let { error ->
+                Log.w(TAG, "Archive storage scan failed; retaining the last good snapshot", error)
+            }
+        }
+        val influxStateLoaded = integrationSettingsLoaded && store != null
+        val influxState = when {
+            profile == DashboardLoadProfile.INITIAL -> initialInfluxState(influxConfig?.enabled == true)
+            influxStateLoaded -> store!!.influxExportState()
+            else -> maintenanceInfluxState()
+        }
+        val useInfluxState = influxStateLoaded || profile == DashboardLoadProfile.INITIAL || previous == null
+        val vehicleKpisLoaded = profile.readsVehicleKpis && store != null
+        val vehicleKpis = if (vehicleKpisLoaded) {
+            //vehicle KPI reads are limited to the ALL_PARAMETERS profile
+            VehicleKpiMapper.from(store!!.normalizedCurrentState(), vehicleKpiLanguage)
         } else {
             VehicleKpis()
         }
         val accessSnapshot = AdbAuthorizationManager.currentSnapshot()
-        return DashboardState(
+        val integrationHealthLoaded = healthDetailLoaded == HealthSnapshotDetail.INTEGRATIONS ||
+            healthDetailLoaded == HealthSnapshotDetail.FULL
+        val mqttStatus = if (integrationHealthLoaded || previous == null) {
+            formatMqttStatus(
+                enabled = mqttConfig?.enabled == true,
+                lastError = health.mqttLastError,
+                lastPublishedAt = health.mqttLastPublishedAt,
+                pendingCount = health.mqttPendingCount,
+                retryFailureCount = health.mqttRetryFailureCount,
+                nextRetryAt = health.mqttNextRetryAt
+            )
+        } else {
+            previous?.mqttStatus ?: formatMqttStatus(
+                enabled = mqttConfig?.enabled == true,
+                lastError = health.mqttLastError,
+                lastPublishedAt = health.mqttLastPublishedAt,
+                pendingCount = health.mqttPendingCount,
+                retryFailureCount = health.mqttRetryFailureCount,
+                nextRetryAt = health.mqttNextRetryAt
+            )
+        }
+        val influxStatus = if (useInfluxState) {
+            formatInfluxStatus(influxState)
+        } else {
+            previous?.influxStatus ?: formatInfluxStatus(influxState)
+        }
+        val next = DashboardState(
             running = mainPollingRunning,
             serviceRunning = serviceRunning,
             mainPollingRunning = mainPollingRunning,
-            autoStartEnabled = settings.isAutoStartEnabled(),
-            pollingEnabled = settings.isPollingEnabled(),
+            autoStartEnabled = if (runtimeSettingsLoaded) settings.isAutoStartEnabled() else false,
+            pollingEnabled = if (runtimeSettingsLoaded) settings.isPollingEnabled() else false,
             activeSessionId = health.activeSessionId,
             lastSuccessAt = DisplayTimeFormatter.formatNullable(health.lastSuccessAt),
             lastError = health.lastError,
@@ -111,9 +171,9 @@ class DashboardStateProvider(
             latestSpeed = health.latestSpeed,
             latestCharging = health.latestCharging,
             logRecording = DiagnosticLogRecorder.isRecording(),
-            debugPollingEnabled = settings.isDebugPollingEnabled(),
+            debugPollingEnabled = if (runtimeSettingsLoaded) settings.isDebugPollingEnabled() else false,
             debugPollingRunning = CollectorService.isDebugRunning(),
-            debugAutoStartEnabled = settings.isDebugAutoStartEnabled(),
+            debugAutoStartEnabled = if (runtimeSettingsLoaded) settings.isDebugAutoStartEnabled() else false,
             debugParameterCount = debugParameterCount,
             debugDatabasePath = debugStatus.databasePath,
             debugDatabaseSizeBytes = debugStatus.databaseSizeBytes,
@@ -123,31 +183,24 @@ class DashboardStateProvider(
             debugLastError = debugStatus.lastError,
             debugErrorCount = debugStatus.errorCount,
             debugLastSessionId = debugStatus.lastSessionId,
-            keepWifiEnabled = keepAliveConfig.keepWifi,
-            keepMobileDataEnabled = keepAliveConfig.keepMobileData,
-            keepBluetoothEnabled = keepAliveConfig.keepBluetooth,
-            recoverCollectorServiceEnabled = keepAliveConfig.recoverCollectorService,
-            tailscaleActivationEnabled = settings.isTailscaleActivationEnabled(),
-            keepAliveEnabled = keepAliveConfig.anyEnabled,
-            keepAliveStatus = if (keepAliveConfig.anyEnabled) "enabled" else "disabled",
-            mqttEnabled = mqttConfig.enabled,
-            mqttAutoStartEnabled = settings.isMqttAutoStartEnabled(),
-            mqttHost = mqttConfig.host,
-            mqttPort = mqttConfig.port,
-            mqttUsername = mqttConfig.username.orEmpty(),
-            mqttPasswordSet = mqttConfig.password != null,
-            mqttClientId = mqttConfig.clientId,
-            mqttTopicPrefix = mqttConfig.topicPrefix,
-            mqttDiscoveryPrefix = mqttConfig.discoveryPrefix,
-            mqttEnabledCategories = mqttConfig.enabledCategories,
-            mqttStatus = formatMqttStatus(
-                enabled = mqttConfig.enabled,
-                lastError = health.mqttLastError,
-                lastPublishedAt = health.mqttLastPublishedAt,
-                pendingCount = health.mqttPendingCount,
-                retryFailureCount = health.mqttRetryFailureCount,
-                nextRetryAt = health.mqttNextRetryAt
-            ),
+            keepWifiEnabled = keepAliveConfig?.keepWifi == true,
+            keepMobileDataEnabled = keepAliveConfig?.keepMobileData == true,
+            keepBluetoothEnabled = keepAliveConfig?.keepBluetooth == true,
+            recoverCollectorServiceEnabled = keepAliveConfig?.recoverCollectorService == true,
+            tailscaleActivationEnabled = if (runtimeSettingsLoaded) settings.isTailscaleActivationEnabled() else false,
+            keepAliveEnabled = keepAliveConfig?.anyEnabled == true,
+            keepAliveStatus = if (keepAliveConfig?.anyEnabled == true) "enabled" else "disabled",
+            mqttEnabled = mqttConfig?.enabled == true,
+            mqttAutoStartEnabled = if (integrationSettingsLoaded) settings.isMqttAutoStartEnabled() else false,
+            mqttHost = mqttConfig?.host.orEmpty(),
+            mqttPort = mqttConfig?.port ?: 0,
+            mqttUsername = "",
+            mqttPasswordSet = previous?.mqttPasswordSet ?: false,
+            mqttClientId = mqttConfig?.clientId.orEmpty(),
+            mqttTopicPrefix = mqttConfig?.topicPrefix.orEmpty(),
+            mqttDiscoveryPrefix = mqttConfig?.discoveryPrefix.orEmpty(),
+            mqttEnabledCategories = mqttConfig?.enabledCategories ?: emptySet(),
+            mqttStatus = mqttStatus,
             mqttLastError = health.mqttLastError,
             mqttLastPublishedAt = DisplayTimeFormatter.formatNullable(health.mqttLastPublishedAt),
             mqttPendingCount = health.mqttPendingCount,
@@ -155,25 +208,41 @@ class DashboardStateProvider(
             mqttNextRetryAt = DisplayTimeFormatter.formatNullable(health.mqttNextRetryAt),
             mqttRetryLastFailureAt = DisplayTimeFormatter.formatNullable(health.mqttRetryLastFailureAt),
             mqttRetryLastSuccessAt = DisplayTimeFormatter.formatNullable(health.mqttRetryLastSuccessAt),
-            influxEnabled = influxConfig.enabled,
-            influxAutoStartEnabled = settings.isInfluxAutoStartEnabled(),
-            haSharedCategoriesEnabled = settings.isHaSharedCategoriesEnabled(),
-            influxHost = influxConfig.host,
-            influxPort = influxConfig.port,
-            influxDatabase = influxConfig.database,
-            influxUsername = influxConfig.username.orEmpty(),
-            influxPasswordSet = influxConfig.password != null,
-            influxMeasurement = influxConfig.measurement,
-            influxEnabledCategories = influxConfig.enabledCategories,
-            influxStatus = formatInfluxStatus(influxState),
-            influxMode = influxState.mode,
-            influxPendingRows = influxState.pendingRows,
-            influxOldestPendingAt = DisplayTimeFormatter.formatNullable(influxState.oldestPendingAt),
-            influxNextRetryAt = DisplayTimeFormatter.formatNullable(influxState.nextRetryAt),
-            influxLastSuccessAt = DisplayTimeFormatter.formatNullable(influxState.lastSuccessAt),
-            influxLastErrorAt = DisplayTimeFormatter.formatNullable(influxState.lastErrorAt),
-            influxLastError = influxState.lastError,
-            influxExportedRowsTotal = influxState.exportedRowsTotal,
+            influxEnabled = influxConfig?.enabled == true,
+            influxAutoStartEnabled = if (integrationSettingsLoaded) settings.isInfluxAutoStartEnabled() else false,
+            haSharedCategoriesEnabled = if (integrationSettingsLoaded) settings.isHaSharedCategoriesEnabled() else false,
+            influxHost = influxConfig?.host.orEmpty(),
+            influxPort = influxConfig?.port ?: 0,
+            influxDatabase = influxConfig?.database.orEmpty(),
+            influxUsername = "",
+            influxPasswordSet = previous?.influxPasswordSet ?: false,
+            influxMeasurement = influxConfig?.measurement.orEmpty(),
+            influxEnabledCategories = influxConfig?.enabledCategories ?: emptySet(),
+            influxStatus = influxStatus,
+            influxMode = if (useInfluxState) influxState.mode else previous?.influxMode,
+            influxPendingRows = if (useInfluxState) influxState.pendingRows else previous?.influxPendingRows ?: 0L,
+            influxOldestPendingAt = if (useInfluxState) {
+                DisplayTimeFormatter.formatNullable(influxState.oldestPendingAt)
+            } else {
+                previous?.influxOldestPendingAt
+            },
+            influxNextRetryAt = if (useInfluxState) {
+                DisplayTimeFormatter.formatNullable(influxState.nextRetryAt)
+            } else {
+                previous?.influxNextRetryAt
+            },
+            influxLastSuccessAt = if (useInfluxState) {
+                DisplayTimeFormatter.formatNullable(influxState.lastSuccessAt)
+            } else {
+                previous?.influxLastSuccessAt
+            },
+            influxLastErrorAt = if (useInfluxState) {
+                DisplayTimeFormatter.formatNullable(influxState.lastErrorAt)
+            } else {
+                previous?.influxLastErrorAt
+            },
+            influxLastError = if (useInfluxState) influxState.lastError else previous?.influxLastError,
+            influxExportedRowsTotal = if (useInfluxState) influxState.exportedRowsTotal else previous?.influxExportedRowsTotal ?: 0L,
             normalizedCurrentCount = health.normalizedCurrentCount,
             normalizedHistoryCount = health.normalizedHistoryCount,
             permissionsGranted = accessSnapshot.permissionsGranted,
@@ -183,6 +252,16 @@ class DashboardStateProvider(
                 event.copy(timestamp = DisplayTimeFormatter.formatNullable(event.timestamp) ?: event.timestamp)
             }
         )
+        return DashboardStateProfileMerger.merge(
+            previous = previous,
+            next = next,
+            healthDetailLoaded = healthDetailLoaded,
+            debugStatusLoaded = debugStatusLoaded,
+            vehicleKpisLoaded = vehicleKpisLoaded,
+            integrationSettingsLoaded = integrationSettingsLoaded,
+            runtimeSettingsLoaded = runtimeSettingsLoaded,
+            archiveDetailsLoaded = archiveDetailsLoaded
+        )
     }
 
     fun invalidateArchiveStorageSnapshot() {
@@ -191,6 +270,21 @@ class DashboardStateProvider(
 
     fun close() {
         archiveStorageCache.close()
+    }
+
+    private fun loadHealthSnapshot(
+        store: TelemetryStore,
+        running: Boolean,
+        detail: HealthSnapshotDetail,
+        nowMs: Long
+    ): HealthSnapshot {
+        val cache = healthCaches.getValue(detail)
+        val runningChanged = healthCacheRunning[detail] != running
+        return cache.get(nowMs = nowMs, force = runningChanged) {
+            healthCacheRunning[detail] = running
+            //Keep TelemetryStore's default FULL for non-dashboard callers; profiles opt in explicitly here.
+            store.healthSnapshot(running = running, detail = detail)
+        }
     }
 
     private fun maintenanceHealthSnapshot(running: Boolean): HealthSnapshot {
@@ -241,6 +335,10 @@ class DashboardStateProvider(
         )
     }
 
+    private fun initialInfluxState(enabled: Boolean): InfluxExportStateSnapshot {
+        return maintenanceInfluxState().copy(status = if (enabled) "enabled" else "stopped")
+    }
+
     private fun formatTrailingTimestamp(status: String?): String? {
         val value = status ?: return null
         val marker = " at "
@@ -283,7 +381,7 @@ class DashboardStateProvider(
         }
     }
 
-    private fun formatInfluxStatus(state: com.bydcollector.collector.influx.InfluxExportStateSnapshot): String {
+    private fun formatInfluxStatus(state: InfluxExportStateSnapshot): String {
         val base = "${state.status}; pending: ${state.pendingRows}"
         return when {
             !state.lastError.isNullOrBlank() -> "$base; error: ${state.lastError.truncate(96)}"
@@ -314,5 +412,9 @@ class DashboardStateProvider(
 
     private fun String.truncate(maxLength: Int): String {
         return if (length <= maxLength) this else take(maxLength) + "..."
+    }
+
+    companion object {
+        private const val TAG = "DashboardStateProvider"
     }
 }

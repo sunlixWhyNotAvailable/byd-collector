@@ -10,7 +10,8 @@ import java.util.concurrent.ExecutorService
 
 data class ArchiveStorageSnapshotResult(
     val snapshot: ArchiveStorageSnapshot,
-    val pending: Boolean
+    val pending: Boolean,
+    val error: Throwable? = null
 )
 
 class ArchiveStorageSnapshotCache(
@@ -31,49 +32,94 @@ class ArchiveStorageSnapshotCache(
     private val lock = Any()
     private var cached: CachedSnapshot? = null
     private var running = false
+    private var generation = 0L
+    private var lastError: Throwable? = null
+    private var retryAfterMs = 0L
 
     fun snapshot(limitBytes: Long, includeDetails: Boolean): ArchiveStorageSnapshotResult {
         val nowMs = clock()
+        val requestedLimitBytes = limitBytes
         var shouldStartScan = false
-        var scanPending = false
-        val resultSnapshot = synchronized(lock) {
+        var scanGeneration = 0L
+        val result = synchronized(lock) {
             val current = cached
-            val fresh = current != null && nowMs - current.loadedAtMs < ttlMs
+            val fresh = current != null &&
+                current.generation == generation &&
+                nowMs >= current.loadedAtMs &&
+                nowMs - current.loadedAtMs < ttlMs
+            val retryCoolingDown = lastError != null && nowMs < retryAfterMs
             when {
-                !includeDetails -> current?.snapshot?.withCurrentActiveDatabases(limitBytes) ?: lightweightSnapshot(limitBytes)
-                fresh -> current.snapshot.withCurrentActiveDatabases(limitBytes)
+                !includeDetails -> ArchiveStorageSnapshotResult(
+                    snapshot = current?.snapshot?.withCurrentActiveDatabases(requestedLimitBytes)
+                        ?: lightweightSnapshot(requestedLimitBytes),
+                    pending = false
+                )
+                fresh -> ArchiveStorageSnapshotResult(
+                    snapshot = current.snapshot.withCurrentActiveDatabases(requestedLimitBytes),
+                    pending = false,
+                    error = lastError
+                )
+                retryCoolingDown -> ArchiveStorageSnapshotResult(
+                    snapshot = current?.snapshot?.withCurrentActiveDatabases(requestedLimitBytes)
+                        ?: lightweightSnapshot(requestedLimitBytes),
+                    pending = false,
+                    error = lastError
+                )
                 else -> {
-                    scanPending = true
                     if (!running) {
                         running = true
                         shouldStartScan = true
+                        scanGeneration = generation
                     }
-                    current?.snapshot?.withCurrentActiveDatabases(limitBytes) ?: lightweightSnapshot(limitBytes)
+                    ArchiveStorageSnapshotResult(
+                        snapshot = current?.snapshot?.withCurrentActiveDatabases(requestedLimitBytes)
+                            ?: lightweightSnapshot(requestedLimitBytes),
+                        pending = true,
+                        error = lastError
+                    )
                 }
             }
         }
 
         if (shouldStartScan) {
-            executor.execute {
-                val loaded = runCatching { loader(limitBytes) }.getOrNull()
+            val scan = Runnable {
+                val loaded = runCatching { loader(requestedLimitBytes) }
                 synchronized(lock) {
-                    if (loaded != null) {
-                        cached = CachedSnapshot(loaded, clock())
+                    if (scanGeneration == generation) {
+                        loaded.onSuccess { snapshot ->
+                            cached = CachedSnapshot(
+                                snapshot = snapshot.copy(archiveLimitBytes = requestedLimitBytes),
+                                loadedAtMs = clock(),
+                                generation = generation
+                            )
+                            lastError = null
+                            retryAfterMs = 0L
+                        }.onFailure { error ->
+                            //Keep the last good snapshot visible while a later request retries.
+                            lastError = error
+                            retryAfterMs = clock() + ttlMs
+                        }
                     }
                     running = false
                 }
             }
+            runCatching { executor.execute(scan) }
+                .onFailure { error ->
+                    synchronized(lock) {
+                        if (scanGeneration == generation) lastError = error
+                        if (scanGeneration == generation) retryAfterMs = clock() + ttlMs
+                        running = false
+                    }
+                }
         }
 
-        return ArchiveStorageSnapshotResult(
-            snapshot = resultSnapshot,
-            pending = includeDetails && scanPending
-        )
+        return result
     }
 
     fun invalidate() {
         synchronized(lock) {
-            cached = null
+            generation += 1L
+            retryAfterMs = 0L
         }
     }
 
@@ -104,6 +150,7 @@ class ArchiveStorageSnapshotCache(
 
     private data class CachedSnapshot(
         val snapshot: ArchiveStorageSnapshot,
-        val loadedAtMs: Long
+        val loadedAtMs: Long,
+        val generation: Long
     )
 }

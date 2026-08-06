@@ -77,6 +77,12 @@ data class HealthSnapshot(
     val recentEvents: List<CollectorEvent>
 )
 
+enum class HealthSnapshotDetail {
+    SUMMARY,
+    INTEGRATIONS,
+    FULL
+}
+
 interface Clock {
     fun nowIso(): String
     fun elapsedRealtimeMs(): Long

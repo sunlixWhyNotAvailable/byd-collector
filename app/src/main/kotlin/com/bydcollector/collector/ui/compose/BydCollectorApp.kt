@@ -69,6 +69,7 @@ import java.util.Locale
 @Composable
 fun BydCollectorApp(
     state: DashboardState?,
+    chromeState: DashboardState? = state,
     activeTab: AppTab,
     language: UiLanguage,
     darkTheme: Boolean,
@@ -104,7 +105,7 @@ fun BydCollectorApp(
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     TopHeader(
-                        state = state,
+                        state = chromeState,
                         language = language,
                         darkTheme = darkTheme,
                         appVersionName = appVersionName,
@@ -159,8 +160,8 @@ fun BydCollectorApp(
                     DatabaseMaintenanceDialog(
                         strings = s,
                         state = databaseMaintenanceUiState,
-                        mqttPending = state?.mqttPendingCount ?: 0L,
-                        influxPending = state?.influxPendingRows ?: 0L,
+                        mqttPending = chromeState?.mqttPendingCount ?: 0L,
+                        influxPending = chromeState?.influxPendingRows ?: 0L,
                         onConfirm = actions::onConfirmDatabaseMaintenance,
                         onCancel = actions::onCancelDatabaseMaintenance,
                         onDismiss = actions::onDismissDatabaseMaintenance
@@ -180,7 +181,7 @@ fun BydCollectorApp(
                         }
                     )
                 }
-                val archiveJob = state?.archiveStorageJobStatus
+                val archiveJob = chromeState?.archiveStorageJobStatus
                 if (archiveJob?.running == true && archiveJob.mode == ArchiveStorageJobMode.DELETE) {
                     ArchiveStorageProgressDialog(strings = s, status = archiveJob)
                 }

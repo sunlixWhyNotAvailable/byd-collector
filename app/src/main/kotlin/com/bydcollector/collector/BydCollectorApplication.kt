@@ -5,11 +5,13 @@ import android.content.Context
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.service.CollectorSettings
+import com.bydcollector.collector.ui.DashboardUiStateStore
 import com.bydcollector.collector.update.UpdateAutoCheckRuntime
 
 //starts process-scoped app bookkeeping before either CollectorService or MainActivity is created
 class BydCollectorApplication : Application() {
     private var telemetryStore: TelemetryStore? = null
+    val dashboardUiStateStore by lazy { DashboardUiStateStore() }
 
     override fun onCreate() {
         super.onCreate()
@@ -39,6 +41,10 @@ class BydCollectorApplication : Application() {
     companion object {
         fun store(context: Context): TelemetryStore {
             return (context.applicationContext as BydCollectorApplication).store()
+        }
+
+        fun dashboardUiStateStore(context: Context): DashboardUiStateStore {
+            return (context.applicationContext as BydCollectorApplication).dashboardUiStateStore
         }
     }
 

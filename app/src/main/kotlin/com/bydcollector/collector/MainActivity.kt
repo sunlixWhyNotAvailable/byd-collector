@@ -3,10 +3,12 @@ package com.bydcollector.collector
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.Intent
+import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import android.widget.Toast
@@ -16,6 +18,7 @@ import androidx.core.content.FileProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.bydcollector.collector.adb.AdbAuthorizationManager
 import com.bydcollector.collector.adb.AccessCheckMode
 import com.bydcollector.collector.data.local.TelemetryStore
@@ -35,8 +38,9 @@ import com.bydcollector.collector.service.CollectorServiceController
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.system.CollectorAutoStart
 import com.bydcollector.collector.ui.DashboardState
-import com.bydcollector.collector.ui.DashboardStateMerger
+import com.bydcollector.collector.ui.DashboardLoadProfile
 import com.bydcollector.collector.ui.DashboardStateProvider
+import com.bydcollector.collector.ui.DashboardUiStateStore
 import com.bydcollector.collector.ui.VehicleKpiLanguage
 import com.bydcollector.collector.ui.compose.AppTab
 import com.bydcollector.collector.ui.compose.BydCollectorActions
@@ -68,7 +72,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 class MainActivity : ComponentActivity() {
     private lateinit var store: TelemetryStore
     private lateinit var settings: CollectorSettings
+    private lateinit var settingsPreferences: SharedPreferences
     private lateinit var stateProvider: DashboardStateProvider
+    private lateinit var dashboardUiStateStore: DashboardUiStateStore
     private val handler = Handler(Looper.getMainLooper())
     private val dashboardExecutor = namedSingleThreadExecutor("byd-ui-dash")
     private val updateExecutor = namedSingleThreadExecutor("byd-update")
@@ -87,7 +93,6 @@ class MainActivity : ComponentActivity() {
     @Volatile private var destroyed = false
     private val archiveShareInFlight = AtomicBoolean(false)
 
-    private var dashboardState by mutableStateOf<DashboardState?>(null)
     private var activeTab by mutableStateOf(AppTab.MAIN)
     private var uiLanguage by mutableStateOf(UiLanguage.UK)
     private var darkTheme by mutableStateOf(true)
@@ -98,15 +103,31 @@ class MainActivity : ComponentActivity() {
     private var updateUiGeneration = 0L
     private var pendingMaintenanceOperation by mutableStateOf<DbMaintenanceOperation?>(null)
     private var maintenanceLaunchOperation by mutableStateOf<DbMaintenanceOperation?>(null)
+    private var maintenancePreflightInFlight = false
     private var dashboardRefreshVersion by mutableStateOf(0)
     private var backgroundSetupPromptVisible by mutableStateOf(false)
     private var backgroundSetupPromptAutoLaunch = false
-    @Volatile private var refreshAgainAfterCurrent = false
+    @Volatile private var forcedRefreshPending = false
+    private var credentialsLoadStarted = false
+    private var credentialsLoaded = false
+    private var mqttCredentialRevision = 0L
+    private var influxCredentialRevision = 0L
+    private var telegramCredentialRevision = 0L
 
     private val refreshTask = object : Runnable {
         override fun run() {
-            refresh()
-            handler.postDelayed(this, DASHBOARD_REFRESH_INTERVAL_MS)
+            refresh(force = false)
+            handler.postDelayed(this, DASHBOARD_REFRESH_HEARTBEAT_MS)
+        }
+    }
+    private val settingsChangeListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (
+            key == CollectorSettings.KEY_TELEGRAM_CONNECTION_STATUS ||
+            key == CollectorSettings.KEY_TELEGRAM_CONNECTION_MESSAGE
+        ) {
+            handler.post {
+                if (!destroyed && ::settings.isInitialized) syncTelegramUiRuntimeState()
+            }
         }
     }
     private val startupAdbSelfCheckTask = Runnable { runStartupAdbSelfCheckIfReady() }
@@ -127,6 +148,7 @@ class MainActivity : ComponentActivity() {
     private val uiActions = object : BydCollectorActions {
         override fun onTabSelected(tab: AppTab) {
             activeTab = tab
+            if (tab == AppTab.TELEGRAM) syncTelegramUiRuntimeState()
             refresh()
         }
 
@@ -183,8 +205,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onOpenArchiveDatabase() {
-            pendingMaintenanceOperation = DbMaintenanceOperation.ARCHIVE
-            refresh()
+            openMainArchiveDialog()
         }
 
         override fun onOpenArchiveDebugDatabase() {
@@ -233,7 +254,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onDismissDatabaseMaintenance() {
-            if (dashboardState?.dbMaintenanceStatus?.running == true || maintenanceLaunchOperation != null) return
+            if (dashboardUiStateStore.currentChrome()?.dbMaintenanceStatus?.running == true || maintenanceLaunchOperation != null) return
             pendingMaintenanceOperation = null
             settings.clearDbMaintenanceStatus()
             refresh()
@@ -327,6 +348,9 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onMqttDraftChanged(draft: MqttDraft) {
+            if (draft.username != mqttDraft.username || draft.password != mqttDraft.password) {
+                mqttCredentialRevision += 1L
+            }
             mqttDraft = draft
             saveMqttDraft()
         }
@@ -376,6 +400,9 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onInfluxDraftChanged(draft: InfluxDraft) {
+            if (draft.username != influxDraft.username || draft.password != influxDraft.password) {
+                influxCredentialRevision += 1L
+            }
             influxDraft = draft
             saveInfluxDraft()
         }
@@ -449,22 +476,21 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        store = currentStore()
-        settings = CollectorSettings(applicationContext, store)
+        settings = CollectorSettings(applicationContext)
+        settingsPreferences = getSharedPreferences(CollectorSettings.PREFS_NAME, MODE_PRIVATE)
+        settingsPreferences.registerOnSharedPreferenceChangeListener(settingsChangeListener)
         if (!CollectorService.isMaintenanceRunningInProcess()) {
             settings.recoverInterruptedDbMaintenanceIfNeeded("activity_start")
         }
         val clearedUserShutdown = settings.clearUserShutdownRequestIfSet()
         if (clearedUserShutdown) {
             settings.clearRuntimeManualStops()
-            CollectorAutoStart.recoverFromForeground(applicationContext, settings, currentStore())
         }
         stateProvider = DashboardStateProvider(applicationContext, { BydCollectorApplication.store(applicationContext) }, settings)
+        dashboardUiStateStore = BydCollectorApplication.dashboardUiStateStore(applicationContext)
         mqttDraft = MqttDraft(
             host = settings.mqttHost(),
             port = settings.mqttPort().toString(),
-            username = settings.mqttUsername(),
-            password = settings.mqttPassword(),
             clientId = settings.mqttClientId(),
             topicPrefix = settings.mqttTopicPrefix(),
             discoveryPrefix = settings.mqttDiscoveryPrefix()
@@ -472,16 +498,20 @@ class MainActivity : ComponentActivity() {
         influxDraft = InfluxDraft(
             host = settings.influxHost(),
             port = settings.influxPort().toString(),
-            username = settings.influxUsername(),
-            password = settings.influxPassword(),
             database = settings.influxDatabase(),
             measurement = settings.influxMeasurement()
         )
         telegramUiState = loadTelegramUiState()
-        startRuntimeUpdateAutoCheck()
+        val initialDashboardState = stateProvider.loadInitial()
+        dashboardUiStateStore.seed(initialDashboardState)
         setContent {
+            val chromeSnapshot by dashboardUiStateStore.chromeState.collectAsStateWithLifecycle()
+            val tabSnapshot by dashboardUiStateStore.tabState(activeTab).collectAsStateWithLifecycle()
+            val renderedChrome = chromeSnapshot?.state
+            val renderedTab = tabSnapshot?.state ?: renderedChrome
             BydCollectorApp(
-                state = dashboardState,
+                state = renderedTab,
+                chromeState = renderedChrome,
                 activeTab = activeTab,
                 language = uiLanguage,
                 darkTheme = darkTheme,
@@ -492,7 +522,7 @@ class MainActivity : ComponentActivity() {
                 appVersionName = BuildConfig.VERSION_NAME,
                 updateAutoCheckEnabled = settings.isUpdateAutoCheckEnabled(),
                 updateUiState = updateUiState,
-                databaseMaintenanceUiState = currentMaintenanceUiState(),
+                databaseMaintenanceUiState = currentMaintenanceUiState(renderedChrome),
                 switchConfirmationVersion = dashboardRefreshVersion,
                 actions = uiActions,
                 backgroundSetupPromptVisible = backgroundSetupPromptVisible,
@@ -500,15 +530,30 @@ class MainActivity : ComponentActivity() {
                 onDismissBackgroundSetupPrompt = ::onDismissBackgroundSetupPrompt
             )
         }
+        loadCredentialsAfterFirstFrame()
+        dashboardExecutor.execute {
+            val runtimeStore = currentStore()
+            runOnUiThread {
+                if (destroyed) return@runOnUiThread
+                store = runtimeStore
+                settings = CollectorSettings(applicationContext, runtimeStore)
+                if (clearedUserShutdown) {
+                    CollectorAutoStart.recoverFromForeground(applicationContext, settings, runtimeStore)
+                }
+                startRuntimeUpdateAutoCheck()
+            }
+        }
     }
 
     override fun onResume() {
         super.onResume()
         foreground = true
+        syncTelegramUiRuntimeState()
         refresh()
         maybeContinueStartupAccessFlow()
         runPendingStartupUpdateCheckIfReady()
-        handler.postDelayed(refreshTask, DASHBOARD_REFRESH_INTERVAL_MS)
+        handler.removeCallbacks(refreshTask)
+        handler.postDelayed(refreshTask, DASHBOARD_REFRESH_HEARTBEAT_MS)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -529,7 +574,6 @@ class MainActivity : ComponentActivity() {
         //asks the watchdog path to recover service work if the user closes only the activity
         if (
             ::settings.isInitialized &&
-            ::store.isInitialized &&
             !CollectorSettings.isDbMaintenanceRunning(applicationContext)
         ) {
             refreshStoreBackedState()
@@ -539,6 +583,9 @@ class MainActivity : ComponentActivity() {
         updateExecutor.shutdownNow()
         if (::stateProvider.isInitialized) {
             stateProvider.close()
+        }
+        if (::settingsPreferences.isInitialized) {
+            settingsPreferences.unregisterOnSharedPreferenceChangeListener(settingsChangeListener)
         }
         handler.removeCallbacks(updateAutoCheckTimerTask)
         handler.removeCallbacks(startupAdbSelfCheckTask)
@@ -676,61 +723,143 @@ class MainActivity : ComponentActivity() {
         settings = CollectorSettings(applicationContext, store)
     }
 
-    private fun refresh() {
-        refreshStoreBackedState()
-        syncTelegramUiRuntimeState()
-        if (destroyed) return
-        if (refreshInFlight) {
-            refreshAgainAfterCurrent = true
-            return
-        }
-        refreshInFlight = true
-        val tab = activeTab
-        //loads only the heavy dashboard slices needed by the visible tab to keep ui refresh cheap
-        val includeTelemetryDetails = tab == AppTab.MAIN || tab == AppTab.ALL_PARAMETERS || tab == AppTab.LOGS
-        val includeDebugStatus = tab == AppTab.ALL_PARAMETERS || tab == AppTab.LOGS
-        val includeVehicleKpis = foreground || tab == AppTab.ALL_PARAMETERS
+    private fun openMainArchiveDialog() {
+        if (maintenancePreflightInFlight || destroyed) return
+        maintenancePreflightInFlight = true
+        val previous = dashboardUiStateStore.currentChrome()
         val kpiLanguage = if (uiLanguage == UiLanguage.UK) VehicleKpiLanguage.UK else VehicleKpiLanguage.EN
         dashboardExecutor.execute {
             val result = runCatching {
                 stateProvider.load(
-                    includeTelemetryDetails = includeTelemetryDetails,
-                    includeDebugStatus = includeDebugStatus,
-                    includeVehicleKpis = includeVehicleKpis,
-                    vehicleKpiLanguage = kpiLanguage,
-                    includeArchiveStorageDetails = activeTab == AppTab.STORAGE
+                    profile = DashboardLoadProfile.MAIN,
+                    previous = previous,
+                    vehicleKpiLanguage = kpiLanguage
                 )
+            }
+            runOnUiThread {
+                maintenancePreflightInFlight = false
+                if (destroyed) return@runOnUiThread
+                result
+                    .onSuccess { state ->
+                        val generation = dashboardUiStateStore.beginChromeRefresh()
+                        dashboardUiStateStore.publishChrome(generation, state)
+                        dashboardRefreshVersion += 1
+                        pendingMaintenanceOperation = DbMaintenanceOperation.ARCHIVE
+                    }
+                    .onFailure { error ->
+                        recordDashboardRefreshFailure("maintenance_preflight", error)
+                        val message = if (uiLanguage == UiLanguage.UK) {
+                            "Не вдалося перевірити стан бази"
+                        } else {
+                            "Could not check database status"
+                        }
+                        Toast.makeText(this@MainActivity, message, Toast.LENGTH_LONG).show()
+                    }
+            }
+        }
+    }
+
+    private fun refresh(force: Boolean = true) {
+        if (destroyed || !foreground) return
+        val nowMs = SystemClock.elapsedRealtime()
+        val tab = activeTab
+        val profile = dashboardProfile(tab)
+        val tabSnapshot = dashboardUiStateStore.tabState(tab).value
+        val tabIntervalMs = dashboardTabRefreshIntervalMs(
+            tab = tab,
+            storageRefreshPending = tabSnapshot?.state?.let { state ->
+                state.archiveStorageJobStatus.running || state.archiveStorageScanPending
+            } == true
+        )
+        val tabDue = profile != null && (
+            force || dashboardSnapshotDue(tabSnapshot?.loadedAtElapsedMs, tabIntervalMs, nowMs)
+        )
+        val chromeSnapshot = dashboardUiStateStore.chromeState.value
+        val chromeDue = force || dashboardSnapshotDue(
+            loadedAtElapsedMs = chromeSnapshot?.loadedAtElapsedMs,
+            intervalMs = DASHBOARD_CHROME_REFRESH_INTERVAL_MS,
+            nowMs = nowMs
+        )
+        if (!tabDue && !chromeDue) return
+        if (refreshInFlight) {
+            if (force) forcedRefreshPending = true
+            return
+        }
+
+        refreshInFlight = true
+        val tabGeneration = if (tabDue) dashboardUiStateStore.beginTabRefresh(tab) else null
+        val chromeGeneration = if (chromeDue) dashboardUiStateStore.beginChromeRefresh() else null
+        val kpiLanguage = if (uiLanguage == UiLanguage.UK) VehicleKpiLanguage.UK else VehicleKpiLanguage.EN
+        dashboardExecutor.execute {
+            val tabResult = if (tabGeneration != null && profile != null) {
+                runCatching {
+                    stateProvider.load(
+                        profile = profile,
+                        previous = dashboardUiStateStore.currentTab(tab),
+                        vehicleKpiLanguage = kpiLanguage
+                    )
+                }
+            } else {
+                null
+            }
+            val chromeResult = if (chromeGeneration != null) {
+                val reusableTabState = tabResult?.getOrNull()
+                    ?.takeIf { profile?.healthDetail != null }
+                reusableTabState?.let { Result.success(it) } ?: runCatching {
+                    stateProvider.load(
+                        profile = DashboardLoadProfile.CHROME,
+                        previous = dashboardUiStateStore.currentChrome(),
+                        vehicleKpiLanguage = kpiLanguage
+                    )
+                }
+            } else {
+                null
             }
             runOnUiThread {
                 refreshInFlight = false
                 if (destroyed) return@runOnUiThread
-                result
-                    .onSuccess { state ->
-                        if (!state.autoStartEnabled && state.debugAutoStartEnabled) {
-                            settings.setDebugAutoStartEnabled(false)
+                var tabPublished = false
+                if (tabGeneration != null && tabResult != null) {
+                    tabResult
+                        .onSuccess { state ->
+                            if (!state.autoStartEnabled && state.debugAutoStartEnabled) {
+                                settings.setDebugAutoStartEnabled(false)
+                            }
+                            tabPublished = dashboardUiStateStore.publishTab(tab, tabGeneration, state)
                         }
-                        //preserves last known heavy-tab values so switching tabs does not blank telemetry until next poll
-                        dashboardState = DashboardStateMerger.merge(
-                            previous = dashboardState,
-                            next = state,
-                            preserveDebugStatus = !includeDebugStatus,
-                            preserveVehicleKpis = !includeVehicleKpis
-                        )
-                    }
-                    .onFailure { error ->
-                        Log.e(TAG, "Dashboard refresh failed", error)
-                        currentStore().recordEvent(
-                            "dashboard_refresh_failed",
-                            "Dashboard refresh failed",
-                            "${error::class.java.simpleName}: ${error.message ?: "no message"}"
-                        )
-                    }
-                dashboardRefreshVersion += 1
-                if (refreshAgainAfterCurrent && !destroyed) {
-                    refreshAgainAfterCurrent = false
-                    refresh()
+                        .onFailure { error ->
+                            dashboardUiStateStore.failTab(tab, tabGeneration, dashboardErrorDetail(error))
+                            recordDashboardRefreshFailure("tab=$tab", error)
+                        }
+                }
+                if (chromeGeneration != null && chromeResult != null) {
+                    chromeResult
+                        .onSuccess { state -> dashboardUiStateStore.publishChrome(chromeGeneration, state) }
+                        .onFailure { error ->
+                            dashboardUiStateStore.failChrome(chromeGeneration, dashboardErrorDetail(error))
+                            recordDashboardRefreshFailure("chrome", error)
+                        }
+                }
+                if (tabPublished) dashboardRefreshVersion += 1
+                if (forcedRefreshPending && !destroyed) {
+                    forcedRefreshPending = false
+                    refresh(force = true)
                 }
             }
+        }
+    }
+
+    private fun recordDashboardRefreshFailure(scope: String, error: Throwable) {
+        val detail = dashboardErrorDetail(error)
+        Log.e(TAG, "Dashboard refresh failed: $scope", error)
+        runCatching {
+            currentStore().recordEvent(
+                "dashboard_refresh_failed",
+                "Dashboard refresh failed",
+                "$scope $detail"
+            )
+        }.onFailure { eventError ->
+            Log.e(TAG, "Dashboard refresh failure could not be recorded", eventError)
         }
     }
 
@@ -1060,11 +1189,65 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun loadCredentialsAfterFirstFrame() {
+        if (credentialsLoadStarted) return
+        credentialsLoadStarted = true
+        val mqttRevision = mqttCredentialRevision
+        val influxRevision = influxCredentialRevision
+        val telegramRevision = telegramCredentialRevision
+        val source = settings
+        updateExecutor.execute {
+            val result = runCatching {
+                LoadedCredentials(
+                    mqttUsername = source.mqttUsername(),
+                    mqttPassword = source.mqttPassword(),
+                    influxUsername = source.influxUsername(),
+                    influxPassword = source.influxPassword(),
+                    telegramBotToken = source.telegramBotToken()
+                )
+            }
+            runOnUiThread {
+                if (destroyed) return@runOnUiThread
+                result
+                    .onSuccess { loaded ->
+                        credentialsLoaded = true
+                        if (mqttRevision == mqttCredentialRevision) {
+                            mqttDraft = mqttDraft.copy(
+                                username = loaded.mqttUsername,
+                                password = loaded.mqttPassword
+                            )
+                        }
+                        if (influxRevision == influxCredentialRevision) {
+                            influxDraft = influxDraft.copy(
+                                username = loaded.influxUsername,
+                                password = loaded.influxPassword
+                            )
+                        }
+                        if (telegramRevision == telegramCredentialRevision) {
+                            telegramUiState = telegramUiState.copy(
+                                config = telegramUiState.config.copy(
+                                    botToken = loaded.telegramBotToken,
+                                    botTokenSet = loaded.telegramBotToken.isNotEmpty()
+                                )
+                            )
+                        }
+                    }
+                    .onFailure { error ->
+                        Log.e(TAG, "Credential UI hydration failed", error)
+                    }
+            }
+        }
+    }
+
     private fun saveMqttDraft(): Boolean {
         //keeps saved passwords sticky while empty password fields mean "leave existing secret unchanged"
         settings.setMqttHost(mqttDraft.host)
         settings.setMqttPort(mqttDraft.port.toIntOrNull() ?: settings.mqttPort())
-        val usernameStored = settings.setMqttUsername(mqttDraft.username)
+        val usernameStored = if (credentialsLoaded || mqttDraft.username.isNotBlank()) {
+            settings.setMqttUsername(mqttDraft.username)
+        } else {
+            true
+        }
         val passwordStored = mqttDraft.password.isBlank() || settings.setMqttPassword(mqttDraft.password)
         settings.setMqttClientId(mqttDraft.clientId)
         settings.setMqttTopicPrefix(mqttDraft.topicPrefix)
@@ -1083,7 +1266,11 @@ class MainActivity : ComponentActivity() {
         //mirrors mqtt draft semantics so editing non-secret influx fields never clears the stored password
         settings.setInfluxHost(influxDraft.host)
         settings.setInfluxPort(influxDraft.port.toIntOrNull() ?: settings.influxPort())
-        val usernameStored = settings.setInfluxUsername(influxDraft.username)
+        val usernameStored = if (credentialsLoaded || influxDraft.username.isNotBlank()) {
+            settings.setInfluxUsername(influxDraft.username)
+        } else {
+            true
+        }
         val passwordStored = influxDraft.password.isBlank() || settings.setInfluxPassword(influxDraft.password)
         settings.setInfluxDatabase(influxDraft.database)
         settings.setInfluxMeasurement(influxDraft.measurement)
@@ -1099,7 +1286,7 @@ class MainActivity : ComponentActivity() {
 
     private fun loadTelegramUiState(): TelegramUiState {
         val localizedMessages = strings(uiLanguage).telegram.messages
-        val botToken = settings.telegramBotToken()
+        val botToken = ""
         val messages = TelegramMessageType.entries.associateWith { type ->
             TelegramMessageConfig(
                 enabled = settings.isTelegramEventEnabled(type.eventKey()),
@@ -1126,7 +1313,8 @@ class MainActivity : ComponentActivity() {
     private fun onTelegramConfigChanged(config: TelegramConfig) {
         refreshStoreBackedState()
         val previous = telegramUiState.config
-        var tokenSet = settings.isTelegramBotTokenSet()
+        if (config.botToken != previous.botToken) telegramCredentialRevision += 1L
+        var tokenSet = previous.botTokenSet
         var secretWriteFailed = false
 
         if (previous.enabled != config.enabled) settings.setTelegramEnabled(config.enabled)
@@ -1200,6 +1388,7 @@ class MainActivity : ComponentActivity() {
 
     private fun onClearTelegramBotToken() {
         refreshStoreBackedState()
+        telegramCredentialRevision += 1L
         val cleared = settings.clearTelegramBotToken()
         if (!cleared) settings.setTelegramEnabled(false)
         val persistedToken = settings.telegramBotToken()
@@ -1240,8 +1429,7 @@ class MainActivity : ComponentActivity() {
         if (telegramUiState.config.messages.isEmpty()) return
         telegramUiState = telegramUiState.copy(
             config = telegramUiState.config.copy(
-                enabled = settings.isTelegramEnabled(),
-                botTokenSet = settings.isTelegramBotTokenSet()
+                enabled = settings.isTelegramEnabled()
             ),
             testStatus = telegramTestStatus(settings.telegramConnectionStatus())
         )
@@ -1317,8 +1505,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun currentMaintenanceUiState(): DbMaintenanceUiState? {
-        val runtime = dashboardState?.dbMaintenanceStatus
+    private fun currentMaintenanceUiState(state: DashboardState? = dashboardUiStateStore.currentChrome()): DbMaintenanceUiState? {
+        val runtime = state?.dbMaintenanceStatus
         val runtimeOperation = runtime?.operation
         if (runtimeOperation != null && (runtime.running || runtime.completed || runtime.error != null)) {
             if (runtime.completed || runtime.error != null) {
@@ -1379,10 +1567,45 @@ class MainActivity : ComponentActivity() {
         private const val KEY_BACKGROUND_SETTINGS_VERSION = "background_settings_version"
         private const val KEY_BACKGROUND_SETTINGS_PENDING_RETURN = "background_settings_pending_return"
         private const val STARTUP_ADB_SELF_CHECK_DELAY_MS = 600L
-        private const val DASHBOARD_REFRESH_INTERVAL_MS = 5_000L
         private const val TELEGRAM_RECONCILE_DELAY_MS = 600L
     }
 }
+
+internal const val DASHBOARD_REFRESH_HEARTBEAT_MS = 1_000L
+internal const val DASHBOARD_CHROME_REFRESH_INTERVAL_MS = 2_000L
+
+internal fun dashboardProfile(tab: AppTab): DashboardLoadProfile? = when (tab) {
+    AppTab.MAIN -> DashboardLoadProfile.MAIN
+    AppTab.ALL_PARAMETERS -> DashboardLoadProfile.ALL_PARAMETERS
+    AppTab.HA -> DashboardLoadProfile.HA
+    AppTab.TELEGRAM -> null
+    AppTab.STORAGE -> DashboardLoadProfile.STORAGE
+    AppTab.EXTRA -> DashboardLoadProfile.EXTRA
+    AppTab.LOGS -> DashboardLoadProfile.LOGS
+}
+
+internal fun dashboardTabRefreshIntervalMs(tab: AppTab, storageRefreshPending: Boolean): Long? = when (tab) {
+    AppTab.MAIN -> 2_000L
+    AppTab.ALL_PARAMETERS -> 1_000L
+    AppTab.HA -> 5_000L
+    AppTab.TELEGRAM -> null
+    AppTab.STORAGE -> if (storageRefreshPending) 1_000L else 30_000L
+    AppTab.EXTRA -> null
+    AppTab.LOGS -> 5_000L
+}
+
+internal fun dashboardSnapshotDue(
+    loadedAtElapsedMs: Long?,
+    intervalMs: Long?,
+    nowMs: Long
+): Boolean {
+    if (intervalMs == null) return false
+    if (loadedAtElapsedMs == null || loadedAtElapsedMs <= 0L || nowMs < loadedAtElapsedMs) return true
+    return nowMs - loadedAtElapsedMs >= intervalMs
+}
+
+private fun dashboardErrorDetail(error: Throwable): String =
+    "${error::class.java.simpleName}: ${error.message ?: "no message"}"
 
 private fun TelegramMessageType.eventKey(): String = when (this) {
     TelegramMessageType.CHARGING_STARTED -> "charging-started"
@@ -1408,6 +1631,14 @@ private data class VerifiedUpdateDownload(
     val info: UpdateInfo,
     val file: File,
     val sha256: String
+)
+
+private data class LoadedCredentials(
+    val mqttUsername: String,
+    val mqttPassword: String,
+    val influxUsername: String,
+    val influxPassword: String,
+    val telegramBotToken: String
 )
 
 internal fun startupHardFlowBlocked(

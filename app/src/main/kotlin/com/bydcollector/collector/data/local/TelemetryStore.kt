@@ -913,8 +913,23 @@ class TelemetryStore(
         }
     }
 
-    fun healthSnapshot(running: Boolean): HealthSnapshot {
-        val mqttRetryState = safeMqttRetryState()
+    fun healthSnapshot(
+        running: Boolean,
+        detail: HealthSnapshotDetail = HealthSnapshotDetail.FULL
+    ): HealthSnapshot {
+        val includeIntegrations = detail != HealthSnapshotDetail.SUMMARY
+        val includeFullDetails = detail == HealthSnapshotDetail.FULL
+        val mqttRetryState = if (includeIntegrations) {
+            safeMqttRetryState()
+        } else {
+            MqttRetryState(
+                failureCount = 0,
+                nextAttemptAt = null,
+                lastFailureAt = null,
+                lastSuccessAt = null,
+                lastError = null
+            )
+        }
         val activeSessionId = if (running) safeActiveSessionId() else null
         val activePollScope = ActivePollSessionScope.from(running = running, activeSessionId = activeSessionId)
         //uses safe queries because the dashboard must keep rendering through migrations and partial failures
@@ -925,28 +940,28 @@ class TelemetryStore(
             lastError = activePollScope.lastErrorSql()?.let { safeScalarString(it) },
             lastErrorAt = activePollScope.lastErrorAtSql()?.let { safeScalarString(it) },
             lastPollStatus = activePollScope.lastPollStatusSql()?.let { safeLastPollStatus(it) },
-            pollCount = safeScalarLong("SELECT COUNT(*) FROM polls"),
-            valueRowCount = safeScalarLong("SELECT COUNT(*) FROM poll_values"),
-            ecRowCount = safeScalarLong("SELECT COUNT(*) FROM ec_energy_consumption"),
-            normalizedCurrentCount = safeScalarLong("SELECT COUNT(*) FROM vehicle_state_current"),
-            normalizedHistoryCount = safeScalarLong("SELECT COUNT(*) FROM vehicle_state_history"),
-            mqttLastError = safeScalarString("SELECT last_error FROM mqtt_publish_state WHERE last_error IS NOT NULL ORDER BY last_error_at DESC, updated_at DESC, id DESC LIMIT 1"),
-            mqttLastPublishedAt = safeScalarString("SELECT last_published_at FROM mqtt_publish_state WHERE last_published_at IS NOT NULL ORDER BY last_published_at DESC, id DESC LIMIT 1"),
-            mqttPendingCount = safeMqttPendingCount(),
+            pollCount = if (includeFullDetails) safeScalarLong("SELECT COUNT(*) FROM polls") else 0L,
+            valueRowCount = if (includeFullDetails) safeScalarLong("SELECT COUNT(*) FROM poll_values") else 0L,
+            ecRowCount = if (includeFullDetails) safeScalarLong("SELECT COUNT(*) FROM ec_energy_consumption") else 0L,
+            normalizedCurrentCount = if (includeFullDetails) safeScalarLong("SELECT COUNT(*) FROM vehicle_state_current") else 0L,
+            normalizedHistoryCount = if (includeFullDetails) safeScalarLong("SELECT COUNT(*) FROM vehicle_state_history") else 0L,
+            mqttLastError = if (includeIntegrations) safeScalarString("SELECT last_error FROM mqtt_publish_state WHERE last_error IS NOT NULL ORDER BY last_error_at DESC, updated_at DESC, id DESC LIMIT 1") else null,
+            mqttLastPublishedAt = if (includeIntegrations) safeScalarString("SELECT last_published_at FROM mqtt_publish_state WHERE last_published_at IS NOT NULL ORDER BY last_published_at DESC, id DESC LIMIT 1") else null,
+            mqttPendingCount = if (includeIntegrations) safeMqttPendingCount() else 0L,
             mqttRetryFailureCount = mqttRetryState.failureCount,
             mqttNextRetryAt = mqttRetryState.nextAttemptAt,
             mqttRetryLastFailureAt = mqttRetryState.lastFailureAt,
             mqttRetryLastSuccessAt = mqttRetryState.lastSuccessAt,
-            lastEcImport = safeScalarString("SELECT ts FROM ec_import_runs ORDER BY id DESC LIMIT 1"),
-            lastEcImportStatus = safeLastEcImportStatus(),
-            elapsedMs = activePollScope.elapsedMsSql()?.let { safeScalarLongOrNull(it) },
-            requestCount = activePollScope.requestCountSql()?.let { safeScalarLongOrNull(it) }?.toInt(),
+            lastEcImport = if (includeFullDetails) safeScalarString("SELECT ts FROM ec_import_runs ORDER BY id DESC LIMIT 1") else null,
+            lastEcImportStatus = if (includeFullDetails) safeLastEcImportStatus() else null,
+            elapsedMs = if (includeFullDetails) activePollScope.elapsedMsSql()?.let { safeScalarLongOrNull(it) } else null,
+            requestCount = if (includeFullDetails) activePollScope.requestCountSql()?.let { safeScalarLongOrNull(it) }?.toInt() else null,
             databasePath = databaseFile().absolutePath,
             databaseSizeBytes = databaseFile().length(),
-            latestSoc = safeLatestReading(listOf("statistic_1014_1145045040_5", "statistic_1014_1134559272_5", "SOC", "soc")),
-            latestSpeed = safeLatestReading(listOf("speed_1013_-1807745016_7", "Speed", "speed")),
-            latestCharging = safeLatestReading(listOf("charging_charge_current", "ChargingStatus", "chargeGunState")),
-            recentEvents = safeRecentEvents()
+            latestSoc = if (includeFullDetails) safeLatestReading(listOf("statistic_1014_1145045040_5", "statistic_1014_1134559272_5", "SOC", "soc")) else null,
+            latestSpeed = if (includeFullDetails) safeLatestReading(listOf("speed_1013_-1807745016_7", "Speed", "speed")) else null,
+            latestCharging = if (includeFullDetails) safeLatestReading(listOf("charging_charge_current", "ChargingStatus", "chargeGunState")) else null,
+            recentEvents = if (includeFullDetails) safeRecentEvents() else emptyList()
         )
     }
 

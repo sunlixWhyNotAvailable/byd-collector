@@ -124,15 +124,15 @@ class CollectorSettings(
         )
     }
 
-    fun mqttConfig(): HaMqttConfig {
+    fun mqttConfig(includeCredentials: Boolean = true): HaMqttConfig {
         //builds an immutable snapshot so async mqtt work uses one consistent set of settings
         return HaMqttConfig(
             enabled = isMqttEnabled(),
             discoveryEnabled = true,
             host = mqttHost(),
             port = mqttPort(),
-            username = mqttUsername().takeIf { it.isNotBlank() },
-            password = mqttPassword().takeIf { it.isNotBlank() },
+            username = if (includeCredentials) mqttUsername().takeIf { it.isNotBlank() } else null,
+            password = if (includeCredentials) mqttPassword().takeIf { it.isNotBlank() } else null,
             clientId = mqttClientId(),
             topicPrefix = mqttTopicPrefix(),
             discoveryPrefix = mqttDiscoveryPrefix(),
@@ -245,15 +245,15 @@ class CollectorSettings(
         prefs.edit().putStringSet(KEY_MQTT_CATEGORIES, categories).apply()
     }
 
-    fun influxConfig(): InfluxConfig {
+    fun influxConfig(includeCredentials: Boolean = true): InfluxConfig {
         //shares category selection with mqtt by default so ha live state and history stay aligned
         return InfluxConfig(
             enabled = isInfluxEnabled(),
             host = influxHost(),
             port = influxPort(),
             database = influxDatabase(),
-            username = influxUsername().takeIf { it.isNotBlank() },
-            password = influxPassword().takeIf { it.isNotBlank() },
+            username = if (includeCredentials) influxUsername().takeIf { it.isNotBlank() } else null,
+            password = if (includeCredentials) influxPassword().takeIf { it.isNotBlank() } else null,
             measurement = influxMeasurement(),
             enabledCategories = effectiveInfluxCategories()
         )
