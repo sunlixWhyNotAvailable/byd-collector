@@ -79,6 +79,7 @@ class CollectorService : Service() {
     private lateinit var influxCoordinator: InfluxExportCoordinator
     private lateinit var telegramCoordinator: TelegramCoordinator
     private lateinit var maintenanceCoordinator: DbMaintenanceCoordinator
+    private var debugStorageReady = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var sessionId: Long? = null
     private var debugPoller: DirectDebugRoundRobinPoller? = null
@@ -143,6 +144,7 @@ class CollectorService : Service() {
         running.set(true)
         store = BydCollectorApplication.store(applicationContext)
         settings = CollectorSettings(applicationContext, store)
+        debugStorageReady = BydCollectorApplication.ensureDebugStorageReady(applicationContext)
         debugStore = DirectDebugStore(applicationContext, DirectDebugDatabaseHelper(applicationContext))
         keepAliveSupervisor = KeepAliveSupervisor(applicationContext, store)
         val endpointProbe = SocketHaEndpointProbe()
@@ -169,7 +171,11 @@ class CollectorService : Service() {
             stopRuntime = { stopRuntimeForMaintenance(it) },
             onStoreReopened = { rebuildStoreBackedRuntime(it) },
             closeDebugStore = { debugStore.close() },
-            onDebugStoreReopened = { debugStore = it }
+            onDebugStoreReopened = {
+                debugStore = it
+                debugStorageReady = it.isCompactV2()
+                (applicationContext as BydCollectorApplication).setDebugStorageReadyAfterMaintenance(debugStorageReady)
+            }
         )
         createNotificationChannel()
         if (settings.isAutoStartEnabled() && settings.hasActiveAccessWork()) {
@@ -231,6 +237,7 @@ class CollectorService : Service() {
             }
             ACTION_START -> reconcileCollection()
         }
+        reconcilePendingCutoverArchiveStorage(action)
         reconcileAccessSelfCheckSchedule()
         return START_STICKY
     }
@@ -424,6 +431,10 @@ class CollectorService : Service() {
 
     private fun startDebugIfNeeded(reason: String) {
         if (maintenanceBlocksRuntimeStart(debugRuntime = true)) return
+        if (!debugStorageReady) {
+            updateNotification("Polling error: debug database cutover required")
+            return
+        }
         if (isDebugPollerRunning()) return
         if (!debugStartInProgress.compareAndSet(false, true)) return
         debugStartExecutor.execute {
@@ -1292,8 +1303,23 @@ class CollectorService : Service() {
                 ?.takeIf { it.isDirectory }
                 ?.let { manager.compressRawArchiveDirectory(it, ::publishArchiveStorageStatus) }
             manager.compressPendingRawArchives(::publishArchiveStorageStatus)
+            val rawArchiveRemains = File(applicationContext.filesDir, "db_archive").listFiles().orEmpty().any { file ->
+                file.isDirectory && (
+                    file.name.startsWith("${File(store.databaseFile().name).nameWithoutExtension}_") ||
+                        file.name.startsWith("${File(DirectDebugDatabaseHelper.DATABASE_NAME).nameWithoutExtension}_")
+                    )
+            }
+            check(!rawArchiveRemains) { "Raw database archive compression remains pending" }
             manager.enforceRetention(limitBytes, ::publishArchiveStorageStatus)
+            settings.setCutoverArchiveStoragePending(false)
         }
+    }
+
+    private fun reconcilePendingCutoverArchiveStorage(action: String) {
+        if (!settings.isCutoverArchiveStoragePending()) return
+        if (action in setOf(ACTION_ARCHIVE_DATABASE, ACTION_ARCHIVE_DEBUG_DATABASE, ACTION_DELETE_ARCHIVES)) return
+        ensureForegroundForChannel("Archive storage")
+        enqueueArchiveStorageMaintenance(null)
     }
 
     private fun enqueueArchiveDelete(ids: List<String>) {

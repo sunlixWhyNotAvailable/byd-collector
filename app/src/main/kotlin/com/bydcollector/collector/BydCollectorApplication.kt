@@ -4,6 +4,8 @@ import android.app.Application
 import android.content.Context
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
+import com.bydcollector.collector.maintenance.StorageFormatCutoverCoordinator
+import com.bydcollector.collector.maintenance.StorageFormat
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.ui.DashboardUiStateStore
 import com.bydcollector.collector.update.UpdateAutoCheckRuntime
@@ -11,6 +13,8 @@ import com.bydcollector.collector.update.UpdateAutoCheckRuntime
 //starts process-scoped app bookkeeping before either CollectorService or MainActivity is created
 class BydCollectorApplication : Application() {
     private var telemetryStore: TelemetryStore? = null
+    private var cutoverCoordinator: StorageFormatCutoverCoordinator? = null
+    private var debugStorageReady: Boolean? = null
     val dashboardUiStateStore by lazy { DashboardUiStateStore() }
 
     override fun onCreate() {
@@ -35,7 +39,21 @@ class BydCollectorApplication : Application() {
             store.ensureCatalogImported()
             store.ensureNormalizedCatalogImported()
             telemetryStore = store
+            if (StorageFormatCutoverCoordinator.detectMain(store.databaseFile()) == StorageFormat.COMPACT_V2) {
+                CollectorSettings(applicationContext).clearMainStorageCutoverStatus()
+            }
         }
+    }
+
+    @Synchronized
+    fun ensureDebugStorageReady(): Boolean {
+        return debugStorageReady ?: coordinator().ensureDebugReady().also { debugStorageReady = it }
+    }
+
+    @Synchronized
+    fun setDebugStorageReadyAfterMaintenance(ready: Boolean) {
+        debugStorageReady = ready
+        CollectorSettings(applicationContext).setDebugStorageCutoverError(if (ready) null else "Debug database verification failed")
     }
 
     companion object {
@@ -46,11 +64,23 @@ class BydCollectorApplication : Application() {
         fun dashboardUiStateStore(context: Context): DashboardUiStateStore {
             return (context.applicationContext as BydCollectorApplication).dashboardUiStateStore
         }
+
+        fun ensureDebugStorageReady(context: Context): Boolean {
+            return (context.applicationContext as BydCollectorApplication).ensureDebugStorageReady()
+        }
     }
 
     @Synchronized
     private fun store(): TelemetryStore {
-        return telemetryStore ?: TelemetryStore(applicationContext, TelemetryDatabaseHelper(applicationContext))
-            .also { telemetryStore = it }
+        telemetryStore?.let { return it }
+        check(coordinator().ensureMainReady()) { "Main telemetry database is not safe to open" }
+        return TelemetryStore(applicationContext, TelemetryDatabaseHelper(applicationContext)).also { telemetryStore = it }
+    }
+
+    private fun coordinator(): StorageFormatCutoverCoordinator {
+        return cutoverCoordinator ?: StorageFormatCutoverCoordinator(
+            applicationContext,
+            CollectorSettings(applicationContext)
+        ).also { cutoverCoordinator = it }
     }
 }

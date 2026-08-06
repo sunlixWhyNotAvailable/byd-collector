@@ -74,11 +74,29 @@ data class DbMaintenanceUiState(
     val messageEn: String = "",
     val error: String? = null,
     val archivePath: String? = null,
-    val cancelAvailable: Boolean = false
+    val cancelAvailable: Boolean = false,
+    val mainArchivePreflight: MainArchivePreflight? = null
 )
 
 data class DbMaintenanceResult(
     val ok: Boolean,
     val message: String,
     val archivePath: String? = null
+)
+
+data class MainArchivePreflight(
+    val telegramPending: Long = 0L,
+    val mqttPending: Long = 0L,
+    val influxPending: Long = 0L,
+    val telegramDeferred: Boolean = false
+) {
+    val blocksAutomaticCutover: Boolean
+        get() = telegramPending > 0L || mqttPending > 0L || influxPending > 0L || telegramDeferred
+}
+
+data class StorageCutoverJournal(
+    val family: String,
+    val archivePath: String?,
+    val phase: String,
+    val sourceFormat: StorageFormat
 )

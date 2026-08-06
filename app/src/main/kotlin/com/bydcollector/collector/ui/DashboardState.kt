@@ -95,7 +95,10 @@ data class DashboardState(
     val permissionsGranted: Boolean,
     val adbAuthorized: Boolean,
     val vehicleKpis: VehicleKpis,
-    val recentEvents: List<CollectorEvent>
+    val recentEvents: List<CollectorEvent>,
+    val mainStorageCutoverDeferredReason: String? = null,
+    val mainStorageCutoverError: String? = null,
+    val debugStorageCutoverError: String? = null
 )
 
 data class VehicleKpis(

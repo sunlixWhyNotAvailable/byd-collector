@@ -12,7 +12,7 @@
 ## Current Features
 
 - direct local vehicle telemetry collection through Android local ADB and a protocol-versioned app_process helper with an APK-owned read-only address whitelist
-- SQLite storage for raw poll values, collection sessions, normalized current state, history, MQTT state, and diagnostics
+- compact-v2 SQLite storage for raw poll values, collection sessions, normalized current state/history, integration queues, and diagnostics
 - grouped native int/float polling for the curated main set, with ordered results and in-helper scalar fallback
 - grouped native debug round-robin polling for the full research catalog in one batch, on the same 500 ms cadence and fallback contract
 - normalized vehicle state for three SOC sources, remaining/trip/cumulative battery energy, charging, doors, tires, climate, speed, odometer, radar distance sensors and related fields
@@ -41,6 +41,10 @@ After first launch:
 The main database is SQLite-based and keeps raw telemetry first. Normalized values are derived from raw fields and stored separately for UI, MQTT, and InfluxDB export.
 Enum values are treated as field-specific. Unknown fields and unsupported values remain queryable instead of being discarded.
 
+Fresh installations create compact-v2 main and round-robin databases. Existing round-robin databases are archived once before v2 starts. An existing main database is archived automatically only when the live Telegram, MQTT, and InfluxDB queues are empty and Telegram has no unfinished event state. Otherwise the automatic transition is deferred once and the legacy database remains active until the user performs the existing manual archive after reviewing the warning.
+
+This is a format cutover, not size-based rotation: the active main normalized history remains lossless and has no automatic retention period. Existing archived databases still count against the configured shared archive limit and are compressed/retained by the existing archive worker.
+
 ## Home Assistant
 
 BYD Collector can publish MQTT Discovery config and live state topics for Home Assistant. MQTT is intended for current vehicle state, while InfluxDB is intended for longer-term historical telemetry.
@@ -51,8 +55,8 @@ When enabled, the built-in Tailscale policy reacts to an unreachable configured 
 
 Telegram integration is optional and disabled by default. Each supported event is also disabled independently until selected by the user.
 The app sends plain text through the Telegram Bot API only; it does not accept Telegram commands, register webhooks, poll updates, or send media.
-Charging notifications use a connected charge gun plus positive charging power as the primary signal, with the vehicle charging-state field used only when that primary data is incomplete.
-Trip summaries default to 10 seconds after parking and can be configured from 5 to 300 seconds. The parked snapshot is persisted and finalized at that deadline even when no later telemetry poll succeeds; an overdue snapshot is finalized after process recovery. Starting a new trip discards undelivered summaries from earlier trips so delayed messages do not arrive during the next drive.
+Charging notifications use a connected charge gun plus positive charging power as the primary signal, with the vehicle charging-state field used only when that primary data is incomplete. After process recovery, a restored charging session requires a new continuous 60-second low-power interval before it can be declared stopped.
+Trip summaries default to 10 seconds after parking and can be configured from 5 to 300 seconds. The parked snapshot is persisted and finalized at that deadline even when no later telemetry poll succeeds. After process recovery, an overdue snapshot waits for fresh confirmed gear; a resumed drive suppresses the stale summary, while a 30-second fallback is used only if telemetry never arrives. Starting a new trip discards undelivered summaries from earlier trips so delayed messages do not arrive during the next drive.
 
 ## Tested
 

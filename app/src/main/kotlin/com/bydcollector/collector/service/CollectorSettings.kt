@@ -9,6 +9,8 @@ import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
 import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
+import com.bydcollector.collector.maintenance.StorageFormat
+import com.bydcollector.collector.maintenance.StorageCutoverJournal
 import com.bydcollector.collector.mqtt.HaMqttConfig
 import com.bydcollector.collector.security.KeystoreSecretStore
 
@@ -580,6 +582,89 @@ class CollectorSettings(
         if (synchronous) editor.commit() else editor.apply()
     }
 
+    fun mainStorageCutoverDeferredReason(): String? =
+        prefs.getString(KEY_MAIN_STORAGE_CUTOVER_DEFERRED_REASON, null)
+
+    fun mainStorageCutoverError(): String? =
+        prefs.getString(KEY_MAIN_STORAGE_CUTOVER_ERROR, null)
+
+    fun deferMainStorageCutover(reason: String) {
+        prefs.edit()
+            .putString(KEY_MAIN_STORAGE_CUTOVER_DEFERRED_REASON, reason)
+            .remove(KEY_MAIN_STORAGE_CUTOVER_ERROR)
+            .commit()
+    }
+
+    fun setMainStorageCutoverError(error: String?) {
+        prefs.edit().apply {
+            error?.let { putString(KEY_MAIN_STORAGE_CUTOVER_ERROR, it) }
+                ?: remove(KEY_MAIN_STORAGE_CUTOVER_ERROR)
+        }.commit()
+    }
+
+    fun clearMainStorageCutoverStatus() {
+        prefs.edit()
+            .remove(KEY_MAIN_STORAGE_CUTOVER_DEFERRED_REASON)
+            .remove(KEY_MAIN_STORAGE_CUTOVER_ERROR)
+            .commit()
+    }
+
+    fun debugStorageCutoverError(): String? =
+        prefs.getString(KEY_DEBUG_STORAGE_CUTOVER_ERROR, null)
+
+    fun setDebugStorageCutoverError(error: String?) {
+        prefs.edit().apply {
+            error?.let { putString(KEY_DEBUG_STORAGE_CUTOVER_ERROR, it) }
+                ?: remove(KEY_DEBUG_STORAGE_CUTOVER_ERROR)
+        }.commit()
+    }
+
+    fun storageCutoverJournal(): StorageCutoverJournal? {
+        val family = prefs.getString(KEY_STORAGE_CUTOVER_JOURNAL_FAMILY, null) ?: return null
+        val phase = prefs.getString(KEY_STORAGE_CUTOVER_JOURNAL_PHASE, null) ?: return null
+        val sourceFormat = prefs.getString(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT, null)
+            ?.let(StorageFormat::valueOf)
+            ?: return null
+        return StorageCutoverJournal(
+            family = family,
+            archivePath = prefs.getString(KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH, null),
+            phase = phase,
+            sourceFormat = sourceFormat
+        )
+    }
+
+    fun setStorageCutoverJournal(journal: StorageCutoverJournal) {
+        check(
+            prefs.edit().apply {
+                putString(KEY_STORAGE_CUTOVER_JOURNAL_FAMILY, journal.family)
+                putString(KEY_STORAGE_CUTOVER_JOURNAL_PHASE, journal.phase)
+                putString(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT, journal.sourceFormat.name)
+                journal.archivePath?.let { putString(KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH, it) }
+                    ?: remove(KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH)
+            }.commit()
+        ) { "Cannot persist storage cutover journal" }
+    }
+
+    fun clearStorageCutoverJournal() {
+        check(
+            prefs.edit()
+                .remove(KEY_STORAGE_CUTOVER_JOURNAL_FAMILY)
+                .remove(KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH)
+                .remove(KEY_STORAGE_CUTOVER_JOURNAL_PHASE)
+                .remove(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT)
+                .commit()
+        ) { "Cannot clear storage cutover journal" }
+    }
+
+    fun isCutoverArchiveStoragePending(): Boolean =
+        prefs.getBoolean(KEY_STORAGE_CUTOVER_ARCHIVE_PENDING, false)
+
+    fun setCutoverArchiveStoragePending(pending: Boolean) {
+        check(prefs.edit().putBoolean(KEY_STORAGE_CUTOVER_ARCHIVE_PENDING, pending).commit()) {
+            "Cannot persist archive-storage cutover state"
+        }
+    }
+
     fun lastUpdateCheckAtMs(): Long = prefs.getLong(KEY_UPDATE_LAST_CHECK_AT_MS, 0L)
 
     fun setLastUpdateCheckAtMs(value: Long) {
@@ -845,6 +930,14 @@ class CollectorSettings(
         const val KEY_DB_MAINTENANCE_STARTED_AT_MS = "dbMaintenanceStartedAtMs"
         const val KEY_DB_MAINTENANCE_UPDATED_AT_MS = "dbMaintenanceUpdatedAtMs"
         const val KEY_DB_MAINTENANCE_CANCEL_AVAILABLE = "dbMaintenanceCancelAvailable"
+        const val KEY_MAIN_STORAGE_CUTOVER_DEFERRED_REASON = "mainStorageCutoverDeferredReason"
+        const val KEY_MAIN_STORAGE_CUTOVER_ERROR = "mainStorageCutoverError"
+        const val KEY_DEBUG_STORAGE_CUTOVER_ERROR = "debugStorageCutoverError"
+        const val KEY_STORAGE_CUTOVER_JOURNAL_FAMILY = "storageCutoverJournalFamily"
+        const val KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH = "storageCutoverJournalArchivePath"
+        const val KEY_STORAGE_CUTOVER_JOURNAL_PHASE = "storageCutoverJournalPhase"
+        const val KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT = "storageCutoverJournalSourceFormat"
+        const val KEY_STORAGE_CUTOVER_ARCHIVE_PENDING = "storageCutoverArchivePending"
         const val DB_MAINTENANCE_RECOVERY_GRACE_MS = 15_000L
         const val DEFAULT_ARCHIVE_STORAGE_LIMIT_GB = 2
         const val MIN_ARCHIVE_STORAGE_LIMIT_GB = 1

@@ -37,6 +37,7 @@ class MainActivityMaintenanceContractTest {
     fun databaseMaintenanceUiIsActivityWiredAndReadOnly() {
         val source = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
         val actions = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorActions.kt").readText()
+        val strings = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorStrings.kt").readText()
 
         assertTrue(source.contains("private var pendingMaintenanceOperation by mutableStateOf<DbMaintenanceOperation?>(null)"))
         assertTrue(source.contains("private var maintenanceLaunchOperation by mutableStateOf<DbMaintenanceOperation?>(null)"))
@@ -47,7 +48,13 @@ class MainActivityMaintenanceContractTest {
         assertTrue(actions.contains("fun onDismissDatabaseMaintenance()"))
         assertTrue(source.contains("pendingMaintenanceOperation = DbMaintenanceOperation.ARCHIVE"))
         assertTrue(source.contains("private fun openMainArchiveDialog()"))
-        assertInOrder(source, "profile = DashboardLoadProfile.MAIN", "pendingMaintenanceOperation = DbMaintenanceOperation.ARCHIVE")
+        assertTrue(source.contains("StorageFormatCutoverCoordinator.readMainPreflight(currentStore().databaseFile())"))
+        assertTrue(source.contains("pendingMainArchivePreflight = preflight"))
+        assertTrue(source.contains("strings(uiLanguage).archivePreflightFailed"))
+        assertFalse(source.contains("\"Не вдалося перевірити стан бази\""))
+        assertTrue(strings.contains("archivePreflightFailed = \"Не вдалося перевірити стан бази\""))
+        assertTrue(strings.contains("archivePreflightFailed = \"Could not check database status\""))
+        assertInOrder(source, "StorageFormatCutoverCoordinator.readMainPreflight", "pendingMaintenanceOperation = DbMaintenanceOperation.ARCHIVE")
         assertInOrder(source, "settings.setDbMaintenanceStatus(", "DbMaintenanceRuntimeStatus(")
         assertInOrder(source, "maintenanceLaunchOperation = operation", "CollectorServiceController.archiveDatabase(this@MainActivity)")
         assertTrue(source.contains("CollectorServiceController.archiveDatabase(this@MainActivity)"))
@@ -59,6 +66,8 @@ class MainActivityMaintenanceContractTest {
         assertTrue(source.contains("stateProvider.close()"))
         assertTrue(source.contains("settings.setArchiveStorageLimitGb(value)"))
         assertTrue(source.contains("CollectorServiceController.deleteArchives(this@MainActivity, ids)"))
+        assertTrue(source.contains("settings.isCutoverArchiveStoragePending() && !CollectorService.isArchiveStorageActive()"))
+        assertTrue(source.contains("CollectorServiceController.reconcileArchiveStorage(this)"))
         assertFalse(source.contains("onArchiveDeletePromptVisibilityChanged"))
         assertFalse(actions.contains("fun onOpenCompactDatabase()"))
         assertFalse(source.contains("DbMaintenanceOperation.COMPACT"))
@@ -94,6 +103,20 @@ class MainActivityMaintenanceContractTest {
         assertTrue(source.contains("CollectorService.isArchiveStorageActive()"))
         assertFalse(source.contains("zipDirectory"))
         assertTrue(paths.readText().contains("<files-path name=\"database_archives\" path=\"db_archive/\" />"))
+    }
+
+    @Test
+    fun successfulDashboardRefreshReconcilesUiOnlyCutoverArchives() {
+        val source = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val refreshResult = source.substringAfterLast("refreshInFlight = false")
+            .substringBefore("private fun recordDashboardRefreshFailure")
+
+        assertTrue(refreshResult.contains("reconcileCutoverArchiveStorageIfNeeded()"))
+        assertInOrder(
+            refreshResult,
+            "dashboardUiStateStore.publishTab",
+            "reconcileCutoverArchiveStorageIfNeeded()"
+        )
     }
 
     private fun sourceFile(path: String): File {

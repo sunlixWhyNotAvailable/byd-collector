@@ -6,6 +6,7 @@ import android.database.sqlite.SQLiteDatabase
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
+import java.time.Instant
 import java.time.OffsetDateTime
 import java.time.temporal.ChronoUnit
 
@@ -14,6 +15,8 @@ class NormalizedStateStore(
     private val helper: TelemetryDatabaseHelper,
     private val clock: Clock = SystemClockAdapter()
 ) {
+    private val compactV2 by lazy { helper.isCompactV2() }
+
     fun upsertCatalog(fields: List<NormalizedFieldDefinition> = NormalizedFieldCatalog.fields) {
         val db = helper.writableDatabase
         db.beginTransaction()
@@ -205,7 +208,62 @@ class NormalizedStateStore(
     }
 
     private fun insertHistory(db: SQLiteDatabase, state: StoredNormalizedState) {
-        db.insertOrThrow("vehicle_state_history", null, state.toContentValues())
+        val values = if (compactV2) state.toCompactHistoryValues(db) else state.toContentValues()
+        db.insertOrThrow("vehicle_state_history", null, values)
+    }
+
+    private fun StoredNormalizedState.toCompactHistoryValues(db: SQLiteDatabase): ContentValues {
+        return ContentValues().apply {
+            put("field_id", compactHistoryFieldId(db))
+            put("value_text", valueText)
+            put("value_number", valueNumber)
+            when (valueBool) {
+                null -> putNull("value_bool")
+                true -> put("value_bool", 1)
+                false -> put("value_bool", 0)
+            }
+            put("quality_code", NormalizedQuality.valueOf(quality).storageCode)
+            if (sourcePollId == null) putNull("source_poll_id") else put("source_poll_id", sourcePollId)
+            put("observed_at_ms", normalizedEpochMillis(observedAt))
+            put("changed_at_ms", normalizedEpochMillis(changedAt))
+        }
+    }
+
+    private fun StoredNormalizedState.compactHistoryFieldId(db: SQLiteDatabase): Long {
+        val unitValue = unit.orEmpty()
+        val catalogIdentity = db.rawQuery(
+            "SELECT normalizer_id, catalog_version FROM normalized_field_catalog WHERE field_key = ? LIMIT 1",
+            arrayOf(fieldKey)
+        ).use { cursor ->
+            check(cursor.moveToFirst()) { "Missing normalized field catalog row: $fieldKey" }
+            cursor.getString(0) to cursor.getString(1)
+        }
+        val args = arrayOf(fieldKey, category, valueType, unitValue, sourceKeys, catalogIdentity.first, catalogIdentity.second)
+        db.rawQuery(
+            """
+            SELECT id
+            FROM normalized_history_field_catalog
+            WHERE field_key = ? AND category = ? AND value_type = ? AND unit = ? AND source_keys = ?
+              AND normalizer_id = ? AND catalog_version = ?
+            LIMIT 1
+            """.trimIndent(),
+            args
+        ).use { cursor ->
+            if (cursor.moveToFirst()) return cursor.getLong(0)
+        }
+        return db.insertOrThrow(
+            "normalized_history_field_catalog",
+            null,
+            ContentValues().apply {
+                put("field_key", fieldKey)
+                put("category", category)
+                put("value_type", valueType)
+                put("unit", unitValue)
+                put("source_keys", sourceKeys)
+                put("normalizer_id", catalogIdentity.first)
+                put("catalog_version", catalogIdentity.second)
+            }
+        )
     }
 
     private fun StoredNormalizedState.toContentValues(): ContentValues {
@@ -264,6 +322,11 @@ class NormalizedStateStore(
             ?.staleAfterMs
     }
 }
+
+internal fun normalizedEpochMillis(value: String): Long =
+    OffsetDateTime.parse(value).toInstant().toEpochMilli()
+
+internal fun normalizedIsoTime(value: Long): String = Instant.ofEpochMilli(value).toString()
 
 internal fun retiredNormalizedFieldKeysToDelete(activeFieldKeys: Set<String>): Set<String> {
     return setOf("hv_battery_current_a").filterNot { it in activeFieldKeys }.toSet()

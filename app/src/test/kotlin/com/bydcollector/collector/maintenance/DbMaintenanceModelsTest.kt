@@ -2,7 +2,9 @@ package com.bydcollector.collector.maintenance
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class DbMaintenanceModelsTest {
     @Test
@@ -35,5 +37,28 @@ class DbMaintenanceModelsTest {
     fun debugArchiveStepsDescribeRoundRobinOnly() {
         assertEquals("Зупиняємо round-robin збір", DbMaintenanceOperation.DEBUG_ARCHIVE.stepsUk.first())
         assertEquals("Restoring round-robin collection", DbMaintenanceOperation.DEBUG_ARCHIVE.stepsEn.last())
+    }
+
+    @Test
+    fun mainArchivePreflightBlocksAutomaticCutoverForEveryPendingSource() {
+        assertFalse(MainArchivePreflight().blocksAutomaticCutover)
+        assertTrue(MainArchivePreflight(telegramPending = 1).blocksAutomaticCutover)
+        assertTrue(MainArchivePreflight(mqttPending = 1).blocksAutomaticCutover)
+        assertTrue(MainArchivePreflight(influxPending = 1).blocksAutomaticCutover)
+        assertTrue(MainArchivePreflight(telegramDeferred = true).blocksAutomaticCutover)
+    }
+
+    @Test
+    fun cutoverJournalCarriesTheExactSourceFormat() {
+        val journal = StorageCutoverJournal(
+            family = "main_telemetry",
+            archivePath = null,
+            phase = "CREATING",
+            sourceFormat = StorageFormat.ABSENT
+        )
+
+        assertEquals(StorageFormat.ABSENT, journal.sourceFormat)
+        assertNull(journal.archivePath)
+        assertEquals(StorageFormat.COMPACT_V2, journal.copy(sourceFormat = StorageFormat.COMPACT_V2).sourceFormat)
     }
 }

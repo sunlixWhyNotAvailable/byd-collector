@@ -7,6 +7,8 @@ internal object PollValueColumns {
 
     fun desc(parameterKey: String): String = "${safeParameterKey(parameterKey)}_desc"
 
+    fun descId(parameterKey: String): String = "${safeParameterKey(parameterKey)}_desc_id"
+
     fun forParameter(parameter: CatalogParameter): List<String> {
         val columns = mutableListOf(raw(parameter.key))
         if (parameter.includeDesc) columns += desc(parameter.key)

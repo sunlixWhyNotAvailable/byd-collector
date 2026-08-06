@@ -20,7 +20,27 @@ enum class NormalizedQuality {
     STALE,
     MISSING,
     INVALID,
-    UNSUPPORTED
+    UNSUPPORTED;
+
+    val storageCode: Int
+        get() = when (this) {
+            OK -> 0
+            STALE -> 1
+            MISSING -> 2
+            INVALID -> 3
+            UNSUPPORTED -> 4
+        }
+
+    companion object {
+        fun fromStorageCode(code: Int): NormalizedQuality = when (code) {
+            0 -> OK
+            1 -> STALE
+            2 -> MISSING
+            3 -> INVALID
+            4 -> UNSUPPORTED
+            else -> error("Unknown normalized quality code: $code")
+        }
+    }
 }
 
 data class NormalizedValue(

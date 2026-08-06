@@ -67,6 +67,23 @@ data class TelegramEventState(
     val tripEndEnergyKwh: Double? = null,
     val lastPersistedAtMs: Long = 0L
 ) {
+    fun hasDeferredStorageWork(): Boolean {
+        return tripId != null ||
+            tripParkedSinceMs != null ||
+            chargingSessionId != null ||
+            chargingActive == true ||
+            chargingLowPowerSinceMs != null ||
+            (chargingCandidate != null && chargingCandidateCount > 0) ||
+            (chargingActiveCandidate != null && chargingActiveCandidateCount > 0) ||
+            (chargeGunCandidate != null && chargeGunCandidateCount > 0) ||
+            (gearCandidate != null && gearCandidateCount > 0) ||
+            fullCandidateCount > 0 ||
+            fullSent ||
+            lowVoltageSinceMs != null ||
+            lowVoltageSent ||
+            telemetryOutageSent
+    }
+
     fun toJson(): String = JSONObject().apply {
         put("initialized", initialized)
         putNullable("charging", charging)
@@ -108,6 +125,10 @@ data class TelegramEventState(
 
     companion object {
         fun fromJson(value: String?): TelegramEventState {
+            return fromJsonOrNull(value) ?: TelegramEventState()
+        }
+
+        fun fromJsonOrNull(value: String?): TelegramEventState? {
             if (value.isNullOrBlank()) return TelegramEventState()
             return runCatching {
                 val json = JSONObject(value)
@@ -149,16 +170,21 @@ data class TelegramEventState(
                     tripEndEnergyKwh = json.optDoubleOrNull("tripEndEnergyKwh"),
                     lastPersistedAtMs = json.optLong("lastPersistedAtMs")
                 )
-            }.getOrDefault(TelegramEventState())
+            }.getOrNull()
         }
     }
 }
 
 class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState()) {
+    private val resumePendingChargingTransition =
+        initialState.chargingActiveCandidate != null && initialState.chargingActiveCandidateCount > 0
+    private var tripRecoveryNeedsFreshGear = initialState.tripId != null && initialState.tripParkedSinceMs != null
+    private var tripRecoveryTelemetrySeen = false
+    private var tripRecoveryGraceStartedAtMs: Long? = null
     var state: TelegramEventState = initialState.copy(
-        chargingActive = null,
-        chargingActiveCandidate = null,
-        chargingActiveCandidateCount = 0,
+        chargingActive = initialState.chargingActive.takeIf { resumePendingChargingTransition },
+        chargingActiveCandidate = initialState.chargingActiveCandidate.takeIf { resumePendingChargingTransition },
+        chargingActiveCandidateCount = initialState.chargingActiveCandidateCount.takeIf { resumePendingChargingTransition } ?: 0,
         chargingEvidenceSource = null,
         chargingLowPowerSinceMs = null,
         fullCandidateCount = 0
@@ -166,6 +192,9 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         private set
 
     fun reset(): TelegramEventState {
+        tripRecoveryNeedsFreshGear = false
+        tripRecoveryTelemetrySeen = false
+        tripRecoveryGraceStartedAtMs = null
         state = TelegramEventState()
         return state
     }
@@ -191,6 +220,11 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         val events = mutableListOf<TelegramDetectedEvent>()
         val original = state
         val firstPoll = !state.initialized
+
+        if (tripRecoveryNeedsFreshGear) {
+            tripRecoveryTelemetrySeen = true
+            tripRecoveryGraceStartedAtMs = null
+        }
 
         if (firstPoll) {
             state = state.copy(
@@ -305,7 +339,10 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
             return false
         }
 
-        if (evidence.source == ChargingEvidenceSource.PRIMARY_LOW_POWER && state.chargingActive == true) {
+        if (
+            evidence.source == ChargingEvidenceSource.PRIMARY_LOW_POWER &&
+            (state.chargingActive == true || state.chargingSessionId != null)
+        ) {
             val lowPowerSince = state.chargingLowPowerSinceMs ?: nowMs
             state = state.copy(
                 chargingActiveCandidate = null,
@@ -396,12 +433,15 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         tripEnergy: Double?,
         config: TelegramEventConfig
     ) {
-        if (raw != null && raw != state.gear) {
+        if (raw != null && (tripRecoveryNeedsFreshGear || raw != state.gear)) {
             val count = if (state.gearCandidate == raw) state.gearCandidateCount + 1 else 1
             state = state.copy(gearCandidate = raw, gearCandidateCount = count)
             if (count >= CONFIRMATION_SAMPLES) {
                 val previous = state.gear
                 state = state.copy(gear = raw, gearCandidate = null, gearCandidateCount = 0)
+                tripRecoveryNeedsFreshGear = false
+                tripRecoveryTelemetrySeen = false
+                tripRecoveryGraceStartedAtMs = null
                 if (previous == PARK && raw != PARK) {
                     val parkedLongEnough = state.tripParkedSinceMs?.let {
                         nowMs - it >= config.tripEndDelayMs
@@ -412,7 +452,7 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
                         clearPendingTrip()
                     }
                 }
-                if (raw == PARK && state.tripId != null) {
+                if (raw == PARK && previous != PARK && state.tripId != null) {
                     state = state.copy(tripParkedSinceMs = nowMs)
                     updatePendingTripSnapshot(odometer, soc, tripEnergy)
                 }
@@ -551,6 +591,14 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
     ) {
         val parkedSince = state.tripParkedSinceMs ?: return
         val tripId = state.tripId ?: return
+        if (tripRecoveryNeedsFreshGear) {
+            if (tripRecoveryTelemetrySeen) return
+            val graceStartedAt = tripRecoveryGraceStartedAtMs ?: nowMs.also {
+                tripRecoveryGraceStartedAtMs = it
+            }
+            if (nowMs - graceStartedAt < TRIP_RECOVERY_GEAR_GRACE_MS) return
+            tripRecoveryNeedsFreshGear = false
+        }
         if (state.gear != PARK || nowMs < parkedSince + config.tripEndDelayMs) return
         val tripStartOdometer = state.tripStartOdometerKm
         val tripEndOdometer = state.tripEndOdometerKm
@@ -592,6 +640,9 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
     }
 
     private fun clearTrip() {
+        tripRecoveryNeedsFreshGear = false
+        tripRecoveryTelemetrySeen = false
+        tripRecoveryGraceStartedAtMs = null
         state = state.copy(
             tripId = null,
             tripStartedAtMs = null,
@@ -624,6 +675,9 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
     }
 
     private fun startTrip(nowMs: Long, odometer: Double?, soc: Double?) {
+        tripRecoveryNeedsFreshGear = false
+        tripRecoveryTelemetrySeen = false
+        tripRecoveryGraceStartedAtMs = null
         state = state.copy(
             tripId = UUID.randomUUID().toString(),
             tripStartedAtMs = nowMs,
@@ -681,6 +735,10 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
 
     private fun pendingTripDeadline(config: TelegramEventConfig): Long? {
         if (state.tripId == null || state.gear != PARK) return null
+        if (tripRecoveryNeedsFreshGear) {
+            if (tripRecoveryTelemetrySeen) return null
+            return tripRecoveryGraceStartedAtMs?.plus(TRIP_RECOVERY_GEAR_GRACE_MS)
+        }
         return state.tripParkedSinceMs?.plus(config.tripEndDelayMs)
     }
 
@@ -698,6 +756,7 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         private const val LOW_VOLTAGE_CONFIRM_MS = 60_000L
         private const val LOW_VOLTAGE_HYSTERESIS = 0.3
         private const val STATE_HEARTBEAT_MS = 30_000L
+        private const val TRIP_RECOVERY_GEAR_GRACE_MS = 30_000L
         private const val MAX_TRIP_DISTANCE_KM = 2_000.0
     }
 

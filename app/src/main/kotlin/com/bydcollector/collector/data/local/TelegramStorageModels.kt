@@ -14,6 +14,12 @@ data class TelegramEnqueueResult(
     val overflowCount: Int
 )
 
+data class TelegramOutboxMessage(
+    val dedupeKey: String,
+    val eventType: String,
+    val payload: String
+)
+
 data class TelegramQueueSnapshot(
     val pendingCount: Long,
     val blockedCount: Long,

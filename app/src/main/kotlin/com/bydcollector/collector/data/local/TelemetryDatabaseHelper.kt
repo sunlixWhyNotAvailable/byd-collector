@@ -16,16 +16,16 @@ class TelemetryDatabaseHelper(
     }
 
     override fun onCreate(db: SQLiteDatabase) {
-        executeSqlAsset(db, SCHEMA_ASSET)
+        executeSqlAsset(db, COMPACT_SCHEMA_ASSET)
         createCollectorEvents(db)
-        ensureSchemaCompatibility(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        //replays the schema asset then adds missing columns so older installs keep their existing rows
-        executeSqlAsset(db, SCHEMA_ASSET)
+        //legacy databases stay writable until the archive cutover creates a fresh compact database
+        val compactV2 = isCompactV2(db)
+        executeSqlAsset(db, if (compactV2) COMPACT_SCHEMA_ASSET else LEGACY_SCHEMA_ASSET)
         createCollectorEvents(db)
-        ensureSchemaCompatibility(db)
+        if (!compactV2) ensureLegacySchemaCompatibility(db)
     }
 
     override fun onDowngrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -37,7 +37,7 @@ class TelemetryDatabaseHelper(
         db.beginTransaction()
         try {
             dropKnownTables(db)
-            executeSqlAsset(db, SCHEMA_ASSET)
+            executeSqlAsset(db, COMPACT_SCHEMA_ASSET)
             createCollectorEvents(db)
             db.setTransactionSuccessful()
         } finally {
@@ -47,6 +47,8 @@ class TelemetryDatabaseHelper(
 
     private fun dropKnownTables(db: SQLiteDatabase) {
         listOf(
+            "storage_meta",
+            "decoded_value_dictionary",
             "telegram_runtime_state",
             "telegram_outbox",
             "influx_export_events",
@@ -56,6 +58,7 @@ class TelemetryDatabaseHelper(
             "mqtt_outbox",
             "mqtt_publish_state",
             "vehicle_state_history",
+            "normalized_history_field_catalog",
             "vehicle_state_current",
             "normalized_field_catalog",
             "collector_events",
@@ -119,7 +122,20 @@ class TelemetryDatabaseHelper(
         )
     }
 
-    private fun ensureSchemaCompatibility(db: SQLiteDatabase) {
+    fun storageFormatVersion(db: SQLiteDatabase = readableDatabase): Int {
+        if (!tableExists(db, "storage_meta")) return LEGACY_STORAGE_FORMAT
+        db.rawQuery(
+            "SELECT format_version FROM storage_meta WHERE schema_family = ? LIMIT 1",
+            arrayOf(SCHEMA_FAMILY)
+        ).use { cursor ->
+            check(cursor.moveToFirst()) { "Compact storage marker is missing" }
+            return cursor.getInt(0)
+        }
+    }
+
+    fun isCompactV2(): Boolean = isCompactV2(readableDatabase)
+
+    private fun ensureLegacySchemaCompatibility(db: SQLiteDatabase) {
         //keeps migrations idempotent because users often install debug builds over several intermediate versions
         ensureColumns(
             db = db,
@@ -447,7 +463,20 @@ class TelemetryDatabaseHelper(
 
     companion object {
         val DATABASE_NAME: String = BuildConfig.COLLECTOR_DATABASE_NAME
-        const val DATABASE_VERSION = 7
-        const val SCHEMA_ASSET = "schema.sql"
+        const val DATABASE_VERSION = 8
+        const val LEGACY_SCHEMA_ASSET = "schema.sql"
+        const val COMPACT_SCHEMA_ASSET = "schema_v2.sql"
+        const val LEGACY_STORAGE_FORMAT = 1
+        const val SCHEMA_FAMILY = "main_telemetry"
+        const val FORMAT_VERSION = 2
+
+        fun isCompactV2(db: SQLiteDatabase): Boolean = runCatching {
+            db.rawQuery(
+                "SELECT format_version FROM storage_meta WHERE schema_family = ? LIMIT 1",
+                arrayOf(SCHEMA_FAMILY)
+            ).use { cursor ->
+                cursor.moveToFirst() && cursor.getInt(0) == FORMAT_VERSION
+            }
+        }.getOrDefault(false)
     }
 }

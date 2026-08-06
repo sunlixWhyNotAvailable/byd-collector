@@ -46,6 +46,17 @@ class DashboardLoadProfileTest {
     }
 
     @Test
+    fun debugStorageGateRunsBeforeAnyDashboardDebugDatabaseOpen() {
+        val source = sourceFile("com/bydcollector/collector/ui/DashboardStateProvider.kt").readText()
+        val gate = source.indexOf("BydCollectorApplication.ensureDebugStorageReady(context)")
+        val open = source.indexOf("DirectDebugStore(context).use")
+
+        assertTrue(gate >= 0)
+        assertTrue(open > gate)
+        assertTrue(source.contains("val debugStatusLoaded = debugStatusRequested &&"))
+    }
+
+    @Test
     fun profileMergePreservesSlicesThatWereNotLoaded() {
         val previous = dashboardState("previous").copy(
             pollCount = 42L,
@@ -94,6 +105,112 @@ class DashboardLoadProfileTest {
         assertEquals(8L, merged.debugReadingCount)
         assertEquals("88%", merged.vehicleKpis.socPercent)
         assertEquals("previous-archive", merged.archiveStorageSnapshot.archiveRootPath)
+    }
+
+    @Test
+    fun nullHealthMergePreservesHealthAcrossStorageAndExtraMaintenanceProfiles() {
+        val previous = dashboardState("previous").copy(
+            activeSessionId = 42L,
+            pollCount = 43L,
+            mqttPendingCount = 44L,
+            normalizedHistoryCount = 45L,
+            autoStartEnabled = false,
+            archiveStorageSnapshot = ArchiveStorageSnapshot(
+                archiveRootPath = "previous-archive",
+                mainDatabaseSizeBytes = 1L,
+                debugDatabaseSizeBytes = 2L,
+                archiveBytes = 3L,
+                archiveLimitBytes = 4L,
+                entries = emptyList()
+            )
+        )
+        val next = dashboardState("next").copy(
+            activeSessionId = null,
+            pollCount = 0L,
+            mqttPendingCount = 0L,
+            normalizedHistoryCount = 0L,
+            autoStartEnabled = true,
+            dbMaintenanceStatus = DbMaintenanceRuntimeStatus(running = true, messageUk = "maintenance-next"),
+            archiveStorageSnapshot = ArchiveStorageSnapshot(
+                archiveRootPath = "next-archive",
+                mainDatabaseSizeBytes = 10L,
+                debugDatabaseSizeBytes = 20L,
+                archiveBytes = 30L,
+                archiveLimitBytes = 40L,
+                entries = emptyList()
+            ),
+            archiveStorageJobStatus = ArchiveStorageJobStatus(running = true, messageUk = "archive-next")
+        )
+
+        val storage = DashboardStateProfileMerger.merge(
+            previous = previous,
+            next = next,
+            healthDetailLoaded = null,
+            debugStatusLoaded = false,
+            vehicleKpisLoaded = false,
+            integrationSettingsLoaded = false,
+            runtimeSettingsLoaded = false,
+            archiveDetailsLoaded = true
+        )
+        val extra = DashboardStateProfileMerger.merge(
+            previous = previous,
+            next = next,
+            healthDetailLoaded = null,
+            debugStatusLoaded = false,
+            vehicleKpisLoaded = false,
+            integrationSettingsLoaded = false,
+            runtimeSettingsLoaded = true,
+            archiveDetailsLoaded = false
+        )
+
+        listOf(storage, extra).forEach { merged ->
+            assertEquals(42L, merged.activeSessionId)
+            assertEquals("previous", merged.lastSuccessAt)
+            assertEquals(43L, merged.pollCount)
+            assertEquals(44L, merged.mqttPendingCount)
+            assertEquals(45L, merged.normalizedHistoryCount)
+            assertEquals("previous", merged.databasePath)
+            assertTrue(merged.dbMaintenanceStatus.running)
+            assertTrue(merged.archiveStorageJobStatus.running)
+        }
+        assertEquals("next-archive", storage.archiveStorageSnapshot.archiveRootPath)
+        assertFalse(storage.autoStartEnabled)
+        assertEquals("previous-archive", extra.archiveStorageSnapshot.archiveRootPath)
+        assertTrue(extra.autoStartEnabled)
+    }
+
+    @Test
+    fun integrationHealthMergeKeepsNonIntegrationHealthFromPreviousSnapshot() {
+        val previous = dashboardState("previous").copy(
+            pollCount = 42L,
+            normalizedCurrentCount = 43L,
+            mqttPendingCount = 1L,
+            mqttLastError = "previous-mqtt"
+        )
+        val next = dashboardState("next").copy(
+            pollCount = 0L,
+            normalizedCurrentCount = 0L,
+            mqttPendingCount = 9L,
+            mqttLastError = "next-mqtt"
+        )
+
+        val merged = DashboardStateProfileMerger.merge(
+            previous = previous,
+            next = next,
+            healthDetailLoaded = HealthSnapshotDetail.INTEGRATIONS,
+            debugStatusLoaded = false,
+            vehicleKpisLoaded = false,
+            integrationSettingsLoaded = true,
+            runtimeSettingsLoaded = false,
+            archiveDetailsLoaded = false
+        )
+
+        assertEquals(42L, merged.pollCount)
+        assertEquals(43L, merged.normalizedCurrentCount)
+        assertEquals("next", merged.databasePath)
+        assertEquals("previous", merged.recentEvents.single().timestamp)
+        assertEquals(9L, merged.mqttPendingCount)
+        assertEquals("next-mqtt", merged.mqttLastError)
     }
 
     private fun sourceFile(path: String): File {

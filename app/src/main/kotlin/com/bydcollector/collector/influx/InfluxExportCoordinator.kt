@@ -84,7 +84,7 @@ class InfluxExportCoordinator(
         if (!force && !state.nextRetryAt.isNullOrBlank() && !retryDue(state.nextRetryAt, clock.nowIso())) {
             store.updateInfluxExportState(
                 status = state.status,
-                mode = state.mode,
+                mode = modeFor(pendingBefore.rows),
                 pendingRows = pendingBefore.rows,
                 oldestPendingAt = pendingBefore.oldestObservedAt,
                 nextRetryAt = state.nextRetryAt,
@@ -100,7 +100,7 @@ class InfluxExportCoordinator(
         if (rows.isEmpty()) {
             store.updateInfluxExportState(
                 status = "running",
-                mode = if (force) "catch_up" else "realtime",
+                mode = modeFor(pendingBefore.rows),
                 pendingRows = 0,
                 oldestPendingAt = null,
                 nextRetryAt = null,
@@ -129,7 +129,7 @@ class InfluxExportCoordinator(
         val pendingAfter = store.pendingInfluxSummary(fieldKeys)
         store.updateInfluxExportState(
             status = "running",
-            mode = if (rows.size >= CATCH_UP_THRESHOLD) "catch_up" else "realtime",
+            mode = modeFor(pendingAfter.rows),
             pendingRows = pendingAfter.rows,
             oldestPendingAt = pendingAfter.oldestObservedAt,
             nextRetryAt = null,
@@ -196,6 +196,10 @@ class InfluxExportCoordinator(
         return runCatching {
             !OffsetDateTime.parse(nowIso).isBefore(OffsetDateTime.parse(nextRetryAt))
         }.getOrDefault(true)
+    }
+
+    private fun modeFor(pendingRows: Long): String {
+        return if (pendingRows >= CATCH_UP_THRESHOLD) "catch_up" else "realtime"
     }
 
     private companion object {

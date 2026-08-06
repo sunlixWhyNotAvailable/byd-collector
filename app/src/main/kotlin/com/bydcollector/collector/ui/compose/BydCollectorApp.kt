@@ -160,8 +160,6 @@ fun BydCollectorApp(
                     DatabaseMaintenanceDialog(
                         strings = s,
                         state = databaseMaintenanceUiState,
-                        mqttPending = chromeState?.mqttPendingCount ?: 0L,
-                        influxPending = chromeState?.influxPendingRows ?: 0L,
                         onConfirm = actions::onConfirmDatabaseMaintenance,
                         onCancel = actions::onCancelDatabaseMaintenance,
                         onDismiss = actions::onDismissDatabaseMaintenance
@@ -1471,8 +1469,6 @@ private fun UpdateCheckDialog(
 private fun DatabaseMaintenanceDialog(
     strings: UiStrings,
     state: DbMaintenanceUiState,
-    mqttPending: Long,
-    influxPending: Long,
     onConfirm: () -> Unit,
     onCancel: () -> Unit,
     onDismiss: () -> Unit
@@ -1503,7 +1499,8 @@ private fun DatabaseMaintenanceDialog(
                     .fillMaxWidth()
                     .background(p.pathField, Rounded8)
                     .border(1.dp, p.border, Rounded8)
-                    .padding(12.dp),
+                    .padding(12.dp)
+                    .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 when {
@@ -1515,7 +1512,7 @@ private fun DatabaseMaintenanceDialog(
                             Text("${strings.dbMaintenanceArchivePath} $it", color = p.muted, fontSize = 13.sp, lineHeight = 18.sp)
                         }
                     }
-                    else -> DatabaseMaintenanceConfirmBody(strings, state, mqttPending, influxPending)
+                    else -> DatabaseMaintenanceConfirmBody(strings, state)
                 }
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -1539,13 +1536,15 @@ private fun DatabaseMaintenanceDialog(
 @Composable
 private fun DatabaseMaintenanceConfirmBody(
     strings: UiStrings,
-    state: DbMaintenanceUiState,
-    mqttPending: Long,
-    influxPending: Long
+    state: DbMaintenanceUiState
 ) {
     val p = LocalBydPalette.current
-    val pending = mqttPending + influxPending
+    val preflight = state.mainArchivePreflight
+    val pending = (preflight?.telegramPending ?: 0L) +
+        (preflight?.mqttPending ?: 0L) +
+        (preflight?.influxPending ?: 0L)
     val debugArchive = state.operation == DbMaintenanceOperation.DEBUG_ARCHIVE
+    val hasPendingWork = pending > 0L || preflight?.telegramDeferred == true
     Text(
         if (debugArchive) strings.dbMaintenanceDebugStopWarning else strings.dbMaintenanceStopWarning,
         color = p.text,
@@ -1553,10 +1552,23 @@ private fun DatabaseMaintenanceConfirmBody(
         lineHeight = 19.sp,
         fontWeight = FontWeight.SemiBold
     )
-    if (!debugArchive && pending > 0) {
-        Text(String.format(strings.dbMaintenancePendingTemplate, mqttPending, influxPending), color = p.yellow, fontSize = 14.sp, lineHeight = 19.sp)
+    if (!debugArchive && pending > 0L) {
+        Text(
+            String.format(
+                strings.dbMaintenancePendingTemplate,
+                preflight?.telegramPending ?: 0L,
+                preflight?.mqttPending ?: 0L,
+                preflight?.influxPending ?: 0L
+            ),
+            color = p.yellow,
+            fontSize = 14.sp,
+            lineHeight = 19.sp
+        )
     }
-    if (!debugArchive && pending > 0) {
+    if (!debugArchive && preflight?.telegramDeferred == true) {
+        Text(strings.dbMaintenanceTelegramDeferredWarning, color = p.yellow, fontSize = 14.sp, lineHeight = 19.sp)
+    }
+    if (!debugArchive && hasPendingWork) {
         Text(strings.dbMaintenanceArchivePendingWarning, color = p.yellow, fontSize = 14.sp, lineHeight = 19.sp)
     }
     Text(String.format(strings.dbMaintenanceConfirmTemplate, operationTitle(strings, state.operation)), color = p.text, fontSize = 14.sp, lineHeight = 19.sp, fontWeight = FontWeight.SemiBold)
@@ -1726,6 +1738,36 @@ private fun StorageTab(
                             textAlign = TextAlign.End,
                             modifier = Modifier.weight(2.8f),
                             maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    state?.mainStorageCutoverDeferredReason?.let {
+                        Text(
+                            strings.mainStorageCutoverDeferred,
+                            color = LocalBydPalette.current.yellow,
+                            fontSize = 12.sp,
+                            lineHeight = 15.sp,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    state?.mainStorageCutoverError?.let { error ->
+                        Text(
+                            String.format(strings.mainStorageCutoverErrorTemplate, error),
+                            color = LocalBydPalette.current.red,
+                            fontSize = 12.sp,
+                            lineHeight = 15.sp,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    state?.debugStorageCutoverError?.let { error ->
+                        Text(
+                            String.format(strings.debugStorageCutoverErrorTemplate, error),
+                            color = LocalBydPalette.current.red,
+                            fontSize = 12.sp,
+                            lineHeight = 15.sp,
+                            maxLines = 2,
                             overflow = TextOverflow.Ellipsis
                         )
                     }

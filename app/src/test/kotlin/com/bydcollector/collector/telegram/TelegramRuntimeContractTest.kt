@@ -2,6 +2,7 @@ package com.bydcollector.collector.telegram
 
 import java.io.File
 import kotlin.test.Test
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class TelegramRuntimeContractTest {
@@ -52,6 +53,24 @@ class TelegramRuntimeContractTest {
         assertInOrder(postSchedule, "mainHandler.post", "submittedGeneration != telegramWorkGeneration.get()")
         assertInOrder(postSchedule, "submittedGeneration != telegramWorkGeneration.get()", "scheduleTelegramTick(deadlineAtMs)")
         assertInOrder(executeChannel, "submittedGeneration != generation.get()", "submittedGeneration == generation.get()")
+    }
+
+    @Test
+    fun outboxAndRuntimeStateUseOneSqliteTransaction() {
+        val coordinator = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
+        val handle = coordinator.substringAfter("private fun handle")
+            .substringBefore("private fun render")
+        val store = sourceFile("com/bydcollector/collector/data/local/TelemetryStore.kt").readText()
+        val commit = store.substringAfter("fun commitTelegramEvents")
+            .substringBefore("private fun enqueueTelegramMessage")
+
+        assertTrue(handle.contains("store.commitTelegramEvents("))
+        assertTrue(handle.contains("engine = TelegramEventEngine(TelegramEventState.fromJson(store.telegramRuntimeState()))"))
+        assertFalse(handle.contains("saveTelegramRuntimeState"))
+        assertInOrder(commit, "db.beginTransaction()", "enqueueTelegramMessage(db, message, nowMs)")
+        assertInOrder(commit, "enqueueTelegramMessage(db, message, nowMs)", "saveTelegramRuntimeState(db, it, nowMs)")
+        assertInOrder(commit, "saveTelegramRuntimeState(db, it, nowMs)", "db.setTransactionSuccessful()")
+        assertInOrder(commit, "db.setTransactionSuccessful()", "db.endTransaction()")
     }
 
     private fun sourceFile(path: String): File {

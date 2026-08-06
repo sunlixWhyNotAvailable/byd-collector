@@ -11,7 +11,9 @@ class PollValueColumnsTest {
 
         assertEquals("pm2p5_1008_neg_1728053202_5_raw", PollValueColumns.raw(key))
         assertEquals("pm2p5_1008_neg_1728053202_5_desc", PollValueColumns.desc(key))
+        assertEquals("pm2p5_1008_neg_1728053202_5_desc_id", PollValueColumns.descId(key))
         assertTrue(PollValueColumns.isSafeIdentifier(PollValueColumns.raw(key)))
         assertTrue(PollValueColumns.isSafeIdentifier(PollValueColumns.desc(key)))
+        assertTrue(PollValueColumns.isSafeIdentifier(PollValueColumns.descId(key)))
     }
 }

@@ -3,6 +3,7 @@ package com.bydcollector.collector.ui
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
+import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.adb.AdbAuthorizationManager
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.debug.DirectDebugStatus
@@ -69,7 +70,9 @@ class DashboardStateProvider(
         } else {
             maintenanceHealthSnapshot(mainPollingRunning)
         }
-        val debugStatusLoaded = profile.readsDebugStatus && !debugMaintenanceRunning
+        val debugStatusRequested = profile.readsDebugStatus && !debugMaintenanceRunning
+        val debugStatusLoaded = debugStatusRequested &&
+            BydCollectorApplication.ensureDebugStorageReady(context)
         val debugStatus = if (debugStatusLoaded) {
             debugStatusCache.get(nowMs = nowMs) {
                 DirectDebugStore(context).use { debugStore -> debugStore.status() }
@@ -250,7 +253,10 @@ class DashboardStateProvider(
             vehicleKpis = vehicleKpis,
             recentEvents = health.recentEvents.map { event ->
                 event.copy(timestamp = DisplayTimeFormatter.formatNullable(event.timestamp) ?: event.timestamp)
-            }
+            },
+            mainStorageCutoverDeferredReason = settings.mainStorageCutoverDeferredReason(),
+            mainStorageCutoverError = settings.mainStorageCutoverError(),
+            debugStorageCutoverError = settings.debugStorageCutoverError()
         )
         return DashboardStateProfileMerger.merge(
             previous = previous,

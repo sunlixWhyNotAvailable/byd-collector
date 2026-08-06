@@ -1,6 +1,7 @@
 package com.bydcollector.collector.telegram
 
 import com.bydcollector.collector.data.local.TelemetryStore
+import com.bydcollector.collector.data.local.TelegramOutboxMessage
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.service.TelegramDetectedEvent
@@ -16,7 +17,7 @@ class TelegramCoordinator(
     private val retryPolicy: TelegramRetryPolicy = TelegramRetryPolicy(),
     private val nowMs: () -> Long = System::currentTimeMillis
 ) {
-    private val engine = TelegramEventEngine(TelegramEventState.fromJson(store.telegramRuntimeState()))
+    private var engine = TelegramEventEngine(TelegramEventState.fromJson(store.telegramRuntimeState()))
 
     fun onSuccessfulPoll(observations: List<NormalizedObservation>): Long? {
         val previousTripId = engine.state.tripId
@@ -129,13 +130,37 @@ class TelegramCoordinator(
     }
 
     private fun handle(result: TelegramEventResult) {
-        result.events.forEach(::enqueue)
-        // Persist the advanced baseline only after every detected event is durable.
-        // A process death can then cause a deduplicated replay, but cannot lose an alert.
-        if (result.shouldPersist) store.saveTelegramRuntimeState(result.state.toJson(), nowMs())
+        val messages = result.events.mapNotNull(::render)
+        val committedAt = nowMs()
+        val outcomes = try {
+            store.commitTelegramEvents(
+                messages = messages,
+                stateJson = result.state.toJson().takeIf { result.shouldPersist },
+                nowMs = committedAt
+            )
+        } catch (error: RuntimeException) {
+            engine = TelegramEventEngine(TelegramEventState.fromJson(store.telegramRuntimeState()))
+            throw error
+        }
+        messages.zip(outcomes).forEach { (message, queued) ->
+            if (queued.inserted) {
+                store.recordEvent(
+                    "telegram_event_queued",
+                    "Telegram event queued",
+                    "event=${message.eventType}"
+                )
+            }
+            if (queued.expiredCount > 0 || queued.overflowCount > 0) {
+                store.recordEvent(
+                    "telegram_outbox_pruned",
+                    "Telegram outbox retention removed messages",
+                    "expired=${queued.expiredCount} overflow=${queued.overflowCount}"
+                )
+            }
+        }
     }
 
-    private fun enqueue(event: TelegramDetectedEvent) {
+    private fun render(event: TelegramDetectedEvent): TelegramOutboxMessage? {
         val template = settings.telegramTemplate(event.type.key)
             ?: TelegramTemplateCatalog.spec(event.type).defaultTemplate
         val rendered = TelegramTemplateRenderer.render(event.type, template, event.variables)
@@ -146,23 +171,9 @@ class TelegramCoordinator(
                 "Telegram event skipped because its template is invalid",
                 "event=${event.type.key} errors=${rendered.errors.joinToString(",") { it.kind.name.lowercase() }}"
             )
-            return
+            return null
         }
-        val queued = store.enqueueTelegramMessage(event.dedupeKey, event.type.key, payload, nowMs())
-        if (queued.inserted) {
-            store.recordEvent(
-                "telegram_event_queued",
-                "Telegram event queued",
-                "event=${event.type.key}"
-            )
-        }
-        if (queued.expiredCount > 0 || queued.overflowCount > 0) {
-            store.recordEvent(
-                "telegram_outbox_pruned",
-                "Telegram outbox retention removed messages",
-                "expired=${queued.expiredCount} overflow=${queued.overflowCount}"
-            )
-        }
+        return TelegramOutboxMessage(event.dedupeKey, event.type.key, payload)
     }
 
     private fun eventConfig(): TelegramEventConfig {

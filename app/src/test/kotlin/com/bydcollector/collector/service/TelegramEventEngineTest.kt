@@ -15,6 +15,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlin.test.assertFailsWith
 
 class TelegramEventEngineTest {
     private val config = TelegramEventConfig(
@@ -156,12 +157,27 @@ class TelegramEventEngineTest {
             config,
             100_500L
         )
+        val beforeFullWindow = restarted.onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = 0.0),
+            config,
+            159_999L
+        )
+        val stopped = restarted.onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = 0.0),
+            config,
+            160_000L
+        )
 
         assertTrue(firstAfterRestart.events.isEmpty())
         assertNull(firstAfterRestart.state.chargingActive)
         assertTrue(confirmedAfterRestart.events.isEmpty())
-        assertEquals(false, confirmedAfterRestart.state.chargingActive)
-        assertNull(confirmedAfterRestart.state.chargingSessionId)
+        assertNull(confirmedAfterRestart.state.chargingActive)
+        assertNotNull(confirmedAfterRestart.state.chargingSessionId)
+        assertEquals(100_000L, confirmedAfterRestart.state.chargingLowPowerSinceMs)
+        assertTrue(beforeFullWindow.events.isEmpty())
+        assertEquals(TelegramEventType.CHARGING_STOPPED, stopped.events.single().type)
+        assertEquals(false, stopped.state.chargingActive)
+        assertNull(stopped.state.chargingSessionId)
     }
 
     @Test
@@ -176,6 +192,34 @@ class TelegramEventEngineTest {
         assertTrue(confirmed.events.isEmpty())
         assertEquals(true, confirmed.state.chargingActive)
         assertEquals(sessionId, confirmed.state.chargingSessionId)
+    }
+
+    @Test
+    fun rolledBackDurabilityCommitReplaysTheTransitionExactlyOnce() {
+        val chargingOnly = config.copy(enabledEvents = setOf(TelegramEventType.CHARGING_STARTED))
+        val baseline = TelegramEventEngine().also { engine ->
+            engine.onSuccessfulPoll(snapshot(chargeGun = false, chargePower = 0.0), chargingOnly, 0L)
+            engine.onSuccessfulPoll(snapshot(chargeGun = false, chargePower = 0.0), chargingOnly, 500L)
+        }
+        val journal = FakeTelegramJournal(baseline.state.toJson())
+
+        val candidate = baseline.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 6.0), chargingOnly, 1_000L)
+        journal.commit(candidate.events, candidate.state.toJson(), failBeforeCommit = false)
+        val firstAttempt = baseline.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 6.0), chargingOnly, 1_500L)
+        assertFailsWith<IllegalStateException> {
+            journal.commit(firstAttempt.events, firstAttempt.state.toJson(), failBeforeCommit = true)
+        }
+
+        val restarted = TelegramEventEngine(TelegramEventState.fromJson(journal.runtimeState))
+        val replay = restarted.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 6.0), chargingOnly, 2_000L)
+        journal.commit(replay.events, replay.state.toJson(), failBeforeCommit = false)
+
+        assertTrue(journal.outbox.single().dedupeKey != firstAttempt.events.single().dedupeKey)
+        assertEquals(replay.state.toJson(), journal.runtimeState)
+        val afterCommit = TelegramEventEngine(TelegramEventState.fromJson(journal.runtimeState))
+        assertTrue(afterCommit.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 6.0), chargingOnly, 2_000L).events.isEmpty())
+        assertTrue(afterCommit.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 6.0), chargingOnly, 2_500L).events.isEmpty())
+        assertEquals(1, journal.outbox.size)
     }
 
     @Test
@@ -277,7 +321,7 @@ class TelegramEventEngineTest {
     }
 
     @Test
-    fun pendingTripSnapshotSurvivesRestartAndExpiredDeadlineSendsImmediately() {
+    fun pendingTripRecoveryWaitsForFreshParkGearBeforeSending() {
         val pending = pendingTripEngine().state
         val restoredState = TelegramEventState.fromJson(pending.toJson())
         assertEquals(101.0, restoredState.tripEndOdometerKm)
@@ -285,10 +329,44 @@ class TelegramEventEngineTest {
         assertEquals(2.5, restoredState.tripEndEnergyKwh)
 
         val restarted = TelegramEventEngine(restoredState)
-        val completed = restarted.onTick(config, mainCollectionExpected = false, lastError = null, nowMs = 20_000L)
+        val waiting = restarted.onTick(config, mainCollectionExpected = false, lastError = null, nowMs = 20_000L)
+        restarted.onSuccessfulPoll(snapshot(gear = "P", odometer = 101.0), config, 20_500L)
+        val freshPark = restarted.onSuccessfulPoll(snapshot(gear = "P", odometer = 101.0), config, 21_000L)
+        val completed = restarted.onTick(config, mainCollectionExpected = false, lastError = null, nowMs = 21_000L)
+
+        assertTrue(waiting.events.isEmpty())
+        assertEquals(50_000L, waiting.nextWakeAtMs)
+        assertEquals(12_500L, freshPark.nextWakeAtMs)
+        assertEquals(TelegramEventType.TRIP_SUMMARY, completed.events.single().type)
+        assertNull(completed.state.tripId)
+    }
+
+    @Test
+    fun pendingTripRecoveryUsesBoundedGraceOnlyWhenTelemetryNeverArrives() {
+        val restarted = TelegramEventEngine(TelegramEventState.fromJson(pendingTripEngine().state.toJson()))
+
+        assertTrue(restarted.onTick(config, false, null, 20_000L).events.isEmpty())
+        assertTrue(restarted.onTick(config, false, null, 49_999L).events.isEmpty())
+        val completed = restarted.onTick(config, false, null, 50_000L)
 
         assertEquals(TelegramEventType.TRIP_SUMMARY, completed.events.single().type)
         assertNull(completed.state.tripId)
+    }
+
+    @Test
+    fun pendingTripRecoveryDoesNotSendAfterFreshDrivingGear() {
+        val previousTripId = pendingTripEngine().state.tripId
+        val restarted = TelegramEventEngine(TelegramEventState.fromJson(pendingTripEngine().state.toJson()))
+
+        restarted.onTick(config, false, null, 20_000L)
+        restarted.onSuccessfulPoll(snapshot(gear = "D", odometer = 101.0), config, 20_500L)
+        val driving = restarted.onSuccessfulPoll(snapshot(gear = "D", odometer = 101.1), config, 21_000L)
+        val laterTick = restarted.onTick(config, false, null, 50_000L)
+
+        assertTrue(driving.events.isEmpty())
+        assertNotNull(driving.state.tripId)
+        assertTrue(driving.state.tripId != previousTripId)
+        assertTrue(laterTick.events.isEmpty())
     }
 
     @Test
@@ -346,6 +424,20 @@ class TelegramEventEngineTest {
             engine.onSuccessfulPoll(snapshot(gear = "D", odometer = 100.0, soc = 50.0), config, 1_000L)
             engine.onSuccessfulPoll(snapshot(gear = "P", odometer = 101.0, soc = 49.0), config, 2_000L)
             engine.onSuccessfulPoll(snapshot(gear = "P", odometer = 101.0, soc = 49.0), config, 2_500L)
+        }
+    }
+
+    private class FakeTelegramJournal(initialState: String) {
+        var runtimeState: String = initialState
+            private set
+        val outbox = mutableListOf<TelegramDetectedEvent>()
+
+        fun commit(events: List<TelegramDetectedEvent>, state: String, failBeforeCommit: Boolean) {
+            val stagedOutbox = outbox + events
+            if (failBeforeCommit) error("simulated transaction rollback")
+            outbox.clear()
+            outbox += stagedOutbox
+            runtimeState = state
         }
     }
 

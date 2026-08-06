@@ -66,6 +66,20 @@ class InfluxExportCoordinatorTest {
     }
 
     @Test
+    fun modeUsesTotalRemainingBacklogInsteadOfBoundedBatchSize() {
+        val catchUpStore = FakeInfluxStore((1L..1_300L).map { id -> row(id, "soc") })
+        val realtimeStore = FakeInfluxStore((1L..1_299L).map { id -> row(id, "soc") })
+
+        coordinator(catchUpStore, FakeInfluxClient()).runOneCycle(force = true)
+        coordinator(realtimeStore, FakeInfluxClient()).runOneCycle(force = true)
+
+        assertEquals(1_000L, catchUpStore.influxExportState().pendingRows)
+        assertEquals("catch_up", catchUpStore.influxExportState().mode)
+        assertEquals(999L, realtimeStore.influxExportState().pendingRows)
+        assertEquals("realtime", realtimeStore.influxExportState().mode)
+    }
+
+    @Test
     fun reExportCreatesMissingCursorsWithoutResettingExisting() {
         val store = FakeInfluxStore(rows = emptyList())
         store.ensureInfluxCursors(setOf("soc"))

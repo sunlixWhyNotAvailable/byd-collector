@@ -6,10 +6,12 @@ import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.util.Log
 import com.bydcollector.collector.data.normalized.NormalizedObservation
+import com.bydcollector.collector.data.normalized.NormalizedQuality
 import com.bydcollector.collector.data.normalized.NormalizedStateStore
 import com.bydcollector.collector.data.normalized.NormalizedWriteSummary
 import com.bydcollector.collector.data.normalized.PollingErrorSummaries
 import com.bydcollector.collector.data.normalized.StoredNormalizedState
+import com.bydcollector.collector.data.normalized.normalizedIsoTime
 import com.bydcollector.collector.data.polling.PollStorage
 import com.bydcollector.collector.mqtt.HaMqttMessage
 import com.bydcollector.collector.influx.InfluxExportStateSnapshot
@@ -25,6 +27,8 @@ import com.bydcollector.collector.mqtt.NormalizedStateProvider
 import java.io.Closeable
 import java.io.File
 import java.security.MessageDigest
+import java.util.Collections
+import java.util.LinkedHashMap
 import java.util.Locale
 
 //central sqlite facade that keeps raw polls, normalized state, mqtt outbox, and influx cursors consistent
@@ -43,7 +47,15 @@ class TelemetryStore(
     private val directImporter = DirectCatalogImporter(helper)
     private val ecImporter = EcDatabaseImporter(context, helper, clock)
     private val normalizedStore = NormalizedStateStore(helper, clock)
+    private val compactV2 by lazy { helper.isCompactV2() }
+    private val decodedValueIds = Collections.synchronizedMap(
+        object : LinkedHashMap<String, Long>(DECODED_VALUE_CACHE_SIZE, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean =
+                size > DECODED_VALUE_CACHE_SIZE
+        }
+    )
     @Volatile private var pollValueColumnsEnsuredForCatalogVersionId: Long? = null
+    @Volatile private var normalizedCatalogEnsured = false
 
     override fun close() {
         helper.close()
@@ -78,7 +90,9 @@ class TelemetryStore(
     }
 
     fun ensureNormalizedCatalogImported() {
+        if (normalizedCatalogEnsured) return
         normalizedStore.upsertCatalog()
+        normalizedCatalogEnsured = true
     }
 
     fun applyNormalizedObservations(observations: List<NormalizedObservation>): NormalizedWriteSummary {
@@ -190,6 +204,8 @@ class TelemetryStore(
     ): Long {
         val db = helper.writableDatabase
         ensurePollValueColumns(db, parameters)
+        var pollId = -1L
+        var decodedIdsToCache: Map<String, Long> = emptyMap()
         //writes the poll header and wide raw values atomically so dashboard counts never see half a poll
         db.beginTransaction()
         try {
@@ -199,7 +215,7 @@ class TelemetryStore(
             } else {
                 0
             }
-            val pollId = db.insertOrThrow(
+            pollId = db.insertOrThrow(
                 "polls",
                 null,
                 ContentValues().apply {
@@ -231,14 +247,15 @@ class TelemetryStore(
             )
 
             if (input.ok) {
-                insertPollValues(db, pollId, input.readings, parameters)
+                decodedIdsToCache = insertPollValues(db, pollId, input.readings, parameters)
             }
 
             db.setTransactionSuccessful()
-            return pollId
         } finally {
             db.endTransaction()
         }
+        decodedValueIds.putAll(decodedIdsToCache)
+        return pollId
     }
 
     fun recordEvent(category: String, message: String) {
@@ -454,30 +471,54 @@ class TelemetryStore(
 
     override fun pendingCount(): Long = safeScalarLong("SELECT COUNT(*) FROM mqtt_outbox")
 
-    fun enqueueTelegramMessage(
-        dedupeKey: String,
-        eventType: String,
-        payload: String,
+    fun commitTelegramEvents(
+        messages: List<TelegramOutboxMessage>,
+        stateJson: String?,
+        nowMs: Long
+    ): List<TelegramEnqueueResult> {
+        if (messages.isEmpty() && stateJson == null) return emptyList()
+        val db = helper.writableDatabase
+        db.beginTransaction()
+        try {
+            val results = messages.map { message ->
+                enqueueTelegramMessage(db, message, nowMs)
+            }
+            stateJson?.let { saveTelegramRuntimeState(db, it, nowMs) }
+            db.setTransactionSuccessful()
+            return results
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    private fun enqueueTelegramMessage(
+        db: SQLiteDatabase,
+        message: TelegramOutboxMessage,
         nowMs: Long
     ): TelegramEnqueueResult {
-        val expired = helper.writableDatabase.delete(
+        val dedupeKey = message.dedupeKey
+        val eventType = message.eventType
+        val payload = message.payload
+        val expired = db.delete(
             "telegram_outbox",
             "created_at_ms < ?",
             arrayOf((nowMs - TELEGRAM_RETENTION_MS).toString())
         )
-        if (telegramMessageExists(dedupeKey)) {
+        if (telegramMessageExists(db, dedupeKey)) {
             return TelegramEnqueueResult(inserted = false, expiredCount = expired, overflowCount = 0)
         }
-        val pending = safeScalarLong("SELECT COUNT(*) FROM telegram_outbox")
+        val pending = db.rawQuery("SELECT COUNT(*) FROM telegram_outbox", emptyArray()).use { cursor ->
+            if (cursor.moveToFirst()) cursor.getLong(0) else 0L
+        }
         val overflow = (pending - TELEGRAM_MAX_PENDING + 1L).coerceAtLeast(0L).toInt()
         if (overflow > 0) {
-            helper.writableDatabase.delete(
+            db.delete(
                 "telegram_outbox",
                 "id IN (SELECT id FROM telegram_outbox ORDER BY id LIMIT ?)",
                 arrayOf(overflow.toString())
             )
         }
-        val inserted = helper.writableDatabase.insertWithOnConflict(
+        val inserted = db.insertWithOnConflict(
             "telegram_outbox",
             null,
             ContentValues().apply {
@@ -613,7 +654,11 @@ class TelemetryStore(
     }
 
     fun saveTelegramRuntimeState(stateJson: String, nowMs: Long) {
-        helper.writableDatabase.insertWithOnConflict(
+        saveTelegramRuntimeState(helper.writableDatabase, stateJson, nowMs)
+    }
+
+    private fun saveTelegramRuntimeState(db: SQLiteDatabase, stateJson: String, nowMs: Long) {
+        db.insertWithOnConflict(
             "telegram_runtime_state",
             null,
             ContentValues().apply {
@@ -646,20 +691,38 @@ class TelemetryStore(
         if (fieldKeys.isEmpty()) return InfluxPendingSummary(rows = 0, oldestObservedAt = null)
         ensureInfluxCursors(fieldKeys)
         val placeholders = fieldKeys.joinToString(",") { "?" }
-        helper.readableDatabase.rawQuery(
+        val sql = if (compactV2) {
+            """
+            SELECT COUNT(*), MIN(history.observed_at_ms)
+            FROM vehicle_state_history AS history
+            INNER JOIN normalized_history_field_catalog AS field ON field.id = history.field_id
+            INNER JOIN influx_export_cursor AS export_cursor ON export_cursor.field_key = field.field_key
+            WHERE field.field_key IN ($placeholders)
+              AND history.id > export_cursor.last_exported_history_id
+            """.trimIndent()
+        } else {
             """
             SELECT COUNT(*), MIN(history.observed_at)
             FROM vehicle_state_history history
             JOIN influx_export_cursor cursor ON cursor.field_key = history.field_key
             WHERE history.field_key IN ($placeholders)
               AND history.id > cursor.last_exported_history_id
-            """.trimIndent(),
+            """.trimIndent()
+        }
+        helper.readableDatabase.rawQuery(
+            sql,
             fieldKeys.toTypedArray()
         ).use { cursor ->
             if (!cursor.moveToFirst()) return InfluxPendingSummary(rows = 0, oldestObservedAt = null)
             return InfluxPendingSummary(
                 rows = cursor.getLong(0),
-                oldestObservedAt = cursor.getNullableString(1)
+                oldestObservedAt = if (cursor.isNull(1)) {
+                    null
+                } else if (compactV2) {
+                    normalizedIsoTime(cursor.getLong(1))
+                } else {
+                    cursor.getString(1)
+                }
             )
         }
     }
@@ -672,7 +735,22 @@ class TelemetryStore(
         ensureInfluxCursors(fieldKeys)
         val placeholders = fieldKeys.joinToString(",") { "?" }
         val args = fieldKeys.toList() + limit.toString()
-        helper.readableDatabase.rawQuery(
+        val sql = if (compactV2) {
+            """
+            SELECT history.id, field.field_key, field.category, field.value_type,
+                   history.value_text, history.value_number, history.value_bool,
+                   history.quality_code, NULLIF(field.unit, ''), history.source_poll_id,
+                   field.source_keys, history.observed_at_ms, history.changed_at_ms
+            FROM vehicle_state_history AS history
+            INNER JOIN normalized_history_field_catalog AS field ON field.id = history.field_id
+            INNER JOIN influx_export_cursor AS export_cursor
+                    ON export_cursor.field_key = field.field_key
+            WHERE field.field_key IN ($placeholders)
+              AND history.id > export_cursor.last_exported_history_id
+            ORDER BY history.id
+            LIMIT ?
+            """.trimIndent()
+        } else {
             """
             SELECT history.id, history.field_key, history.category, history.value_type,
                    history.value_text, history.value_number, history.value_bool,
@@ -685,7 +763,10 @@ class TelemetryStore(
               AND history.id > export_cursor.last_exported_history_id
             ORDER BY history.id
             LIMIT ?
-            """.trimIndent(),
+            """.trimIndent()
+        }
+        helper.readableDatabase.rawQuery(
+            sql,
             args.toTypedArray()
         ).use { cursor ->
             return buildList {
@@ -699,12 +780,16 @@ class TelemetryStore(
                             valueText = cursor.getNullableString(4),
                             valueNumber = if (cursor.isNull(5)) null else cursor.getDouble(5),
                             valueBool = if (cursor.isNull(6)) null else cursor.getInt(6) == 1,
-                            quality = cursor.getString(7),
+                            quality = if (compactV2) {
+                                NormalizedQuality.fromStorageCode(cursor.getInt(7)).name
+                            } else {
+                                cursor.getString(7)
+                            },
                             unit = cursor.getNullableString(8),
                             sourcePollId = if (cursor.isNull(9)) null else cursor.getLong(9),
                             sourceKeys = cursor.getString(10),
-                            observedAt = cursor.getString(11),
-                            changedAt = cursor.getString(12)
+                            observedAt = if (compactV2) normalizedIsoTime(cursor.getLong(11)) else cursor.getString(11),
+                            changedAt = if (compactV2) normalizedIsoTime(cursor.getLong(12)) else cursor.getString(12)
                         )
                     )
                 }
@@ -1088,15 +1173,23 @@ class TelemetryStore(
         val catalogVersionId = parameters.firstOrNull()?.catalogVersionId ?: return
         if (pollValueColumnsEnsuredForCatalogVersionId == catalogVersionId) return
 
-        //keeps raw and desc values queryable by stable column names instead of burying them in json blobs
+        //keeps raw and decoded ids queryable by stable columns instead of repeating text every poll
         val existingColumns = pollValueColumnNames(db)
             .map { it.lowercase(Locale.US) }
             .toMutableSet()
         parameters.forEach { parameter ->
-            PollValueColumns.forParameter(parameter).forEach { columnName ->
+            val columns = if (compactV2) {
+                buildList {
+                    add(PollValueColumns.raw(parameter.key) to "INTEGER")
+                    if (parameter.includeDesc) add(PollValueColumns.descId(parameter.key) to "INTEGER")
+                }
+            } else {
+                PollValueColumns.forParameter(parameter).map { it to "TEXT" }
+            }
+            columns.forEach { (columnName, storageType) ->
                 val normalizedColumnName = columnName.lowercase(Locale.US)
                 if (!existingColumns.contains(normalizedColumnName)) {
-                    db.execSQL("ALTER TABLE poll_values ADD COLUMN ${quoteIdentifier(columnName)} TEXT")
+                    db.execSQL("ALTER TABLE poll_values ADD COLUMN ${quoteIdentifier(columnName)} $storageType")
                     existingColumns.add(normalizedColumnName)
                 }
             }
@@ -1117,8 +1210,9 @@ class TelemetryStore(
         pollId: Long,
         readings: List<PollReading>,
         parameters: List<CatalogParameter>
-    ) {
+    ): Map<String, Long> {
         val parametersByKey = parameters.associateBy { it.key }
+        val resolvedDecodedIds = mutableMapOf<String, Long>()
         db.insertOrThrow(
             "poll_values",
             null,
@@ -1126,13 +1220,54 @@ class TelemetryStore(
                 put("poll_id", pollId)
                 readings.forEach { reading ->
                     val parameter = parametersByKey[reading.rawKey] ?: return@forEach
-                    put(PollValueColumns.raw(parameter.key), reading.rawValue)
-                    if (parameter.includeDesc) {
+                    if (compactV2) {
+                        reading.rawInt?.let { put(PollValueColumns.raw(parameter.key), it) }
+                            ?: putNull(PollValueColumns.raw(parameter.key))
+                    } else {
+                        put(PollValueColumns.raw(parameter.key), reading.rawValue)
+                    }
+                    if (parameter.includeDesc && compactV2) {
+                        reading.descValue?.let { decoded ->
+                            put(
+                                PollValueColumns.descId(parameter.key),
+                                decodedValueId(db, decoded, resolvedDecodedIds)
+                            )
+                        }
+                    } else if (parameter.includeDesc) {
                         put(PollValueColumns.desc(parameter.key), reading.descValue)
                     }
                 }
             }
         )
+        return resolvedDecodedIds
+    }
+
+    private fun decodedValueId(
+        db: SQLiteDatabase,
+        value: String,
+        resolvedInTransaction: MutableMap<String, Long>
+    ): Long {
+        decodedValueIds[value]?.let { return it }
+        resolvedInTransaction[value]?.let { return it }
+        val insertedId = db.insertWithOnConflict(
+            "decoded_value_dictionary",
+            null,
+            ContentValues().apply { put("value", value) },
+            SQLiteDatabase.CONFLICT_IGNORE
+        )
+        val id = if (insertedId != -1L) {
+            insertedId
+        } else {
+            db.rawQuery(
+                "SELECT id FROM decoded_value_dictionary WHERE value = ? LIMIT 1",
+                arrayOf(value)
+            ).use { cursor ->
+                check(cursor.moveToFirst()) { "Decoded value dictionary lookup failed" }
+                cursor.getLong(0)
+            }
+        }
+        resolvedInTransaction[value] = id
+        return id
     }
 
     private fun upsertMqttPublishState(targetKey: String, targetType: String, values: ContentValues) {
@@ -1211,8 +1346,8 @@ class TelemetryStore(
         }
     }
 
-    private fun telegramMessageExists(dedupeKey: String): Boolean {
-        helper.readableDatabase.rawQuery(
+    private fun telegramMessageExists(db: SQLiteDatabase, dedupeKey: String): Boolean {
+        db.rawQuery(
             "SELECT 1 FROM telegram_outbox WHERE dedupe_key = ? LIMIT 1",
             arrayOf(dedupeKey)
         ).use { cursor -> return cursor.moveToFirst() }
@@ -1301,6 +1436,7 @@ class TelemetryStore(
         private const val TAG = "BYDCollectorEvent"
         private const val MAX_ERROR_TEXT_LENGTH = 2_048
         private const val MAX_RAW_RESPONSE_BODY_LENGTH = 4_096
+        private const val DECODED_VALUE_CACHE_SIZE = 2_048
         private const val TELEGRAM_MAX_PENDING = 1_000L
         private const val TELEGRAM_RETENTION_MS = 30L * 24L * 60L * 60L * 1_000L
     }

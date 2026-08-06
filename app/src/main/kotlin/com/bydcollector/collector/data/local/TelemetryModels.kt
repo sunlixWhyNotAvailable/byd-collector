@@ -24,7 +24,9 @@ data class PollReading(
     val rawKey: String,
     val rawValue: String?,
     val descValue: String? = null
-)
+) {
+    val rawInt: Int? get() = rawValue?.toIntOrNull()
+}
 
 data class PersistedPollInput(
     val timestamp: String,

@@ -239,21 +239,71 @@ class CollectorServiceMaintenanceContractTest {
     }
 
     @Test
-    fun archiveFailureWithMissingOriginalDoesNotReopenFreshDatabase() {
+    fun archiveFailureRequiresCompleteRollbackAndVerifiedOriginalBeforeRuntimeCanResume() {
         val source = sourceFile("com/bydcollector/collector/maintenance/DbMaintenanceCoordinator.kt").readText()
         val run = source.substringAfter("fun run(").substringBefore("private fun archive")
-        val archive = source.substringAfter("private fun archive").substringBefore("private fun reopenAndRebind")
-        val missingOriginalBranch = archive.substringAfter("if (!databaseFile.exists())").substringBefore("reopenAndRebind()")
+        val archiveMain = source.substringAfter("private fun archiveMain").substringBefore("private fun rollbackMain")
+        val archiveDebug = source.substringAfter("private fun archiveDebug").substringBefore("private fun rollbackDebug")
 
         assertTrue(source.contains("private class TerminalArchiveFailure"))
         assertTrue(run.contains("var skipRestore = false"))
         assertTrue(run.contains("catch (error: TerminalArchiveFailure)"))
         assertTrue(run.contains("skipRestore = true"))
         assertTrue(run.contains("if (!restored && !skipRestore)"))
-        assertTrue(missingOriginalBranch.contains("throw TerminalArchiveFailure(\"Database archive failed and original database was not restored:"))
-        assertFalse(missingOriginalBranch.contains("application.reopenTelemetryStoreForMaintenance()"))
-        assertFalse(missingOriginalBranch.contains("reopenAndRebind()"))
-        assertTrue(archive.contains("if (!reopened && databaseFile.exists())"))
+        assertTrue(archiveMain.contains("if (!archive.rollbackOk || !databaseFile.exists())"))
+        assertTrue(archiveMain.contains("throw TerminalArchiveFailure(\"Database archive failed and original database was not restored:"))
+        assertInOrder(archiveMain, "reopenMainAndVerifyRestored(databaseFile)", "settings.clearStorageCutoverJournal()")
+        assertTrue(archiveDebug.contains("if (!archive.rollbackOk || !databaseFile.exists())"))
+        assertTrue(archiveDebug.contains("throw TerminalArchiveFailure(\"Debug database archive failed and original database was not restored:"))
+        assertInOrder(archiveDebug, "reopenDebugAndVerifyRestored(databaseFile)", "settings.clearStorageCutoverJournal()")
+    }
+
+    @Test
+    fun failedNewDatabaseIsClosedDeletedRestoredAndVerifiedBeforeRebind() {
+        val source = sourceFile("com/bydcollector/collector/maintenance/DbMaintenanceCoordinator.kt").readText()
+        val archiveMain = source.substringAfter("private fun archiveMain").substringBefore("private fun rollbackMain")
+        val rollbackMain = source.substringAfter("private fun rollbackMain").substringBefore("private fun reopenMainAndVerifyRestored")
+        val archiveDebug = source.substringAfter("private fun archiveDebug").substringBefore("private fun rollbackDebug")
+        val rollbackDebug = source.substringAfter("private fun rollbackDebug").substringBefore("private fun reopenDebugAndVerifyRestored")
+        val exactDelete = source.substringAfter("private fun deleteExactNewDatabaseSet").substringBefore("private fun checkCancelled")
+
+        assertInOrder(archiveMain, "val newStore = application.reopenTelemetryStoreForMaintenance()", "check(newStore.verifyWritableDatabase())", "rollbackMain(databaseFile, archive, createFailure)")
+        assertInOrder(rollbackMain, "application.closeTelemetryStoreForMaintenance()", "markRollbackPhase()", "deleteExactNewDatabaseSet(databaseFile)", "DatabaseArchiveManager.restore(databaseFile, archive.movedFiles)", "reopenMainAndVerifyRestored(databaseFile)")
+        assertInOrder(archiveDebug, "val newStore = reopenDebugAndRebind()", "check(newStore.verifyWritableDatabase())", "rollbackDebug(databaseFile, archive, createFailure)")
+        assertInOrder(rollbackDebug, "closeDebugStore()", "markRollbackPhase()", "deleteExactNewDatabaseSet(databaseFile)", "DatabaseArchiveManager.restore(databaseFile, archive.movedFiles)", "reopenDebugAndVerifyRestored(databaseFile)")
+        assertFalse(rollbackMain.contains("runCatching { markRollbackPhase() }"))
+        assertFalse(rollbackDebug.contains("runCatching { markRollbackPhase() }"))
+        assertTrue(source.contains("checkNotNull(settings.storageCutoverJournal()) { \"Database rollback journal is missing\" }"))
+        assertTrue(exactDelete.contains("databaseFile.name == TelemetryDatabaseHelper.DATABASE_NAME"))
+        assertTrue(exactDelete.contains("databaseFile.name == DirectDebugDatabaseHelper.DATABASE_NAME"))
+        assertTrue(exactDelete.contains("context.getDatabasePath(databaseFile.name).canonicalFile"))
+        assertTrue(exactDelete.contains("databaseFile.canonicalFile"))
+        assertTrue(exactDelete.contains("DatabaseArchiveManager.sidecarFiles(expected)"))
+    }
+
+    @Test
+    fun manualArchiveDoesNotOverwriteAnUnresolvedCutoverJournal() {
+        val source = sourceFile("com/bydcollector/collector/maintenance/DbMaintenanceCoordinator.kt").readText()
+        val archiveMain = source.substringAfter("private fun archiveMain").substringBefore("private fun rollbackMain")
+        val archiveDebug = source.substringAfter("private fun archiveDebug").substringBefore("private fun rollbackDebug")
+
+        assertInOrder(archiveMain, "check(settings.storageCutoverJournal() == null)", "application.closeTelemetryStoreForMaintenance()", "settings.setStorageCutoverJournal(")
+        assertInOrder(archiveDebug, "check(settings.storageCutoverJournal() == null)", "closeDebugStore()", "settings.setStorageCutoverJournal(")
+    }
+
+    @Test
+    fun partialRestoreIsTerminalAndDoesNotRestartRuntime() {
+        val source = sourceFile("com/bydcollector/collector/maintenance/DbMaintenanceCoordinator.kt").readText()
+        val run = source.substringAfter("fun run(").substringBefore("private fun archive")
+        val rollbackMain = source.substringAfter("private fun rollbackMain").substringBefore("private fun reopenMainAndVerifyRestored")
+        val rollbackDebug = source.substringAfter("private fun rollbackDebug").substringBefore("private fun reopenDebugAndVerifyRestored")
+
+        assertTrue(rollbackMain.contains("if (!DatabaseArchiveManager.restore(databaseFile, archive.movedFiles))"))
+        assertTrue(rollbackMain.contains("throw TerminalArchiveFailure(\"Database archive restore was incomplete"))
+        assertTrue(rollbackDebug.contains("if (!DatabaseArchiveManager.restore(databaseFile, archive.movedFiles))"))
+        assertTrue(rollbackDebug.contains("throw TerminalArchiveFailure(\"Debug database archive restore was incomplete"))
+        assertInOrder(run, "catch (error: TerminalArchiveFailure)", "skipRestore = true")
+        assertTrue(run.contains("if (!restored && !skipRestore)"))
     }
 
     private fun sourceFile(path: String): File {

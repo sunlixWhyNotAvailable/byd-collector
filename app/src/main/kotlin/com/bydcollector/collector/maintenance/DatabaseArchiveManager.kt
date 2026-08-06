@@ -22,8 +22,11 @@ internal object DatabaseArchiveManager {
         File(databaseFile.path + "-journal")
     )
 
+    fun plannedArchiveDirectory(databaseFile: File, archiveRoot: File, timestamp: String): File =
+        File(archiveRoot, "${databaseFile.nameWithoutExtension}_$timestamp")
+
     fun archive(databaseFile: File, archiveRoot: File, timestamp: String): ArchiveResult {
-        val archiveDirectory = File(archiveRoot, "${databaseFile.nameWithoutExtension}_$timestamp")
+        val archiveDirectory = plannedArchiveDirectory(databaseFile, archiveRoot, timestamp)
         val movedFiles = mutableListOf<File>()
 
         if (!databaseFile.exists()) {
@@ -41,11 +44,11 @@ internal object DatabaseArchiveManager {
         for (source in sidecarFiles(databaseFile).filter { it.exists() }) {
             val target = File(archiveDirectory, source.name)
             if (target.exists()) {
-                val rollbackOk = rollback(databaseFile, movedFiles)
+                val rollbackOk = restore(databaseFile, movedFiles)
                 return ArchiveResult(false, archiveDirectory, movedFiles.toList(), "Archive target already exists: ${source.name}", rollbackOk)
             }
             if (!source.renameTo(target)) {
-                val rollbackOk = rollback(databaseFile, movedFiles)
+                val rollbackOk = restore(databaseFile, movedFiles)
                 return ArchiveResult(false, archiveDirectory, movedFiles.toList(), "Cannot move ${source.name}", rollbackOk)
             }
             movedFiles += target
@@ -54,17 +57,24 @@ internal object DatabaseArchiveManager {
         return ArchiveResult(true, archiveDirectory, movedFiles.toList())
     }
 
-    internal fun rollback(
+    internal fun restore(
         databaseFile: File,
         movedFiles: List<File>,
         moveFile: (File, File) -> Boolean = { source, target -> source.renameTo(target) }
     ): Boolean {
         var rollbackOk = true
         for (moved in movedFiles.asReversed()) {
-            if (!moveFile(moved, File(databaseFile.parentFile, moved.name))) {
+            val target = File(databaseFile.parentFile, moved.name)
+            if (target.exists() || !moveFile(moved, target)) {
                 rollbackOk = false
             }
         }
         return rollbackOk
     }
+
+    internal fun rollback(
+        databaseFile: File,
+        movedFiles: List<File>,
+        moveFile: (File, File) -> Boolean = { source, target -> source.renameTo(target) }
+    ): Boolean = restore(databaseFile, movedFiles, moveFile)
 }

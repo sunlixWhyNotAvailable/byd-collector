@@ -29,6 +29,8 @@ import com.bydcollector.collector.influx.InfluxActions
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
 import com.bydcollector.collector.maintenance.DbMaintenanceUiState
+import com.bydcollector.collector.maintenance.MainArchivePreflight
+import com.bydcollector.collector.maintenance.StorageFormatCutoverCoordinator
 import com.bydcollector.collector.maintenance.ArchiveStorageManager
 import com.bydcollector.collector.maintenance.ArchiveShareLeaseRegistry
 import com.bydcollector.collector.mqtt.HaMqttActions
@@ -102,6 +104,7 @@ class MainActivity : ComponentActivity() {
     private var updateUiState by mutableStateOf<UpdateUiState>(UpdateUiState.Hidden)
     private var updateUiGeneration = 0L
     private var pendingMaintenanceOperation by mutableStateOf<DbMaintenanceOperation?>(null)
+    private var pendingMainArchivePreflight by mutableStateOf<MainArchivePreflight?>(null)
     private var maintenanceLaunchOperation by mutableStateOf<DbMaintenanceOperation?>(null)
     private var maintenancePreflightInFlight = false
     private var dashboardRefreshVersion by mutableStateOf(0)
@@ -209,6 +212,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onOpenArchiveDebugDatabase() {
+            pendingMainArchivePreflight = null
             pendingMaintenanceOperation = DbMaintenanceOperation.DEBUG_ARCHIVE
             refresh()
         }
@@ -217,6 +221,7 @@ class MainActivity : ComponentActivity() {
             val operation = pendingMaintenanceOperation ?: return
             maintenanceLaunchOperation = operation
             pendingMaintenanceOperation = null
+            pendingMainArchivePreflight = null
             stateProvider.invalidateArchiveStorageSnapshot()
             settings.setDbMaintenanceStatus(
                 DbMaintenanceRuntimeStatus(
@@ -256,6 +261,7 @@ class MainActivity : ComponentActivity() {
         override fun onDismissDatabaseMaintenance() {
             if (dashboardUiStateStore.currentChrome()?.dbMaintenanceStatus?.running == true || maintenanceLaunchOperation != null) return
             pendingMaintenanceOperation = null
+            pendingMainArchivePreflight = null
             settings.clearDbMaintenanceStatus()
             refresh()
         }
@@ -540,6 +546,7 @@ class MainActivity : ComponentActivity() {
                 if (clearedUserShutdown) {
                     CollectorAutoStart.recoverFromForeground(applicationContext, settings, runtimeStore)
                 }
+                reconcileCutoverArchiveStorageIfNeeded()
                 startRuntimeUpdateAutoCheck()
             }
         }
@@ -548,6 +555,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         foreground = true
+        reconcileCutoverArchiveStorageIfNeeded()
         syncTelegramUiRuntimeState()
         refresh()
         maybeContinueStartupAccessFlow()
@@ -599,6 +607,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun currentStore(): TelemetryStore = BydCollectorApplication.store(applicationContext)
+
+    private fun reconcileCutoverArchiveStorageIfNeeded() {
+        if (settings.isCutoverArchiveStoragePending() && !CollectorService.isArchiveStorageActive()) {
+            CollectorServiceController.reconcileArchiveStorage(this)
+        }
+    }
 
     private fun shareArchives(ids: List<String>) {
         if (!archiveShareInFlight.compareAndSet(false, true)) return
@@ -726,34 +740,25 @@ class MainActivity : ComponentActivity() {
     private fun openMainArchiveDialog() {
         if (maintenancePreflightInFlight || destroyed) return
         maintenancePreflightInFlight = true
-        val previous = dashboardUiStateStore.currentChrome()
-        val kpiLanguage = if (uiLanguage == UiLanguage.UK) VehicleKpiLanguage.UK else VehicleKpiLanguage.EN
         dashboardExecutor.execute {
             val result = runCatching {
-                stateProvider.load(
-                    profile = DashboardLoadProfile.MAIN,
-                    previous = previous,
-                    vehicleKpiLanguage = kpiLanguage
-                )
+                StorageFormatCutoverCoordinator.readMainPreflight(currentStore().databaseFile())
             }
             runOnUiThread {
                 maintenancePreflightInFlight = false
                 if (destroyed) return@runOnUiThread
                 result
-                    .onSuccess { state ->
-                        val generation = dashboardUiStateStore.beginChromeRefresh()
-                        dashboardUiStateStore.publishChrome(generation, state)
-                        dashboardRefreshVersion += 1
+                    .onSuccess { preflight ->
+                        pendingMainArchivePreflight = preflight
                         pendingMaintenanceOperation = DbMaintenanceOperation.ARCHIVE
                     }
                     .onFailure { error ->
                         recordDashboardRefreshFailure("maintenance_preflight", error)
-                        val message = if (uiLanguage == UiLanguage.UK) {
-                            "Не вдалося перевірити стан бази"
-                        } else {
-                            "Could not check database status"
-                        }
-                        Toast.makeText(this@MainActivity, message, Toast.LENGTH_LONG).show()
+                        Toast.makeText(
+                            this@MainActivity,
+                            strings(uiLanguage).archivePreflightFailed,
+                            Toast.LENGTH_LONG
+                        ).show()
                     }
             }
         }
@@ -840,6 +845,7 @@ class MainActivity : ComponentActivity() {
                             recordDashboardRefreshFailure("chrome", error)
                         }
                 }
+                reconcileCutoverArchiveStorageIfNeeded()
                 if (tabPublished) dashboardRefreshVersion += 1
                 if (forcedRefreshPending && !destroyed) {
                     forcedRefreshPending = false
@@ -1536,7 +1542,14 @@ class MainActivity : ComponentActivity() {
                 messageEn = operation.stepsEn.first()
             )
         }
-        return pendingMaintenanceOperation?.let { DbMaintenanceUiState(operation = it) }
+        return pendingMaintenanceOperation?.let { operation ->
+            DbMaintenanceUiState(
+                operation = operation,
+                mainArchivePreflight = pendingMainArchivePreflight.takeIf {
+                    operation == DbMaintenanceOperation.ARCHIVE
+                }
+            )
+        }
     }
 
     private fun startDiagnostics(source: String) {
