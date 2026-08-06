@@ -25,7 +25,8 @@ data class TelegramDetectedEvent(
 data class TelegramEventResult(
     val state: TelegramEventState,
     val events: List<TelegramDetectedEvent>,
-    val shouldPersist: Boolean
+    val shouldPersist: Boolean,
+    val nextWakeAtMs: Long?
 )
 
 data class TelegramEventState(
@@ -33,6 +34,11 @@ data class TelegramEventState(
     val charging: String? = null,
     val chargingCandidate: String? = null,
     val chargingCandidateCount: Int = 0,
+    val chargingActive: Boolean? = null,
+    val chargingActiveCandidate: Boolean? = null,
+    val chargingActiveCandidateCount: Int = 0,
+    val chargingEvidenceSource: String? = null,
+    val chargingLowPowerSinceMs: Long? = null,
     val chargeGunConnected: Boolean? = null,
     val chargeGunCandidate: Boolean? = null,
     val chargeGunCandidateCount: Int = 0,
@@ -56,6 +62,9 @@ data class TelegramEventState(
     val tripStartOdometerKm: Double? = null,
     val tripStartSoc: Double? = null,
     val tripParkedSinceMs: Long? = null,
+    val tripEndOdometerKm: Double? = null,
+    val tripEndSoc: Double? = null,
+    val tripEndEnergyKwh: Double? = null,
     val lastPersistedAtMs: Long = 0L
 ) {
     fun toJson(): String = JSONObject().apply {
@@ -63,6 +72,11 @@ data class TelegramEventState(
         putNullable("charging", charging)
         putNullable("chargingCandidate", chargingCandidate)
         put("chargingCandidateCount", chargingCandidateCount)
+        putNullable("chargingActive", chargingActive)
+        putNullable("chargingActiveCandidate", chargingActiveCandidate)
+        put("chargingActiveCandidateCount", chargingActiveCandidateCount)
+        putNullable("chargingEvidenceSource", chargingEvidenceSource)
+        putNullable("chargingLowPowerSinceMs", chargingLowPowerSinceMs)
         putNullable("chargeGunConnected", chargeGunConnected)
         putNullable("chargeGunCandidate", chargeGunCandidate)
         put("chargeGunCandidateCount", chargeGunCandidateCount)
@@ -86,6 +100,9 @@ data class TelegramEventState(
         putNullable("tripStartOdometerKm", tripStartOdometerKm)
         putNullable("tripStartSoc", tripStartSoc)
         putNullable("tripParkedSinceMs", tripParkedSinceMs)
+        putNullable("tripEndOdometerKm", tripEndOdometerKm)
+        putNullable("tripEndSoc", tripEndSoc)
+        putNullable("tripEndEnergyKwh", tripEndEnergyKwh)
         put("lastPersistedAtMs", lastPersistedAtMs)
     }.toString()
 
@@ -99,6 +116,11 @@ data class TelegramEventState(
                     charging = json.optStringOrNull("charging"),
                     chargingCandidate = json.optStringOrNull("chargingCandidate"),
                     chargingCandidateCount = json.optInt("chargingCandidateCount"),
+                    chargingActive = json.optBooleanOrNull("chargingActive"),
+                    chargingActiveCandidate = json.optBooleanOrNull("chargingActiveCandidate"),
+                    chargingActiveCandidateCount = json.optInt("chargingActiveCandidateCount"),
+                    chargingEvidenceSource = json.optStringOrNull("chargingEvidenceSource"),
+                    chargingLowPowerSinceMs = json.optLongOrNull("chargingLowPowerSinceMs"),
                     chargeGunConnected = json.optBooleanOrNull("chargeGunConnected"),
                     chargeGunCandidate = json.optBooleanOrNull("chargeGunCandidate"),
                     chargeGunCandidateCount = json.optInt("chargeGunCandidateCount"),
@@ -122,6 +144,9 @@ data class TelegramEventState(
                     tripStartOdometerKm = json.optDoubleOrNull("tripStartOdometerKm"),
                     tripStartSoc = json.optDoubleOrNull("tripStartSoc"),
                     tripParkedSinceMs = json.optLongOrNull("tripParkedSinceMs"),
+                    tripEndOdometerKm = json.optDoubleOrNull("tripEndOdometerKm"),
+                    tripEndSoc = json.optDoubleOrNull("tripEndSoc"),
+                    tripEndEnergyKwh = json.optDoubleOrNull("tripEndEnergyKwh"),
                     lastPersistedAtMs = json.optLong("lastPersistedAtMs")
                 )
             }.getOrDefault(TelegramEventState())
@@ -130,7 +155,14 @@ data class TelegramEventState(
 }
 
 class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState()) {
-    var state: TelegramEventState = initialState
+    var state: TelegramEventState = initialState.copy(
+        chargingActive = null,
+        chargingActiveCandidate = null,
+        chargingActiveCandidateCount = 0,
+        chargingEvidenceSource = null,
+        chargingLowPowerSinceMs = null,
+        fullCandidateCount = 0
+    )
         private set
 
     fun reset(): TelegramEventState {
@@ -148,7 +180,7 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
             .associateBy { it.field.fieldKey }
         val soc = values.number("soc")
         val remainingEnergy = values.number("battery_remaining_energy_kwh")
-        val batteryPower = values.number("battery_power_kw")
+        val batteryChargePower = values.number("battery_charge_power_kw")
         val auxVoltage = values.number("aux_voltage_v")
         val odometer = values.number("odometer_km")
         val tripEnergy = values.number("trip_energy_kwh")
@@ -158,8 +190,9 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         val rawGear = values.text("gear_auto_mode_raw")
         val events = mutableListOf<TelegramDetectedEvent>()
         val original = state
+        val firstPoll = !state.initialized
 
-        if (!state.initialized) {
+        if (firstPoll) {
             state = state.copy(
                 initialized = true,
                 charging = rawCharging,
@@ -169,36 +202,54 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
                 telemetryExpectedSinceMs = state.telemetryExpectedSinceMs ?: nowMs,
                 telemetryOutageSent = false
             )
-            if (rawCharging == CHARGING) startChargingSession(nowMs, soc, remainingEnergy, config.chargeStepPercent)
             if (rawGear != null && rawGear != PARK) startTrip(nowMs, odometer, soc)
-            return persistedResult(events, nowMs, force = true)
+        } else {
+            state = state.copy(
+                lastSuccessfulPollAtMs = nowMs,
+                telemetryExpectedSinceMs = state.telemetryExpectedSinceMs ?: nowMs,
+                telemetryOutageSent = false
+            )
+            trackChargingSemantic(rawCharging)
+            confirmChargeGun(rawGun, nowMs, soc, config, events)
+            confirmGear(rawGear, nowMs, odometer, soc, tripEnergy, config)
         }
 
-        state = state.copy(
-            lastSuccessfulPollAtMs = nowMs,
-            telemetryExpectedSinceMs = state.telemetryExpectedSinceMs ?: nowMs,
-            telemetryOutageSent = false
+        val evidence = chargingEvidence(rawGun, batteryChargePower, rawCharging)
+        val stopCharging = confirmChargingEvidence(
+            evidence = evidence,
+            nowMs = nowMs,
+            soc = soc,
+            remainingEnergy = remainingEnergy,
+            batteryChargePower = batteryChargePower,
+            config = config,
+            events = events
         )
-        confirmCharging(rawCharging, nowMs, soc, remainingEnergy, batteryPower, config, events)
-        confirmChargeGun(rawGun, nowMs, soc, config, events)
-        confirmGear(rawGear, nowMs, odometer, soc, tripEnergy, config, events)
-        evaluateChargingProgress(nowMs, soc, remainingEnergy, batteryPower, range, config, events)
+        if (evidence.active != null && (state.chargingActive == true || stopCharging)) {
+            evaluateChargingProgress(nowMs, soc, remainingEnergy, batteryChargePower, range, config, events)
+        }
+        if (stopCharging && state.chargingSessionId != null) {
+            stopChargingSession(nowMs, soc, remainingEnergy, batteryChargePower, config, events)
+        } else if (stopCharging) {
+            state = state.copy(fullSent = false)
+        }
         evaluateLowVoltage(nowMs, auxVoltage, config, events)
 
         val changedBeyondHeartbeat = state.copy(lastSuccessfulPollAtMs = original.lastSuccessfulPollAtMs) != original
         return persistedResult(
             events = events,
             nowMs = nowMs,
-            force = changedBeyondHeartbeat || nowMs - state.lastPersistedAtMs >= STATE_HEARTBEAT_MS
+            force = firstPoll || changedBeyondHeartbeat || nowMs - state.lastPersistedAtMs >= STATE_HEARTBEAT_MS,
+            config = config
         )
     }
 
     fun onTick(config: TelegramEventConfig, mainCollectionExpected: Boolean, lastError: String?, nowMs: Long): TelegramEventResult {
         val events = mutableListOf<TelegramDetectedEvent>()
         val original = state
+        finalizePendingTrip(config, nowMs, events)
         if (!mainCollectionExpected) {
             state = state.copy(telemetryExpectedSinceMs = null, telemetryOutageSent = false)
-            return persistedResult(events, nowMs, force = state != original)
+            return persistedResult(events, nowMs, force = state != original || events.isNotEmpty(), config = config)
         }
         val expectedSince = state.telemetryExpectedSinceMs ?: nowMs
         state = state.copy(telemetryExpectedSinceMs = expectedSince)
@@ -220,51 +271,99 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
                 )
             )
         }
-        return persistedResult(events, nowMs, force = state != original || events.isNotEmpty())
+        return persistedResult(events, nowMs, force = state != original || events.isNotEmpty(), config = config)
     }
 
-    private fun confirmCharging(
-        raw: String?,
-        nowMs: Long,
-        soc: Double?,
-        remainingEnergy: Double?,
-        batteryPower: Double?,
-        config: TelegramEventConfig,
-        events: MutableList<TelegramDetectedEvent>
-    ) {
+    private fun trackChargingSemantic(raw: String?) {
         if (raw == null || raw == state.charging) {
             state = state.copy(chargingCandidate = null, chargingCandidateCount = 0)
             return
         }
         val count = if (state.chargingCandidate == raw) state.chargingCandidateCount + 1 else 1
         state = state.copy(chargingCandidate = raw, chargingCandidateCount = count)
-        if (count < CONFIRMATION_SAMPLES) return
-        val previous = state.charging
-        state = state.copy(charging = raw, chargingCandidate = null, chargingCandidateCount = 0)
-        if (raw == CHARGING && previous != CHARGING) {
-            startChargingSession(nowMs, soc, remainingEnergy, config.chargeStepPercent)
-            addIfEnabled(
-                events, config, TelegramEventType.CHARGING_STARTED,
-                "${state.chargingSessionId}:started",
-                chargingVariables(nowMs, soc, remainingEnergy, batteryPower)
-            )
-        } else if (previous == CHARGING && raw != CHARGING && state.chargingSessionId != null) {
-            val sessionId = state.chargingSessionId.orEmpty()
-            addIfEnabled(
-                events, config, TelegramEventType.CHARGING_STOPPED,
-                "$sessionId:stopped",
-                chargingVariables(nowMs, soc, remainingEnergy, batteryPower)
-            )
-            state = state.copy(
-                chargingSessionId = null,
-                chargingStartedAtMs = null,
-                chargingStartSoc = null,
-                chargingStartEnergyKwh = null,
-                lastProgressThreshold = null,
-                fullCandidateCount = 0,
-                fullSent = false
-            )
+        if (count >= CONFIRMATION_SAMPLES) {
+            state = state.copy(charging = raw, chargingCandidate = null, chargingCandidateCount = 0)
         }
+    }
+
+    private fun confirmChargingEvidence(
+        evidence: ChargingEvidence,
+        nowMs: Long,
+        soc: Double?,
+        remainingEnergy: Double?,
+        batteryChargePower: Double?,
+        config: TelegramEventConfig,
+        events: MutableList<TelegramDetectedEvent>
+    ): Boolean {
+        if (evidence.active == null) {
+            state = state.copy(
+                chargingActiveCandidate = null,
+                chargingActiveCandidateCount = 0,
+                chargingLowPowerSinceMs = null,
+                fullCandidateCount = 0
+            )
+            return false
+        }
+
+        if (evidence.source == ChargingEvidenceSource.PRIMARY_LOW_POWER && state.chargingActive == true) {
+            val lowPowerSince = state.chargingLowPowerSinceMs ?: nowMs
+            state = state.copy(
+                chargingActiveCandidate = null,
+                chargingActiveCandidateCount = 0,
+                chargingEvidenceSource = evidence.source.key,
+                chargingLowPowerSinceMs = lowPowerSince
+            )
+            if (nowMs - lowPowerSince < CHARGING_LOW_POWER_CONFIRM_MS) return false
+            state = state.copy(chargingActive = false, chargingLowPowerSinceMs = null)
+            return true
+        }
+
+        state = state.copy(chargingLowPowerSinceMs = null)
+        if (evidence.active == state.chargingActive) {
+            state = state.copy(
+                chargingActiveCandidate = null,
+                chargingActiveCandidateCount = 0,
+                chargingEvidenceSource = evidence.source.key
+            )
+            return false
+        }
+        val count = if (state.chargingActiveCandidate == evidence.active) {
+            state.chargingActiveCandidateCount + 1
+        } else {
+            1
+        }
+        state = state.copy(chargingActiveCandidate = evidence.active, chargingActiveCandidateCount = count)
+        if (count < CONFIRMATION_SAMPLES) return false
+        val previous = state.chargingActive
+        state = state.copy(
+            chargingActive = evidence.active,
+            chargingActiveCandidate = null,
+            chargingActiveCandidateCount = 0,
+            chargingEvidenceSource = evidence.source.key
+        )
+        if (evidence.active) {
+            if (state.chargingSessionId == null) {
+                startChargingSession(
+                    nowMs,
+                    soc,
+                    remainingEnergy,
+                    config.chargeStepPercent,
+                    fullAlreadySent = previous == null && state.fullSent && soc?.let { it >= FULL_SOC_THRESHOLD } == true
+                )
+            }
+            if (previous == false) {
+                addIfEnabled(
+                    events, config, TelegramEventType.CHARGING_STARTED,
+                    "${state.chargingSessionId}:started",
+                    chargingVariables(nowMs, soc, remainingEnergy, batteryChargePower)
+                )
+            }
+            return false
+        }
+        if (previous == null && state.chargingSessionId != null) {
+            finishChargingSession(full = false)
+        }
+        return previous == true
     }
 
     private fun confirmChargeGun(
@@ -295,8 +394,7 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         odometer: Double?,
         soc: Double?,
         tripEnergy: Double?,
-        config: TelegramEventConfig,
-        events: MutableList<TelegramDetectedEvent>
+        config: TelegramEventConfig
     ) {
         if (raw != null && raw != state.gear) {
             val count = if (state.gearCandidate == raw) state.gearCandidateCount + 1 else 1
@@ -310,46 +408,29 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
                     } == true
                     if (state.tripId == null || parkedLongEnough) {
                         startTrip(nowMs, odometer, soc)
+                    } else {
+                        clearPendingTrip()
                     }
                 }
-                if (raw == PARK && state.tripId != null) state = state.copy(tripParkedSinceMs = nowMs)
-                if (raw != PARK) state = state.copy(tripParkedSinceMs = null)
+                if (raw == PARK && state.tripId != null) {
+                    state = state.copy(tripParkedSinceMs = nowMs)
+                    updatePendingTripSnapshot(odometer, soc, tripEnergy)
+                }
+                if (raw != PARK && previous != PARK) clearPendingTrip()
             }
         } else {
             state = state.copy(gearCandidate = null, gearCandidateCount = 0)
         }
-        val parkedSince = state.tripParkedSinceMs ?: return
-        val tripId = state.tripId ?: return
-        if (state.gear != PARK || nowMs - parkedSince < config.tripEndDelayMs) return
-        val tripStartOdometer = state.tripStartOdometerKm
-        val distance = if (odometer != null && tripStartOdometer != null) {
-            (odometer - tripStartOdometer).takeIf { it >= 0.0 && it <= MAX_TRIP_DISTANCE_KM }
-        } else null
-        addIfEnabled(
-            events, config, TelegramEventType.TRIP_SUMMARY, "$tripId:summary",
-            mapOf(
-                "trip_distance_km" to formatNumber(distance),
-                "trip_energy_kwh" to formatNumber(tripEnergy),
-                "trip_duration" to formatDuration(nowMs - (state.tripStartedAtMs ?: nowMs)),
-                "soc_start" to formatNumber(state.tripStartSoc),
-                "soc_end" to formatNumber(soc),
-                "time" to formatTime(nowMs)
-            )
-        )
-        state = state.copy(
-            tripId = null,
-            tripStartedAtMs = null,
-            tripStartOdometerKm = null,
-            tripStartSoc = null,
-            tripParkedSinceMs = null
-        )
+        if (state.gear == PARK && state.tripParkedSinceMs != null && state.tripId != null) {
+            updatePendingTripSnapshot(odometer, soc, tripEnergy)
+        }
     }
 
     private fun evaluateChargingProgress(
         nowMs: Long,
         soc: Double?,
         remainingEnergy: Double?,
-        batteryPower: Double?,
+        batteryChargePower: Double?,
         range: Double?,
         config: TelegramEventConfig,
         events: MutableList<TelegramDetectedEvent>
@@ -359,27 +440,33 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         val fullNow = currentSoc >= FULL_SOC_THRESHOLD
         val fullCount = if (fullNow) state.fullCandidateCount + 1 else 0
         state = state.copy(fullCandidateCount = fullCount)
-        if (fullCount >= CONFIRMATION_SAMPLES && !state.fullSent) {
-            addIfEnabled(
-                events, config, TelegramEventType.CHARGED_TO_100, "$sessionId:full",
-                chargingVariables(nowMs, soc, remainingEnergy, batteryPower) +
-                    mapOf("remaining_energy_kwh" to formatNumber(remainingEnergy), "range_km" to formatNumber(range))
-            )
-            state = state.copy(fullSent = true)
+        if (fullCount >= CONFIRMATION_SAMPLES) {
+            if (!state.fullSent) {
+                if (TelegramEventType.CHARGED_TO_100 in config.enabledEvents) {
+                    addIfEnabled(
+                        events, config, TelegramEventType.CHARGED_TO_100, "$sessionId:full",
+                        chargingVariables(nowMs, soc, remainingEnergy, batteryChargePower) +
+                            mapOf("remaining_energy_kwh" to formatNumber(remainingEnergy), "range_km" to formatNumber(range))
+                    )
+                } else {
+                    addIfEnabled(
+                        events, config, TelegramEventType.CHARGING_PROGRESS, "$sessionId:progress:100",
+                        chargingVariables(nowMs, soc, remainingEnergy, batteryChargePower)
+                    )
+                }
+            }
+            finishChargingSession(full = true)
+            return
         }
         val step = config.chargeStepPercent.coerceIn(1, 99)
-        var threshold = if (fullCount >= CONFIRMATION_SAMPLES && TelegramEventType.CHARGED_TO_100 !in config.enabledEvents) {
-            100
-        } else {
-            (floor(currentSoc / step) * step).toInt()
-        }
+        var threshold = (floor(currentSoc / step) * step).toInt()
         if (threshold >= 100 && TelegramEventType.CHARGED_TO_100 in config.enabledEvents) threshold = 100 - step
         val previousThreshold = state.lastProgressThreshold ?: return
         if (threshold <= previousThreshold) return
         state = state.copy(lastProgressThreshold = threshold)
         addIfEnabled(
             events, config, TelegramEventType.CHARGING_PROGRESS, "$sessionId:progress:$threshold",
-            chargingVariables(nowMs, soc, remainingEnergy, batteryPower)
+            chargingVariables(nowMs, soc, remainingEnergy, batteryChargePower)
         )
     }
 
@@ -405,7 +492,125 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         }
     }
 
-    private fun startChargingSession(nowMs: Long, soc: Double?, remainingEnergy: Double?, chargeStepPercent: Int) {
+    private fun chargingEvidence(
+        chargeGunConnected: Boolean?,
+        batteryChargePower: Double?,
+        semanticState: String?
+    ): ChargingEvidence {
+        if (chargeGunConnected == false) {
+            return ChargingEvidence(false, ChargingEvidenceSource.PRIMARY_DISCONNECTED)
+        }
+        if (chargeGunConnected == true && batteryChargePower != null) {
+            return if (batteryChargePower >= CHARGING_POWER_THRESHOLD_KW) {
+                ChargingEvidence(true, ChargingEvidenceSource.PRIMARY_POWER)
+            } else {
+                ChargingEvidence(false, ChargingEvidenceSource.PRIMARY_LOW_POWER)
+            }
+        }
+        if (semanticState == CHARGING) {
+            return ChargingEvidence(true, ChargingEvidenceSource.SEMANTIC_FALLBACK)
+        }
+        if (semanticState != null) {
+            return ChargingEvidence(false, ChargingEvidenceSource.SEMANTIC_FALLBACK)
+        }
+        return ChargingEvidence(null, ChargingEvidenceSource.UNKNOWN)
+    }
+
+    private fun stopChargingSession(
+        nowMs: Long,
+        soc: Double?,
+        remainingEnergy: Double?,
+        batteryChargePower: Double?,
+        config: TelegramEventConfig,
+        events: MutableList<TelegramDetectedEvent>
+    ) {
+        val sessionId = state.chargingSessionId ?: return
+        addIfEnabled(
+            events, config, TelegramEventType.CHARGING_STOPPED, "$sessionId:stopped",
+            chargingVariables(nowMs, soc, remainingEnergy, batteryChargePower)
+        )
+        finishChargingSession(full = false)
+    }
+
+    private fun finishChargingSession(full: Boolean) {
+        state = state.copy(
+            chargingSessionId = null,
+            chargingStartedAtMs = null,
+            chargingStartSoc = null,
+            chargingStartEnergyKwh = null,
+            lastProgressThreshold = null,
+            fullCandidateCount = 0,
+            fullSent = full
+        )
+    }
+
+    private fun finalizePendingTrip(
+        config: TelegramEventConfig,
+        nowMs: Long,
+        events: MutableList<TelegramDetectedEvent>
+    ) {
+        val parkedSince = state.tripParkedSinceMs ?: return
+        val tripId = state.tripId ?: return
+        if (state.gear != PARK || nowMs < parkedSince + config.tripEndDelayMs) return
+        val tripStartOdometer = state.tripStartOdometerKm
+        val tripEndOdometer = state.tripEndOdometerKm
+        val distance = if (tripEndOdometer != null && tripStartOdometer != null) {
+            (tripEndOdometer - tripStartOdometer)
+                .takeIf { it >= 0.0 && it <= MAX_TRIP_DISTANCE_KM }
+        } else {
+            null
+        }
+        addIfEnabled(
+            events, config, TelegramEventType.TRIP_SUMMARY, "$tripId:summary",
+            mapOf(
+                "trip_distance_km" to formatNumber(distance),
+                "trip_energy_kwh" to formatNumber(state.tripEndEnergyKwh),
+                "trip_duration" to formatDuration(parkedSince - (state.tripStartedAtMs ?: parkedSince)),
+                "soc_start" to formatNumber(state.tripStartSoc),
+                "soc_end" to formatNumber(state.tripEndSoc),
+                "time" to formatTime(parkedSince)
+            )
+        )
+        clearTrip()
+    }
+
+    private fun updatePendingTripSnapshot(odometer: Double?, soc: Double?, tripEnergy: Double?) {
+        state = state.copy(
+            tripEndOdometerKm = odometer ?: state.tripEndOdometerKm,
+            tripEndSoc = soc ?: state.tripEndSoc,
+            tripEndEnergyKwh = tripEnergy ?: state.tripEndEnergyKwh
+        )
+    }
+
+    private fun clearPendingTrip() {
+        state = state.copy(
+            tripParkedSinceMs = null,
+            tripEndOdometerKm = null,
+            tripEndSoc = null,
+            tripEndEnergyKwh = null
+        )
+    }
+
+    private fun clearTrip() {
+        state = state.copy(
+            tripId = null,
+            tripStartedAtMs = null,
+            tripStartOdometerKm = null,
+            tripStartSoc = null,
+            tripParkedSinceMs = null,
+            tripEndOdometerKm = null,
+            tripEndSoc = null,
+            tripEndEnergyKwh = null
+        )
+    }
+
+    private fun startChargingSession(
+        nowMs: Long,
+        soc: Double?,
+        remainingEnergy: Double?,
+        chargeStepPercent: Int,
+        fullAlreadySent: Boolean = false
+    ) {
         val step = chargeStepPercent.coerceIn(1, 99)
         state = state.copy(
             chargingSessionId = UUID.randomUUID().toString(),
@@ -414,7 +619,7 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
             chargingStartEnergyKwh = remainingEnergy,
             lastProgressThreshold = soc?.let { (floor(it / step) * step).toInt() },
             fullCandidateCount = 0,
-            fullSent = false
+            fullSent = fullAlreadySent
         )
     }
 
@@ -424,7 +629,10 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
             tripStartedAtMs = nowMs,
             tripStartOdometerKm = odometer,
             tripStartSoc = soc,
-            tripParkedSinceMs = null
+            tripParkedSinceMs = null,
+            tripEndOdometerKm = null,
+            tripEndSoc = null,
+            tripEndEnergyKwh = null
         )
     }
 
@@ -460,10 +668,20 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         if (type in config.enabledEvents) events += TelegramDetectedEvent(type, dedupeKey, variables)
     }
 
-    private fun persistedResult(events: List<TelegramDetectedEvent>, nowMs: Long, force: Boolean): TelegramEventResult {
+    private fun persistedResult(
+        events: List<TelegramDetectedEvent>,
+        nowMs: Long,
+        force: Boolean,
+        config: TelegramEventConfig
+    ): TelegramEventResult {
         val persist = force || events.isNotEmpty()
         if (persist) state = state.copy(lastPersistedAtMs = nowMs)
-        return TelegramEventResult(state, events, persist)
+        return TelegramEventResult(state, events, persist, pendingTripDeadline(config))
+    }
+
+    private fun pendingTripDeadline(config: TelegramEventConfig): Long? {
+        if (state.tripId == null || state.gear != PARK) return null
+        return state.tripParkedSinceMs?.plus(config.tripEndDelayMs)
     }
 
     private fun Map<String, NormalizedObservation>.number(key: String): Double? = get(key)?.value?.number
@@ -475,10 +693,25 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         private const val PARK = "P"
         private const val CONFIRMATION_SAMPLES = 2
         private const val FULL_SOC_THRESHOLD = 99.5
+        private const val CHARGING_POWER_THRESHOLD_KW = 0.5
+        private const val CHARGING_LOW_POWER_CONFIRM_MS = 60_000L
         private const val LOW_VOLTAGE_CONFIRM_MS = 60_000L
         private const val LOW_VOLTAGE_HYSTERESIS = 0.3
         private const val STATE_HEARTBEAT_MS = 30_000L
         private const val MAX_TRIP_DISTANCE_KM = 2_000.0
+    }
+
+    private data class ChargingEvidence(
+        val active: Boolean?,
+        val source: ChargingEvidenceSource
+    )
+
+    private enum class ChargingEvidenceSource(val key: String) {
+        PRIMARY_POWER("primary_power"),
+        PRIMARY_LOW_POWER("primary_low_power"),
+        PRIMARY_DISCONNECTED("primary_disconnected"),
+        SEMANTIC_FALLBACK("semantic_fallback"),
+        UNKNOWN("unknown")
     }
 }
 

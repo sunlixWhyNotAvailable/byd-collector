@@ -111,17 +111,22 @@ class CollectorService : Service() {
     private var accessSelfCheckScheduled = false
     @Volatile private var lastTelegramPollError: String? = null
     private var telegramTickScheduled = false
+    private var telegramTickAtMs: Long? = null
     private val telegramTickTask = object : Runnable {
         override fun run() {
             telegramTickScheduled = false
-            if (!settings.isTelegramEnabled()) return
-            executeTelegram("telegram_tick_error") {
+            telegramTickAtMs = null
+            if (!running.get() || !settings.isTelegramEnabled() || maintenanceBlocksRuntimeStart()) return
+            scheduleTelegramTick()
+            executeTelegram(
+                "telegram_tick_error",
+                onSuccess = ::postTelegramTickSchedule
+            ) {
                 telegramCoordinator.tick(
                     mainCollectionExpected = settings.isPollingEnabled() && !settings.isMainManuallyStopped(),
                     lastError = lastTelegramPollError
                 )
             }
-            scheduleTelegramTick()
         }
     }
     private val accessSelfCheckTask = object : Runnable {
@@ -232,9 +237,8 @@ class CollectorService : Service() {
 
     override fun onDestroy() {
         mainHandler.removeCallbacks(accessSelfCheckTask)
-        mainHandler.removeCallbacks(telegramTickTask)
+        cancelTelegramTick()
         accessSelfCheckScheduled = false
-        telegramTickScheduled = false
         stopCollection("service_destroyed")
         keepAliveSupervisor.shutdown()
         debugStartExecutor.shutdownNow()
@@ -292,7 +296,10 @@ class CollectorService : Service() {
                         )
                         val summary = store.applyNormalizedObservations(observations)
                         if (settings.isTelegramEnabled()) {
-                            executeTelegram("telegram_event_error") {
+                            executeTelegram(
+                                "telegram_event_error",
+                                onSuccess = ::postTelegramTickSchedule
+                            ) {
                                 telegramCoordinator.onSuccessfulPoll(observations)
                             }
                         }
@@ -562,8 +569,7 @@ class CollectorService : Service() {
         settings.setDebugPollingEnabled(false)
         settings.setMqttEnabled(false)
         settings.setInfluxEnabled(false)
-        mainHandler.removeCallbacks(telegramTickTask)
-        telegramTickScheduled = false
+        cancelTelegramTick()
         resetTelegramExecutorForMaintenance()
         store.recordEvent(
             "user_shutdown_deferred_for_maintenance",
@@ -584,8 +590,7 @@ class CollectorService : Service() {
         disconnectOfflineAsync()
         runCatching { influxCoordinator.stopExport() }
         resetInfluxExecutorForMaintenance()
-        mainHandler.removeCallbacks(telegramTickTask)
-        telegramTickScheduled = false
+        cancelTelegramTick()
         resetTelegramExecutorForMaintenance()
     }
 
@@ -711,8 +716,7 @@ class CollectorService : Service() {
         mqttRuntimeActive.set(false)
         mqttOfflineQueued.set(false)
         mqttCoordinator.disconnectForMaintenance()
-        mainHandler.removeCallbacks(telegramTickTask)
-        telegramTickScheduled = false
+        cancelTelegramTick()
         resetMqttExecutorForMaintenance()
         resetInfluxExecutorForMaintenance()
         resetTelegramExecutorForMaintenance(requireStopped = true)
@@ -912,8 +916,7 @@ class CollectorService : Service() {
     private fun reconcileTelegramRuntime(unblockBlocked: Boolean = false) {
         if (maintenanceBlocksRuntimeStart()) return
         if (!settings.isTelegramEnabled()) {
-            mainHandler.removeCallbacks(telegramTickTask)
-            telegramTickScheduled = false
+            cancelTelegramTick()
             executeTelegram("telegram_reset_error") {
                 telegramCoordinator.integrationDisabled()
             }
@@ -921,7 +924,10 @@ class CollectorService : Service() {
             return
         }
         ensureForegroundForChannel("Telegram notifications enabled")
-        executeTelegram("telegram_start_error") {
+        executeTelegram(
+            "telegram_start_error",
+            onSuccess = ::postTelegramTickSchedule
+        ) {
             if (unblockBlocked) telegramCoordinator.credentialsChanged()
             telegramCoordinator.tick(
                 mainCollectionExpected = settings.isPollingEnabled() && !settings.isMainManuallyStopped(),
@@ -940,10 +946,29 @@ class CollectorService : Service() {
         }
     }
 
-    private fun scheduleTelegramTick() {
-        if (telegramTickScheduled || !settings.isTelegramEnabled()) return
+    private fun scheduleTelegramTick(deadlineAtMs: Long? = null) {
+        if (!running.get() || !settings.isTelegramEnabled() || maintenanceBlocksRuntimeStart()) return
+        val nowMs = System.currentTimeMillis()
+        val regularAtMs = nowMs + TELEGRAM_TICK_INTERVAL_MS
+        val targetAtMs = deadlineAtMs?.let { minOf(it, regularAtMs) } ?: regularAtMs
+        if (telegramTickScheduled && telegramTickAtMs?.let { it <= targetAtMs } == true) return
+        if (telegramTickScheduled) mainHandler.removeCallbacks(telegramTickTask)
         telegramTickScheduled = true
-        mainHandler.postDelayed(telegramTickTask, TELEGRAM_TICK_INTERVAL_MS)
+        telegramTickAtMs = targetAtMs
+        mainHandler.postDelayed(telegramTickTask, (targetAtMs - nowMs).coerceAtLeast(0L))
+    }
+
+    private fun postTelegramTickSchedule(deadlineAtMs: Long?, submittedGeneration: Long) {
+        mainHandler.post {
+            if (submittedGeneration != telegramWorkGeneration.get()) return@post
+            scheduleTelegramTick(deadlineAtMs)
+        }
+    }
+
+    private fun cancelTelegramTick() {
+        mainHandler.removeCallbacks(telegramTickTask)
+        telegramTickScheduled = false
+        telegramTickAtMs = null
     }
 
     private fun stopIfNoActiveRuntime() {
@@ -1101,13 +1126,19 @@ class CollectorService : Service() {
         ChannelActionStatus(result.ok, result.category, result.message)
     }
 
-    private fun executeTelegram(errorCategory: String, action: () -> Unit) = executeChannel(
+    private fun <T> executeTelegram(
+        errorCategory: String,
+        onSuccess: ((T, Long) -> Unit)? = null,
+        action: () -> T
+    ) = executeChannel(
         channelName = "Telegram",
         errorCategory = errorCategory,
         executorLock = telegramExecutorLock,
         executor = { telegramExecutor },
         generation = telegramWorkGeneration,
-        action = action
+        canExecute = { !maintenanceBlocksRuntimeStart() },
+        action = action,
+        onSuccess = onSuccess
     ) {
         ChannelActionStatus(true, "ok", "ok")
     }
@@ -1119,8 +1150,10 @@ class CollectorService : Service() {
         executor: () -> ExecutorService,
         generation: AtomicLong,
         lowPriority: Boolean = false,
+        canExecute: () -> Boolean = { true },
         action: () -> T,
         onFailedAction: (() -> Unit)? = null,
+        onSuccess: ((T, Long) -> Unit)? = null,
         status: (T) -> ChannelActionStatus
     ) {
         val submittedGeneration = generation.get()
@@ -1129,18 +1162,21 @@ class CollectorService : Service() {
             selectedExecutor.execute {
                 if (lowPriority) Thread.currentThread().priority = Thread.MIN_PRIORITY
                 //drops stale work submitted before a channel executor reset
-                if (submittedGeneration != generation.get()) return@execute
+                if (submittedGeneration != generation.get() || !canExecute()) return@execute
                 runCatching { action() }
                     .onSuccess { result ->
                         val state = status(result)
                         if (!state.ok) {
                             store.recordEvent(
-                            errorCategory,
-                            "$channelName async action failed",
-                            "${state.category}: ${state.message}"
-                        )
-                        onFailedAction?.invoke()
-                    }
+                                errorCategory,
+                                "$channelName async action failed",
+                                "${state.category}: ${state.message}"
+                            )
+                            onFailedAction?.invoke()
+                        }
+                        if (submittedGeneration == generation.get()) {
+                            onSuccess?.invoke(result, submittedGeneration)
+                        }
                     }
                     .onFailure { error ->
                         store.recordEvent(

@@ -1772,7 +1772,12 @@ private fun StorageTab(
                     ArchiveStorageInlineStatus(strings, it)
                 }
                 if (entries.isEmpty()) {
-                    Text(strings.archiveStorageEmpty, color = LocalBydPalette.current.muted, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        if (state?.archiveStorageScanPending == true) strings.archiveStorageScanning else strings.archiveStorageEmpty,
+                        color = LocalBydPalette.current.muted,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
                 } else {
                     sortedEntries.forEach { entry ->
                         ArchiveEntryRow(

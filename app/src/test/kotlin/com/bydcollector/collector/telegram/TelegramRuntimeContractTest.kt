@@ -19,6 +19,41 @@ class TelegramRuntimeContractTest {
         assertTrue(coordinator.contains("telegramTripEndDelaySeconds() * 1_000L"))
     }
 
+    @Test
+    fun pendingTripDeadlineReschedulesTheExistingTelegramTick() {
+        val engine = sourceFile("com/bydcollector/collector/service/TelegramEventEngine.kt").readText()
+        val coordinator = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val schedule = service.substringAfter("private fun scheduleTelegramTick")
+            .substringBefore("private fun cancelTelegramTick")
+        val tickTask = service.substringAfter("private val telegramTickTask")
+            .substringBefore("private val accessSelfCheckTask")
+        val postSchedule = service.substringAfter("private fun postTelegramTickSchedule")
+            .substringBefore("private fun cancelTelegramTick")
+        val executeTelegram = service.substringAfter("private fun <T> executeTelegram")
+            .substringBefore("private fun <T> executeChannel")
+        val executeChannel = service.substringAfter("private fun <T> executeChannel")
+            .substringBefore("private data class ChannelActionStatus")
+
+        assertInOrder(engine, "finalizePendingTrip(config, nowMs, events)", "if (!mainCollectionExpected)")
+        assertTrue(engine.contains("nextWakeAtMs: Long?"))
+        assertTrue(engine.contains("pendingTripDeadline(config)"))
+        assertTrue(coordinator.contains("fun onSuccessfulPoll(observations: List<NormalizedObservation>): Long?"))
+        assertTrue(coordinator.contains("fun tick(mainCollectionExpected: Boolean, lastError: String?): Long?"))
+        assertTrue(coordinator.contains("return result.nextWakeAtMs"))
+        assertTrue(service.contains("private fun scheduleTelegramTick(deadlineAtMs: Long? = null)"))
+        assertTrue(schedule.contains("maintenanceBlocksRuntimeStart()"))
+        assertTrue(tickTask.contains("maintenanceBlocksRuntimeStart()"))
+        assertTrue(schedule.contains("minOf(it, regularAtMs)"))
+        assertTrue(service.contains("scheduleTelegramTick(deadlineAtMs)"))
+        assertTrue(schedule.contains("telegramTickAtMs?.let { it <= targetAtMs }"))
+        assertTrue(executeTelegram.contains("canExecute = { !maintenanceBlocksRuntimeStart() }"))
+        assertInOrder(executeChannel, "!canExecute()", "action()")
+        assertInOrder(postSchedule, "mainHandler.post", "submittedGeneration != telegramWorkGeneration.get()")
+        assertInOrder(postSchedule, "submittedGeneration != telegramWorkGeneration.get()", "scheduleTelegramTick(deadlineAtMs)")
+        assertInOrder(executeChannel, "submittedGeneration != generation.get()", "submittedGeneration == generation.get()")
+    }
+
     private fun sourceFile(path: String): File {
         return listOf(
             File("src/main/kotlin/$path"),

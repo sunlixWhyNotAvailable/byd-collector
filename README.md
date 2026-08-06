@@ -51,7 +51,8 @@ When enabled, the built-in Tailscale policy reacts to an unreachable configured 
 
 Telegram integration is optional and disabled by default. Each supported event is also disabled independently until selected by the user.
 The app sends plain text through the Telegram Bot API only; it does not accept Telegram commands, register webhooks, poll updates, or send media.
-Trip summaries default to 10 seconds after parking and can be configured from 5 to 300 seconds. Starting a new trip discards undelivered summaries from earlier trips so delayed messages do not arrive during the next drive.
+Charging notifications use a connected charge gun plus positive charging power as the primary signal, with the vehicle charging-state field used only when that primary data is incomplete.
+Trip summaries default to 10 seconds after parking and can be configured from 5 to 300 seconds. The parked snapshot is persisted and finalized at that deadline even when no later telemetry poll succeeds; an overdue snapshot is finalized after process recovery. Starting a new trip discards undelivered summaries from earlier trips so delayed messages do not arrive during the next drive.
 
 ## Tested
 

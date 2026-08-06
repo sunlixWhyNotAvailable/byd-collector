@@ -18,8 +18,9 @@ class TelegramCoordinator(
 ) {
     private val engine = TelegramEventEngine(TelegramEventState.fromJson(store.telegramRuntimeState()))
 
-    fun onSuccessfulPoll(observations: List<NormalizedObservation>) {
+    fun onSuccessfulPoll(observations: List<NormalizedObservation>): Long? {
         val previousTripId = engine.state.tripId
+        val previousChargingActive = engine.state.chargingActive
         val result = engine.onSuccessfulPoll(observations, eventConfig(), nowMs())
         if (result.state.tripId != null && result.state.tripId != previousTripId) {
             val deleted = store.deleteUndeliveredTelegramMessages(TelegramEventType.TRIP_SUMMARY.key)
@@ -32,9 +33,17 @@ class TelegramCoordinator(
             }
         }
         handle(result)
+        if (result.state.chargingActive != previousChargingActive) {
+            store.recordEvent(
+                "telegram_charging_transition",
+                "Telegram charging evidence changed",
+                "active=${result.state.chargingActive ?: "unknown"} source=${result.state.chargingEvidenceSource ?: "unknown"}"
+            )
+        }
+        return result.nextWakeAtMs
     }
 
-    fun tick(mainCollectionExpected: Boolean, lastError: String?) {
+    fun tick(mainCollectionExpected: Boolean, lastError: String?): Long? {
         val expired = store.pruneTelegramMessages(nowMs())
         if (expired > 0) {
             store.recordEvent(
@@ -43,8 +52,10 @@ class TelegramCoordinator(
                 "expired=$expired overflow=0"
             )
         }
-        handle(engine.onTick(eventConfig(), mainCollectionExpected, lastError, nowMs()))
+        val result = engine.onTick(eventConfig(), mainCollectionExpected, lastError, nowMs())
+        handle(result)
         flushPending()
+        return result.nextWakeAtMs
     }
 
     fun testConnection(): TelegramSendResult {
@@ -138,6 +149,13 @@ class TelegramCoordinator(
             return
         }
         val queued = store.enqueueTelegramMessage(event.dedupeKey, event.type.key, payload, nowMs())
+        if (queued.inserted) {
+            store.recordEvent(
+                "telegram_event_queued",
+                "Telegram event queued",
+                "event=${event.type.key}"
+            )
+        }
         if (queued.expiredCount > 0 || queued.overflowCount > 0) {
             store.recordEvent(
                 "telegram_outbox_pruned",

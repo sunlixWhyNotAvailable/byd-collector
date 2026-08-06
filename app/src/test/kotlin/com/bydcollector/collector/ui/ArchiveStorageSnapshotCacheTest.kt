@@ -14,6 +14,7 @@ class ArchiveStorageSnapshotCacheTest {
         val active = root.resolve("bydcollector_telemetry.db").apply { writeText("active") }
         val debug = root.resolve("bydcollector_debug_round_robin.db").apply { writeText("debug") }
         val archiveRoot = root.resolve("db_archive").apply { mkdirs() }
+        archiveRoot.resolve("bydcollector_telemetry_20260806_120000.zip").writeText("archive")
         var now = 1_000L
         var scans = 0
         val requestedLimits = mutableListOf<Long>()
@@ -45,12 +46,14 @@ class ArchiveStorageSnapshotCacheTest {
         assertEquals(1, scans)
         assertFalse(cached.pending)
         assertEquals(3L * 1024 * 1024 * 1024, cached.snapshot.archiveLimitBytes)
+        assertEquals(1, cached.snapshot.entries.size)
 
         now += 31_000L
         val stale = cache.snapshot(limitBytes = 3L * 1024 * 1024 * 1024, includeDetails = true)
         assertEquals(2, scans)
         assertEquals(listOf(2L * 1024 * 1024 * 1024, 3L * 1024 * 1024 * 1024), requestedLimits)
         assertTrue(stale.pending)
+        assertEquals(cached.snapshot.entries, stale.snapshot.entries)
     }
 
     @Test
