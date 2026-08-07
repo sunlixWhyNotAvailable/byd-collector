@@ -10,7 +10,6 @@ import com.bydcollector.collector.util.namedSingleThreadExecutor
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.min
 
 //cycles through non-main direct parameters so debug discovery can progress without one huge poll
 class DirectDebugRoundRobinCursor(
@@ -20,12 +19,11 @@ class DirectDebugRoundRobinCursor(
 
     fun nextBatch(requestedCount: Int): List<DirectDebugParameter> {
         if (parameters.isEmpty()) return emptyList()
-        val count = min(requestedCount.coerceAtLeast(1), parameters.size)
-        return List(count) {
-            val parameter = parameters[nextIndex]
-            nextIndex = (nextIndex + 1) % parameters.size
-            parameter
-        }
+        val count = requestedCount.coerceAtLeast(1).coerceAtMost(parameters.size - nextIndex)
+        val batch = parameters.subList(nextIndex, nextIndex + count)
+        nextIndex += count
+        if (nextIndex == parameters.size) nextIndex = 0
+        return batch
     }
 }
 

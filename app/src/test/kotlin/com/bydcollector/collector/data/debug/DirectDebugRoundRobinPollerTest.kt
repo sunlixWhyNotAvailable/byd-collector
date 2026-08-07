@@ -1,6 +1,7 @@
 package com.bydcollector.collector.data.debug
 
 import java.io.File
+import java.security.MessageDigest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -9,7 +10,7 @@ import kotlin.test.assertTrue
 
 class DirectDebugRoundRobinPollerTest {
     @Test
-    fun cursorWrapsRequestedBatchSizeAcrossFullCycle() {
+    fun cursorEndsAtCatalogTailWithoutWrappingInsideBatch() {
         val parameters = (1..12).map { index ->
             DirectDebugParameter(
                 key = "p$index",
@@ -26,9 +27,9 @@ class DirectDebugRoundRobinPollerTest {
 
         assertEquals((1..5).map { "p$it" }, cursor.nextBatch(5).map { it.key })
         assertEquals((6..10).map { "p$it" }, cursor.nextBatch(5).map { it.key })
-        assertEquals(listOf("p11", "p12", "p1", "p2", "p3"), cursor.nextBatch(5).map { it.key })
-        assertEquals((4..12).map { "p$it" } + (1..3).map { "p$it" }, cursor.nextBatch(20).map { it.key })
-        assertEquals(listOf("p4"), cursor.nextBatch(0).map { it.key })
+        assertEquals(listOf("p11", "p12"), cursor.nextBatch(5).map { it.key })
+        assertEquals((1..12).map { "p$it" }, cursor.nextBatch(20).map { it.key })
+        assertEquals(listOf("p1"), cursor.nextBatch(0).map { it.key })
     }
 
     @Test
@@ -72,8 +73,8 @@ class DirectDebugRoundRobinPollerTest {
     @Test
     fun assetParserReadsCsvRows() {
         val csv = """
-            key,feature_group,dev,fid,tx,feature_names,feature_refs,candidate_source,source_read_count,source_write_count,source_change_count,seed_last_status,seed_last_raw_present,seed_last_raw_int,seed_last_error,raw_sample,float_sample
-            ac_1000_1_5,AC,1000,1,5,Ac.TEST,Ac.TEST,unit,1,0,0,0,1,7,,,
+            key,feature_group,dev,fid,tx,feature_names,feature_refs,candidate_source
+            ac_1000_1_5,AC,1000,1,5,Ac.TEST,Ac.TEST,unit
         """.trimIndent()
 
         val rows = DirectDebugParameterAsset.parse(csv)
@@ -91,8 +92,8 @@ class DirectDebugRoundRobinPollerTest {
             ac_1000_1_5,AC,1000,1,Ac.TEST,Ac.TEST,unit
         """.trimIndent()
         val writeTx = """
-            key,feature_group,dev,fid,tx,feature_names,feature_refs,candidate_source,source_read_count,source_write_count,source_change_count,seed_last_status,seed_last_raw_present,seed_last_raw_int,seed_last_error,raw_sample,float_sample
-            ac_1000_1_8,AC,1000,1,8,Ac.TEST,Ac.TEST,unit,1,0,0,0,1,7,,,
+            key,feature_group,dev,fid,tx,feature_names,feature_refs,candidate_source
+            ac_1000_1_8,AC,1000,1,8,Ac.TEST,Ac.TEST,unit
         """.trimIndent()
 
         assertFailsWith<IllegalArgumentException> {
@@ -117,43 +118,44 @@ class DirectDebugRoundRobinPollerTest {
 
     @Test
     fun assetParserReadsGeneratedDebugAssetRows() {
-        val asset = listOf(
-            File("src/main/assets/${DirectDebugParameterAsset.ASSET_NAME}"),
-            File("app/src/main/assets/${DirectDebugParameterAsset.ASSET_NAME}")
-        ).firstOrNull { it.isFile } ?: error("Missing ${DirectDebugParameterAsset.ASSET_NAME}")
+        val assets = debugAssetFiles()
+        val shards = assets.map { DirectDebugParameterAsset.parse(it.readText(Charsets.UTF_8)) }
+        val rows = shards.flatten()
 
-        val rows = DirectDebugParameterAsset.parse(asset.readText(Charsets.UTF_8))
-
-        assertEquals("wide-poll-session-20260605_161751-curated-main81-roundrobin6432-energy-soc-v1", DirectDebugParameterAsset.SOURCE_VERSION)
-        assertEquals(6432, rows.size)
-        assertTrue(rows.size <= com.bydcollector.collector.direct.CollectorHelperProtocol.MAX_BATCH_SIZE)
-        assertTrue(rows.none { it.key == "statistic_1014_1145045040_5" })
-        assertTrue(rows.none { it.key == "charging_charge_current" })
-        assertTrue(rows.any { it.key == "charging_charging_charge_current_not_convert" })
-        assertTrue(rows.any { it.key == "charging_1009_842006544_5" })
-        assertTrue(rows.any { it.key == "power_low_voltage" })
-        assertTrue(rows.none { it.key == "statistic_remaining_battery_power" })
-        assertTrue(rows.none { it.key == "power_battery_remain_electricity" })
-        assertTrue(rows.none { it.key == "statistic_statistic_this_trip_total_elec_consumption" })
-        assertTrue(rows.none { it.key == "statistic_total_elec_consumption" })
-        assertTrue(rows.any { it.key == "statistic_1014_877658152_5" })
-        assertEquals(
-            DirectDebugParameterAsset.EXPECTED_HEADER,
-            asset.useLines(Charsets.UTF_8) { it.first().split(",") }
-        )
+        assertEquals("fid-catalog-20260804-6e29ad30-main81-roundrobin23096-both-read-tx-v1", DirectDebugParameterAsset.SOURCE_VERSION)
+        assertEquals(listOf(7_699, 7_699, 7_698), shards.map { it.size })
+        assertEquals(23_096, rows.size)
+        assertEquals(7_699, DirectDebugParameterAsset.MAX_SHARD_SIZE)
+        assertTrue(shards.all { it.size <= com.bydcollector.collector.direct.CollectorHelperProtocol.MAX_BATCH_SIZE })
+        assets.forEach { asset ->
+            assertEquals(DirectDebugParameterAsset.EXPECTED_HEADER, asset.useLines(Charsets.UTF_8) { it.first().split(",") })
+        }
         assertEquals(rows.size, rows.map { it.key }.distinct().size)
         assertEquals(rows.size, rows.map { Triple(it.dev, it.fid, it.tx) }.distinct().size)
         assertTrue(rows.all { it.tx == 5 || it.tx == 7 })
+
+        val dumpRows = rows.filter { it.candidateSource == "fid_catalog_20260804_6e29ad30" }
+        val aliasesByPair = dumpRows.groupBy { it.dev to it.fid }.values.map { it.first().featureNames.split(";") }
+        assertEquals(11_582, aliasesByPair.size)
+        assertEquals(54, aliasesByPair.count { it.size > 1 })
+        assertEquals(3, aliasesByPair.maxOf { it.size })
+        assertTrue(aliasesByPair.any { aliases -> aliases.any { it.endsWith("_SET") } })
+        assertEquals(13, rows.count { it.candidateSource == "live_reflection_device_map" })
+
+        assertEquals(
+            listOf(
+                "7A448F762B52976501FBFFEEBEA8EAEADC443A5C5E3B476B84E8F61C37BD149A",
+                "0A95E822EA78502EBC98B20361502E8D43E596B3E683A0E0F8AC266AC2B06CB1",
+                "265A61C5098528D504BF2C08389E0D10CFB62BAED7B6CDE6E8ECFD27430DC132"
+            ),
+            assets.map(::sha256)
+        )
     }
 
     @Test
     fun generatedDebugAssetDoesNotOverlapMainDirectRegistry() {
-        val asset = listOf(
-            File("src/main/assets/${DirectDebugParameterAsset.ASSET_NAME}"),
-            File("app/src/main/assets/${DirectDebugParameterAsset.ASSET_NAME}")
-        ).firstOrNull { it.isFile } ?: error("Missing ${DirectDebugParameterAsset.ASSET_NAME}")
-
-        val debugSignatures = DirectDebugParameterAsset.parse(asset.readText(Charsets.UTF_8))
+        val rows = debugAssetFiles().flatMap { DirectDebugParameterAsset.parse(it.readText(Charsets.UTF_8)) }
+        val debugSignatures = rows
             .map { Triple(it.dev, it.fid, it.tx) }
         assertEquals(debugSignatures.size, debugSignatures.distinct().size)
         val prodSignatures = com.bydcollector.collector.data.direct.DirectFidRegistry.entries
@@ -161,7 +163,36 @@ class DirectDebugRoundRobinPollerTest {
         assertEquals(prodSignatures.size, prodSignatures.distinct().size)
 
         assertEquals(emptySet(), prodSignatures.toSet().intersect(debugSignatures.toSet()))
+
+        val allReadTxByDumpPair = (rows.filter { it.candidateSource == "fid_catalog_20260804_6e29ad30" }
+            .map { Triple(it.dev, it.fid, it.tx) } + prodSignatures)
+            .groupBy { it.first to it.second }
+            .mapValues { (_, signatures) -> signatures.map { it.third }.toSet() }
+        assertTrue(allReadTxByDumpPair.values.all { it == setOf(5, 7) })
     }
+
+    @Test
+    fun generatedShardsHaveExactCursorCoverage() {
+        val rows = debugAssetFiles().flatMap { DirectDebugParameterAsset.parse(it.readText(Charsets.UTF_8)) }
+        val cursor = DirectDebugRoundRobinCursor(rows)
+        val batches = List(DirectDebugParameterAsset.SHARD_COUNT) {
+            cursor.nextBatch(DirectDebugParameterAsset.MAX_SHARD_SIZE)
+        }
+
+        assertEquals(DirectDebugParameterAsset.EXPECTED_SHARD_SIZES, batches.map { it.size })
+        assertEquals(rows.map { it.key }, batches.flatten().map { it.key })
+        assertEquals(rows.size, batches.flatten().map { Triple(it.dev, it.fid, it.tx) }.distinct().size)
+        assertEquals(batches.first().map { it.key }, cursor.nextBatch(DirectDebugParameterAsset.MAX_SHARD_SIZE).map { it.key })
+    }
+
+    private fun debugAssetFiles(): List<File> = DirectDebugParameterAsset.ASSET_NAMES.map { name ->
+        listOf(File("src/main/assets/$name"), File("app/src/main/assets/$name"))
+            .firstOrNull { it.isFile } ?: error("Missing debug asset: $name")
+    }
+
+    private fun sha256(file: File): String = MessageDigest.getInstance("SHA-256")
+        .digest(file.readBytes())
+        .joinToString("") { "%02X".format(it) }
 
     private fun sourceFile(path: String): File {
         return listOf(

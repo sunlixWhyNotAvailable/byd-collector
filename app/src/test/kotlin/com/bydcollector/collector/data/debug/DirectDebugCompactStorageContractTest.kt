@@ -58,6 +58,20 @@ class DirectDebugCompactStorageContractTest {
     }
 
     @Test
+    fun sourceVersionChangeReconcilesMetadataAndKeepsTransitionOnlyState() {
+        val source = sourceFile("DirectDebugStore.kt").readText()
+
+        assertTrue(source.contains("put(\"feature_names\", parameter.featureNames)"))
+        assertTrue(source.contains("put(\"feature_refs\", parameter.featureRefs)"))
+        assertTrue(source.contains("ensureCandidates(db, parameters, sourceVersionChanged)"))
+        assertTrue(source.contains("existingId != null && reconcileMetadata"))
+        assertTrue(source.contains("db.update(\"debug_direct_candidates\", values, \"id = ?\""))
+        assertTrue(source.contains("WHERE catalog_version_id = ?"))
+        assertTrue(source.contains("if (previous == null) return \"initial\""))
+        assertFalse(source.contains("UPDATE debug_direct_candidate_state SET catalog_version_id"))
+    }
+
+    @Test
     fun legacyDatabaseRemainsInspectableButPollingFailsClosed() {
         val helper = sourceFile("DirectDebugDatabaseHelper.kt").readText()
         val store = sourceFile("DirectDebugStore.kt").readText()

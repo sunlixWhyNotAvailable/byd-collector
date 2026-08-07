@@ -6,11 +6,11 @@ import kotlin.test.assertTrue
 
 class CollectorServiceDebugPollerContractTest {
     @Test
-    fun debugPollerAlwaysUsesTheCompleteAssetCatalog() {
+    fun debugPollerUsesTheMaximumPackagedShardSize() {
         val source = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
         val start = source.substringAfter("private fun startDebugIfNeeded").substringBefore("private fun handleStartFailure")
 
-        assertTrue(start.contains("val batchSize = parameters.size"))
+        assertTrue(start.contains("val batchSize = DirectDebugParameterAsset.MAX_SHARD_SIZE"))
         assertTrue(!start.contains("debugBatchSize"))
         assertTrue(!start.contains("debugAutostartBatchSize"))
     }

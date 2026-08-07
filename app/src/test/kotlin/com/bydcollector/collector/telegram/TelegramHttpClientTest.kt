@@ -15,6 +15,71 @@ import kotlin.test.assertTrue
 
 class TelegramHttpClientTest {
     @Test
+    fun getMeUsesAuthenticatedNonMessageRequestAndReportsSanitizedEvidence() {
+        val connection = FakeConnection(200, """{"ok":true,"result":{"id":1,"username":"private"}}""")
+        var openedUrl: URL? = null
+        var evidence: TelegramRequestEvidence? = null
+        var elapsedMs = 2_000L
+        val client = TelegramHttpClient(
+            epochMs = { 1_000L },
+            elapsedRealtimeMs = { elapsedMs++ },
+            requestObserver = { evidence = it },
+            connectionFactory = { url ->
+                openedUrl = url
+                connection
+            }
+        )
+
+        val result = client.getMe("123:secret")
+
+        assertEquals(TelegramSendResult.Success, result)
+        assertEquals("https://api.telegram.org/bot123:secret/getMe", openedUrl.toString())
+        assertEquals("GET", connection.requestMethod)
+        assertEquals(0, connection.sentBody.size())
+        assertEquals("getMe", evidence?.operation)
+        assertEquals(200, evidence?.httpStatus)
+        assertEquals(true, evidence?.networkReached)
+        assertEquals(true, evidence?.authenticated)
+        assertFalse(evidence.toString().contains("secret"))
+        assertFalse(evidence.toString().contains("private"))
+    }
+
+    @Test
+    fun locallyRejectedTokenDoesNotCountAsNetworkRequest() {
+        var requests = 0
+        val failure = assertIs<TelegramSendResult.Failure>(
+            TelegramHttpClient(
+                requestObserver = { requests += 1 },
+                connectionFactory = { error("must not open") }
+            ).getMe("bad token")
+        )
+
+        assertEquals(TelegramSendFailureKind.CONFIGURATION, failure.kind)
+        assertEquals(0, requests)
+    }
+
+    @Test
+    fun getMeAuthenticatesOnlyAParsedOkResponse() {
+        listOf(
+            200 to "not json",
+            200 to """{"ok":false,"error_code":400}""",
+            403 to """{"ok":false,"error_code":403}""",
+            429 to """{"ok":false,"error_code":429}""",
+            500 to """{"ok":false,"error_code":500}"""
+        ).forEach { (status, body) ->
+            var evidence: TelegramRequestEvidence? = null
+            val result = TelegramHttpClient(
+                requestObserver = { evidence = it },
+                connectionFactory = { FakeConnection(status, body) }
+            ).getMe("123:secret")
+
+            assertIs<TelegramSendResult.Failure>(result)
+            assertEquals(true, evidence?.networkReached, "status=$status body=$body")
+            assertEquals(false, evidence?.authenticated, "status=$status body=$body")
+        }
+    }
+
+    @Test
     fun sendsUtf8FormWithoutParseMode() {
         val connection = FakeConnection(200, """{"ok":true,"result":{"message_id":1}}""")
         var openedUrl: URL? = null

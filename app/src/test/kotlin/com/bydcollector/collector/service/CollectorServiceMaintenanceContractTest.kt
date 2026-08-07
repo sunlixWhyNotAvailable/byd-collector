@@ -15,9 +15,19 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(stop.contains("if (!poller.stopAndJoin(2_000L)) error("))
         assertTrue(stop.contains("detachDebugPoller()?.shutdownAndAwait(\"database_maintenance\", 2_000L) == false"))
         assertTrue(stop.contains("error(\"Debug poller did not stop for database maintenance\")"))
-        assertTrue(stop.contains("resetTelegramExecutorForMaintenance(requireStopped = true)"))
+        assertTrue(stop.contains("resetTelegramExecutorForMaintenance()"))
+        assertTrue(stop.contains("resetInfluxExecutorForMaintenance()"))
+        assertTrue(source.contains("previous.awaitTermination(INFLUX_MAINTENANCE_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)"))
+        assertTrue(source.contains("if (!stopped) maintenanceRuntimeRestoreAllowed.set(false)"))
         assertTrue(source.contains("previous.awaitTermination(TELEGRAM_MAINTENANCE_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)"))
         assertTrue(source.contains("check(stopped) { \"Telegram worker did not stop before database maintenance\" }"))
+        assertInOrder(
+            source.substringAfter("private fun resetTelegramExecutorForMaintenance")
+                .substringBefore("private fun shutdownTelegramExecutorForUserShutdown"),
+            "previous.awaitTermination(TELEGRAM_MAINTENANCE_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)",
+            "check(stopped)",
+            "telegramExecutor = namedSingleThreadExecutor(\"byd-telegram\")"
+        )
         assertFalse(stop.contains("settings.setPollingEnabled(false)"))
         assertFalse(stop.contains("settings.setDebugPollingEnabled(false)"))
         assertFalse(stop.contains("settings.setMqttEnabled(false)"))
@@ -38,6 +48,32 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(source.contains("action != ACTION_CANCEL_DATABASE_MAINTENANCE"))
         assertTrue(source.contains("private fun maintenanceBlocksRuntimeStart(debugRuntime: Boolean = false): Boolean"))
         assertTrue(source.contains("activeMaintenanceOperation == DbMaintenanceOperation.ARCHIVE"))
+    }
+
+    @Test
+    fun influxStopSerializesOnTheCurrentWorkerAndMaintenancePublishesReplacementOnlyAfterTermination() {
+        val source = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val stop = source.substringAfter("private fun stopInfluxExport").substringBefore("private fun reconcileTelegramRuntime")
+        val reset = source.substringAfter("private fun resetInfluxExecutorForMaintenance")
+            .substringBefore("private fun startDatabaseMaintenance")
+        val maintenance = source.substringAfter("private fun startDatabaseMaintenance")
+            .substringBefore("private fun resetTelegramExecutorForMaintenance")
+
+        assertTrue(stop.contains("queueInfluxStop(stopServiceWhenIdle = true)"))
+        assertTrue(stop.contains("executeInflux(\"influx_stop_error\""))
+        assertFalse(stop.contains("resetInfluxExecutorForMaintenance()"))
+        assertTrue(source.contains("canExecute = { !maintenanceBlocksRuntimeStart() }"))
+        assertInOrder(stop, "influxCoordinator.stopExport()", "mainHandler.post { stopIfNoActiveRuntime() }")
+        assertInOrder(
+            reset,
+            "influxWorkGeneration.incrementAndGet()",
+            "previous.awaitTermination(INFLUX_MAINTENANCE_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)",
+            "check(stopped)",
+            "influxExecutor = namedSingleThreadExecutor(\"byd-influx\")"
+        )
+        assertTrue(maintenance.contains("maintenanceRuntimeRestoreAllowed.set(true)"))
+        assertTrue(maintenance.contains("if (maintenanceRuntimeRestoreAllowed.get()) restoreAfterMaintenance = true"))
+        assertTrue(maintenance.contains("if (restoreAfterMaintenance && maintenanceRuntimeRestoreAllowed.get())"))
     }
 
     @Test
@@ -196,7 +232,7 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(service.contains("snapshot.debugRunning &&"))
         assertTrue(service.contains("maintenanceBlocksRuntimeStart(debugRuntime = true)"))
         assertTrue(service.contains("activeMaintenanceOperation != DbMaintenanceOperation.DEBUG_ARCHIVE || debugRuntime"))
-        assertInOrder(service, "maintenanceActive.set(false)", "if (restoreAfterMaintenance)")
+        assertInOrder(service, "maintenanceActive.set(false)", "if (restoreAfterMaintenance && maintenanceRuntimeRestoreAllowed.get())")
         assertInOrder(
             "$run\n$archiveDebug",
             "stopRuntime(operation)",

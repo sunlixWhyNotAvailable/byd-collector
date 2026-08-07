@@ -103,8 +103,8 @@ class DirectDebugStore(
         }
         db.beginTransaction()
         try {
-            val catalogVersionId = ensureCatalogVersion(db)
-            ensureCandidates(db, parameters)
+            val (catalogVersionId, sourceVersionChanged) = ensureCatalogVersion(db)
+            ensureCandidates(db, parameters, sourceVersionChanged)
             loadCandidateState(db, catalogVersionId)
             val sessionId = db.insertOrThrow(
                 "debug_direct_sessions",
@@ -281,23 +281,27 @@ class DirectDebugStore(
 
     fun isCompactV2(): Boolean = DirectDebugDatabaseHelper.isCompactV2(helper.readableDatabase)
 
-    private fun ensureCatalogVersion(db: SQLiteDatabase): Long {
-        db.insertWithOnConflict(
+    private fun ensureCatalogVersion(db: SQLiteDatabase): Pair<Long, Boolean> {
+        val sourceVersionChanged = db.insertWithOnConflict(
             "debug_direct_catalog_versions",
             null,
             ContentValues().apply { put("source_version", DirectDebugParameterAsset.SOURCE_VERSION) },
             SQLiteDatabase.CONFLICT_IGNORE
-        )
+        ) != -1L
         db.rawQuery(
             "SELECT id FROM debug_direct_catalog_versions WHERE source_version = ?",
             arrayOf(DirectDebugParameterAsset.SOURCE_VERSION)
         ).use { cursor ->
             check(cursor.moveToFirst()) { "Debug catalog version was not persisted" }
-            return cursor.getLong(0)
+            return cursor.getLong(0) to sourceVersionChanged
         }
     }
 
-    private fun ensureCandidates(db: SQLiteDatabase, parameters: List<DirectDebugParameter>) {
+    private fun ensureCandidates(
+        db: SQLiteDatabase,
+        parameters: List<DirectDebugParameter>,
+        reconcileMetadata: Boolean
+    ) {
         candidateIdsByKey.clear()
         val existingIds = HashMap<String, Long>()
         db.rawQuery("SELECT id, dev, fid, tx FROM debug_direct_candidates", emptyArray()).use { cursor ->
@@ -307,21 +311,26 @@ class DirectDebugStore(
         }
         parameters.forEach { parameter ->
             val signature = signature(parameter.dev, parameter.fid, parameter.tx)
-            val id = existingIds[signature] ?: db.insertOrThrow(
-                "debug_direct_candidates",
-                null,
-                ContentValues().apply {
-                    put("source_key", parameter.key)
-                    put("dev", parameter.dev)
-                    put("fid", parameter.fid)
-                    put("tx", parameter.tx)
-                    put("feature_group", parameter.featureGroup)
-                    put("feature_names", parameter.featureNames)
-                    put("feature_refs", parameter.featureRefs)
-                    put("candidate_source", parameter.candidateSource)
-                    put("decoder", parameter.toDirectFidEntry().decoder.name)
+            val values = ContentValues().apply {
+                put("source_key", parameter.key)
+                put("dev", parameter.dev)
+                put("fid", parameter.fid)
+                put("tx", parameter.tx)
+                put("feature_group", parameter.featureGroup)
+                put("feature_names", parameter.featureNames)
+                put("feature_refs", parameter.featureRefs)
+                put("candidate_source", parameter.candidateSource)
+                put("decoder", parameter.toDirectFidEntry().decoder.name)
+            }
+            val existingId = existingIds[signature]
+            val id = existingId ?: db.insertOrThrow("debug_direct_candidates", null, values).also {
+                existingIds[signature] = it
+            }
+            if (existingId != null && reconcileMetadata) {
+                check(db.update("debug_direct_candidates", values, "id = ?", arrayOf(id.toString())) == 1) {
+                    "Debug candidate metadata was not reconciled for $signature"
                 }
-            ).also { existingIds[signature] = it }
+            }
             candidateIdsByKey[parameter.key] = id
         }
     }

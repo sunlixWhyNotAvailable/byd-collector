@@ -40,7 +40,7 @@ class TelegramRuntimeContractTest {
         assertTrue(engine.contains("nextWakeAtMs: Long?"))
         assertTrue(engine.contains("pendingTripDeadline(config)"))
         assertTrue(coordinator.contains("fun onSuccessfulPoll(observations: List<NormalizedObservation>): Long?"))
-        assertTrue(coordinator.contains("fun tick(mainCollectionExpected: Boolean, lastError: String?): Long?"))
+        assertTrue(coordinator.contains("reachabilityMainPollState: () -> Pair<Boolean, Long?>"))
         assertTrue(coordinator.contains("return result.nextWakeAtMs"))
         assertTrue(service.contains("private fun scheduleTelegramTick(deadlineAtMs: Long? = null)"))
         assertTrue(schedule.contains("maintenanceBlocksRuntimeStart()"))
@@ -71,6 +71,27 @@ class TelegramRuntimeContractTest {
         assertInOrder(commit, "enqueueTelegramMessage(db, message, nowMs)", "saveTelegramRuntimeState(db, it, nowMs)")
         assertInOrder(commit, "saveTelegramRuntimeState(db, it, nowMs)", "db.setTransactionSuccessful()")
         assertInOrder(commit, "db.setTransactionSuccessful()", "db.endTransaction()")
+    }
+
+    @Test
+    fun flushStopsBetweenRequestsWhenMaintenanceInterruptsTheWorker() {
+        val coordinator = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
+        val probe = sourceFile("com/bydcollector/collector/telegram/TelegramReachabilityProbe.kt").readText()
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val flush = coordinator.substringAfter("fun flushPending").substringBefore("private fun handle")
+        val mainPollState = service.substringAfter("private fun telegramReachabilityMainPollState")
+            .substringBefore("private fun exportInfluxAfterNormalizedWrite")
+
+        assertInOrder(flush, "for (entry in store.dueTelegramMessages(nowMs()))", "Thread.currentThread().isInterrupted")
+        assertInOrder(flush, "Thread.currentThread().isInterrupted", "client.sendMessage")
+        assertInOrder(coordinator, "flushPending()", "if (Thread.currentThread().isInterrupted) return result.nextWakeAtMs")
+        assertInOrder(coordinator, "if (Thread.currentThread().isInterrupted) return result.nextWakeAtMs", "reachabilityProbe?.maybeProbe(")
+        assertInOrder(probe, "val reservation = synchronized(this)", "val (mainCollectionExpected, mainPollStaleMs) = mainPollState()")
+        assertInOrder(probe, "val (mainCollectionExpected, mainPollStaleMs) = mainPollState()", "lastProbeAtMs = nowElapsedMs")
+        assertTrue(coordinator.contains("mainPollState = reachabilityMainPollState"))
+        assertTrue(service.contains("reachabilityMainPollState = ::telegramReachabilityMainPollState"))
+        assertTrue(mainPollState.contains("synchronized(mainObserverLock)"))
+        assertTrue(mainPollState.contains("activeMainSessionId != null"))
     }
 
     private fun sourceFile(path: String): File {

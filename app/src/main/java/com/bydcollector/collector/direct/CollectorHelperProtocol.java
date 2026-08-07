@@ -7,10 +7,16 @@ public final class CollectorHelperProtocol {
     public static final String HELPER_CLASS = "com.bydcollector.collector.direct.CollectorHelperDaemon";
     public static final String LOG_PATH = "/data/local/tmp/bydcollector_helper.log";
     public static final String LOCK_PATH = "/data/local/tmp/bydcollector_helper.lock";
-    public static final int PROTOCOL_VERSION = 2;
+    public static final int PROTOCOL_VERSION = 3;
     public static final int TX_PING = 1;
     public static final int TX_READ = 2;
     public static final int TX_READ_BATCH = 3;
+    public static final int TX_MAIN_HEARTBEAT = 4;
+    public static final int TX_OFFCAR_DISARM = 5;
+
+    public static final String OFFCAR_ROOT = "/data/local/tmp/bydcollector_offcar_poc";
+    public static final long OFFCAR_STALE_MS = 10_000L;
+    public static final long OFFCAR_POLL_MS = 5_000L;
 
     public static final int AUTO_TX_INT = 5;
     public static final int AUTO_TX_FLOAT = 7;

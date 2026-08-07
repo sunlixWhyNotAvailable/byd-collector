@@ -28,7 +28,8 @@ class RuntimeManualStopContractTest {
         assertTrue(service.contains("val mainAllowed = mainEnabled && !settings.isMainManuallyStopped()"))
         assertTrue(service.contains("val debugAllowed = debugEnabled && !settings.isDebugManuallyStopped()"))
         assertTrue(service.contains("if (settings.isMqttAutoStartEnabled() && !settings.isMqttManuallyStopped()) startMqttExport(clearManualStop = false)"))
-        assertTrue(service.contains("if (settings.isInfluxAutoStartEnabled() && !settings.isInfluxManuallyStopped()) startInfluxExport(clearManualStop = false)"))
+        assertTrue(service.contains("(settings.isInfluxEnabled() || settings.isInfluxAutoStartEnabled())"))
+        assertTrue(service.contains("!settings.isInfluxManuallyStopped()"))
         assertTrue(service.contains("settings.setMqttManuallyStopped(true)"))
         assertTrue(service.contains("settings.setInfluxManuallyStopped(true)"))
     }

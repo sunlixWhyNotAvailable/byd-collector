@@ -39,8 +39,16 @@ data class DirectDebugParameter(
 }
 
 object DirectDebugParameterAsset {
-    const val ASSET_NAME = "direct_debug_round_robin_parameters.csv"
-    const val SOURCE_VERSION = "wide-poll-session-20260605_161751-curated-main81-roundrobin6432-energy-soc-v1"
+    val ASSET_NAMES = listOf(
+        "direct_debug_round_robin_parameters_1.csv",
+        "direct_debug_round_robin_parameters_2.csv",
+        "direct_debug_round_robin_parameters_3.csv"
+    )
+    val EXPECTED_SHARD_SIZES = listOf(7_699, 7_699, 7_698)
+    const val SHARD_COUNT = 3
+    const val MAX_SHARD_SIZE = 7_699
+    const val TOTAL_PARAMETER_COUNT = 23_096
+    const val SOURCE_VERSION = "fid-catalog-20260804-6e29ad30-main81-roundrobin23096-both-read-tx-v1"
     val EXPECTED_HEADER = listOf(
         "key",
         "feature_group",
@@ -49,21 +57,24 @@ object DirectDebugParameterAsset {
         "tx",
         "feature_names",
         "feature_refs",
-        "candidate_source",
-        "source_read_count",
-        "source_write_count",
-        "source_change_count",
-        "seed_last_status",
-        "seed_last_raw_present",
-        "seed_last_raw_int",
-        "seed_last_error",
-        "raw_sample",
-        "float_sample"
+        "candidate_source"
     )
 
     fun load(context: Context): List<DirectDebugParameter> {
-        val text = context.assets.open(ASSET_NAME).bufferedReader(Charsets.UTF_8).use { it.readText() }
-        return parse(text)
+        return loadShards(context).flatten().also { rows ->
+            require(rows.size == TOTAL_PARAMETER_COUNT) { "Unexpected debug catalog size: ${rows.size}" }
+        }
+    }
+
+    fun loadShards(context: Context): List<List<DirectDebugParameter>> {
+        return ASSET_NAMES.mapIndexed { index, assetName ->
+            val text = context.assets.open(assetName).bufferedReader(Charsets.UTF_8).use { it.readText() }
+            parse(text).also { rows ->
+                require(rows.size == EXPECTED_SHARD_SIZES[index]) {
+                    "Unexpected debug shard size for $assetName: ${rows.size}"
+                }
+            }
+        }
     }
 
     fun parse(text: String): List<DirectDebugParameter> {
@@ -74,6 +85,7 @@ object DirectDebugParameterAsset {
         val index = header.withIndex().associate { it.value to it.index }
         return lines.drop(1).map { line ->
             val columns = splitCsvLine(line)
+            require(columns.size == header.size) { "Unexpected debug asset row width: ${columns.size}" }
             DirectDebugParameter(
                 key = columns.value(index, "key"),
                 featureGroup = columns.value(index, "feature_group"),

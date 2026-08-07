@@ -14,6 +14,7 @@ class TelegramCoordinator(
     private val store: TelemetryStore,
     private val settings: CollectorSettings,
     private val client: TelegramHttpClient = TelegramHttpClient(),
+    private val reachabilityProbe: TelegramReachabilityProbe? = null,
     private val retryPolicy: TelegramRetryPolicy = TelegramRetryPolicy(),
     private val nowMs: () -> Long = System::currentTimeMillis
 ) {
@@ -44,7 +45,12 @@ class TelegramCoordinator(
         return result.nextWakeAtMs
     }
 
-    fun tick(mainCollectionExpected: Boolean, lastError: String?): Long? {
+    fun tick(
+        mainCollectionExpected: Boolean,
+        lastError: String?,
+        mainPollStaleMs: Long? = null,
+        reachabilityMainPollState: () -> Pair<Boolean, Long?> = { mainCollectionExpected to mainPollStaleMs }
+    ): Long? {
         val expired = store.pruneTelegramMessages(nowMs())
         if (expired > 0) {
             store.recordEvent(
@@ -56,6 +62,13 @@ class TelegramCoordinator(
         val result = engine.onTick(eventConfig(), mainCollectionExpected, lastError, nowMs())
         handle(result)
         flushPending()
+        if (Thread.currentThread().isInterrupted) return result.nextWakeAtMs
+        reachabilityProbe?.maybeProbe(
+            telegramEnabled = settings::isTelegramEnabled,
+            mainPollState = reachabilityMainPollState
+        ) {
+            client.getMe(settings.telegramBotToken())
+        }
         return result.nextWakeAtMs
     }
 
@@ -91,6 +104,7 @@ class TelegramCoordinator(
     }
 
     fun integrationDisabled() {
+        reachabilityProbe?.reset()
         store.saveTelegramRuntimeState(engine.reset().toJson(), nowMs())
     }
 
@@ -100,6 +114,7 @@ class TelegramCoordinator(
         val chatId = settings.telegramChatId()
         if (token.isBlank() || chatId.isBlank()) return
         for (entry in store.dueTelegramMessages(nowMs())) {
+            if (Thread.currentThread().isInterrupted) return
             val attemptedAt = nowMs()
             when (val result = client.sendMessage(TelegramSendMessage(token, chatId, entry.payload))) {
                 TelegramSendResult.Success -> {

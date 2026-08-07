@@ -90,28 +90,32 @@ class CollectorHelperDaemonBatchTest {
     }
 
     @Test
-    fun apkWhitelistLoadsBothCatalogsAndRejectsUnknownReads() {
-        val asset = listOf(
-            File("src/main/assets/${DirectDebugParameterAsset.ASSET_NAME}"),
-            File("app/src/main/assets/${DirectDebugParameterAsset.ASSET_NAME}")
-        ).firstOrNull { it.isFile } ?: error("Missing ${DirectDebugParameterAsset.ASSET_NAME}")
+    fun apkWhitelistLoadsMainAndThreeDebugShardsAndRejectsUnknownReads() {
+        val assets = DirectDebugParameterAsset.ASSET_NAMES.map(::assetFile)
         val apk = Files.createTempFile("bydcollector-whitelist", ".apk").toFile()
         try {
             ZipOutputStream(apk.outputStream()).use { zip ->
-                zip.putNextEntry(ZipEntry("assets/${DirectDebugParameterAsset.ASSET_NAME}"))
-                asset.inputStream().use { it.copyTo(zip) }
-                zip.closeEntry()
+                assets.forEach { asset ->
+                    zip.putNextEntry(ZipEntry("assets/${asset.name}"))
+                    asset.inputStream().use { it.copyTo(zip) }
+                    zip.closeEntry()
+                }
             }
 
             val whitelist = CollectorHelperDaemon.loadWhitelist(apk.absolutePath)
             val known = address(5, 1014, 1145045040)
-            val debugRows = DirectDebugParameterAsset.parse(asset.readText(Charsets.UTF_8))
+            val debugRows = assets.flatMap { DirectDebugParameterAsset.parse(it.readText(Charsets.UTF_8)) }
             val debugAddresses = debugRows.map { address(it.tx, it.dev, it.fid) }
 
-            assertEquals(6513, whitelist.size)
-            assertEquals(6432, debugAddresses.size)
-            assertTrue(debugAddresses.size <= CollectorHelperProtocol.MAX_BATCH_SIZE)
-            assertNull(CollectorHelperDaemon.validateRows(debugAddresses, whitelist))
+            assertEquals(3, assets.size)
+            assertEquals(23177, whitelist.size)
+            assertEquals(23096, debugAddresses.size)
+            assets.forEach { asset ->
+                val shard = DirectDebugParameterAsset.parse(asset.readText(Charsets.UTF_8))
+                    .map { address(it.tx, it.dev, it.fid) }
+                assertTrue(shard.size <= CollectorHelperProtocol.MAX_BATCH_SIZE)
+                assertNull(CollectorHelperDaemon.validateRows(shard, whitelist))
+            }
             assertNull(CollectorHelperDaemon.validateRows(listOf(known), whitelist))
             assertContains(
                 CollectorHelperDaemon.validateRows(listOf(address(8, 1014, 1145045040)), whitelist).orEmpty(),
@@ -127,16 +131,15 @@ class CollectorHelperDaemonBatchTest {
     }
 
     @Test
-    fun fullRoundRobinBatchFitsClientGateAndOversizedBatchIsRejectedByDaemonBoundary() {
-        val asset = listOf(
-            File("src/main/assets/${DirectDebugParameterAsset.ASSET_NAME}"),
-            File("app/src/main/assets/${DirectDebugParameterAsset.ASSET_NAME}")
-        ).firstOrNull { it.isFile } ?: error("Missing ${DirectDebugParameterAsset.ASSET_NAME}")
+    fun everyRoundRobinShardFitsClientGateAndOversizedBatchIsRejectedByDaemonBoundary() {
+        val assets = DirectDebugParameterAsset.ASSET_NAMES.map(::assetFile)
         val client = sourceFile("com/bydcollector/collector/data/direct/DirectVehicleHelperClient.kt").readText()
         val daemon = sourceFile("com/bydcollector/collector/direct/CollectorHelperDaemon.java").readText()
-        val rows = DirectDebugParameterAsset.parse(asset.readText(Charsets.UTF_8))
+        val shardSizes = assets.map { DirectDebugParameterAsset.parse(it.readText(Charsets.UTF_8)).size }
 
-        assertEquals(6432, rows.size)
+        assertEquals(listOf(7699, 7699, 7698), shardSizes)
+        assertEquals(23096, shardSizes.sum())
+        assertTrue(shardSizes.all { it <= CollectorHelperProtocol.MAX_BATCH_SIZE })
         assertEquals(10000, CollectorHelperProtocol.MAX_BATCH_SIZE)
         assertTrue(client.contains("entries.isEmpty() || entries.size > CollectorHelperProtocol.MAX_BATCH_SIZE"))
         assertTrue(client.contains("return synchronized(lock)"))
@@ -157,6 +160,11 @@ class CollectorHelperDaemonBatchTest {
     }
 
     private fun address(tx: Int, dev: Int, fid: Int) = CollectorHelperDaemon.Address(tx, dev, fid)
+
+    private fun assetFile(name: String): File = listOf(
+        File("src/main/assets/$name"),
+        File("app/src/main/assets/$name")
+    ).firstOrNull { it.isFile } ?: error("Missing $name")
 
     private fun sourceFile(path: String): File {
         return listOf(

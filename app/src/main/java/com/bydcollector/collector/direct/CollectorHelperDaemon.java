@@ -7,8 +7,11 @@ import android.os.Looper;
 import android.os.Parcel;
 import android.os.Process;
 import android.os.RemoteException;
+import android.os.SystemClock;
 
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.InputStreamReader;
 import java.io.RandomAccessFile;
 import java.lang.reflect.Constructor;
@@ -17,6 +20,7 @@ import java.lang.reflect.Method;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -46,8 +50,10 @@ public final class CollectorHelperDaemon {
             return;
         }
 
+        final HelperIdentity helperIdentity = HelperIdentity.create();
         prepareMainLooper();
-        final Set<Address> whitelist = loadWhitelist(apkPath);
+        final MainCatalog mainCatalog = loadMainCatalog();
+        final Set<Address> whitelist = loadWhitelist(apkPath, mainCatalog);
         Class<?> serviceManager = Class.forName("android.os.ServiceManager");
         Method getService = serviceManager.getMethod("getService", String.class);
         final IBinder autoservice = (IBinder) getService.invoke(null, "autoservice");
@@ -60,6 +66,22 @@ public final class CollectorHelperDaemon {
         final String autoserviceDescriptor = descriptor == null ? "" : descriptor;
         final NativeArrayReader nativeReader = NativeArrayReader.create();
         final Object readLock = new Object();
+        final EvidenceStore evidence = new EvidenceStore(
+            new File(CollectorHelperProtocol.OFFCAR_ROOT),
+            mainCatalog,
+            helperIdentity,
+            128L * 1024L * 1024L,
+            1L * 1024L * 1024L,
+            127L * 1024L * 1024L
+        );
+        final OffcarController offcar = new OffcarController(
+            mainCatalog,
+            autoservice,
+            autoserviceDescriptor,
+            nativeReader,
+            readLock,
+            evidence
+        );
         Binder helperBinder = new Binder() {
             @Override
             protected boolean onTransact(int code, Parcel data, Parcel reply, int flags) throws RemoteException {
@@ -75,6 +97,16 @@ public final class CollectorHelperDaemon {
                         reply.writeInt(nativeReader.isAvailable() ? 1 : 0);
                         reply.writeString(nativeReader.unavailableReason());
                     }
+                    return true;
+                }
+                if (code == CollectorHelperProtocol.TX_MAIN_HEARTBEAT) {
+                    offcar.mainHeartbeat();
+                    if (reply != null) reply.writeInt(CollectorHelperProtocol.STATUS_OK);
+                    return true;
+                }
+                if (code == CollectorHelperProtocol.TX_OFFCAR_DISARM) {
+                    offcar.disarm();
+                    if (reply != null) reply.writeInt(CollectorHelperProtocol.STATUS_OK);
                     return true;
                 }
                 if (code == CollectorHelperProtocol.TX_READ) {
@@ -138,8 +170,11 @@ public final class CollectorHelperDaemon {
                     (nativeReader.isAvailable() ? "" : " native_error=" + nativeReader.unavailableReason())
             );
             System.out.flush();
+            evidence.appendLifecycle("helper_started", 0L, null);
+            offcar.start();
             Looper.loop();
         } finally {
+            offcar.stop();
             ownerLock.close();
         }
     }
@@ -213,34 +248,68 @@ public final class CollectorHelperDaemon {
     }
 
     static Set<Address> loadWhitelist(String apkPath) throws Exception {
+        return loadWhitelist(apkPath, loadMainCatalog());
+    }
+
+    private static Set<Address> loadWhitelist(String apkPath, MainCatalog mainCatalog) throws Exception {
         Set<Address> whitelist = new HashSet<Address>();
-        loadMainWhitelist(whitelist);
+        whitelist.addAll(mainCatalog.rows);
         loadDebugWhitelist(apkPath, whitelist);
         if (whitelist.isEmpty()) throw new IllegalStateException("empty telemetry whitelist");
         return whitelist;
     }
 
-    private static void loadMainWhitelist(Set<Address> whitelist) throws Exception {
+    static MainCatalog loadMainCatalog() throws Exception {
         Class<?> registryClass = Class.forName("com.bydcollector.collector.data.direct.DirectFidRegistry");
         Object registry = registryClass.getField("INSTANCE").get(null);
         List<?> entries = (List<?>) registryClass.getMethod("getEntries").invoke(registry);
-        for (Object entry : entries) {
+        String version = (String) registryClass.getField("CATALOG_VERSION").get(null);
+        List<Address> rows = new ArrayList<Address>(entries.size());
+        StringBuilder tsv = new StringBuilder(
+            "position\tkey\ttx\tdev\tfid\tdecoder\tscale\tgroup_name\tfeature_names\tclassification\tprod_category\tsource\tsource_id\tnote\n"
+        );
+        for (int position = 0; position < entries.size(); position++) {
+            Object entry = entries.get(position);
             Class<?> entryClass = entry.getClass();
             int tx = (Integer) entryClass.getMethod("getTx").invoke(entry);
             int dev = (Integer) entryClass.getMethod("getDev").invoke(entry);
             int fid = (Integer) entryClass.getMethod("getFid").invoke(entry);
             if (!isAllowedTx(tx)) throw new IllegalArgumentException("unsupported main whitelist tx: " + tx);
-            whitelist.add(new Address(tx, dev, fid));
+            rows.add(new Address(tx, dev, fid));
+            appendTsv(tsv, position);
+            appendTsv(tsv, entryClass.getMethod("getKey").invoke(entry));
+            appendTsv(tsv, tx);
+            appendTsv(tsv, dev);
+            appendTsv(tsv, fid);
+            appendTsv(tsv, entryClass.getMethod("getDecoder").invoke(entry));
+            appendTsv(tsv, entryClass.getMethod("getScale").invoke(entry));
+            appendTsv(tsv, entryClass.getMethod("getGroupName").invoke(entry));
+            appendTsv(tsv, entryClass.getMethod("getFeatureNames").invoke(entry));
+            appendTsv(tsv, entryClass.getMethod("getClassification").invoke(entry));
+            appendTsv(tsv, entryClass.getMethod("getProdCategory").invoke(entry));
+            appendTsv(tsv, entryClass.getMethod("getSource").invoke(entry));
+            appendTsv(tsv, entryClass.getMethod("getSourceId").invoke(entry));
+            appendTsv(tsv, entryClass.getMethod("getNote").invoke(entry));
+            tsv.setLength(tsv.length() - 1);
+            tsv.append('\n');
         }
+        byte[] bytes = tsv.toString().getBytes(StandardCharsets.UTF_8);
+        return new MainCatalog(version, rows, bytes, sha256(bytes));
     }
 
     private static void loadDebugWhitelist(String apkPath, Set<Address> whitelist) throws Exception {
         try (ZipFile apk = new ZipFile(apkPath)) {
-            ZipEntry asset = apk.getEntry("assets/direct_debug_round_robin_parameters.csv");
-            if (asset == null) throw new IllegalStateException("debug whitelist asset missing");
-            try (BufferedReader reader = new BufferedReader(
-                new InputStreamReader(apk.getInputStream(asset), StandardCharsets.UTF_8)
-            )) {
+            String[] assetNames = {
+                "assets/direct_debug_round_robin_parameters_1.csv",
+                "assets/direct_debug_round_robin_parameters_2.csv",
+                "assets/direct_debug_round_robin_parameters_3.csv"
+            };
+            for (String assetName : assetNames) {
+                ZipEntry asset = apk.getEntry(assetName);
+                if (asset == null) throw new IllegalStateException("debug whitelist asset missing: " + assetName);
+                try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(apk.getInputStream(asset), StandardCharsets.UTF_8)
+                )) {
                 List<String> header = splitCsvLine(reader.readLine());
                 int devIndex = header.indexOf("dev");
                 int fidIndex = header.indexOf("fid");
@@ -258,8 +327,41 @@ public final class CollectorHelperDaemon {
                     if (!isAllowedTx(tx)) throw new IllegalArgumentException("unsupported debug whitelist tx: " + tx);
                     whitelist.add(new Address(tx, dev, fid));
                 }
+                }
             }
         }
+    }
+
+    private static void appendTsv(StringBuilder target, Object value) {
+        String text = String.valueOf(value)
+            .replace("\\", "\\\\")
+            .replace("\t", "\\t")
+            .replace("\r", "\\r")
+            .replace("\n", "\\n");
+        target.append(text).append('\t');
+    }
+
+    static String sha256(byte[] bytes) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        return hex(digest.digest(bytes));
+    }
+
+    private static String sha256(File file) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        byte[] buffer = new byte[8192];
+        try (FileInputStream input = new FileInputStream(file)) {
+            int count;
+            while ((count = input.read(buffer)) >= 0) {
+                if (count > 0) digest.update(buffer, 0, count);
+            }
+        }
+        return hex(digest.digest());
+    }
+
+    private static String hex(byte[] bytes) {
+        StringBuilder text = new StringBuilder(bytes.length * 2);
+        for (byte value : bytes) text.append(String.format("%02x", value & 0xff));
+        return text.toString();
     }
 
     private static List<String> splitCsvLine(String line) {
@@ -299,6 +401,530 @@ public final class CollectorHelperDaemon {
         } catch (Throwable ignored) {
             // app_process may already have the main looper prepared.
         }
+    }
+
+    enum OffcarEvent {
+        NONE,
+        ARMED,
+        RECOVERED,
+        DISARMED
+    }
+
+    static final class PollPermit {
+        final long generation;
+        final boolean firstFallback;
+
+        PollPermit(long generation, boolean firstFallback) {
+            this.generation = generation;
+            this.firstFallback = firstFallback;
+        }
+    }
+
+    static final class SampleGate {
+        final long generation;
+        final long heartbeatAgeMs;
+
+        SampleGate(long generation, long heartbeatAgeMs) {
+            this.generation = generation;
+            this.heartbeatAgeMs = heartbeatAgeMs;
+        }
+    }
+
+    static final class HelperIdentity {
+        private static final String UNKNOWN_BOOT_ID = "unknown";
+        final String bootId;
+        final String helperRunId;
+        final int pid;
+        final long startEpochMs;
+        final long startElapsedMs;
+
+        HelperIdentity(String bootId, String helperRunId, int pid, long startEpochMs, long startElapsedMs) {
+            this.bootId = sanitizeBootId(bootId);
+            this.helperRunId = helperRunId;
+            this.pid = pid;
+            this.startEpochMs = startEpochMs;
+            this.startElapsedMs = startElapsedMs;
+        }
+
+        static HelperIdentity create() {
+            int pid = Process.myPid();
+            long startEpochMs = System.currentTimeMillis();
+            long startElapsedMs = SystemClock.elapsedRealtime();
+            return new HelperIdentity(
+                readBootId(),
+                "pid-" + pid + "-epoch-" + startEpochMs + "-elapsed-" + startElapsedMs,
+                pid,
+                startEpochMs,
+                startElapsedMs
+            );
+        }
+
+        private static String readBootId() {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                new FileInputStream("/proc/sys/kernel/random/boot_id"),
+                StandardCharsets.UTF_8
+            ))) {
+                return sanitizeBootId(reader.readLine());
+            } catch (Throwable ignored) {
+                return UNKNOWN_BOOT_ID;
+            }
+        }
+
+        static String sanitizeBootId(String value) {
+            if (value == null) return UNKNOWN_BOOT_ID;
+            String trimmed = value.trim();
+            if (trimmed.isEmpty() || trimmed.length() > 128) return UNKNOWN_BOOT_ID;
+            for (int index = 0; index < trimmed.length(); index++) {
+                char ch = trimmed.charAt(index);
+                if (!(ch >= 'a' && ch <= 'z') && !(ch >= 'A' && ch <= 'Z') &&
+                    !(ch >= '0' && ch <= '9') && ch != '-' && ch != '_' && ch != '.') {
+                    return UNKNOWN_BOOT_ID;
+                }
+            }
+            return trimmed;
+        }
+    }
+
+    interface SampleAppender {
+        boolean append();
+    }
+
+    static final class OffcarState {
+        private boolean armed;
+        private boolean fallbackActive;
+        private long generation;
+        private long lastHeartbeatElapsedMs;
+        private long nextPollElapsedMs;
+
+        synchronized OffcarEvent heartbeat(long nowElapsedMs) {
+            OffcarEvent event = !armed
+                ? OffcarEvent.ARMED
+                : fallbackActive ? OffcarEvent.RECOVERED : OffcarEvent.NONE;
+            generation++;
+            armed = true;
+            fallbackActive = false;
+            lastHeartbeatElapsedMs = nowElapsedMs;
+            nextPollElapsedMs = nowElapsedMs + CollectorHelperProtocol.OFFCAR_STALE_MS;
+            notifyAll();
+            return event;
+        }
+
+        synchronized OffcarEvent disarm() {
+            boolean wasArmed = armed;
+            generation++;
+            armed = false;
+            fallbackActive = false;
+            notifyAll();
+            return wasArmed ? OffcarEvent.DISARMED : OffcarEvent.NONE;
+        }
+
+        synchronized PollPermit beginPoll(long nowElapsedMs) {
+            long heartbeatAgeMs = Math.max(0L, nowElapsedMs - lastHeartbeatElapsedMs);
+            if (!armed || heartbeatAgeMs < CollectorHelperProtocol.OFFCAR_STALE_MS || nowElapsedMs < nextPollElapsedMs) {
+                return null;
+            }
+            boolean firstFallback = !fallbackActive;
+            fallbackActive = true;
+            nextPollElapsedMs = nowElapsedMs + CollectorHelperProtocol.OFFCAR_POLL_MS;
+            return new PollPermit(generation, firstFallback);
+        }
+
+        synchronized SampleGate completePoll(PollPermit permit, long nowElapsedMs) {
+            long heartbeatAgeMs = Math.max(0L, nowElapsedMs - lastHeartbeatElapsedMs);
+            if (!armed || generation != permit.generation || heartbeatAgeMs < CollectorHelperProtocol.OFFCAR_STALE_MS) {
+                return null;
+            }
+            return new SampleGate(generation, heartbeatAgeMs);
+        }
+
+        synchronized boolean commitPoll(PollPermit permit, long nowElapsedMs, SampleAppender appender) {
+            if (completePoll(permit, nowElapsedMs) == null) return false;
+            return appender.append();
+        }
+
+        synchronized long nextDelayMs(long nowElapsedMs) {
+            if (!armed) return Long.MAX_VALUE;
+            long staleAt = lastHeartbeatElapsedMs + CollectorHelperProtocol.OFFCAR_STALE_MS;
+            if (nowElapsedMs < staleAt) return staleAt - nowElapsedMs;
+            if (nowElapsedMs < nextPollElapsedMs) return nextPollElapsedMs - nowElapsedMs;
+            return 0L;
+        }
+    }
+
+    static final class MainCatalog {
+        final String version;
+        final List<Address> rows;
+        final byte[] tsvBytes;
+        final String sha256;
+
+        MainCatalog(String version, List<Address> rows, byte[] tsvBytes, String sha256) {
+            this.version = version;
+            this.rows = rows;
+            this.tsvBytes = tsvBytes;
+            this.sha256 = sha256;
+        }
+    }
+
+    static final class EvidenceStore {
+        private static final long SYNC_INTERVAL_MS = 30_000L;
+        private final File root;
+        private final MainCatalog catalog;
+        private final String identityJson;
+        private final long totalCapBytes;
+        private final long reserveCapBytes;
+        private final long telemetryCapBytes;
+        private final File catalogFile;
+        private final File telemetryFile;
+        private final File lifecycleFile;
+        private long lastTelemetrySyncElapsedMs = -SYNC_INTERVAL_MS;
+        private boolean stopped;
+        private String stopReason;
+
+        EvidenceStore(
+            File root,
+            MainCatalog catalog,
+            HelperIdentity helperIdentity,
+            long totalCapBytes,
+            long reserveCapBytes,
+            long telemetryCapBytes
+        ) {
+            this.root = root;
+            this.catalog = catalog;
+            this.identityJson = new StringBuilder()
+                .append("\"boot_id\":\"").append(jsonEscape(helperIdentity.bootId)).append("\"")
+                .append(",\"helper_run_id\":\"").append(jsonEscape(helperIdentity.helperRunId)).append("\"")
+                .append(",\"helper_pid\":").append(helperIdentity.pid)
+                .append(",\"helper_start_epoch_ms\":").append(helperIdentity.startEpochMs)
+                .append(",\"helper_start_elapsed_ms\":").append(helperIdentity.startElapsedMs)
+                .toString();
+            this.totalCapBytes = totalCapBytes;
+            this.reserveCapBytes = reserveCapBytes;
+            this.telemetryCapBytes = telemetryCapBytes;
+            this.catalogFile = new File(root, "main_catalog_" + catalog.sha256 + ".tsv");
+            this.telemetryFile = new File(root, "telemetry_samples.jsonl");
+            this.lifecycleFile = new File(root, "helper_lifecycle.jsonl");
+            initialize();
+        }
+
+        private void initialize() {
+            try {
+                if (!root.isDirectory() && !root.mkdirs()) throw new IllegalStateException("cannot create evidence root");
+                if (!catalogFile.exists()) {
+                    if (reservedBytes() + catalog.tsvBytes.length > reserveCapBytes || rootBytes() + catalog.tsvBytes.length > totalCapBytes) {
+                        stop("cap");
+                        return;
+                    }
+                    try (RandomAccessFile file = new RandomAccessFile(catalogFile, "rwd")) {
+                        if (file.length() == 0L) file.write(catalog.tsvBytes);
+                    }
+                }
+                if (catalogFile.length() != catalog.tsvBytes.length || !catalog.sha256.equals(sha256(catalogFile))) {
+                    stop("catalog_mismatch");
+                    return;
+                }
+                if (telemetryFile.length() >= telemetryCapBytes || rootBytes() >= totalCapBytes) stop("cap");
+            } catch (Throwable error) {
+                stop("io:" + describe(error));
+            }
+        }
+
+        synchronized boolean canCollect() {
+            return !stopped;
+        }
+
+        synchronized String stopReason() {
+            return stopReason;
+        }
+
+        synchronized boolean appendSample(String json, long elapsedMs) {
+            if (stopped) return false;
+            try {
+                if (json.length() < 2 || json.charAt(0) != '{' || json.charAt(json.length() - 1) != '}') {
+                    throw new IllegalArgumentException("sample must be a JSON object");
+                }
+                String evidenceJson = "{" + identityJson + (json.length() == 2 ? "" : ",") + json.substring(1);
+                byte[] line = (evidenceJson + "\n").getBytes(StandardCharsets.UTF_8);
+                long currentLength = telemetryFile.length();
+                boolean needsSeparator = needsSeparator(telemetryFile, currentLength);
+                long writeLength = line.length + (needsSeparator ? 1L : 0L);
+                if (currentLength + writeLength > telemetryCapBytes || rootBytes() + writeLength > totalCapBytes) {
+                    stop("cap");
+                    return false;
+                }
+                try (RandomAccessFile file = new RandomAccessFile(telemetryFile, "rw")) {
+                    file.seek(currentLength);
+                    if (needsSeparator) file.write('\n');
+                    file.write(line);
+                    if (elapsedMs - lastTelemetrySyncElapsedMs >= SYNC_INTERVAL_MS) {
+                        file.getFD().sync();
+                        lastTelemetrySyncElapsedMs = elapsedMs;
+                    }
+                }
+                return true;
+            } catch (Throwable error) {
+                stop("io:" + describe(error));
+                return false;
+            }
+        }
+
+        synchronized void appendLifecycle(String event, long generation, String detail) {
+            appendLifecycle(event, generation, detail, System.currentTimeMillis(), SystemClock.elapsedRealtime());
+        }
+
+        synchronized void appendLifecycle(
+            String event,
+            long generation,
+            String detail,
+            long epochMs,
+            long elapsedMs
+        ) {
+            try {
+                StringBuilder json = new StringBuilder()
+                    .append("{\"event\":\"").append(jsonEscape(event)).append("\"")
+                    .append(',').append(identityJson)
+                    .append(",\"protocol\":").append(CollectorHelperProtocol.PROTOCOL_VERSION)
+                    .append(",\"generation\":").append(generation)
+                    .append(",\"catalog_sha256\":\"").append(catalog.sha256).append("\"")
+                    .append(",\"catalog_version\":\"").append(jsonEscape(catalog.version)).append("\"")
+                    .append(",\"epoch_ms\":").append(epochMs)
+                    .append(",\"elapsed_ms\":").append(elapsedMs);
+                if (detail != null) json.append(",\"detail\":\"").append(jsonEscape(detail)).append("\"");
+                byte[] line = json.append("}\n").toString().getBytes(StandardCharsets.UTF_8);
+                long currentLength = lifecycleFile.length();
+                boolean needsSeparator = needsSeparator(lifecycleFile, currentLength);
+                long writeLength = line.length + (needsSeparator ? 1L : 0L);
+                if (reservedBytes() + writeLength > reserveCapBytes || rootBytes() + writeLength > totalCapBytes) return;
+                try (RandomAccessFile file = new RandomAccessFile(lifecycleFile, "rw")) {
+                    file.seek(currentLength);
+                    if (needsSeparator) file.write('\n');
+                    file.write(line);
+                    file.getFD().sync();
+                }
+            } catch (Throwable ignored) {
+                // Evidence failure must never take down the Binder helper.
+            }
+        }
+
+        private boolean needsSeparator(File file, long length) throws Exception {
+            if (length == 0L) return false;
+            try (RandomAccessFile input = new RandomAccessFile(file, "r")) {
+                input.seek(length - 1L);
+                return input.read() != '\n';
+            }
+        }
+
+        private long reservedBytes() {
+            long total = lifecycleFile.length();
+            File[] files = root.listFiles();
+            if (files == null) return total;
+            for (File file : files) {
+                if (file.isFile() && file.getName().startsWith("main_catalog_") && file.getName().endsWith(".tsv")) {
+                    total += file.length();
+                }
+            }
+            return total;
+        }
+
+        private long rootBytes() {
+            long total = 0L;
+            File[] files = root.listFiles();
+            if (files == null) return total;
+            for (File file : files) if (file.isFile()) total += file.length();
+            return total;
+        }
+
+        private void stop(String reason) {
+            stopped = true;
+            stopReason = reason;
+        }
+    }
+
+    static final class OffcarController implements Runnable {
+        private final MainCatalog catalog;
+        private final IBinder autoservice;
+        private final String autoserviceDescriptor;
+        private final NativeReader nativeReader;
+        private final Object readLock;
+        private final EvidenceStore evidence;
+        private final OffcarState state = new OffcarState();
+        private volatile boolean running;
+        private Thread thread;
+
+        OffcarController(
+            MainCatalog catalog,
+            IBinder autoservice,
+            String autoserviceDescriptor,
+            NativeReader nativeReader,
+            Object readLock,
+            EvidenceStore evidence
+        ) {
+            this.catalog = catalog;
+            this.autoservice = autoservice;
+            this.autoserviceDescriptor = autoserviceDescriptor;
+            this.nativeReader = nativeReader;
+            this.readLock = readLock;
+            this.evidence = evidence;
+        }
+
+        void start() {
+            if (!evidence.canCollect()) {
+                evidence.appendLifecycle("evidence_stopped", 0L, evidence.stopReason());
+                return;
+            }
+            running = true;
+            thread = new Thread(this, "BYDCollectorOffcar");
+            thread.setDaemon(true);
+            thread.start();
+        }
+
+        void stop() {
+            running = false;
+            synchronized (state) {
+                state.notifyAll();
+            }
+        }
+
+        void mainHeartbeat() {
+            OffcarEvent event = state.heartbeat(SystemClock.elapsedRealtime());
+            if (event == OffcarEvent.ARMED) evidence.appendLifecycle("offcar_armed", currentGeneration(), null);
+            if (event == OffcarEvent.RECOVERED) evidence.appendLifecycle("main_heartbeat_recovered", currentGeneration(), null);
+        }
+
+        void disarm() {
+            OffcarEvent event = state.disarm();
+            if (event == OffcarEvent.DISARMED) evidence.appendLifecycle("offcar_disarmed", currentGeneration(), null);
+        }
+
+        private long currentGeneration() {
+            synchronized (state) {
+                return state.generation;
+            }
+        }
+
+        @Override public void run() {
+            while (running && evidence.canCollect()) {
+                PollPermit permit = awaitPermit();
+                if (permit == null) continue;
+                if (permit.firstFallback) evidence.appendLifecycle("offcar_fallback_started", permit.generation, null);
+                BatchResult result;
+                try {
+                    synchronized (readLock) {
+                        result = BatchEngine.run(
+                            catalog.rows,
+                            address -> scalarRead(autoservice, autoserviceDescriptor, address),
+                            nativeReader
+                        );
+                    }
+                } catch (Throwable error) {
+                    evidence.appendLifecycle("offcar_poll_error", permit.generation, describe(error));
+                    continue;
+                }
+                long elapsedMs = SystemClock.elapsedRealtime();
+                SampleGate gate = state.completePoll(permit, elapsedMs);
+                if (gate == null) continue;
+                String sample = sampleJson(catalog, gate, result, System.currentTimeMillis(), elapsedMs);
+                boolean appended = state.commitPoll(permit, elapsedMs, () -> evidence.appendSample(sample, elapsedMs));
+                if (!appended && !evidence.canCollect()) {
+                    evidence.appendLifecycle("evidence_stopped", gate.generation, evidence.stopReason());
+                    return;
+                }
+            }
+        }
+
+        private PollPermit awaitPermit() {
+            synchronized (state) {
+                while (running) {
+                    long nowElapsedMs = SystemClock.elapsedRealtime();
+                    PollPermit permit = state.beginPoll(nowElapsedMs);
+                    if (permit != null) return permit;
+                    long delayMs = state.nextDelayMs(nowElapsedMs);
+                    try {
+                        if (delayMs == Long.MAX_VALUE) state.wait();
+                        else state.wait(Math.max(1L, delayMs));
+                    } catch (InterruptedException ignored) {
+                        Thread.currentThread().interrupt();
+                        return null;
+                    }
+                }
+            }
+            return null;
+        }
+    }
+
+    static String sampleJson(
+        MainCatalog catalog,
+        SampleGate gate,
+        BatchResult result,
+        long epochMs,
+        long elapsedMs
+    ) {
+        int statusOk = 0;
+        int rawPresent = 0;
+        for (ReadValue value : result.values) {
+            if (value != null && value.status == CollectorHelperProtocol.STATUS_OK) statusOk++;
+            if (value != null && value.raw != null) rawPresent++;
+        }
+        StringBuilder json = new StringBuilder(4096)
+            .append("{\"schema\":1")
+            .append(",\"generation\":").append(gate.generation)
+            .append(",\"catalog_sha256\":\"").append(catalog.sha256).append("\"")
+            .append(",\"catalog_version\":\"").append(jsonEscape(catalog.version)).append("\"")
+            .append(",\"epoch_ms\":").append(epochMs)
+            .append(",\"elapsed_ms\":").append(elapsedMs)
+            .append(",\"heartbeat_age_ms\":").append(gate.heartbeatAgeMs)
+            .append(",\"position_count\":").append(result.values.length)
+            .append(",\"poll\":{")
+            .append("\"batch_status\":").append(result.batchStatus)
+            .append(",\"mode\":\"").append(modeName(result.mode)).append("\"")
+            .append(",\"native_available\":").append(result.nativeAvailable)
+            .append(",\"native_group_count\":").append(result.nativeGroupCount)
+            .append(",\"fallback_group_count\":").append(result.fallbackGroupCount)
+            .append(",\"fallback_read_count\":").append(result.fallbackReadCount)
+            .append(",\"group_failure_count\":").append(result.groupFailureCount)
+            .append(",\"elapsed_ms\":").append(result.elapsedMs);
+        if (result.error != null) json.append(",\"error\":\"").append(jsonEscape(result.error)).append("\"");
+        json.append("},\"quality\":{")
+            .append("\"status_ok\":").append(statusOk)
+            .append(",\"status_error\":").append(result.values.length - statusOk)
+            .append(",\"raw_present\":").append(rawPresent)
+            .append(",\"raw_missing\":").append(result.values.length - rawPresent)
+            .append("},\"raw_values\":[");
+        for (int index = 0; index < result.values.length; index++) {
+            if (index > 0) json.append(',');
+            ReadValue value = result.values[index];
+            if (value == null || value.raw == null) json.append("null");
+            else json.append(value.raw);
+        }
+        json.append("],\"status_values\":[");
+        for (int index = 0; index < result.values.length; index++) {
+            if (index > 0) json.append(',');
+            ReadValue value = result.values[index];
+            json.append(value == null ? CollectorHelperProtocol.STATUS_READ_ERROR : value.status);
+        }
+        return json.append("]}").toString();
+    }
+
+    private static String modeName(int mode) {
+        if (mode == CollectorHelperProtocol.MODE_NATIVE) return "native";
+        if (mode == CollectorHelperProtocol.MODE_NATIVE_WITH_FALLBACK) return "native_with_fallback";
+        if (mode == CollectorHelperProtocol.MODE_SCALAR_FALLBACK) return "scalar_fallback";
+        return "rejected";
+    }
+
+    private static String jsonEscape(String value) {
+        StringBuilder escaped = new StringBuilder(value.length() + 16);
+        for (int index = 0; index < value.length(); index++) {
+            char ch = value.charAt(index);
+            if (ch == '"' || ch == '\\') escaped.append('\\').append(ch);
+            else if (ch == '\b') escaped.append("\\b");
+            else if (ch == '\f') escaped.append("\\f");
+            else if (ch == '\n') escaped.append("\\n");
+            else if (ch == '\r') escaped.append("\\r");
+            else if (ch == '\t') escaped.append("\\t");
+            else if (ch < 0x20) escaped.append(String.format("\\u%04x", (int) ch));
+            else escaped.append(ch);
+        }
+        return escaped.toString();
     }
 
     interface ScalarReader {
