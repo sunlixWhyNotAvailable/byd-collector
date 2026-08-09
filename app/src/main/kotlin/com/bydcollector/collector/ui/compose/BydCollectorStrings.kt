@@ -1,5 +1,7 @@
 package com.bydcollector.collector.ui.compose
 
+import com.bydcollector.collector.telegram.TelegramBuiltInTemplates
+
 enum class AppTab {
     MAIN,
     ALL_PARAMETERS,
@@ -267,7 +269,7 @@ private val telegramUk = TelegramStrings(
         ),
         TelegramMessageType.CHARGING_PROGRESS to TelegramMessageStrings(
             "Прогрес заряджання",
-            "Заряд: {soc}%\nДодано: {charge_added_percent}% / {charge_added_kwh} кВт·год"
+            TelegramBuiltInTemplates.CHARGING_PROGRESS_UK
         ),
         TelegramMessageType.CHARGED_TO_100 to TelegramMessageStrings(
             "Заряджено до 100%",
@@ -295,14 +297,16 @@ private val telegramUk = TelegramStrings(
         ),
         TelegramMessageType.TRIP_SUMMARY to TelegramMessageStrings(
             "Підсумок поїздки",
-            "Поїздку завершено\nВідстань: {trip_distance_km} км за {trip_duration}\nSOC: {soc_start}% -> {soc_end}%\nЕнергія: {trip_energy_kwh} кВт·год"
+            TelegramBuiltInTemplates.TRIP_SUMMARY_UK
         )
     ),
     variableDescriptions = mapOf(
         "soc" to "Поточний заряд батареї, %",
         "battery_power_kw" to "Поточна потужність заряджання, кВт",
-        "charge_added_percent" to "Доданий заряд, %",
-        "charge_added_kwh" to "Додана енергія, кВт·год",
+        "charge_step_added_percent" to "Доданий заряд за поточний крок, %",
+        "charge_step_added_kwh" to "Додана енергія за поточний крок, кВт·год",
+        "charge_added_percent" to "Доданий заряд за всю сесію, %",
+        "charge_added_kwh" to "Додана енергія за всю сесію, кВт·год",
         "remaining_energy_kwh" to "Залишок енергії, кВт·год",
         "range_km" to "Розрахунковий запас ходу, км",
         "charge_duration" to "Тривалість заряджання",
@@ -314,7 +318,10 @@ private val telegramUk = TelegramStrings(
         "trip_energy_kwh" to "Енергія поїздки, кВт·год",
         "trip_duration" to "Тривалість поїздки",
         "soc_start" to "SOC на початку поїздки, %",
-        "soc_end" to "SOC наприкінці поїздки, %"
+        "soc_end" to "SOC наприкінці поїздки, %",
+        "total_distance_km" to "Загальна відстань, км",
+        "total_energy_kwh" to "Загальна витрата енергії, кВт·год",
+        "total_duration" to "Загальна тривалість поїздок"
     )
 )
 
@@ -347,7 +354,7 @@ private val telegramEn = TelegramStrings(
         ),
         TelegramMessageType.CHARGING_PROGRESS to TelegramMessageStrings(
             "Charging progress",
-            "Charge: {soc}%\nAdded: {charge_added_percent}% / {charge_added_kwh} kWh"
+            TelegramBuiltInTemplates.CHARGING_PROGRESS_EN
         ),
         TelegramMessageType.CHARGED_TO_100 to TelegramMessageStrings(
             "Charged to 100%",
@@ -375,14 +382,16 @@ private val telegramEn = TelegramStrings(
         ),
         TelegramMessageType.TRIP_SUMMARY to TelegramMessageStrings(
             "Trip summary",
-            "Trip complete\nDistance: {trip_distance_km} km in {trip_duration}\nSOC: {soc_start}% -> {soc_end}%\nEnergy: {trip_energy_kwh} kWh"
+            TelegramBuiltInTemplates.TRIP_SUMMARY_EN
         )
     ),
     variableDescriptions = mapOf(
         "soc" to "Current battery charge, %",
         "battery_power_kw" to "Current charging power, kW",
-        "charge_added_percent" to "Added charge, %",
-        "charge_added_kwh" to "Added energy, kWh",
+        "charge_step_added_percent" to "Charge added during the current step, %",
+        "charge_step_added_kwh" to "Energy added during the current step, kWh",
+        "charge_added_percent" to "Charge added during the whole session, %",
+        "charge_added_kwh" to "Energy added during the whole session, kWh",
         "remaining_energy_kwh" to "Remaining energy, kWh",
         "range_km" to "Estimated range, km",
         "charge_duration" to "Charging duration",
@@ -394,7 +403,10 @@ private val telegramEn = TelegramStrings(
         "trip_energy_kwh" to "Trip energy, kWh",
         "trip_duration" to "Trip duration",
         "soc_start" to "SOC at trip start, %",
-        "soc_end" to "SOC at trip end, %"
+        "soc_end" to "SOC at trip end, %",
+        "total_distance_km" to "Total distance, km",
+        "total_energy_kwh" to "Total energy used, kWh",
+        "total_duration" to "Total trip duration"
     )
 )
 

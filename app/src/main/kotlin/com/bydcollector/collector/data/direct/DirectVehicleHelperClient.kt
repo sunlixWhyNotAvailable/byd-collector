@@ -18,10 +18,6 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
         return ping?.status == 0 && ping.raw == CollectorHelperProtocol.PROTOCOL_VERSION
     }
 
-    fun mainHeartbeat(): Boolean = transactControl(CollectorHelperProtocol.TX_MAIN_HEARTBEAT)
-
-    fun offcarDisarm(): Boolean = transactControl(CollectorHelperProtocol.TX_OFFCAR_DISARM)
-
     override fun read(entry: DirectFidEntry): DirectHelperReadResult {
         return transactScalar(CollectorHelperProtocol.TX_READ) { data ->
             data.writeInt(entry.tx)
@@ -119,31 +115,6 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                 DirectHelperReadResult(status = STATUS_DEAD_OBJECT, raw = null, error = error.message ?: "dead binder")
             } catch (error: Exception) {
                 DirectHelperReadResult(status = STATUS_CLIENT_ERROR, raw = null, error = "${error::class.java.simpleName}: ${error.message ?: "no message"}")
-            } finally {
-                data.recycle()
-                reply.recycle()
-            }
-        }
-    }
-
-    private fun transactControl(code: Int): Boolean {
-        return synchronized(lock) {
-            // ServiceManager lookup only: disarming never launches a missing helper.
-            val binder = ensureBinder() ?: return@synchronized false
-            val data = Parcel.obtain()
-            val reply = Parcel.obtain()
-            try {
-                data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
-                if (!binder.transact(code, data, reply, 0)) {
-                    cached = null
-                    return@synchronized false
-                }
-                reply.dataAvail() >= 4 && reply.readInt() == CollectorHelperProtocol.STATUS_OK
-            } catch (error: DeadObjectException) {
-                cached = null
-                false
-            } catch (_: Exception) {
-                false
             } finally {
                 data.recycle()
                 reply.recycle()

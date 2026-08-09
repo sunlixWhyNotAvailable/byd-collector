@@ -58,8 +58,6 @@ import com.bydcollector.collector.mqtt.MqttPublishCoordinator
 import com.bydcollector.collector.mqtt.PahoMqttClientFacade
 import com.bydcollector.collector.system.CollectorAutoStart
 import com.bydcollector.collector.telegram.TelegramCoordinator
-import com.bydcollector.collector.telegram.TelegramHttpClient
-import com.bydcollector.collector.telegram.TelegramReachabilityProbe
 import com.bydcollector.collector.util.namedSingleThreadExecutor
 import java.io.File
 import java.util.concurrent.ExecutorService
@@ -81,8 +79,6 @@ class CollectorService : Service() {
     private lateinit var mqttCoordinator: MqttPublishCoordinator
     private lateinit var influxCoordinator: InfluxExportCoordinator
     private lateinit var telegramCoordinator: TelegramCoordinator
-    private lateinit var telegramReachabilityProbe: TelegramReachabilityProbe
-    private lateinit var offcarHelper: DirectVehicleHelperClient
     private lateinit var maintenanceCoordinator: DbMaintenanceCoordinator
     private var debugStorageReady = false
     private var wakeLock: PowerManager.WakeLock? = null
@@ -123,12 +119,6 @@ class CollectorService : Service() {
     @Volatile private var lastTelegramPollError: String? = null
     private var telegramTickScheduled = false
     private var telegramTickAtMs: Long? = null
-    private val mainObserverLock = Any()
-    private var activeMainSessionId: Long? = null
-    private var mainExpectedSinceElapsedMs: Long? = null
-    private var lastSuccessfulMainPollElapsedMs: Long? = null
-    private var lastMainHeartbeatAtElapsedMs = Long.MIN_VALUE
-    private val processGeneration = PROCESS_GENERATION
     private val influxRetryTask = object : Runnable {
         override fun run() {
             influxRetryScheduled = false
@@ -149,8 +139,7 @@ class CollectorService : Service() {
             ) {
                 telegramCoordinator.tick(
                     mainCollectionExpected = settings.isPollingEnabled() && !settings.isMainManuallyStopped(),
-                    lastError = lastTelegramPollError,
-                    reachabilityMainPollState = ::telegramReachabilityMainPollState
+                    lastError = lastTelegramPollError
                 )
             }
         }
@@ -169,19 +158,6 @@ class CollectorService : Service() {
         running.set(true)
         store = BydCollectorApplication.store(applicationContext)
         settings = CollectorSettings(applicationContext, store)
-        offcarHelper = DirectVehicleHelperClient()
-        telegramReachabilityProbe = TelegramReachabilityProbe(
-            logFile = File(applicationContext.filesDir, "offcar_poc/telegram_reachability.jsonl"),
-            processGeneration = processGeneration,
-            elapsedRealtimeMs = { SystemClock.elapsedRealtime() },
-            onAppendFailure = { exceptionClass ->
-                store.recordEvent(
-                    "telegram_reachability_evidence_append_failed",
-                    "Telegram reachability evidence append failed",
-                    "exception=$exceptionClass"
-                )
-            }
-        )
         debugStorageReady = BydCollectorApplication.ensureDebugStorageReady(applicationContext)
         debugStore = DirectDebugStore(applicationContext, DirectDebugDatabaseHelper(applicationContext))
         keepAliveSupervisor = KeepAliveSupervisor(applicationContext, store)
@@ -243,7 +219,7 @@ class CollectorService : Service() {
             ACTION_STOP -> {
                 settings.setMainManuallyStopped(true)
                 settings.setPollingEnabled(false)
-                stopMain("polling_disabled", disarmOffcar = true)
+                stopMain("polling_disabled")
                 reconcileCollection()
             }
             ACTION_START_DEBUG -> {
@@ -336,8 +312,6 @@ class CollectorService : Service() {
                         timestamp: String,
                         readings: List<PollReading>
                     ) {
-                        heartbeatAfterPersistedMainPoll(sessionId)
-                        telegramReachabilityProbe.reset()
                         val observations = vehicleStateNormalizer.normalize(
                             pollId = pollId,
                             observedAt = timestamp,
@@ -469,7 +443,6 @@ class CollectorService : Service() {
                 "${error::class.java.simpleName}: ${error.message ?: "no message"}"
             )
         }
-        activateMainObserver(openedSessionId)
         poller.start(openedSessionId)
         mainPollingRunning.set(true)
         flushPendingMqttAsync(force = false)
@@ -498,7 +471,7 @@ class CollectorService : Service() {
                     return@execute
                 }
                 if (!settings.isDebugPollingEnabled() || settings.isDebugManuallyStopped()) return@execute
-                val batchSize = DirectDebugParameterAsset.MAX_SHARD_SIZE
+                val batchSize = DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT
                 var lastDebugReadModeKey: String? = null
                 val nextPoller = DirectDebugRoundRobinPoller(
                     parameters = parameters,
@@ -595,7 +568,7 @@ class CollectorService : Service() {
     }
 
     private fun stopCollection(reason: String) {
-        stopMain(reason, disarmOffcar = false)
+        stopMain(reason)
         stopDebug(reason)
         releaseWakeLock()
         runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
@@ -626,7 +599,6 @@ class CollectorService : Service() {
         settings.setDebugPollingEnabled(false)
         settings.setMqttEnabled(false)
         settings.setInfluxEnabled(false)
-        deactivateMainObserver(disarmOffcar = true)
         cancelInfluxRetry()
         cancelTelegramTick()
         store.recordEvent(
@@ -643,7 +615,7 @@ class CollectorService : Service() {
         settings.setDebugPollingEnabled(false)
         settings.setMqttEnabled(false)
         settings.setInfluxEnabled(false)
-        stopMain("user_shutdown", disarmOffcar = true)
+        stopMain("user_shutdown")
         stopDebug("user_shutdown")
         disconnectOfflineAsync()
         cancelInfluxRetry()
@@ -699,8 +671,7 @@ class CollectorService : Service() {
         }
     }
 
-    private fun stopMain(reason: String, disarmOffcar: Boolean = false) {
-        deactivateMainObserver(disarmOffcar)
+    private fun stopMain(reason: String) {
         val wasPolling = poller.isRunning()
         if (wasPolling) poller.stop()
         mainPollingRunning.set(false)
@@ -718,62 +689,6 @@ class CollectorService : Service() {
         if (wasPolling || reason == "service_destroyed") {
             //publishes retained offline only after there was a real live mqtt runtime to retire
             disconnectOfflineAsync()
-        }
-    }
-
-    private fun activateMainObserver(openedSessionId: Long) {
-        synchronized(mainObserverLock) {
-            activeMainSessionId = openedSessionId
-            mainExpectedSinceElapsedMs = SystemClock.elapsedRealtime()
-            lastSuccessfulMainPollElapsedMs = null
-            lastMainHeartbeatAtElapsedMs = Long.MIN_VALUE
-        }
-        telegramReachabilityProbe.reset()
-    }
-
-    private fun heartbeatAfterPersistedMainPoll(observedSessionId: Long) {
-        synchronized(mainObserverLock) {
-            if (activeMainSessionId != observedSessionId) return
-            val nowElapsedMs = SystemClock.elapsedRealtime()
-            lastSuccessfulMainPollElapsedMs = nowElapsedMs
-            if (
-                lastMainHeartbeatAtElapsedMs != Long.MIN_VALUE &&
-                nowElapsedMs - lastMainHeartbeatAtElapsedMs < MAIN_HEARTBEAT_INTERVAL_MS
-            ) return
-            lastMainHeartbeatAtElapsedMs = nowElapsedMs
-            runCatching { offcarHelper.mainHeartbeat() }
-        }
-    }
-
-    private fun deactivateMainObserver(disarmOffcar: Boolean) {
-        if (disarmOffcar) {
-            telegramReachabilityProbe.resetAndRunAtomically {
-                deactivateMainObserverState(disarmOffcar = true)
-            }
-            return
-        }
-        deactivateMainObserverState(disarmOffcar = false)
-    }
-
-    private fun deactivateMainObserverState(disarmOffcar: Boolean) {
-        synchronized(mainObserverLock) {
-            activeMainSessionId = null
-            mainExpectedSinceElapsedMs = null
-            lastSuccessfulMainPollElapsedMs = null
-            lastMainHeartbeatAtElapsedMs = Long.MIN_VALUE
-            if (disarmOffcar) runCatching { offcarHelper.offcarDisarm() }
-        }
-    }
-
-    private fun telegramReachabilityMainPollState(): Pair<Boolean, Long?> {
-        return synchronized(mainObserverLock) {
-            val mainCollectionExpected = activeMainSessionId != null &&
-                settings.isPollingEnabled() &&
-                !settings.isMainManuallyStopped()
-            val since = lastSuccessfulMainPollElapsedMs ?: mainExpectedSinceElapsedMs
-            mainCollectionExpected to since?.let {
-                (SystemClock.elapsedRealtime() - it).coerceAtLeast(0L)
-            }
         }
     }
 
@@ -897,7 +812,6 @@ class CollectorService : Service() {
             debugRunning.set(false)
             return
         }
-        deactivateMainObserver(disarmOffcar = true)
         cancelInfluxRetry()
         if (!poller.stopAndJoin(2_000L)) error("Main poller did not stop for database maintenance")
         if (detachDebugPoller()?.shutdownAndAwait("database_maintenance", 2_000L) == false) {
@@ -1135,7 +1049,6 @@ class CollectorService : Service() {
         if (maintenanceBlocksRuntimeStart()) return
         if (!settings.isTelegramEnabled()) {
             cancelTelegramTick()
-            telegramReachabilityProbe.reset()
             executeTelegram("telegram_reset_error") {
                 telegramCoordinator.integrationDisabled()
             }
@@ -1150,8 +1063,7 @@ class CollectorService : Service() {
             if (unblockBlocked) telegramCoordinator.credentialsChanged()
             telegramCoordinator.tick(
                 mainCollectionExpected = settings.isPollingEnabled() && !settings.isMainManuallyStopped(),
-                lastError = lastTelegramPollError,
-                reachabilityMainPollState = ::telegramReachabilityMainPollState
+                lastError = lastTelegramPollError
             )
         }
         scheduleTelegramTick()
@@ -1691,12 +1603,7 @@ class CollectorService : Service() {
     private fun createTelegramCoordinator(): TelegramCoordinator {
         return TelegramCoordinator(
             store = store,
-            settings = settings,
-            client = TelegramHttpClient(
-                elapsedRealtimeMs = { SystemClock.elapsedRealtime() },
-                requestObserver = telegramReachabilityProbe::onRequest
-            ),
-            reachabilityProbe = telegramReachabilityProbe
+            settings = settings
         )
     }
 
@@ -1774,7 +1681,6 @@ class CollectorService : Service() {
         private const val STATUS_HEARTBEAT_INTERVAL_MS = 30_000L
         private const val ACCESS_SELF_CHECK_INTERVAL_MS = 5 * 60_000L
         private const val TELEGRAM_TICK_INTERVAL_MS = 15_000L
-        private const val MAIN_HEARTBEAT_INTERVAL_MS = 2_000L
         private const val INFLUX_MAINTENANCE_STOP_TIMEOUT_MS = 16_000L
         private const val TELEGRAM_MAINTENANCE_STOP_TIMEOUT_MS = 16_000L
         private const val USER_SHUTDOWN_STOP_TIMEOUT_MS = 16_000L
@@ -1786,7 +1692,6 @@ class CollectorService : Service() {
         private val debugRunning = AtomicBoolean(false)
         private val maintenanceRunningInProcess = AtomicBoolean(false)
         private val archiveStorageActiveInProcess = AtomicBoolean(false)
-        private val PROCESS_GENERATION = System.currentTimeMillis()
         val archiveShareLeaseRegistry = ArchiveShareLeaseRegistry(
             elapsedRealtimeMs = { SystemClock.elapsedRealtime() }
         )

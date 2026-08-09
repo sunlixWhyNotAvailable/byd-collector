@@ -40,7 +40,9 @@ class TelegramStorageCutoverStateTest {
             TelegramEventState(fullSent = true),
             TelegramEventState(lowVoltageSinceMs = 1L),
             TelegramEventState(lowVoltageSent = true),
-            TelegramEventState(telemetryOutageSent = true)
+            TelegramEventState(telemetryOutageSent = true),
+            TelegramEventState(bootTotalDistanceKm = 1.0),
+            TelegramEventState(bootTotalDurationMs = 60_000L)
         )
 
         assertTrue(blockers.all(TelegramEventState::hasDeferredStorageWork))

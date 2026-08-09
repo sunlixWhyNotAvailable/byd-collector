@@ -5,7 +5,9 @@ data class TelegramOutboxEntry(
     val dedupeKey: String,
     val eventType: String,
     val payload: String,
-    val attemptCount: Int
+    val attemptCount: Int,
+    val nextAttemptAtMs: Long,
+    val blocked: Boolean
 )
 
 data class TelegramEnqueueResult(

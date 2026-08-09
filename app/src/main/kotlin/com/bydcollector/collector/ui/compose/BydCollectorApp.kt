@@ -349,7 +349,14 @@ private val TelegramMessageDefinitions = listOf(
     ),
     TelegramMessageDefinition(
         TelegramMessageType.CHARGING_PROGRESS,
-        listOf("soc", "charge_added_percent", "charge_added_kwh", "battery_power_kw")
+        listOf(
+            "soc",
+            "charge_step_added_percent",
+            "charge_step_added_kwh",
+            "charge_added_percent",
+            "charge_added_kwh",
+            "battery_power_kw"
+        )
     ),
     TelegramMessageDefinition(
         TelegramMessageType.CHARGED_TO_100,
@@ -377,7 +384,17 @@ private val TelegramMessageDefinitions = listOf(
     ),
     TelegramMessageDefinition(
         TelegramMessageType.TRIP_SUMMARY,
-        listOf("trip_distance_km", "trip_energy_kwh", "trip_duration", "soc_start", "soc_end", "time")
+        listOf(
+            "trip_distance_km",
+            "trip_energy_kwh",
+            "trip_duration",
+            "soc_start",
+            "soc_end",
+            "total_distance_km",
+            "total_energy_kwh",
+            "total_duration",
+            "time"
+        )
     )
 )
 

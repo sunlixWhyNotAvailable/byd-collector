@@ -2,6 +2,8 @@ package com.bydcollector.collector.service
 
 import android.content.Context
 import com.bydcollector.collector.data.local.TelemetryStore
+import com.bydcollector.collector.telegram.TelegramBuiltInTemplates
+import com.bydcollector.collector.telegram.TelegramEventType
 import com.bydcollector.collector.ha.HaIntegrationCategories
 import com.bydcollector.collector.influx.InfluxConfig
 import com.bydcollector.collector.keepalive.KeepAliveConfig
@@ -24,6 +26,7 @@ class CollectorSettings(
 
     init {
         migrateTripEndDelayToSeconds()
+        migrateTelegramBuiltInTemplates()
         migrateLegacySecret(KEY_MQTT_USERNAME, SECRET_MQTT_USERNAME, KEY_MQTT_ENABLED)
         migrateLegacySecret(KEY_MQTT_PASSWORD, SECRET_MQTT_PASSWORD, KEY_MQTT_ENABLED)
         migrateLegacySecret(KEY_INFLUX_USERNAME, SECRET_INFLUX_USERNAME, KEY_INFLUX_ENABLED)
@@ -850,6 +853,21 @@ class CollectorSettings(
             .putInt(KEY_TELEGRAM_TRIP_END_DELAY_SECONDS, seconds)
             .remove(KEY_TELEGRAM_TRIP_END_DELAY)
             .commit()
+    }
+
+    private fun migrateTelegramBuiltInTemplates() {
+        val editor = prefs.edit()
+        var changed = false
+        listOf(TelegramEventType.CHARGING_PROGRESS, TelegramEventType.TRIP_SUMMARY).forEach { event ->
+            val key = "$KEY_TELEGRAM_TEMPLATE_PREFIX${event.key}"
+            val saved = runCatching { prefs.getString(key, null) }.getOrNull() ?: return@forEach
+            val migrated = TelegramBuiltInTemplates.migrateKnownSaved(event.key, saved)
+            if (migrated != saved) {
+                editor.putString(key, migrated)
+                changed = true
+            }
+        }
+        if (changed) editor.commit()
     }
 
     companion object {

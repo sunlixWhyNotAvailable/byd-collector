@@ -1,5 +1,6 @@
 package com.bydcollector.collector.ui.compose
 
+import com.bydcollector.collector.telegram.TelegramBuiltInTemplates
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
@@ -142,5 +143,30 @@ class BydCollectorStringsTest {
         assertEquals("Newest first", en.archiveSortNewestFirst)
         assertEquals("Oldest first", en.archiveSortOldestFirst)
         assertEquals("(%d arch.)", en.archiveCountShortTemplate)
+    }
+
+    @Test
+    fun telegramDefaultsAndVariableDescriptionsMatchApprovedPreview() {
+        val uk = strings(UiLanguage.UK).telegram
+        val en = strings(UiLanguage.EN).telegram
+
+        assertEquals(
+            TelegramBuiltInTemplates.CHARGING_PROGRESS_UK,
+            uk.messages.getValue(TelegramMessageType.CHARGING_PROGRESS).defaultTemplate
+        )
+        assertEquals(
+            TelegramBuiltInTemplates.CHARGING_PROGRESS_EN,
+            en.messages.getValue(TelegramMessageType.CHARGING_PROGRESS).defaultTemplate
+        )
+        assertEquals(
+            TelegramBuiltInTemplates.TRIP_SUMMARY_UK,
+            uk.messages.getValue(TelegramMessageType.TRIP_SUMMARY).defaultTemplate
+        )
+        assertEquals(
+            TelegramBuiltInTemplates.TRIP_SUMMARY_EN,
+            en.messages.getValue(TelegramMessageType.TRIP_SUMMARY).defaultTemplate
+        )
+        assertEquals("Доданий заряд за поточний крок, %", uk.variableDescriptions["charge_step_added_percent"])
+        assertEquals("Total trip duration", en.variableDescriptions["total_duration"])
     }
 }

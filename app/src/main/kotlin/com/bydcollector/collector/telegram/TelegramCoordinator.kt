@@ -14,26 +14,14 @@ class TelegramCoordinator(
     private val store: TelemetryStore,
     private val settings: CollectorSettings,
     private val client: TelegramHttpClient = TelegramHttpClient(),
-    private val reachabilityProbe: TelegramReachabilityProbe? = null,
     private val retryPolicy: TelegramRetryPolicy = TelegramRetryPolicy(),
     private val nowMs: () -> Long = System::currentTimeMillis
 ) {
     private var engine = TelegramEventEngine(TelegramEventState.fromJson(store.telegramRuntimeState()))
 
     fun onSuccessfulPoll(observations: List<NormalizedObservation>): Long? {
-        val previousTripId = engine.state.tripId
         val previousChargingActive = engine.state.chargingActive
         val result = engine.onSuccessfulPoll(observations, eventConfig(), nowMs())
-        if (result.state.tripId != null && result.state.tripId != previousTripId) {
-            val deleted = store.deleteUndeliveredTelegramMessages(TelegramEventType.TRIP_SUMMARY.key)
-            if (deleted > 0) {
-                store.recordEvent(
-                    "telegram_trip_summaries_discarded",
-                    "Undelivered trip summaries discarded when a new trip started",
-                    "count=$deleted"
-                )
-            }
-        }
         handle(result)
         if (result.state.chargingActive != previousChargingActive) {
             store.recordEvent(
@@ -42,14 +30,12 @@ class TelegramCoordinator(
                 "active=${result.state.chargingActive ?: "unknown"} source=${result.state.chargingEvidenceSource ?: "unknown"}"
             )
         }
-        return result.nextWakeAtMs
+        return nextWakeAt(result.nextWakeAtMs, pendingQueueDeadline())
     }
 
     fun tick(
         mainCollectionExpected: Boolean,
-        lastError: String?,
-        mainPollStaleMs: Long? = null,
-        reachabilityMainPollState: () -> Pair<Boolean, Long?> = { mainCollectionExpected to mainPollStaleMs }
+        lastError: String?
     ): Long? {
         val expired = store.pruneTelegramMessages(nowMs())
         if (expired > 0) {
@@ -61,15 +47,7 @@ class TelegramCoordinator(
         }
         val result = engine.onTick(eventConfig(), mainCollectionExpected, lastError, nowMs())
         handle(result)
-        flushPending()
-        if (Thread.currentThread().isInterrupted) return result.nextWakeAtMs
-        reachabilityProbe?.maybeProbe(
-            telegramEnabled = settings::isTelegramEnabled,
-            mainPollState = reachabilityMainPollState
-        ) {
-            client.getMe(settings.telegramBotToken())
-        }
-        return result.nextWakeAtMs
+        return nextWakeAt(result.nextWakeAtMs, flushPending())
     }
 
     fun testConnection(): TelegramSendResult {
@@ -104,44 +82,59 @@ class TelegramCoordinator(
     }
 
     fun integrationDisabled() {
-        reachabilityProbe?.reset()
         store.saveTelegramRuntimeState(engine.reset().toJson(), nowMs())
     }
 
-    fun flushPending() {
-        if (!settings.isTelegramEnabled()) return
+    fun flushPending(): Long? {
+        if (!settings.isTelegramEnabled()) return null
         val token = settings.telegramBotToken()
         val chatId = settings.telegramChatId()
-        if (token.isBlank() || chatId.isBlank()) return
-        for (entry in store.dueTelegramMessages(nowMs())) {
-            if (Thread.currentThread().isInterrupted) return
-            val attemptedAt = nowMs()
-            when (val result = client.sendMessage(TelegramSendMessage(token, chatId, entry.payload))) {
-                TelegramSendResult.Success -> {
-                    store.markTelegramDelivered(entry.id)
-                    store.recordEvent(
-                        "telegram_message_delivered",
-                        "Telegram message delivered",
-                        "event=${entry.eventType}"
-                    )
-                }
-                is TelegramSendResult.Failure -> {
-                    val error = failureCode(result)
-                    if (result.kind.retryable) {
-                        val delay = retryPolicy.delayForFailure(entry.attemptCount + 1, result.retryAfterSeconds)
-                        store.markTelegramRetry(entry.id, error, attemptedAt, attemptedAt + delay)
-                    } else {
-                        store.markTelegramBlocked(entry.id, error, attemptedAt)
+        if (token.isBlank() || chatId.isBlank()) return null
+        val entry = store.oldestTelegramMessage() ?: return null
+        if (entry.blocked) return null
+        val now = nowMs()
+        if (entry.nextAttemptAtMs > now) return entry.nextAttemptAtMs
+        if (Thread.currentThread().isInterrupted) return entry.nextAttemptAtMs
+        val attemptedAt = nowMs()
+        return when (val result = client.sendMessage(TelegramSendMessage(token, chatId, entry.payload))) {
+            TelegramSendResult.Success -> {
+                store.markTelegramDelivered(entry.id)
+                store.recordEvent(
+                    "telegram_message_delivered",
+                    "Telegram message delivered",
+                    "event=${entry.eventType}"
+                )
+                store.delayOldestTelegramMessageUntil(nowMs() + BACKLOG_SUCCESS_DELAY_MS)
+            }
+            is TelegramSendResult.Failure -> {
+                val error = failureCode(result)
+                val nextAttemptAtMs = if (result.kind.retryable) {
+                    val delay = retryPolicy.delayForFailure(entry.attemptCount + 1, result.retryAfterSeconds)
+                    (attemptedAt + delay).also {
+                        store.markTelegramRetry(entry.id, error, attemptedAt, it)
                     }
-                    store.recordEvent(
-                        "telegram_message_failed",
-                        "Telegram message delivery failed",
-                        "event=${entry.eventType} ${failureDetail(result)}"
-                    )
-                    break
+                } else {
+                    store.markTelegramBlocked(entry.id, error, attemptedAt)
+                    null
                 }
+                store.recordEvent(
+                    "telegram_message_failed",
+                    "Telegram message delivery failed",
+                    "event=${entry.eventType} ${failureDetail(result)}"
+                )
+                nextAttemptAtMs
             }
         }
+    }
+
+    private fun pendingQueueDeadline(): Long? {
+        if (!settings.isTelegramEnabled()) return null
+        if (settings.telegramBotToken().isBlank() || settings.telegramChatId().isBlank()) return null
+        return store.oldestTelegramMessage()?.takeUnless { it.blocked }?.nextAttemptAtMs
+    }
+
+    private fun nextWakeAt(eventDeadlineAtMs: Long?, queueDeadlineAtMs: Long?): Long? {
+        return listOfNotNull(eventDeadlineAtMs, queueDeadlineAtMs).minOrNull()
     }
 
     private fun handle(result: TelegramEventResult) {
@@ -218,5 +211,9 @@ class TelegramCoordinator(
         return "kind=${result.kind.name.lowercase()} " +
             "status=${result.httpStatus ?: "none"} " +
             "exception=${result.exceptionClass ?: "none"}"
+    }
+
+    private companion object {
+        const val BACKLOG_SUCCESS_DELAY_MS = 5_000L
     }
 }

@@ -110,6 +110,8 @@ class CollectorHelperDaemonBatchTest {
             assertEquals(3, assets.size)
             assertEquals(23177, whitelist.size)
             assertEquals(23096, debugAddresses.size)
+            assertEquals(CollectorHelperProtocol.MAX_BATCH_SIZE, debugAddresses.size)
+            assertNull(CollectorHelperDaemon.validateRows(debugAddresses, whitelist))
             assets.forEach { asset ->
                 val shard = DirectDebugParameterAsset.parse(asset.readText(Charsets.UTF_8))
                     .map { address(it.tx, it.dev, it.fid) }
@@ -131,7 +133,7 @@ class CollectorHelperDaemonBatchTest {
     }
 
     @Test
-    fun everyRoundRobinShardFitsClientGateAndOversizedBatchIsRejectedByDaemonBoundary() {
+    fun completeRoundRobinCatalogFitsOneRequestAndAboveMaxIsRejected() {
         val assets = DirectDebugParameterAsset.ASSET_NAMES.map(::assetFile)
         val client = sourceFile("com/bydcollector/collector/data/direct/DirectVehicleHelperClient.kt").readText()
         val daemon = sourceFile("com/bydcollector/collector/direct/CollectorHelperDaemon.java").readText()
@@ -139,8 +141,8 @@ class CollectorHelperDaemonBatchTest {
 
         assertEquals(listOf(7699, 7699, 7698), shardSizes)
         assertEquals(23096, shardSizes.sum())
-        assertTrue(shardSizes.all { it <= CollectorHelperProtocol.MAX_BATCH_SIZE })
-        assertEquals(10000, CollectorHelperProtocol.MAX_BATCH_SIZE)
+        assertEquals(shardSizes.sum(), CollectorHelperProtocol.MAX_BATCH_SIZE)
+        assertEquals(23_096, CollectorHelperProtocol.MAX_BATCH_SIZE)
         assertTrue(client.contains("entries.isEmpty() || entries.size > CollectorHelperProtocol.MAX_BATCH_SIZE"))
         assertTrue(client.contains("return synchronized(lock)"))
         assertTrue(client.contains("data.writeInt(entries.size)"))
@@ -154,9 +156,32 @@ class CollectorHelperDaemonBatchTest {
         )
         assertTrue(gateIndex < writeCountIndex)
         assertTrue(writeCountIndex < transactIndex)
-        assertTrue(10001 > CollectorHelperProtocol.MAX_BATCH_SIZE)
+        assertTrue(23_097 > CollectorHelperProtocol.MAX_BATCH_SIZE)
         assertTrue(daemon.contains("if (count < 1 || count > CollectorHelperProtocol.MAX_BATCH_SIZE)"))
         assertTrue(daemon.contains("throw new IllegalArgumentException(\"invalid batch size: \" + count)"))
+    }
+
+    @Test
+    fun protocolV4RejectsStaleHelpersAndExposesReadOnlyEndpointsOnly() {
+        val protocol = sourceFile("com/bydcollector/collector/direct/CollectorHelperProtocol.java").readText()
+        val daemon = sourceFile("com/bydcollector/collector/direct/CollectorHelperDaemon.java").readText()
+        val client = sourceFile("com/bydcollector/collector/data/direct/DirectVehicleHelperClient.kt").readText()
+
+        assertEquals(4, CollectorHelperProtocol.PROTOCOL_VERSION)
+        assertTrue(client.contains("ping.raw == CollectorHelperProtocol.PROTOCOL_VERSION"))
+        assertTrue(client.contains("TX_PING"))
+        assertTrue(client.contains("TX_READ"))
+        assertTrue(client.contains("TX_READ_BATCH"))
+        assertTrue(!protocol.contains("HEARTBEAT", ignoreCase = true))
+        assertTrue(!protocol.contains("DISARM", ignoreCase = true))
+        assertTrue(!daemon.contains("offcar", ignoreCase = true))
+        assertTrue(!client.contains("transactControl"))
+        assertTrue(!protocol.contains("TX_WRITE"))
+        assertTrue(!daemon.contains("sendCmd"))
+        assertTrue(!daemon.contains("setXD"))
+        assertTrue(!daemon.contains("setTrigger"))
+        assertTrue(!daemon.contains("wakeUpMcu"))
+        assertTrue(!daemon.contains("setAction"))
     }
 
     private fun address(tx: Int, dev: Int, fid: Int) = CollectorHelperDaemon.Address(tx, dev, fid)

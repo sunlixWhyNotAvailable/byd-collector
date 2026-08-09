@@ -7,16 +7,15 @@ import kotlin.test.assertTrue
 
 class TelegramRuntimeContractTest {
     @Test
-    fun newTripDiscardsOnlyUndeliveredTripSummariesBeforeStateHandling() {
+    fun newTripsPreserveEveryQueuedTripSummary() {
         val coordinator = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
         val poll = coordinator.substringAfter("fun onSuccessfulPoll")
             .substringBefore("fun tick")
         val store = sourceFile("com/bydcollector/collector/data/local/TelemetryStore.kt").readText()
 
-        assertInOrder(poll, "val previousTripId", "deleteUndeliveredTelegramMessages")
-        assertInOrder(poll, "deleteUndeliveredTelegramMessages", "handle(result)")
-        assertTrue(poll.contains("TelegramEventType.TRIP_SUMMARY.key"))
-        assertTrue(store.contains("\"event_type = ?\""))
+        assertTrue(poll.contains("handle(result)"))
+        assertFalse(coordinator.contains("deleteUndeliveredTelegramMessages"))
+        assertFalse(store.contains("fun deleteUndeliveredTelegramMessages"))
         assertTrue(coordinator.contains("telegramTripEndDelaySeconds() * 1_000L"))
     }
 
@@ -40,8 +39,9 @@ class TelegramRuntimeContractTest {
         assertTrue(engine.contains("nextWakeAtMs: Long?"))
         assertTrue(engine.contains("pendingTripDeadline(config)"))
         assertTrue(coordinator.contains("fun onSuccessfulPoll(observations: List<NormalizedObservation>): Long?"))
-        assertTrue(coordinator.contains("reachabilityMainPollState: () -> Pair<Boolean, Long?>"))
-        assertTrue(coordinator.contains("return result.nextWakeAtMs"))
+        assertTrue(coordinator.contains("nextWakeAt(result.nextWakeAtMs, pendingQueueDeadline())"))
+        assertTrue(coordinator.contains("nextWakeAt(result.nextWakeAtMs, flushPending())"))
+        assertTrue(coordinator.contains("listOfNotNull(eventDeadlineAtMs, queueDeadlineAtMs).minOrNull()"))
         assertTrue(service.contains("private fun scheduleTelegramTick(deadlineAtMs: Long? = null)"))
         assertTrue(schedule.contains("maintenanceBlocksRuntimeStart()"))
         assertTrue(tickTask.contains("maintenanceBlocksRuntimeStart()"))
@@ -74,24 +74,70 @@ class TelegramRuntimeContractTest {
     }
 
     @Test
-    fun flushStopsBetweenRequestsWhenMaintenanceInterruptsTheWorker() {
+    fun outboxFlushIsStrictHeadOfLineAndAttemptsOnlyOncePerTick() {
         val coordinator = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
-        val probe = sourceFile("com/bydcollector/collector/telegram/TelegramReachabilityProbe.kt").readText()
-        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
-        val flush = coordinator.substringAfter("fun flushPending").substringBefore("private fun handle")
-        val mainPollState = service.substringAfter("private fun telegramReachabilityMainPollState")
-            .substringBefore("private fun exportInfluxAfterNormalizedWrite")
+        val store = sourceFile("com/bydcollector/collector/data/local/TelemetryStore.kt").readText()
+        val flush = coordinator.substringAfter("fun flushPending").substringBefore("private fun pendingQueueDeadline")
+        val oldest = store.substringAfter("fun oldestTelegramMessage")
+            .substringBefore("fun delayOldestTelegramMessageUntil")
+        val snapshot = store.substringAfter("fun telegramQueueSnapshot")
+            .substringBefore("fun telegramRuntimeState")
+        val connectionTest = coordinator.substringAfter("fun testConnection")
+            .substringBefore("fun credentialsChanged")
+        val credentialsChanged = coordinator.substringAfter("fun credentialsChanged")
+            .substringBefore("fun integrationDisabled")
 
-        assertInOrder(flush, "for (entry in store.dueTelegramMessages(nowMs()))", "Thread.currentThread().isInterrupted")
+        assertTrue(oldest.contains("ORDER BY id"))
+        assertTrue(oldest.contains("LIMIT 1"))
+        assertFalse(oldest.contains("WHERE blocked = 0"))
+        assertInOrder(flush, "store.oldestTelegramMessage()", "if (entry.blocked) return null")
+        assertInOrder(flush, "entry.nextAttemptAtMs > now", "Thread.currentThread().isInterrupted")
         assertInOrder(flush, "Thread.currentThread().isInterrupted", "client.sendMessage")
-        assertInOrder(coordinator, "flushPending()", "if (Thread.currentThread().isInterrupted) return result.nextWakeAtMs")
-        assertInOrder(coordinator, "if (Thread.currentThread().isInterrupted) return result.nextWakeAtMs", "reachabilityProbe?.maybeProbe(")
-        assertInOrder(probe, "val reservation = synchronized(this)", "val (mainCollectionExpected, mainPollStaleMs) = mainPollState()")
-        assertInOrder(probe, "val (mainCollectionExpected, mainPollStaleMs) = mainPollState()", "lastProbeAtMs = nowElapsedMs")
-        assertTrue(coordinator.contains("mainPollState = reachabilityMainPollState"))
-        assertTrue(service.contains("reachabilityMainPollState = ::telegramReachabilityMainPollState"))
-        assertTrue(mainPollState.contains("synchronized(mainObserverLock)"))
-        assertTrue(mainPollState.contains("activeMainSessionId != null"))
+        assertFalse(flush.contains("for ("))
+        assertTrue(flush.contains("entry.attemptCount + 1, result.retryAfterSeconds"))
+        assertTrue(flush.contains("store.markTelegramBlocked"))
+        assertTrue(flush.contains("store.delayOldestTelegramMessageUntil(nowMs() + BACKLOG_SUCCESS_DELAY_MS)"))
+        assertTrue(coordinator.contains("BACKLOG_SUCCESS_DELAY_MS = 5_000L"))
+        assertInOrder(snapshot, "SELECT CASE WHEN blocked = 0 THEN next_attempt_at_ms END", "ORDER BY id")
+        assertTrue(store.contains("TELEGRAM_MAX_PENDING = 1_000L"))
+        assertTrue(store.contains("TELEGRAM_RETENTION_MS = 30L * 24L * 60L * 60L * 1_000L"))
+        assertInOrder(connectionTest, "client.sendMessage", "store.unblockTelegramMessages(nowMs())")
+        assertTrue(credentialsChanged.contains("store.unblockTelegramMessages(nowMs())"))
+    }
+
+    @Test
+    fun successPacingSurvivesABlockedHeadBeingUnblocked() {
+        val coordinator = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
+        val store = sourceFile("com/bydcollector/collector/data/local/TelemetryStore.kt").readText()
+        val flush = coordinator.substringAfter("fun flushPending").substringBefore("private fun pendingQueueDeadline")
+        val pace = store.substringAfter("fun delayOldestTelegramMessageUntil")
+            .substringBefore("fun pruneTelegramMessages")
+        val unblock = store.substringAfter("fun unblockTelegramMessages")
+            .substringBefore("fun telegramQueueSnapshot")
+
+        assertInOrder(flush, "store.markTelegramDelivered(entry.id)", "nowMs() + BACKLOG_SUCCESS_DELAY_MS")
+        assertTrue(pace.contains("maxOf(entry.nextAttemptAtMs, minimumAttemptAtMs)"))
+        assertFalse(pace.contains("if (entry.blocked) return null"))
+        assertTrue(pace.contains("return nextAttemptAtMs.takeUnless { entry.blocked }"))
+        assertTrue(unblock.contains("next_attempt_at_ms = MAX(next_attempt_at_ms, ?)"))
+        assertFalse(unblock.contains("put(\"next_attempt_at_ms\", nowMs)"))
+    }
+
+    @Test
+    fun serviceKeepsTheIdleTickAndRemovesReachabilityAndOffcarWiring() {
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val coordinator = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
+        val client = sourceFile("com/bydcollector/collector/telegram/TelegramHttpClient.kt").readText()
+
+        assertTrue(service.contains("TELEGRAM_TICK_INTERVAL_MS = 15_000L"))
+        assertTrue(service.contains("DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT"))
+        assertFalse(service.contains("TelegramReachabilityProbe"))
+        assertFalse(service.contains("telegram_reachability"))
+        assertFalse(service.contains("mainHeartbeat"))
+        assertFalse(service.contains("offcarDisarm"))
+        assertFalse(coordinator.contains("getMe"))
+        assertFalse(client.contains("getMe"))
+        assertFalse(client.contains("TelegramRequestEvidence"))
     }
 
     private fun sourceFile(path: String): File {

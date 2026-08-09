@@ -126,7 +126,7 @@ class DirectDebugRoundRobinPollerTest {
         assertEquals(listOf(7_699, 7_699, 7_698), shards.map { it.size })
         assertEquals(23_096, rows.size)
         assertEquals(7_699, DirectDebugParameterAsset.MAX_SHARD_SIZE)
-        assertTrue(shards.all { it.size <= com.bydcollector.collector.direct.CollectorHelperProtocol.MAX_BATCH_SIZE })
+        assertEquals(rows.size, com.bydcollector.collector.direct.CollectorHelperProtocol.MAX_BATCH_SIZE)
         assets.forEach { asset ->
             assertEquals(DirectDebugParameterAsset.EXPECTED_HEADER, asset.useLines(Charsets.UTF_8) { it.first().split(",") })
         }
@@ -172,17 +172,15 @@ class DirectDebugRoundRobinPollerTest {
     }
 
     @Test
-    fun generatedShardsHaveExactCursorCoverage() {
+    fun generatedShardsFlattenIntoOneCompleteHelperBatch() {
         val rows = debugAssetFiles().flatMap { DirectDebugParameterAsset.parse(it.readText(Charsets.UTF_8)) }
         val cursor = DirectDebugRoundRobinCursor(rows)
-        val batches = List(DirectDebugParameterAsset.SHARD_COUNT) {
-            cursor.nextBatch(DirectDebugParameterAsset.MAX_SHARD_SIZE)
-        }
+        val batch = cursor.nextBatch(DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT)
 
-        assertEquals(DirectDebugParameterAsset.EXPECTED_SHARD_SIZES, batches.map { it.size })
-        assertEquals(rows.map { it.key }, batches.flatten().map { it.key })
-        assertEquals(rows.size, batches.flatten().map { Triple(it.dev, it.fid, it.tx) }.distinct().size)
-        assertEquals(batches.first().map { it.key }, cursor.nextBatch(DirectDebugParameterAsset.MAX_SHARD_SIZE).map { it.key })
+        assertEquals(23_096, batch.size)
+        assertEquals(rows.map { it.key }, batch.map { it.key })
+        assertEquals(rows.size, batch.map { Triple(it.dev, it.fid, it.tx) }.distinct().size)
+        assertEquals(batch.map { it.key }, cursor.nextBatch(DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT).map { it.key })
     }
 
     private fun debugAssetFiles(): List<File> = DirectDebugParameterAsset.ASSET_NAMES.map { name ->

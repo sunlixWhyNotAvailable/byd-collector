@@ -23,6 +23,44 @@ data class TelegramTemplateSpec(
     val allowedVariables: Set<String>
 )
 
+object TelegramBuiltInTemplates {
+    const val CHARGING_PROGRESS_UK =
+        "Заряд: {soc}%\nЗа крок: +{charge_step_added_percent}% / +{charge_step_added_kwh} кВт·год\nЗа сесію: +{charge_added_percent}% / +{charge_added_kwh} кВт·год"
+    const val CHARGING_PROGRESS_EN =
+        "Charge: {soc}%\nThis step: +{charge_step_added_percent}% / +{charge_step_added_kwh} kWh\nSession total: +{charge_added_percent}% / +{charge_added_kwh} kWh"
+    const val TRIP_SUMMARY_UK =
+        "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\nВитрата: {trip_energy_kwh} кВт·год, SOC: {soc_start}% -> {soc_end}%\nЗагалом: {total_distance_km} км / {total_duration}\nВитрата: {total_energy_kwh} кВт·год"
+    const val TRIP_SUMMARY_EN =
+        "Trip complete\nCurrent trip: {trip_distance_km} km / {trip_duration}\nEnergy used: {trip_energy_kwh} kWh, SOC: {soc_start}% -> {soc_end}%\nTotal: {total_distance_km} km / {total_duration}\nEnergy used: {total_energy_kwh} kWh"
+
+    fun migrateKnownSaved(eventKey: String, template: String): String = when (eventKey) {
+        TelegramEventType.CHARGING_PROGRESS.key -> when (template) {
+            OLD_CHARGING_PROGRESS_UK -> CHARGING_PROGRESS_UK
+            OLD_CHARGING_PROGRESS_EN, OLD_CHARGING_PROGRESS_RUNTIME -> CHARGING_PROGRESS_EN
+            else -> template
+        }
+        TelegramEventType.TRIP_SUMMARY.key -> when (template) {
+            OLD_TRIP_SUMMARY_UK -> TRIP_SUMMARY_UK
+            OLD_TRIP_SUMMARY_EN, OLD_TRIP_SUMMARY_RUNTIME -> TRIP_SUMMARY_EN
+            else -> template
+        }
+        else -> template
+    }
+
+    private const val OLD_CHARGING_PROGRESS_UK =
+        "Заряд: {soc}%\nДодано: {charge_added_percent}% / {charge_added_kwh} кВт·год"
+    private const val OLD_CHARGING_PROGRESS_EN =
+        "Charge: {soc}%\nAdded: {charge_added_percent}% / {charge_added_kwh} kWh"
+    private const val OLD_CHARGING_PROGRESS_RUNTIME =
+        "Charging progress: {soc}% (+{charge_added_percent}%, {charge_added_kwh} kWh), {battery_power_kw} kW."
+    private const val OLD_TRIP_SUMMARY_UK =
+        "Поїздку завершено\nВідстань: {trip_distance_km} км за {trip_duration}\nSOC: {soc_start}% -> {soc_end}%\nЕнергія: {trip_energy_kwh} кВт·год"
+    private const val OLD_TRIP_SUMMARY_EN =
+        "Trip complete\nDistance: {trip_distance_km} km in {trip_duration}\nSOC: {soc_start}% -> {soc_end}%\nEnergy: {trip_energy_kwh} kWh"
+    private const val OLD_TRIP_SUMMARY_RUNTIME =
+        "Trip complete: {trip_distance_km} km, {trip_energy_kwh} kWh at {time}."
+}
+
 object TelegramTemplateCatalog {
     private val specs = mapOf(
         TelegramEventType.CHARGING_STARTED to TelegramTemplateSpec(
@@ -30,8 +68,15 @@ object TelegramTemplateCatalog {
             setOf("soc", "battery_power_kw", "time")
         ),
         TelegramEventType.CHARGING_PROGRESS to TelegramTemplateSpec(
-            "Charging progress: {soc}% (+{charge_added_percent}%, {charge_added_kwh} kWh), {battery_power_kw} kW.",
-            setOf("soc", "charge_added_percent", "charge_added_kwh", "battery_power_kw")
+            TelegramBuiltInTemplates.CHARGING_PROGRESS_EN,
+            setOf(
+                "soc",
+                "charge_step_added_percent",
+                "charge_step_added_kwh",
+                "charge_added_percent",
+                "charge_added_kwh",
+                "battery_power_kw"
+            )
         ),
         TelegramEventType.CHARGED_TO_100 to TelegramTemplateSpec(
             "Charging complete: {soc}%, {remaining_energy_kwh} kWh remaining, range {range_km} km at {time}.",
@@ -58,8 +103,18 @@ object TelegramTemplateCatalog {
             setOf("last_data_time", "error", "time")
         ),
         TelegramEventType.TRIP_SUMMARY to TelegramTemplateSpec(
-            "Trip complete: {trip_distance_km} km, {trip_energy_kwh} kWh at {time}.",
-            setOf("trip_distance_km", "trip_energy_kwh", "trip_duration", "soc_start", "soc_end", "time")
+            TelegramBuiltInTemplates.TRIP_SUMMARY_EN,
+            setOf(
+                "trip_distance_km",
+                "trip_energy_kwh",
+                "trip_duration",
+                "soc_start",
+                "soc_end",
+                "total_distance_km",
+                "total_energy_kwh",
+                "total_duration",
+                "time"
+            )
         )
     )
 
