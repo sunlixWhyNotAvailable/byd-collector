@@ -102,56 +102,75 @@ class DbMaintenanceCoordinator(
         val archiveRoot = File(context.filesDir, "db_archive")
         val archiveTimestamp = timestamp()
         val archiveDirectory = DatabaseArchiveManager.plannedArchiveDirectory(databaseFile, archiveRoot, archiveTimestamp)
-        runCatching {
-            settings.setStorageCutoverJournal(
-                StorageCutoverJournal(
-                    TelemetryDatabaseHelper.SCHEMA_FAMILY,
-                    archiveDirectory.absolutePath,
-                    PHASE_ARCHIVING,
-                    sourceFormat
-                )
-            )
-        }.onFailure {
+        val journal = StorageCutoverJournal(
+            TelemetryDatabaseHelper.SCHEMA_FAMILY,
+            archiveDirectory.absolutePath,
+            PHASE_ARCHIVING,
+            sourceFormat
+        )
+        if (!runCatching { settings.setStorageCutoverJournal(journal) }.getOrDefault(false)) {
             reopenMainAndVerifyRestored(databaseFile)
-            throw it
+            throw TerminalArchiveFailure("Cannot persist database cutover journal before archive")
         }
         val archive = DatabaseArchiveManager.archive(databaseFile, archiveRoot, archiveTimestamp)
         if (!archive.ok) {
             if (!archive.rollbackOk || !databaseFile.exists()) {
                 throw TerminalArchiveFailure("Database archive failed and original database was not restored: ${archive.error ?: "unknown"}")
             }
+            if (StorageFormatCutoverCoordinator.detectMain(databaseFile) != sourceFormat ||
+                !verifyWritableDatabaseFile(databaseFile)
+            ) {
+                throw TerminalArchiveFailure("Database archive failed and original database was not restored: ${archive.error ?: "unknown"}")
+            }
             reopenMainAndVerifyRestored(databaseFile)
-            settings.clearStorageCutoverJournal()
+            if (!runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)) {
+                throw TerminalArchiveFailure("Cannot clear database cutover journal after archive failure")
+            }
             error(archive.error ?: "Database archive failed")
+        }
+        if (!StorageFormatCutoverCoordinator.verifyArchivedSource(
+                TelemetryDatabaseHelper.SCHEMA_FAMILY,
+                databaseFile,
+                archiveDirectory,
+                sourceFormat
+            )
+        ) {
+            rollbackMain(databaseFile, archive, IllegalStateException("Archived source verification failed"))
         }
 
         publish(operation, 4)
         val createFailure = runCatching {
-            settings.setStorageCutoverJournal(
+            check(settings.setStorageCutoverJournal(
                 StorageCutoverJournal(
                     TelemetryDatabaseHelper.SCHEMA_FAMILY,
                     archiveDirectory.absolutePath,
                     PHASE_CREATING,
                     sourceFormat
                 )
-            )
+            )) { "Cannot persist database creation journal" }
             val newStore = application.reopenTelemetryStoreForMaintenance()
             onStoreReopened(newStore)
             publish(operation, 5)
-            settings.setStorageCutoverJournal(
+            check(settings.setStorageCutoverJournal(
                 StorageCutoverJournal(
                     TelemetryDatabaseHelper.SCHEMA_FAMILY,
                     archiveDirectory.absolutePath,
                     PHASE_VERIFYING,
                     sourceFormat
                 )
-            )
+            )) { "Cannot persist database verification journal" }
             check(newStore.verifyWritableDatabase()) { "New database quick_check failed" }
         }.exceptionOrNull()
         if (createFailure != null) rollbackMain(databaseFile, archive, createFailure)
 
-        settings.clearStorageCutoverJournal()
+        if (!runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)) {
+            throw RuntimeException("Cannot clear database cutover journal after successful archive")
+        }
         return DbMaintenanceResult(true, "Database archived", archive.archiveDirectory.absolutePath)
+    }
+
+    private fun verifyWritableDatabaseFile(databaseFile: File): Boolean {
+        return StorageFormatCutoverCoordinator.verifyDatabaseQuickCheck(databaseFile)
     }
 
     private fun rollbackMain(
@@ -168,8 +187,10 @@ class DbMaintenanceCoordinator(
             throw TerminalArchiveFailure("Database archive restore was incomplete after new database failure: ${cause.message ?: cause::class.java.simpleName}")
         }
         reopenMainAndVerifyRestored(databaseFile)
+        if (!runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)) {
+            throw TerminalArchiveFailure("Cannot clear database rollback journal after restore")
+        }
         archive.archiveDirectory.takeIf { it.listFiles().orEmpty().isEmpty() }?.delete()
-        settings.clearStorageCutoverJournal()
         throw RuntimeException(cause.message ?: "New database verification failed", cause)
     }
 
@@ -206,54 +227,69 @@ class DbMaintenanceCoordinator(
         val archiveRoot = File(context.filesDir, "db_archive")
         val archiveTimestamp = timestamp()
         val archiveDirectory = DatabaseArchiveManager.plannedArchiveDirectory(databaseFile, archiveRoot, archiveTimestamp)
-        runCatching {
-            settings.setStorageCutoverJournal(
-                StorageCutoverJournal(
-                    DirectDebugDatabaseHelper.SCHEMA_FAMILY,
-                    archiveDirectory.absolutePath,
-                    PHASE_ARCHIVING,
-                    sourceFormat
-                )
-            )
-        }.onFailure {
+        val journal = StorageCutoverJournal(
+            DirectDebugDatabaseHelper.SCHEMA_FAMILY,
+            archiveDirectory.absolutePath,
+            PHASE_ARCHIVING,
+            sourceFormat
+        )
+        if (!runCatching { settings.setStorageCutoverJournal(journal) }.getOrDefault(false)) {
             reopenDebugAndVerifyRestored(databaseFile)
-            throw it
+            throw TerminalArchiveFailure("Cannot persist debug database cutover journal before archive")
         }
         val archive = DatabaseArchiveManager.archive(databaseFile, archiveRoot, archiveTimestamp)
         if (!archive.ok) {
             if (!archive.rollbackOk || !databaseFile.exists()) {
                 throw TerminalArchiveFailure("Debug database archive failed and original database was not restored: ${archive.error ?: "unknown"}")
             }
+            if (StorageFormatCutoverCoordinator.detectDebug(databaseFile) != sourceFormat ||
+                !verifyWritableDatabaseFile(databaseFile)
+            ) {
+                throw TerminalArchiveFailure("Debug database archive failed and original database was not restored: ${archive.error ?: "unknown"}")
+            }
             reopenDebugAndVerifyRestored(databaseFile)
-            settings.clearStorageCutoverJournal()
+            if (!runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)) {
+                throw TerminalArchiveFailure("Cannot clear debug database cutover journal after archive failure")
+            }
             error(archive.error ?: "Debug database archive failed")
+        }
+        if (!StorageFormatCutoverCoordinator.verifyArchivedSource(
+                DirectDebugDatabaseHelper.SCHEMA_FAMILY,
+                databaseFile,
+                archiveDirectory,
+                sourceFormat
+            )
+        ) {
+            rollbackDebug(databaseFile, archive, IllegalStateException("Archived debug source verification failed"))
         }
 
         publish(operation, 4)
         val createFailure = runCatching {
-            settings.setStorageCutoverJournal(
+            check(settings.setStorageCutoverJournal(
                 StorageCutoverJournal(
                     DirectDebugDatabaseHelper.SCHEMA_FAMILY,
                     archiveDirectory.absolutePath,
                     PHASE_CREATING,
                     sourceFormat
                 )
-            )
+            )) { "Cannot persist debug database creation journal" }
             val newStore = reopenDebugAndRebind()
             publish(operation, 5)
-            settings.setStorageCutoverJournal(
+            check(settings.setStorageCutoverJournal(
                 StorageCutoverJournal(
                     DirectDebugDatabaseHelper.SCHEMA_FAMILY,
                     archiveDirectory.absolutePath,
                     PHASE_VERIFYING,
                     sourceFormat
                 )
-            )
+            )) { "Cannot persist debug database verification journal" }
             check(newStore.verifyWritableDatabase()) { "New debug database quick_check failed" }
         }.exceptionOrNull()
         if (createFailure != null) rollbackDebug(databaseFile, archive, createFailure)
 
-        settings.clearStorageCutoverJournal()
+        if (!runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)) {
+            throw RuntimeException("Cannot clear debug database cutover journal after successful archive")
+        }
         return DbMaintenanceResult(true, "Debug database archived", archive.archiveDirectory.absolutePath)
     }
 
@@ -271,8 +307,10 @@ class DbMaintenanceCoordinator(
             throw TerminalArchiveFailure("Debug database archive restore was incomplete after new database failure: ${cause.message ?: cause::class.java.simpleName}")
         }
         reopenDebugAndVerifyRestored(databaseFile)
+        if (!runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)) {
+            throw TerminalArchiveFailure("Cannot clear debug rollback journal after restore")
+        }
         archive.archiveDirectory.takeIf { it.listFiles().orEmpty().isEmpty() }?.delete()
-        settings.clearStorageCutoverJournal()
         throw RuntimeException(cause.message ?: "New debug database verification failed", cause)
     }
 
@@ -299,7 +337,9 @@ class DbMaintenanceCoordinator(
 
     private fun markRollbackPhase() {
         val journal = checkNotNull(settings.storageCutoverJournal()) { "Database rollback journal is missing" }
-        settings.setStorageCutoverJournal(journal.copy(phase = PHASE_ROLLBACK))
+        check(runCatching { settings.setStorageCutoverJournal(journal.copy(phase = PHASE_ROLLBACK)) }.getOrDefault(false)) {
+            "Cannot persist database rollback journal"
+        }
     }
 
     private fun deleteExactNewDatabaseSet(databaseFile: File): Boolean {

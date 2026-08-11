@@ -100,14 +100,25 @@ class StorageFormatCutoverContractTest {
 
         assertTrue(maintenance.contains("val sourceFormat = StorageFormatCutoverCoordinator.detectMain(databaseFile)"))
         assertTrue(maintenance.contains("val sourceFormat = StorageFormatCutoverCoordinator.detectDebug(databaseFile)"))
-        assertTrue(maintenance.contains("PHASE_ARCHIVING,\n                    sourceFormat"))
-        assertTrue(maintenance.contains("PHASE_CREATING,\n                    sourceFormat"))
-        assertTrue(maintenance.contains("PHASE_VERIFYING,\n                    sourceFormat"))
+        assertTrue(maintenance.contains("val journal = StorageCutoverJournal("))
+        assertTrue(maintenance.contains("PHASE_ARCHIVING"))
+        assertTrue(maintenance.contains("PHASE_CREATING"))
+        assertTrue(maintenance.contains("PHASE_VERIFYING"))
         assertTrue(recovery.contains("activeFormat == journal.sourceFormat && archivedFiles.isEmpty()"))
         assertTrue(recovery.contains("formatMatches(family, archivedDatabase, journal.sourceFormat)"))
         assertTrue(recovery.contains("formatMatches(family, databaseFile, journal.sourceFormat)"))
         assertTrue(settings.contains("KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT"))
         assertTrue(settings.contains("journal.sourceFormat.name"))
+        assertTrue(settings.contains("runCatching { journalKeys.none(prefs::contains) }.getOrDefault(false)"))
+        assertTrue(settings.contains("fun journalString(key: String): String? = runCatching { prefs.getString(key, null) }.getOrNull()"))
+        assertTrue(settings.contains("runCatching { StorageFormat.valueOf(it) }.getOrNull()"))
+        assertTrue(settings.contains("?: StorageFormat.UNKNOWN"))
+        assertInOrder(
+            recovery,
+            "journal.family !in setOf(MAIN_FAMILY, DEBUG_FAMILY)",
+            "journal.phase !in setOf(PHASE_ARCHIVING, PHASE_CREATING, PHASE_VERIFYING, PHASE_ROLLBACK)",
+            "journal.family != family"
+        )
     }
 
     @Test
@@ -120,8 +131,10 @@ class StorageFormatCutoverContractTest {
             recovery,
             "activeFormat == journal.sourceFormat && archivedFiles.isEmpty()",
             "if (journal.phase == PHASE_ROLLBACK) return false",
-            "deleteExactDatabaseSet(databaseFile)",
-            "DatabaseArchiveManager.restore(databaseFile, archivedFiles)"
+            "recoveryAction != StorageCutoverRecovery.Action.RESTORE_ARCHIVE",
+            "deleteActive = { file ->",
+            "deleteExactDatabaseSet(file)",
+            "restore = { file, moved -> DatabaseArchiveManager.restore(file, moved) }"
         )
     }
 

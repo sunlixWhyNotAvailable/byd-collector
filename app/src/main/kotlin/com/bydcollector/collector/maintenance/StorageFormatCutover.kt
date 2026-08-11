@@ -111,19 +111,23 @@ internal class StorageFormatCutoverCoordinator(
             phase = PHASE_CREATING,
             sourceFormat = StorageFormat.ABSENT
         )
+        if (!runCatching { settings.setStorageCutoverJournal(journal) }.getOrDefault(false)) return false
         return runCatching {
-            settings.setStorageCutoverJournal(journal)
             createDatabase()
-            settings.setStorageCutoverJournal(journal.copy(phase = PHASE_VERIFYING))
+            if (!runCatching {
+                    settings.setStorageCutoverJournal(journal.copy(phase = PHASE_VERIFYING))
+                }.getOrDefault(false)
+            ) return@runCatching false
             check(detect(databaseFile) == StorageFormat.COMPACT_V2 && quickCheck(databaseFile)) {
                 "Fresh compact database verification failed"
             }
-            settings.clearStorageCutoverJournal()
-            true
+            runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)
         }.getOrElse {
-            if (deleteExactDatabaseSet(databaseFile) && detect(databaseFile) == StorageFormat.ABSENT) {
-                runCatching { settings.clearStorageCutoverJournal() }
-            }
+            // A valid compact store is recoverable; keep its journal if clearing or
+            // the phase update failed.  Delete only an invalid/partial fresh set.
+            if (detect(databaseFile) == StorageFormat.COMPACT_V2 && quickCheck(databaseFile)) return@getOrElse false
+            if (!deleteExactDatabaseSet(databaseFile) || detect(databaseFile) != StorageFormat.ABSENT) return@getOrElse false
+            if (!runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)) return@getOrElse false
             false
         }
     }
@@ -133,34 +137,49 @@ internal class StorageFormatCutoverCoordinator(
         if (!checkpoint(databaseFile)) return false
         val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val plannedDirectory = DatabaseArchiveManager.plannedArchiveDirectory(databaseFile, archiveRoot, timestamp)
-        settings.setStorageCutoverJournal(
-            StorageCutoverJournal(
-                family = family,
-                archivePath = plannedDirectory.absolutePath,
-                phase = PHASE_ARCHIVING,
-                sourceFormat = StorageFormat.LEGACY_V1
-            )
+        val journal = StorageCutoverJournal(
+            family = family,
+            archivePath = plannedDirectory.absolutePath,
+            phase = PHASE_ARCHIVING,
+            sourceFormat = StorageFormat.LEGACY_V1
         )
+        if (!runCatching { settings.setStorageCutoverJournal(journal) }.getOrDefault(false)) return false
         val archive = DatabaseArchiveManager.archive(databaseFile, archiveRoot, timestamp)
         if (!archive.ok) {
             if (archive.rollbackOk && legacyFormat(family, databaseFile) && quickCheck(databaseFile)) {
-                settings.clearStorageCutoverJournal()
+                if (!runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)) return false
             }
             return false
         }
 
-        settings.setStorageCutoverJournal(
-            StorageCutoverJournal(family, plannedDirectory.absolutePath, PHASE_CREATING, StorageFormat.LEGACY_V1)
-        )
+        val archivedDatabase = File(plannedDirectory, databaseFile.name)
+        if (!formatMatches(family, archivedDatabase, StorageFormat.LEGACY_V1) || !quickCheck(archivedDatabase)) {
+            rollbackNewDatabase(databaseFile, family, archive.movedFiles)
+            return false
+        }
+        if (!runCatching {
+                settings.setStorageCutoverJournal(
+                    StorageCutoverJournal(family, plannedDirectory.absolutePath, PHASE_CREATING, StorageFormat.LEGACY_V1)
+                )
+            }.getOrDefault(false)
+        ) {
+            rollbackNewDatabase(databaseFile, family, archive.movedFiles)
+            return false
+        }
         val created = runCatching { createDatabase() }.isSuccess
-        settings.setStorageCutoverJournal(
-            StorageCutoverJournal(family, plannedDirectory.absolutePath, PHASE_VERIFYING, StorageFormat.LEGACY_V1)
-        )
+        if (!runCatching {
+                settings.setStorageCutoverJournal(
+                    StorageCutoverJournal(family, plannedDirectory.absolutePath, PHASE_VERIFYING, StorageFormat.LEGACY_V1)
+                )
+            }.getOrDefault(false)
+        ) {
+            rollbackNewDatabase(databaseFile, family, archive.movedFiles)
+            return false
+        }
         val verified = created && compactFormat(family, databaseFile) && quickCheck(databaseFile)
         if (verified) {
-            settings.setCutoverArchiveStoragePending(true)
-            settings.clearStorageCutoverJournal()
-            return true
+            if (runCatching { settings.setCutoverArchiveStoragePending(true) }.isFailure) return false
+            return runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)
         }
         rollbackNewDatabase(databaseFile, family, archive.movedFiles)
         return false
@@ -168,22 +187,26 @@ internal class StorageFormatCutoverCoordinator(
 
     private fun rollbackNewDatabase(databaseFile: File, family: String, movedFiles: List<File>): Boolean {
         settings.storageCutoverJournal()?.let { journal ->
-            settings.setStorageCutoverJournal(journal.copy(phase = PHASE_ROLLBACK))
+            if (!runCatching {
+                    settings.setStorageCutoverJournal(journal.copy(phase = PHASE_ROLLBACK))
+                }.getOrDefault(false)
+            ) return false
         }
         if (!deleteExactDatabaseSet(databaseFile)) return false
         if (!DatabaseArchiveManager.restore(databaseFile, movedFiles)) return false
         val restored = legacyFormat(family, databaseFile) && quickCheck(databaseFile)
         if (restored) {
             movedFiles.firstOrNull()?.parentFile?.takeIf { it.listFiles().orEmpty().isEmpty() }?.delete()
-            settings.clearStorageCutoverJournal()
+            if (!runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)) return false
         }
         return restored
     }
 
     private fun recoverInterruptedCutover(family: String, databaseFile: File): Boolean {
         val journal = settings.storageCutoverJournal() ?: return true
-        if (journal.family != family) return true
+        if (journal.family !in setOf(MAIN_FAMILY, DEBUG_FAMILY)) return false
         if (journal.phase !in setOf(PHASE_ARCHIVING, PHASE_CREATING, PHASE_VERIFYING, PHASE_ROLLBACK)) return false
+        if (journal.family != family) return true
         if (journal.sourceFormat == StorageFormat.ABSENT) {
             return recoverInterruptedFreshCreation(family, databaseFile, journal)
         }
@@ -192,45 +215,55 @@ internal class StorageFormatCutoverCoordinator(
         val archivedFiles = archivedSidecars(databaseFile, archiveDirectory)
         val activeFormat = detectFormat(family, databaseFile)
         val archivedDatabase = File(archiveDirectory, databaseFile.name)
+        val recoveryAction = StorageCutoverRecovery.decide(
+            StorageCutoverRecovery.Snapshot(
+                phase = journal.phase,
+                sourceFormat = journal.sourceFormat,
+                activeFormat = activeFormat,
+                activeDatabaseExists = databaseFile.isFile,
+                activeQuickCheck = quickCheck(databaseFile),
+                archivedDatabasePresent = archivedDatabase.isFile,
+                archivedFormat = detectFormat(family, archivedDatabase),
+                archivedQuickCheck = quickCheck(archivedDatabase),
+                archivedSidecarNames = archivedFiles.map { it.name }.toSet(),
+                expectedSidecarNames = DatabaseArchiveManager.sidecarFiles(databaseFile).map { it.name }.toSet(),
+                unknownArchiveFiles = archiveDirectory.listFiles().orEmpty().any {
+                    it.name !in DatabaseArchiveManager.sidecarFiles(databaseFile).map { file -> file.name }
+                }
+            )
+        )
 
         if (activeFormat == journal.sourceFormat && archivedFiles.isEmpty()) {
-            if (!quickCheck(databaseFile)) return false
-            settings.clearStorageCutoverJournal()
-            return true
+            if (recoveryAction != StorageCutoverRecovery.Action.CLEAR_INTACT_SOURCE || !quickCheck(databaseFile)) {
+                return false
+            }
+            return runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)
         }
-        if (journal.phase == PHASE_ARCHIVING && databaseFile.exists() && archivedFiles.isNotEmpty()) return false
         // A partial rollback is ambiguous: active sidecars may already contain restored WAL data.
         // Never delete or move anything unless the complete source set above already verifies.
         if (journal.phase == PHASE_ROLLBACK) return false
-        if (activeFormat == StorageFormat.COMPACT_V2) {
+        if (recoveryAction == StorageCutoverRecovery.Action.COMPLETE_FORWARD) {
             if (!formatMatches(family, archivedDatabase, journal.sourceFormat) ||
                 !quickCheck(archivedDatabase) ||
                 !quickCheck(databaseFile)
             ) return false
-            settings.setCutoverArchiveStoragePending(true)
-            settings.clearStorageCutoverJournal()
-            return true
+            if (runCatching { settings.setCutoverArchiveStoragePending(true) }.isFailure) return false
+            return runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)
         }
-        if (journal.phase != PHASE_ARCHIVING && archivedFiles.isNotEmpty()) {
-            if (!formatMatches(family, archivedDatabase, journal.sourceFormat) || !quickCheck(archivedDatabase)) return false
-            if (!deleteExactDatabaseSet(databaseFile)) return false
-            if (!DatabaseArchiveManager.restore(databaseFile, archivedFiles)) return false
-            val restored = formatMatches(family, databaseFile, journal.sourceFormat) && quickCheck(databaseFile)
-            if (restored) {
-                archiveDirectory.takeIf { it.listFiles().orEmpty().isEmpty() }?.delete()
-                settings.clearStorageCutoverJournal()
-            }
-            return restored
-        }
-        if (databaseFile.exists() || archivedFiles.isEmpty()) return false
-        if (!formatMatches(family, archivedDatabase, journal.sourceFormat) || !quickCheck(archivedDatabase)) return false
-        if (!DatabaseArchiveManager.restore(databaseFile, archivedFiles)) return false
-        val restored = formatMatches(family, databaseFile, journal.sourceFormat) && quickCheck(databaseFile)
-        if (restored) {
-            archiveDirectory.takeIf { it.listFiles().orEmpty().isEmpty() }?.delete()
-            settings.clearStorageCutoverJournal()
-        }
-        return restored
+        if (recoveryAction != StorageCutoverRecovery.Action.RESTORE_ARCHIVE || archivedFiles.isEmpty()) return false
+        if (journal.phase == PHASE_ARCHIVING && databaseFile.exists()) return false
+        return StorageCutoverRecovery.execute(
+            action = recoveryAction,
+            databaseFile = databaseFile,
+            movedFiles = archivedFiles,
+            deleteActive = { file ->
+                if (journal.phase == PHASE_ARCHIVING && !file.exists()) true else deleteExactDatabaseSet(file)
+            },
+            restore = { file, moved -> DatabaseArchiveManager.restore(file, moved) },
+            verifyActive = { formatMatches(family, databaseFile, journal.sourceFormat) && quickCheck(databaseFile) },
+            clearJournal = { runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false) },
+            cleanupArchive = { archiveDirectory.takeIf { it.listFiles().orEmpty().isEmpty() }?.delete() }
+        )
     }
 
     private fun recoverInterruptedFreshCreation(
@@ -242,19 +275,16 @@ internal class StorageFormatCutoverCoordinator(
         return when (detectFormat(family, databaseFile)) {
             StorageFormat.COMPACT_V2 -> {
                 if (!quickCheck(databaseFile)) return false
-                settings.clearStorageCutoverJournal()
-                true
+                runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)
             }
             StorageFormat.ABSENT -> {
-                settings.clearStorageCutoverJournal()
-                true
+                runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)
             }
             StorageFormat.UNKNOWN -> {
                 if (!deleteExactDatabaseSet(databaseFile) || detectFormat(family, databaseFile) != StorageFormat.ABSENT) {
                     return false
                 }
-                settings.clearStorageCutoverJournal()
-                true
+                runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)
             }
             StorageFormat.LEGACY_V1 -> false
         }
@@ -401,6 +431,23 @@ internal class StorageFormatCutoverCoordinator(
 
         internal fun detectDebug(databaseFile: File): StorageFormat = detectFile(databaseFile, ::detectDebug)
 
+        internal fun verifyArchivedSource(
+            family: String,
+            databaseFile: File,
+            archiveDirectory: File,
+            sourceFormat: StorageFormat
+        ): Boolean {
+            val archivedDatabase = File(archiveDirectory, databaseFile.name)
+            val detected = when (family) {
+                MAIN_FAMILY -> detectMain(archivedDatabase)
+                DEBUG_FAMILY -> detectDebug(archivedDatabase)
+                else -> StorageFormat.UNKNOWN
+            }
+            return detected == sourceFormat && quickCheckFile(archivedDatabase)
+        }
+
+        internal fun verifyDatabaseQuickCheck(databaseFile: File): Boolean = quickCheckFile(databaseFile)
+
         private fun detectFile(databaseFile: File, detector: (SQLiteDatabase) -> StorageFormat): StorageFormat {
             if (!databaseFile.exists()) {
                 return if (DatabaseArchiveManager.sidecarFiles(databaseFile).drop(1).any { it.exists() }) {
@@ -489,6 +536,17 @@ internal class StorageFormatCutoverCoordinator(
                 null,
                 if (readOnly) SQLiteDatabase.OPEN_READONLY else SQLiteDatabase.OPEN_READWRITE
             )
+        }
+
+        private fun quickCheckFile(databaseFile: File): Boolean {
+            if (!databaseFile.isFile) return false
+            return runCatching {
+                open(databaseFile, readOnly = true).use { db ->
+                    db.rawQuery("PRAGMA quick_check", emptyArray()).use { cursor ->
+                        cursor.moveToFirst() && cursor.getString(0) == "ok"
+                    }
+                }
+            }.getOrDefault(false)
         }
     }
 }

@@ -62,6 +62,14 @@ internal object DatabaseArchiveManager {
         movedFiles: List<File>,
         moveFile: (File, File) -> Boolean = { source, target -> source.renameTo(target) }
     ): Boolean {
+        val expectedNames = sidecarFiles(databaseFile).map { it.name }.toSet()
+        val activeParent = runCatching { databaseFile.canonicalFile.parentFile }.getOrNull()
+        if (movedFiles.map { it.name }.toSet().size != movedFiles.size ||
+            movedFiles.any { it.name !in expectedNames ||
+                runCatching { it.canonicalFile.parentFile == activeParent }.getOrDefault(false) }
+        ) {
+            return false
+        }
         var rollbackOk = true
         for (moved in movedFiles.asReversed()) {
             val target = File(databaseFile.parentFile, moved.name)

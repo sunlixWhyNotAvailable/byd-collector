@@ -8,6 +8,7 @@ import com.bydcollector.collector.adb.AdbAuthorizationManager
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.debug.DirectDebugStatus
 import com.bydcollector.collector.data.debug.DirectDebugStore
+import com.bydcollector.collector.data.local.CollectorEvent
 import com.bydcollector.collector.data.local.HealthSnapshot
 import com.bydcollector.collector.data.local.HealthSnapshotDetail
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
@@ -42,12 +43,17 @@ class DashboardStateProvider(
         )
     }
     private val debugStatusCache = TimedCache<DirectDebugStatus>(ttlMs = 5_000L)
+    private val vehicleKpiCaches = VehicleKpiLanguage.values().associateWith {
+        TimedCache<VehicleKpis>(ttlMs = 1_000L)
+    }
     private val archiveStorageCache = ArchiveStorageSnapshotCache(
         archiveRoot = File(context.filesDir, "db_archive"),
         mainDatabaseFile = context.getDatabasePath(TelemetryDatabaseHelper.DATABASE_NAME),
         debugDatabaseFile = context.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME)
     )
     private val healthCacheRunning = mutableMapOf<HealthSnapshotDetail, Boolean>()
+    private var recentEventsSource: List<CollectorEvent>? = null
+    private var formattedRecentEvents: List<CollectorEvent> = emptyList()
     private var archiveStorageJobActive = false
 
     fun loadInitial(): DashboardState = load(DashboardLoadProfile.INITIAL)
@@ -114,7 +120,9 @@ class DashboardStateProvider(
         val vehicleKpisLoaded = profile.readsVehicleKpis && store != null
         val vehicleKpis = if (vehicleKpisLoaded) {
             //vehicle KPI reads are limited to the ALL_PARAMETERS profile
-            VehicleKpiMapper.from(store!!.normalizedCurrentState(), vehicleKpiLanguage)
+            vehicleKpiCaches.getValue(vehicleKpiLanguage).get(nowMs = nowMs) {
+                VehicleKpiMapper.from(store!!.normalizedCurrentState(), vehicleKpiLanguage)
+            }
         } else {
             VehicleKpis()
         }
@@ -222,7 +230,6 @@ class DashboardStateProvider(
             influxMeasurement = influxConfig?.measurement.orEmpty(),
             influxEnabledCategories = influxConfig?.enabledCategories ?: emptySet(),
             influxStatus = influxStatus,
-            influxMode = if (useInfluxState) influxState.mode else previous?.influxMode,
             influxPendingRows = if (useInfluxState) influxState.pendingRows else previous?.influxPendingRows ?: 0L,
             influxOldestPendingAt = if (useInfluxState) {
                 DisplayTimeFormatter.formatNullable(influxState.oldestPendingAt)
@@ -251,9 +258,7 @@ class DashboardStateProvider(
             permissionsGranted = accessSnapshot.permissionsGranted,
             adbAuthorized = accessSnapshot.adbAuthorized,
             vehicleKpis = vehicleKpis,
-            recentEvents = health.recentEvents.map { event ->
-                event.copy(timestamp = DisplayTimeFormatter.formatNullable(event.timestamp) ?: event.timestamp)
-            },
+            recentEvents = formatRecentEvents(health.recentEvents),
             mainStorageCutoverDeferredReason = settings.mainStorageCutoverDeferredReason(),
             mainStorageCutoverError = settings.mainStorageCutoverError(),
             debugStorageCutoverError = settings.debugStorageCutoverError()
@@ -290,6 +295,16 @@ class DashboardStateProvider(
             healthCacheRunning[detail] = running
             //Keep TelemetryStore's default FULL for non-dashboard callers; profiles opt in explicitly here.
             store.healthSnapshot(running = running, detail = detail)
+        }
+    }
+
+    private fun formatRecentEvents(events: List<CollectorEvent>): List<CollectorEvent> {
+        if (events === recentEventsSource) return formattedRecentEvents
+        return events.map { event ->
+            event.copy(timestamp = DisplayTimeFormatter.formatNullable(event.timestamp) ?: event.timestamp)
+        }.also {
+            recentEventsSource = events
+            formattedRecentEvents = it
         }
     }
 

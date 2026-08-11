@@ -3,8 +3,15 @@ package com.bydcollector.collector.ui.compose
 import com.bydcollector.collector.telegram.TelegramBuiltInTemplates
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertSame
 
 class BydCollectorStringsTest {
+    @Test
+    fun localizedStringsAreSingletonInstances() {
+        assertSame(strings(UiLanguage.UK), strings(UiLanguage.UK))
+        assertSame(strings(UiLanguage.EN), strings(UiLanguage.EN))
+    }
+
     @Test
     fun influxCountersUsePointsInsteadOfMainDatabaseRows() {
         assertEquals("точок", strings(UiLanguage.UK).points)

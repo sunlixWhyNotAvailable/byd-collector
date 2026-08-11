@@ -62,6 +62,7 @@ import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.maintenance.DbMaintenanceUiState
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.ui.DashboardState
+import com.bydcollector.collector.ui.VehicleKpis
 import com.bydcollector.collector.update.UpdateInfo
 import com.bydcollector.collector.update.UpdateUiState
 import java.util.Locale
@@ -397,6 +398,7 @@ private val TelegramMessageDefinitions = listOf(
         )
     )
 )
+private val TelegramMessageDefinitionRows = TelegramMessageDefinitions.chunked(2)
 
 private data class TelegramNumberSetting(
     val label: String,
@@ -534,15 +536,14 @@ private fun AllParametersTab(
                         NumericInput(state?.debugParameterCount?.toString().orEmpty(), modifier = Modifier.width(60.dp))
                     }
                 }
-            VehicleKpiCard(state, strings, Modifier.weight(2f).height(262.dp))
+            VehicleKpiCard(state?.vehicleKpis, strings, Modifier.weight(2f).height(262.dp))
         }
         DebugDatabaseCard(state, strings, actions, Modifier.fillMaxWidth())
     }
 }
 
 @Composable
-private fun VehicleKpiCard(state: DashboardState?, strings: UiStrings, modifier: Modifier) {
-    val kpi = state?.vehicleKpis
+private fun VehicleKpiCard(kpi: VehicleKpis?, strings: UiStrings, modifier: Modifier) {
     val chargeLabel = if (kpi?.batteryPowerCharging == true) strings.kpiCharging else strings.kpiDischarging
     SectionCard(title = strings.currentVehicleState, modifier = modifier, bodyPadding = 14.dp) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -710,15 +711,17 @@ private fun CategoryGrid(
     onToggle: (String) -> Unit
 ) {
     Text(title, color = LocalBydPalette.current.muted, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-    val categories = listOf(
-        "battery" to strings.battery,
-        "motion" to strings.motion,
-        "body" to strings.body,
-        "climate" to strings.climate,
-        "safety" to strings.safety
-    )
+    val categoryRows = remember(strings) {
+        listOf(
+            "battery" to strings.battery,
+            "motion" to strings.motion,
+            "body" to strings.body,
+            "climate" to strings.climate,
+            "safety" to strings.safety
+        ).chunked(3)
+    }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        categories.chunked(3).forEach { row ->
+        categoryRows.forEach { row ->
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 row.forEach { (key, label) ->
                     CategoryChip(label, selected.contains(key), enabled, { onToggle(key) }, modifier = Modifier.weight(1f))
@@ -806,7 +809,7 @@ private fun TelegramTab(
             onClearBotToken = actions.onClearBotToken,
             onTestConnection = actions.onTestConnection
         )
-        TelegramMessageDefinitions.chunked(2).forEach { messages ->
+        TelegramMessageDefinitionRows.forEach { messages ->
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp),

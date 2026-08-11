@@ -29,52 +29,7 @@ class TelemetryDatabaseHelper(
     }
 
     override fun onDowngrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        //downgrade support is destructive because old code cannot safely interpret newer telemetry tables
-        recreateDatabase(db)
-    }
-
-    private fun recreateDatabase(db: SQLiteDatabase) {
-        db.beginTransaction()
-        try {
-            dropKnownTables(db)
-            executeSqlAsset(db, COMPACT_SCHEMA_ASSET)
-            createCollectorEvents(db)
-            db.setTransactionSuccessful()
-        } finally {
-            db.endTransaction()
-        }
-    }
-
-    private fun dropKnownTables(db: SQLiteDatabase) {
-        listOf(
-            "storage_meta",
-            "decoded_value_dictionary",
-            "telegram_runtime_state",
-            "telegram_outbox",
-            "influx_export_events",
-            "influx_export_state",
-            "influx_export_cursor",
-            "mqtt_retry_state",
-            "mqtt_outbox",
-            "mqtt_publish_state",
-            "vehicle_state_history",
-            "normalized_history_field_catalog",
-            "vehicle_state_current",
-            "normalized_field_catalog",
-            "collector_events",
-            "ec_import_runs",
-            "ec_energy_consumption",
-            "parameter_observations",
-            "vehicle_snapshots",
-            "poll_values",
-            "readings",
-            "polls",
-            "collection_sessions",
-            "parameter_catalog",
-            "catalog_versions"
-        ).forEach { tableName ->
-            db.execSQL("DROP TABLE IF EXISTS $tableName")
-        }
+        error("Telemetry database downgrade $oldVersion->$newVersion is not supported; archive before opening older code")
     }
 
     private fun executeSqlAsset(db: SQLiteDatabase, assetName: String) {

@@ -71,7 +71,9 @@ internal object DashboardStateProfileMerger {
                 debugLastSessionId = previous.debugLastSessionId
             )
         }
-        if (!vehicleKpisLoaded) merged = merged.copy(vehicleKpis = previous.vehicleKpis)
+        if (!vehicleKpisLoaded || merged.vehicleKpis == previous.vehicleKpis) {
+            merged = merged.copy(vehicleKpis = previous.vehicleKpis)
+        }
         if (!integrationSettingsLoaded) {
             merged = merged.copy(
                 mqttEnabled = previous.mqttEnabled,
@@ -94,7 +96,6 @@ internal object DashboardStateProfileMerger {
                 influxMeasurement = previous.influxMeasurement,
                 influxEnabledCategories = previous.influxEnabledCategories,
                 influxStatus = previous.influxStatus,
-                influxMode = previous.influxMode,
                 influxPendingRows = previous.influxPendingRows,
                 influxOldestPendingAt = previous.influxOldestPendingAt,
                 influxNextRetryAt = previous.influxNextRetryAt,

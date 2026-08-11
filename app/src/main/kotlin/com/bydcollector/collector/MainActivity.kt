@@ -65,6 +65,7 @@ import com.bydcollector.collector.update.UpdateCheckResult
 import com.bydcollector.collector.update.UpdateDownloader
 import com.bydcollector.collector.update.UpdateInfo
 import com.bydcollector.collector.update.UpdateUiState
+import com.bydcollector.collector.util.dispatchOperationalEvent
 import com.bydcollector.collector.util.namedSingleThreadExecutor
 import java.io.File
 import java.util.ArrayList
@@ -223,34 +224,59 @@ class MainActivity : ComponentActivity() {
             pendingMaintenanceOperation = null
             pendingMainArchivePreflight = null
             stateProvider.invalidateArchiveStorageSnapshot()
-            settings.setDbMaintenanceStatus(
-                DbMaintenanceRuntimeStatus(
-                    operation = operation,
-                    running = true,
-                    completed = false,
-                    stepIndex = 1,
-                    stepCount = operation.stepsUk.size,
-                    messageUk = operation.stepsUk.first(),
-                    messageEn = operation.stepsEn.first()
-                ),
-                synchronous = true
+            val runningStatus = DbMaintenanceRuntimeStatus(
+                operation = operation,
+                running = true,
+                completed = false,
+                stepIndex = 1,
+                stepCount = operation.stepsUk.size,
+                messageUk = operation.stepsUk.first(),
+                messageEn = operation.stepsEn.first()
             )
-            runCatching {
-                when (operation) {
-                    DbMaintenanceOperation.ARCHIVE -> CollectorServiceController.archiveDatabase(this@MainActivity)
-                    DbMaintenanceOperation.DEBUG_ARCHIVE -> CollectorServiceController.archiveDebugDatabase(this@MainActivity)
+            try {
+                dashboardExecutor.execute {
+                    val committed = runCatching {
+                        settings.setDbMaintenanceStatus(runningStatus, synchronous = true)
+                    }.getOrElse { error ->
+                        postMaintenanceLaunchFailure(error)
+                        return@execute
+                    }
+                    if (!committed) {
+                        postMaintenanceLaunchFailure(
+                            IllegalStateException("Could not persist database maintenance status")
+                        )
+                        return@execute
+                    }
+                    runCatching {
+                        when (operation) {
+                            DbMaintenanceOperation.ARCHIVE -> CollectorServiceController.archiveDatabase(applicationContext)
+                            DbMaintenanceOperation.DEBUG_ARCHIVE -> CollectorServiceController.archiveDebugDatabase(applicationContext)
+                        }
+                    }.onSuccess {
+                        runOnUiThread {
+                            if (!destroyed) refresh()
+                        }
+                    }.onFailure { error ->
+                        val failure = settings.dbMaintenanceStatus().copy(
+                            running = false,
+                            completed = false,
+                            error = dashboardErrorDetail(error)
+                        )
+                        val persisted = runCatching {
+                            settings.setDbMaintenanceStatus(failure, synchronous = true)
+                        }.getOrElse { persistError ->
+                            Log.e(TAG, "Database maintenance failure status could not be persisted", persistError)
+                            false
+                        }
+                        if (!persisted) {
+                            Log.e(TAG, "Database maintenance failure status commit returned false")
+                        }
+                        postMaintenanceLaunchFailure(error)
+                    }
                 }
-            }.onFailure { error ->
-                settings.setDbMaintenanceStatus(
-                    settings.dbMaintenanceStatus().copy(
-                        running = false,
-                        completed = false,
-                        error = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
-                    )
-                )
-                maintenanceLaunchOperation = null
+            } catch (error: RuntimeException) {
+                postMaintenanceLaunchFailure(error)
             }
-            refresh()
         }
 
         override fun onCancelDatabaseMaintenance() {
@@ -542,7 +568,11 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 if (destroyed) return@runOnUiThread
                 store = runtimeStore
-                settings = CollectorSettings(applicationContext, runtimeStore)
+                settings = CollectorSettings(
+                    applicationContext,
+                    runtimeStore,
+                    eventExecutor = dashboardExecutor
+                )
                 if (clearedUserShutdown) {
                     CollectorAutoStart.recoverFromForeground(applicationContext, settings, runtimeStore)
                 }
@@ -607,6 +637,24 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun currentStore(): TelemetryStore = BydCollectorApplication.store(applicationContext)
+
+    private fun recordOperationalEvent(category: String, message: String, detail: String? = null) {
+        dispatchOperationalEvent(dashboardExecutor) {
+            val eventStore = currentStore()
+            eventStore.recordEvent(category, message, detail)
+        }
+    }
+
+    private fun postMaintenanceLaunchFailure(error: Throwable) {
+        Log.e(TAG, "Database maintenance could not start", error)
+        runOnUiThread {
+            if (destroyed) return@runOnUiThread
+            maintenanceLaunchOperation = null
+            pendingMaintenanceOperation = null
+            pendingMainArchivePreflight = null
+            refresh()
+        }
+    }
 
     private fun reconcileCutoverArchiveStorageIfNeeded() {
         if (settings.isCutoverArchiveStoragePending() && !CollectorService.isArchiveStorageActive()) {
@@ -691,7 +739,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
             startActivity(Intent.createChooser(sendIntent, strings(uiLanguage).shareSelectedArchives))
-            currentStore().recordEvent(
+            recordOperationalEvent(
                 "archive_share_chooser_opened",
                 "Archive share chooser opened",
                 "count=${ids.size}"
@@ -714,7 +762,7 @@ class MainActivity : ComponentActivity() {
     ) {
         lease?.let(CollectorService.archiveShareLeaseRegistry::release)
         archiveShareInFlight.set(false)
-        currentStore().recordEvent(
+        recordOperationalEvent(
             "archive_share_failed",
             "Archive share rejected",
             "reason=$reason count=${ids.size}"
@@ -734,7 +782,11 @@ class MainActivity : ComponentActivity() {
 
     private fun refreshStoreBackedState() {
         store = currentStore()
-        settings = CollectorSettings(applicationContext, store)
+        settings = CollectorSettings(
+            applicationContext,
+            store,
+            eventExecutor = dashboardExecutor
+        )
     }
 
     private fun openMainArchiveDialog() {
@@ -859,7 +911,7 @@ class MainActivity : ComponentActivity() {
         val detail = dashboardErrorDetail(error)
         Log.e(TAG, "Dashboard refresh failed: $scope", error)
         runCatching {
-            currentStore().recordEvent(
+            recordOperationalEvent(
                 "dashboard_refresh_failed",
                 "Dashboard refresh failed",
                 "$scope $detail"
@@ -887,12 +939,12 @@ class MainActivity : ComponentActivity() {
                 .putBoolean(KEY_BACKGROUND_SETTINGS_PENDING_RETURN, false)
                 .putInt(KEY_BACKGROUND_SETTINGS_VERSION, BuildConfig.VERSION_CODE)
                 .apply()
-            currentStore().recordEvent(
+            recordOperationalEvent(
                 "startup_background_settings_returned",
                 "Returned from background settings",
                 "version=${BuildConfig.VERSION_CODE}"
             )
-            currentStore().recordEvent(
+            recordOperationalEvent(
                 "adb_authorization_ready_after_background",
                 "Background setup completed; ADB self-check may continue"
             )
@@ -905,7 +957,7 @@ class MainActivity : ComponentActivity() {
         if (startupBackgroundLaunchPosted) return true
 
         startupBackgroundLaunchPosted = true
-        currentStore().recordEvent(
+        recordOperationalEvent(
             "startup_background_check_required",
             "Showing BYD background settings prompt for this app version",
             "checked_version=$checkedVersion current_version=${BuildConfig.VERSION_CODE}"
@@ -952,7 +1004,7 @@ class MainActivity : ComponentActivity() {
             .putInt(KEY_BACKGROUND_SETTINGS_VERSION, BuildConfig.VERSION_CODE)
             .remove(KEY_BACKGROUND_SETTINGS_PENDING_RETURN)
             .apply()
-        currentStore().recordEvent(
+        recordOperationalEvent(
             eventKey,
             message,
             "version=${BuildConfig.VERSION_CODE}"
@@ -984,7 +1036,7 @@ class MainActivity : ComponentActivity() {
                         .edit()
                         .putBoolean(KEY_BACKGROUND_SETTINGS_PENDING_RETURN, true)
                         .apply()
-                    currentStore().recordEvent(
+                    recordOperationalEvent(
                         "startup_background_settings_opened",
                         "Background settings opened automatically",
                         "version=${BuildConfig.VERSION_CODE}"
@@ -1003,7 +1055,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestAdbAuthorizationFlow(source: String) {
-        currentStore().recordEvent(
+        recordOperationalEvent(
             "adb_authorization_flow_started",
             "Starting local ADB RSA authorization request",
             "source=$source"
@@ -1043,7 +1095,7 @@ class MainActivity : ComponentActivity() {
             startupAdbSelfCheckPosted = false
             return
         }
-        currentStore().recordEvent(
+        recordOperationalEvent(
             "startup_adb_self_check_started",
             "Starting startup ADB authorization self-check",
             "source=$startupAdbSelfCheckSource mode=${AccessCheckMode.COLD_START.name.lowercase()}"
@@ -1376,7 +1428,7 @@ class MainActivity : ComponentActivity() {
             testStatus = nextTestStatus
         )
         if (secretWriteFailed) {
-            currentStore().recordEvent(
+            recordOperationalEvent(
                 "telegram_secret_write_failed",
                 "Telegram bot token could not be stored in Android Keystore"
             )
@@ -1410,7 +1462,7 @@ class MainActivity : ComponentActivity() {
             settings.setTelegramConnectionStatus("not_tested", null)
         } else {
             settings.setTelegramConnectionStatus("storage_error", "clear_failed")
-            currentStore().recordEvent(
+            recordOperationalEvent(
                 "telegram_secret_clear_failed",
                 "Telegram bot token could not be cleared from Android Keystore"
             )
@@ -1557,10 +1609,10 @@ class MainActivity : ComponentActivity() {
         requestAccessCheck("start_$source", AccessCheckMode.NORMAL)
         try {
             val dir = DiagnosticLogRecorder.start(applicationContext)
-            currentStore().recordEvent("log_recording_started", "Diagnostic log recording started", "source=$source path=${dir.absolutePath}")
+            recordOperationalEvent("log_recording_started", "Diagnostic log recording started", "source=$source path=${dir.absolutePath}")
             Toast.makeText(this, "Запис логів почато", Toast.LENGTH_SHORT).show()
         } catch (error: Exception) {
-            currentStore().recordEvent("log_recording_error", "Diagnostic log recording failed", error.message)
+            recordOperationalEvent("log_recording_error", "Diagnostic log recording failed", error.message)
             Toast.makeText(this, "Помилка запису логів: ${error.message}", Toast.LENGTH_LONG).show()
         }
         refresh()
@@ -1569,7 +1621,7 @@ class MainActivity : ComponentActivity() {
     private fun stopDiagnostics(source: String) {
         refreshStoreBackedState()
         val dir = DiagnosticLogRecorder.stop()
-        currentStore().recordEvent("log_recording_stopped", "Diagnostic log recording stopped", "source=$source path=${dir?.absolutePath}")
+        recordOperationalEvent("log_recording_stopped", "Diagnostic log recording stopped", "source=$source path=${dir?.absolutePath}")
         Toast.makeText(this, "Запис логів зупинено", Toast.LENGTH_SHORT).show()
         refresh()
     }

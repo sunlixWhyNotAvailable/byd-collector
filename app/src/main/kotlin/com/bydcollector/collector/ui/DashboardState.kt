@@ -82,7 +82,6 @@ data class DashboardState(
     val influxMeasurement: String,
     val influxEnabledCategories: Set<String>,
     val influxStatus: String,
-    val influxMode: String?,
     val influxPendingRows: Long,
     val influxOldestPendingAt: String?,
     val influxNextRetryAt: String?,

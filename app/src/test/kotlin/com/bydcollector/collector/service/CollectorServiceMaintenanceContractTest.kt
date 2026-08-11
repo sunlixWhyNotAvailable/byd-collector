@@ -79,9 +79,13 @@ class CollectorServiceMaintenanceContractTest {
     @Test
     fun maintenanceStatusHasSynchronousPersistenceAndInterruptedRecovery() {
         val settings = sourceFile("com/bydcollector/collector/service/CollectorSettings.kt").readText()
+        val setStatus = settings.substringAfter("fun setDbMaintenanceStatus")
+            .substringBefore("fun recoverInterruptedDbMaintenanceIfNeeded")
 
         assertTrue(settings.contains("fun setDbMaintenanceStatus(status: DbMaintenanceRuntimeStatus, synchronous: Boolean = false)"))
-        assertTrue(settings.contains("if (synchronous) editor.commit() else editor.apply()"))
+        assertTrue(setStatus.contains("return if (synchronous) editor.commit() else {"))
+        assertTrue(setStatus.contains("editor.apply()"))
+        assertTrue(setStatus.contains("true"))
         assertTrue(settings.contains("fun recoverInterruptedDbMaintenanceIfNeeded(source: String): Boolean"))
         assertTrue(settings.contains("previous.running && previous.operation == status.operation && previous.startedAtMs > 0L"))
         assertTrue(settings.contains("DB_MAINTENANCE_RECOVERY_GRACE_MS = 15_000L"))

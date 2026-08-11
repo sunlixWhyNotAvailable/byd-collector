@@ -410,7 +410,7 @@ private val telegramEn = TelegramStrings(
     )
 )
 
-fun strings(language: UiLanguage): UiStrings {
+private fun buildStrings(language: UiLanguage): UiStrings {
     return when (language) {
         UiLanguage.UK -> UiStrings(
             appSubtitle = "Прямий збір телеметрії • Sea Lion 07 EV",
@@ -772,4 +772,12 @@ fun strings(language: UiLanguage): UiStrings {
             dbMaintenanceArchivePath = "Archive:"
         )
     }
+}
+
+private val uiStringsUk = buildStrings(UiLanguage.UK)
+private val uiStringsEn = buildStrings(UiLanguage.EN)
+
+fun strings(language: UiLanguage): UiStrings = when (language) {
+    UiLanguage.UK -> uiStringsUk
+    UiLanguage.EN -> uiStringsEn
 }

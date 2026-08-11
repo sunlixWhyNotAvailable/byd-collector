@@ -43,7 +43,7 @@ class CompactStorageSchemaContractTest {
     }
 
     @Test
-    fun legacySchemaRemainsSeparateAndWritable() {
+    fun legacySchemaRemainsSeparateAndDowngradeFailsClosed() {
         val legacy = projectFile("app/src/main/assets/schema.sql", "src/main/assets/schema.sql").readText()
         val helper = projectFile(
             "app/src/main/kotlin/com/bydcollector/collector/data/local/TelemetryDatabaseHelper.kt",
@@ -52,10 +52,11 @@ class CompactStorageSchemaContractTest {
 
         assertFalse(legacy.contains("CREATE TABLE IF NOT EXISTS storage_meta"))
         assertTrue(legacy.contains("field_key TEXT NOT NULL"))
-        assertTrue(helper.contains("executeSqlAsset(db, COMPACT_SCHEMA_ASSET)"))
-        assertTrue(helper.contains("\"vehicle_state_history\",\n            \"normalized_history_field_catalog\","))
         assertTrue(helper.contains("if (compactV2) COMPACT_SCHEMA_ASSET else LEGACY_SCHEMA_ASSET"))
         assertTrue(helper.contains("if (!compactV2) ensureLegacySchemaCompatibility(db)"))
+        assertTrue(helper.contains("Telemetry database downgrade \$oldVersion->\$newVersion is not supported"))
+        assertFalse(helper.contains("private fun recreateDatabase"))
+        assertFalse(helper.contains("DROP TABLE IF EXISTS"))
     }
 
     @Test

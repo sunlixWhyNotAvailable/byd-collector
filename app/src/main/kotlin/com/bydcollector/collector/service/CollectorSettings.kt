@@ -15,11 +15,14 @@ import com.bydcollector.collector.maintenance.StorageFormat
 import com.bydcollector.collector.maintenance.StorageCutoverJournal
 import com.bydcollector.collector.mqtt.HaMqttConfig
 import com.bydcollector.collector.security.KeystoreSecretStore
+import com.bydcollector.collector.util.dispatchOperationalEvent
+import java.util.concurrent.Executor
 
 //persistent user settings facade that also records operational events for later diagnostics
 class CollectorSettings(
     context: Context,
-    private val store: TelemetryStore? = null
+    private val store: TelemetryStore? = null,
+    private val eventExecutor: Executor? = null
 ) {
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val secretStore = KeystoreSecretStore(context)
@@ -44,7 +47,7 @@ class CollectorSettings(
 
     fun setAutoStartEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_AUTO_START, enabled).apply()
-        store?.recordEvent(
+        recordEvent(
             category = if (enabled) "auto_start_enabled" else "auto_start_disabled",
             message = if (enabled) AUTO_START_ENABLED_UK else AUTO_START_DISABLED_UK
         )
@@ -54,7 +57,7 @@ class CollectorSettings(
 
     fun setUserShutdownRequested(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_USER_SHUTDOWN, enabled).commit()
-        store?.recordEvent(
+        recordEvent(
             category = if (enabled) "user_shutdown_enabled" else "user_shutdown_cleared",
             message = if (enabled) "User shutdown requested" else "User shutdown cleared"
         )
@@ -103,7 +106,7 @@ class CollectorSettings(
 
     fun setPollingEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_POLLING_ENABLED, enabled).apply()
-        store?.recordEvent(
+        recordEvent(
             category = if (enabled) "polling_enabled" else "polling_disabled",
             message = "Polling ${if (enabled) "enabled" else "disabled"}"
         )
@@ -113,7 +116,7 @@ class CollectorSettings(
 
     fun setDebugPollingEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_DEBUG_POLLING_ENABLED, enabled).apply()
-        store?.recordEvent(
+        recordEvent(
             category = if (enabled) "debug_polling_enabled" else "debug_polling_disabled",
             message = "Debug polling ${if (enabled) "enabled" else "disabled"}"
         )
@@ -123,7 +126,7 @@ class CollectorSettings(
 
     fun setDebugAutoStartEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_DEBUG_AUTO_START, enabled).apply()
-        store?.recordEvent(
+        recordEvent(
             category = if (enabled) "debug_auto_start_enabled" else "debug_auto_start_disabled",
             message = "Debug autostart ${if (enabled) "enabled" else "disabled"}"
         )
@@ -149,7 +152,7 @@ class CollectorSettings(
 
     fun setMqttEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_MQTT_ENABLED, enabled).apply()
-        store?.recordEvent(
+        recordEvent(
             category = if (enabled) "mqtt_enabled" else "mqtt_disabled",
             message = "MQTT ${if (enabled) "enabled" else "disabled"}"
         )
@@ -159,7 +162,7 @@ class CollectorSettings(
 
     fun setMqttAutoStartEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_MQTT_AUTO_START, enabled).apply()
-        store?.recordEvent(
+        recordEvent(
             category = if (enabled) "mqtt_auto_start_enabled" else "mqtt_auto_start_disabled",
             message = "MQTT auto-start ${if (enabled) "enabled" else "disabled"}"
         )
@@ -169,7 +172,7 @@ class CollectorSettings(
 
     fun setHaDiscoveryEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_HA_DISCOVERY_ENABLED, enabled).apply()
-        store?.recordEvent(
+        recordEvent(
             category = if (enabled) "ha_discovery_enabled" else "ha_discovery_disabled",
             message = "Home Assistant discovery ${if (enabled) "enabled" else "disabled"}"
         )
@@ -268,7 +271,7 @@ class CollectorSettings(
 
     fun setInfluxEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_INFLUX_ENABLED, enabled).apply()
-        store?.recordEvent(
+        recordEvent(
             category = if (enabled) "influx_enabled" else "influx_disabled",
             message = "InfluxDB export ${if (enabled) "enabled" else "disabled"}"
         )
@@ -278,7 +281,7 @@ class CollectorSettings(
 
     fun setInfluxAutoStartEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_INFLUX_AUTO_START, enabled).apply()
-        store?.recordEvent(
+        recordEvent(
             category = if (enabled) "influx_auto_start_enabled" else "influx_auto_start_disabled",
             message = "InfluxDB auto-start ${if (enabled) "enabled" else "disabled"}"
         )
@@ -288,7 +291,7 @@ class CollectorSettings(
 
     fun setHaSharedCategoriesEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_HA_SHARED_CATEGORIES, enabled).apply()
-        store?.recordEvent(
+        recordEvent(
             category = if (enabled) "ha_shared_categories_enabled" else "ha_shared_categories_disabled",
             message = "HA shared categories ${if (enabled) "enabled" else "disabled"}"
         )
@@ -298,7 +301,7 @@ class CollectorSettings(
 
     fun setUpdateAutoCheckEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_UPDATE_AUTO_CHECK, enabled).apply()
-        store?.recordEvent(
+        recordEvent(
             category = if (enabled) "update_auto_check_enabled" else "update_auto_check_disabled",
             message = "Update auto-check ${if (enabled) "enabled" else "disabled"}"
         )
@@ -309,7 +312,7 @@ class CollectorSettings(
     fun setTailscaleActivationEnabled(enabled: Boolean) {
         if (enabled) clearTailscaleActivationAttempt()
         prefs.edit().putBoolean(KEY_TAILSCALE_ACTIVATION, enabled).apply()
-        store?.recordEvent(
+        recordEvent(
             category = if (enabled) "tailscale_activation_enabled" else "tailscale_activation_disabled",
             message = "Tailscale activation ${if (enabled) "enabled" else "disabled"}"
         )
@@ -329,7 +332,7 @@ class CollectorSettings(
 
     fun setTelegramEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_TELEGRAM_ENABLED, enabled).apply()
-        store?.recordEvent(
+        recordEvent(
             category = if (enabled) "telegram_enabled" else "telegram_disabled",
             message = "Telegram ${if (enabled) "enabled" else "disabled"}"
         )
@@ -432,7 +435,7 @@ class CollectorSettings(
     fun setArchiveStorageLimitGb(value: Int) {
         val safeValue = value.coerceIn(MIN_ARCHIVE_STORAGE_LIMIT_GB, MAX_ARCHIVE_STORAGE_LIMIT_GB)
         prefs.edit().putInt(KEY_ARCHIVE_STORAGE_LIMIT_GB, safeValue).apply()
-        store?.recordEvent(
+        recordEvent(
             category = "archive_storage_limit_changed",
             message = "Archive storage limit changed",
             detail = "limit_gb=$safeValue"
@@ -505,7 +508,7 @@ class CollectorSettings(
         )
     }
 
-    fun setDbMaintenanceStatus(status: DbMaintenanceRuntimeStatus, synchronous: Boolean = false) {
+    fun setDbMaintenanceStatus(status: DbMaintenanceRuntimeStatus, synchronous: Boolean = false): Boolean {
         val previous = dbMaintenanceStatus()
         val now = System.currentTimeMillis()
         val startedAt = when {
@@ -530,14 +533,17 @@ class CollectorSettings(
             putLong(KEY_DB_MAINTENANCE_UPDATED_AT_MS, now)
             putBoolean(KEY_DB_MAINTENANCE_CANCEL_AVAILABLE, status.cancelAvailable)
         }
-        if (synchronous) editor.commit() else editor.apply()
+        return if (synchronous) editor.commit() else {
+            editor.apply()
+            true
+        }
     }
 
     fun recoverInterruptedDbMaintenanceIfNeeded(source: String): Boolean {
         val operationKey = prefs.getString(KEY_DB_MAINTENANCE_OPERATION, null)
         if (prefs.getBoolean(KEY_DB_MAINTENANCE_RUNNING, false) && DbMaintenanceOperation.fromKey(operationKey) == null) {
             clearDbMaintenanceStatus(synchronous = true)
-            store?.recordEvent(
+            recordEvent(
                 category = "database_maintenance_unknown_cleared",
                 message = "Unknown database maintenance state cleared",
                 detail = "source=$source operation=$operationKey"
@@ -560,7 +566,7 @@ class CollectorSettings(
             ),
             synchronous = true
         )
-        store?.recordEvent(
+        recordEvent(
             category = "database_maintenance_interrupted",
             message = "Database maintenance interrupted before completion",
             detail = "source=$source operation=${operation.key} step=${status.stepIndex}/${status.stepCount} updated_at_ms=${status.updatedAtMs}"
@@ -623,41 +629,43 @@ class CollectorSettings(
     }
 
     fun storageCutoverJournal(): StorageCutoverJournal? {
-        val family = prefs.getString(KEY_STORAGE_CUTOVER_JOURNAL_FAMILY, null) ?: return null
-        val phase = prefs.getString(KEY_STORAGE_CUTOVER_JOURNAL_PHASE, null) ?: return null
-        val sourceFormat = prefs.getString(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT, null)
-            ?.let(StorageFormat::valueOf)
-            ?: return null
+        val journalKeys = listOf(
+            KEY_STORAGE_CUTOVER_JOURNAL_FAMILY,
+            KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH,
+            KEY_STORAGE_CUTOVER_JOURNAL_PHASE,
+            KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT
+        )
+        if (runCatching { journalKeys.none(prefs::contains) }.getOrDefault(false)) return null
+        fun journalString(key: String): String? = runCatching { prefs.getString(key, null) }.getOrNull()
+        val family = journalString(KEY_STORAGE_CUTOVER_JOURNAL_FAMILY).orEmpty()
+        val phase = journalString(KEY_STORAGE_CUTOVER_JOURNAL_PHASE).orEmpty()
+        val sourceFormat = journalString(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT)
+            ?.let { runCatching { StorageFormat.valueOf(it) }.getOrNull() }
+            ?: StorageFormat.UNKNOWN
         return StorageCutoverJournal(
             family = family,
-            archivePath = prefs.getString(KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH, null),
+            archivePath = journalString(KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH),
             phase = phase,
             sourceFormat = sourceFormat
         )
     }
 
-    fun setStorageCutoverJournal(journal: StorageCutoverJournal) {
-        check(
-            prefs.edit().apply {
-                putString(KEY_STORAGE_CUTOVER_JOURNAL_FAMILY, journal.family)
-                putString(KEY_STORAGE_CUTOVER_JOURNAL_PHASE, journal.phase)
-                putString(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT, journal.sourceFormat.name)
-                journal.archivePath?.let { putString(KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH, it) }
-                    ?: remove(KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH)
-            }.commit()
-        ) { "Cannot persist storage cutover journal" }
-    }
+    fun setStorageCutoverJournal(journal: StorageCutoverJournal): Boolean =
+        prefs.edit().apply {
+            putString(KEY_STORAGE_CUTOVER_JOURNAL_FAMILY, journal.family)
+            putString(KEY_STORAGE_CUTOVER_JOURNAL_PHASE, journal.phase)
+            putString(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT, journal.sourceFormat.name)
+            journal.archivePath?.let { putString(KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH, it) }
+                ?: remove(KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH)
+        }.commit()
 
-    fun clearStorageCutoverJournal() {
-        check(
-            prefs.edit()
-                .remove(KEY_STORAGE_CUTOVER_JOURNAL_FAMILY)
-                .remove(KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH)
-                .remove(KEY_STORAGE_CUTOVER_JOURNAL_PHASE)
-                .remove(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT)
-                .commit()
-        ) { "Cannot clear storage cutover journal" }
-    }
+    fun clearStorageCutoverJournal(): Boolean =
+        prefs.edit()
+            .remove(KEY_STORAGE_CUTOVER_JOURNAL_FAMILY)
+            .remove(KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH)
+            .remove(KEY_STORAGE_CUTOVER_JOURNAL_PHASE)
+            .remove(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT)
+            .commit()
 
     fun isCutoverArchiveStoragePending(): Boolean =
         prefs.getBoolean(KEY_STORAGE_CUTOVER_ARCHIVE_PENDING, false)
@@ -750,7 +758,7 @@ class CollectorSettings(
 
     fun setKeepWifiEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_KEEP_WIFI, enabled).apply()
-        store?.recordEvent(
+        recordEvent(
             category = if (enabled) "keep_alive_wifi_enabled" else "keep_alive_wifi_disabled",
             message = "Wi-Fi keep-alive ${if (enabled) "enabled" else "disabled"}"
         )
@@ -760,7 +768,7 @@ class CollectorSettings(
 
     fun setKeepMobileDataEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_KEEP_MOBILE_DATA, enabled).apply()
-        store?.recordEvent(
+        recordEvent(
             category = if (enabled) "keep_alive_mobile_data_enabled" else "keep_alive_mobile_data_disabled",
             message = "Mobile data keep-alive ${if (enabled) "enabled" else "disabled"}"
         )
@@ -770,7 +778,7 @@ class CollectorSettings(
 
     fun setKeepBluetoothEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_KEEP_BLUETOOTH, enabled).apply()
-        store?.recordEvent(
+        recordEvent(
             category = if (enabled) "keep_alive_bluetooth_enabled" else "keep_alive_bluetooth_disabled",
             message = "Bluetooth keep-alive ${if (enabled) "enabled" else "disabled"}"
         )
@@ -780,10 +788,17 @@ class CollectorSettings(
 
     fun setRecoverCollectorServiceEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_RECOVER_COLLECTOR_SERVICE, enabled).apply()
-        store?.recordEvent(
+        recordEvent(
             category = if (enabled) "keep_alive_collector_recovery_enabled" else "keep_alive_collector_recovery_disabled",
             message = "Collector service recovery ${if (enabled) "enabled" else "disabled"}"
         )
+    }
+
+    private fun recordEvent(category: String, message: String, detail: String? = null) {
+        val eventStore = store ?: return
+        dispatchOperationalEvent(eventExecutor) {
+            eventStore.recordEvent(category, message, detail)
+        }
     }
 
     private fun secretValue(name: String): String = secretStore.read(name).orEmpty()
@@ -804,7 +819,7 @@ class CollectorSettings(
         if (!written) integrationEnabledKey?.let { editor.putBoolean(it, false) }
         editor.commit()
         if (!written) {
-            store?.recordEvent(
+            recordEvent(
                 category = "keystore_secret_write_failed",
                 message = "Credential could not be stored in Android Keystore",
                 detail = "secret=$name"
@@ -829,7 +844,7 @@ class CollectorSettings(
             if (!migrated) putBoolean(integrationEnabledKey, false)
         }.commit()
         if (!migrated) {
-            store?.recordEvent(
+            recordEvent(
                 category = "keystore_secret_migration_failed",
                 message = "Legacy credential migration failed closed",
                 detail = "secret=$secretName"

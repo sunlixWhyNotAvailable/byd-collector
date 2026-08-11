@@ -197,7 +197,6 @@ class DashboardUiStateStoreTest {
             influxMeasurement = "",
             influxEnabledCategories = emptySet(),
             influxStatus = "stopped",
-            influxMode = null,
             influxPendingRows = 0L,
             influxOldestPendingAt = null,
             influxNextRetryAt = null,

@@ -30,7 +30,9 @@ class MainActivityMaintenanceContractTest {
         val source = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
 
         assertFalse(source.contains("store.recordEvent("))
-        assertTrue(source.contains("currentStore().recordEvent("))
+        assertFalse(source.contains("currentStore().recordEvent("))
+        assertTrue(source.contains("dispatchOperationalEvent(dashboardExecutor)"))
+        assertTrue(source.contains("val eventStore = currentStore()"))
     }
 
     @Test
@@ -55,9 +57,12 @@ class MainActivityMaintenanceContractTest {
         assertTrue(strings.contains("archivePreflightFailed = \"Не вдалося перевірити стан бази\""))
         assertTrue(strings.contains("archivePreflightFailed = \"Could not check database status\""))
         assertInOrder(source, "StorageFormatCutoverCoordinator.readMainPreflight", "pendingMaintenanceOperation = DbMaintenanceOperation.ARCHIVE")
-        assertInOrder(source, "settings.setDbMaintenanceStatus(", "DbMaintenanceRuntimeStatus(")
-        assertInOrder(source, "maintenanceLaunchOperation = operation", "CollectorServiceController.archiveDatabase(this@MainActivity)")
-        assertTrue(source.contains("CollectorServiceController.archiveDatabase(this@MainActivity)"))
+        assertInOrder(source, "val runningStatus = DbMaintenanceRuntimeStatus(", "settings.setDbMaintenanceStatus(runningStatus, synchronous = true)")
+        assertInOrder(source, "maintenanceLaunchOperation = operation", "dashboardExecutor.execute")
+        assertInOrder(source, "settings.setDbMaintenanceStatus(runningStatus, synchronous = true)", "CollectorServiceController.archiveDatabase(applicationContext)")
+        assertTrue(source.contains("CollectorServiceController.archiveDatabase(applicationContext)"))
+        assertTrue(source.contains("if (!committed)"))
+        assertTrue(source.contains("runOnUiThread {\n                            if (!destroyed) refresh()"))
         assertTrue(actions.contains("fun onSetArchiveStorageLimitGb(value: Int)"))
         assertTrue(actions.contains("fun onDeleteArchives(ids: List<String>)"))
         assertTrue(actions.contains("fun onShareArchives(ids: List<String>)"))

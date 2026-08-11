@@ -9,6 +9,7 @@ import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 class DashboardLoadProfileTest {
@@ -105,6 +106,23 @@ class DashboardLoadProfileTest {
         assertEquals(8L, merged.debugReadingCount)
         assertEquals("88%", merged.vehicleKpis.socPercent)
         assertEquals("previous-archive", merged.archiveStorageSnapshot.archiveRootPath)
+    }
+
+    @Test
+    fun profileMergeReusesEquivalentVehicleKpiInstance() {
+        val previousKpis = VehicleKpis(socPercent = "88%")
+        val merged = DashboardStateProfileMerger.merge(
+            previous = dashboardState("previous").copy(vehicleKpis = previousKpis),
+            next = dashboardState("next").copy(vehicleKpis = VehicleKpis(socPercent = "88%")),
+            healthDetailLoaded = null,
+            debugStatusLoaded = false,
+            vehicleKpisLoaded = true,
+            integrationSettingsLoaded = false,
+            runtimeSettingsLoaded = false,
+            archiveDetailsLoaded = false
+        )
+
+        assertSame(previousKpis, merged.vehicleKpis)
     }
 
     @Test
@@ -305,7 +323,6 @@ class DashboardLoadProfileTest {
             influxMeasurement = "",
             influxEnabledCategories = emptySet(),
             influxStatus = "stopped",
-            influxMode = null,
             influxPendingRows = 0L,
             influxOldestPendingAt = null,
             influxNextRetryAt = null,

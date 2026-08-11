@@ -21,10 +21,3 @@ data class TelegramOutboxMessage(
     val eventType: String,
     val payload: String
 )
-
-data class TelegramQueueSnapshot(
-    val pendingCount: Long,
-    val blockedCount: Long,
-    val nextAttemptAtMs: Long?,
-    val lastError: String?
-)

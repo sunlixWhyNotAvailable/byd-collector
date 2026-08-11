@@ -623,35 +623,6 @@ class TelemetryStore(
         )
     }
 
-    fun telegramQueueSnapshot(): TelegramQueueSnapshot {
-        helper.readableDatabase.rawQuery(
-            """
-            SELECT COUNT(*),
-                   COALESCE(SUM(CASE WHEN blocked = 1 THEN 1 ELSE 0 END), 0),
-                   (
-                       SELECT CASE WHEN blocked = 0 THEN next_attempt_at_ms END
-                       FROM telegram_outbox
-                       ORDER BY id
-                       LIMIT 1
-                   )
-            FROM telegram_outbox
-            """.trimIndent(),
-            emptyArray()
-        ).use { cursor ->
-            if (!cursor.moveToFirst()) return TelegramQueueSnapshot(0, 0, null, null)
-            val lastError = helper.readableDatabase.rawQuery(
-                "SELECT last_error FROM telegram_outbox WHERE last_error IS NOT NULL ORDER BY last_attempt_at_ms DESC LIMIT 1",
-                emptyArray()
-            ).use { errorCursor -> if (errorCursor.moveToFirst()) errorCursor.getString(0) else null }
-            return TelegramQueueSnapshot(
-                pendingCount = cursor.getLong(0),
-                blockedCount = cursor.getLong(1),
-                nextAttemptAtMs = if (cursor.isNull(2)) null else cursor.getLong(2),
-                lastError = lastError
-            )
-        }
-    }
-
     fun telegramRuntimeState(): String? {
         helper.readableDatabase.rawQuery(
             "SELECT state_json FROM telegram_runtime_state WHERE id = 1",
