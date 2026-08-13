@@ -35,14 +35,6 @@ class TailscaleActivationGate(
                 process.message
             )
         }
-        if (process.running) {
-            return TailscaleGateDecision(
-                false,
-                "tailscale_activation_skipped_running",
-                process.message
-            )
-        }
-
         val now = nowMs()
         val lastAttempt = lastAttemptAtMs()
         if (lastAttempt > 0L && now - lastAttempt < throttleMs) {

@@ -1,6 +1,8 @@
 package com.bydcollector.collector.ui
 
 import android.os.SystemClock
+import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
+import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
 import com.bydcollector.collector.ui.compose.AppTab
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -14,6 +16,38 @@ data class CachedDashboardState(
     val lastError: String?
 )
 
+data class DashboardRuntimeFlags(
+    val serviceRunning: Boolean,
+    val mainPollingRunning: Boolean,
+    val debugPollingRunning: Boolean,
+    val pollingEnabled: Boolean,
+    val debugPollingEnabled: Boolean,
+    val mqttEnabled: Boolean,
+    val influxEnabled: Boolean,
+    val permissionsGranted: Boolean,
+    val adbAuthorized: Boolean,
+    val dbMaintenanceStatus: DbMaintenanceRuntimeStatus,
+    val archiveStorageJobStatus: ArchiveStorageJobStatus
+)
+
+data class DashboardMainPollState(
+    val activeSessionId: Long?,
+    val lastSuccessAt: String?,
+    val lastError: String?,
+    val lastErrorAt: String?,
+    val lastPollStatus: String?,
+    val elapsedMs: Long?,
+    val requestCount: Int?
+)
+
+data class DashboardDebugPollState(
+    val lastReadingAt: String?,
+    val lastErrorAt: String?,
+    val lastError: String?,
+    val errorCount: Long,
+    val lastSessionId: Long?
+)
+
 class DashboardUiStateStore(
     private val clock: () -> Long = { SystemClock.elapsedRealtime() }
 ) {
@@ -24,6 +58,21 @@ class DashboardUiStateStore(
         MutableStateFlow<CachedDashboardState?>(null)
     }
     private val pendingGenerations = mutableMapOf<AppTab?, Long>()
+    private var selectedKpiLanguage = VehicleKpiLanguage.UK
+    private var localizedVehicleKpis = mapOf(
+        VehicleKpiLanguage.UK to VehicleKpis(),
+        VehicleKpiLanguage.EN to VehicleKpis()
+    )
+    private var rowCounts: DashboardRowCounts? = null
+    private var countBootstrapInFlight = false
+    private var countBootstrapGeneration = 0L
+    private var initialHydrationStarted = false
+    private var runtimeFlags: DashboardRuntimeFlags? = null
+    private var mainPollState: DashboardMainPollState? = null
+    private var debugPollState: DashboardDebugPollState? = null
+    private var integrationRuntimeState: DashboardState? = null
+    private var mainDatabaseSizeBytes: Long? = null
+    private var debugDatabaseSizeBytes: Long? = null
 
     val chromeState: StateFlow<CachedDashboardState?> = chrome.asStateFlow()
     private val tabFlows = tabs.mapValues { (_, flow) -> flow.asStateFlow() }
@@ -35,12 +84,13 @@ class DashboardUiStateStore(
             val emptyTabs = AppTab.entries.filter { tabs.getValue(it).value == null }
             if (chrome.value != null && emptyTabs.isEmpty()) return
 
+            val seeded = applyRuntimeOverlays(initial)
             val generation = nextGenerationLocked()
             val loadedAtElapsedMs = clock()
             if (chrome.value == null) {
                 pendingGenerations.remove(null)
                 chrome.value = CachedDashboardState(
-                    state = initial,
+                    state = seeded,
                     loadedAtElapsedMs = loadedAtElapsedMs,
                     generation = generation,
                     inFlight = false,
@@ -50,7 +100,7 @@ class DashboardUiStateStore(
             emptyTabs.forEach { tab ->
                 pendingGenerations.remove(tab)
                 tabs.getValue(tab).value = CachedDashboardState(
-                    state = initial,
+                    state = seeded,
                     loadedAtElapsedMs = loadedAtElapsedMs,
                     generation = generation,
                     inFlight = false,
@@ -92,6 +142,153 @@ class DashboardUiStateStore(
         }
     }
 
+    fun selectVehicleKpiLanguage(language: VehicleKpiLanguage) {
+        synchronized(lock) {
+            if (selectedKpiLanguage == language) return
+            selectedKpiLanguage = language
+            updateTargetsLocked(setOf(AppTab.ALL_PARAMETERS), includeChrome = false)
+        }
+    }
+
+    fun publishVehicleKpis(uk: VehicleKpis, en: VehicleKpis) {
+        synchronized(lock) {
+            localizedVehicleKpis = mapOf(
+                VehicleKpiLanguage.UK to uk,
+                VehicleKpiLanguage.EN to en
+            )
+            updateTargetsLocked(setOf(AppTab.ALL_PARAMETERS), includeChrome = false)
+        }
+    }
+
+    fun clearVehicleKpis() = publishVehicleKpis(VehicleKpis(), VehicleKpis())
+
+    fun beginCountBootstrap(force: Boolean = false): Long? {
+        return synchronized(lock) {
+            val hasKnownBaseline = rowCounts?.let { counts ->
+                counts.pollCount >= 0L &&
+                    counts.valueRowCount >= 0L &&
+                    counts.ecRowCount >= 0L &&
+                    counts.normalizedCurrentCount >= 0L &&
+                    counts.normalizedHistoryCount >= 0L &&
+                    counts.debugReadingCount >= 0L
+            } == true
+            if (countBootstrapInFlight || (!force && hasKnownBaseline)) return@synchronized null
+            check(countBootstrapGeneration < Long.MAX_VALUE) { "dashboard count generation overflow" }
+            countBootstrapGeneration += 1L
+            countBootstrapInFlight = true
+            countBootstrapGeneration
+        }
+    }
+
+    fun invalidateRowCounts() {
+        synchronized(lock) {
+            rowCounts = DashboardRowCounts(
+                pollCount = UNKNOWN_DASHBOARD_COUNT,
+                valueRowCount = UNKNOWN_DASHBOARD_COUNT,
+                ecRowCount = UNKNOWN_DASHBOARD_COUNT,
+                normalizedCurrentCount = UNKNOWN_DASHBOARD_COUNT,
+                normalizedHistoryCount = UNKNOWN_DASHBOARD_COUNT,
+                debugReadingCount = UNKNOWN_DASHBOARD_COUNT
+            )
+            countBootstrapInFlight = false
+            check(countBootstrapGeneration < Long.MAX_VALUE) { "dashboard count generation overflow" }
+            countBootstrapGeneration += 1L
+            updateTargetsLocked(setOf(AppTab.LOGS), includeChrome = false)
+        }
+    }
+
+    fun beginInitialHydration(): Boolean = synchronized(lock) {
+        if (initialHydrationStarted) return@synchronized false
+        initialHydrationStarted = true
+        true
+    }
+
+    fun publishRowCountBaseline(generation: Long, counts: DashboardRowCounts): Boolean {
+        return synchronized(lock) {
+            if (!countBootstrapInFlight || generation != countBootstrapGeneration) return@synchronized false
+            rowCounts = counts
+            countBootstrapInFlight = false
+            updateTargetsLocked(setOf(AppTab.LOGS), includeChrome = false)
+            true
+        }
+    }
+
+    fun failCountBootstrap(generation: Long): Boolean {
+        return synchronized(lock) {
+            if (!countBootstrapInFlight || generation != countBootstrapGeneration) return@synchronized false
+            countBootstrapInFlight = false
+            true
+        }
+    }
+
+    fun incrementMainRowCounts(
+        pollRows: Long = 0L,
+        valueRows: Long = 0L,
+        ecRows: Long = 0L,
+        normalizedCurrentRows: Long = 0L,
+        normalizedHistoryRows: Long = 0L
+    ) {
+        synchronized(lock) {
+            val current = rowCounts ?: return
+            rowCounts = current.copy(
+                pollCount = incrementKnownCount(current.pollCount, pollRows),
+                valueRowCount = incrementKnownCount(current.valueRowCount, valueRows),
+                ecRowCount = incrementKnownCount(current.ecRowCount, ecRows),
+                normalizedCurrentCount = incrementKnownCount(current.normalizedCurrentCount, normalizedCurrentRows),
+                normalizedHistoryCount = incrementKnownCount(current.normalizedHistoryCount, normalizedHistoryRows)
+            )
+            updateTargetsLocked(setOf(AppTab.LOGS), includeChrome = false)
+        }
+    }
+
+    fun incrementDebugReadingCount(rows: Long) {
+        if (rows == 0L) return
+        synchronized(lock) {
+            val current = rowCounts ?: return
+            rowCounts = current.copy(debugReadingCount = incrementKnownCount(current.debugReadingCount, rows))
+            updateTargetsLocked(setOf(AppTab.LOGS), includeChrome = false)
+        }
+    }
+
+    fun publishRuntimeFlags(flags: DashboardRuntimeFlags) {
+        synchronized(lock) {
+            runtimeFlags = flags
+            updateAllLocked(::applyRuntimeOverlays)
+        }
+    }
+
+    fun publishMainPollState(state: DashboardMainPollState) {
+        synchronized(lock) {
+            mainPollState = state
+            updateTargetsLocked(setOf(AppTab.MAIN, AppTab.LOGS), includeChrome = true)
+        }
+    }
+
+    fun publishDebugPollState(state: DashboardDebugPollState) {
+        synchronized(lock) {
+            debugPollState = state
+            updateTargetsLocked(setOf(AppTab.ALL_PARAMETERS, AppTab.LOGS), includeChrome = false)
+        }
+    }
+
+    fun publishIntegrationRuntime(state: DashboardState) {
+        synchronized(lock) {
+            integrationRuntimeState = state
+            updateTargetsLocked(setOf(AppTab.MAIN, AppTab.HA, AppTab.LOGS), includeChrome = true)
+        }
+    }
+
+    fun publishDatabaseFootprints(mainBytes: Long, debugBytes: Long) {
+        synchronized(lock) {
+            mainDatabaseSizeBytes = mainBytes
+            debugDatabaseSizeBytes = debugBytes
+            updateTargetsLocked(
+                setOf(AppTab.MAIN, AppTab.ALL_PARAMETERS, AppTab.STORAGE, AppTab.LOGS),
+                includeChrome = true
+            )
+        }
+    }
+
     private fun beginRefresh(tab: AppTab?): Long {
         return synchronized(lock) {
             val generation = nextGenerationLocked()
@@ -113,7 +310,7 @@ class DashboardUiStateStore(
                 false
             } else {
                 flow.value = CachedDashboardState(
-                    state = state,
+                    state = applyRuntimeOverlays(state),
                     loadedAtElapsedMs = clock(),
                     generation = generation,
                     inFlight = false,
@@ -160,9 +357,109 @@ class DashboardUiStateStore(
         return if (tab == null) chrome else tabs.getValue(tab)
     }
 
+    private fun updateAllLocked(transform: (DashboardState) -> DashboardState) {
+        updateFlowLocked(chrome, transform)
+        tabs.values.forEach { flow -> updateFlowLocked(flow, transform) }
+    }
+
+    private fun updateTargetsLocked(targetTabs: Set<AppTab>, includeChrome: Boolean) {
+        if (includeChrome) updateFlowLocked(chrome, ::applyRuntimeOverlays)
+        targetTabs.forEach { tab -> updateFlowLocked(tabs.getValue(tab), ::applyRuntimeOverlays) }
+    }
+
+    private fun updateFlowLocked(
+        flow: MutableStateFlow<CachedDashboardState?>,
+        transform: (DashboardState) -> DashboardState
+    ) {
+        val current = flow.value ?: return
+        val next = transform(current.state)
+        if (next != current.state) flow.value = current.copy(state = next)
+    }
+
+    private fun applyRuntimeOverlays(source: DashboardState): DashboardState {
+        var state = source.copy(vehicleKpis = localizedVehicleKpis.getValue(selectedKpiLanguage))
+        rowCounts?.let { counts ->
+            state = state.copy(
+                pollCount = counts.pollCount,
+                valueRowCount = counts.valueRowCount,
+                ecRowCount = counts.ecRowCount,
+                normalizedCurrentCount = counts.normalizedCurrentCount,
+                normalizedHistoryCount = counts.normalizedHistoryCount,
+                debugReadingCount = counts.debugReadingCount
+            )
+        }
+        mainPollState?.let { poll ->
+            state = state.copy(
+                activeSessionId = poll.activeSessionId,
+                lastSuccessAt = poll.lastSuccessAt,
+                lastError = poll.lastError,
+                lastErrorAt = poll.lastErrorAt,
+                lastPollStatus = poll.lastPollStatus,
+                elapsedMs = poll.elapsedMs,
+                requestCount = poll.requestCount
+            )
+        }
+        debugPollState?.let { debug ->
+            state = state.copy(
+                debugLastReadingAt = debug.lastReadingAt,
+                debugLastErrorAt = debug.lastErrorAt,
+                debugLastError = debug.lastError,
+                debugErrorCount = debug.errorCount,
+                debugLastSessionId = debug.lastSessionId
+            )
+        }
+        integrationRuntimeState?.let { runtime ->
+            state = state.copy(
+                mqttEnabled = runtime.mqttEnabled,
+                mqttStatus = runtime.mqttStatus,
+                mqttLastError = runtime.mqttLastError,
+                mqttLastPublishedAt = runtime.mqttLastPublishedAt,
+                mqttPendingCount = runtime.mqttPendingCount,
+                mqttRetryFailureCount = runtime.mqttRetryFailureCount,
+                mqttNextRetryAt = runtime.mqttNextRetryAt,
+                mqttRetryLastFailureAt = runtime.mqttRetryLastFailureAt,
+                mqttRetryLastSuccessAt = runtime.mqttRetryLastSuccessAt,
+                influxEnabled = runtime.influxEnabled,
+                influxStatus = runtime.influxStatus,
+                influxPendingRows = runtime.influxPendingRows,
+                influxOldestPendingAt = runtime.influxOldestPendingAt,
+                influxNextRetryAt = runtime.influxNextRetryAt,
+                influxLastSuccessAt = runtime.influxLastSuccessAt,
+                influxLastErrorAt = runtime.influxLastErrorAt,
+                influxLastError = runtime.influxLastError,
+                influxExportedRowsTotal = runtime.influxExportedRowsTotal
+            )
+        }
+        //Settings/service flags are the newest producer-owned truth and must win over a slightly older
+        //integration snapshot loaded from SQLite.
+        runtimeFlags?.let { flags ->
+            state = state.copy(
+                running = flags.mainPollingRunning,
+                serviceRunning = flags.serviceRunning,
+                mainPollingRunning = flags.mainPollingRunning,
+                pollingEnabled = flags.pollingEnabled,
+                debugPollingEnabled = flags.debugPollingEnabled,
+                debugPollingRunning = flags.debugPollingRunning,
+                mqttEnabled = flags.mqttEnabled,
+                influxEnabled = flags.influxEnabled,
+                permissionsGranted = flags.permissionsGranted,
+                adbAuthorized = flags.adbAuthorized,
+                dbMaintenanceStatus = flags.dbMaintenanceStatus,
+                archiveStorageJobStatus = flags.archiveStorageJobStatus
+            )
+        }
+        mainDatabaseSizeBytes?.let { state = state.copy(databaseSizeBytes = it) }
+        debugDatabaseSizeBytes?.let { state = state.copy(debugDatabaseSizeBytes = it) }
+        return state
+    }
+
     private fun nextGenerationLocked(): Long {
         check(nextGeneration < Long.MAX_VALUE) { "dashboard UI generation overflow" }
         nextGeneration += 1L
         return nextGeneration
+    }
+
+    private fun incrementKnownCount(current: Long, delta: Long): Long {
+        return if (current == UNKNOWN_DASHBOARD_COUNT) current else current + delta
     }
 }

@@ -79,6 +79,14 @@ data class HealthSnapshot(
     val recentEvents: List<CollectorEvent>
 )
 
+data class TelemetryRowCounts(
+    val pollCount: Long,
+    val valueRowCount: Long,
+    val ecRowCount: Long,
+    val normalizedCurrentCount: Long,
+    val normalizedHistoryCount: Long
+)
+
 enum class HealthSnapshotDetail {
     SUMMARY,
     INTEGRATIONS,

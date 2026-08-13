@@ -2,7 +2,7 @@ package com.bydcollector.collector.ui.compose
 
 import java.util.Locale
 
-//maps verbose channel health strings into compact ui labels without letting enabled+retry look healthy
+//maps verbose channel health strings into compact ui labels without treating a healthy next batch as a retry failure
 object ChannelStatusFormatter {
     fun compactText(status: String?, strings: UiStrings): String {
         val normalized = status.orEmpty().lowercase(Locale.US)
@@ -25,6 +25,6 @@ object ChannelStatusFormatter {
     }
 
     private fun String.hasFailureSignal(): Boolean {
-        return contains("error") || contains("failed") || contains("retry") || contains("backoff")
+        return contains("error") || contains("failed") || contains("retry #") || contains("backoff")
     }
 }

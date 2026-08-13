@@ -23,9 +23,9 @@ class DashboardStateProviderMaintenanceContractTest {
 
         assertTrue(source.contains("HealthSnapshotDetail.INTEGRATIONS"))
         assertTrue(source.contains("HealthSnapshotDetail.FULL"))
-        assertTrue(source.contains("store.healthSnapshot(running = running, detail = detail)"))
+        assertTrue(source.contains("detail = detail, includeCounts = false"))
         assertTrue(source.contains("profile.readsDebugStatus && !debugMaintenanceRunning"))
-        assertTrue(source.contains("profile.readsVehicleKpis && store != null"))
+        assertTrue(source.contains("KPI values are fed directly by the successful normalized-poll producer"))
         assertTrue(source.contains("DirectDebugStore(context).use"))
         assertTrue(source.contains("debugStatusCache.get(nowMs = nowMs)"))
         assertTrue(source.contains("private fun maintenanceHealthSnapshot("))

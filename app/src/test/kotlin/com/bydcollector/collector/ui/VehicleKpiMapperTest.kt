@@ -1,6 +1,10 @@
 package com.bydcollector.collector.ui
 
 import com.bydcollector.collector.data.normalized.NormalizedQuality
+import com.bydcollector.collector.data.normalized.NormalizedFieldCatalog
+import com.bydcollector.collector.data.normalized.NormalizedObservation
+import com.bydcollector.collector.data.normalized.NormalizedValue
+import com.bydcollector.collector.data.normalized.NormalizedValueType
 import com.bydcollector.collector.data.normalized.StoredNormalizedState
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -91,6 +95,22 @@ class VehicleKpiMapperTest {
         assertEquals("-", invalidDelta.cellVoltageDeltaMv)
     }
 
+    @Test
+    fun mapsDirectlyFromTheCurrentPollAndFailsClosedPerField() {
+        val kpis = VehicleKpiMapper.fromObservations(
+            observations = listOf(
+                observation("soc", 74.0),
+                observation("odometer_km", 12_345.0),
+                observation("inside_temp_c_raw", 99.0, NormalizedQuality.MISSING)
+            ),
+            language = VehicleKpiLanguage.EN
+        )
+
+        assertEquals("74%", kpis.socPercent)
+        assertEquals("12 345 km", kpis.odometerKm)
+        assertEquals("-", kpis.cabinTempC)
+    }
+
     private fun state(fieldKey: String, valueNumber: Double): StoredNormalizedState {
         return StoredNormalizedState(
             fieldKey = fieldKey,
@@ -105,6 +125,22 @@ class VehicleKpiMapperTest {
             sourceKeys = fieldKey,
             observedAt = "2026-06-19T12:00:00+03:00",
             changedAt = "2026-06-19T12:00:00+03:00"
+        )
+    }
+
+    private fun observation(
+        fieldKey: String,
+        valueNumber: Double,
+        quality: NormalizedQuality = NormalizedQuality.OK
+    ): NormalizedObservation {
+        val field = NormalizedFieldCatalog.fields.first { it.fieldKey == fieldKey }
+        return NormalizedObservation(
+            field = field,
+            value = NormalizedValue(NormalizedValueType.NUMBER, number = valueNumber),
+            quality = quality,
+            sourcePollId = 1L,
+            sourceKey = field.sourceKeys.firstOrNull(),
+            observedAt = "2026-06-19T12:00:00+03:00"
         )
     }
 }

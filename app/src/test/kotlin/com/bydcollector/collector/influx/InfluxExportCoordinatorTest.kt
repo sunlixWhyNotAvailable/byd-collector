@@ -55,7 +55,8 @@ class InfluxExportCoordinatorTest {
         val rows = (1L..301L).map { id -> row(id = id, fieldKey = "soc") }
         val store = FakeInfluxStore(rows = rows)
         val client = FakeInfluxClient()
-        val coordinator = coordinator(store, client)
+        val clock = FakeClock()
+        val coordinator = coordinator(store, client, clock)
 
         coordinator.runOneCycle(force = true)
 
@@ -63,15 +64,22 @@ class InfluxExportCoordinatorTest {
         assertEquals(listOf(300), store.pendingBatchLimits)
         assertEquals(300, store.cursor("soc").lastExportedHistoryId)
         assertEquals(1, store.influxExportState().pendingRows)
-        assertEquals("2026-06-15T12:00:30Z", store.influxExportState().nextRetryAt)
+        assertEquals("2026-06-15T12:00:01Z", store.influxExportState().nextRetryAt)
 
         coordinator.runOneCycle(force = false)
 
         assertEquals(1, client.writtenLines.size)
+
+        clock.now = "2026-06-15T12:00:01Z"
+        coordinator.runOneCycle(force = false)
+
+        assertEquals(2, client.writtenLines.size)
+        assertEquals(0, store.influxExportState().pendingRows)
+        assertEquals(null, store.influxExportState().nextRetryAt)
     }
 
     @Test
-    fun drainedBatchStillGatesRowsThatArriveBeforeTheNextEligibleTime() {
+    fun manualStartWritesPendingRowsWithoutASeparateConnectionPreflight() {
         val store = FakeInfluxStore(rows = listOf(row(id = 10, fieldKey = "soc")))
         val client = FakeInfluxClient()
         val clock = FakeClock()
@@ -80,24 +88,37 @@ class InfluxExportCoordinatorTest {
         coordinator.runOneCycle(force = true)
 
         assertEquals(0, store.influxExportState().pendingRows)
-        assertEquals("2026-06-15T12:00:30Z", store.influxExportState().nextRetryAt)
+        assertEquals(null, store.influxExportState().nextRetryAt)
         assertEquals(null, coordinator.retryDelayMs())
 
         clock.now = "2026-06-15T12:00:20Z"
         store.addRow(row(id = 11, fieldKey = "soc"))
         coordinator.startExport()
 
-        assertEquals(1, client.writtenLines.size)
-        assertEquals(1, client.testCalls)
-        assertEquals(1, store.influxExportState().pendingRows)
-        assertEquals(10_000L, coordinator.retryDelayMs())
+        assertEquals(2, client.writtenLines.size)
+        assertEquals(0, client.testCalls)
+        assertEquals(0, store.influxExportState().pendingRows)
+        assertEquals(null, coordinator.retryDelayMs())
 
         clock.now = "2026-06-15T12:00:30Z"
         coordinator.runOneCycle(force = false)
 
         assertEquals(2, client.writtenLines.size)
         assertEquals(0, store.influxExportState().pendingRows)
-        assertEquals("2026-06-15T12:01Z", store.influxExportState().nextRetryAt)
+        assertEquals(null, store.influxExportState().nextRetryAt)
+    }
+
+    @Test
+    fun resumeSchedulesHealthyBacklogAfterOneSecond() {
+        val store = FakeInfluxStore(rows = listOf(row(id = 10, fieldKey = "soc")))
+        val coordinator = coordinator(store, FakeInfluxClient())
+
+        val result = coordinator.resumeExport()
+
+        assertTrue(result.ok)
+        assertEquals("running", store.influxExportState().status)
+        assertEquals("2026-06-15T12:00:01Z", store.influxExportState().nextRetryAt)
+        assertEquals(1_000L, coordinator.retryDelayMs())
     }
 
     @Test
@@ -117,15 +138,42 @@ class InfluxExportCoordinatorTest {
     }
 
     @Test
-    fun failedStartConnectionTestKeepsAuthoritativePendingSummary() {
+    fun failedStartWriteKeepsAuthoritativePendingSummary() {
         val store = FakeInfluxStore(rows = listOf(row(id = 10, fieldKey = "soc")))
-        val client = FakeInfluxClient(testResult = InfluxActionResult.fail("influx_error", "offline"))
+        val client = FakeInfluxClient(writeResult = InfluxActionResult.fail("influx_error", "offline"))
 
         val result = coordinator(store, client).startExport()
 
         assertFalse(result.ok)
+        assertEquals(0, client.testCalls)
         assertEquals(1, store.influxExportState().pendingRows)
         assertEquals("2026-06-15T12:00:30Z", store.influxExportState().nextRetryAt)
+    }
+
+    @Test
+    fun failureAndStopPreserveLastSuccessErrorAndRealPendingRows() {
+        val store = FakeInfluxStore(rows = listOf(row(id = 10, fieldKey = "soc")))
+        val clock = FakeClock()
+        coordinator(store, FakeInfluxClient(), clock).runOneCycle(force = true)
+
+        clock.now = "2026-06-15T12:01:00Z"
+        store.addRow(row(id = 11, fieldKey = "soc"))
+        coordinator(
+            store,
+            FakeInfluxClient(writeResult = InfluxActionResult.fail("influx_error", "offline")),
+            clock
+        ).runOneCycle(force = true)
+
+        coordinator(store, FakeInfluxClient(), clock).stopExport()
+
+        val state = store.influxExportState()
+        assertEquals("stopped", state.status)
+        assertEquals("realtime", state.mode)
+        assertEquals(1, state.pendingRows)
+        assertEquals("2026-06-15T12:00:00Z", state.lastSuccessAt)
+        assertEquals("2026-06-15T12:01:00Z", state.lastErrorAt)
+        assertEquals("offline", state.lastError)
+        assertEquals(null, state.nextRetryAt)
     }
 
     @Test

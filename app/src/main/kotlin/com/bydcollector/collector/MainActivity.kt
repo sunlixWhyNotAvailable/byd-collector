@@ -23,6 +23,7 @@ import com.bydcollector.collector.adb.AdbAuthorizationManager
 import com.bydcollector.collector.adb.AccessCheckMode
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
+import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
 import com.bydcollector.collector.influx.InfluxActionResult
 import com.bydcollector.collector.influx.InfluxActions
@@ -41,6 +42,7 @@ import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.system.CollectorAutoStart
 import com.bydcollector.collector.ui.DashboardState
 import com.bydcollector.collector.ui.DashboardLoadProfile
+import com.bydcollector.collector.ui.DashboardRowCounts
 import com.bydcollector.collector.ui.DashboardStateProvider
 import com.bydcollector.collector.ui.DashboardUiStateStore
 import com.bydcollector.collector.ui.VehicleKpiLanguage
@@ -80,6 +82,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var dashboardUiStateStore: DashboardUiStateStore
     private val handler = Handler(Looper.getMainLooper())
     private val dashboardExecutor = namedSingleThreadExecutor("byd-ui-dash")
+    private val dashboardCountExecutor = namedSingleThreadExecutor("byd-ui-counts")
     private val updateExecutor = namedSingleThreadExecutor("byd-update")
     private val updateChecker by lazy { UpdateChecker(settings) }
     private val updateDownloader by lazy { UpdateDownloader(applicationContext) }
@@ -158,6 +161,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onLanguageSelected(language: UiLanguage) {
             uiLanguage = language
+            dashboardUiStateStore.selectVehicleKpiLanguage(language.vehicleKpiLanguage())
         }
 
         override fun onDarkThemeSelected(dark: Boolean) {
@@ -520,6 +524,7 @@ class MainActivity : ComponentActivity() {
         }
         stateProvider = DashboardStateProvider(applicationContext, { BydCollectorApplication.store(applicationContext) }, settings)
         dashboardUiStateStore = BydCollectorApplication.dashboardUiStateStore(applicationContext)
+        dashboardUiStateStore.selectVehicleKpiLanguage(uiLanguage.vehicleKpiLanguage())
         mqttDraft = MqttDraft(
             host = settings.mqttHost(),
             port = settings.mqttPort().toString(),
@@ -534,8 +539,12 @@ class MainActivity : ComponentActivity() {
             measurement = settings.influxMeasurement()
         )
         telegramUiState = loadTelegramUiState()
-        val initialDashboardState = stateProvider.loadInitial()
-        dashboardUiStateStore.seed(initialDashboardState)
+        //An Activity recreation must render the process cache immediately; only a cold process
+        //needs the lightweight initial snapshot before Compose starts collecting the flows.
+        if (dashboardUiStateStore.currentChrome() == null) {
+            dashboardUiStateStore.seed(stateProvider.loadInitial())
+        }
+        scheduleDashboardCountBootstrap(force = false)
         setContent {
             val chromeSnapshot by dashboardUiStateStore.chromeState.collectAsStateWithLifecycle()
             val tabSnapshot by dashboardUiStateStore.tabState(activeTab).collectAsStateWithLifecycle()
@@ -578,6 +587,7 @@ class MainActivity : ComponentActivity() {
                 }
                 reconcileCutoverArchiveStorageIfNeeded()
                 startRuntimeUpdateAutoCheck()
+                hydrateDashboardTabsOnce()
             }
         }
     }
@@ -585,6 +595,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         foreground = true
+        scheduleDashboardCountBootstrap(force = false)
         reconcileCutoverArchiveStorageIfNeeded()
         syncTelegramUiRuntimeState()
         refresh()
@@ -618,6 +629,7 @@ class MainActivity : ComponentActivity() {
             CollectorAutoStart.scheduleRestartAfterUiClosed(applicationContext, settings, currentStore())
         }
         dashboardExecutor.shutdownNow()
+        dashboardCountExecutor.shutdownNow()
         updateExecutor.shutdownNow()
         if (::stateProvider.isInitialized) {
             stateProvider.close()
@@ -789,6 +801,74 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    private fun scheduleDashboardCountBootstrap(force: Boolean) {
+        val countGeneration = dashboardUiStateStore.beginCountBootstrap(force) ?: return
+        runCatching {
+            dashboardCountExecutor.execute {
+                runCatching {
+                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+                    val main = currentStore().dashboardRowCounts()
+                    val debug = if (BydCollectorApplication.ensureDebugStorageReady(applicationContext)) {
+                        DirectDebugStore(applicationContext).use { it.dashboardReadingCount() }
+                    } else {
+                        0L
+                    }
+                    DashboardRowCounts(
+                        pollCount = main.pollCount,
+                        valueRowCount = main.valueRowCount,
+                        ecRowCount = main.ecRowCount,
+                        normalizedCurrentCount = main.normalizedCurrentCount,
+                        normalizedHistoryCount = main.normalizedHistoryCount,
+                        debugReadingCount = debug
+                    )
+                }.onSuccess { counts ->
+                    dashboardUiStateStore.publishRowCountBaseline(countGeneration, counts)
+                }
+                    .onFailure { error ->
+                        dashboardUiStateStore.failCountBootstrap(countGeneration)
+                        Log.w(TAG, "Dashboard row-count bootstrap failed", error)
+                    }
+            }
+        }.onFailure { error ->
+            dashboardUiStateStore.failCountBootstrap(countGeneration)
+            Log.w(TAG, "Dashboard row-count bootstrap rejected", error)
+        }
+    }
+
+    private fun hydrateDashboardTabsOnce() {
+        if (!dashboardUiStateStore.beginInitialHydration()) return
+        val kpiLanguage = uiLanguage.vehicleKpiLanguage()
+        val targets = listOf(
+            AppTab.MAIN to DashboardLoadProfile.MAIN,
+            AppTab.ALL_PARAMETERS to DashboardLoadProfile.ALL_PARAMETERS,
+            AppTab.HA to DashboardLoadProfile.HA,
+            AppTab.EXTRA to DashboardLoadProfile.EXTRA,
+            AppTab.LOGS to DashboardLoadProfile.LOGS
+        )
+        runCatching {
+            dashboardExecutor.execute {
+                targets.forEach { (tab, profile) ->
+                    if (Thread.currentThread().isInterrupted) return@execute
+                    val generation = dashboardUiStateStore.beginTabRefresh(tab)
+                    runCatching {
+                        stateProvider.load(
+                            profile = profile,
+                            previous = dashboardUiStateStore.currentTab(tab),
+                            vehicleKpiLanguage = kpiLanguage
+                        )
+                    }.onSuccess { state ->
+                        dashboardUiStateStore.publishTab(tab, generation, state)
+                    }.onFailure { error ->
+                        dashboardUiStateStore.failTab(tab, generation, dashboardErrorDetail(error))
+                        Log.w(TAG, "Initial dashboard hydration failed for $tab", error)
+                    }
+                }
+            }
+        }.onFailure { error ->
+            Log.w(TAG, "Initial dashboard hydration rejected", error)
+        }
+    }
+
     private fun openMainArchiveDialog() {
         if (maintenancePreflightInFlight || destroyed) return
         maintenancePreflightInFlight = true
@@ -846,7 +926,7 @@ class MainActivity : ComponentActivity() {
         refreshInFlight = true
         val tabGeneration = if (tabDue) dashboardUiStateStore.beginTabRefresh(tab) else null
         val chromeGeneration = if (chromeDue) dashboardUiStateStore.beginChromeRefresh() else null
-        val kpiLanguage = if (uiLanguage == UiLanguage.UK) VehicleKpiLanguage.UK else VehicleKpiLanguage.EN
+        val kpiLanguage = uiLanguage.vehicleKpiLanguage()
         dashboardExecutor.execute {
             val tabResult = if (tabGeneration != null && profile != null) {
                 runCatching {
@@ -1637,7 +1717,9 @@ class MainActivity : ComponentActivity() {
 }
 
 internal const val DASHBOARD_REFRESH_HEARTBEAT_MS = 1_000L
-internal const val DASHBOARD_CHROME_REFRESH_INTERVAL_MS = 2_000L
+//Chrome/status fields are producer-fed while the service runs. Activity entry, resume, tab changes,
+//and explicit actions still force a reconciliation; the foreground heartbeat does not reread SQLite.
+internal val DASHBOARD_CHROME_REFRESH_INTERVAL_MS: Long? = null
 
 internal fun dashboardProfile(tab: AppTab): DashboardLoadProfile? = when (tab) {
     AppTab.MAIN -> DashboardLoadProfile.MAIN
@@ -1650,11 +1732,13 @@ internal fun dashboardProfile(tab: AppTab): DashboardLoadProfile? = when (tab) {
 }
 
 internal fun dashboardTabRefreshIntervalMs(tab: AppTab, storageRefreshPending: Boolean): Long? = when (tab) {
-    AppTab.MAIN -> 2_000L
-    AppTab.ALL_PARAMETERS -> 1_000L
-    AppTab.HA -> 5_000L
+    //Main/All/HA dynamic values are producer-fed into the process cache; entry/resume still force
+    //one async reconciliation without polling SQLite on every foreground heartbeat.
+    AppTab.MAIN -> null
+    AppTab.ALL_PARAMETERS -> null
+    AppTab.HA -> null
     AppTab.TELEGRAM -> null
-    AppTab.STORAGE -> if (storageRefreshPending) 1_000L else 30_000L
+    AppTab.STORAGE -> if (storageRefreshPending) 1_000L else null
     AppTab.EXTRA -> null
     AppTab.LOGS -> 5_000L
 }
@@ -1671,6 +1755,11 @@ internal fun dashboardSnapshotDue(
 
 private fun dashboardErrorDetail(error: Throwable): String =
     "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+
+private fun UiLanguage.vehicleKpiLanguage(): VehicleKpiLanguage = when (this) {
+    UiLanguage.UK -> VehicleKpiLanguage.UK
+    UiLanguage.EN -> VehicleKpiLanguage.EN
+}
 
 private fun TelegramMessageType.eventKey(): String = when (this) {
     TelegramMessageType.CHARGING_STARTED -> "charging-started"

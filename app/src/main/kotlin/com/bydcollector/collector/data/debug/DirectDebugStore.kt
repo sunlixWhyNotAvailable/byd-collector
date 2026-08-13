@@ -8,6 +8,7 @@ import com.bydcollector.collector.data.direct.DirectBatchDiagnostics
 import com.bydcollector.collector.data.direct.DirectHelperReadResult
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
+import com.bydcollector.collector.util.sqliteFootprintBytes
 import java.io.Closeable
 import java.io.File
 import java.time.Instant
@@ -218,10 +219,12 @@ class DirectDebugStore(
         )
     }
 
-    fun status(): DirectDebugStatus {
+    fun dashboardReadingCount(): Long = scalarLong("SELECT COUNT(*) FROM debug_direct_readings")
+
+    fun status(readingCount: Long = UNKNOWN_READING_COUNT): DirectDebugStatus {
         val db = helper.readableDatabase
         val dbFile = context.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME)
-        if (!DirectDebugDatabaseHelper.isCompactV2(db)) return legacyStatus(db, dbFile)
+        if (!DirectDebugDatabaseHelper.isCompactV2(db)) return legacyStatus(db, dbFile, readingCount)
         val session = db.rawQuery(
             """
             SELECT id, started_at_ms, ended_at_ms, batch_size, candidate_count, error_count
@@ -241,13 +244,12 @@ class DirectDebugStore(
                 errorCount = cursor.getLong(5)
             )
         }
-        val readingCount = scalarLong("SELECT COUNT(*) FROM debug_direct_readings")
         val lastReadingAtMs = nullableLong("SELECT sampled_at_ms FROM debug_direct_readings ORDER BY id DESC LIMIT 1")
         val lastError = latestDebugError(db)
 
         return DirectDebugStatus(
             databasePath = dbFile.absolutePath,
-            databaseSizeBytes = dbFile.takeIf { it.exists() }?.length() ?: 0L,
+            databaseSizeBytes = sqliteFootprintBytes(dbFile),
             lastSessionId = session?.id,
             lastSessionStartedAt = session?.startedAtMs?.let(::iso),
             lastSessionEndedAt = session?.endedAtMs?.let(::iso),
@@ -407,7 +409,7 @@ class DirectDebugStore(
         }
     }
 
-    private fun legacyStatus(db: SQLiteDatabase, dbFile: File): DirectDebugStatus {
+    private fun legacyStatus(db: SQLiteDatabase, dbFile: File, readingCount: Long): DirectDebugStatus {
         val session = db.rawQuery(
             """
             SELECT id, started_at, ended_at, batch_size, candidate_count
@@ -444,15 +446,13 @@ class DirectDebugStore(
         }
         return DirectDebugStatus(
             databasePath = dbFile.absolutePath,
-            databaseSizeBytes = dbFile.takeIf { it.exists() }?.length() ?: 0L,
+            databaseSizeBytes = sqliteFootprintBytes(dbFile),
             lastSessionId = session?.get(0) as? Long,
             lastSessionStartedAt = session?.get(1) as? String,
             lastSessionEndedAt = session?.get(2) as? String,
             lastBatchSize = session?.get(3) as? Int,
             candidateCount = (session?.get(4) as? Int) ?: DirectDebugParameterAsset.load(context).size,
-            readingCount = db.rawQuery("SELECT COUNT(*) FROM debug_direct_readings", emptyArray()).use { cursor ->
-                if (cursor.moveToFirst()) cursor.getLong(0) else 0L
-            },
+            readingCount = readingCount,
             lastReadingAt = lastReadingAt,
             lastErrorAt = lastError?.first,
             lastError = lastError?.second,
@@ -523,5 +523,6 @@ class DirectDebugStore(
 
     companion object {
         private const val TAG = "BYDCollectorDebugStore"
+        private const val UNKNOWN_READING_COUNT = -1L
     }
 }

@@ -1,7 +1,10 @@
 package com.bydcollector.collector.influx
 
 import java.io.File
+import java.io.ByteArrayInputStream
 import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class InfluxClientContractTest {
@@ -12,6 +15,32 @@ class InfluxClientContractTest {
         assertTrue(source.contains("var connection: HttpURLConnection? = null"))
         assertTrue(source.contains("finally"))
         assertInOrder(source, "finally", "connection?.disconnect()")
+    }
+
+    @Test
+    fun responseDiagnosticsAreBoundedAndCredentialSafe() {
+        val raw = "user=anton password=secret auth=YW50b246c2VjcmV0\n" + "x".repeat(5_000)
+        val bounded = boundedInfluxResponse(ByteArrayInputStream(raw.toByteArray()), maxChars = 2_048)
+            ?: error("missing body")
+        val sanitized = sanitizeInfluxDiagnostic(
+            bounded,
+            InfluxConfig(
+                enabled = true,
+                host = "influx.local",
+                port = 8086,
+                database = "bydcollector",
+                username = "anton",
+                password = "secret",
+                measurement = "byd_state",
+                enabledCategories = emptySet()
+            )
+        )
+
+        assertEquals(2_048, bounded.length)
+        assertFalse(sanitized.contains("anton"))
+        assertFalse(sanitized.contains("secret"))
+        assertFalse(sanitized.contains("YW50b246c2VjcmV0"))
+        assertFalse(sanitized.contains('\n'))
     }
 
     private fun sourceFile(path: String): File {

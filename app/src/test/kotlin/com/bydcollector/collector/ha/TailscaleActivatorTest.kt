@@ -48,12 +48,12 @@ class TailscaleActivatorTest {
     }
 
     @Test
-    fun launchTransactionChecksProcessCapturesDisplayZeroAndStartsTailscale() {
-        val command = TailscaleActivator.launchIfNeededCommand(
+    fun reactivationCapturesDisplayZeroAndStartsTailscaleEvenWhenItsProcessAlreadyExists() {
+        val command = TailscaleActivator.reactivationCommand(
             "com.tailscale.ipn",
             "com.tailscale.ipn.MainActivity"
         )
-        assertTrue(command.contains("pidof com.tailscale.ipn"))
+        assertFalse(command.contains("pidof com.tailscale.ipn"))
         assertTrue(command.contains("dumpsys activity activities"))
         assertTrue(command.contains("sed -n '/Display #0 /,/Display #[1-9][0-9]* /p'"))
         assertTrue(command.contains("BYDCOLLECTOR_TAILSCALE_PREVIOUS=%s"))

@@ -10,9 +10,10 @@ class TelemetryHealthDetailContractTest {
         val source = sourceFile("com/bydcollector/collector/data/local/TelemetryStore.kt").readText()
 
         assertTrue(source.contains("detail: HealthSnapshotDetail = HealthSnapshotDetail.FULL"))
+        assertTrue(source.contains("includeCounts: Boolean = detail == HealthSnapshotDetail.FULL"))
         assertTrue(source.contains("detail != HealthSnapshotDetail.SUMMARY"))
         assertTrue(source.contains("detail == HealthSnapshotDetail.FULL"))
-        assertTrue(source.contains("pollCount = if (includeFullDetails)"))
+        assertTrue(source.contains("pollCount = if (includeCounts)"))
         assertTrue(source.contains("mqttPendingCount = if (includeIntegrations)"))
         assertTrue(source.contains("recentEvents = if (includeFullDetails) safeRecentEvents() else emptyList()"))
     }

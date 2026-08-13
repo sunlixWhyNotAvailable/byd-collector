@@ -12,7 +12,20 @@ class MqttPublishCoordinatorTest {
     fun testConnectionOnlyDoesNotPublishDiscoveryOrState() {
         val client = FakeMqttClient()
         val outbox = FakeOutboxStore()
-        val coordinator = coordinator(client = client, outbox = outbox, config = config(enabled = false))
+        val existingRetry = MqttRetryState(
+            failureCount = 3,
+            nextAttemptAt = "2026-06-14T12:05:00+03:00",
+            lastFailureAt = "2026-06-14T12:00:00+03:00",
+            lastSuccessAt = null,
+            lastError = "runtime broker error"
+        )
+        val retry = FakeRetryStateStore(existingRetry)
+        val coordinator = coordinator(
+            client = client,
+            outbox = outbox,
+            retry = retry,
+            config = config(enabled = false)
+        )
 
         val result = coordinator.testConnectionOnly()
 
@@ -20,6 +33,9 @@ class MqttPublishCoordinatorTest {
         assertEquals(1, client.connectCount)
         assertEquals(emptyList(), client.published)
         assertEquals(emptyList(), outbox.pendingRows())
+        assertEquals(existingRetry, retry.state)
+        assertEquals(emptyList(), retry.failures)
+        assertEquals(emptyList(), retry.successes)
     }
 
     @Test

@@ -14,7 +14,11 @@ data class PollCycleResult(
     val ok: Boolean,
     val category: String?,
     val elapsedMs: Long,
-    val requestCount: Int
+    val requestCount: Int,
+    val timestamp: String? = null,
+    val errorMessage: String? = null,
+    val pollRowsPersisted: Long = 0L,
+    val valueRowsPersisted: Long = 0L
 )
 
 interface PollCycleRunner {
@@ -83,20 +87,38 @@ class PollPersistenceCoordinator(
                     }
                     lastPersistedFailureKey = null
                     lastPersistedFailureAtMs = Long.MIN_VALUE
-                    PollCycleResult(pollId, ok = true, category = null, elapsedMs = result.elapsedMs, requestCount = DIRECT_REQUEST_COUNT)
+                    PollCycleResult(
+                        pollId = pollId,
+                        ok = true,
+                        category = null,
+                        elapsedMs = result.elapsedMs,
+                        requestCount = DIRECT_REQUEST_COUNT,
+                        timestamp = timestamp,
+                        pollRowsPersisted = 1L,
+                        valueRowsPersisted = 1L
+                    )
                 }
 
                 is TelemetryReadResult.Failure -> {
                     val failureKey = "${result.category}:${result.message}"
                     val nowMs = clock.elapsedRealtimeMs()
+                    val timestamp = clock.nowIso()
                     //throttles identical failures so helper outages do not flood sqlite every second
                     if (shouldSkipRepeatedFailure(failureKey, nowMs)) {
-                        return PollCycleResult(null, ok = false, category = result.category, elapsedMs = result.elapsedMs, requestCount = DIRECT_REQUEST_COUNT)
+                        return PollCycleResult(
+                            pollId = null,
+                            ok = false,
+                            category = result.category,
+                            elapsedMs = result.elapsedMs,
+                            requestCount = DIRECT_REQUEST_COUNT,
+                            timestamp = timestamp,
+                            errorMessage = result.message
+                        )
                     }
                     val pollId = store.insertPoll(
                         sessionId,
                         PersistedPollInput(
-                            timestamp = clock.nowIso(),
+                            timestamp = timestamp,
                             ok = false,
                             elapsedMs = result.elapsedMs,
                             requestCount = DIRECT_REQUEST_COUNT,
@@ -111,7 +133,16 @@ class PollPersistenceCoordinator(
                     lastPersistedFailureKey = failureKey
                     lastPersistedFailureAtMs = nowMs
                     store.recordEvent("poll_failure", "Poll failed: ${result.category}", result.message)
-                    PollCycleResult(pollId, ok = false, category = result.category, elapsedMs = result.elapsedMs, requestCount = DIRECT_REQUEST_COUNT)
+                    PollCycleResult(
+                        pollId = pollId,
+                        ok = false,
+                        category = result.category,
+                        elapsedMs = result.elapsedMs,
+                        requestCount = DIRECT_REQUEST_COUNT,
+                        timestamp = timestamp,
+                        errorMessage = result.message,
+                        pollRowsPersisted = 1L
+                    )
                 }
             }
         } catch (error: RuntimeException) {

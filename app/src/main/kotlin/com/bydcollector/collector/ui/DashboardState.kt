@@ -111,3 +111,14 @@ data class VehicleKpis(
     val batteryTempC: String = "-",
     val cellVoltageDeltaMv: String = "-"
 )
+
+data class DashboardRowCounts(
+    val pollCount: Long,
+    val valueRowCount: Long,
+    val ecRowCount: Long,
+    val normalizedCurrentCount: Long,
+    val normalizedHistoryCount: Long,
+    val debugReadingCount: Long
+)
+
+const val UNKNOWN_DASHBOARD_COUNT = -1L

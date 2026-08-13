@@ -46,7 +46,8 @@ class ReleaseNotesMarkdownTest {
         val blocks = ReleaseNotesMarkdown.parse(
             """
             #### too deep
-            1. numbered
+            1.text
+            12.item
             **unclosed
             `also unclosed
             """.trimIndent()
@@ -55,9 +56,38 @@ class ReleaseNotesMarkdownTest {
         assertEquals(
             listOf(
                 ReleaseNotesMarkdownBlock.Paragraph(listOf(ReleaseNotesMarkdownSpan.Text("#### too deep"))),
-                ReleaseNotesMarkdownBlock.Paragraph(listOf(ReleaseNotesMarkdownSpan.Text("1. numbered"))),
+                ReleaseNotesMarkdownBlock.Paragraph(listOf(ReleaseNotesMarkdownSpan.Text("1.text"))),
+                ReleaseNotesMarkdownBlock.Paragraph(listOf(ReleaseNotesMarkdownSpan.Text("12.item"))),
                 ReleaseNotesMarkdownBlock.Paragraph(listOf(ReleaseNotesMarkdownSpan.Text("**unclosed"))),
                 ReleaseNotesMarkdownBlock.Paragraph(listOf(ReleaseNotesMarkdownSpan.Text("`also unclosed")))
+            ),
+            blocks
+        )
+    }
+
+    @Test
+    fun parsesOrderedItemsWithOriginalNumbersAndInlineSpans() {
+        val blocks = ReleaseNotesMarkdown.parse(
+            """
+            1. **bold** uses `retry`
+            12. plain item
+            """.trimIndent()
+        )
+
+        assertEquals(
+            listOf(
+                ReleaseNotesMarkdownBlock.Ordered(
+                    "1",
+                    listOf(
+                        ReleaseNotesMarkdownSpan.Bold("bold"),
+                        ReleaseNotesMarkdownSpan.Text(" uses "),
+                        ReleaseNotesMarkdownSpan.Code("retry")
+                    )
+                ),
+                ReleaseNotesMarkdownBlock.Ordered(
+                    "12",
+                    listOf(ReleaseNotesMarkdownSpan.Text("plain item"))
+                )
             ),
             blocks
         )

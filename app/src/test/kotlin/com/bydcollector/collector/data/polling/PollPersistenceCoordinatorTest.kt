@@ -42,6 +42,9 @@ class PollPersistenceCoordinatorTest {
 
         assertTrue(result.ok)
         assertEquals(99L, result.pollId)
+        assertEquals(clock.now, result.timestamp)
+        assertEquals(1L, result.pollRowsPersisted)
+        assertEquals(1L, result.valueRowsPersisted)
         assertEquals(99L, observedPollId)
         assertEquals(clock.now, observedTimestamp)
         assertSame(readings, observedReadings)

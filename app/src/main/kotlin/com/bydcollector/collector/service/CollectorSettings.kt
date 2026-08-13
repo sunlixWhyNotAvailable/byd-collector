@@ -115,6 +115,7 @@ class CollectorSettings(
     fun isDebugPollingEnabled(): Boolean = prefs.getBoolean(KEY_DEBUG_POLLING_ENABLED, false)
 
     fun setDebugPollingEnabled(enabled: Boolean) {
+        if (isDebugPollingEnabled() == enabled) return
         prefs.edit().putBoolean(KEY_DEBUG_POLLING_ENABLED, enabled).apply()
         recordEvent(
             category = if (enabled) "debug_polling_enabled" else "debug_polling_disabled",
@@ -151,6 +152,7 @@ class CollectorSettings(
     fun isMqttEnabled(): Boolean = prefs.getBoolean(KEY_MQTT_ENABLED, false)
 
     fun setMqttEnabled(enabled: Boolean) {
+        if (isMqttEnabled() == enabled) return
         prefs.edit().putBoolean(KEY_MQTT_ENABLED, enabled).apply()
         recordEvent(
             category = if (enabled) "mqtt_enabled" else "mqtt_disabled",
@@ -270,6 +272,7 @@ class CollectorSettings(
     fun isInfluxEnabled(): Boolean = prefs.getBoolean(KEY_INFLUX_ENABLED, false)
 
     fun setInfluxEnabled(enabled: Boolean) {
+        if (isInfluxEnabled() == enabled) return
         prefs.edit().putBoolean(KEY_INFLUX_ENABLED, enabled).apply()
         recordEvent(
             category = if (enabled) "influx_enabled" else "influx_disabled",

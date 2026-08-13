@@ -24,6 +24,7 @@ import com.bydcollector.collector.data.debug.DirectDebugRoundRobinPoller
 import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.data.local.TelemetryStore
+import com.bydcollector.collector.data.local.HealthSnapshotDetail
 import com.bydcollector.collector.data.normalized.NormalizedWriteSummary
 import com.bydcollector.collector.data.normalized.PollingErrorSummaries
 import com.bydcollector.collector.data.normalized.VehicleStateNormalizer
@@ -58,7 +59,19 @@ import com.bydcollector.collector.mqtt.MqttPublishCoordinator
 import com.bydcollector.collector.mqtt.PahoMqttClientFacade
 import com.bydcollector.collector.system.CollectorAutoStart
 import com.bydcollector.collector.telegram.TelegramCoordinator
+import com.bydcollector.collector.ui.DashboardDebugPollState
+import com.bydcollector.collector.ui.DashboardMainPollState
+import com.bydcollector.collector.ui.DashboardRowCounts
+import com.bydcollector.collector.ui.DashboardRuntimeFlags
+import com.bydcollector.collector.ui.DashboardStateProvider
+import com.bydcollector.collector.ui.DashboardUiStateStore
+import com.bydcollector.collector.ui.DisplayTimeFormatter
+import com.bydcollector.collector.ui.VehicleKpiLanguage
+import com.bydcollector.collector.ui.VehicleKpiMapper
+import com.bydcollector.collector.ui.VehicleKpis
+import com.bydcollector.collector.ui.compose.AppTab
 import com.bydcollector.collector.util.namedSingleThreadExecutor
+import com.bydcollector.collector.util.sqliteFootprintBytes
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.RejectedExecutionException
@@ -80,6 +93,8 @@ class CollectorService : Service() {
     private lateinit var influxCoordinator: InfluxExportCoordinator
     private lateinit var telegramCoordinator: TelegramCoordinator
     private lateinit var maintenanceCoordinator: DbMaintenanceCoordinator
+    private lateinit var dashboardUiStateStore: DashboardUiStateStore
+    private lateinit var dashboardStateProvider: DashboardStateProvider
     private var debugStorageReady = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var sessionId: Long? = null
@@ -90,6 +105,8 @@ class CollectorService : Service() {
     private val maintenanceExecutor = namedSingleThreadExecutor("byd-db-maintenance")
     private val archiveStorageExecutor = namedSingleThreadExecutor("byd-archive-storage")
     private val tailscaleExecutor = namedSingleThreadExecutor("byd-tailscale")
+    private val dashboardMetricsExecutor = namedSingleThreadExecutor("byd-dashboard-metrics")
+    private val dashboardCountExecutor = namedSingleThreadExecutor("byd-dashboard-counts")
     private val mainHandler = Handler(Looper.getMainLooper())
     private val mqttExecutorLock = Any()
     private var mqttExecutor: ExecutorService = namedSingleThreadExecutor("byd-mqtt")
@@ -119,6 +136,15 @@ class CollectorService : Service() {
     @Volatile private var lastTelegramPollError: String? = null
     private var telegramTickScheduled = false
     private var telegramTickAtMs: Long? = null
+    private val dashboardMetricsGeneration = AtomicLong(0L)
+    private val databaseFootprintQueued = AtomicBoolean(false)
+    private val integrationDashboardRefreshQueued = AtomicBoolean(false)
+    private val integrationDashboardRefreshPending = AtomicBoolean(false)
+    @Volatile private var lastDatabaseFootprintAtMs = Long.MIN_VALUE
+    private var lastKpiPublishAtMs = Long.MIN_VALUE
+    private var lastKpiObservationAtMs = Long.MIN_VALUE
+    private var pendingVehicleKpis: LocalizedVehicleKpis? = null
+    private var kpiPublishScheduled = false
     private val influxRetryTask = object : Runnable {
         override fun run() {
             influxRetryScheduled = false
@@ -152,6 +178,25 @@ class CollectorService : Service() {
             scheduleAccessSelfCheck()
         }
     }
+    private val dashboardHeartbeatTask = object : Runnable {
+        override fun run() {
+            if (!running.get()) return
+            publishDashboardRuntimeFlags()
+            scheduleDatabaseFootprintRefresh(force = false)
+            mainHandler.postDelayed(this, DASHBOARD_RUNTIME_HEARTBEAT_MS)
+        }
+    }
+    private val kpiPublishTask = Runnable {
+        kpiPublishScheduled = false
+        pendingVehicleKpis?.let { kpis ->
+            pendingVehicleKpis = null
+            publishVehicleKpisNow(kpis)
+        }
+    }
+    private val kpiStaleTask = Runnable {
+        val nowMs = SystemClock.elapsedRealtime()
+        if (nowMs - lastKpiObservationAtMs >= KPI_STALE_AFTER_MS) clearDashboardVehicleKpis()
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -160,6 +205,11 @@ class CollectorService : Service() {
         settings = CollectorSettings(applicationContext, store)
         debugStorageReady = BydCollectorApplication.ensureDebugStorageReady(applicationContext)
         debugStore = DirectDebugStore(applicationContext, DirectDebugDatabaseHelper(applicationContext))
+        dashboardUiStateStore = BydCollectorApplication.dashboardUiStateStore(applicationContext)
+        dashboardStateProvider = DashboardStateProvider(applicationContext, { store }, settings)
+        if (dashboardUiStateStore.currentChrome() == null) {
+            dashboardUiStateStore.seed(dashboardStateProvider.loadInitial())
+        }
         keepAliveSupervisor = KeepAliveSupervisor(applicationContext, store)
         val endpointProbe = SocketHaEndpointProbe()
         tailscaleGate = TailscaleActivationGate(
@@ -189,9 +239,19 @@ class CollectorService : Service() {
                 debugStore = it
                 debugStorageReady = it.isCompactV2()
                 (applicationContext as BydCollectorApplication).setDebugStorageReadyAfterMaintenance(debugStorageReady)
+                dashboardMetricsGeneration.incrementAndGet()
+                dashboardUiStateStore.invalidateRowCounts()
+                lastDatabaseFootprintAtMs = Long.MIN_VALUE
+                scheduleDashboardCountBootstrap(force = true)
+                scheduleDatabaseFootprintRefresh(force = true)
             }
         )
         createNotificationChannel()
+        publishDashboardRuntimeFlags()
+        scheduleDashboardCountBootstrap(force = false)
+        scheduleIntegrationDashboardRefresh()
+        scheduleDatabaseFootprintRefresh(force = true)
+        mainHandler.postDelayed(dashboardHeartbeatTask, DASHBOARD_RUNTIME_HEARTBEAT_MS)
         if (settings.isAutoStartEnabled() && settings.hasActiveAccessWork()) {
             requestAccessSelfCheck("runtime_supervisor_start")
         }
@@ -259,6 +319,9 @@ class CollectorService : Service() {
 
     override fun onDestroy() {
         mainHandler.removeCallbacks(accessSelfCheckTask)
+        mainHandler.removeCallbacks(dashboardHeartbeatTask)
+        mainHandler.removeCallbacks(kpiPublishTask)
+        mainHandler.removeCallbacks(kpiStaleTask)
         cancelInfluxRetry()
         cancelTelegramTick()
         accessSelfCheckScheduled = false
@@ -268,11 +331,16 @@ class CollectorService : Service() {
         maintenanceExecutor.shutdownNow()
         archiveStorageExecutor.shutdownNow()
         tailscaleExecutor.shutdownNow()
+        dashboardMetricsExecutor.shutdownNow()
+        dashboardCountExecutor.shutdownNow()
         shutdownMqttExecutor()
         shutdownInfluxExecutor()
         shutdownTelegramExecutor()
         mainPollingRunning.set(false)
         running.set(false)
+        publishDashboardRuntimeFlags()
+        clearDashboardVehicleKpis()
+        if (::dashboardStateProvider.isInitialized) dashboardStateProvider.close()
         if (::debugStore.isInitialized) {
             debugStore.close()
         }
@@ -318,6 +386,17 @@ class CollectorService : Service() {
                             readings = readings
                         )
                         val summary = store.applyNormalizedObservations(observations)
+                        dashboardUiStateStore.incrementMainRowCounts(
+                            normalizedCurrentRows = summary.currentInsertedCount.toLong(),
+                            normalizedHistoryRows = summary.historyInsertedCount.toLong()
+                        )
+                        queueDashboardVehicleKpis(
+                            LocalizedVehicleKpis(
+                                uk = VehicleKpiMapper.fromObservations(observations, VehicleKpiLanguage.UK),
+                                en = VehicleKpiMapper.fromObservations(observations, VehicleKpiLanguage.EN)
+                            )
+                        )
+                        scheduleDatabaseFootprintRefresh(force = false)
                         if (settings.isTelegramEnabled()) {
                             executeTelegram(
                                 "telegram_event_error",
@@ -427,6 +506,7 @@ class CollectorService : Service() {
         if (maintenanceBlocksRuntimeStart()) return
         if (poller.isRunning()) {
             mainPollingRunning.set(true)
+            publishDashboardRuntimeFlags()
             return
         }
         mqttRuntimeActive.set(false)
@@ -435,7 +515,10 @@ class CollectorService : Service() {
         sessionId = openedSessionId
         try {
             //imports the car energy database opportunistically; telemetry polling must survive import failure
-            store.importEcDatabaseAtSessionStart(openedSessionId)
+            val importResult = store.importEcDatabaseAtSessionStart(openedSessionId)
+            if (importResult.ok && importResult.insertedCount > 0) {
+                dashboardUiStateStore.incrementMainRowCounts(ecRows = importResult.insertedCount.toLong())
+            }
         } catch (error: RuntimeException) {
             store.recordEvent(
                 "ec_import_error",
@@ -445,6 +528,7 @@ class CollectorService : Service() {
         }
         poller.start(openedSessionId)
         mainPollingRunning.set(true)
+        publishDashboardRuntimeFlags()
         flushPendingMqttAsync(force = false)
     }
 
@@ -454,7 +538,11 @@ class CollectorService : Service() {
             updateNotification("Polling error: debug database cutover required")
             return
         }
-        if (isDebugPollerRunning()) return
+        if (isDebugPollerRunning()) {
+            debugRunning.set(true)
+            publishDashboardRuntimeFlags()
+            return
+        }
         if (!debugStartInProgress.compareAndSet(false, true)) return
         debugStartExecutor.execute {
             try {
@@ -479,6 +567,24 @@ class CollectorService : Service() {
                     store = debugStore,
                     onCycle = { summary ->
                         debugRunning.set(true)
+                        dashboardUiStateStore.incrementDebugReadingCount(summary.changedCount.toLong())
+                        val previous = dashboardUiStateStore.currentTab(AppTab.ALL_PARAMETERS)
+                        val completedAt = DisplayTimeFormatter.formatNullable(java.time.Instant.now().toString())
+                        dashboardUiStateStore.publishDebugPollState(
+                            DashboardDebugPollState(
+                                lastReadingAt = if (summary.okCount > 0) completedAt else previous?.debugLastReadingAt,
+                                lastErrorAt = if (summary.errorCount > 0) completedAt else previous?.debugLastErrorAt,
+                                lastError = if (summary.errorCount > 0) {
+                                    "Debug helper returned ${summary.errorCount} errors"
+                                } else {
+                                    previous?.debugLastError
+                                },
+                                errorCount = (previous?.debugErrorCount ?: 0L).coerceAtLeast(0L) + summary.errorCount,
+                                lastSessionId = previous?.debugLastSessionId
+                            )
+                        )
+                        publishDashboardRuntimeFlags()
+                        scheduleDatabaseFootprintRefresh(force = false)
                         summary.batchDiagnostics?.let { diagnostics ->
                             if (diagnostics.stateKey != lastDebugReadModeKey) {
                                 runCatching {
@@ -523,6 +629,7 @@ class CollectorService : Service() {
                     return@execute
                 }
                 debugRunning.set(true)
+                publishDashboardRuntimeFlags()
                 store.recordEvent(
                     "debug_polling_started",
                     "Debug round-robin polling started",
@@ -563,6 +670,8 @@ class CollectorService : Service() {
                 }
         }
         sessionId = null
+        clearDashboardVehicleKpis()
+        publishDashboardRuntimeFlags()
         releaseWakeLock()
         stopSelf()
     }
@@ -690,6 +799,8 @@ class CollectorService : Service() {
             //publishes retained offline only after there was a real live mqtt runtime to retire
             disconnectOfflineAsync()
         }
+        clearDashboardVehicleKpis()
+        publishDashboardRuntimeFlags()
     }
 
     private fun exportInfluxAfterNormalizedWrite(summary: NormalizedWriteSummary) {
@@ -746,6 +857,7 @@ class CollectorService : Service() {
     private fun stopDebug(reason: String) {
         detachDebugPoller()?.shutdown(reason)
         debugRunning.set(false)
+        publishDashboardRuntimeFlags()
     }
 
     private fun isDebugPollerRunning(): Boolean {
@@ -769,6 +881,11 @@ class CollectorService : Service() {
         val debugRunning: Boolean
     )
 
+    private data class LocalizedVehicleKpis(
+        val uk: VehicleKpis,
+        val en: VehicleKpis
+    )
+
     private fun runtimeSnapshot(): RuntimeSnapshot {
         return RuntimeSnapshot(
             mainEnabled = settings.isPollingEnabled(),
@@ -778,6 +895,169 @@ class CollectorService : Service() {
             telegramEnabled = settings.isTelegramEnabled(),
             debugRunning = isDebugPollerRunning()
         )
+    }
+
+    private fun publishDashboardRuntimeFlags() {
+        if (!::dashboardUiStateStore.isInitialized || !::settings.isInitialized) return
+        val access = AdbAuthorizationManager.currentSnapshot()
+        dashboardUiStateStore.publishRuntimeFlags(
+            DashboardRuntimeFlags(
+                serviceRunning = running.get(),
+                mainPollingRunning = mainPollingRunning.get(),
+                debugPollingRunning = debugRunning.get(),
+                pollingEnabled = settings.isPollingEnabled(),
+                debugPollingEnabled = settings.isDebugPollingEnabled(),
+                mqttEnabled = settings.isMqttEnabled(),
+                influxEnabled = settings.isInfluxEnabled(),
+                permissionsGranted = access.permissionsGranted,
+                adbAuthorized = access.adbAuthorized,
+                dbMaintenanceStatus = settings.dbMaintenanceStatus(),
+                archiveStorageJobStatus = settings.archiveStorageJobStatus()
+            )
+        )
+    }
+
+    private fun queueDashboardVehicleKpis(kpis: LocalizedVehicleKpis) {
+        mainHandler.post {
+            if (!running.get() || !mainPollingRunning.get()) return@post
+            val nowMs = SystemClock.elapsedRealtime()
+            lastKpiObservationAtMs = nowMs
+            mainHandler.removeCallbacks(kpiStaleTask)
+            mainHandler.postDelayed(kpiStaleTask, KPI_STALE_AFTER_MS)
+            if (lastKpiPublishAtMs == Long.MIN_VALUE || nowMs - lastKpiPublishAtMs >= KPI_PUBLISH_INTERVAL_MS) {
+                pendingVehicleKpis = null
+                mainHandler.removeCallbacks(kpiPublishTask)
+                kpiPublishScheduled = false
+                publishVehicleKpisNow(kpis)
+            } else {
+                pendingVehicleKpis = kpis
+                if (!kpiPublishScheduled) {
+                    kpiPublishScheduled = true
+                    mainHandler.postDelayed(
+                        kpiPublishTask,
+                        (KPI_PUBLISH_INTERVAL_MS - (nowMs - lastKpiPublishAtMs)).coerceAtLeast(0L)
+                    )
+                }
+            }
+        }
+    }
+
+    private fun publishVehicleKpisNow(kpis: LocalizedVehicleKpis) {
+        lastKpiPublishAtMs = SystemClock.elapsedRealtime()
+        dashboardUiStateStore.publishVehicleKpis(kpis.uk, kpis.en)
+    }
+
+    private fun clearDashboardVehicleKpis() {
+        if (!::dashboardUiStateStore.isInitialized) return
+        mainHandler.removeCallbacks(kpiPublishTask)
+        mainHandler.removeCallbacks(kpiStaleTask)
+        kpiPublishScheduled = false
+        pendingVehicleKpis = null
+        lastKpiPublishAtMs = Long.MIN_VALUE
+        lastKpiObservationAtMs = Long.MIN_VALUE
+        dashboardUiStateStore.clearVehicleKpis()
+    }
+
+    private fun scheduleDashboardCountBootstrap(force: Boolean) {
+        val countGeneration = dashboardUiStateStore.beginCountBootstrap(force) ?: return
+        val generation = dashboardMetricsGeneration.get()
+        val mainStore = store
+        val roundRobinStore = debugStore
+        try {
+            dashboardCountExecutor.execute {
+                runCatching {
+                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+                    val main = mainStore.dashboardRowCounts()
+                    val debug = if (debugStorageReady) {
+                        roundRobinStore.dashboardReadingCount()
+                    } else {
+                        0L
+                    }
+                    DashboardRowCounts(
+                        pollCount = main.pollCount,
+                        valueRowCount = main.valueRowCount,
+                        ecRowCount = main.ecRowCount,
+                        normalizedCurrentCount = main.normalizedCurrentCount,
+                        normalizedHistoryCount = main.normalizedHistoryCount,
+                        debugReadingCount = debug
+                    )
+                }.onSuccess { counts ->
+                    if (generation == dashboardMetricsGeneration.get()) {
+                        dashboardUiStateStore.publishRowCountBaseline(countGeneration, counts)
+                    }
+                }.onFailure { error ->
+                    if (generation == dashboardMetricsGeneration.get()) {
+                        dashboardUiStateStore.failCountBootstrap(countGeneration)
+                        Log.w(TAG, "Dashboard row-count bootstrap failed", error)
+                    }
+                }
+            }
+        } catch (error: RejectedExecutionException) {
+            dashboardUiStateStore.failCountBootstrap(countGeneration)
+            Log.w(TAG, "Dashboard row-count bootstrap rejected", error)
+        }
+    }
+
+    private fun scheduleDatabaseFootprintRefresh(force: Boolean) {
+        if (!::dashboardUiStateStore.isInitialized) return
+        val nowMs = SystemClock.elapsedRealtime()
+        if (!force && nowMs - lastDatabaseFootprintAtMs < DATABASE_FOOTPRINT_INTERVAL_MS) return
+        if (!databaseFootprintQueued.compareAndSet(false, true)) return
+        val generation = dashboardMetricsGeneration.get()
+        try {
+            dashboardMetricsExecutor.execute {
+                try {
+                    val mainBytes = sqliteFootprintBytes(applicationContext.getDatabasePath(com.bydcollector.collector.data.local.TelemetryDatabaseHelper.DATABASE_NAME))
+                    val debugBytes = sqliteFootprintBytes(applicationContext.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME))
+                    if (generation == dashboardMetricsGeneration.get()) {
+                        dashboardUiStateStore.publishDatabaseFootprints(mainBytes, debugBytes)
+                        lastDatabaseFootprintAtMs = SystemClock.elapsedRealtime()
+                    }
+                } finally {
+                    databaseFootprintQueued.set(false)
+                }
+            }
+        } catch (error: RejectedExecutionException) {
+            databaseFootprintQueued.set(false)
+            Log.w(TAG, "Dashboard database-footprint refresh rejected", error)
+        }
+    }
+
+    private fun scheduleIntegrationDashboardRefresh() {
+        if (!::dashboardStateProvider.isInitialized) return
+        if (!integrationDashboardRefreshQueued.compareAndSet(false, true)) {
+            integrationDashboardRefreshPending.set(true)
+            return
+        }
+        val generation = dashboardMetricsGeneration.get()
+        try {
+            dashboardMetricsExecutor.execute {
+                try {
+                    if (generation != dashboardMetricsGeneration.get()) return@execute
+                    dashboardStateProvider.invalidateIntegrationRuntime()
+                    val previous = dashboardUiStateStore.currentTab(AppTab.HA)
+                        ?: dashboardUiStateStore.currentChrome()
+                    val state = dashboardStateProvider.load(
+                        profile = com.bydcollector.collector.ui.DashboardLoadProfile.HA,
+                        previous = previous
+                    )
+                    if (generation == dashboardMetricsGeneration.get()) {
+                        dashboardUiStateStore.publishIntegrationRuntime(state)
+                    }
+                } catch (error: RuntimeException) {
+                    Log.w(TAG, "Dashboard integration refresh failed", error)
+                } finally {
+                    integrationDashboardRefreshQueued.set(false)
+                    if (integrationDashboardRefreshPending.getAndSet(false)) {
+                        scheduleIntegrationDashboardRefresh()
+                    }
+                }
+            }
+        } catch (error: RejectedExecutionException) {
+            integrationDashboardRefreshQueued.set(false)
+            integrationDashboardRefreshPending.set(false)
+            Log.w(TAG, "Dashboard integration refresh rejected", error)
+        }
     }
 
     private fun requestAccessSelfCheck(source: String) {
@@ -877,14 +1157,22 @@ class CollectorService : Service() {
     }
 
     private fun rebuildStoreBackedRuntime(newStore: TelemetryStore) {
+        dashboardMetricsGeneration.incrementAndGet()
+        dashboardUiStateStore.invalidateRowCounts()
+        dashboardStateProvider.close()
         store = newStore
         settings = CollectorSettings(applicationContext, store)
+        dashboardStateProvider = DashboardStateProvider(applicationContext, { store }, settings)
         keepAliveSupervisor.shutdown()
         keepAliveSupervisor = KeepAliveSupervisor(applicationContext, store)
         mqttCoordinator = createMqttCoordinator(PahoMqttClientFacade())
         influxCoordinator = createInfluxCoordinator()
         telegramCoordinator = createTelegramCoordinator()
         poller = createTelemetryPoller()
+        lastDatabaseFootprintAtMs = Long.MIN_VALUE
+        scheduleDashboardCountBootstrap(force = true)
+        scheduleDatabaseFootprintRefresh(force = true)
+        scheduleIntegrationDashboardRefresh()
     }
 
     private fun acquireWakeLock() {
@@ -913,6 +1201,29 @@ class CollectorService : Service() {
 
     private fun handlePollCycleResult(result: com.bydcollector.collector.data.polling.PollCycleResult) {
         lastTelegramPollError = if (result.ok) null else result.category
+        dashboardUiStateStore.incrementMainRowCounts(
+            pollRows = result.pollRowsPersisted,
+            valueRows = result.valueRowsPersisted
+        )
+        val completedAt = DisplayTimeFormatter.formatNullable(result.timestamp ?: java.time.Instant.now().toString())
+        val errorSummary = if (result.ok) null else PollingErrorSummaries.summary(result.category, result.errorMessage)
+        dashboardUiStateStore.publishMainPollState(
+            DashboardMainPollState(
+                activeSessionId = sessionId,
+                lastSuccessAt = if (result.ok) completedAt else dashboardUiStateStore.currentChrome()?.lastSuccessAt,
+                lastError = errorSummary,
+                lastErrorAt = if (result.ok) null else completedAt,
+                lastPollStatus = if (result.ok) {
+                    completedAt?.let { "ok at $it" } ?: "ok"
+                } else {
+                    completedAt?.let { "Polling error: $errorSummary at $it" } ?: "Polling error: $errorSummary"
+                },
+                elapsedMs = result.elapsedMs,
+                requestCount = result.requestCount
+            )
+        )
+        if (!result.ok) clearDashboardVehicleKpis()
+        if (result.pollRowsPersisted > 0L) scheduleDatabaseFootprintRefresh(force = false)
         val text = if (result.ok) {
             notificationText(
                 mainEnabled = true,
@@ -924,6 +1235,7 @@ class CollectorService : Service() {
             "Polling error: ${PollingErrorSummaries.summary(result.category)}"
         }
         updateNotification(text)
+        publishDashboardRuntimeFlags()
         publishStatusHeartbeat(result, force = !result.ok)
     }
 
@@ -941,6 +1253,7 @@ class CollectorService : Service() {
         if (maintenanceBlocksRuntimeStart()) return
         if (clearManualStop) settings.setMqttManuallyStopped(false)
         settings.setMqttEnabled(true)
+        publishDashboardRuntimeFlags()
         ensureForegroundForChannel("MQTT export running")
         mqttRuntimeActive.set(true)
         executeMqtt("mqtt_start_error") {
@@ -951,6 +1264,8 @@ class CollectorService : Service() {
     private fun stopMqttExport(manualStop: Boolean = true) {
         if (manualStop) settings.setMqttManuallyStopped(true)
         settings.setMqttEnabled(false)
+        publishDashboardRuntimeFlags()
+        scheduleIntegrationDashboardRefresh()
         disconnectOfflineAsync()
         mqttRuntimeActive.set(false)
         stopIfNoActiveRuntime()
@@ -960,6 +1275,7 @@ class CollectorService : Service() {
         if (maintenanceBlocksRuntimeStart()) return
         if (clearManualStop) settings.setInfluxManuallyStopped(false)
         settings.setInfluxEnabled(true)
+        publishDashboardRuntimeFlags()
         ensureForegroundForChannel("Influx export running")
         val submittedGeneration = influxWorkGeneration.get()
         val accepted = executeInflux("influx_start_error") {
@@ -997,7 +1313,7 @@ class CollectorService : Service() {
                     TailscaleActivator.runDelayedSequence(
                         isEnabled = { settings.isTailscaleActivationEnabled() },
                         sleeper = { Thread.sleep(it) },
-                        launch = { TailscaleActivator.launchIfNeeded(applicationContext) },
+                        launch = { TailscaleActivator.reactivate(applicationContext) },
                         restoreForeground = { target ->
                             TailscaleActivator.restoreForeground(applicationContext, target)
                         },
@@ -1030,6 +1346,8 @@ class CollectorService : Service() {
     private fun stopInfluxExport(manualStop: Boolean = true) {
         if (manualStop) settings.setInfluxManuallyStopped(true)
         settings.setInfluxEnabled(false)
+        publishDashboardRuntimeFlags()
+        scheduleIntegrationDashboardRefresh()
         queueInfluxStop(stopServiceWhenIdle = true)
     }
 
@@ -1139,7 +1457,11 @@ class CollectorService : Service() {
     }
 
     private fun statusHeartbeat(result: com.bydcollector.collector.data.polling.PollCycleResult): HaMqttStatus {
-        val health = store.healthSnapshot(running = poller.isRunning())
+        val health = store.healthSnapshot(
+            running = poller.isRunning(),
+            detail = HealthSnapshotDetail.SUMMARY,
+            includeCounts = false
+        )
         return HaMqttStatus(
             availability = "online",
             polling = poller.isRunning(),
@@ -1166,25 +1488,31 @@ class CollectorService : Service() {
         val executor = resetMqttExecutorForOffline()
         try {
             executor.execute {
-                runCatching { oneShotMqttCoordinator().disconnectOffline() }
-                    .onSuccess { result ->
-                        if (!result.ok) {
+                try {
+                    runCatching { oneShotMqttCoordinator().disconnectOffline() }
+                        .onSuccess { result ->
+                            if (!result.ok) {
+                                store.recordEvent(
+                                    "mqtt_offline_publish_error",
+                                    "MQTT offline publish failed",
+                                    "${result.category}: ${result.message}"
+                                )
+                            }
+                        }
+                        .onFailure { error ->
                             store.recordEvent(
                                 "mqtt_offline_publish_error",
                                 "MQTT offline publish failed",
-                                "${result.category}: ${result.message}"
+                                "${error::class.java.simpleName}: ${error.message ?: "no message"}"
                             )
                         }
-                    }
-                    .onFailure { error ->
-                        store.recordEvent(
-                            "mqtt_offline_publish_error",
-                            "MQTT offline publish failed",
-                            "${error::class.java.simpleName}: ${error.message ?: "no message"}"
-                        )
-                    }
+                } finally {
+                    mqttOfflineQueued.set(false)
+                    scheduleIntegrationDashboardRefresh()
+                }
             }
         } catch (error: RejectedExecutionException) {
+            mqttOfflineQueued.set(false)
             store.recordEvent(
                 "mqtt_offline_publish_error",
                 "MQTT offline publish rejected",
@@ -1204,6 +1532,7 @@ class CollectorService : Service() {
         executor = { mqttExecutor },
         generation = mqttWorkGeneration,
         action = action,
+        onComplete = ::scheduleIntegrationDashboardRefresh,
         onFailedAction = if (activateTailscaleOnFailure) {
             { maybeActivateTailscaleAfterHaFailure("mqtt") }
         } else {
@@ -1250,6 +1579,7 @@ class CollectorService : Service() {
         lowPriority = true,
         canExecute = { !maintenanceBlocksRuntimeStart() },
         action = action,
+        onComplete = ::scheduleIntegrationDashboardRefresh,
         onFailedAction = if (activateTailscaleOnFailure) {
             { maybeActivateTailscaleAfterHaFailure("influx") }
         } else {
@@ -1287,6 +1617,7 @@ class CollectorService : Service() {
         action: () -> T,
         onFailedAction: (() -> Unit)? = null,
         onSuccess: ((T, Long) -> Unit)? = null,
+        onComplete: (() -> Unit)? = null,
         status: (T) -> ChannelActionStatus
     ): Boolean {
         val submittedGeneration = generation.get()
@@ -1296,28 +1627,34 @@ class CollectorService : Service() {
                 if (lowPriority) Thread.currentThread().priority = Thread.MIN_PRIORITY
                 //drops stale work submitted before a channel executor reset
                 if (submittedGeneration != generation.get() || !canExecute()) return@execute
-                runCatching { action() }
-                    .onSuccess { result ->
-                        val state = status(result)
-                        if (!state.ok) {
+                try {
+                    runCatching { action() }
+                        .onSuccess { result ->
+                            val state = status(result)
+                            if (!state.ok) {
+                                store.recordEvent(
+                                    errorCategory,
+                                    "$channelName async action failed",
+                                    "${state.category}: ${state.message}"
+                                )
+                                onFailedAction?.invoke()
+                            }
+                            if (submittedGeneration == generation.get()) {
+                                onSuccess?.invoke(result, submittedGeneration)
+                            }
+                        }
+                        .onFailure { error ->
                             store.recordEvent(
                                 errorCategory,
                                 "$channelName async action failed",
-                                "${state.category}: ${state.message}"
+                                "${error::class.java.simpleName}: ${error.message ?: "no message"}"
                             )
-                            onFailedAction?.invoke()
                         }
-                        if (submittedGeneration == generation.get()) {
-                            onSuccess?.invoke(result, submittedGeneration)
-                        }
+                } finally {
+                    if (submittedGeneration == generation.get()) {
+                        onComplete?.invoke()
                     }
-                    .onFailure { error ->
-                        store.recordEvent(
-                            errorCategory,
-                            "$channelName async action failed",
-                            "${error::class.java.simpleName}: ${error.message ?: "no message"}"
-                        )
-                    }
+                }
             }
             return true
         } catch (error: RejectedExecutionException) {
@@ -1326,6 +1663,7 @@ class CollectorService : Service() {
                 "$channelName async action rejected",
                 "${error::class.java.simpleName}: ${error.message ?: "no message"}"
             )
+            onComplete?.invoke()
             return false
         }
     }
@@ -1522,6 +1860,7 @@ class CollectorService : Service() {
                 "Archive storage action rejected",
                 "${error::class.java.simpleName}: ${error.message ?: "no message"}"
             )
+            scheduleIntegrationDashboardRefresh()
         }
     }
 
@@ -1679,6 +2018,10 @@ class CollectorService : Service() {
         private const val CHANNEL_ID = "collector"
         private const val NOTIFICATION_ID = 1001
         private const val STATUS_HEARTBEAT_INTERVAL_MS = 30_000L
+        private const val DASHBOARD_RUNTIME_HEARTBEAT_MS = 2_000L
+        private const val DATABASE_FOOTPRINT_INTERVAL_MS = 10_000L
+        private const val KPI_PUBLISH_INTERVAL_MS = 1_000L
+        private const val KPI_STALE_AFTER_MS = 3_000L
         private const val ACCESS_SELF_CHECK_INTERVAL_MS = 5 * 60_000L
         private const val TELEGRAM_TICK_INTERVAL_MS = 15_000L
         private const val INFLUX_MAINTENANCE_STOP_TIMEOUT_MS = 16_000L

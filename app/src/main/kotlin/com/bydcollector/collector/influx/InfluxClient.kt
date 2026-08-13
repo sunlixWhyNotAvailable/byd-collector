@@ -1,6 +1,8 @@
 package com.bydcollector.collector.influx
 
 import java.io.OutputStreamWriter
+import java.io.InputStream
+import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URLEncoder
 import java.net.URL
@@ -60,13 +62,20 @@ class HttpInfluxClient : InfluxClient {
                 if (code in 200..299) {
                     InfluxActionResult.ok("http $code")
                 } else {
-                    InfluxActionResult.fail("influx_http_error", "HTTP $code")
+                    val response = boundedInfluxResponse(
+                        connection.errorStream ?: runCatching { connection.inputStream }.getOrNull()
+                    )?.let { sanitizeInfluxDiagnostic(it, config) }
+                    val message = response?.takeIf { it.isNotBlank() }
+                        ?.let { "HTTP $code: $it" }
+                        ?: "HTTP $code"
+                    InfluxActionResult.fail("influx_http_error", message)
                 }
             } finally {
                 connection?.disconnect()
             }
         }.getOrElse { error ->
-            InfluxActionResult.fail("influx_network_error", "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+            val detail = sanitizeInfluxDiagnostic(error.message ?: "no message", config)
+            InfluxActionResult.fail("influx_network_error", "${error::class.java.simpleName}: $detail")
         }
     }
 
@@ -84,4 +93,33 @@ class HttpInfluxClient : InfluxClient {
         const val CONNECT_TIMEOUT_MS = 5_000
         const val READ_TIMEOUT_MS = 10_000
     }
+}
+
+internal fun boundedInfluxResponse(input: InputStream?, maxChars: Int = 2_048): String? {
+    if (input == null || maxChars <= 0) return null
+    return InputStreamReader(input, StandardCharsets.UTF_8).use { reader ->
+        val output = StringBuilder(minOf(maxChars, 512))
+        val buffer = CharArray(512)
+        while (output.length < maxChars) {
+            val read = reader.read(buffer, 0, minOf(buffer.size, maxChars - output.length))
+            if (read < 0) break
+            output.append(buffer, 0, read)
+        }
+        output.toString()
+    }
+}
+
+internal fun sanitizeInfluxDiagnostic(value: String, config: InfluxConfig): String {
+    val user = config.username.orEmpty()
+    val password = config.password.orEmpty()
+    val authPayload = if (user.isNotEmpty() || password.isNotEmpty()) "$user:$password" else ""
+    val encodedAuth = authPayload.takeIf { it.isNotEmpty() }
+        ?.let { Base64.getEncoder().encodeToString(it.toByteArray(StandardCharsets.UTF_8)) }
+        .orEmpty()
+    return listOf(user, password, authPayload, encodedAuth)
+        .filter { it.isNotEmpty() }
+        .distinct()
+        .fold(value) { sanitized, secret -> sanitized.replace(secret, "[redacted]") }
+        .replace(Regex("[\\p{Cntrl}\\s]+"), " ")
+        .trim()
 }

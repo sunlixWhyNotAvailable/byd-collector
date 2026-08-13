@@ -58,6 +58,15 @@ internal object DashboardStateProfileMerger {
             HealthSnapshotDetail.FULL -> Unit
         }
 
+        //Row counts are bootstrapped once and then advanced by successful write deltas outside profile loads.
+        merged = merged.copy(
+            pollCount = previous.pollCount,
+            valueRowCount = previous.valueRowCount,
+            ecRowCount = previous.ecRowCount,
+            normalizedCurrentCount = previous.normalizedCurrentCount,
+            normalizedHistoryCount = previous.normalizedHistoryCount
+        )
+
         if (!debugStatusLoaded) {
             merged = merged.copy(
                 debugParameterCount = previous.debugParameterCount,

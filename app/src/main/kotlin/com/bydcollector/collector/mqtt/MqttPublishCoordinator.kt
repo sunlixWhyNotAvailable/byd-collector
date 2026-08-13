@@ -19,13 +19,9 @@ class MqttPublishCoordinator(
         val config = configProvider()
 
         val connect = client.connect(config, messageFactory.offlineMessage())
-        if (!connect.ok) {
-            recordRetryFailure(connect.message, retryStateStore.retryState())
-            return connect
-        }
-
-        retryStateStore.recordRetrySuccess(clock.nowIso())
-        return MqttActionResult.ok("connected")
+        //A manual test reports only its own result. Runtime retry/error state belongs to real export
+        //attempts and must not briefly overwrite the HA status pill.
+        return if (connect.ok) MqttActionResult.ok("connected") else connect
     }
 
     fun startLiveExport(): MqttActionResult {

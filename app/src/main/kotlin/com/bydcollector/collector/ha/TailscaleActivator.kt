@@ -21,7 +21,7 @@ object TailscaleActivator {
         return interpretProcessCheck(result)
     }
 
-    internal fun launchIfNeeded(context: Context): TailscaleLaunchResult {
+    internal fun reactivate(context: Context): TailscaleLaunchResult {
         val launchIntent = packageCandidates()
             .asSequence()
             .mapNotNull { packageName -> context.packageManager.getLaunchIntentForPackage(packageName) }
@@ -35,7 +35,7 @@ object TailscaleActivator {
         )?.activityInfo?.packageName
 
         val result = adbClient(context).execShell(
-            launchIfNeededCommand(component.packageName, component.className)
+            reactivationCommand(component.packageName, component.className)
         )
         return interpretLaunchResult(result, homePackageName)
     }
@@ -107,15 +107,11 @@ object TailscaleActivator {
             "sed -n '/Display #0 /,/Display #[1-9][0-9]* /p' | " +
             "grep -m 1 -E 'mResumedActivity|topResumedActivity'"
 
-    internal fun launchIfNeededCommand(packageName: String, className: String): String =
-        "pidof $packageName >/dev/null 2>&1; process_rc=${'$'}?; " +
-            "if [ ${'$'}process_rc -eq 0 ]; then echo $PROCESS_RUNNING_MARKER; " +
-            "elif [ ${'$'}process_rc -eq 1 ]; then " +
-            "previous=\"${'$'}(${foregroundActivityCommand()})\"; " +
+    internal fun reactivationCommand(packageName: String, className: String): String =
+        "previous=\"${'$'}(${foregroundActivityCommand()})\"; " +
             "printf '$PREVIOUS_FOREGROUND_MARKER%s\\n' \"${'$'}previous\"; " +
             "if ${launchCommand(packageName, className)}; then echo $LAUNCH_REQUESTED_MARKER; " +
-            "else echo $LAUNCH_FAILED_MARKER; exit 1; fi; " +
-            "else echo $PROCESS_CHECK_FAILED_MARKER; exit ${'$'}process_rc; fi"
+            "else echo $LAUNCH_FAILED_MARKER; exit 1; fi"
 
     internal fun guardedRestoreCommand(
         tailscalePackageName: String,

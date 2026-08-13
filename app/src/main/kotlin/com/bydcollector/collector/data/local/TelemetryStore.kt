@@ -24,6 +24,7 @@ import com.bydcollector.collector.mqtt.MqttRetryStateStore
 import com.bydcollector.collector.mqtt.PendingMqttMessage
 import com.bydcollector.collector.mqtt.MqttPublishStateRecorder
 import com.bydcollector.collector.mqtt.NormalizedStateProvider
+import com.bydcollector.collector.util.sqliteFootprintBytes
 import java.io.Closeable
 import java.io.File
 import java.security.MessageDigest
@@ -106,6 +107,16 @@ class TelemetryStore(
     }
 
     override fun currentState(categories: Set<String>?): List<StoredNormalizedState> = normalizedCurrentState(categories)
+
+    fun dashboardRowCounts(): TelemetryRowCounts {
+        return TelemetryRowCounts(
+            pollCount = scalarLong("SELECT COUNT(*) FROM polls"),
+            valueRowCount = scalarLong("SELECT COUNT(*) FROM poll_values"),
+            ecRowCount = scalarLong("SELECT COUNT(*) FROM ec_energy_consumption"),
+            normalizedCurrentCount = scalarLong("SELECT COUNT(*) FROM vehicle_state_current"),
+            normalizedHistoryCount = scalarLong("SELECT COUNT(*) FROM vehicle_state_history")
+        )
+    }
 
     private fun catalogParameters(catalogVersionId: Long): List<CatalogParameter> {
         helper.readableDatabase.rawQuery(
@@ -977,7 +988,8 @@ class TelemetryStore(
 
     fun healthSnapshot(
         running: Boolean,
-        detail: HealthSnapshotDetail = HealthSnapshotDetail.FULL
+        detail: HealthSnapshotDetail = HealthSnapshotDetail.FULL,
+        includeCounts: Boolean = detail == HealthSnapshotDetail.FULL
     ): HealthSnapshot {
         val includeIntegrations = detail != HealthSnapshotDetail.SUMMARY
         val includeFullDetails = detail == HealthSnapshotDetail.FULL
@@ -1002,11 +1014,11 @@ class TelemetryStore(
             lastError = activePollScope.lastErrorSql()?.let { safeScalarString(it) },
             lastErrorAt = activePollScope.lastErrorAtSql()?.let { safeScalarString(it) },
             lastPollStatus = activePollScope.lastPollStatusSql()?.let { safeLastPollStatus(it) },
-            pollCount = if (includeFullDetails) safeScalarLong("SELECT COUNT(*) FROM polls") else 0L,
-            valueRowCount = if (includeFullDetails) safeScalarLong("SELECT COUNT(*) FROM poll_values") else 0L,
-            ecRowCount = if (includeFullDetails) safeScalarLong("SELECT COUNT(*) FROM ec_energy_consumption") else 0L,
-            normalizedCurrentCount = if (includeFullDetails) safeScalarLong("SELECT COUNT(*) FROM vehicle_state_current") else 0L,
-            normalizedHistoryCount = if (includeFullDetails) safeScalarLong("SELECT COUNT(*) FROM vehicle_state_history") else 0L,
+            pollCount = if (includeCounts) safeScalarLong("SELECT COUNT(*) FROM polls") else UNKNOWN_COUNT,
+            valueRowCount = if (includeCounts) safeScalarLong("SELECT COUNT(*) FROM poll_values") else UNKNOWN_COUNT,
+            ecRowCount = if (includeCounts) safeScalarLong("SELECT COUNT(*) FROM ec_energy_consumption") else UNKNOWN_COUNT,
+            normalizedCurrentCount = if (includeCounts) safeScalarLong("SELECT COUNT(*) FROM vehicle_state_current") else UNKNOWN_COUNT,
+            normalizedHistoryCount = if (includeCounts) safeScalarLong("SELECT COUNT(*) FROM vehicle_state_history") else UNKNOWN_COUNT,
             mqttLastError = if (includeIntegrations) safeScalarString("SELECT last_error FROM mqtt_publish_state WHERE last_error IS NOT NULL ORDER BY last_error_at DESC, updated_at DESC, id DESC LIMIT 1") else null,
             mqttLastPublishedAt = if (includeIntegrations) safeScalarString("SELECT last_published_at FROM mqtt_publish_state WHERE last_published_at IS NOT NULL ORDER BY last_published_at DESC, id DESC LIMIT 1") else null,
             mqttPendingCount = if (includeIntegrations) safeMqttPendingCount() else 0L,
@@ -1019,7 +1031,7 @@ class TelemetryStore(
             elapsedMs = if (includeFullDetails) activePollScope.elapsedMsSql()?.let { safeScalarLongOrNull(it) } else null,
             requestCount = if (includeFullDetails) activePollScope.requestCountSql()?.let { safeScalarLongOrNull(it) }?.toInt() else null,
             databasePath = databaseFile().absolutePath,
-            databaseSizeBytes = databaseFile().length(),
+            databaseSizeBytes = sqliteFootprintBytes(databaseFile()),
             latestSoc = if (includeFullDetails) safeLatestReading(listOf("statistic_1014_1145045040_5", "statistic_1014_1134559272_5", "SOC", "soc")) else null,
             latestSpeed = if (includeFullDetails) safeLatestReading(listOf("speed_1013_-1807745016_7", "Speed", "speed")) else null,
             latestCharging = if (includeFullDetails) safeLatestReading(listOf("charging_charge_current", "ChargingStatus", "chargeGunState")) else null,
@@ -1413,6 +1425,7 @@ class TelemetryStore(
         private const val TAG = "BYDCollectorEvent"
         private const val MAX_ERROR_TEXT_LENGTH = 2_048
         private const val MAX_RAW_RESPONSE_BODY_LENGTH = 4_096
+        private const val UNKNOWN_COUNT = -1L
         private const val DECODED_VALUE_CACHE_SIZE = 2_048
         private const val TELEGRAM_MAX_PENDING = 1_000L
         private const val TELEGRAM_RETENTION_MS = 30L * 24L * 60L * 60L * 1_000L

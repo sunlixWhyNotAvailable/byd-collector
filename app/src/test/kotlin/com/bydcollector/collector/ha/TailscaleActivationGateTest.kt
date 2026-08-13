@@ -128,23 +128,25 @@ class TailscaleActivationGateTest {
     }
 
     @Test
-    fun runningProcessSkipsActivationWithoutTouchingThrottle() {
+    fun runningProcessIsReactivatedWhenHaEndpointIsStillUnreachable() {
+        var storedLastAttempt = 0L
         val gate = TailscaleActivationGate(
             isEnabled = { true },
-            lastAttemptAtMs = { error("must not read throttle when Tailscale is running") },
-            setLastAttemptAtMs = { error("must not update throttle when Tailscale is running") },
+            lastAttemptAtMs = { storedLastAttempt },
+            setLastAttemptAtMs = { storedLastAttempt = it },
             isReachable = { false },
             processCheck = {
                 TailscaleProcessCheck(true, true, TailscaleActivator.PROCESS_RUNNING_MESSAGE)
             },
-            activate = { error("must not activate when Tailscale is running") }
+            activate = { TailscaleActivationResult(true, "tailscale_activation_scheduled") },
+            nowMs = { 10_000L }
         )
 
         val decision = gate.maybeActivate(endpoint)
 
-        assertFalse(decision.activated)
-        assertEquals("tailscale_activation_skipped_running", decision.category)
-        assertEquals(TailscaleActivator.PROCESS_RUNNING_MESSAGE, decision.message)
+        assertTrue(decision.activated)
+        assertEquals("tailscale_activation_requested", decision.category)
+        assertEquals(10_000L, storedLastAttempt)
     }
 
     @Test

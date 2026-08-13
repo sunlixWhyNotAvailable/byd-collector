@@ -36,6 +36,7 @@ class NormalizedStateStore(
         val db = helper.writableDatabase
         var changedCount = 0
         var historyInsertedCount = 0
+        var currentInsertedCount = 0
         val changedCategories = mutableSetOf<String>()
 
         db.beginTransaction()
@@ -43,6 +44,7 @@ class NormalizedStateStore(
             observations.forEach { observation ->
                 val next = observation.toStoredState()
                 val previous = currentStateForField(db, next.fieldKey)
+                if (previous == null) currentInsertedCount += 1
                 //dedupes unchanged semantic values so history represents changes instead of every poll tick
                 val decision = NormalizedStateReducer.decide(previous, next)
 
@@ -63,6 +65,7 @@ class NormalizedStateStore(
             observedCount = observations.size,
             changedCount = changedCount,
             historyInsertedCount = historyInsertedCount,
+            currentInsertedCount = currentInsertedCount,
             changedCategories = changedCategories
         )
     }
@@ -336,5 +339,6 @@ data class NormalizedWriteSummary(
     val observedCount: Int,
     val changedCount: Int,
     val historyInsertedCount: Int,
+    val currentInsertedCount: Int = 0,
     val changedCategories: Set<String> = emptySet()
 )

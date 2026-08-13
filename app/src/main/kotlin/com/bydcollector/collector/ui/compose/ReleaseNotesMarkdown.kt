@@ -3,6 +3,7 @@ package com.bydcollector.collector.ui.compose
 internal sealed interface ReleaseNotesMarkdownBlock {
     data class Heading(val level: Int, val spans: List<ReleaseNotesMarkdownSpan>) : ReleaseNotesMarkdownBlock
     data class Bullet(val spans: List<ReleaseNotesMarkdownSpan>) : ReleaseNotesMarkdownBlock
+    data class Ordered(val number: String, val spans: List<ReleaseNotesMarkdownSpan>) : ReleaseNotesMarkdownBlock
     data class Paragraph(val spans: List<ReleaseNotesMarkdownSpan>) : ReleaseNotesMarkdownBlock
     data object Blank : ReleaseNotesMarkdownBlock
     data object Separator : ReleaseNotesMarkdownBlock
@@ -15,6 +16,8 @@ internal sealed interface ReleaseNotesMarkdownSpan {
 }
 
 internal object ReleaseNotesMarkdown {
+    private val orderedItemPattern = Regex("^(\\d+)\\.\\s+(.*)$")
+
     fun parse(text: String): List<ReleaseNotesMarkdownBlock> {
         return text.lines()
             .map { it.trimEnd() }
@@ -27,9 +30,14 @@ internal object ReleaseNotesMarkdown {
                     trimmed == "---" -> ReleaseNotesMarkdownBlock.Separator
                     trimmed.startsWith("- ") || trimmed.startsWith("* ") ->
                         ReleaseNotesMarkdownBlock.Bullet(parseInline(trimmed.drop(2)))
-                    else -> headingBlock(trimmed) ?: ReleaseNotesMarkdownBlock.Paragraph(parseInline(trimmed))
+                    else -> orderedBlock(trimmed) ?: headingBlock(trimmed) ?: ReleaseNotesMarkdownBlock.Paragraph(parseInline(trimmed))
                 }
             }
+    }
+
+    private fun orderedBlock(line: String): ReleaseNotesMarkdownBlock.Ordered? {
+        val match = orderedItemPattern.matchEntire(line) ?: return null
+        return ReleaseNotesMarkdownBlock.Ordered(match.groupValues[1], parseInline(match.groupValues[2]))
     }
 
     private fun headingBlock(line: String): ReleaseNotesMarkdownBlock.Heading? {

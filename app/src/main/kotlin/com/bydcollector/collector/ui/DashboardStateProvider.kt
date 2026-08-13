@@ -19,6 +19,7 @@ import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.util.TimedCache
+import com.bydcollector.collector.util.sqliteFootprintBytes
 import java.io.File
 
 //assembles one immutable dashboard snapshot from settings, service flags, sqlite health, and diagnostics
@@ -43,9 +44,6 @@ class DashboardStateProvider(
         )
     }
     private val debugStatusCache = TimedCache<DirectDebugStatus>(ttlMs = 5_000L)
-    private val vehicleKpiCaches = VehicleKpiLanguage.values().associateWith {
-        TimedCache<VehicleKpis>(ttlMs = 1_000L)
-    }
     private val archiveStorageCache = ArchiveStorageSnapshotCache(
         archiveRoot = File(context.filesDir, "db_archive"),
         mainDatabaseFile = context.getDatabasePath(TelemetryDatabaseHelper.DATABASE_NAME),
@@ -58,6 +56,7 @@ class DashboardStateProvider(
 
     fun loadInitial(): DashboardState = load(DashboardLoadProfile.INITIAL)
 
+    @Suppress("UNUSED_PARAMETER")
     fun load(
         profile: DashboardLoadProfile,
         previous: DashboardState? = null,
@@ -81,7 +80,9 @@ class DashboardStateProvider(
             BydCollectorApplication.ensureDebugStorageReady(context)
         val debugStatus = if (debugStatusLoaded) {
             debugStatusCache.get(nowMs = nowMs) {
-                DirectDebugStore(context).use { debugStore -> debugStore.status() }
+                DirectDebugStore(context).use { debugStore ->
+                    debugStore.status(previous?.debugReadingCount ?: UNKNOWN_DASHBOARD_COUNT)
+                }
             }
         } else {
             lightweightDebugStatus()
@@ -117,15 +118,9 @@ class DashboardStateProvider(
             else -> maintenanceInfluxState()
         }
         val useInfluxState = influxStateLoaded || profile == DashboardLoadProfile.INITIAL || previous == null
-        val vehicleKpisLoaded = profile.readsVehicleKpis && store != null
-        val vehicleKpis = if (vehicleKpisLoaded) {
-            //vehicle KPI reads are limited to the ALL_PARAMETERS profile
-            vehicleKpiCaches.getValue(vehicleKpiLanguage).get(nowMs = nowMs) {
-                VehicleKpiMapper.from(store!!.normalizedCurrentState(), vehicleKpiLanguage)
-            }
-        } else {
-            VehicleKpis()
-        }
+        //KPI values are fed directly by the successful normalized-poll producer; dashboard refresh never rereads them.
+        val vehicleKpisLoaded = false
+        val vehicleKpis = previous?.vehicleKpis ?: VehicleKpis()
         val accessSnapshot = AdbAuthorizationManager.currentSnapshot()
         val integrationHealthLoaded = healthDetailLoaded == HealthSnapshotDetail.INTEGRATIONS ||
             healthDetailLoaded == HealthSnapshotDetail.FULL
@@ -279,6 +274,11 @@ class DashboardStateProvider(
         archiveStorageCache.invalidate()
     }
 
+    fun invalidateIntegrationRuntime() {
+        healthCaches.getValue(HealthSnapshotDetail.INTEGRATIONS).clear()
+        healthCaches.getValue(HealthSnapshotDetail.FULL).clear()
+    }
+
     fun close() {
         archiveStorageCache.close()
     }
@@ -294,7 +294,7 @@ class DashboardStateProvider(
         return cache.get(nowMs = nowMs, force = runningChanged) {
             healthCacheRunning[detail] = running
             //Keep TelemetryStore's default FULL for non-dashboard callers; profiles opt in explicitly here.
-            store.healthSnapshot(running = running, detail = detail)
+            store.healthSnapshot(running = running, detail = detail, includeCounts = false)
         }
     }
 
@@ -317,11 +317,11 @@ class DashboardStateProvider(
             lastError = null,
             lastErrorAt = null,
             lastPollStatus = null,
-            pollCount = 0L,
-            valueRowCount = 0L,
-            ecRowCount = 0L,
-            normalizedCurrentCount = 0L,
-            normalizedHistoryCount = 0L,
+            pollCount = UNKNOWN_DASHBOARD_COUNT,
+            valueRowCount = UNKNOWN_DASHBOARD_COUNT,
+            ecRowCount = UNKNOWN_DASHBOARD_COUNT,
+            normalizedCurrentCount = UNKNOWN_DASHBOARD_COUNT,
+            normalizedHistoryCount = UNKNOWN_DASHBOARD_COUNT,
             mqttLastError = null,
             mqttLastPublishedAt = null,
             mqttPendingCount = 0L,
@@ -334,7 +334,7 @@ class DashboardStateProvider(
             elapsedMs = null,
             requestCount = null,
             databasePath = dbFile.absolutePath,
-            databaseSizeBytes = dbFile.takeIf { it.exists() }?.length() ?: 0L,
+            databaseSizeBytes = sqliteFootprintBytes(dbFile),
             latestSoc = null,
             latestSpeed = null,
             latestCharging = null,
@@ -406,7 +406,7 @@ class DashboardStateProvider(
         val base = "${state.status}; pending: ${state.pendingRows}"
         return when {
             !state.lastError.isNullOrBlank() -> "$base; error: ${state.lastError.truncate(96)}"
-            !state.nextRetryAt.isNullOrBlank() -> "$base; retry at ${DisplayTimeFormatter.formatNullable(state.nextRetryAt) ?: state.nextRetryAt}"
+            state.status == "backoff" && !state.nextRetryAt.isNullOrBlank() -> "$base; retry at ${DisplayTimeFormatter.formatNullable(state.nextRetryAt) ?: state.nextRetryAt}"
             !state.lastSuccessAt.isNullOrBlank() -> "$base; last success: ${DisplayTimeFormatter.formatNullable(state.lastSuccessAt) ?: state.lastSuccessAt}"
             else -> base
         }
@@ -417,13 +417,13 @@ class DashboardStateProvider(
         //keeps debug card geometry stable without reading round-robin history outside debug/log tabs
         return DirectDebugStatus(
             databasePath = dbFile.absolutePath,
-            databaseSizeBytes = dbFile.takeIf { it.exists() }?.length() ?: 0L,
+            databaseSizeBytes = sqliteFootprintBytes(dbFile),
             lastSessionId = null,
             lastSessionStartedAt = null,
             lastSessionEndedAt = null,
             lastBatchSize = null,
             candidateCount = 0,
-            readingCount = 0,
+            readingCount = UNKNOWN_DASHBOARD_COUNT,
             lastReadingAt = null,
             lastErrorAt = null,
             lastError = null,

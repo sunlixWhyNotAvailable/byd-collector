@@ -112,6 +112,95 @@ class DashboardUiStateStoreTest {
         assertNull(store.chromeState.value?.lastError)
     }
 
+    @Test
+    fun producerOwnedValuesSurviveAStaleTabRefresh() {
+        val store = DashboardUiStateStore { 1L }
+        store.seed(dashboardState("initial"))
+        val countGeneration = store.beginCountBootstrap() ?: error("count bootstrap did not start")
+        store.publishRowCountBaseline(
+            countGeneration,
+            DashboardRowCounts(10L, 11L, 12L, 13L, 14L, 15L)
+        )
+        store.incrementMainRowCounts(pollRows = 1L, normalizedHistoryRows = 2L)
+        store.incrementDebugReadingCount(3L)
+        store.publishVehicleKpis(
+            uk = VehicleKpis(socPercent = "88%", odometerKm = "1 234 км"),
+            en = VehicleKpis(socPercent = "88%", odometerKm = "1 234 km")
+        )
+        store.publishIntegrationRuntime(
+            dashboardState("integration").copy(
+                mqttEnabled = false,
+                mqttStatus = "runtime-ok",
+                influxEnabled = false,
+                influxStatus = "runtime-error"
+            )
+        )
+        store.publishRuntimeFlags(
+            DashboardRuntimeFlags(
+                serviceRunning = true,
+                mainPollingRunning = true,
+                debugPollingRunning = true,
+                pollingEnabled = true,
+                debugPollingEnabled = true,
+                mqttEnabled = true,
+                influxEnabled = true,
+                permissionsGranted = true,
+                adbAuthorized = true,
+                dbMaintenanceStatus = DbMaintenanceRuntimeStatus(running = true),
+                archiveStorageJobStatus = ArchiveStorageJobStatus(running = true)
+            )
+        )
+        store.publishDatabaseFootprints(100L, 200L)
+
+        val generation = store.beginTabRefresh(AppTab.ALL_PARAMETERS)
+        assertTrue(store.publishTab(AppTab.ALL_PARAMETERS, generation, dashboardState("stale")))
+        val state = store.currentTab(AppTab.ALL_PARAMETERS) ?: error("missing state")
+
+        assertEquals(11L, state.pollCount)
+        assertEquals(16L, state.normalizedHistoryCount)
+        assertEquals(18L, state.debugReadingCount)
+        assertEquals("88%", state.vehicleKpis.socPercent)
+        assertEquals("1 234 км", state.vehicleKpis.odometerKm)
+        assertEquals("runtime-ok", state.mqttStatus)
+        assertEquals("runtime-error", state.influxStatus)
+        assertTrue(state.mqttEnabled)
+        assertTrue(state.influxEnabled)
+        assertEquals(100L, state.databaseSizeBytes)
+        assertEquals(200L, state.debugDatabaseSizeBytes)
+        assertTrue(state.dbMaintenanceStatus.running)
+        assertTrue(state.archiveStorageJobStatus.running)
+
+        store.selectVehicleKpiLanguage(VehicleKpiLanguage.EN)
+        assertEquals("1 234 km", store.currentTab(AppTab.ALL_PARAMETERS)?.vehicleKpis?.odometerKm)
+    }
+
+    @Test
+    fun initialHydrationCanStartOnlyOncePerProcessStore() {
+        val store = DashboardUiStateStore { 1L }
+
+        assertTrue(store.beginInitialHydration())
+        assertFalse(store.beginInitialHydration())
+    }
+
+    @Test
+    fun storageCutoverInvalidatesCountsAndAllowsOneRecount() {
+        val store = DashboardUiStateStore { 1L }
+        store.seed(dashboardState("initial"))
+        val first = store.beginCountBootstrap() ?: error("count bootstrap did not start")
+        store.publishRowCountBaseline(first, DashboardRowCounts(1L, 2L, 3L, 4L, 5L, 6L))
+        assertNull(store.beginCountBootstrap())
+
+        store.invalidateRowCounts()
+        store.incrementMainRowCounts(pollRows = 1L, valueRows = 1L)
+        store.incrementDebugReadingCount(1L)
+
+        assertEquals(UNKNOWN_DASHBOARD_COUNT, store.currentTab(AppTab.LOGS)?.pollCount)
+        assertEquals(UNKNOWN_DASHBOARD_COUNT, store.currentTab(AppTab.LOGS)?.valueRowCount)
+        assertEquals(UNKNOWN_DASHBOARD_COUNT, store.currentTab(AppTab.LOGS)?.debugReadingCount)
+        assertTrue(store.beginCountBootstrap() != null)
+        assertNull(store.beginCountBootstrap())
+    }
+
     private fun dashboardState(marker: String): DashboardState {
         return DashboardState(
             running = false,

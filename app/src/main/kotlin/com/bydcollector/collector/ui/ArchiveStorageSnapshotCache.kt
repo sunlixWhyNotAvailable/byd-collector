@@ -4,6 +4,7 @@ import android.os.SystemClock
 import com.bydcollector.collector.maintenance.ArchiveStorageManager
 import com.bydcollector.collector.maintenance.ArchiveStorageSnapshot
 import com.bydcollector.collector.util.namedSingleThreadExecutor
+import com.bydcollector.collector.util.sqliteFootprintBytes
 import java.io.File
 import java.util.concurrent.Executor
 import java.util.concurrent.ExecutorService
@@ -146,7 +147,7 @@ class ArchiveStorageSnapshotCache(
         )
     }
 
-    private fun databaseSize(file: File): Long = file.takeIf { it.exists() }?.length() ?: 0L
+    private fun databaseSize(file: File): Long = sqliteFootprintBytes(file)
 
     private data class CachedSnapshot(
         val snapshot: ArchiveStorageSnapshot,

@@ -63,6 +63,7 @@ import com.bydcollector.collector.maintenance.DbMaintenanceUiState
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.ui.DashboardState
 import com.bydcollector.collector.ui.VehicleKpis
+import com.bydcollector.collector.update.ReleaseNotesSelector
 import com.bydcollector.collector.update.UpdateInfo
 import com.bydcollector.collector.update.UpdateUiState
 import java.util.Locale
@@ -152,6 +153,7 @@ fun BydCollectorApp(
                     UpdateCheckDialog(
                         strings = s,
                         appVersionName = appVersionName,
+                        language = language,
                         state = updateUiState,
                         onDismiss = actions::onDismissUpdateDialog,
                         onUpdate = actions::onInstallUpdate
@@ -1415,6 +1417,7 @@ private fun ModalInputBlocker() {
 private fun UpdateCheckDialog(
     strings: UiStrings,
     appVersionName: String,
+    language: UiLanguage,
     state: UpdateUiState,
     onDismiss: () -> Unit,
     onUpdate: () -> Unit
@@ -1457,11 +1460,11 @@ private fun UpdateCheckDialog(
                     when (state) {
                         UpdateUiState.Checking -> Text(strings.checkingForUpdate, color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                         UpdateUiState.UpToDate -> Text(strings.latestVersion, color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                        is UpdateUiState.Available -> AvailableUpdateNotes(strings, state.info)
+                        is UpdateUiState.Available -> AvailableUpdateNotes(strings, state.info, language)
                         is UpdateUiState.Downloading -> {
                             DownloadingUpdateHeader(strings)
                             Spacer(Modifier.height(10.dp))
-                            AvailableUpdateNotes(strings, state.info)
+                            AvailableUpdateNotes(strings, state.info, language)
                         }
                         is UpdateUiState.Error -> Text("${strings.updateError}: ${localizedUpdateError(strings, state.message)}", color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                         UpdateUiState.Hidden -> Text(strings.checkingForUpdate, color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
@@ -1983,7 +1986,10 @@ private fun localizedArchiveStorageMessage(strings: UiStrings, status: ArchiveSt
 }
 
 @Composable
-private fun AvailableUpdateNotes(strings: UiStrings, info: UpdateInfo) {
+private fun AvailableUpdateNotes(strings: UiStrings, info: UpdateInfo, language: UiLanguage) {
+    val selectedReleaseNotes = remember(info.releaseNotes, language) {
+        ReleaseNotesSelector.select(info.releaseNotes, language == UiLanguage.UK)
+    }
     Text(
         text = "${strings.availableVersion} ${info.version}",
         color = LocalBydPalette.current.text,
@@ -1991,7 +1997,7 @@ private fun AvailableUpdateNotes(strings: UiStrings, info: UpdateInfo) {
         fontWeight = FontWeight.SemiBold
     )
     Spacer(Modifier.height(12.dp))
-    MarkdownPatchNotesText(info.releaseNotes)
+    MarkdownPatchNotesText(selectedReleaseNotes)
 }
 
 @Composable
@@ -2029,8 +2035,9 @@ private fun UpdateProgressBar(progress: Int) {
 @Composable
 private fun MarkdownPatchNotesText(text: String) {
     val p = LocalBydPalette.current
+    val blocks = remember(text) { ReleaseNotesMarkdown.parse(text) }
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        ReleaseNotesMarkdown.parse(text).forEach { block ->
+        blocks.forEach { block ->
             when (block) {
                 ReleaseNotesMarkdownBlock.Blank -> Spacer(Modifier.height(6.dp))
                 ReleaseNotesMarkdownBlock.Separator -> Box(Modifier.fillMaxWidth().height(1.dp).background(p.border))
@@ -2045,12 +2052,8 @@ private fun MarkdownPatchNotesText(text: String) {
                     fontWeight = FontWeight.Bold,
                     lineHeight = 19.sp
                 )
-                is ReleaseNotesMarkdownBlock.Bullet -> Text(
-                    text = AnnotatedString("• ") + block.spans.toAnnotatedString(),
-                    color = p.text,
-                    fontSize = 13.sp,
-                    lineHeight = 18.sp
-                )
+                is ReleaseNotesMarkdownBlock.Bullet -> MarkdownListRow("•", block.spans)
+                is ReleaseNotesMarkdownBlock.Ordered -> MarkdownListRow("${block.number}.", block.spans)
                 is ReleaseNotesMarkdownBlock.Paragraph -> Text(
                     text = block.spans.toAnnotatedString(),
                     color = p.text,
@@ -2059,6 +2062,32 @@ private fun MarkdownPatchNotesText(text: String) {
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun MarkdownListRow(marker: String, spans: List<ReleaseNotesMarkdownSpan>) {
+    val p = LocalBydPalette.current
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.Top
+    ) {
+        Text(
+            text = marker,
+            modifier = Modifier.widthIn(min = 22.dp),
+            color = p.text,
+            fontSize = 13.sp,
+            lineHeight = 18.sp,
+            textAlign = TextAlign.End
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            text = spans.toAnnotatedString(),
+            modifier = Modifier.weight(1f),
+            color = p.text,
+            fontSize = 13.sp,
+            lineHeight = 18.sp
+        )
     }
 }
 
@@ -2241,7 +2270,9 @@ private fun Modifier.clickableNoRipple(
 private fun Modifier.borderSafe(color: androidx.compose.ui.graphics.Color): Modifier =
     this.then(Modifier.border(1.dp, color, Rounded8))
 
-private fun formatCount(value: Long): String = "%,d".format(Locale.US, value).replace(",", " ")
+private fun formatCount(value: Long): String {
+    return if (value < 0L) "-" else "%,d".format(Locale.US, value).replace(",", " ")
+}
 
 private fun errorCount(state: DashboardState?): String {
     return if (state?.lastErrorAt != null || state?.lastError != null) "1" else "0"

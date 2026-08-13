@@ -207,6 +207,15 @@ class BydCollectorUiContractTest {
     }
 
     @Test
+    fun updateNotesSelectByLanguageForBothAvailableStates() {
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+
+        assertEquals(2, Regex("AvailableUpdateNotes\\(strings, state.info, language\\)").findAll(app).count())
+        assertTrue(app.contains("remember(info.releaseNotes, language)"))
+        assertTrue(app.contains("remember(text) { ReleaseNotesMarkdown.parse(text) }"))
+    }
+
+    @Test
     fun secretFieldsLoadStoredValuesAndUseLocalVisibilityToggles() {
         val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
