@@ -341,16 +341,28 @@ class BydCollectorUiContractTest {
     }
 
     @Test
-    fun buttonLikeControlsForceVisualPressBeforeAction() {
+    fun buttonLikeControlsKeepForcedPressWhileBottomTabsSwitchImmediately() {
         val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val pressHelper = components
+            .substringAfter("fun rememberForcedPressClick(")
+            .substringBefore("fun Modifier.pressScaleModifier(")
+        val bottomTabs = app
+            .substringAfter("private fun BottomTabs(")
+            .substringBefore("private fun Modifier.clickableNoRipple(")
 
         assertTrue(components.contains("FORCED_PRESS_DELAY_MS"))
         assertTrue(components.contains("rememberForcedPressClick"))
         assertTrue(components.contains("delay(FORCED_PRESS_DELAY_MS)"))
         assertTrue(components.contains("latestOnClick()"))
+        assertTrue(pressHelper.contains("invokeImmediately: Boolean = false"))
+        assertTrue(pressHelper.contains("if (!invokeImmediately) latestOnClick()"))
+        assertTrue(pressHelper.contains("if (invokeImmediately) latestOnClick()"))
         assertTrue(components.contains("visualPressed"))
         assertTrue(components.contains(".clickable(enabled = enabled && !press.locked"))
+        assertTrue(bottomTabs.contains("invokeImmediately = true"))
+        assertEquals(1, Regex("invokeImmediately = true").findAll(app).count())
+        assertFalse(components.contains("invokeImmediately = true"))
         assertTrue(app.contains("pressScaleModifier(interactionSource, forcePressed = press.visualPressed"))
         assertTrue(app.contains("clickableNoRipple(interactionSource, press.visualPressed"))
         assertTrue(app.contains("ShutdownIconButton(onClick = actions::onShutdownApp)"))

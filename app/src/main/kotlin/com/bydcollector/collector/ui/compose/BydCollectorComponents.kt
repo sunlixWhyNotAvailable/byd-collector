@@ -79,6 +79,7 @@ private data class SwitchPendingState(
 @Composable
 fun rememberForcedPressClick(
     enabled: Boolean,
+    invokeImmediately: Boolean = false,
     onClick: () -> Unit
 ): ForcedPressClick {
     val latestOnClick by rememberUpdatedState(onClick)
@@ -86,13 +87,13 @@ fun rememberForcedPressClick(
     var locked by remember { mutableStateOf(false) }
     var clickToken by remember { mutableStateOf(0) }
 
-    //delays actions briefly so every button visibly acknowledges the tap first
+    //holds forced feedback and the repeat lock; tabs opt into immediate action
     LaunchedEffect(clickToken) {
         if (clickToken == 0) return@LaunchedEffect
         delay(FORCED_PRESS_DELAY_MS)
         visualPressed = false
         locked = false
-        latestOnClick()
+        if (!invokeImmediately) latestOnClick()
     }
 
     return ForcedPressClick(
@@ -103,6 +104,7 @@ fun rememberForcedPressClick(
             locked = true
             visualPressed = true
             clickToken += 1
+            if (invokeImmediately) latestOnClick()
         }
     )
 }
@@ -256,7 +258,7 @@ fun ActionButton(
     val p = LocalBydPalette.current
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
-    val press = rememberForcedPressClick(enabled, onClick)
+    val press = rememberForcedPressClick(enabled = enabled, onClick = onClick)
     val visualPressed = pressed || press.visualPressed
     val bg = when {
         !enabled -> p.disabled.copy(alpha = 0.55f)
@@ -711,7 +713,7 @@ fun CategoryChip(
     val p = LocalBydPalette.current
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
-    val press = rememberForcedPressClick(enabled, onClick)
+    val press = rememberForcedPressClick(enabled = enabled, onClick = onClick)
     val visualPressed = pressed || press.visualPressed
     val bg = when {
         !enabled -> p.disabled.copy(alpha = 0.35f)

@@ -2223,7 +2223,10 @@ private fun BottomTabs(activeTab: AppTab, strings: UiStrings, actions: BydCollec
         tabs.forEach { (tab, pair) ->
             val selected = tab == activeTab
             val interactionSource = remember { MutableInteractionSource() }
-            val press = rememberForcedPressClick(enabled = true) { actions.onTabSelected(tab) }
+            val press = rememberForcedPressClick(
+                enabled = true,
+                invokeImmediately = true
+            ) { actions.onTabSelected(tab) }
             Row(
                 modifier = Modifier
                     .weight(1f)
