@@ -1,6 +1,7 @@
 package com.bydcollector.collector.direct;
 
 import android.content.ContentValues;
+import android.database.Cursor;
 import android.database.DatabaseUtils;
 import android.database.sqlite.SQLiteDatabase;
 
@@ -89,6 +90,30 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         }
     }
 
+    List<Sample> pending(int limit) {
+        if (limit < 1 || limit > CollectorHelperProtocol.MAX_PENDING_WORKER_SAMPLES) {
+            throw new IllegalArgumentException("invalid pending sample limit: " + limit);
+        }
+        List<Sample> samples = new ArrayList<Sample>();
+        database.beginTransactionNonExclusive();
+        try {
+            List<SampleHeader> headers = pendingHeaders(limit);
+            for (SampleHeader header : headers) {
+                List<Value> values = values(header.identity);
+                if (values.size() != header.fieldCount) {
+                    throw new IllegalStateException(
+                        "worker sample field count mismatch: expected=" + header.fieldCount + " actual=" + values.size()
+                    );
+                }
+                samples.add(header.toSample(values));
+            }
+            database.setTransactionSuccessful();
+        } finally {
+            database.endTransaction();
+        }
+        return samples;
+    }
+
     int acknowledge(TelemetryWorkerSampleIdentity identity, long acknowledgedAtMs) {
         if (acknowledgedAtMs < 0) throw new IllegalArgumentException("acknowledgedAtMs must be non-negative");
         ContentValues values = new ContentValues();
@@ -115,6 +140,68 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         } finally {
             database.endTransaction();
         }
+    }
+
+    private List<SampleHeader> pendingHeaders(int limit) {
+        List<SampleHeader> headers = new ArrayList<SampleHeader>();
+        try (Cursor cursor = database.query(
+            SAMPLE_TABLE,
+            new String[] {
+                "boot_id", "helper_generation", "poll_sequence", "catalog_version",
+                "captured_wall_ms", "captured_elapsed_ms", "poll_elapsed_ms",
+                "batch_status", "batch_mode", "native_available", "group_failure_count",
+                "field_count", "error"
+            },
+            "acknowledged_at_ms IS NULL",
+            null,
+            null,
+            null,
+            "captured_wall_ms, captured_elapsed_ms, boot_id, helper_generation, poll_sequence",
+            Integer.toString(limit)
+        )) {
+            while (cursor.moveToNext()) {
+                headers.add(new SampleHeader(
+                    new TelemetryWorkerSampleIdentity(cursor.getString(0), cursor.getString(1), cursor.getLong(2)),
+                    cursor.getString(3),
+                    cursor.getLong(4),
+                    cursor.getLong(5),
+                    cursor.getLong(6),
+                    cursor.getInt(7),
+                    cursor.getInt(8),
+                    cursor.getInt(9) == 1,
+                    cursor.getInt(10),
+                    cursor.getInt(11),
+                    cursor.isNull(12) ? null : cursor.getString(12)
+                ));
+            }
+        }
+        return headers;
+    }
+
+    private List<Value> values(TelemetryWorkerSampleIdentity identity) {
+        List<Value> values = new ArrayList<Value>();
+        try (Cursor cursor = database.query(
+            VALUE_TABLE,
+            new String[] {"field_index", "tx", "dev", "fid", "status", "raw", "error"},
+            "boot_id=? AND helper_generation=? AND poll_sequence=?",
+            identityArgs(identity),
+            null,
+            null,
+            "field_index"
+        )) {
+            while (cursor.moveToNext()) {
+                values.add(new Value(
+                    cursor.getInt(0),
+                    cursor.getInt(1),
+                    cursor.getInt(2),
+                    cursor.getInt(3),
+                    cursor.getInt(4),
+                    cursor.isNull(5) ? null : cursor.getInt(5),
+                    cursor.isNull(6) ? null : cursor.getString(6)
+                ));
+            }
+        }
+        return values;
     }
 
     private static ContentValues sampleValues(Sample sample) {
@@ -196,6 +283,9 @@ final class TelemetryWorkerSpool implements AutoCloseable {
             }
             if (groupFailureCount < 0) throw new IllegalArgumentException("groupFailureCount must be non-negative");
             if (values == null || values.isEmpty()) throw new IllegalArgumentException("values must not be empty");
+            if (values.size() > CollectorHelperProtocol.MAX_WORKER_FIELD_COUNT) {
+                throw new IllegalArgumentException("too many worker fields: " + values.size());
+            }
             Set<Integer> indexes = new HashSet<Integer>();
             for (Value value : values) {
                 if (value == null) throw new IllegalArgumentException("values must not contain null");
@@ -215,6 +305,62 @@ final class TelemetryWorkerSpool implements AutoCloseable {
             this.groupFailureCount = groupFailureCount;
             this.error = error;
             this.values = Collections.unmodifiableList(new ArrayList<Value>(values));
+        }
+    }
+
+    private static final class SampleHeader {
+        final TelemetryWorkerSampleIdentity identity;
+        final String catalogVersion;
+        final long capturedWallMs;
+        final long capturedElapsedMs;
+        final long pollElapsedMs;
+        final int batchStatus;
+        final int batchMode;
+        final boolean nativeAvailable;
+        final int groupFailureCount;
+        final int fieldCount;
+        final String error;
+
+        SampleHeader(
+            TelemetryWorkerSampleIdentity identity,
+            String catalogVersion,
+            long capturedWallMs,
+            long capturedElapsedMs,
+            long pollElapsedMs,
+            int batchStatus,
+            int batchMode,
+            boolean nativeAvailable,
+            int groupFailureCount,
+            int fieldCount,
+            String error
+        ) {
+            this.identity = identity;
+            this.catalogVersion = catalogVersion;
+            this.capturedWallMs = capturedWallMs;
+            this.capturedElapsedMs = capturedElapsedMs;
+            this.pollElapsedMs = pollElapsedMs;
+            this.batchStatus = batchStatus;
+            this.batchMode = batchMode;
+            this.nativeAvailable = nativeAvailable;
+            this.groupFailureCount = groupFailureCount;
+            this.fieldCount = fieldCount;
+            this.error = error;
+        }
+
+        Sample toSample(List<Value> values) {
+            return new Sample(
+                identity,
+                catalogVersion,
+                capturedWallMs,
+                capturedElapsedMs,
+                pollElapsedMs,
+                batchStatus,
+                batchMode,
+                nativeAvailable,
+                groupFailureCount,
+                error,
+                values
+            );
         }
     }
 

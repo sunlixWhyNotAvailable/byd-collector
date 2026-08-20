@@ -1,5 +1,6 @@
 package com.bydcollector.collector.direct
 
+import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -60,4 +61,25 @@ class TelemetryWorkerSpoolContractTest {
             TelemetryWorkerSpool.Value(0, 8, 1001, 11, 0, 2, null)
         }
     }
+
+    @Test
+    fun pendingReadsOnlyUnacknowledgedSamplesInCapturedOrder() {
+        val source = projectFile(
+            "app/src/main/java/com/bydcollector/collector/direct/TelemetryWorkerSpool.java",
+            "src/main/java/com/bydcollector/collector/direct/TelemetryWorkerSpool.java"
+        ).readText()
+        val pending = source.substringAfter("List<Sample> pending(int limit)")
+            .substringBefore("int acknowledge(")
+        val headers = source.substringAfter("private List<SampleHeader> pendingHeaders(int limit)")
+            .substringBefore("private List<Value> values(")
+
+        assertTrue(pending.contains("beginTransactionNonExclusive()"))
+        assertTrue(pending.contains("values.size() != header.fieldCount"))
+        assertTrue(headers.contains("\"acknowledged_at_ms IS NULL\""))
+        assertTrue(headers.contains("\"captured_wall_ms, captured_elapsed_ms, boot_id, helper_generation, poll_sequence\""))
+        assertTrue(headers.contains("Integer.toString(limit)"))
+    }
+
+    private fun projectFile(vararg paths: String): File =
+        paths.map(::File).firstOrNull(File::isFile) ?: error("Missing project file: ${paths.joinToString()}")
 }

@@ -5,6 +5,7 @@ import android.os.IBinder
 import android.os.Parcel
 import android.util.Log
 import com.bydcollector.collector.direct.CollectorHelperProtocol
+import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
 
 //wraps the helper binder so autoservice calls stay behind one read-only app-facing interface
 class DirectVehicleHelperClient : DirectVehicleHelper {
@@ -94,6 +95,140 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
         }
     }
 
+    fun pendingWorkerSamples(limit: Int): PendingTelemetryWorkerSamples {
+        if (limit !in 1..CollectorHelperProtocol.MAX_PENDING_WORKER_SAMPLES) {
+            return pendingFailure(STATUS_CLIENT_ERROR, "invalid pending sample limit: $limit")
+        }
+        return synchronized(lock) {
+            val binder = ensureBinder()
+                ?: return@synchronized pendingFailure(STATUS_NO_BINDER, "helper binder unavailable")
+            val data = Parcel.obtain()
+            val reply = Parcel.obtain()
+            try {
+                data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
+                data.writeInt(limit)
+                if (!binder.transact(CollectorHelperProtocol.TX_WORKER_PENDING, data, reply, 0)) {
+                    cached = null
+                    return@synchronized pendingFailure(STATUS_TRANSACT_FALSE, "pending transact returned false")
+                }
+                val status = reply.readInt()
+                val error = reply.readString()
+                val count = reply.readInt()
+                require(count in 0..limit) { "invalid pending sample count: $count" }
+                PendingTelemetryWorkerSamples(
+                    status = status,
+                    samples = List(count) { readWorkerSample(reply) },
+                    error = error
+                )
+            } catch (error: DeadObjectException) {
+                cached = null
+                pendingFailure(STATUS_DEAD_OBJECT, error.message ?: "dead binder")
+            } catch (error: Exception) {
+                pendingFailure(STATUS_CLIENT_ERROR, "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+            } finally {
+                data.recycle()
+                reply.recycle()
+            }
+        }
+    }
+
+    fun acknowledgeWorkerSample(
+        identity: TelemetryWorkerSampleIdentity,
+        acknowledgedAtMs: Long
+    ): TelemetryWorkerAckResult {
+        if (acknowledgedAtMs < 0) return ackFailure(STATUS_CLIENT_ERROR, "acknowledgedAtMs must be non-negative")
+        return synchronized(lock) {
+            val binder = ensureBinder()
+                ?: return@synchronized ackFailure(STATUS_NO_BINDER, "helper binder unavailable")
+            val data = Parcel.obtain()
+            val reply = Parcel.obtain()
+            try {
+                data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
+                data.writeString(identity.bootId)
+                data.writeString(identity.helperGeneration)
+                data.writeLong(identity.pollSequence)
+                data.writeLong(acknowledgedAtMs)
+                if (!binder.transact(CollectorHelperProtocol.TX_WORKER_ACK, data, reply, 0)) {
+                    cached = null
+                    return@synchronized ackFailure(STATUS_TRANSACT_FALSE, "ack transact returned false")
+                }
+                val status = reply.readInt()
+                val updated = reply.readInt()
+                require(updated == 0 || updated == 1) { "invalid ack update marker: $updated" }
+                TelemetryWorkerAckResult(status, updated == 1, reply.readString())
+            } catch (error: DeadObjectException) {
+                cached = null
+                ackFailure(STATUS_DEAD_OBJECT, error.message ?: "dead binder")
+            } catch (error: Exception) {
+                ackFailure(STATUS_CLIENT_ERROR, "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+            } finally {
+                data.recycle()
+                reply.recycle()
+            }
+        }
+    }
+
+    private fun readWorkerSample(reply: Parcel): TelemetryWorkerSample {
+        val identity = TelemetryWorkerSampleIdentity(
+            requireNotNull(reply.readString()) { "worker sample boot id missing" },
+            requireNotNull(reply.readString()) { "worker sample generation missing" },
+            reply.readLong()
+        )
+        val catalogVersion = requireNotNull(reply.readString()) { "worker sample catalog version missing" }
+        val capturedWallMs = reply.readLong()
+        val capturedElapsedMs = reply.readLong()
+        val pollElapsedMs = reply.readLong()
+        require(capturedElapsedMs >= 0 && pollElapsedMs >= 0) { "worker sample elapsed time is negative" }
+        val batchStatus = reply.readInt()
+        val batchMode = reply.readInt()
+        val nativeAvailable = reply.readInt()
+        require(nativeAvailable == 0 || nativeAvailable == 1) { "invalid native availability marker" }
+        val groupFailureCount = reply.readInt()
+        require(groupFailureCount >= 0) { "negative group failure count" }
+        val error = reply.readString()
+        val fieldCount = reply.readInt()
+        require(fieldCount in 1..CollectorHelperProtocol.MAX_WORKER_FIELD_COUNT) {
+            "invalid worker field count: $fieldCount"
+        }
+        val values = List(fieldCount) { expectedIndex ->
+            val fieldIndex = reply.readInt()
+            require(fieldIndex == expectedIndex) {
+                "worker field order mismatch: expected=$expectedIndex actual=$fieldIndex"
+            }
+            val tx = reply.readInt()
+            require(tx == CollectorHelperProtocol.AUTO_TX_INT || tx == CollectorHelperProtocol.AUTO_TX_FLOAT) {
+                "unsupported worker read transaction: $tx"
+            }
+            val dev = reply.readInt()
+            val fid = reply.readInt()
+            val status = reply.readInt()
+            val hasRaw = reply.readInt()
+            require(hasRaw == 0 || hasRaw == 1) { "invalid worker raw marker: $hasRaw" }
+            TelemetryWorkerFieldValue(
+                fieldIndex = fieldIndex,
+                tx = tx,
+                dev = dev,
+                fid = fid,
+                status = status,
+                raw = if (hasRaw == 1) reply.readInt() else null,
+                error = reply.readString()
+            )
+        }
+        return TelemetryWorkerSample(
+            identity = identity,
+            catalogVersion = catalogVersion,
+            capturedWallMs = capturedWallMs,
+            capturedElapsedMs = capturedElapsedMs,
+            pollElapsedMs = pollElapsedMs,
+            batchStatus = batchStatus,
+            batchMode = batchMode,
+            nativeAvailable = nativeAvailable == 1,
+            groupFailureCount = groupFailureCount,
+            error = error,
+            values = values
+        )
+    }
+
     private fun transactScalar(code: Int, writeArgs: (Parcel) -> Unit): DirectHelperReadResult? {
         return synchronized(lock) {
             //synchronizes binder parcels because one cached binder is shared by polling and status checks
@@ -138,6 +273,12 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
             )
         )
     }
+
+    private fun pendingFailure(status: Int, error: String): PendingTelemetryWorkerSamples =
+        PendingTelemetryWorkerSamples(status, emptyList(), error)
+
+    private fun ackFailure(status: Int, error: String): TelemetryWorkerAckResult =
+        TelemetryWorkerAckResult(status, updated = false, error)
 
     private fun modeName(mode: Int): String = when (mode) {
         CollectorHelperProtocol.MODE_NATIVE -> "native"

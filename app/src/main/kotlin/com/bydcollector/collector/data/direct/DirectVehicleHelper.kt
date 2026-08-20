@@ -1,5 +1,7 @@
 package com.bydcollector.collector.data.direct
 
+import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
+
 interface DirectVehicleHelper {
     fun isAlive(): Boolean
     fun read(entry: DirectFidEntry): DirectHelperReadResult
@@ -62,4 +64,44 @@ data class DirectBatchDiagnostics(
         append(" returned=").append(returnedCount)
         if (error != null) append(" error=").append(error)
     }
+}
+
+data class PendingTelemetryWorkerSamples(
+    val status: Int,
+    val samples: List<TelemetryWorkerSample>,
+    val error: String? = null
+) {
+    val ok: Boolean = status == 0
+}
+
+data class TelemetryWorkerSample(
+    val identity: TelemetryWorkerSampleIdentity,
+    val catalogVersion: String,
+    val capturedWallMs: Long,
+    val capturedElapsedMs: Long,
+    val pollElapsedMs: Long,
+    val batchStatus: Int,
+    val batchMode: Int,
+    val nativeAvailable: Boolean,
+    val groupFailureCount: Int,
+    val error: String?,
+    val values: List<TelemetryWorkerFieldValue>
+)
+
+data class TelemetryWorkerFieldValue(
+    val fieldIndex: Int,
+    val tx: Int,
+    val dev: Int,
+    val fid: Int,
+    val status: Int,
+    val raw: Int?,
+    val error: String?
+)
+
+data class TelemetryWorkerAckResult(
+    val status: Int,
+    val updated: Boolean,
+    val error: String? = null
+) {
+    val ok: Boolean = status == 0 && updated
 }

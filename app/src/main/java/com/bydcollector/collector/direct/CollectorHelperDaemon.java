@@ -18,6 +18,7 @@ import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -59,6 +60,15 @@ public final class CollectorHelperDaemon {
         String descriptor = autoservice.getInterfaceDescriptor();
         final String autoserviceDescriptor = descriptor == null ? "" : descriptor;
         final NativeArrayReader nativeReader = NativeArrayReader.create();
+        TelemetryWorkerSpool openedSpool = null;
+        String openedSpoolError = null;
+        try {
+            openedSpool = TelemetryWorkerSpool.open();
+        } catch (Throwable error) {
+            openedSpoolError = describe(error);
+        }
+        final TelemetryWorkerSpool workerSpool = openedSpool;
+        final String workerSpoolError = openedSpoolError;
         final Object readLock = new Object();
         Binder helperBinder = new Binder() {
             @Override
@@ -123,6 +133,86 @@ public final class CollectorHelperDaemon {
                     if (reply != null) writeBatchReply(reply, result);
                     return true;
                 }
+                if (code == CollectorHelperProtocol.TX_WORKER_PENDING) {
+                    if (reply != null) {
+                        if (workerSpool == null) {
+                            writeWorkerPendingReply(
+                                reply,
+                                CollectorHelperProtocol.STATUS_SPOOL_UNAVAILABLE,
+                                workerSpoolError,
+                                Collections.<TelemetryWorkerSpool.Sample>emptyList()
+                            );
+                        } else {
+                            try {
+                                writeWorkerPendingReply(
+                                    reply,
+                                    CollectorHelperProtocol.STATUS_OK,
+                                    null,
+                                    workerSpool.pending(data.readInt())
+                                );
+                            } catch (IllegalArgumentException error) {
+                                writeWorkerPendingReply(
+                                    reply,
+                                    CollectorHelperProtocol.STATUS_INVALID_REQUEST,
+                                    describe(error),
+                                    Collections.<TelemetryWorkerSpool.Sample>emptyList()
+                                );
+                            } catch (Throwable error) {
+                                writeWorkerPendingReply(
+                                    reply,
+                                    CollectorHelperProtocol.STATUS_SPOOL_UNAVAILABLE,
+                                    describe(error),
+                                    Collections.<TelemetryWorkerSpool.Sample>emptyList()
+                                );
+                            }
+                        }
+                    }
+                    return true;
+                }
+                if (code == CollectorHelperProtocol.TX_WORKER_ACK) {
+                    if (reply != null) {
+                        if (workerSpool == null) {
+                            writeWorkerAckReply(
+                                reply,
+                                CollectorHelperProtocol.STATUS_SPOOL_UNAVAILABLE,
+                                0,
+                                workerSpoolError
+                            );
+                        } else {
+                            try {
+                                TelemetryWorkerSampleIdentity identity = new TelemetryWorkerSampleIdentity(
+                                    data.readString(),
+                                    data.readString(),
+                                    data.readLong()
+                                );
+                                int updated = workerSpool.acknowledge(identity, data.readLong());
+                                writeWorkerAckReply(
+                                    reply,
+                                    updated == 1
+                                        ? CollectorHelperProtocol.STATUS_OK
+                                        : CollectorHelperProtocol.STATUS_SAMPLE_NOT_FOUND,
+                                    updated,
+                                    updated == 1 ? null : "worker sample not found"
+                                );
+                            } catch (IllegalArgumentException error) {
+                                writeWorkerAckReply(
+                                    reply,
+                                    CollectorHelperProtocol.STATUS_INVALID_REQUEST,
+                                    0,
+                                    describe(error)
+                                );
+                            } catch (Throwable error) {
+                                writeWorkerAckReply(
+                                    reply,
+                                    CollectorHelperProtocol.STATUS_SPOOL_UNAVAILABLE,
+                                    0,
+                                    describe(error)
+                                );
+                            }
+                        }
+                    }
+                    return true;
+                }
                 return false;
             }
         };
@@ -135,12 +225,18 @@ public final class CollectorHelperDaemon {
                     " protocol=" + CollectorHelperProtocol.PROTOCOL_VERSION +
                     " whitelist=" + whitelist.size() +
                     " native=" + nativeReader.isAvailable() +
-                    (nativeReader.isAvailable() ? "" : " native_error=" + nativeReader.unavailableReason())
+                    (nativeReader.isAvailable() ? "" : " native_error=" + nativeReader.unavailableReason()) +
+                    " spool=" + (workerSpool != null) +
+                    (workerSpoolError == null ? "" : " spool_error=" + workerSpoolError)
             );
             System.out.flush();
             Looper.loop();
         } finally {
-            ownerLock.close();
+            try {
+                if (workerSpool != null) workerSpool.close();
+            } finally {
+                ownerLock.close();
+            }
         }
     }
 
@@ -210,6 +306,48 @@ public final class CollectorHelperDaemon {
             reply.writeInt(value.raw == null ? 0 : 1);
             if (value.raw != null) reply.writeInt(value.raw);
         }
+    }
+
+    private static void writeWorkerPendingReply(
+            Parcel reply,
+            int status,
+            String error,
+            List<TelemetryWorkerSpool.Sample> samples
+    ) {
+        reply.writeInt(status);
+        reply.writeString(error);
+        reply.writeInt(samples.size());
+        for (TelemetryWorkerSpool.Sample sample : samples) {
+            reply.writeString(sample.identity.bootId);
+            reply.writeString(sample.identity.helperGeneration);
+            reply.writeLong(sample.identity.pollSequence);
+            reply.writeString(sample.catalogVersion);
+            reply.writeLong(sample.capturedWallMs);
+            reply.writeLong(sample.capturedElapsedMs);
+            reply.writeLong(sample.pollElapsedMs);
+            reply.writeInt(sample.batchStatus);
+            reply.writeInt(sample.batchMode);
+            reply.writeInt(sample.nativeAvailable ? 1 : 0);
+            reply.writeInt(sample.groupFailureCount);
+            reply.writeString(sample.error);
+            reply.writeInt(sample.values.size());
+            for (TelemetryWorkerSpool.Value value : sample.values) {
+                reply.writeInt(value.fieldIndex);
+                reply.writeInt(value.tx);
+                reply.writeInt(value.dev);
+                reply.writeInt(value.fid);
+                reply.writeInt(value.status);
+                reply.writeInt(value.raw == null ? 0 : 1);
+                if (value.raw != null) reply.writeInt(value.raw);
+                reply.writeString(value.error);
+            }
+        }
+    }
+
+    private static void writeWorkerAckReply(Parcel reply, int status, int updated, String error) {
+        reply.writeInt(status);
+        reply.writeInt(updated);
+        reply.writeString(error);
     }
 
     static Set<Address> loadWhitelist(String apkPath) throws Exception {

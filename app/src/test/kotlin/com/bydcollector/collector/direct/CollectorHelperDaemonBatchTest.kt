@@ -162,16 +162,18 @@ class CollectorHelperDaemonBatchTest {
     }
 
     @Test
-    fun protocolV4RejectsStaleHelpersAndExposesReadOnlyEndpointsOnly() {
+    fun protocolV5RejectsStaleHelpersAndExposesReadOnlyEndpointsOnly() {
         val protocol = sourceFile("com/bydcollector/collector/direct/CollectorHelperProtocol.java").readText()
         val daemon = sourceFile("com/bydcollector/collector/direct/CollectorHelperDaemon.java").readText()
         val client = sourceFile("com/bydcollector/collector/data/direct/DirectVehicleHelperClient.kt").readText()
 
-        assertEquals(4, CollectorHelperProtocol.PROTOCOL_VERSION)
+        assertEquals(5, CollectorHelperProtocol.PROTOCOL_VERSION)
         assertTrue(client.contains("ping.raw == CollectorHelperProtocol.PROTOCOL_VERSION"))
         assertTrue(client.contains("TX_PING"))
         assertTrue(client.contains("TX_READ"))
         assertTrue(client.contains("TX_READ_BATCH"))
+        assertTrue(client.contains("TX_WORKER_PENDING"))
+        assertTrue(client.contains("TX_WORKER_ACK"))
         assertTrue(!protocol.contains("HEARTBEAT", ignoreCase = true))
         assertTrue(!protocol.contains("DISARM", ignoreCase = true))
         assertTrue(!daemon.contains("offcar", ignoreCase = true))
