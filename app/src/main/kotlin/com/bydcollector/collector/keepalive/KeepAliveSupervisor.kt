@@ -53,10 +53,18 @@ class KeepAliveSupervisor(
             val userShutdown = CollectorSettings(context.applicationContext, store).isUserShutdownRequested()
             val configChanged = reconcileState.configChanged(config, userShutdown)
             val shouldStopDisabledDaemon = reconcileState.shouldStopDaemonForDisabledConfig(configChanged)
-            if (config.anyEnabled && !configChanged && reconcileState.aliveFresh(nowMs)) return
-            if (!config.anyEnabled && !shouldStopDisabledDaemon) return
+            if (config.keepBluetooth) reconcileState.markBluetoothProfilesMayBeOverridden()
+            val shouldRestoreBluetoothProfiles = reconcileState.shouldRestoreBluetoothProfiles(config)
+            if (
+                config.anyEnabled &&
+                !configChanged &&
+                !shouldRestoreBluetoothProfiles &&
+                reconcileState.aliveFresh(nowMs)
+            ) return
+            if (!config.anyEnabled && !shouldStopDisabledDaemon && !shouldRestoreBluetoothProfiles) return
 
             val shell = shellFactory()
+            var configSynchronized = !configChanged
             if (configChanged) {
                 //writes every flag before launch/stop so the daemon loop observes a complete desired state
                 val mirrorResults = KeepAliveShellPlanner.mirrorSettingsCommands(config, userShutdown).map { command ->
@@ -64,7 +72,16 @@ class KeepAliveSupervisor(
                 }
                 if (mirrorResults.all { it.ok }) {
                     reconcileState.markConfigApplied(config, userShutdown)
+                    configSynchronized = true
                 }
+            }
+            if (configSynchronized && shouldRestoreBluetoothProfiles) {
+                val rollback = runCommand(
+                    shell,
+                    KeepAliveShellPlanner.bluetoothProfilesRestoreCommand(),
+                    "keep_alive_bluetooth_profiles_restore"
+                )
+                if (rollback.ok) reconcileState.markBluetoothProfilesRestored()
             }
 
             if (config.anyEnabled) {

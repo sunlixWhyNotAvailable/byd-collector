@@ -7,6 +7,7 @@ class KeepAliveReconcileState(
     private var lastAppliedConfig: KeepAliveConfig? = null
     private var lastAppliedUserShutdown: Boolean? = null
     private var lastAliveAtMs: Long = 0L
+    private var bluetoothProfilesRestored: Boolean = false
 
     fun currentConfigEnabled(): Boolean = lastAppliedConfig?.anyEnabled == true
 
@@ -18,9 +19,21 @@ class KeepAliveReconcileState(
         return configChanged || currentConfigEnabled()
     }
 
+    fun shouldRestoreBluetoothProfiles(config: KeepAliveConfig): Boolean {
+        return !config.keepBluetooth && !bluetoothProfilesRestored
+    }
+
+    fun markBluetoothProfilesMayBeOverridden() {
+        bluetoothProfilesRestored = false
+    }
+
     fun markConfigApplied(config: KeepAliveConfig, userShutdown: Boolean) {
         lastAppliedConfig = config
         lastAppliedUserShutdown = userShutdown
+    }
+
+    fun markBluetoothProfilesRestored() {
+        bluetoothProfilesRestored = true
     }
 
     fun markAlive(nowMs: Long) {

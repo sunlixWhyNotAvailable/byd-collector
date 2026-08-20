@@ -43,4 +43,21 @@ class KeepAliveReconcileStateTest {
         assertTrue(state.shouldStopDaemonForDisabledConfig(configChanged = true))
         assertFalse(state.shouldStopDaemonForDisabledConfig(configChanged = false))
     }
+
+    @Test
+    fun bluetoothRollbackRetriesUntilSuccessAndResetsAfterKeepAliveIsEnabled() {
+        val state = KeepAliveReconcileState(aliveTtlMs = 600_000)
+        val disabled = KeepAliveConfig(false, false, false, false)
+        val enabled = disabled.copy(keepBluetooth = true)
+
+        assertTrue(state.shouldRestoreBluetoothProfiles(disabled))
+        assertTrue(state.shouldRestoreBluetoothProfiles(disabled))
+
+        state.markBluetoothProfilesRestored()
+        assertFalse(state.shouldRestoreBluetoothProfiles(disabled))
+
+        state.markBluetoothProfilesMayBeOverridden()
+        assertFalse(state.shouldRestoreBluetoothProfiles(enabled))
+        assertTrue(state.shouldRestoreBluetoothProfiles(disabled))
+    }
 }

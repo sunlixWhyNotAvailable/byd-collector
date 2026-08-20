@@ -20,6 +20,9 @@ object KeepAliveShellPlanner {
     fun daemonLogTailCommand(): String =
         "tail -n 40 /data/local/tmp/bydcollector_keepalive.log 2>/dev/null || true"
 
+    fun bluetoothProfilesRestoreCommand(): String =
+        "settings put global bluetooth_disabled_profiles 0"
+
     fun daemonStopCommand(): String =
         "pidof bydcollector_keepalive >/dev/null 2>&1 && kill -TERM \$(pidof bydcollector_keepalive) 2>/dev/null || true"
 

@@ -113,6 +113,25 @@ class KeepAliveShellPlannerTest {
     }
 
     @Test
+    fun bluetoothProfilesRestoreCommandReturnsNormalPolicy() {
+        assertEquals(
+            "settings put global bluetooth_disabled_profiles 0",
+            KeepAliveShellPlanner.bluetoothProfilesRestoreCommand()
+        )
+    }
+
+    @Test
+    fun supervisorMirrorsFlagsBeforeBluetoothRollbackAndStopsAfterIt() {
+        val source = sourceFile("com/bydcollector/collector/keepalive/KeepAliveSupervisor.kt").readText()
+        val mirrorIndex = source.indexOf("mirrorSettingsCommands")
+        val rollbackIndex = source.indexOf("bluetoothProfilesRestoreCommand")
+        val stopIndex = source.indexOf("daemonStopCommand")
+
+        assertTrue(mirrorIndex in 0..<rollbackIndex)
+        assertTrue(rollbackIndex in 0..<stopIndex)
+    }
+
+    @Test
     fun singleQuoteInApkPathIsShellQuoted() {
         val command = KeepAliveShellPlanner.daemonLaunchCommand("/data/app/a'b/base.apk")
 
@@ -138,7 +157,9 @@ class KeepAliveShellPlannerTest {
     private fun sourceFile(path: String): File {
         return listOf(
             File("src/main/java/$path"),
-            File("app/src/main/java/$path")
+            File("app/src/main/java/$path"),
+            File("src/main/kotlin/$path"),
+            File("app/src/main/kotlin/$path")
         ).firstOrNull { it.isFile } ?: error("Missing source file: $path")
     }
 }
