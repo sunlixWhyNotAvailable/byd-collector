@@ -87,9 +87,10 @@ public final class CollectorHelperDaemon {
             return;
         }
         final Object readLock = new Object();
+        final Handler mainHandler = new Handler(Looper.myLooper());
         final WorkerPollLoop workerPollLoop = workerMode
             ? new WorkerPollLoop(
-                new Handler(Looper.myLooper()),
+                mainHandler,
                 mainRows,
                 loadMainCatalogVersion(),
                 readBootId(),
@@ -245,6 +246,30 @@ public final class CollectorHelperDaemon {
                                 );
                             }
                         }
+                    }
+                    return true;
+                }
+                if (code == CollectorHelperProtocol.TX_STOP_OWNER) {
+                    int expectedOwnerMode = data.readInt();
+                    int actualOwnerMode = workerMode
+                        ? CollectorHelperProtocol.OWNER_MODE_AUTONOMOUS_WORKER
+                        : CollectorHelperProtocol.OWNER_MODE_APP;
+                    boolean accepted = expectedOwnerMode == actualOwnerMode;
+                    if (reply != null) {
+                        reply.writeInt(
+                            accepted
+                                ? CollectorHelperProtocol.STATUS_OK
+                                : CollectorHelperProtocol.STATUS_INVALID_REQUEST
+                        );
+                        reply.writeInt(accepted ? 1 : 0);
+                        reply.writeString(accepted ? null : "owner mode mismatch");
+                    }
+                    if (accepted) {
+                        //allows the synchronous Binder reply to leave the shell process before its main looper exits
+                        mainHandler.postDelayed(() -> {
+                            if (workerPollLoop != null) workerPollLoop.stop();
+                            mainHandler.getLooper().quitSafely();
+                        }, 100L);
                     }
                     return true;
                 }

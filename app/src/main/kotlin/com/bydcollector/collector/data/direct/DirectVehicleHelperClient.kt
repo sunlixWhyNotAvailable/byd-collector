@@ -191,6 +191,43 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
         }
     }
 
+    fun requestStop(ownerMode: DirectHelperOwnerMode): DirectHelperStopResult {
+        return synchronized(lock) {
+            val binder = ensureBinder()
+                ?: return@synchronized stopFailure(STATUS_NO_BINDER, "helper binder unavailable")
+            val data = Parcel.obtain()
+            val reply = Parcel.obtain()
+            try {
+                data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
+                data.writeInt(ownerMode.protocolValue)
+                if (!binder.transact(CollectorHelperProtocol.TX_STOP_OWNER, data, reply, 0)) {
+                    cached = null
+                    return@synchronized stopFailure(STATUS_TRANSACT_FALSE, "stop transact returned false")
+                }
+                val status = reply.readInt()
+                val acceptedMarker = reply.readInt()
+                require(acceptedMarker == 0 || acceptedMarker == 1) {
+                    "invalid stop accepted marker: $acceptedMarker"
+                }
+                val accepted = acceptedMarker == 1
+                require((status == CollectorHelperProtocol.STATUS_OK) == accepted) {
+                    "inconsistent stop reply: status=$status accepted=$acceptedMarker"
+                }
+                val result = DirectHelperStopResult(status, accepted, reply.readString())
+                if (result.ok) cached = null
+                result
+            } catch (error: DeadObjectException) {
+                cached = null
+                stopFailure(STATUS_DEAD_OBJECT, error.message ?: "dead binder")
+            } catch (error: Exception) {
+                stopFailure(STATUS_CLIENT_ERROR, "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+            } finally {
+                data.recycle()
+                reply.recycle()
+            }
+        }
+    }
+
     private fun readWorkerSample(reply: Parcel): TelemetryWorkerSample {
         val identity = TelemetryWorkerSampleIdentity(
             requireNotNull(reply.readString()) { "worker sample boot id missing" },
@@ -302,6 +339,9 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
 
     private fun ackFailure(status: Int, error: String): TelemetryWorkerAckResult =
         TelemetryWorkerAckResult(status, updated = false, error)
+
+    private fun stopFailure(status: Int, error: String): DirectHelperStopResult =
+        DirectHelperStopResult(status, accepted = false, error)
 
     private fun modeName(mode: Int): String = when (mode) {
         CollectorHelperProtocol.MODE_NATIVE -> "native"

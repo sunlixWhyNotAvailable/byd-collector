@@ -116,3 +116,11 @@ data class TelemetryWorkerAckResult(
 ) {
     val ok: Boolean = status == 0 && updated
 }
+
+data class DirectHelperStopResult(
+    val status: Int,
+    val accepted: Boolean,
+    val error: String? = null
+) {
+    val ok: Boolean = status == 0 && accepted
+}

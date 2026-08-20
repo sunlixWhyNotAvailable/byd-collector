@@ -8,12 +8,13 @@ public final class CollectorHelperProtocol {
     public static final String WORKER_MODE_ARG = "worker";
     public static final String LOG_PATH = "/data/local/tmp/bydcollector_helper.log";
     public static final String LOCK_PATH = "/data/local/tmp/bydcollector_helper.lock";
-    public static final int PROTOCOL_VERSION = 6;
+    public static final int PROTOCOL_VERSION = 7;
     public static final int TX_PING = 1;
     public static final int TX_READ = 2;
     public static final int TX_READ_BATCH = 3;
     public static final int TX_WORKER_PENDING = 4;
     public static final int TX_WORKER_ACK = 5;
+    public static final int TX_STOP_OWNER = 6;
     public static final int AUTO_TX_INT = 5;
     public static final int AUTO_TX_FLOAT = 7;
     public static final int MAX_BATCH_SIZE = 23_096;
