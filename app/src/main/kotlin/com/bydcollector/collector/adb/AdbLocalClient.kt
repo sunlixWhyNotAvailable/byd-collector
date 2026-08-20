@@ -382,7 +382,11 @@ class AdbLocalClient(
         while (System.currentTimeMillis() < deadline) {
             cancellation.throwIfCancelled()
             socket.soTimeout = (deadline - System.currentTimeMillis()).coerceIn(100, timeoutMs.toLong()).toInt()
-            val packet = readPacket(input)
+            val packet = try {
+                readPacket(input)
+            } catch (_: SocketTimeoutException) {
+                break
+            }
             when (packet.command) {
                 COMMAND_OKAY -> {
                     if (packet.arg1 == localId) remoteId = packet.arg0

@@ -111,6 +111,23 @@ class AdbLocalClientTest {
         assertTrue(privateFile.readBytes().contentEquals(invalidKey))
     }
 
+    @Test
+    fun shellTimeoutPreservesPartialOutputAndElapsedTime() {
+        PartialShellAdbServer().use { server ->
+            val client = AdbLocalClient(
+                keyDir = Files.createTempDirectory("bydcollector-adb-test").toFile(),
+                endpoints = listOf(AdbEndpoint("127.0.0.1", server.port))
+            )
+
+            val result = client.execShell("ignored", timeoutMs = 250)
+
+            assertFalse(result.ok)
+            assertEquals("partial output", result.output)
+            assertEquals("shell command timed out", result.error)
+            assertTrue(result.elapsedMs >= 100, "timeout elapsed time must not be reset to zero")
+        }
+    }
+
     private class BrokenAdbServer : AutoCloseable {
         private val server = ServerSocket(0)
         private val accepted = CountDownLatch(1)
@@ -217,9 +234,40 @@ class AdbLocalClientTest {
         }
     }
 
+    private class PartialShellAdbServer : AutoCloseable {
+        private val server = ServerSocket(0)
+        private val release = CountDownLatch(1)
+        val port: Int = server.localPort
+
+        init {
+            thread(name = "partial-shell-adb-test-server", isDaemon = true) {
+                runCatching {
+                    server.accept().use { socket ->
+                        val input = socket.getInputStream()
+                        val output = socket.getOutputStream()
+                        readAdbPacket(input)
+                        writeAdbPacket(output, COMMAND_CNXN, ADB_VERSION, ADB_MAX_DATA, "device::\u0000".toByteArray())
+                        readAdbPacket(input)
+                        writeAdbPacket(output, COMMAND_OKAY, 2, 1, ByteArray(0))
+                        writeAdbPacket(output, COMMAND_WRTE, 2, 1, "partial output\n".toByteArray())
+                        readAdbPacket(input)
+                        release.await(3, TimeUnit.SECONDS)
+                    }
+                }
+            }
+        }
+
+        override fun close() {
+            release.countDown()
+            server.close()
+        }
+    }
+
     companion object {
         private const val COMMAND_CNXN = 0x4e584e43
         private const val COMMAND_AUTH = 0x48545541
+        private const val COMMAND_OKAY = 0x59414b4f
+        private const val COMMAND_WRTE = 0x45545257
         private const val AUTH_TOKEN = 1
         private const val ADB_VERSION = 0x01000001
         private const val ADB_MAX_DATA = 262_144
