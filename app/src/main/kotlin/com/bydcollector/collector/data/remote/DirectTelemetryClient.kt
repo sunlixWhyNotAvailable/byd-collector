@@ -21,22 +21,7 @@ class DirectTelemetryClient(
 
     override fun read(): TelemetryReadResult {
         val startedAt = clock.elapsedRealtimeMs()
-        if (!helper.isAlive()) {
-            val now = clock.elapsedRealtimeMs()
-            //backs off helper launch failures because adb/app_process startup can block for seconds
-            if (now < nextLaunchAttemptAtMs) {
-                return failure("helper_launch_backoff", "Direct helper launch is cooling down after a previous failure", startedAt)
-            }
-            val launch = DirectBridgeManager.ensureRunning(appContext, adbClient, helper)
-            if (!launch.ok) {
-                nextLaunchAttemptAtMs = clock.elapsedRealtimeMs() + LAUNCH_FAILURE_BACKOFF_MS
-                return launchFailure(launch, startedAt)
-            }
-            if (!waitForHelper()) {
-                nextLaunchAttemptAtMs = clock.elapsedRealtimeMs() + LAUNCH_FAILURE_BACKOFF_MS
-                return failure("helper_unavailable", "Direct helper did not answer Binder ping", startedAt)
-            }
-        }
+        ensureHelperReady(startedAt)?.let { return it }
 
         val snapshot = reader.readSnapshot()
         return if (snapshot.readings.isEmpty()) {
@@ -60,6 +45,30 @@ class DirectTelemetryClient(
                 diagnosticMessage = snapshot.batchDiagnostics.summary()
             )
         }
+    }
+
+    internal fun ensureHelperReady(): TelemetryReadResult.Failure? {
+        return ensureHelperReady(clock.elapsedRealtimeMs())
+    }
+
+    private fun ensureHelperReady(startedAt: Long): TelemetryReadResult.Failure? {
+        if (!helper.isAlive()) {
+            val now = clock.elapsedRealtimeMs()
+            //backs off helper launch failures because adb/app_process startup can block for seconds
+            if (now < nextLaunchAttemptAtMs) {
+                return failure("helper_launch_backoff", "Direct helper launch is cooling down after a previous failure", startedAt)
+            }
+            val launch = DirectBridgeManager.ensureRunning(appContext, adbClient, helper)
+            if (!launch.ok) {
+                nextLaunchAttemptAtMs = clock.elapsedRealtimeMs() + LAUNCH_FAILURE_BACKOFF_MS
+                return launchFailure(launch, startedAt)
+            }
+            if (!waitForHelper()) {
+                nextLaunchAttemptAtMs = clock.elapsedRealtimeMs() + LAUNCH_FAILURE_BACKOFF_MS
+                return failure("helper_unavailable", "Direct helper did not answer Binder ping", startedAt)
+            }
+        }
+        return null
     }
 
     private fun waitForHelper(): Boolean {

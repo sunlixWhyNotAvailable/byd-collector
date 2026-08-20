@@ -31,10 +31,11 @@ import com.bydcollector.collector.data.normalized.VehicleStateNormalizer
 import com.bydcollector.collector.data.polling.PollPersistenceCoordinator
 import com.bydcollector.collector.data.polling.SuccessfulPollObserver
 import com.bydcollector.collector.data.polling.TelemetryPoller
+import com.bydcollector.collector.data.polling.TelemetryWorkerReplayCoordinator
+import com.bydcollector.collector.data.polling.TelemetryWorkerReplayPollCycleRunner
 import com.bydcollector.collector.data.local.PollReading
 import com.bydcollector.collector.data.remote.DirectTelemetryClient
 import com.bydcollector.collector.data.remote.DirectBridgeManager
-import com.bydcollector.collector.data.remote.TelemetryClient
 import com.bydcollector.collector.keepalive.KeepAliveConfig
 import com.bydcollector.collector.keepalive.KeepAliveSupervisor
 import com.bydcollector.collector.influx.HttpInfluxClient
@@ -383,57 +384,80 @@ class CollectorService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun telemetryClient(): TelemetryClient {
-        return DirectTelemetryClient(applicationContext)
-    }
-
     private fun createTelemetryPoller(): TelemetryPoller {
-        return TelemetryPoller(
-            PollPersistenceCoordinator(
-                store = store,
-                client = telemetryClient(),
-                //normalizes only after raw poll persistence so raw telemetry remains the source of truth
-                successfulPollObserver = object : SuccessfulPollObserver {
-                    override fun onSuccessfulPoll(
-                        sessionId: Long,
-                        pollId: Long,
-                        timestamp: String,
-                        readings: List<PollReading>
-                    ) {
-                        val observations = vehicleStateNormalizer.normalize(
-                            pollId = pollId,
-                            observedAt = timestamp,
-                            readings = readings
-                        )
-                        val summary = store.applyNormalizedObservations(observations)
-                        dashboardUiStateStore.incrementMainRowCounts(
-                            normalizedCurrentRows = summary.currentInsertedCount.toLong(),
-                            normalizedHistoryRows = summary.historyInsertedCount.toLong()
-                        )
-                        queueDashboardVehicleKpis(
-                            LocalizedVehicleKpis(
-                                uk = VehicleKpiMapper.fromObservations(observations, VehicleKpiLanguage.UK),
-                                en = VehicleKpiMapper.fromObservations(observations, VehicleKpiLanguage.EN)
-                            )
-                        )
-                        scheduleDatabaseFootprintRefresh(force = false)
-                        if (settings.isTelegramEnabled()) {
-                            executeTelegram(
-                                "telegram_event_error",
-                                onSuccess = ::postTelegramTickSchedule
-                            ) {
-                                telegramCoordinator.onSuccessfulPoll(observations)
-                            }
-                        }
-                        if (summary.changedCategories.isNotEmpty()) {
-                            normalizedStateChangedCallback?.invoke(summary.changedCategories)
-                        }
-                        exportInfluxAfterNormalizedWrite(summary)
-                    }
+        val helper = DirectVehicleHelperClient()
+        val adbClient = AdbLocalClient(File(applicationContext.filesDir, "adb_keys"))
+        val observer = createSuccessfulPollObserver()
+        val liveClient = DirectTelemetryClient(
+            context = applicationContext,
+            adbClient = adbClient,
+            helper = helper
+        )
+        val live = PollPersistenceCoordinator(
+            store = store,
+            client = liveClient,
+            successfulPollObserver = observer
+        )
+        val replay = TelemetryWorkerReplayCoordinator(
+            store = store,
+            ensureHelper = {
+                liveClient.ensureHelperReady()?.let { failure ->
+                    "${failure.category}: ${failure.message}"
                 }
+            },
+            pendingSamples = helper::pendingWorkerSamples,
+            acknowledgeSample = helper::acknowledgeWorkerSample,
+            successfulPollObserver = observer
+        )
+        return TelemetryPoller(
+            TelemetryWorkerReplayPollCycleRunner(
+                replay = replay,
+                live = live
             ),
             onCycleResult = { result -> handlePollCycleResult(result) }
         )
+    }
+
+    private fun createSuccessfulPollObserver(): SuccessfulPollObserver {
+        //normalizes only after raw poll persistence so raw telemetry remains the source of truth
+        return object : SuccessfulPollObserver {
+            override fun onSuccessfulPoll(
+                sessionId: Long,
+                pollId: Long,
+                timestamp: String,
+                readings: List<PollReading>
+            ) {
+                val observations = vehicleStateNormalizer.normalize(
+                    pollId = pollId,
+                    observedAt = timestamp,
+                    readings = readings
+                )
+                val summary = store.applyNormalizedObservations(observations)
+                dashboardUiStateStore.incrementMainRowCounts(
+                    normalizedCurrentRows = summary.currentInsertedCount.toLong(),
+                    normalizedHistoryRows = summary.historyInsertedCount.toLong()
+                )
+                queueDashboardVehicleKpis(
+                    LocalizedVehicleKpis(
+                        uk = VehicleKpiMapper.fromObservations(observations, VehicleKpiLanguage.UK),
+                        en = VehicleKpiMapper.fromObservations(observations, VehicleKpiLanguage.EN)
+                    )
+                )
+                scheduleDatabaseFootprintRefresh(force = false)
+                if (settings.isTelegramEnabled()) {
+                    executeTelegram(
+                        "telegram_event_error",
+                        onSuccess = ::postTelegramTickSchedule
+                    ) {
+                        telegramCoordinator.onSuccessfulPoll(observations)
+                    }
+                }
+                if (summary.changedCategories.isNotEmpty()) {
+                    normalizedStateChangedCallback?.invoke(summary.changedCategories)
+                }
+                exportInfluxAfterNormalizedWrite(summary)
+            }
+        }
     }
 
     private fun reconcileCollection(debugStartReason: String = DEBUG_REASON_AUTOSTART) {

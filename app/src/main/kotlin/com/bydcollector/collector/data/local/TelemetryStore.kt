@@ -14,6 +14,7 @@ import com.bydcollector.collector.data.normalized.PollingErrorSummaries
 import com.bydcollector.collector.data.normalized.StoredNormalizedState
 import com.bydcollector.collector.data.normalized.normalizedIsoTime
 import com.bydcollector.collector.data.polling.PollStorage
+import com.bydcollector.collector.data.polling.WorkerPollStorage
 import com.bydcollector.collector.mqtt.HaMqttMessage
 import com.bydcollector.collector.influx.InfluxExportStateSnapshot
 import com.bydcollector.collector.influx.InfluxExportStore
@@ -40,6 +41,7 @@ class TelemetryStore(
     private val clock: Clock = SystemClockAdapter(),
     private val eventRetention: Int = 200
 ) : PollStorage,
+    WorkerPollStorage,
     NormalizedStateProvider,
     MqttPublishStateRecorder,
     MqttOutboxStore,
@@ -230,7 +232,7 @@ class TelemetryStore(
         return committed.pollId
     }
 
-    fun insertWorkerPoll(
+    override fun insertWorkerPoll(
         sessionId: Long,
         identity: TelemetryWorkerSampleIdentity,
         input: PersistedPollInput,
