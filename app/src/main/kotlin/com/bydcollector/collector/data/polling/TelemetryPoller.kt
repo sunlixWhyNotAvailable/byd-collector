@@ -47,7 +47,7 @@ class TelemetryPoller(
         while (running.get()) {
             val startedAt = clock.elapsedRealtimeMs()
             try {
-                onCycleResult(coordinator.pollOnce(sessionId))
+                coordinator.pollOnce(sessionId)?.let(onCycleResult)
             } catch (_: InterruptedException) {
                 running.set(false)
             } catch (_: RuntimeException) {

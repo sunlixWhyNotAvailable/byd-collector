@@ -107,10 +107,42 @@ class TelemetryWorkerReplayCoordinatorTest {
             }
         )
 
-        assertEquals(41L, runner.pollOnce(7L).pollId)
+        assertEquals(41L, runner.pollOnce(7L)?.pollId)
         assertEquals(0, livePolls)
-        assertEquals(88L, runner.pollOnce(7L).pollId)
+        assertEquals(88L, runner.pollOnce(7L)?.pollId)
         assertEquals(1, livePolls)
+    }
+
+    @Test
+    fun workerOnlyRunnerKeepsCheckingTheSpoolWithoutLivePolling() {
+        val actions = mutableListOf<String>()
+        val storage = FakeWorkerPollStorage(actions)
+        var pendingCalls = 0
+        val replay = TelemetryWorkerReplayCoordinator(
+            store = storage,
+            ensureHelper = { null },
+            pendingSamples = {
+                pendingCalls += 1
+                PendingTelemetryWorkerSamples(
+                    status = CollectorHelperProtocol.STATUS_OK,
+                    samples = if (pendingCalls == 1) emptyList() else listOf(sample())
+                )
+            },
+            acknowledgeSample = { _, _ ->
+                TelemetryWorkerAckResult(
+                    status = CollectorHelperProtocol.STATUS_OK,
+                    updated = true
+                )
+            },
+            successfulPollObserver = null,
+            entries = listOf(TEST_ENTRY),
+            acknowledgedAtMs = { 999L }
+        )
+        val runner = TelemetryWorkerReplayPollCycleRunner(replay)
+
+        assertEquals(null, runner.pollOnce(7L))
+        assertEquals(41L, runner.pollOnce(7L)?.pollId)
+        assertEquals(2, pendingCalls)
     }
 
     private fun coordinator(

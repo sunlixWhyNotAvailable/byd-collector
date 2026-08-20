@@ -13,6 +13,7 @@ class CollectorSettingsAutoStartContractTest {
         assertTrue(settings.contains("prefs.edit().putBoolean(KEY_AUTO_START, enabled).apply()"))
         assertTrue(settings.contains("prefs.getBoolean(KEY_USER_SHUTDOWN, false)"))
         assertTrue(settings.contains("prefs.getBoolean(KEY_POLLING_ENABLED, false)"))
+        assertTrue(settings.contains("prefs.getBoolean(KEY_AUTONOMOUS_MAIN_WORKER, false)"))
         assertTrue(settings.contains("prefs.getBoolean(KEY_DEBUG_POLLING_ENABLED, false)"))
         assertTrue(settings.contains("prefs.getBoolean(KEY_DEBUG_AUTO_START, false)"))
         assertTrue(settings.contains("prefs.getBoolean(KEY_MQTT_ENABLED, false)"))

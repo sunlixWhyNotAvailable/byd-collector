@@ -60,6 +60,24 @@ class TelemetryPollerTest {
     }
 
     @Test
+    fun emptyWorkerCycleDoesNotPublishFakeStatus() {
+        val results = mutableListOf<PollCycleResult>()
+        val poller = TelemetryPoller(
+            coordinator = object : PollCycleRunner {
+                override fun pollOnce(sessionId: Long): PollCycleResult? = null
+            },
+            onCycleResult = { results += it },
+            sleeper = { pollerStopSignal() }
+        )
+
+        poller.start(sessionId = 1L)
+        Thread.sleep(20)
+        poller.stop()
+
+        assertTrue(results.isEmpty())
+    }
+
+    @Test
     fun stopAndJoinWaitsForWorkerToStop() {
         val poller = TelemetryPoller(
             coordinator = object : PollCycleRunner {

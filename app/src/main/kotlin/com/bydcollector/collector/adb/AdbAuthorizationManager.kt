@@ -2,6 +2,7 @@ package com.bydcollector.collector.adb
 
 import android.content.Context
 import android.os.SystemClock
+import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.remote.DirectBridgeManager
@@ -38,11 +39,12 @@ object AdbAuthorizationManager {
         store: TelemetryStore,
         source: String,
         mode: AccessCheckMode,
+        helperOwnerMode: DirectHelperOwnerMode = DirectHelperOwnerMode.APP,
         onComplete: ((AccessRuntimeSnapshot) -> Unit)? = null
     ): Boolean {
         val appContext = context.applicationContext
         val submitted = coordinator.submit(mode) { lease ->
-            runCheck(appContext, store, source, mode, lease, onComplete)
+            runCheck(appContext, store, source, mode, helperOwnerMode, lease, onComplete)
         }
         if (!submitted) {
             store.recordEvent(
@@ -59,6 +61,7 @@ object AdbAuthorizationManager {
         store: TelemetryStore,
         source: String,
         mode: AccessCheckMode,
+        helperOwnerMode: DirectHelperOwnerMode,
         lease: AdbPipelineLease,
         onComplete: ((AccessRuntimeSnapshot) -> Unit)?
     ) {
@@ -71,7 +74,7 @@ object AdbAuthorizationManager {
         try {
             val cancellation = lease.cancellation
             var permissionsGranted = !RequiredAccessChecker.hasMissingRequiredAccess(appContext)
-            var helperReady = helperReadyAfterRebind(cancellation)
+            var helperReady = helperReadyAfterRebind(cancellation, helperOwnerMode)
             var adbAuthorized = runtimeSnapshot.adbAuthorized
             val repairNeeded = !permissionsGranted || !helperReady
             val repairAllowed = repairNeeded && (
@@ -96,10 +99,11 @@ object AdbAuthorizationManager {
                         client = client,
                         source = source,
                         helperReady = helperReady,
+                        helperOwnerMode = helperOwnerMode,
                         cancellation = cancellation
                     )
                     permissionsGranted = !RequiredAccessChecker.hasMissingRequiredAccess(appContext)
-                    helperReady = DirectVehicleHelperClient().isAlive()
+                    helperReady = DirectVehicleHelperClient().ownerMode() == helperOwnerMode
                 } else if (repairNeeded && !repairAllowed) {
                     store.recordEvent(
                         "adb_repair_rate_limited",
@@ -196,6 +200,7 @@ object AdbAuthorizationManager {
         client: AdbLocalClient,
         source: String,
         helperReady: Boolean,
+        helperOwnerMode: DirectHelperOwnerMode,
         cancellation: AdbCancellation
     ) {
         RequiredAccessChecker.missingShellGrantCommands(appContext).forEachIndexed { index, command ->
@@ -217,6 +222,7 @@ object AdbAuthorizationManager {
             val bridge = DirectBridgeManager.ensureRunning(
                 context = appContext,
                 adbClient = client,
+                ownerMode = helperOwnerMode,
                 cancellation = cancellation
             )
             store.recordEvent(
@@ -227,8 +233,11 @@ object AdbAuthorizationManager {
         }
     }
 
-    private fun helperReadyAfterRebind(cancellation: AdbCancellation): Boolean {
-        if (DirectVehicleHelperClient().isAlive()) return true
+    private fun helperReadyAfterRebind(
+        cancellation: AdbCancellation,
+        helperOwnerMode: DirectHelperOwnerMode
+    ): Boolean {
+        if (DirectVehicleHelperClient().ownerMode() == helperOwnerMode) return true
         try {
             Thread.sleep(HELPER_REBIND_WAIT_MS)
         } catch (_: InterruptedException) {
@@ -236,7 +245,7 @@ object AdbAuthorizationManager {
             throw AdbOperationCancelledException()
         }
         cancellation.throwIfCancelled()
-        return DirectVehicleHelperClient().isAlive()
+        return DirectVehicleHelperClient().ownerMode() == helperOwnerMode
     }
 
     private fun adbClient(

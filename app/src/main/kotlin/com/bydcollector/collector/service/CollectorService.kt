@@ -22,6 +22,7 @@ import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.debug.DirectDebugParameterAsset
 import com.bydcollector.collector.data.debug.DirectDebugRoundRobinPoller
 import com.bydcollector.collector.data.debug.DirectDebugStore
+import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.local.HealthSnapshotDetail
@@ -98,6 +99,7 @@ class CollectorService : Service() {
     private lateinit var maintenanceCoordinator: DbMaintenanceCoordinator
     private lateinit var dashboardUiStateStore: DashboardUiStateStore
     private lateinit var dashboardStateProvider: DashboardStateProvider
+    private var mainPollerOwnerMode = DirectHelperOwnerMode.APP
     private var debugStorageReady = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var sessionId: Long? = null
@@ -126,6 +128,7 @@ class CollectorService : Service() {
     private val influxWorkGeneration = AtomicLong(0L)
     private val telegramWorkGeneration = AtomicLong(0L)
     private val debugStartInProgress = AtomicBoolean(false)
+    private val debugOwnerHandoffPending = AtomicBoolean(false)
     private val mqttRuntimeActive = AtomicBoolean(false)
     private val mqttOfflineQueued = AtomicBoolean(false)
     private val maintenanceActive = AtomicBoolean(false)
@@ -384,7 +387,9 @@ class CollectorService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun createTelemetryPoller(): TelemetryPoller {
+    private fun createTelemetryPoller(
+        ownerMode: DirectHelperOwnerMode = settings.mainHelperOwnerMode()
+    ): TelemetryPoller {
         val helper = DirectVehicleHelperClient()
         val adbClient = AdbLocalClient(File(applicationContext.filesDir, "adb_keys"))
         val observer = createSuccessfulPollObserver()
@@ -393,15 +398,19 @@ class CollectorService : Service() {
             adbClient = adbClient,
             helper = helper
         )
-        val live = PollPersistenceCoordinator(
-            store = store,
-            client = liveClient,
-            successfulPollObserver = observer
-        )
+        val live = if (ownerMode == DirectHelperOwnerMode.APP) {
+            PollPersistenceCoordinator(
+                store = store,
+                client = liveClient,
+                successfulPollObserver = observer
+            )
+        } else {
+            null
+        }
         val replay = TelemetryWorkerReplayCoordinator(
             store = store,
             ensureHelper = {
-                liveClient.ensureHelperReady()?.let { failure ->
+                liveClient.ensureHelperReady(ownerMode)?.let { failure ->
                     "${failure.category}: ${failure.message}"
                 }
             },
@@ -409,13 +418,15 @@ class CollectorService : Service() {
             acknowledgeSample = helper::acknowledgeWorkerSample,
             successfulPollObserver = observer
         )
-        return TelemetryPoller(
+        val nextPoller = TelemetryPoller(
             TelemetryWorkerReplayPollCycleRunner(
                 replay = replay,
                 live = live
             ),
             onCycleResult = { result -> handlePollCycleResult(result) }
         )
+        mainPollerOwnerMode = ownerMode
+        return nextPoller
     }
 
     private fun createSuccessfulPollObserver(): SuccessfulPollObserver {
@@ -553,6 +564,8 @@ class CollectorService : Service() {
             publishDashboardRuntimeFlags()
             return
         }
+        val ownerMode = settings.mainHelperOwnerMode()
+        if (mainPollerOwnerMode != ownerMode) poller = createTelemetryPoller(ownerMode)
         mqttRuntimeActive.set(false)
         mqttOfflineQueued.set(false)
         val openedSessionId = store.openSession()
@@ -595,7 +608,8 @@ class CollectorService : Service() {
                 val launch = DirectBridgeManager.ensureRunning(
                     context = applicationContext,
                     adbClient = AdbLocalClient(File(applicationContext.filesDir, "adb_keys")),
-                    helper = helper
+                    helper = helper,
+                    ownerMode = settings.mainHelperOwnerMode()
                 )
                 if (!launch.ok) {
                     store.recordEvent("debug_polling_start_error", "Debug direct helper unavailable", launch.message)
@@ -690,6 +704,17 @@ class CollectorService : Service() {
                 updateNotification("Polling error: debug startup failed")
             } finally {
                 debugStartInProgress.set(false)
+                if (debugOwnerHandoffPending.getAndSet(false)) {
+                    mainHandler.post {
+                        if (!running.get()) return@post
+                        val debugAllowed = settings.isDebugPollingEnabled() && !settings.isDebugManuallyStopped()
+                        val ownerMismatch = DirectVehicleHelperClient().ownerMode() != settings.mainHelperOwnerMode()
+                        if (debugAllowed && (!isDebugPollerRunning() || ownerMismatch)) {
+                            stopDebug("helper_owner_handoff")
+                            startDebugIfNeeded(DEBUG_REASON_AUTOSTART)
+                        }
+                    }
+                }
             }
         }
     }
@@ -831,6 +856,7 @@ class CollectorService : Service() {
     private fun stopMain(reason: String) {
         val wasPolling = poller.isRunning()
         if (wasPolling) poller.stop()
+        stopAutonomousMainWorker(reason)
         mainPollingRunning.set(false)
         sessionId?.let { openedSessionId ->
             runCatching { store.endSession(openedSessionId, reason) }
@@ -849,6 +875,26 @@ class CollectorService : Service() {
         }
         clearDashboardVehicleKpis()
         publishDashboardRuntimeFlags()
+    }
+
+    private fun stopAutonomousMainWorker(reason: String) {
+        if (reason == "service_destroyed") return
+        val helper = DirectVehicleHelperClient()
+        if (
+            debugStartInProgress.get() &&
+            settings.isDebugPollingEnabled() &&
+            !settings.isDebugManuallyStopped()
+        ) {
+            debugOwnerHandoffPending.set(true)
+        }
+        if (helper.ownerMode() != DirectHelperOwnerMode.AUTONOMOUS_WORKER) return
+        if (isDebugPollerRunning()) stopDebug("helper_owner_handoff")
+        val result = helper.requestStop(DirectHelperOwnerMode.AUTONOMOUS_WORKER)
+        store.recordEvent(
+            if (result.ok) "telemetry_worker_stop_requested" else "telemetry_worker_stop_failed",
+            if (result.ok) "Autonomous Main worker stop requested" else "Autonomous Main worker stop failed",
+            "reason=$reason ${result.error.orEmpty()}".trim()
+        )
     }
 
     private fun exportInfluxAfterNormalizedWrite(summary: NormalizedWriteSummary) {
@@ -1113,7 +1159,8 @@ class CollectorService : Service() {
             context = applicationContext,
             store = store,
             source = source,
-            mode = AccessCheckMode.NORMAL
+            mode = AccessCheckMode.NORMAL,
+            helperOwnerMode = settings.mainHelperOwnerMode()
         )
     }
 

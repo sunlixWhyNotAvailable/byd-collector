@@ -50,7 +50,8 @@ object CollectorAutoStart {
                 context = appContext,
                 store = store,
                 source = "broadcast_${action.substringAfterLast('.')}",
-                mode = AccessCheckMode.NORMAL
+                mode = AccessCheckMode.NORMAL,
+                helperOwnerMode = settings.mainHelperOwnerMode()
             )
         }
         if (CollectorService.isRunning()) {

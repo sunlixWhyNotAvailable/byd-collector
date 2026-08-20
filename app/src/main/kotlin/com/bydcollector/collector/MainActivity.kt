@@ -170,9 +170,9 @@ class MainActivity : ComponentActivity() {
 
         override fun onStartMain() {
             refreshStoreBackedState()
-            requestAccessCheck("start_main", AccessCheckMode.NORMAL)
             settings.setMainManuallyStopped(false)
             settings.setPollingEnabled(true)
+            requestAccessCheck("start_main", AccessCheckMode.NORMAL)
             CollectorServiceController.start(this@MainActivity)
             refresh()
         }
@@ -1198,6 +1198,7 @@ class MainActivity : ComponentActivity() {
             store = currentStore(),
             source = source,
             mode = mode,
+            helperOwnerMode = settings.mainHelperOwnerMode(),
             onComplete = {
                 handler.post {
                     if (!destroyed) {

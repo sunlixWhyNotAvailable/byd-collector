@@ -232,16 +232,16 @@ class TelemetryWorkerReplayCoordinator(
 
 class TelemetryWorkerReplayPollCycleRunner(
     private val replay: TelemetryWorkerReplayCoordinator,
-    private val live: PollCycleRunner
+    private val live: PollCycleRunner? = null
 ) : PollCycleRunner {
     private var replayPending = true
 
-    override fun pollOnce(sessionId: Long): PollCycleResult {
-        if (replayPending) {
+    override fun pollOnce(sessionId: Long): PollCycleResult? {
+        if (replayPending || live == null) {
             val result = replay.replayNextBatch(sessionId)
             replayPending = result.needsReplay
             result.cycleResult?.let { return it }
         }
-        return live.pollOnce(sessionId)
+        return live?.pollOnce(sessionId)
     }
 }

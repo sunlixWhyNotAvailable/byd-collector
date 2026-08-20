@@ -22,7 +22,7 @@ data class PollCycleResult(
 )
 
 interface PollCycleRunner {
-    fun pollOnce(sessionId: Long): PollCycleResult
+    fun pollOnce(sessionId: Long): PollCycleResult?
 }
 
 interface PollStorage {

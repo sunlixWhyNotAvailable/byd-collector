@@ -7,6 +7,7 @@ import com.bydcollector.collector.telegram.TelegramEventType
 import com.bydcollector.collector.ha.HaIntegrationCategories
 import com.bydcollector.collector.influx.InfluxConfig
 import com.bydcollector.collector.keepalive.KeepAliveConfig
+import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
 import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
 import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
@@ -111,6 +112,32 @@ class CollectorSettings(
             category = if (enabled) "polling_enabled" else "polling_disabled",
             message = "Polling ${if (enabled) "enabled" else "disabled"}"
         )
+    }
+
+    fun isAutonomousMainWorkerEnabled(): Boolean =
+        prefs.getBoolean(KEY_AUTONOMOUS_MAIN_WORKER, false)
+
+    fun setAutonomousMainWorkerEnabled(enabled: Boolean): Boolean {
+        val persisted = prefs.edit().putBoolean(KEY_AUTONOMOUS_MAIN_WORKER, enabled).commit()
+        if (persisted) {
+            recordEvent(
+                category = if (enabled) "autonomous_main_worker_enabled" else "autonomous_main_worker_disabled",
+                message = "Autonomous Main worker ${if (enabled) "enabled" else "disabled"}"
+            )
+        }
+        return persisted
+    }
+
+    fun mainHelperOwnerMode(): DirectHelperOwnerMode {
+        return if (
+            isAutonomousMainWorkerEnabled() &&
+            isPollingEnabled() &&
+            !isMainManuallyStopped()
+        ) {
+            DirectHelperOwnerMode.AUTONOMOUS_WORKER
+        } else {
+            DirectHelperOwnerMode.APP
+        }
     }
 
     fun isDebugPollingEnabled(): Boolean = prefs.getBoolean(KEY_DEBUG_POLLING_ENABLED, false)
@@ -888,6 +915,7 @@ class CollectorSettings(
         const val KEY_MQTT_MANUAL_STOP = "mqttManualStop"
         const val KEY_INFLUX_MANUAL_STOP = "influxManualStop"
         const val KEY_POLLING_ENABLED = "pollingEnabled"
+        const val KEY_AUTONOMOUS_MAIN_WORKER = "autonomousMainWorker"
         const val KEY_DEBUG_POLLING_ENABLED = "debugPollingEnabled"
         const val KEY_DEBUG_AUTO_START = "debugAutoStart"
         const val KEY_KEEP_WIFI = "keepWifi"
