@@ -1,5 +1,6 @@
 package com.bydcollector.collector.keepalive
 
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.nio.file.Files
 import kotlin.test.Test
@@ -169,6 +170,21 @@ class KeepAliveShellPlannerTest {
         val source = sourceFile("com/bydcollector/collector/keepalive/KeepAliveDaemon.java").readText()
         assertTrue(source.contains("LOG_MAX_BYTES = 1_048_576L"))
         assertTrue(source.contains("truncateLogIfNeeded(LOG_FILE, LOG_MAX_BYTES);"))
+    }
+
+    @Test
+    fun daemonDrainsCommandOutputBeforeWaitingAndCapsRetainedBytes() {
+        val input = ByteArrayInputStream(ByteArray(128) { 'a'.code.toByte() })
+
+        assertEquals("a".repeat(64), KeepAliveDaemon.drainOutput(input, 64))
+        assertEquals(0, input.available())
+
+        val source = sourceFile("com/bydcollector/collector/keepalive/KeepAliveDaemon.java").readText()
+        val drainStartIndex = source.indexOf("outputDrainer.start();")
+        val processWaitIndex = source.indexOf("process.waitFor(timeoutMs")
+        assertTrue(drainStartIndex in 0..<processWaitIndex)
+        assertTrue(source.contains("COMMAND_OUTPUT_MAX_BYTES = 65_536"))
+        assertTrue(source.contains("if (outputDrainTimedOut)"))
     }
 
     private fun sourceFile(path: String): File {

@@ -7,13 +7,17 @@ import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 //keeps selected dilink radios/service recovery alive from shell while the app process may be backgrounded
 public final class KeepAliveDaemon {
     private static final String PACKAGE_NAME = "com.bydcollector.collector";
     private static final File LOG_FILE = new File(KeepAliveProtocol.LOG_PATH);
     private static final long LOG_MAX_BYTES = 1_048_576L;
+    private static final int COMMAND_OUTPUT_MAX_BYTES = 65_536;
+    private static final long OUTPUT_DRAIN_TIMEOUT_MS = 1_000L;
     private static final String USER_SHUTDOWN_COMMAND = "settings get global bydcollector_user_shutdown";
     private static final String RECOVER_COLLECTOR_COMMAND =
             "am broadcast --include-stopped-packages -a com.bydcollector.collector.action.KEEP_ALIVE_RECOVERY " +
@@ -146,17 +150,39 @@ public final class KeepAliveDaemon {
         }
         long startedAt = System.currentTimeMillis();
         Process process = null;
+        InputStream processOutput = null;
+        FutureTask<String> outputTask = null;
         try {
             process = new ProcessBuilder("sh", "-c", command)
                     .redirectErrorStream(true)
                     .start();
+            processOutput = process.getInputStream();
+            final InputStream drainInput = processOutput;
+            outputTask = new FutureTask<>(() -> drainOutput(drainInput, COMMAND_OUTPUT_MAX_BYTES));
+            Thread outputDrainer = new Thread(outputTask, "byd-keepalive-command-output");
+            outputDrainer.setDaemon(true);
+            outputDrainer.start();
             boolean finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS);
             if (!finished) {
                 process.destroyForcibly();
                 process.waitFor(1, TimeUnit.SECONDS);
-                return new ShellResult(false, "", "timeout", System.currentTimeMillis() - startedAt);
             }
-            String output = readFully(process.getInputStream()).trim();
+            String output;
+            boolean outputDrainTimedOut = false;
+            try {
+                output = outputTask.get(OUTPUT_DRAIN_TIMEOUT_MS, TimeUnit.MILLISECONDS).trim();
+            } catch (TimeoutException error) {
+                outputDrainTimedOut = true;
+                processOutput.close();
+                outputTask.cancel(true);
+                output = "";
+            }
+            if (!finished) {
+                return new ShellResult(false, output, "timeout", System.currentTimeMillis() - startedAt);
+            }
+            if (outputDrainTimedOut) {
+                return new ShellResult(false, output, "output_drain_timeout", System.currentTimeMillis() - startedAt);
+            }
             int exitCode = process.exitValue();
             return new ShellResult(exitCode == 0, output, exitCode == 0 ? "" : "exit_code=" + exitCode, System.currentTimeMillis() - startedAt);
         } catch (Exception error) {
@@ -167,8 +193,20 @@ public final class KeepAliveDaemon {
                     System.currentTimeMillis() - startedAt
             );
         } finally {
+            if (processOutput != null) {
+                try {
+                    processOutput.close();
+                } catch (Exception ignored) {
+                }
+            }
+            if (outputTask != null && !outputTask.isDone()) {
+                outputTask.cancel(true);
+            }
             if (process != null) {
                 process.destroy();
+                if (process.isAlive()) {
+                    process.destroyForcibly();
+                }
             }
         }
     }
@@ -182,12 +220,15 @@ public final class KeepAliveDaemon {
         return false;
     }
 
-    private static String readFully(InputStream input) throws Exception {
+    static String drainOutput(InputStream input, int maxBytes) throws Exception {
         ByteArrayOutputStream output = new ByteArrayOutputStream();
         byte[] buffer = new byte[4096];
         int count;
         while ((count = input.read(buffer)) >= 0) {
-            output.write(buffer, 0, count);
+            int remaining = maxBytes - output.size();
+            if (remaining > 0) {
+                output.write(buffer, 0, Math.min(count, remaining));
+            }
         }
         return output.toString(StandardCharsets.UTF_8.name());
     }
