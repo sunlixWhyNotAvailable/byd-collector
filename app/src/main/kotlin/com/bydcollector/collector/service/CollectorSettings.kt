@@ -171,16 +171,6 @@ class CollectorSettings(
         )
     }
 
-    fun isHaDiscoveryEnabled(): Boolean = prefs.getBoolean(KEY_HA_DISCOVERY_ENABLED, false)
-
-    fun setHaDiscoveryEnabled(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_HA_DISCOVERY_ENABLED, enabled).apply()
-        recordEvent(
-            category = if (enabled) "ha_discovery_enabled" else "ha_discovery_disabled",
-            message = "Home Assistant discovery ${if (enabled) "enabled" else "disabled"}"
-        )
-    }
-
     fun mqttHost(): String = prefs.getString(KEY_MQTT_HOST, "") ?: ""
 
     fun setMqttHost(host: String) {
@@ -906,7 +896,6 @@ class CollectorSettings(
         const val KEY_RECOVER_COLLECTOR_SERVICE = "recoverCollectorService"
         const val KEY_MQTT_ENABLED = "mqttEnabled"
         const val KEY_MQTT_AUTO_START = "mqttAutoStart"
-        const val KEY_HA_DISCOVERY_ENABLED = "haDiscoveryEnabled"
         const val KEY_MQTT_HOST = "mqttHost"
         const val KEY_MQTT_PORT = "mqttPort"
         const val KEY_MQTT_USERNAME = "mqttUsername"
