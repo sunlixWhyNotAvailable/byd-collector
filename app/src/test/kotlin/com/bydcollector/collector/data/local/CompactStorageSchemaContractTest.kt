@@ -60,6 +60,25 @@ class CompactStorageSchemaContractTest {
     }
 
     @Test
+    fun bothMainSchemasDeduplicateImportedWorkerSamples() {
+        val legacy = projectFile("app/src/main/assets/schema.sql", "src/main/assets/schema.sql").readText()
+        val compact = projectFile("app/src/main/assets/schema_v2.sql", "src/main/assets/schema_v2.sql").readText()
+        val helper = projectFile(
+            "app/src/main/kotlin/com/bydcollector/collector/data/local/TelemetryDatabaseHelper.kt",
+            "src/main/kotlin/com/bydcollector/collector/data/local/TelemetryDatabaseHelper.kt"
+        ).readText()
+
+        listOf(legacy, compact).forEach { schema ->
+            val imports = schema.substringAfter("CREATE TABLE IF NOT EXISTS telemetry_worker_imports (")
+                .substringBefore(") WITHOUT ROWID;")
+            assertTrue(imports.contains("PRIMARY KEY (boot_id, helper_generation, poll_sequence)"))
+            assertTrue(imports.contains("poll_id INTEGER NOT NULL UNIQUE"))
+            assertTrue(imports.contains("REFERENCES polls(id) ON DELETE CASCADE"))
+        }
+        assertTrue(helper.contains("const val DATABASE_VERSION = 9"))
+    }
+
+    @Test
     fun storeUsesCompactRawDictionaryAndReconstructsInfluxRows() {
         val store = projectFile(
             "app/src/main/kotlin/com/bydcollector/collector/data/local/TelemetryStore.kt",

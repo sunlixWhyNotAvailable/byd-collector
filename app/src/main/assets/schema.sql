@@ -63,6 +63,16 @@ CREATE TABLE IF NOT EXISTS poll_values (
     FOREIGN KEY (poll_id) REFERENCES polls(id)
 );
 
+CREATE TABLE IF NOT EXISTS telemetry_worker_imports (
+    boot_id TEXT NOT NULL,
+    helper_generation TEXT NOT NULL,
+    poll_sequence INTEGER NOT NULL CHECK (poll_sequence >= 0),
+    poll_id INTEGER NOT NULL UNIQUE,
+    imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (boot_id, helper_generation, poll_sequence),
+    FOREIGN KEY (poll_id) REFERENCES polls(id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS vehicle_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id INTEGER NOT NULL,

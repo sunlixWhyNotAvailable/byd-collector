@@ -40,6 +40,11 @@ data class PersistedPollInput(
     val readings: List<PollReading>
 )
 
+data class WorkerPollImportResult(
+    val pollId: Long,
+    val inserted: Boolean
+)
+
 data class CollectorEvent(
     val id: Long,
     val timestamp: String,

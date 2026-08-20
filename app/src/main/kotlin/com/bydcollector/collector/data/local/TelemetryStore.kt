@@ -5,6 +5,7 @@ import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.util.Log
+import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.data.normalized.NormalizedQuality
 import com.bydcollector.collector.data.normalized.NormalizedStateStore
@@ -215,58 +216,57 @@ class TelemetryStore(
     ): Long {
         val db = helper.writableDatabase
         ensurePollValueColumns(db, parameters)
-        var pollId = -1L
-        var decodedIdsToCache: Map<String, Long> = emptyMap()
+        var inserted: PollInsertResult? = null
         //writes the poll header and wide raw values atomically so dashboard counts never see half a poll
         db.beginTransaction()
         try {
-            val requestedParameterCount = parameters.size
-            val receivedParameterCount = if (input.ok) {
-                input.readings.map { it.rawKey }.distinct().size
+            inserted = insertPollInTransaction(db, sessionId, input, parameters)
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        val committed = checkNotNull(inserted)
+        decodedValueIds.putAll(committed.decodedIds)
+        return committed.pollId
+    }
+
+    fun insertWorkerPoll(
+        sessionId: Long,
+        identity: TelemetryWorkerSampleIdentity,
+        input: PersistedPollInput,
+        parameters: List<CatalogParameter>
+    ): WorkerPollImportResult {
+        val db = helper.writableDatabase
+        ensurePollValueColumns(db, parameters)
+        var result: WorkerPollImportResult? = null
+        var decodedIdsToCache: Map<String, Long> = emptyMap()
+        db.beginTransaction()
+        try {
+            val existingPollId = workerPollId(db, identity)
+            if (existingPollId != null) {
+                result = WorkerPollImportResult(existingPollId, inserted = false)
             } else {
-                0
-            }
-            pollId = db.insertOrThrow(
-                "polls",
-                null,
-                ContentValues().apply {
-                    put("session_id", sessionId)
-                    put("ts", input.timestamp)
-                    put("ok", if (input.ok) 1 else 0)
-                    input.elapsedMs?.let { put("elapsed_ms", it) }
-                    put("request_count", input.requestCount)
-                    put("errors", input.errors.truncateForStorage(MAX_ERROR_TEXT_LENGTH))
-                    put("error_category", input.errorCategory)
-                    put("error_message", input.errorMessage.truncateForStorage(MAX_ERROR_TEXT_LENGTH))
-                    put("requested_parameter_count", requestedParameterCount)
-                    put("received_parameter_count", receivedParameterCount)
-                    put("missing_parameter_count", (requestedParameterCount - receivedParameterCount).coerceAtLeast(0))
-                    if (input.ok) {
-                        putNull("raw_response_body")
-                    } else {
-                        put("raw_response_body", input.rawResponseBody.truncateForStorage(MAX_RAW_RESPONSE_BODY_LENGTH))
+                val inserted = insertPollInTransaction(db, sessionId, input, parameters)
+                db.insertOrThrow(
+                    "telemetry_worker_imports",
+                    null,
+                    ContentValues().apply {
+                        put("boot_id", identity.bootId)
+                        put("helper_generation", identity.helperGeneration)
+                        put("poll_sequence", identity.pollSequence)
+                        put("poll_id", inserted.pollId)
+                        put("imported_at", clock.nowIso())
                     }
-                    put(
-                        "import_quality",
-                        when {
-                            input.ok && input.errorCategory != null -> "partial_success"
-                            input.ok -> "full_success"
-                            else -> "failure_recorded"
-                        }
-                    )
-                }
-            )
-
-            if (input.ok) {
-                decodedIdsToCache = insertPollValues(db, pollId, input.readings, parameters)
+                )
+                decodedIdsToCache = inserted.decodedIds
+                result = WorkerPollImportResult(inserted.pollId, inserted = true)
             }
-
             db.setTransactionSuccessful()
         } finally {
             db.endTransaction()
         }
         decodedValueIds.putAll(decodedIdsToCache)
-        return pollId
+        return checkNotNull(result)
     }
 
     fun recordEvent(category: String, message: String) {
@@ -1194,6 +1194,70 @@ class TelemetryStore(
         }
     }
 
+    private fun insertPollInTransaction(
+        db: SQLiteDatabase,
+        sessionId: Long,
+        input: PersistedPollInput,
+        parameters: List<CatalogParameter>
+    ): PollInsertResult {
+        val requestedParameterCount = parameters.size
+        val receivedParameterCount = if (input.ok) {
+            input.readings.map { it.rawKey }.distinct().size
+        } else {
+            0
+        }
+        val pollId = db.insertOrThrow(
+            "polls",
+            null,
+            ContentValues().apply {
+                put("session_id", sessionId)
+                put("ts", input.timestamp)
+                put("ok", if (input.ok) 1 else 0)
+                input.elapsedMs?.let { put("elapsed_ms", it) }
+                put("request_count", input.requestCount)
+                put("errors", input.errors.truncateForStorage(MAX_ERROR_TEXT_LENGTH))
+                put("error_category", input.errorCategory)
+                put("error_message", input.errorMessage.truncateForStorage(MAX_ERROR_TEXT_LENGTH))
+                put("requested_parameter_count", requestedParameterCount)
+                put("received_parameter_count", receivedParameterCount)
+                put("missing_parameter_count", (requestedParameterCount - receivedParameterCount).coerceAtLeast(0))
+                if (input.ok) {
+                    putNull("raw_response_body")
+                } else {
+                    put("raw_response_body", input.rawResponseBody.truncateForStorage(MAX_RAW_RESPONSE_BODY_LENGTH))
+                }
+                put(
+                    "import_quality",
+                    when {
+                        input.ok && input.errorCategory != null -> "partial_success"
+                        input.ok -> "full_success"
+                        else -> "failure_recorded"
+                    }
+                )
+            }
+        )
+        val decodedIds = if (input.ok) {
+            insertPollValues(db, pollId, input.readings, parameters)
+        } else {
+            emptyMap()
+        }
+        return PollInsertResult(pollId, decodedIds)
+    }
+
+    private fun workerPollId(db: SQLiteDatabase, identity: TelemetryWorkerSampleIdentity): Long? {
+        db.rawQuery(
+            """
+            SELECT poll_id
+            FROM telemetry_worker_imports
+            WHERE boot_id = ? AND helper_generation = ? AND poll_sequence = ?
+            LIMIT 1
+            """.trimIndent(),
+            arrayOf(identity.bootId, identity.helperGeneration, identity.pollSequence.toString())
+        ).use { cursor ->
+            return if (cursor.moveToFirst()) cursor.getLong(0) else null
+        }
+    }
+
     private fun insertPollValues(
         db: SQLiteDatabase,
         pollId: Long,
@@ -1230,6 +1294,11 @@ class TelemetryStore(
         )
         return resolvedDecodedIds
     }
+
+    private data class PollInsertResult(
+        val pollId: Long,
+        val decodedIds: Map<String, Long>
+    )
 
     private fun decodedValueId(
         db: SQLiteDatabase,

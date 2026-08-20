@@ -418,7 +418,7 @@ class TelemetryDatabaseHelper(
 
     companion object {
         val DATABASE_NAME: String = BuildConfig.COLLECTOR_DATABASE_NAME
-        const val DATABASE_VERSION = 8
+        const val DATABASE_VERSION = 9
         const val LEGACY_SCHEMA_ASSET = "schema.sql"
         const val COMPACT_SCHEMA_ASSET = "schema_v2.sql"
         const val LEGACY_STORAGE_FORMAT = 1
