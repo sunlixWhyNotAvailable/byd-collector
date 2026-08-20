@@ -12,11 +12,14 @@ class CollectorServiceMaintenanceContractTest {
         val stop = source.substringAfter("private fun stopRuntimeForMaintenance").substringBefore("private fun restoreRuntimeAfterMaintenance")
 
         assertTrue(source.contains("private val maintenanceActive = AtomicBoolean(false)"))
-        assertTrue(stop.contains("if (!poller.stopAndJoin(2_000L)) error("))
-        assertTrue(stop.contains("detachDebugPoller()?.shutdownAndAwait(\"database_maintenance\", 2_000L) == false"))
+        assertTrue(stop.contains("val detached = runOnRuntimeOwnerBlocking"))
+        assertTrue(stop.contains("detached.mainPoller?.stopAndJoin(2_000L) == false"))
+        assertTrue(stop.contains("detached.debugPoller?.shutdownAndAwait(debugStopReason, 2_000L) == false"))
         assertTrue(stop.contains("error(\"Debug poller did not stop for database maintenance\")"))
         assertTrue(stop.contains("resetTelegramExecutorForMaintenance()"))
         assertTrue(stop.contains("resetInfluxExecutorForMaintenance()"))
+        assertTrue(source.contains("previous.awaitTermination(MQTT_MAINTENANCE_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)"))
+        assertTrue(source.contains("check(stopped) { \"MQTT worker did not stop before database maintenance\" }"))
         assertTrue(source.contains("previous.awaitTermination(INFLUX_MAINTENANCE_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)"))
         assertTrue(source.contains("if (!stopped) maintenanceRuntimeRestoreAllowed.set(false)"))
         assertTrue(source.contains("previous.awaitTermination(TELEGRAM_MAINTENANCE_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)"))
@@ -43,6 +46,8 @@ class CollectorServiceMaintenanceContractTest {
         assertFalse(source.contains("maintenanceRuntimeSnapshot"))
         assertTrue(start.contains("if (!maintenanceActive.compareAndSet(false, true))"))
         assertTrue(start.contains("val snapshot = runtimeSnapshot()"))
+        assertTrue(start.contains("dispatchDatabaseMaintenanceCompletion("))
+        assertTrue(start.contains("finishDatabaseMaintenanceOnRuntimeOwner("))
         assertTrue(start.contains("restoreRuntimeAfterMaintenance(operation, snapshot)"))
         assertTrue(start.contains("maintenanceActive.set(false)"))
         assertTrue(source.contains("action != ACTION_CANCEL_DATABASE_MAINTENANCE"))
@@ -73,7 +78,60 @@ class CollectorServiceMaintenanceContractTest {
         )
         assertTrue(maintenance.contains("maintenanceRuntimeRestoreAllowed.set(true)"))
         assertTrue(maintenance.contains("if (maintenanceRuntimeRestoreAllowed.get()) restoreAfterMaintenance = true"))
-        assertTrue(maintenance.contains("if (restoreAfterMaintenance && maintenanceRuntimeRestoreAllowed.get())"))
+        assertTrue(maintenance.contains("restoreAfterMaintenance &&"))
+        assertTrue(maintenance.contains("maintenanceRuntimeRestoreAllowed.get()"))
+    }
+
+    @Test
+    fun maintenanceLifecycleStateAndWakeLockAreConfinedToTheMainHandler() {
+        val source = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val stop = source.substringAfter("private fun stopRuntimeForMaintenance")
+            .substringBefore("private fun restoreRuntimeAfterMaintenance")
+        val prepare = source.substringAfter("private fun prepareRuntimeStopForMaintenance")
+            .substringBefore("private fun restoreRuntimeAfterMaintenance")
+        val restore = source.substringAfter("private fun restoreRuntimeAfterMaintenance")
+            .substringBefore("private fun rebuildStoreBackedRuntime")
+        val finish = source.substringAfter("private fun finishDatabaseMaintenanceOnRuntimeOwner")
+            .substringBefore("private fun resetTelegramExecutorForMaintenance")
+        val completion = source.substringAfter("private fun dispatchDatabaseMaintenanceCompletion")
+            .substringBefore("private fun finishDatabaseMaintenanceOnRuntimeOwner")
+        val mqttReset = source.substringAfter("private fun resetMqttExecutorForMaintenance")
+            .substringBefore("private fun shutdownMqttExecutor")
+        val influxReset = source.substringAfter("private fun resetInfluxExecutorForMaintenance")
+            .substringBefore("private fun startDatabaseMaintenance")
+        val telegramReset = source.substringAfter("private fun resetTelegramExecutorForMaintenance")
+            .substringBefore("private fun shutdownTelegramExecutorForUserShutdown")
+
+        assertTrue(source.contains("private fun isRuntimeOwner(): Boolean = Looper.myLooper() == mainHandler.looper"))
+        assertTrue(source.contains("private fun <T> runOnRuntimeOwnerBlocking(action: () -> T): T"))
+        assertInOrder(stop, "runOnRuntimeOwnerBlocking", "stopAndJoin(2_000L)", "shutdownAndAwait(debugStopReason, 2_000L)")
+        assertTrue(prepare.contains("requireRuntimeOwner()"))
+        assertTrue(prepare.contains("sessionId = null"))
+        assertTrue(prepare.contains("cancelInfluxRetry()"))
+        assertTrue(prepare.contains("cancelTelegramTick()"))
+        assertFalse(prepare.contains("stopAndJoin(2_000L)"))
+        assertTrue(restore.contains("requireRuntimeOwner()"))
+        val wiring = source.substringAfter("maintenanceCoordinator = DbMaintenanceCoordinator(")
+            .substringBefore("createNotificationChannel()")
+        assertInOrder(wiring, "onStoreReopened", "runOnRuntimeOwnerBlocking", "rebuildStoreBackedRuntime(newStore)")
+        assertInOrder(
+            wiring,
+            "onDebugStoreReopened",
+            "val storageReady = newStore.isCompactV2()",
+            "runOnRuntimeOwnerBlocking",
+            "rebindDebugStoreAfterMaintenance(newStore, storageReady)"
+        )
+        assertInOrder(finish, "restoreRuntimeAfterMaintenance(operation, snapshot)", "maintenanceActive.set(false)")
+        assertTrue(completion.contains("mainHandler.post"))
+        assertTrue(completion.contains("finishDatabaseMaintenanceOnRuntimeOwner(operation, snapshot, restoreAfterMaintenance)"))
+        assertTrue(source.substringAfter("private fun acquireWakeLock").substringBefore("private fun releaseWakeLock").contains("requireRuntimeOwner()"))
+        assertTrue(source.substringAfter("private fun releaseWakeLock").substringBefore("private fun handlePollCycleResult").contains("requireRuntimeOwner()"))
+        assertTrue(source.contains("if (restoringRuntime.get() && isRuntimeOwner()) return false"))
+        assertTrue(stop.contains("check(!isRuntimeOwner())"))
+        listOf(mqttReset, influxReset, telegramReset).forEach { reset ->
+            assertInOrder(reset, "runOnRuntimeOwnerBlocking", "awaitTermination(", "runOnRuntimeOwnerBlocking")
+            assertTrue(reset.contains("requireRuntimeOwner()"))
+        }
     }
 
     @Test
@@ -223,11 +281,16 @@ class CollectorServiceMaintenanceContractTest {
         val run = coordinator.substringAfter("fun run(").substringBefore("private fun archive")
         val archiveDebug = coordinator.substringAfter("private fun archiveDebug").substringBefore("private fun reopenDebugAndRebind")
         val stop = service.substringAfter("private fun stopRuntimeForMaintenance").substringBefore("private fun restoreRuntimeAfterMaintenance")
-        val debugBranch = stop.substringAfter("if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE)").substringBefore("if (!poller.stopAndJoin")
+        val prepare = service.substringAfter("private fun prepareRuntimeStopForMaintenance")
+            .substringBefore("private fun restoreRuntimeAfterMaintenance")
+        val debugBranch = prepare.substringAfter("if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE)")
+            .substringBefore("cancelInfluxRetry()")
 
         assertTrue(service.contains("ACTION_ARCHIVE_DEBUG_DATABASE"))
-        assertTrue(debugBranch.contains("shutdownAndAwait(\"debug_database_maintenance\", 2_000L)"))
-        assertFalse(debugBranch.contains("poller.stopAndJoin"))
+        assertTrue(stop.contains("\"debug_database_maintenance\""))
+        assertTrue(stop.contains("shutdownAndAwait(debugStopReason, 2_000L)"))
+        assertTrue(debugBranch.contains("detachDebugPoller()"))
+        assertFalse(debugBranch.contains("poller.stop()"))
         assertFalse(debugBranch.contains("mqttCoordinator"))
         assertFalse(debugBranch.contains("resetInfluxExecutorForMaintenance"))
         assertTrue(coordinator.contains("private fun archiveDebug(operation: DbMaintenanceOperation)"))
@@ -236,7 +299,9 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(service.contains("snapshot.debugRunning &&"))
         assertTrue(service.contains("maintenanceBlocksRuntimeStart(debugRuntime = true)"))
         assertTrue(service.contains("activeMaintenanceOperation != DbMaintenanceOperation.DEBUG_ARCHIVE || debugRuntime"))
-        assertInOrder(service, "maintenanceActive.set(false)", "if (restoreAfterMaintenance && maintenanceRuntimeRestoreAllowed.get())")
+        val finish = service.substringAfter("private fun finishDatabaseMaintenanceOnRuntimeOwner")
+            .substringBefore("private fun resetTelegramExecutorForMaintenance")
+        assertInOrder(finish, "restoreRuntimeAfterMaintenance(operation, snapshot)", "maintenanceActive.set(false)")
         assertInOrder(
             "$run\n$archiveDebug",
             "stopRuntime(operation)",

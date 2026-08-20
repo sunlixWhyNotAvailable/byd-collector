@@ -73,7 +73,9 @@ import com.bydcollector.collector.ui.compose.AppTab
 import com.bydcollector.collector.util.namedSingleThreadExecutor
 import com.bydcollector.collector.util.sqliteFootprintBytes
 import java.io.File
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.FutureTask
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
@@ -233,17 +235,19 @@ class CollectorService : Service() {
             debugStoreProvider = { debugStore },
             application = applicationContext as BydCollectorApplication,
             stopRuntime = { stopRuntimeForMaintenance(it) },
-            onStoreReopened = { rebuildStoreBackedRuntime(it) },
+            onStoreReopened = { newStore ->
+                runOnRuntimeOwnerBlocking {
+                    check(running.get()) { "Collector service stopped during database maintenance" }
+                    rebuildStoreBackedRuntime(newStore)
+                }
+            },
             closeDebugStore = { debugStore.close() },
-            onDebugStoreReopened = {
-                debugStore = it
-                debugStorageReady = it.isCompactV2()
-                (applicationContext as BydCollectorApplication).setDebugStorageReadyAfterMaintenance(debugStorageReady)
-                dashboardMetricsGeneration.incrementAndGet()
-                dashboardUiStateStore.invalidateRowCounts()
-                lastDatabaseFootprintAtMs = Long.MIN_VALUE
-                scheduleDashboardCountBootstrap(force = true)
-                scheduleDatabaseFootprintRefresh(force = true)
+            onDebugStoreReopened = { newStore ->
+                val storageReady = newStore.isCompactV2()
+                runOnRuntimeOwnerBlocking {
+                    check(running.get()) { "Collector service stopped during debug database maintenance" }
+                    rebindDebugStoreAfterMaintenance(newStore, storageReady)
+                }
             }
         )
         createNotificationChannel()
@@ -318,6 +322,8 @@ class CollectorService : Service() {
     }
 
     override fun onDestroy() {
+        requireRuntimeOwner()
+        maintenanceRuntimeRestoreAllowed.set(false)
         mainHandler.removeCallbacks(accessSelfCheckTask)
         mainHandler.removeCallbacks(dashboardHeartbeatTask)
         mainHandler.removeCallbacks(kpiPublishTask)
@@ -336,6 +342,9 @@ class CollectorService : Service() {
         shutdownMqttExecutor()
         shutdownInfluxExecutor()
         shutdownTelegramExecutor()
+        activeMaintenanceOperation = null
+        maintenanceActive.set(false)
+        maintenanceRunningInProcess.set(false)
         mainPollingRunning.set(false)
         running.set(false)
         publishDashboardRuntimeFlags()
@@ -566,7 +575,6 @@ class CollectorService : Service() {
                     helper = helper,
                     store = debugStore,
                     onCycle = { summary ->
-                        debugRunning.set(true)
                         dashboardUiStateStore.incrementDebugReadingCount(summary.changedCount.toLong())
                         val previous = dashboardUiStateStore.currentTab(AppTab.ALL_PARAMETERS)
                         val completedAt = DisplayTimeFormatter.formatNullable(java.time.Instant.now().toString())
@@ -610,26 +618,29 @@ class CollectorService : Service() {
                         }
                     }
                 )
-                val started = synchronized(debugPollerLock) {
-                    if (
-                        !settings.isDebugPollingEnabled() ||
-                        settings.isDebugManuallyStopped() ||
-                        maintenanceBlocksRuntimeStart(debugRuntime = true) ||
-                        debugPoller?.isRunning() == true
-                    ) {
-                        false
-                    } else {
-                        nextPoller.start(batchSize)
-                        debugPoller = nextPoller
-                        true
+                val started = runOnRuntimeOwnerBlocking {
+                    requireRuntimeOwner()
+                    synchronized(debugPollerLock) {
+                        if (
+                            !settings.isDebugPollingEnabled() ||
+                            settings.isDebugManuallyStopped() ||
+                            maintenanceBlocksRuntimeStart(debugRuntime = true) ||
+                            debugPoller?.isRunning() == true
+                        ) {
+                            false
+                        } else {
+                            nextPoller.start(batchSize)
+                            debugPoller = nextPoller
+                            debugRunning.set(true)
+                            publishDashboardRuntimeFlags()
+                            true
+                        }
                     }
                 }
                 if (!started) {
                     nextPoller.shutdown("debug_start_cancelled")
                     return@execute
                 }
-                debugRunning.set(true)
-                publishDashboardRuntimeFlags()
                 store.recordEvent(
                     "debug_polling_started",
                     "Debug round-robin polling started",
@@ -1084,35 +1095,70 @@ class CollectorService : Service() {
         mainHandler.postDelayed(accessSelfCheckTask, ACCESS_SELF_CHECK_INTERVAL_MS)
     }
 
+    private data class DetachedMaintenanceRuntime(
+        val mainPoller: TelemetryPoller? = null,
+        val debugPoller: DirectDebugRoundRobinPoller? = null,
+        val openedSessionId: Long? = null
+    )
+
     private fun stopRuntimeForMaintenance(operation: DbMaintenanceOperation) {
-        if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
-            if (detachDebugPoller()?.shutdownAndAwait("debug_database_maintenance", 2_000L) == false) {
-                error("Debug poller did not stop for database maintenance")
-            }
-            debugRunning.set(false)
-            return
+        check(!isRuntimeOwner()) { "Database maintenance must not wait for workers on the main handler" }
+        val detached = runOnRuntimeOwnerBlocking {
+            prepareRuntimeStopForMaintenance(operation)
         }
-        cancelInfluxRetry()
-        if (!poller.stopAndJoin(2_000L)) error("Main poller did not stop for database maintenance")
-        if (detachDebugPoller()?.shutdownAndAwait("database_maintenance", 2_000L) == false) {
+        if (detached.mainPoller?.stopAndJoin(2_000L) == false) {
+            maintenanceRuntimeRestoreAllowed.set(false)
+            error("Main poller did not stop for database maintenance")
+        }
+        val debugStopReason = if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
+            "debug_database_maintenance"
+        } else {
+            "database_maintenance"
+        }
+        if (detached.debugPoller?.shutdownAndAwait(debugStopReason, 2_000L) == false) {
+            maintenanceRuntimeRestoreAllowed.set(false)
             error("Debug poller did not stop for database maintenance")
         }
-        mainPollingRunning.set(false)
-        debugRunning.set(false)
-        sessionId?.let { openedSessionId ->
+        if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) return
+
+        detached.openedSessionId?.let { openedSessionId ->
             runCatching { store.endSession(openedSessionId, "database_maintenance") }
         }
-        sessionId = null
-        mqttRuntimeActive.set(false)
-        mqttOfflineQueued.set(false)
         mqttCoordinator.disconnectForMaintenance()
-        cancelTelegramTick()
         resetMqttExecutorForMaintenance()
         resetInfluxExecutorForMaintenance()
         resetTelegramExecutorForMaintenance()
     }
 
+    private fun prepareRuntimeStopForMaintenance(operation: DbMaintenanceOperation): DetachedMaintenanceRuntime {
+        requireRuntimeOwner()
+        if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
+            val detachedDebugPoller = detachDebugPoller()
+            debugRunning.set(false)
+            publishDashboardRuntimeFlags()
+            return DetachedMaintenanceRuntime(debugPoller = detachedDebugPoller)
+        }
+
+        cancelInfluxRetry()
+        cancelTelegramTick()
+        poller.stop()
+        val detachedDebugPoller = detachDebugPoller()
+        val openedSessionId = sessionId
+        sessionId = null
+        mainPollingRunning.set(false)
+        debugRunning.set(false)
+        mqttRuntimeActive.set(false)
+        mqttOfflineQueued.set(false)
+        publishDashboardRuntimeFlags()
+        return DetachedMaintenanceRuntime(
+            mainPoller = poller,
+            debugPoller = detachedDebugPoller,
+            openedSessionId = openedSessionId
+        )
+    }
+
     private fun restoreRuntimeAfterMaintenance(operation: DbMaintenanceOperation, snapshot: RuntimeSnapshot) {
+        requireRuntimeOwner()
         restoringRuntime.set(true)
         try {
             if (settings.isUserShutdownRequested()) {
@@ -1157,6 +1203,7 @@ class CollectorService : Service() {
     }
 
     private fun rebuildStoreBackedRuntime(newStore: TelemetryStore) {
+        requireRuntimeOwner()
         dashboardMetricsGeneration.incrementAndGet()
         dashboardUiStateStore.invalidateRowCounts()
         dashboardStateProvider.close()
@@ -1175,7 +1222,20 @@ class CollectorService : Service() {
         scheduleIntegrationDashboardRefresh()
     }
 
+    private fun rebindDebugStoreAfterMaintenance(newStore: DirectDebugStore, storageReady: Boolean) {
+        requireRuntimeOwner()
+        debugStore = newStore
+        debugStorageReady = storageReady
+        (applicationContext as BydCollectorApplication).setDebugStorageReadyAfterMaintenance(debugStorageReady)
+        dashboardMetricsGeneration.incrementAndGet()
+        dashboardUiStateStore.invalidateRowCounts()
+        lastDatabaseFootprintAtMs = Long.MIN_VALUE
+        scheduleDashboardCountBootstrap(force = true)
+        scheduleDatabaseFootprintRefresh(force = true)
+    }
+
     private fun acquireWakeLock() {
+        requireRuntimeOwner()
         val current = wakeLock
         if (current?.isHeld == true) return
 
@@ -1191,6 +1251,7 @@ class CollectorService : Service() {
     }
 
     private fun releaseWakeLock() {
+        requireRuntimeOwner()
         val current = wakeLock
         if (current?.isHeld == true) {
             current.release()
@@ -1553,10 +1614,30 @@ class CollectorService : Service() {
     }
 
     private fun resetMqttExecutorForMaintenance() {
-        mqttWorkGeneration.incrementAndGet()
-        synchronized(mqttExecutorLock) {
-            mqttExecutor.shutdownNow()
-            mqttExecutor = namedSingleThreadExecutor("byd-mqtt")
+        val previous = runOnRuntimeOwnerBlocking {
+            requireRuntimeOwner()
+            mqttWorkGeneration.incrementAndGet()
+            synchronized(mqttExecutorLock) {
+                mqttExecutor.also { it.shutdownNow() }
+            }
+        }
+        val stopped = try {
+            previous.awaitTermination(MQTT_MAINTENANCE_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        if (!stopped) maintenanceRuntimeRestoreAllowed.set(false)
+        check(stopped) { "MQTT worker did not stop before database maintenance" }
+        runOnRuntimeOwnerBlocking {
+            requireRuntimeOwner()
+            synchronized(mqttExecutorLock) {
+                if (mqttExecutor !== previous) {
+                    maintenanceRuntimeRestoreAllowed.set(false)
+                    error("MQTT executor changed during database maintenance")
+                }
+                mqttExecutor = namedSingleThreadExecutor("byd-mqtt")
+            }
         }
     }
 
@@ -1683,10 +1764,13 @@ class CollectorService : Service() {
     }
 
     private fun resetInfluxExecutorForMaintenance() {
-        influxWorkGeneration.incrementAndGet()
-        influxRequestQueued.set(false)
-        val previous = synchronized(influxExecutorLock) {
-            influxExecutor.also { it.shutdownNow() }
+        val previous = runOnRuntimeOwnerBlocking {
+            requireRuntimeOwner()
+            influxWorkGeneration.incrementAndGet()
+            influxRequestQueued.set(false)
+            synchronized(influxExecutorLock) {
+                influxExecutor.also { it.shutdownNow() }
+            }
         }
         val stopped = try {
             previous.awaitTermination(INFLUX_MAINTENANCE_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)
@@ -1696,16 +1780,20 @@ class CollectorService : Service() {
         }
         if (!stopped) maintenanceRuntimeRestoreAllowed.set(false)
         check(stopped) { "Influx worker did not stop before database maintenance" }
-        synchronized(influxExecutorLock) {
-            if (influxExecutor !== previous) {
-                maintenanceRuntimeRestoreAllowed.set(false)
-                error("Influx executor changed during database maintenance")
+        runOnRuntimeOwnerBlocking {
+            requireRuntimeOwner()
+            synchronized(influxExecutorLock) {
+                if (influxExecutor !== previous) {
+                    maintenanceRuntimeRestoreAllowed.set(false)
+                    error("Influx executor changed during database maintenance")
+                }
+                influxExecutor = namedSingleThreadExecutor("byd-influx")
             }
-            influxExecutor = namedSingleThreadExecutor("byd-influx")
         }
     }
 
     private fun startDatabaseMaintenance(operation: DbMaintenanceOperation) {
+        requireRuntimeOwner()
         if (!maintenanceActive.compareAndSet(false, true)) return
         activeMaintenanceOperation = operation
         maintenanceRuntimeRestoreAllowed.set(true)
@@ -1726,18 +1814,19 @@ class CollectorService : Service() {
                         enqueueArchiveStorageMaintenance(result.archivePath)
                     }
                 } finally {
-                    activeMaintenanceOperation = null
-                    maintenanceActive.set(false)
-                    maintenanceRunningInProcess.set(false)
-                    if (restoreAfterMaintenance && maintenanceRuntimeRestoreAllowed.get()) {
-                        restoreRuntimeAfterMaintenance(operation, snapshot)
-                    }
+                    dispatchDatabaseMaintenanceCompletion(
+                        operation = operation,
+                        snapshot = snapshot,
+                        restoreAfterMaintenance = restoreAfterMaintenance
+                    )
                 }
             }
         } catch (error: RejectedExecutionException) {
-            activeMaintenanceOperation = null
-            maintenanceActive.set(false)
-            maintenanceRunningInProcess.set(false)
+            finishDatabaseMaintenanceOnRuntimeOwner(
+                operation = operation,
+                snapshot = snapshot,
+                restoreAfterMaintenance = false
+            )
             store.recordEvent(
                 "database_maintenance_rejected",
                 "Database maintenance action rejected",
@@ -1746,10 +1835,48 @@ class CollectorService : Service() {
         }
     }
 
+    private fun dispatchDatabaseMaintenanceCompletion(
+        operation: DbMaintenanceOperation,
+        snapshot: RuntimeSnapshot,
+        restoreAfterMaintenance: Boolean
+    ) {
+        if (isRuntimeOwner()) {
+            finishDatabaseMaintenanceOnRuntimeOwner(operation, snapshot, restoreAfterMaintenance)
+            return
+        }
+        check(mainHandler.post {
+            finishDatabaseMaintenanceOnRuntimeOwner(operation, snapshot, restoreAfterMaintenance)
+        }) { "Collector runtime owner is unavailable" }
+    }
+
+    private fun finishDatabaseMaintenanceOnRuntimeOwner(
+        operation: DbMaintenanceOperation,
+        snapshot: RuntimeSnapshot,
+        restoreAfterMaintenance: Boolean
+    ) {
+        requireRuntimeOwner()
+        try {
+            if (
+                running.get() &&
+                restoreAfterMaintenance &&
+                maintenanceRuntimeRestoreAllowed.get()
+            ) {
+                restoreRuntimeAfterMaintenance(operation, snapshot)
+            }
+        } finally {
+            activeMaintenanceOperation = null
+            maintenanceActive.set(false)
+            maintenanceRunningInProcess.set(false)
+        }
+    }
+
     private fun resetTelegramExecutorForMaintenance() {
-        telegramWorkGeneration.incrementAndGet()
-        val previous = synchronized(telegramExecutorLock) {
-            telegramExecutor.also { it.shutdownNow() }
+        val previous = runOnRuntimeOwnerBlocking {
+            requireRuntimeOwner()
+            telegramWorkGeneration.incrementAndGet()
+            synchronized(telegramExecutorLock) {
+                telegramExecutor.also { it.shutdownNow() }
+            }
         }
         val stopped = try {
             previous.awaitTermination(TELEGRAM_MAINTENANCE_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)
@@ -1759,12 +1886,15 @@ class CollectorService : Service() {
         }
         if (!stopped) maintenanceRuntimeRestoreAllowed.set(false)
         check(stopped) { "Telegram worker did not stop before database maintenance" }
-        synchronized(telegramExecutorLock) {
-            if (telegramExecutor !== previous) {
-                maintenanceRuntimeRestoreAllowed.set(false)
-                error("Telegram executor changed during database maintenance")
+        runOnRuntimeOwnerBlocking {
+            requireRuntimeOwner()
+            synchronized(telegramExecutorLock) {
+                if (telegramExecutor !== previous) {
+                    maintenanceRuntimeRestoreAllowed.set(false)
+                    error("Telegram executor changed during database maintenance")
+                }
+                telegramExecutor = namedSingleThreadExecutor("byd-telegram")
             }
-            telegramExecutor = namedSingleThreadExecutor("byd-telegram")
         }
     }
 
@@ -1878,7 +2008,7 @@ class CollectorService : Service() {
     }
 
     private fun maintenanceBlocksRuntimeStart(debugRuntime: Boolean = false): Boolean {
-        if (restoringRuntime.get()) return false
+        if (restoringRuntime.get() && isRuntimeOwner()) return false
         if (maintenanceActive.get()) {
             return activeMaintenanceOperation != DbMaintenanceOperation.DEBUG_ARCHIVE || debugRuntime
         }
@@ -1887,6 +2017,33 @@ class CollectorService : Service() {
             return false
         }
         return false
+    }
+
+    private fun isRuntimeOwner(): Boolean = Looper.myLooper() == mainHandler.looper
+
+    private fun requireRuntimeOwner() {
+        check(isRuntimeOwner()) { "Collector runtime state must be changed on the main handler" }
+    }
+
+    private fun <T> runOnRuntimeOwnerBlocking(action: () -> T): T {
+        if (isRuntimeOwner()) return action()
+        val task = FutureTask<T> { action() }
+        check(mainHandler.post(task)) { "Collector runtime owner is unavailable" }
+        return try {
+            task.get(RUNTIME_OWNER_HANDOFF_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        } catch (error: InterruptedException) {
+            task.cancel(false)
+            Thread.currentThread().interrupt()
+            throw IllegalStateException("Interrupted while waiting for collector runtime owner", error)
+        } catch (error: TimeoutException) {
+            mainHandler.removeCallbacks(task)
+            task.cancel(false)
+            throw IllegalStateException("Timed out waiting for collector runtime owner", error)
+        } catch (error: ExecutionException) {
+            val cause = error.cause ?: error
+            if (cause is RuntimeException) throw cause
+            throw IllegalStateException("Collector runtime owner action failed", cause)
+        }
     }
 
     private fun recoverInterruptedMaintenanceIfNeeded(action: String) {
@@ -2024,8 +2181,10 @@ class CollectorService : Service() {
         private const val KPI_STALE_AFTER_MS = 3_000L
         private const val ACCESS_SELF_CHECK_INTERVAL_MS = 5 * 60_000L
         private const val TELEGRAM_TICK_INTERVAL_MS = 15_000L
+        private const val MQTT_MAINTENANCE_STOP_TIMEOUT_MS = 16_000L
         private const val INFLUX_MAINTENANCE_STOP_TIMEOUT_MS = 16_000L
         private const val TELEGRAM_MAINTENANCE_STOP_TIMEOUT_MS = 16_000L
+        private const val RUNTIME_OWNER_HANDOFF_TIMEOUT_MS = 30_000L
         private const val USER_SHUTDOWN_STOP_TIMEOUT_MS = 16_000L
         private const val TAG = "BYDCollectorService"
         private const val DEBUG_REASON_AUTOSTART = "autostart"
