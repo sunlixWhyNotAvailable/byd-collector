@@ -10,8 +10,7 @@ class BootReceiver : BroadcastReceiver() {
         if (
             action != Intent.ACTION_BOOT_COMPLETED &&
             action != Intent.ACTION_MY_PACKAGE_REPLACED &&
-            action != ACTION_QUICKBOOT_POWERON &&
-            action != Intent.ACTION_USER_PRESENT
+            action != ACTION_QUICKBOOT_POWERON
         ) {
             return
         }
