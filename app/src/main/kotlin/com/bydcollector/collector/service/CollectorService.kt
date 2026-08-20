@@ -112,6 +112,8 @@ class CollectorService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val mqttExecutorLock = Any()
     private var mqttExecutor: ExecutorService = namedSingleThreadExecutor("byd-mqtt")
+    private var mqttRetryScheduled = false
+    private var mqttRetryAtElapsedMs: Long? = null
     private val influxExecutorLock = Any()
     private var influxExecutor: ExecutorService = namedSingleThreadExecutor("byd-influx")
     private val influxRequestQueued = AtomicBoolean(false)
@@ -147,6 +149,14 @@ class CollectorService : Service() {
     private var lastKpiObservationAtMs = Long.MIN_VALUE
     private var pendingVehicleKpis: LocalizedVehicleKpis? = null
     private var kpiPublishScheduled = false
+    private val mqttRetryTask = object : Runnable {
+        override fun run() {
+            mqttRetryScheduled = false
+            mqttRetryAtElapsedMs = null
+            if (!running.get() || !settings.isMqttEnabled() || maintenanceBlocksRuntimeStart()) return
+            flushPendingMqttAsync(force = false)
+        }
+    }
     private val influxRetryTask = object : Runnable {
         override fun run() {
             influxRetryScheduled = false
@@ -328,6 +338,7 @@ class CollectorService : Service() {
         mainHandler.removeCallbacks(dashboardHeartbeatTask)
         mainHandler.removeCallbacks(kpiPublishTask)
         mainHandler.removeCallbacks(kpiStaleTask)
+        cancelMqttRetry()
         cancelInfluxRetry()
         cancelTelegramTick()
         accessSelfCheckScheduled = false
@@ -719,6 +730,7 @@ class CollectorService : Service() {
         settings.setDebugPollingEnabled(false)
         settings.setMqttEnabled(false)
         settings.setInfluxEnabled(false)
+        cancelMqttRetry()
         cancelInfluxRetry()
         cancelTelegramTick()
         store.recordEvent(
@@ -737,6 +749,7 @@ class CollectorService : Service() {
         settings.setInfluxEnabled(false)
         stopMain("user_shutdown")
         stopDebug("user_shutdown")
+        cancelMqttRetry()
         disconnectOfflineAsync()
         cancelInfluxRetry()
         cancelTelegramTick()
@@ -1139,6 +1152,7 @@ class CollectorService : Service() {
             return DetachedMaintenanceRuntime(debugPoller = detachedDebugPoller)
         }
 
+        cancelMqttRetry()
         cancelInfluxRetry()
         cancelTelegramTick()
         poller.stop()
@@ -1324,6 +1338,7 @@ class CollectorService : Service() {
 
     private fun stopMqttExport(manualStop: Boolean = true) {
         if (manualStop) settings.setMqttManuallyStopped(true)
+        cancelMqttRetry()
         settings.setMqttEnabled(false)
         publishDashboardRuntimeFlags()
         scheduleIntegrationDashboardRefresh()
@@ -1494,6 +1509,34 @@ class CollectorService : Service() {
         stopSelf()
     }
 
+    private fun postMqttRetrySchedule(submittedGeneration: Long) {
+        if (submittedGeneration != mqttWorkGeneration.get()) return
+        val delayMs = runCatching { mqttCoordinator.retryDelayMs() }.getOrNull()
+        mainHandler.post {
+            if (submittedGeneration != mqttWorkGeneration.get()) return@post
+            scheduleMqttRetry(delayMs)
+        }
+    }
+
+    private fun scheduleMqttRetry(delayMs: Long?) {
+        if (delayMs == null || !running.get() || !settings.isMqttEnabled() || maintenanceBlocksRuntimeStart()) {
+            cancelMqttRetry()
+            return
+        }
+        val targetElapsedMs = SystemClock.elapsedRealtime() + delayMs
+        if (mqttRetryScheduled && mqttRetryAtElapsedMs?.let { it <= targetElapsedMs } == true) return
+        if (mqttRetryScheduled) mainHandler.removeCallbacks(mqttRetryTask)
+        mqttRetryScheduled = true
+        mqttRetryAtElapsedMs = targetElapsedMs
+        mainHandler.postDelayed(mqttRetryTask, delayMs)
+    }
+
+    private fun cancelMqttRetry() {
+        mainHandler.removeCallbacks(mqttRetryTask)
+        mqttRetryScheduled = false
+        mqttRetryAtElapsedMs = null
+    }
+
     private fun flushPendingMqttAsync(force: Boolean) {
         if (!settings.isMqttEnabled()) return
         mqttRuntimeActive.set(true)
@@ -1593,6 +1636,7 @@ class CollectorService : Service() {
         executor = { mqttExecutor },
         generation = mqttWorkGeneration,
         action = action,
+        onSuccess = { _, submittedGeneration -> postMqttRetrySchedule(submittedGeneration) },
         onComplete = ::scheduleIntegrationDashboardRefresh,
         onFailedAction = if (activateTailscaleOnFailure) {
             { maybeActivateTailscaleAfterHaFailure("mqtt") }

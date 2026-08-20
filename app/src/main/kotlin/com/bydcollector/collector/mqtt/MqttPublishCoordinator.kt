@@ -28,17 +28,20 @@ class MqttPublishCoordinator(
         val config = configProvider()
         validateEnabled(config)?.let { return it }
 
-        val connect = client.connect(config, messageFactory.offlineMessage())
-        if (!connect.ok) {
-            recordRetryFailure(connect.message, retryStateStore.retryState())
-            return connect
-        }
-
-        retryStateStore.recordRetrySuccess(clock.nowIso())
-        //publishes discovery before state so ha can attach incoming retained values to known entities
+        //queues discovery before state so a failed initial connection retains complete restart work
         enqueueBuildResult(messageFactory.discoveryMessages(), DISCOVERY_PRIORITY)?.let { return it }
         enqueueBuildResult(messageFactory.fullResyncMessages(), STATE_PRIORITY)?.let { return it }
-        return flushPending(force = true)
+        return flushPendingInternal(force = true, allowFullResyncAfterSuccess = false)
+    }
+
+    fun retryDelayMs(): Long? {
+        val config = configProvider()
+        if (!config.enabled || outbox.pendingCount() == 0L) return null
+        val nextAttemptAt = retryStateStore.retryState().nextAttemptAt ?: return null
+        return runCatching {
+            val now = OffsetDateTime.parse(clock.nowIso()).toInstant().toEpochMilli()
+            (OffsetDateTime.parse(nextAttemptAt).toInstant().toEpochMilli() - now).coerceAtLeast(0L)
+        }.getOrDefault(0L)
     }
 
     fun queueDiscoveryAndFlush(force: Boolean = true): MqttActionResult {

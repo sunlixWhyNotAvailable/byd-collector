@@ -53,6 +53,34 @@ class MqttPublishCoordinatorTest {
     }
 
     @Test
+    fun failedStartRetainsCompleteWorkAndReportsPersistedRetryDelay() {
+        val client = FakeMqttClient(connectResult = MqttActionResult.fail("mqtt_error", "broker down"))
+        val outbox = FakeOutboxStore()
+        val coordinator = coordinator(client = client, outbox = outbox)
+
+        val result = coordinator.startLiveExport()
+
+        assertFalse(result.ok)
+        assertTrue(outbox.pendingRows().any { it.targetType == "discovery" })
+        assertTrue(outbox.pendingRows().any { it.targetType == "state" })
+        assertEquals(30_000L, coordinator.retryDelayMs())
+    }
+
+    @Test
+    fun manualStartAfterFailurePublishesOneFullSnapshot() {
+        val client = FakeMqttClient()
+        val retry = FakeRetryStateStore(
+            MqttRetryState(1, "2026-06-14T12:05:00+03:00", null, null, "broker down")
+        )
+        val coordinator = coordinator(client = client, retry = retry)
+
+        val result = coordinator.startLiveExport()
+
+        assertTrue(result.ok)
+        assertEquals(1, client.published.count { it.topic == "bydcollector/state/battery" })
+    }
+
+    @Test
     fun failedChangedCategoryPublishStoresPendingRowForCategoryTopic() {
         val client = FakeMqttClient(
             publishResults = mutableListOf(MqttActionResult.fail("mqtt_error", "publish failed"))
