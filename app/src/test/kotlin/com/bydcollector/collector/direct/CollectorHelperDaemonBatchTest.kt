@@ -9,6 +9,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -87,6 +88,47 @@ class CollectorHelperDaemonBatchTest {
         assertEquals(1, result.groupFailureCount)
         assertTrue(result.error?.contains("length mismatch") == true)
         assertEquals(listOf(110, 210, 120), result.values.map { it.raw })
+    }
+
+    @Test
+    fun workerSamplePreservesCatalogOrderIdentityAndBatchMetadata() {
+        val rows = listOf(address(5, 1000, 11), address(7, 1001, 21))
+        val result = CollectorHelperDaemon.BatchResult(
+            CollectorHelperProtocol.STATUS_OK,
+            CollectorHelperProtocol.MODE_NATIVE_WITH_FALLBACK,
+            true,
+            1,
+            1,
+            1,
+            1,
+            17,
+            arrayOf(
+                CollectorHelperDaemon.ReadValue.ok(110),
+                CollectorHelperDaemon.ReadValue.error(CollectorHelperProtocol.STATUS_READ_ERROR, "read failed")
+            ),
+            "group failed"
+        )
+        val identity = TelemetryWorkerSampleIdentity("boot-a", "generation-a", 3)
+
+        val sample = CollectorHelperDaemon.workerSample(identity, "catalog-a", 100, 90, rows, result)
+
+        assertEquals(identity, sample.identity)
+        assertEquals("catalog-a", sample.catalogVersion)
+        assertEquals(100, sample.capturedWallMs)
+        assertEquals(90, sample.capturedElapsedMs)
+        assertEquals(17, sample.pollElapsedMs)
+        assertEquals(CollectorHelperProtocol.MODE_NATIVE_WITH_FALLBACK, sample.batchMode)
+        assertEquals(1, sample.groupFailureCount)
+        assertEquals("group failed", sample.error)
+        assertEquals(listOf(0, 1), sample.values.map { it.fieldIndex })
+        assertEquals(rows.map { Triple(it.tx, it.dev, it.fid) }, sample.values.map { Triple(it.tx, it.dev, it.fid) })
+        assertEquals(listOf(110, null), sample.values.map { it.raw })
+        assertEquals(listOf(null, "read failed"), sample.values.map { it.error })
+        assertEquals(5_000L, CollectorHelperDaemon.WorkerPollLoop.INTERVAL_MS)
+
+        assertFailsWith<IllegalArgumentException> {
+            CollectorHelperDaemon.workerSample(identity, "catalog-a", 100, 90, rows.dropLast(1), result)
+        }
     }
 
     @Test

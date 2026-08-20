@@ -22,6 +22,7 @@ class DirectBridgeManagerTest {
         assertContains(command, "service list 2>/dev/null | grep -q bydcollector_helper")
         assert(command.indexOf("kill \"${'$'}pid\"") < command.indexOf("setsid app_process"))
         assert(command.indexOf("rm -f /data/local/tmp/bydcollector_helper.lock") < command.indexOf("setsid app_process"))
+        assertFalse(command.contains("base.apk' worker"))
         assertFalse(command.contains("DirectVehicleBridgeServer"))
         assertFalse(command.contains("19837"))
     }

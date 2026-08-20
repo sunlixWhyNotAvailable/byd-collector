@@ -8,7 +8,7 @@ import kotlin.test.assertTrue
 
 class TelemetryWorkerBinderContractTest {
     @Test
-    fun protocolExposesBoundedPendingAndPostCommitAckWithoutStartingAPoller() {
+    fun protocolExposesBoundedPendingAndPostCommitAckWithOptInWorkerPolling() {
         val daemon = source("com/bydcollector/collector/direct/CollectorHelperDaemon.java")
         val client = source("com/bydcollector/collector/data/direct/DirectVehicleHelperClient.kt")
 
@@ -21,7 +21,9 @@ class TelemetryWorkerBinderContractTest {
         assertTrue(client.contains("binder.transact(CollectorHelperProtocol.TX_WORKER_PENDING"))
         assertTrue(client.contains("binder.transact(CollectorHelperProtocol.TX_WORKER_ACK"))
         assertTrue(client.contains("fieldIndex == expectedIndex"))
-        assertFalse(daemon.contains("workerSpool.append("))
+        assertTrue(daemon.contains("final boolean workerMode = args.length == 3"))
+        assertTrue(daemon.contains("? new WorkerPollLoop("))
+        assertTrue(daemon.contains("spool.append(workerSample("))
         assertFalse(daemon.contains("TX_WRITE"))
         assertFalse(daemon.contains("sendCmd"))
         assertFalse(daemon.contains("setXD"))

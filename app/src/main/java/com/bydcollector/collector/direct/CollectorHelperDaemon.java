@@ -2,11 +2,13 @@ package com.bydcollector.collector.direct;
 
 import android.os.Binder;
 import android.content.Context;
+import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.Parcel;
 import android.os.Process;
 import android.os.RemoteException;
+import android.os.SystemClock;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -17,6 +19,8 @@ import java.lang.reflect.Method;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -24,22 +28,26 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 //runs as shell app_process so the app can read autoservice through a narrow binder bridge
 public final class CollectorHelperDaemon {
+    private static final String WORKER_MODE_ARG = "worker";
+
     private CollectorHelperDaemon() {
     }
 
     public static void main(String[] args) throws Exception {
-        if (args.length < 2) {
-            System.err.println("ERR: usage: CollectorHelperDaemon <appUid> <apkPath>");
+        if (args.length < 2 || args.length > 3 || (args.length == 3 && !WORKER_MODE_ARG.equals(args[2]))) {
+            System.err.println("ERR: usage: CollectorHelperDaemon <appUid> <apkPath> [worker]");
             System.exit(2);
             return;
         }
         final int appUid = Integer.parseInt(args[0]);
         final String apkPath = args[1];
+        final boolean workerMode = args.length == 3;
         OwnerLock ownerLock = acquireSingleOwnerLock();
         if (ownerLock == null) {
             System.out.println("ALREADY_RUNNING");
@@ -48,7 +56,8 @@ public final class CollectorHelperDaemon {
         }
 
         prepareMainLooper();
-        final Set<Address> whitelist = loadWhitelist(apkPath);
+        final List<Address> mainRows = loadMainRows();
+        final Set<Address> whitelist = loadWhitelist(apkPath, mainRows);
         Class<?> serviceManager = Class.forName("android.os.ServiceManager");
         Method getService = serviceManager.getMethod("getService", String.class);
         final IBinder autoservice = (IBinder) getService.invoke(null, "autoservice");
@@ -69,7 +78,26 @@ public final class CollectorHelperDaemon {
         }
         final TelemetryWorkerSpool workerSpool = openedSpool;
         final String workerSpoolError = openedSpoolError;
+        if (workerMode && workerSpool == null) {
+            System.err.println("ERR: worker spool unavailable: " + workerSpoolError);
+            ownerLock.close();
+            System.exit(4);
+            return;
+        }
         final Object readLock = new Object();
+        final WorkerPollLoop workerPollLoop = workerMode
+            ? new WorkerPollLoop(
+                new Handler(Looper.myLooper()),
+                mainRows,
+                loadMainCatalogVersion(),
+                readBootId(),
+                UUID.randomUUID().toString(),
+                workerSpool,
+                readLock,
+                address -> scalarRead(autoservice, autoserviceDescriptor, address),
+                nativeReader
+            )
+            : null;
         Binder helperBinder = new Binder() {
             @Override
             protected boolean onTransact(int code, Parcel data, Parcel reply, int flags) throws RemoteException {
@@ -227,12 +255,15 @@ public final class CollectorHelperDaemon {
                     " native=" + nativeReader.isAvailable() +
                     (nativeReader.isAvailable() ? "" : " native_error=" + nativeReader.unavailableReason()) +
                     " spool=" + (workerSpool != null) +
+                    " worker=" + workerMode +
                     (workerSpoolError == null ? "" : " spool_error=" + workerSpoolError)
             );
             System.out.flush();
+            if (workerPollLoop != null) workerPollLoop.start();
             Looper.loop();
         } finally {
             try {
+                if (workerPollLoop != null) workerPollLoop.stop();
                 if (workerSpool != null) workerSpool.close();
             } finally {
                 ownerLock.close();
@@ -351,25 +382,44 @@ public final class CollectorHelperDaemon {
     }
 
     static Set<Address> loadWhitelist(String apkPath) throws Exception {
+        return loadWhitelist(apkPath, loadMainRows());
+    }
+
+    private static Set<Address> loadWhitelist(String apkPath, List<Address> mainRows) throws Exception {
         Set<Address> whitelist = new HashSet<Address>();
-        loadMainWhitelist(whitelist);
+        whitelist.addAll(mainRows);
         loadDebugWhitelist(apkPath, whitelist);
         if (whitelist.isEmpty()) throw new IllegalStateException("empty telemetry whitelist");
         return whitelist;
     }
 
-    private static void loadMainWhitelist(Set<Address> whitelist) throws Exception {
+    static List<Address> loadMainRows() throws Exception {
         Class<?> registryClass = Class.forName("com.bydcollector.collector.data.direct.DirectFidRegistry");
         Object registry = registryClass.getField("INSTANCE").get(null);
         List<?> entries = (List<?>) registryClass.getMethod("getEntries").invoke(registry);
+        List<Address> rows = new ArrayList<Address>(entries.size());
         for (Object entry : entries) {
             Class<?> entryClass = entry.getClass();
             int tx = (Integer) entryClass.getMethod("getTx").invoke(entry);
             int dev = (Integer) entryClass.getMethod("getDev").invoke(entry);
             int fid = (Integer) entryClass.getMethod("getFid").invoke(entry);
             if (!isAllowedTx(tx)) throw new IllegalArgumentException("unsupported main whitelist tx: " + tx);
-            whitelist.add(new Address(tx, dev, fid));
+            rows.add(new Address(tx, dev, fid));
         }
+        if (rows.isEmpty()) throw new IllegalStateException("empty main telemetry catalog");
+        return Collections.unmodifiableList(rows);
+    }
+
+    private static String loadMainCatalogVersion() throws Exception {
+        Class<?> registryClass = Class.forName("com.bydcollector.collector.data.direct.DirectFidRegistry");
+        return (String) registryClass.getField("CATALOG_VERSION").get(null);
+    }
+
+    private static String readBootId() throws Exception {
+        return new String(
+            Files.readAllBytes(Paths.get("/proc/sys/kernel/random/boot_id")),
+            StandardCharsets.UTF_8
+        ).trim();
     }
 
     private static void loadDebugWhitelist(String apkPath, Set<Address> whitelist) throws Exception {
@@ -455,6 +505,130 @@ public final class CollectorHelperDaemon {
         String unavailableReason();
         int[] readInts(int dev, int[] fids) throws Throwable;
         float[] readFloats(int dev, int[] fids) throws Throwable;
+    }
+
+    static TelemetryWorkerSpool.Sample workerSample(
+        TelemetryWorkerSampleIdentity identity,
+        String catalogVersion,
+        long capturedWallMs,
+        long capturedElapsedMs,
+        List<Address> rows,
+        BatchResult result
+    ) {
+        if (rows.size() != result.values.length) {
+            throw new IllegalArgumentException(
+                "worker batch size mismatch: rows=" + rows.size() + " values=" + result.values.length
+            );
+        }
+        List<TelemetryWorkerSpool.Value> values = new ArrayList<TelemetryWorkerSpool.Value>(rows.size());
+        for (int index = 0; index < rows.size(); index++) {
+            Address row = rows.get(index);
+            ReadValue value = result.values[index];
+            values.add(new TelemetryWorkerSpool.Value(
+                index,
+                row.tx,
+                row.dev,
+                row.fid,
+                value.status,
+                value.raw,
+                value.error
+            ));
+        }
+        return new TelemetryWorkerSpool.Sample(
+            identity,
+            catalogVersion,
+            capturedWallMs,
+            capturedElapsedMs,
+            result.elapsedMs,
+            result.batchStatus,
+            result.mode,
+            result.nativeAvailable,
+            result.groupFailureCount,
+            result.error,
+            values
+        );
+    }
+
+    static final class WorkerPollLoop implements Runnable {
+        static final long INTERVAL_MS = 5_000L;
+
+        private final Handler handler;
+        private final List<Address> rows;
+        private final String catalogVersion;
+        private final String bootId;
+        private final String helperGeneration;
+        private final TelemetryWorkerSpool spool;
+        private final Object readLock;
+        private final ScalarReader scalarReader;
+        private final NativeReader nativeReader;
+        private long sequence;
+        private boolean stopped;
+        private String lastError;
+
+        WorkerPollLoop(
+            Handler handler,
+            List<Address> rows,
+            String catalogVersion,
+            String bootId,
+            String helperGeneration,
+            TelemetryWorkerSpool spool,
+            Object readLock,
+            ScalarReader scalarReader,
+            NativeReader nativeReader
+        ) {
+            this.handler = handler;
+            this.rows = rows;
+            this.catalogVersion = catalogVersion;
+            this.bootId = bootId;
+            this.helperGeneration = helperGeneration;
+            this.spool = spool;
+            this.readLock = readLock;
+            this.scalarReader = scalarReader;
+            this.nativeReader = nativeReader;
+        }
+
+        void start() {
+            handler.post(this);
+        }
+
+        void stop() {
+            stopped = true;
+            handler.removeCallbacks(this);
+        }
+
+        @Override public void run() {
+            if (stopped) return;
+            long cycleStartedAt = SystemClock.elapsedRealtime();
+            long capturedWallMs = System.currentTimeMillis();
+            long capturedElapsedMs = SystemClock.elapsedRealtime();
+            long pollSequence = sequence++;
+            try {
+                BatchResult result;
+                synchronized (readLock) {
+                    result = BatchEngine.run(rows, scalarReader, nativeReader);
+                }
+                spool.append(workerSample(
+                    new TelemetryWorkerSampleIdentity(bootId, helperGeneration, pollSequence),
+                    catalogVersion,
+                    capturedWallMs,
+                    capturedElapsedMs,
+                    rows,
+                    result
+                ));
+                lastError = null;
+            } catch (Throwable error) {
+                String currentError = describe(error);
+                if (!currentError.equals(lastError)) {
+                    System.err.println("WARN: telemetry worker poll failed: " + currentError);
+                    System.err.flush();
+                    lastError = currentError;
+                }
+            }
+            if (!stopped) {
+                long delayMs = Math.max(0L, INTERVAL_MS - (SystemClock.elapsedRealtime() - cycleStartedAt));
+                handler.postDelayed(this, delayMs);
+            }
+        }
     }
 
     static final class BatchEngine {
