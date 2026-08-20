@@ -53,6 +53,21 @@ class MqttPublishCoordinatorTest {
     }
 
     @Test
+    fun locationOptInPublishesCoordinates() {
+        val provider = MutableNormalizedProvider(
+            listOf(storedState("location_latitude", "location", valueNumber = 50.0))
+        )
+        val result = HaMqttMessageFactory(
+            normalizedProvider = provider,
+            configProvider = { config(enabledCategories = emptySet(), locationEnabled = true) },
+            clock = FakeClock()
+        ).fullResyncMessages() as MqttMessageBuildResult.Success
+
+        assertEquals(setOf("location"), provider.requestedCategories.single())
+        assertTrue(result.messages.any { it.topic == "bydcollector/state/location" })
+    }
+
+    @Test
     fun failedStartRetainsCompleteWorkAndReportsPersistedRetryDelay() {
         val client = FakeMqttClient(connectResult = MqttActionResult.fail("mqtt_error", "broker down"))
         val outbox = FakeOutboxStore()
@@ -514,7 +529,8 @@ class MqttPublishCoordinatorTest {
     private fun config(
         enabled: Boolean = true,
         discoveryEnabled: Boolean = true,
-        enabledCategories: Set<String> = HaMqttConfig.DEFAULT_CATEGORIES
+        enabledCategories: Set<String> = HaMqttConfig.DEFAULT_CATEGORIES,
+        locationEnabled: Boolean = false
     ): HaMqttConfig {
         return HaMqttConfig(
             enabled = enabled,
@@ -526,7 +542,8 @@ class MqttPublishCoordinatorTest {
             clientId = HaMqttConfig.DEFAULT_CLIENT_ID,
             topicPrefix = HaMqttConfig.DEFAULT_TOPIC_PREFIX,
             discoveryPrefix = HaMqttConfig.DEFAULT_DISCOVERY_PREFIX,
-            enabledCategories = enabledCategories
+            enabledCategories = enabledCategories,
+            locationEnabled = locationEnabled
         )
     }
 

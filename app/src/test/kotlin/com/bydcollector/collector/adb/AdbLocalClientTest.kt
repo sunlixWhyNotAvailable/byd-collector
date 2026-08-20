@@ -1,6 +1,7 @@
 package com.bydcollector.collector.adb
 
 import java.io.InputStream
+import java.io.ByteArrayOutputStream
 import java.io.OutputStream
 import java.net.ServerSocket
 import java.nio.ByteBuffer
@@ -125,6 +126,26 @@ class AdbLocalClientTest {
             assertEquals("partial output", result.output)
             assertEquals("shell command timed out", result.error)
             assertTrue(result.elapsedMs >= 100, "timeout elapsed time must not be reset to zero")
+        }
+    }
+
+    @Test
+    fun shellStreamUsesExactCommandAndClosesRemoteSocket() {
+        StreamingAdbServer().use { server ->
+            val client = AdbLocalClient(
+                keyDir = Files.createTempDirectory("bydcollector-adb-test").toFile(),
+                endpoints = listOf(AdbEndpoint("127.0.0.1", server.port))
+            )
+            val output = ByteArrayOutputStream()
+            val stream = client.openShellStream("logcat -b all -v threadtime", output)
+
+            assertTrue(server.awaitOpened())
+            assertTrue(server.awaitAcknowledged())
+            assertEquals("system log\n", output.toString(Charsets.UTF_8.name()))
+            assertTrue(server.command.contains("shell:logcat -b all -v threadtime\u0000"))
+
+            stream.close()
+            assertTrue(server.awaitClosed())
         }
     }
 
@@ -259,6 +280,46 @@ class AdbLocalClientTest {
 
         override fun close() {
             release.countDown()
+            server.close()
+        }
+    }
+
+    private class StreamingAdbServer : AutoCloseable {
+        private val server = ServerSocket(0)
+        private val opened = CountDownLatch(1)
+        private val acknowledged = CountDownLatch(1)
+        private val closed = CountDownLatch(1)
+        @Volatile
+        var command: String = ""
+            private set
+        val port: Int = server.localPort
+
+        init {
+            thread(name = "streaming-adb-test-server", isDaemon = true) {
+                runCatching {
+                    server.accept().use { socket ->
+                        val input = socket.getInputStream()
+                        val output = socket.getOutputStream()
+                        readAdbPacket(input)
+                        writeAdbPacket(output, COMMAND_CNXN, ADB_VERSION, ADB_MAX_DATA, "device::\u0000".toByteArray())
+                        command = String(readAdbPacket(input))
+                        opened.countDown()
+                        writeAdbPacket(output, COMMAND_OKAY, 2, 1, ByteArray(0))
+                        writeAdbPacket(output, COMMAND_WRTE, 2, 1, "system log\n".toByteArray())
+                        readAdbPacket(input)
+                        acknowledged.countDown()
+                        readAdbPacket(input)
+                        closed.countDown()
+                    }
+                }
+            }
+        }
+
+        fun awaitOpened(): Boolean = opened.await(3, TimeUnit.SECONDS)
+        fun awaitAcknowledged(): Boolean = acknowledged.await(3, TimeUnit.SECONDS)
+        fun awaitClosed(): Boolean = closed.await(3, TimeUnit.SECONDS)
+
+        override fun close() {
             server.close()
         }
     }

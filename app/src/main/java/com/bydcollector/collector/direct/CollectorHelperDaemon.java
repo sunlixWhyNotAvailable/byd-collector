@@ -170,6 +170,7 @@ public final class CollectorHelperDaemon {
                     return true;
                 }
                 if (code == CollectorHelperProtocol.TX_WORKER_PENDING) {
+                    if (workerPollLoop != null) workerPollLoop.markConsumerHeartbeat();
                     if (reply != null) {
                         if (workerSpool == null) {
                             writeWorkerPendingReply(
@@ -582,7 +583,9 @@ public final class CollectorHelperDaemon {
     }
 
     static final class WorkerPollLoop implements Runnable {
-        static final long INTERVAL_MS = 5_000L;
+        static final long ACTIVE_INTERVAL_MS = 500L;
+        static final long DETACHED_INTERVAL_MS = 5_000L;
+        static final long CONSUMER_LEASE_MS = 2_000L;
 
         private final Handler handler;
         private final List<Address> rows;
@@ -594,6 +597,7 @@ public final class CollectorHelperDaemon {
         private final ScalarReader scalarReader;
         private final NativeReader nativeReader;
         private long sequence;
+        private volatile long lastConsumerHeartbeatElapsedMs;
         private boolean stopped;
         private String lastError;
 
@@ -628,6 +632,17 @@ public final class CollectorHelperDaemon {
             handler.removeCallbacks(this);
         }
 
+        void markConsumerHeartbeat() {
+            long now = SystemClock.elapsedRealtime();
+            long previous = lastConsumerHeartbeatElapsedMs;
+            lastConsumerHeartbeatElapsedMs = now;
+            if (previous == 0L || now - previous > CONSUMER_LEASE_MS) {
+                //wake a detached loop immediately; repeated active heartbeats do not repost work
+                handler.removeCallbacks(this);
+                if (!stopped) handler.post(this);
+            }
+        }
+
         @Override public void run() {
             if (stopped) return;
             long cycleStartedAt = SystemClock.elapsedRealtime();
@@ -635,11 +650,21 @@ public final class CollectorHelperDaemon {
             long capturedElapsedMs = SystemClock.elapsedRealtime();
             long pollSequence = sequence++;
             try {
+                if (!spool.canAppend()) {
+                    String currentError = "telemetry worker spool cap reached";
+                    if (!currentError.equals(lastError)) {
+                        System.err.println("WARN: " + currentError);
+                        System.err.flush();
+                        lastError = currentError;
+                    }
+                    scheduleNext(cycleStartedAt);
+                    return;
+                }
                 BatchResult result;
                 synchronized (readLock) {
                     result = BatchEngine.run(rows, scalarReader, nativeReader);
                 }
-                spool.append(workerSample(
+                boolean appended = spool.append(workerSample(
                     new TelemetryWorkerSampleIdentity(bootId, helperGeneration, pollSequence),
                     catalogVersion,
                     capturedWallMs,
@@ -647,7 +672,16 @@ public final class CollectorHelperDaemon {
                     rows,
                     result
                 ));
-                lastError = null;
+                if (appended) {
+                    lastError = null;
+                } else {
+                    String currentError = "telemetry worker spool cap reached";
+                    if (!currentError.equals(lastError)) {
+                        System.err.println("WARN: " + currentError);
+                        System.err.flush();
+                        lastError = currentError;
+                    }
+                }
             } catch (Throwable error) {
                 String currentError = describe(error);
                 if (!currentError.equals(lastError)) {
@@ -656,8 +690,15 @@ public final class CollectorHelperDaemon {
                     lastError = currentError;
                 }
             }
+            scheduleNext(cycleStartedAt);
+        }
+
+        private void scheduleNext(long cycleStartedAt) {
             if (!stopped) {
-                long delayMs = Math.max(0L, INTERVAL_MS - (SystemClock.elapsedRealtime() - cycleStartedAt));
+                long intervalMs = SystemClock.elapsedRealtime() - lastConsumerHeartbeatElapsedMs <= CONSUMER_LEASE_MS
+                    ? ACTIVE_INTERVAL_MS
+                    : DETACHED_INTERVAL_MS;
+                long delayMs = Math.max(0L, intervalMs - (SystemClock.elapsedRealtime() - cycleStartedAt));
                 handler.postDelayed(this, delayMs);
             }
         }

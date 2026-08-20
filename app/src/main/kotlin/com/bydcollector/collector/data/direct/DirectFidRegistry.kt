@@ -36,7 +36,7 @@ enum class DirectValueDecoder {
 
 //curated read-only autoservice scope for the main db; exploratory values belong in round-robin
 object DirectFidRegistry {
-    const val CATALOG_VERSION = "autoservice-fid-direct-20260719-curated-81-energy-soc-v1"
+    const val CATALOG_VERSION = "autoservice-fid-direct-20260820-curated-82-power-v1"
     const val TX_GET_INT = 5
     const val TX_GET_FLOAT = 7
 
@@ -122,6 +122,7 @@ object DirectFidRegistry {
         DirectFidEntry("statistic_average_battery_temp", 1014, 1148190776, TX_GET_INT, DirectValueDecoder.INT_TEMP_C_OFS40, groupName = "direct_statistic", featureNames = "STATISTIC_AVERAGE_BATTERY_TEMP;Statistic.STATISTIC_AVERAGE_BATTERY_TEMP", classification = "vehicle_energy_candidate", prodCategory = "charging_energy", source = "wide-poll-session-20260605_161751"),
         DirectFidEntry("charging_1009_89128973_5", 1009, 89128973, TX_GET_INT, DirectValueDecoder.INT_RAW, groupName = "direct_charging", featureNames = "CHARGING_CHARGER_CONNECT_STATE;Charging.CHARGING_CHARGER_CONNECT_STATE", classification = "round_robin_promoted_20260613", prodCategory = "charging_energy", source = "wide-poll-session-20260605_161751"),
         DirectFidEntry("statistic_1014_877658120_5", 1014, 877658120, TX_GET_INT, DirectValueDecoder.INT_RAW, groupName = "direct_statistic", featureNames = "STATISTIC_MAX_DISCHARGE_POWER_ALLOW;Statistic.STATISTIC_MAX_DISCHARGE_POWER_ALLOW", classification = "round_robin_promoted_20260613", prodCategory = "charging_energy", source = "wide-poll-session-20260605_161751"),
+        DirectFidEntry("bodywork_power_level", 1001, 315621418, TX_GET_INT, DirectValueDecoder.INT_RAW, groupName = "direct_bodywork", featureNames = "BODYWORK_POWER_LEVEL;Bodywork.BODYWORK_POWER_LEVEL", classification = "curated_power_boundary_20260820", prodCategory = "curated_main", source = "archived_power-transition-evidence-20260817"),
     )
 }
 

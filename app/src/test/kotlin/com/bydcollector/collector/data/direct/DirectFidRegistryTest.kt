@@ -11,13 +11,13 @@ class DirectFidRegistryTest {
     fun registryContainsAllWidePollDynamicReadFields() {
         val entries = DirectFidRegistry.entries
 
-        assertEquals(81, entries.size)
+        assertEquals(82, entries.size)
         assertEquals(entries.size, entries.map { it.key }.distinct().size)
         assertEquals(
             entries.size,
             entries.map { Triple(it.dev, it.fid, it.tx) }.distinct().size
         )
-        assertEquals("autoservice-fid-direct-20260719-curated-81-energy-soc-v1", DirectFidRegistry.CATALOG_VERSION)
+        assertEquals("autoservice-fid-direct-20260820-curated-82-power-v1", DirectFidRegistry.CATALOG_VERSION)
         assertNotNull(entries.firstOrNull { it.key == "statistic_1014_1134559272_5" && it.dev == 1014 && it.fid == 1134559272 && it.tx == 5 })
         assertNotNull(entries.firstOrNull { it.key == "statistic_1014_1145045040_5" && it.dev == 1014 && it.fid == 1145045040 && it.tx == 5 })
         assertNotNull(entries.firstOrNull { it.key == "charging_charge_battery_volt" && it.dev == 1009 && it.fid == 1145045000 && it.tx == 5 })
@@ -27,6 +27,7 @@ class DirectFidRegistryTest {
         assertNotNull(entries.firstOrNull { it.key == "tyre_1016_-1728052957_5" && it.dev == 1016 && it.fid == -1728052957 && it.tx == 5 })
         assertNotNull(entries.firstOrNull { it.key == "charging_1009_89128973_5" && it.dev == 1009 && it.fid == 89128973 && it.tx == 5 })
         assertNotNull(entries.firstOrNull { it.key == "statistic_1014_877658120_5" && it.dev == 1014 && it.fid == 877658120 && it.tx == 5 })
+        assertNotNull(entries.firstOrNull { it.key == "bodywork_power_level" && it.dev == 1001 && it.fid == 315621418 && it.tx == 5 })
         assertNotNull(entries.firstOrNull { it.key == "statistic_1014_1145045032_5" && it.dev == 1014 && it.fid == 1145045032 && it.tx == 5 })
         assertTrue(entries.none { it.key == "power_low_voltage" })
         assertNotNull(entries.firstOrNull { it.key == "statistic_remaining_battery_power" && it.dev == 1014 && it.fid == 1148190760 && it.tx == 5 })

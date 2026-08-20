@@ -12,8 +12,8 @@ android {
         applicationId = "com.bydcollector.collector"
         minSdk = 26
         targetSdk = 29
-        versionCode = 263
-        versionName = "2.6.3"
+        versionCode = 270
+        versionName = "2.7.0"
         manifestPlaceholders["collectorLabel"] = "BYD Collector"
         buildConfigField("String", "COLLECTOR_DISPLAY_NAME", "\"BYD Collector\"")
         buildConfigField("String", "COLLECTOR_DATABASE_NAME", "\"bydcollector_telemetry.db\"")
@@ -51,6 +51,7 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("org.osmdroid:osmdroid-android:6.1.20")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     testImplementation(kotlin("test"))

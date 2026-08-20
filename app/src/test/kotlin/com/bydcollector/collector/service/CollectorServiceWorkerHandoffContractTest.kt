@@ -2,6 +2,7 @@ package com.bydcollector.collector.service
 
 import java.io.File
 import kotlin.test.Test
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class CollectorServiceWorkerHandoffContractTest {
@@ -11,7 +12,7 @@ class CollectorServiceWorkerHandoffContractTest {
         val runner = sourceFile("com/bydcollector/collector/data/polling/TelemetryWorkerReplayCoordinator.kt").readText()
         val create = service.substringAfter("private fun createTelemetryPoller").substringBefore("private fun createSuccessfulPollObserver")
 
-        assertTrue(create.contains("ownerMode: DirectHelperOwnerMode = settings.mainHelperOwnerMode()"))
+        assertTrue(create.contains("ownerMode: DirectHelperOwnerMode = DirectHelperOwnerMode.AUTONOMOUS_WORKER"))
         assertTrue(create.contains("val live = if (ownerMode == DirectHelperOwnerMode.APP)"))
         assertTrue(create.contains("liveClient.ensureHelperReady(ownerMode)"))
         assertTrue(create.contains("TelemetryWorkerReplayPollCycleRunner("))
@@ -20,15 +21,16 @@ class CollectorServiceWorkerHandoffContractTest {
     }
 
     @Test
-    fun everyHelperRepairPathUsesThePersistedOwnerMode() {
+    fun everyHelperRepairPathUsesTheStandardOwnerMode() {
         val settings = sourceFile("com/bydcollector/collector/service/CollectorSettings.kt").readText()
         val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
         val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
         val autoStart = sourceFile("com/bydcollector/collector/system/CollectorAutoStart.kt").readText()
         val access = sourceFile("com/bydcollector/collector/adb/AdbAuthorizationManager.kt").readText()
 
-        assertTrue(settings.contains("isAutonomousMainWorkerEnabled() &&"))
+        assertFalse(settings.substringAfter("fun mainHelperOwnerMode").substringBefore("fun isDebugPollingEnabled").contains("isAutonomousMainWorkerEnabled()"))
         assertTrue(settings.contains("DirectHelperOwnerMode.AUTONOMOUS_WORKER"))
+        assertTrue(service.contains("ownerMode: DirectHelperOwnerMode = DirectHelperOwnerMode.AUTONOMOUS_WORKER"))
         assertTrue(service.contains("ownerMode = settings.mainHelperOwnerMode()"))
         assertTrue(activity.contains("helperOwnerMode = settings.mainHelperOwnerMode()"))
         assertTrue(autoStart.contains("helperOwnerMode = settings.mainHelperOwnerMode()"))

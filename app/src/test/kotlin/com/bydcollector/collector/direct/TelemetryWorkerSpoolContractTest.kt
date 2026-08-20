@@ -21,7 +21,8 @@ class TelemetryWorkerSpoolContractTest {
 
     @Test
     fun schemaUsesImmutableIdentityAndReadOnlyTransactions() {
-        assertEquals(1, TelemetryWorkerSpool.SCHEMA_VERSION)
+        assertEquals(2, TelemetryWorkerSpool.SCHEMA_VERSION)
+        assertEquals(128L * 1024L * 1024L, TelemetryWorkerSpool.MAX_DATABASE_BYTES)
         assertTrue(
             TelemetryWorkerSpool.CREATE_SAMPLE_TABLE.contains(
                 "PRIMARY KEY(boot_id, helper_generation, poll_sequence)"
@@ -34,6 +35,7 @@ class TelemetryWorkerSpoolContractTest {
         )
         assertTrue(TelemetryWorkerSpool.CREATE_VALUE_TABLE.contains("CHECK(tx IN (5,7))"))
         assertTrue(TelemetryWorkerSpool.CREATE_SAMPLE_TABLE.contains("acknowledged_at_ms INTEGER"))
+        assertTrue(source("com/bydcollector/collector/direct/TelemetryWorkerSpool.java").contains("database.delete("))
     }
 
     @Test
@@ -79,6 +81,20 @@ class TelemetryWorkerSpoolContractTest {
         assertTrue(headers.contains("\"captured_wall_ms, captured_elapsed_ms, boot_id, helper_generation, poll_sequence\""))
         assertTrue(headers.contains("Integer.toString(limit)"))
     }
+
+    @Test
+    fun appendsPauseAtCapWithoutEvictingUnacknowledgedRows() {
+        val source = projectFile(
+            "app/src/main/java/com/bydcollector/collector/direct/TelemetryWorkerSpool.java",
+            "src/main/java/com/bydcollector/collector/direct/TelemetryWorkerSpool.java"
+        ).readText()
+        assertTrue(source.contains("MAX_APPEND_RESERVATION_BYTES"))
+        assertTrue(source.contains("return false"))
+        assertTrue(source.contains("wal_checkpoint(TRUNCATE)"))
+        assertTrue(source.contains("acknowledged_at_ms IS NOT NULL"))
+    }
+
+    private fun source(path: String): String = projectFile("app/src/main/java/$path", "src/main/java/$path").readText()
 
     private fun projectFile(vararg paths: String): File =
         paths.map(::File).firstOrNull(File::isFile) ?: error("Missing project file: ${paths.joinToString()}")

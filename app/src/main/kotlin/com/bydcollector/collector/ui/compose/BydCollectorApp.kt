@@ -1,5 +1,9 @@
 package com.bydcollector.collector.ui.compose
 
+import android.content.Context
+import android.graphics.Color as AndroidColor
+import android.view.ViewGroup
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -23,6 +27,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -31,10 +36,12 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -52,6 +59,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.viewinterop.AndroidView
 import com.bydcollector.collector.R
 import com.bydcollector.collector.maintenance.ArchiveEntryStatus
 import com.bydcollector.collector.maintenance.ArchiveStorageSnapshot
@@ -67,6 +75,12 @@ import com.bydcollector.collector.update.ReleaseNotesSelector
 import com.bydcollector.collector.update.UpdateInfo
 import com.bydcollector.collector.update.UpdateUiState
 import java.util.Locale
+import org.osmdroid.config.Configuration
+import org.osmdroid.tileprovider.tilesource.XYTileSource
+import org.osmdroid.util.BoundingBox
+import org.osmdroid.util.GeoPoint
+import org.osmdroid.views.MapView
+import org.osmdroid.views.overlay.Polyline
 
 @Composable
 fun BydCollectorApp(
@@ -77,6 +91,10 @@ fun BydCollectorApp(
     darkTheme: Boolean,
     mqttDraft: MqttDraft,
     influxDraft: InfluxDraft,
+    tripsUiState: TripsUiState = TripsUiState(),
+    tripsUiActions: TripsUiActions = TripsUiActions(),
+    mqttLocationEnabled: Boolean = false,
+    influxLocationEnabled: Boolean = false,
     telegramUiState: TelegramUiState = TelegramUiState(),
     telegramActions: TelegramUiActions = TelegramUiActions(),
     appVersionName: String = "",
@@ -128,7 +146,16 @@ fun BydCollectorApp(
                             when (activeTab) {
                                 AppTab.MAIN -> MainTab(state, s, actions)
                                 AppTab.ALL_PARAMETERS -> AllParametersTab(state, s, language, actions)
-                                AppTab.HA -> HaTab(state, s, mqttDraft, influxDraft, actions)
+                                AppTab.TRIPS -> TripsTab(tripsUiState, tripsUiActions, s)
+                                AppTab.HA -> HaTab(
+                                    state,
+                                    s,
+                                    mqttDraft,
+                                    influxDraft,
+                                    mqttLocationEnabled,
+                                    influxLocationEnabled,
+                                    actions
+                                )
                                 AppTab.TELEGRAM -> TelegramTab(s, telegramUiState, telegramActions)
                                 AppTab.STORAGE -> StorageTab(state, s, actions) { ids ->
                                     pendingArchiveDeleteIds = ids
@@ -458,6 +485,8 @@ private fun MainCollectionCard(
             Text(strings.permissions, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(0.75f))
             ActionButton(strings.grantAdb, actions::onGrantAdb, primary = true, modifier = Modifier.weight(0.9f))
             Spacer(Modifier.width(10.dp))
+            ActionButton(strings.grantLocation, actions::onRequestLocationPermission, modifier = Modifier.weight(0.9f))
+            Spacer(Modifier.width(10.dp))
             ActionButton(strings.backgroundWork, actions::onOpenBackgroundApps, modifier = Modifier.weight(0.9f))
         }
         Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -587,11 +616,326 @@ private fun DebugDatabaseCard(state: DashboardState?, strings: UiStrings, action
 }
 
 @Composable
+private fun TripsTab(
+    state: TripsUiState,
+    actions: TripsUiActions,
+    strings: UiStrings
+) {
+    var selectedTripId by remember { mutableStateOf<String?>(null) }
+    val selectedTrip = state.years.asSequence()
+        .flatMap { it.months.asSequence() }
+        .flatMap { it.days.asSequence() }
+        .flatMap { it.trips.asSequence() }
+        .firstOrNull { it.id == selectedTripId }
+    TabScrollColumn {
+        ScreenTitle(strings.tripsTab, strings.tripsSubtitle)
+        SectionCard(strings.routeColors, modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(strings.speed, color = if (state.colorMetric == TripMapMetric.SPEED) LocalBydPalette.current.text else LocalBydPalette.current.muted, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                BydSwitch(
+                    checked = state.colorMetric == TripMapMetric.CONSUMPTION,
+                    onCheckedChange = { actions.onColorMetricChanged(if (it) TripMapMetric.CONSUMPTION else TripMapMetric.SPEED) }
+                )
+                Text(strings.consumption, color = if (state.colorMetric == TripMapMetric.CONSUMPTION) LocalBydPalette.current.text else LocalBydPalette.current.muted, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.weight(1f))
+                TripThresholdRow(
+                    strings = strings,
+                    metric = state.colorMetric,
+                    green = if (state.colorMetric == TripMapMetric.SPEED) state.speedGreenThreshold else state.consumptionGreenThreshold,
+                    yellow = if (state.colorMetric == TripMapMetric.SPEED) state.speedYellowThreshold else state.consumptionYellowThreshold,
+                    onChange = { green, yellow ->
+                        if (state.colorMetric == TripMapMetric.SPEED) actions.onSpeedThresholdsChanged(green, yellow)
+                        else actions.onConsumptionThresholdsChanged(green, yellow)
+                    }
+                )
+            }
+        }
+        SectionCard(strings.tripList, modifier = Modifier.fillMaxWidth()) {
+            if (state.years.isEmpty()) {
+                Text(strings.noTrips, color = LocalBydPalette.current.muted, fontSize = 13.sp, modifier = Modifier.fillMaxWidth().padding(18.dp), textAlign = TextAlign.Center)
+            } else {
+                state.years.forEach { year ->
+                    TripGroupRow(strings, year.title, year.distanceKm, year.energyKwh, year.averageConsumptionKwhPer100Km, year.months.sumOf { it.days.sumOf { day -> day.trips.size } })
+                    year.months.forEach { month ->
+                        TripGroupRow(strings, month.title, month.distanceKm, month.energyKwh, month.averageConsumptionKwhPer100Km, month.days.sumOf { it.trips.size }, indent = 12.dp)
+                        month.days.forEach { day ->
+                            TripGroupRow(strings, day.title, day.distanceKm, day.energyKwh, day.averageConsumptionKwhPer100Km, day.trips.size, indent = 24.dp)
+                            TripTableHeader(strings)
+                            day.trips.forEach { trip ->
+                                TripTableRow(strings, trip) {
+                                    selectedTripId = trip.id
+                                    actions.onRouteRequested(trip.id)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    selectedTrip?.let { trip ->
+        TripRouteDialog(
+            trip = trip,
+            state = state,
+            strings = strings,
+            onDismiss = { selectedTripId = null }
+        )
+    }
+}
+
+@Composable
+private fun TripThresholdRow(
+    strings: UiStrings,
+    metric: TripMapMetric,
+    green: Int,
+    yellow: Int,
+    onChange: (Int, Int) -> Unit
+) {
+    var greenText by remember(metric, green) { mutableStateOf(green.toString()) }
+    var yellowText by remember(metric, yellow) { mutableStateOf(yellow.toString()) }
+    val speed = metric == TripMapMetric.SPEED
+    val boundary = if (speed) ">=" else "<="
+    val between = if (speed) ">" else "<"
+    val p = LocalBydPalette.current
+    Text(strings.green, color = p.green, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+    Text(boundary, color = p.muted, fontSize = 12.sp)
+    TextInput("", greenText, { value -> greenText = value; value.toIntOrNull()?.let { onChange(it, yellowText.toIntOrNull() ?: yellow) } }, Modifier.width(62.dp), keyboardType = KeyboardType.Number)
+    Text(between, color = p.muted, fontSize = 12.sp)
+    Text(strings.yellow, color = p.yellow, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+    Text(boundary, color = p.muted, fontSize = 12.sp)
+    TextInput("", yellowText, { value -> yellowText = value; value.toIntOrNull()?.let { onChange(greenText.toIntOrNull() ?: green, it) } }, Modifier.width(62.dp), keyboardType = KeyboardType.Number)
+    Text(between, color = p.muted, fontSize = 12.sp)
+    Text(strings.red, color = p.red, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+}
+
+@Composable
+private fun TripGroupRow(
+    strings: UiStrings,
+    title: String,
+    distanceKm: Double?,
+    energyKwh: Double?,
+    averageConsumption: Double?,
+    tripCount: Int,
+    indent: Dp = 0.dp
+) {
+    val p = LocalBydPalette.current
+    Column(Modifier.fillMaxWidth().padding(start = indent)) {
+        Row(Modifier.fillMaxWidth().heightIn(min = 42.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(title, color = p.text, fontSize = if (indent == 0.dp) 16.sp else 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+            Text("${formatTripNumber(distanceKm)} ${if (strings.distance == "Відстань") "км" else "km"} • ${formatTripNumber(energyKwh)} ${if (strings.used == "Витрачено") "кВт·год" else "kWh"} • ${formatTripNumber(averageConsumption)} ${if (strings.used == "Витрачено") "кВт·год/100 км" else "kWh/100 km"} • $tripCount", color = p.muted, fontSize = 12.sp, textAlign = TextAlign.End)
+        }
+        Box(Modifier.fillMaxWidth().height(1.dp).background(p.border))
+    }
+}
+
+@Composable
+private fun TripTableHeader(strings: UiStrings) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+        listOf(strings.startEnd, strings.duration, strings.distance, "SOC", strings.used, strings.averageConsumption, strings.route).forEach { label ->
+            Text(label, color = LocalBydPalette.current.muted, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center, modifier = Modifier.weight(1f).padding(horizontal = 3.dp))
+        }
+    }
+}
+
+@Composable
+private fun TripTableRow(strings: UiStrings, trip: TripSummaryUi, onRoute: () -> Unit) {
+    val p = LocalBydPalette.current
+    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
+        listOf(
+            "${trip.startAt} → ${trip.endAt}",
+            trip.duration,
+            "${formatTripNumber(trip.distanceKm)} ${if (strings.distance == "Відстань") "км" else "km"}",
+            "${formatTripNumber(trip.socStart)} → ${formatTripNumber(trip.socEnd)}%",
+            "${formatTripNumber(trip.energyKwh)} ${if (strings.used == "Витрачено") "кВт·год" else "kWh"}",
+            "${formatTripNumber(trip.averageConsumptionKwhPer100Km)} ${if (strings.used == "Витрачено") "кВт·год/100 км" else "kWh/100 km"}",
+        ).forEachIndexed { index, value ->
+            Text(value, color = if (index == 5) p.green else p.text, fontSize = 11.sp, fontWeight = if (index == 0 || index == 5) FontWeight.SemiBold else FontWeight.Normal, textAlign = TextAlign.Center, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(horizontal = 3.dp))
+        }
+        Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+            ActionButton(strings.route, onRoute, modifier = Modifier.width(92.dp))
+        }
+    }
+    Box(Modifier.fillMaxWidth().height(1.dp).background(p.border.copy(alpha = 0.55f)))
+}
+
+private fun formatTripNumber(value: Double?): String = value?.takeIf { it.isFinite() }?.let {
+    "%.1f".format(Locale.US, it).trimEnd('0').trimEnd('.')
+} ?: "-"
+
+@Composable
+private fun TripRouteDialog(
+    trip: TripSummaryUi,
+    state: TripsUiState,
+    strings: UiStrings,
+    onDismiss: () -> Unit
+) {
+    var metric by rememberSaveable(trip.id) { mutableStateOf(state.colorMetric) }
+    val p = LocalBydPalette.current
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(dismissOnClickOutside = false, usePlatformDefaultWidth = false)) {
+        Box(Modifier.fillMaxSize().background(p.background.copy(alpha = 0.82f)).padding(28.dp), contentAlignment = Alignment.Center) {
+            ModalInputBlocker()
+            Column(Modifier.fillMaxWidth(0.92f).fillMaxHeight(0.86f).background(p.panel, Rounded8).border(1.dp, p.borderStrong, Rounded8).padding(14.dp)) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Column {
+                        Text(strings.tripRoute, color = p.text, fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
+                        Text("${trip.startAt} → ${trip.endAt} • ${formatTripNumber(trip.distanceKm)} km", color = p.muted, fontSize = 12.sp)
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+                TripMapView(
+                    points = trip.route,
+                    metric = metric,
+                    speedGreen = state.speedGreenThreshold,
+                    speedYellow = state.speedYellowThreshold,
+                    consumptionGreen = state.consumptionGreenThreshold,
+                    consumptionYellow = state.consumptionYellowThreshold,
+                    modifier = Modifier.weight(1f).fillMaxWidth()
+                )
+                Row(Modifier.fillMaxWidth().padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(strings.colorBySpeed, color = if (metric == TripMapMetric.SPEED) p.text else p.muted, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.width(10.dp))
+                    BydSwitch(metric == TripMapMetric.CONSUMPTION, { metric = if (it) TripMapMetric.CONSUMPTION else TripMapMetric.SPEED })
+                    Spacer(Modifier.width(10.dp))
+                    Text(strings.colorByConsumption, color = if (metric == TripMapMetric.CONSUMPTION) p.text else p.muted, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.weight(1f))
+                    ActionButton(strings.close, onDismiss, modifier = Modifier.width(140.dp))
+                }
+            }
+        }
+    }
+}
+
+private fun createTripMap(context: Context): MapView {
+    val cache = java.io.File(context.cacheDir, "osmdroid").apply { mkdirs() }
+    trimTripMapCache(cache)
+    Configuration.getInstance().load(context, context.getSharedPreferences("osmdroid", Context.MODE_PRIVATE))
+    Configuration.getInstance().userAgentValue = "BYD Collector/2.7.0"
+    Configuration.getInstance().osmdroidTileCache = cache
+    return MapView(context).apply {
+        setTileSource(XYTileSource(
+            "OpenStreetMap",
+            0,
+            19,
+            256,
+            ".png",
+            arrayOf("https://tile.openstreetmap.org/")
+        ))
+        setMultiTouchControls(true)
+        layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+    }
+}
+
+private fun trimTripMapCache(cache: java.io.File) {
+    val files = cache.walkTopDown().filter { it.isFile }.toList()
+    var bytes = files.sumOf { it.length() }
+    if (bytes <= 64L * 1024L * 1024L) return
+    files.sortedBy { it.lastModified() }.forEach { file ->
+        if (bytes <= 64L * 1024L * 1024L) return@forEach
+        bytes -= file.length()
+        runCatching { file.delete() }
+    }
+}
+
+@Composable
+private fun TripMapView(
+    points: List<TripRoutePointUi>,
+    metric: TripMapMetric,
+    speedGreen: Int,
+    speedYellow: Int,
+    consumptionGreen: Int,
+    consumptionYellow: Int,
+    modifier: Modifier = Modifier
+) {
+    val p = LocalBydPalette.current
+    val context = androidx.compose.ui.platform.LocalContext.current
+    Box(modifier.clip(Rounded8).background(p.pathField).border(1.dp, p.border, Rounded8)) {
+        if (points.none { !it.gap }) {
+            Text("© OpenStreetMap contributors", color = p.muted, fontSize = 10.sp, modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp))
+        } else {
+            AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { createTripMap(context) },
+                update = { map -> updateTripMap(map, points, metric, speedGreen, speedYellow, consumptionGreen, consumptionYellow) },
+                onRelease = MapView::onDetach
+            )
+            Text("© OpenStreetMap contributors", color = p.muted, fontSize = 10.sp, modifier = Modifier.align(Alignment.BottomEnd).background(p.surface.copy(alpha = 0.86f), Rounded8).padding(horizontal = 8.dp, vertical = 4.dp))
+        }
+    }
+}
+
+private fun updateTripMap(
+    map: MapView,
+    points: List<TripRoutePointUi>,
+    metric: TripMapMetric,
+    speedGreen: Int,
+    speedYellow: Int,
+    consumptionGreen: Int,
+    consumptionYellow: Int
+) {
+    map.overlays.clear()
+    val runs = buildList {
+        var run = mutableListOf<TripRoutePointUi>()
+        points.forEach { point ->
+            if (point.gap || !point.latitude.isFinite() || !point.longitude.isFinite()) {
+                if (run.size > 1) add(run)
+                run = mutableListOf()
+            } else {
+                run += point
+            }
+        }
+        if (run.size > 1) add(run)
+    }
+    val p = runs.flatten()
+    if (p.isEmpty()) return
+    runs.forEach { run ->
+        run.zipWithNext().forEach { (from, to) ->
+            val line = Polyline(map).apply {
+                setPoints(listOf(GeoPoint(from.latitude, from.longitude), GeoPoint(to.latitude, to.longitude)))
+                color = when (metric) {
+                    TripMapMetric.SPEED -> routeColor(from.speedKmh, speedGreen.toDouble(), speedYellow.toDouble(), speed = true)
+                    TripMapMetric.CONSUMPTION -> routeColor(from.consumptionKwhPer100Km, consumptionGreen.toDouble(), consumptionYellow.toDouble(), speed = false)
+                }
+                width = 8f
+            }
+            map.overlays += line
+        }
+    }
+    map.post {
+        if (p.size == 1) {
+            map.controller.setCenter(GeoPoint(p.first().latitude, p.first().longitude))
+            map.controller.setZoom(14.0)
+        } else {
+            map.zoomToBoundingBox(
+                BoundingBox.fromGeoPoints(p.map { GeoPoint(it.latitude, it.longitude) }),
+                true,
+                64
+            )
+        }
+    }
+    map.invalidate()
+}
+
+private fun routeColor(value: Double?, green: Double, yellow: Double, speed: Boolean): Int = when {
+    value == null -> AndroidColor.GRAY
+    speed && value >= green -> AndroidColor.rgb(84, 216, 152)
+    speed && value > yellow -> AndroidColor.rgb(242, 195, 78)
+    !speed && value <= green -> AndroidColor.rgb(84, 216, 152)
+    !speed && value <= yellow -> AndroidColor.rgb(242, 195, 78)
+    else -> AndroidColor.rgb(255, 140, 140)
+}
+
+@Composable
 private fun HaTab(
     state: DashboardState?,
     strings: UiStrings,
     mqttDraft: MqttDraft,
     influxDraft: InfluxDraft,
+    mqttLocationEnabled: Boolean,
+    influxLocationEnabled: Boolean,
     actions: BydCollectorActions
 ) {
     TabScrollColumn {
@@ -602,14 +946,21 @@ private fun HaTab(
             BydSwitch(state?.haSharedCategoriesEnabled == true, actions::onToggleSharedCategories, enabled = state?.influxEnabled != true)
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            MqttCard(state, strings, mqttDraft, actions, Modifier.weight(1f))
-            InfluxCard(state, strings, influxDraft, actions, Modifier.weight(1f))
+            MqttCard(state, strings, mqttDraft, mqttLocationEnabled, actions, Modifier.weight(1f))
+            InfluxCard(state, strings, influxDraft, influxLocationEnabled, actions, Modifier.weight(1f))
         }
     }
 }
 
 @Composable
-private fun MqttCard(state: DashboardState?, strings: UiStrings, draft: MqttDraft, actions: BydCollectorActions, modifier: Modifier) {
+private fun MqttCard(
+    state: DashboardState?,
+    strings: UiStrings,
+    draft: MqttDraft,
+    locationEnabled: Boolean,
+    actions: BydCollectorActions,
+    modifier: Modifier
+) {
     SectionCard(
         title = "MQTT",
         trailing = { StatusPill(compactChannelStatusText(state?.mqttStatus, strings), channelStatusKind(state?.mqttStatus, state?.mqttEnabled == true), compact = true) },
@@ -624,12 +975,20 @@ private fun MqttCard(state: DashboardState?, strings: UiStrings, draft: MqttDraf
         CategoryGrid(strings.mqttCategories, state?.mqttEnabledCategories.orEmpty(), enabled = state?.mqttEnabled != true, strings = strings) { category ->
             actions.onToggleMqttCategory(category, !state?.mqttEnabledCategories.orEmpty().contains(category))
         }
+        SwitchRow(strings.location, locationEnabled, actions::onToggleMqttLocation)
         CredentialGridMqtt(strings, draft, actions)
     }
 }
 
 @Composable
-private fun InfluxCard(state: DashboardState?, strings: UiStrings, draft: InfluxDraft, actions: BydCollectorActions, modifier: Modifier) {
+private fun InfluxCard(
+    state: DashboardState?,
+    strings: UiStrings,
+    draft: InfluxDraft,
+    locationEnabled: Boolean,
+    actions: BydCollectorActions,
+    modifier: Modifier
+) {
     SectionCard(
         title = "InfluxDB",
         trailing = { StatusPill(compactChannelStatusText(state?.influxStatus, strings), channelStatusKind(state?.influxStatus, state?.influxEnabled == true), compact = true) },
@@ -649,6 +1008,7 @@ private fun InfluxCard(state: DashboardState?, strings: UiStrings, draft: Influx
         ) { category ->
             actions.onToggleInfluxCategory(category, !state?.influxEnabledCategories.orEmpty().contains(category))
         }
+        SwitchRow(strings.location, locationEnabled, actions::onToggleInfluxLocation)
         CredentialGridInflux(strings, draft, actions)
     }
 }
@@ -944,7 +1304,14 @@ private fun TelegramMessageCard(
         modifier = modifier
     ) {
         telegramNumberSetting(definition.type, config, strings.telegram, onConfigChanged)?.let { setting ->
-            TelegramNumberStepper(setting)
+            TelegramNumberStepper(
+                setting = setting,
+                sendLocationEnabled = definition.type == TelegramMessageType.TRIP_SUMMARY && config.sendLocation,
+                onSendLocationChanged = { onConfigChanged(config.copy(sendLocation = it)) },
+                sendLocationLabel = strings.sendLocation.takeIf {
+                    definition.type == TelegramMessageType.TRIP_SUMMARY
+                }.orEmpty()
+            )
         }
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -994,7 +1361,12 @@ private fun TelegramMessageCard(
 }
 
 @Composable
-private fun TelegramNumberStepper(setting: TelegramNumberSetting) {
+private fun TelegramNumberStepper(
+    setting: TelegramNumberSetting,
+    sendLocationEnabled: Boolean = false,
+    onSendLocationChanged: (Boolean) -> Unit = {},
+    sendLocationLabel: String = ""
+) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(7.dp),
@@ -1017,6 +1389,10 @@ private fun TelegramNumberStepper(setting: TelegramNumberSetting) {
             enabled = setting.value > setting.range.first,
             modifier = Modifier.width(42.dp)
         )
+        if (sendLocationLabel.isNotBlank()) {
+            Text(sendLocationLabel, color = LocalBydPalette.current.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            BydSwitch(sendLocationEnabled, onSendLocationChanged)
+        }
         NumericInput(
             value = if (setting.unit == "%") "${setting.value}%" else "${setting.value} ${setting.unit}",
             modifier = Modifier.width(72.dp)
@@ -2204,6 +2580,7 @@ private fun BottomTabs(activeTab: AppTab, strings: UiStrings, actions: BydCollec
     val tabs = listOf(
         AppTab.MAIN to (strings.mainTab to BottomTabIcon.HOME),
         AppTab.ALL_PARAMETERS to (strings.allTab to BottomTabIcon.STORAGE),
+        AppTab.TRIPS to (strings.tripsTab to BottomTabIcon.TRIPS),
         AppTab.HA to (strings.haTab to BottomTabIcon.HA),
         AppTab.TELEGRAM to (strings.telegram.tab to BottomTabIcon.TELEGRAM),
         AppTab.STORAGE to (strings.storageTab to BottomTabIcon.DATABASE),

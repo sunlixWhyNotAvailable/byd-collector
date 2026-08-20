@@ -19,6 +19,73 @@ data class InfluxDraft(
     val measurement: String = ""
 )
 
+enum class TripMapMetric {
+    SPEED,
+    CONSUMPTION
+}
+
+data class TripRoutePointUi(
+    val latitude: Double,
+    val longitude: Double,
+    val speedKmh: Double? = null,
+    val consumptionKwhPer100Km: Double? = null,
+    val gap: Boolean = false
+)
+
+data class TripSummaryUi(
+    val id: String,
+    val startAt: String,
+    val endAt: String,
+    val duration: String,
+    val distanceKm: Double?,
+    val socStart: Double?,
+    val socEnd: Double?,
+    val energyKwh: Double?,
+    val averageConsumptionKwhPer100Km: Double?,
+    val route: List<TripRoutePointUi> = emptyList()
+)
+
+data class TripDayUi(
+    val title: String,
+    val distanceKm: Double?,
+    val energyKwh: Double?,
+    val averageConsumptionKwhPer100Km: Double?,
+    val trips: List<TripSummaryUi>
+)
+
+data class TripMonthUi(
+    val title: String,
+    val distanceKm: Double?,
+    val energyKwh: Double?,
+    val averageConsumptionKwhPer100Km: Double?,
+    val days: List<TripDayUi>
+)
+
+data class TripYearUi(
+    val title: String,
+    val distanceKm: Double?,
+    val energyKwh: Double?,
+    val averageConsumptionKwhPer100Km: Double?,
+    val months: List<TripMonthUi>
+)
+
+data class TripsUiState(
+    val years: List<TripYearUi> = emptyList(),
+    val colorMetric: TripMapMetric = TripMapMetric.SPEED,
+    val speedGreenThreshold: Int = 90,
+    val speedYellowThreshold: Int = 30,
+    val consumptionGreenThreshold: Int = 15,
+    val consumptionYellowThreshold: Int = 20,
+    val routeLoadingId: String? = null
+)
+
+data class TripsUiActions(
+    val onColorMetricChanged: (TripMapMetric) -> Unit = {},
+    val onSpeedThresholdsChanged: (green: Int, yellow: Int) -> Unit = { _, _ -> },
+    val onConsumptionThresholdsChanged: (green: Int, yellow: Int) -> Unit = { _, _ -> },
+    val onRouteRequested: (String) -> Unit = {}
+)
+
 enum class TelegramMessageType {
     CHARGING_STARTED,
     CHARGING_PROGRESS,
@@ -45,6 +112,7 @@ data class TelegramConfig(
     val low12vThresholdVolts: Int = 12,
     val telemetryUnavailableMinutes: Int = 1,
     val tripSummaryDelaySeconds: Int = 10,
+    val sendLocation: Boolean = false,
     val messages: Map<TelegramMessageType, TelegramMessageConfig> = emptyMap()
 )
 
@@ -76,6 +144,7 @@ interface BydCollectorActions {
     fun onStopMain()
     fun onToggleMainAutoStart(enabled: Boolean)
     fun onGrantAdb()
+    fun onRequestLocationPermission()
     fun onOpenBackgroundApps()
     fun onOpenArchiveDatabase()
     fun onOpenArchiveDebugDatabase()
@@ -96,6 +165,7 @@ interface BydCollectorActions {
     fun onTestMqtt()
     fun onToggleMqttAutoStart(enabled: Boolean)
     fun onToggleMqttCategory(category: String, enabled: Boolean)
+    fun onToggleMqttLocation(enabled: Boolean)
     fun onMqttDraftChanged(draft: MqttDraft)
 
     fun onStartInflux()
@@ -104,6 +174,7 @@ interface BydCollectorActions {
     fun onReExportInflux()
     fun onToggleInfluxAutoStart(enabled: Boolean)
     fun onToggleInfluxCategory(category: String, enabled: Boolean)
+    fun onToggleInfluxLocation(enabled: Boolean)
     fun onInfluxDraftChanged(draft: InfluxDraft)
 
     fun onToggleKeepWifi(enabled: Boolean)

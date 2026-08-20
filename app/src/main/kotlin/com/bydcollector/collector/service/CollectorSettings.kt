@@ -114,23 +114,8 @@ class CollectorSettings(
         )
     }
 
-    fun isAutonomousMainWorkerEnabled(): Boolean =
-        prefs.getBoolean(KEY_AUTONOMOUS_MAIN_WORKER, false)
-
-    fun setAutonomousMainWorkerEnabled(enabled: Boolean): Boolean {
-        val persisted = prefs.edit().putBoolean(KEY_AUTONOMOUS_MAIN_WORKER, enabled).commit()
-        if (persisted) {
-            recordEvent(
-                category = if (enabled) "autonomous_main_worker_enabled" else "autonomous_main_worker_disabled",
-                message = "Autonomous Main worker ${if (enabled) "enabled" else "disabled"}"
-            )
-        }
-        return persisted
-    }
-
     fun mainHelperOwnerMode(): DirectHelperOwnerMode {
         return if (
-            isAutonomousMainWorkerEnabled() &&
             isPollingEnabled() &&
             !isMainManuallyStopped()
         ) {
@@ -173,7 +158,8 @@ class CollectorSettings(
             clientId = mqttClientId(),
             topicPrefix = mqttTopicPrefix(),
             discoveryPrefix = mqttDiscoveryPrefix(),
-            enabledCategories = mqttEnabledCategories()
+            enabledCategories = mqttEnabledCategories(),
+            locationEnabled = isMqttLocationEnabled()
         )
     }
 
@@ -273,6 +259,12 @@ class CollectorSettings(
         prefs.edit().putStringSet(KEY_MQTT_CATEGORIES, categories).apply()
     }
 
+    fun isMqttLocationEnabled(): Boolean = prefs.getBoolean(KEY_MQTT_LOCATION, false)
+
+    fun setMqttLocationEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_MQTT_LOCATION, enabled).apply()
+    }
+
     fun influxConfig(includeCredentials: Boolean = true): InfluxConfig {
         //shares category selection with mqtt by default so ha live state and history stay aligned
         return InfluxConfig(
@@ -283,7 +275,8 @@ class CollectorSettings(
             username = if (includeCredentials) influxUsername().takeIf { it.isNotBlank() } else null,
             password = if (includeCredentials) influxPassword().takeIf { it.isNotBlank() } else null,
             measurement = influxMeasurement(),
-            enabledCategories = effectiveInfluxCategories()
+            enabledCategories = effectiveInfluxCategories(),
+            locationEnabled = isInfluxLocationEnabled()
         )
     }
 
@@ -372,6 +365,37 @@ class CollectorSettings(
     fun setTelegramBotToken(token: String): Boolean = writeSecret(SECRET_TELEGRAM_BOT_TOKEN, token.trim())
 
     fun clearTelegramBotToken(): Boolean = secretStore.clear(SECRET_TELEGRAM_BOT_TOKEN)
+
+    fun isTelegramSendLocationEnabled(): Boolean = prefs.getBoolean(KEY_TELEGRAM_SEND_LOCATION, false)
+
+    fun setTelegramSendLocationEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_TELEGRAM_SEND_LOCATION, enabled).apply()
+    }
+
+    fun isTripHistoryEnabled(): Boolean = prefs.getBoolean(KEY_TRIP_HISTORY, true)
+
+    fun setTripHistoryEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_TRIP_HISTORY, enabled).apply()
+    }
+
+    fun tripSpeedGreenThreshold(): Int = prefs.getInt(KEY_TRIP_SPEED_GREEN, DEFAULT_TRIP_SPEED_GREEN).coerceIn(0, 300)
+    fun tripSpeedYellowThreshold(): Int = prefs.getInt(KEY_TRIP_SPEED_YELLOW, DEFAULT_TRIP_SPEED_YELLOW).coerceIn(0, 300)
+    fun tripConsumptionGreenThreshold(): Int = prefs.getInt(KEY_TRIP_CONSUMPTION_GREEN, DEFAULT_TRIP_CONSUMPTION_GREEN).coerceIn(0, 300)
+    fun tripConsumptionYellowThreshold(): Int = prefs.getInt(KEY_TRIP_CONSUMPTION_YELLOW, DEFAULT_TRIP_CONSUMPTION_YELLOW).coerceIn(0, 300)
+
+    fun setTripSpeedThresholds(green: Int, yellow: Int) {
+        prefs.edit()
+            .putInt(KEY_TRIP_SPEED_GREEN, green.coerceIn(0, 300))
+            .putInt(KEY_TRIP_SPEED_YELLOW, yellow.coerceIn(0, 300))
+            .apply()
+    }
+
+    fun setTripConsumptionThresholds(green: Int, yellow: Int) {
+        prefs.edit()
+            .putInt(KEY_TRIP_CONSUMPTION_GREEN, green.coerceIn(0, 300))
+            .putInt(KEY_TRIP_CONSUMPTION_YELLOW, yellow.coerceIn(0, 300))
+            .apply()
+    }
 
     fun isTelegramEventEnabled(eventKey: String): Boolean {
         return prefs.getBoolean("$KEY_TELEGRAM_EVENT_PREFIX$eventKey", false)
@@ -765,6 +789,12 @@ class CollectorSettings(
         prefs.edit().putStringSet(KEY_INFLUX_CATEGORIES, categories).apply()
     }
 
+    fun isInfluxLocationEnabled(): Boolean = prefs.getBoolean(KEY_INFLUX_LOCATION, false)
+
+    fun setInfluxLocationEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_INFLUX_LOCATION, enabled).apply()
+    }
+
     fun keepAliveConfig(): KeepAliveConfig {
         //groups radio/service recovery toggles for foreground-service reconciliation
         return KeepAliveConfig(
@@ -915,7 +945,6 @@ class CollectorSettings(
         const val KEY_MQTT_MANUAL_STOP = "mqttManualStop"
         const val KEY_INFLUX_MANUAL_STOP = "influxManualStop"
         const val KEY_POLLING_ENABLED = "pollingEnabled"
-        const val KEY_AUTONOMOUS_MAIN_WORKER = "autonomousMainWorker"
         const val KEY_DEBUG_POLLING_ENABLED = "debugPollingEnabled"
         const val KEY_DEBUG_AUTO_START = "debugAutoStart"
         const val KEY_KEEP_WIFI = "keepWifi"
@@ -932,6 +961,7 @@ class CollectorSettings(
         const val KEY_MQTT_TOPIC_PREFIX = "mqttTopicPrefix"
         const val KEY_MQTT_DISCOVERY_PREFIX = "mqttDiscoveryPrefix"
         const val KEY_MQTT_CATEGORIES = "mqttCategories"
+        const val KEY_MQTT_LOCATION = "mqttLocation"
         const val KEY_INFLUX_ENABLED = "influxEnabled"
         const val KEY_INFLUX_AUTO_START = "influxAutoStart"
         const val KEY_HA_SHARED_CATEGORIES = "haSharedCategories"
@@ -942,6 +972,7 @@ class CollectorSettings(
         const val KEY_INFLUX_PASSWORD = "influxPassword"
         const val KEY_INFLUX_MEASUREMENT = "influxMeasurement"
         const val KEY_INFLUX_CATEGORIES = "influxCategories"
+        const val KEY_INFLUX_LOCATION = "influxLocation"
         const val KEY_TELEGRAM_ENABLED = "telegramEnabled"
         const val KEY_TELEGRAM_CHAT_ID = "telegramChatId"
         const val KEY_TELEGRAM_EVENT_PREFIX = "telegramEvent."
@@ -953,6 +984,12 @@ class CollectorSettings(
         const val KEY_TELEGRAM_TRIP_END_DELAY_SECONDS = "telegramTripEndDelaySeconds"
         const val KEY_TELEGRAM_CONNECTION_STATUS = "telegramConnectionStatus"
         const val KEY_TELEGRAM_CONNECTION_MESSAGE = "telegramConnectionMessage"
+        const val KEY_TELEGRAM_SEND_LOCATION = "telegramSendLocation"
+        const val KEY_TRIP_HISTORY = "tripHistory"
+        const val KEY_TRIP_SPEED_GREEN = "tripSpeedGreen"
+        const val KEY_TRIP_SPEED_YELLOW = "tripSpeedYellow"
+        const val KEY_TRIP_CONSUMPTION_GREEN = "tripConsumptionGreen"
+        const val KEY_TRIP_CONSUMPTION_YELLOW = "tripConsumptionYellow"
         const val SECRET_MQTT_USERNAME = "mqtt.username"
         const val SECRET_MQTT_PASSWORD = "mqtt.password"
         const val SECRET_INFLUX_USERNAME = "influx.username"
@@ -1005,6 +1042,10 @@ class CollectorSettings(
         const val MAX_TELEGRAM_LOW_VOLTAGE = 15.0f
         const val DEFAULT_TELEGRAM_UNAVAILABLE_DELAY = 1
         const val DEFAULT_TELEGRAM_TRIP_END_DELAY_SECONDS = 10
+        const val DEFAULT_TRIP_SPEED_GREEN = 90
+        const val DEFAULT_TRIP_SPEED_YELLOW = 30
+        const val DEFAULT_TRIP_CONSUMPTION_GREEN = 15
+        const val DEFAULT_TRIP_CONSUMPTION_YELLOW = 20
         const val MIN_TELEGRAM_TRIP_END_DELAY_SECONDS = 5
         const val MAX_TELEGRAM_TRIP_END_DELAY_SECONDS = 300
         const val MIN_TELEGRAM_DELAY_MINUTES = 1

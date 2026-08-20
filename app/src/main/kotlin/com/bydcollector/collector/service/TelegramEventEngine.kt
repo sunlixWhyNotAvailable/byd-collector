@@ -14,13 +14,31 @@ data class TelegramEventConfig(
     val chargeStepPercent: Int,
     val lowVoltageThreshold: Double,
     val unavailableDelayMs: Long,
-    val tripEndDelayMs: Long
+    val tripEndDelayMs: Long,
+    val sendLocation: Boolean = false
+)
+
+data class TelegramLocationSnapshot(
+    val latitude: Double,
+    val longitude: Double,
+    val capturedAt: String,
+    val age: String,
+    val osmUrl: String,
+    val googleUrl: String,
+    val appleUrl: String
+)
+
+data class TelegramPowerOffSnapshot(
+    val odometerKm: Double? = null,
+    val soc: Double? = null,
+    val tripEnergyKwh: Double? = null
 )
 
 data class TelegramDetectedEvent(
     val type: TelegramEventType,
     val dedupeKey: String,
-    val variables: Map<String, String>
+    val variables: Map<String, String>,
+    val textSuffix: String? = null
 )
 
 data class TelegramEventResult(
@@ -336,6 +354,57 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
             )
         }
         return persistedResult(events, nowMs, force = state != original || events.isNotEmpty(), config = config)
+    }
+
+    /** Finalizes the pending trip immediately after a confirmed vehicle power-off. */
+    fun onPowerOffConfirmed(
+        config: TelegramEventConfig,
+        snapshot: TelegramPowerOffSnapshot = TelegramPowerOffSnapshot(),
+        location: TelegramLocationSnapshot? = null,
+        nowMs: Long
+    ): TelegramEventResult {
+        val events = mutableListOf<TelegramDetectedEvent>()
+        val tripId = state.tripId
+        if (tripId == null) return persistedResult(events, nowMs, force = false, config = config)
+        state = state.copy(
+            tripEndOdometerKm = snapshot.odometerKm ?: state.tripEndOdometerKm,
+            tripEndSoc = snapshot.soc ?: state.tripEndSoc,
+            tripEndEnergyKwh = snapshot.tripEnergyKwh ?: state.tripEndEnergyKwh
+        )
+        val distance = nonNegativeDelta(state.tripEndOdometerKm, state.tripStartOdometerKm)
+            ?.takeIf { it <= MAX_TRIP_DISTANCE_KM }
+        val energy = nonNegativeDelta(state.tripEndEnergyKwh, state.tripStartEnergyKwh)
+        val durationMs = (nowMs - (state.tripStartedAtMs ?: nowMs)).coerceAtLeast(0L)
+        val totalDistance = state.bootTotalDistanceKm + (distance ?: 0.0)
+        val totalDurationMs = state.bootTotalDurationMs + durationMs
+        state = state.copy(bootTotalDistanceKm = totalDistance, bootTotalDurationMs = totalDurationMs)
+        val socDelta = nonNegativeMagnitude(state.tripEndSoc, state.tripStartSoc)
+        if (socDelta?.let { meetsThreshold(it, MIN_TRIP_SOC_DELTA_PERCENT) } == true ||
+            distance?.let { exceedsThreshold(it, MIN_TRIP_DISTANCE_KM) } == true ||
+            energy?.let { exceedsThreshold(it, MIN_TRIP_ENERGY_KWH) } == true
+        ) {
+            addIfEnabled(
+                events,
+                config,
+                TelegramEventType.TRIP_SUMMARY,
+                "$tripId:summary",
+                mapOf(
+                    "trip_distance_km" to formatNumber(distance),
+                    "trip_energy_kwh" to formatNumber(energy),
+                    "trip_duration" to formatDuration(durationMs),
+                    "soc_start" to formatNumber(state.tripStartSoc),
+                    "soc_end" to formatNumber(state.tripEndSoc),
+                    "total_distance_km" to formatNumber(totalDistance),
+                    "total_energy_kwh" to formatNumber(state.tripEndEnergyKwh),
+                    "total_duration" to formatDuration(totalDurationMs),
+                    "time" to formatTime(nowMs)
+                ),
+                textSuffix = location.takeIf { config.sendLocation }?.let(::formatLocation)
+            )
+        }
+        clearTrip()
+        resolveDeferredTripCounterReset()
+        return persistedResult(events, nowMs, force = true, config = config)
     }
 
     private fun trackChargingSemantic(raw: String?) {
@@ -841,9 +910,10 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         config: TelegramEventConfig,
         type: TelegramEventType,
         dedupeKey: String,
-        variables: Map<String, String>
+        variables: Map<String, String>,
+        textSuffix: String? = null
     ) {
-        if (type in config.enabledEvents) events += TelegramDetectedEvent(type, dedupeKey, variables)
+        if (type in config.enabledEvents) events += TelegramDetectedEvent(type, dedupeKey, variables, textSuffix)
     }
 
     private fun persistedResult(
@@ -958,3 +1028,8 @@ private fun formatDuration(durationMs: Long): String {
 private fun formatTime(timeMs: Long): String {
     return java.text.SimpleDateFormat("dd.MM.yyyy HH:mm", java.util.Locale.getDefault()).format(java.util.Date(timeMs))
 }
+
+private fun formatLocation(location: TelegramLocationSnapshot): String =
+    "\nЛокація: ${location.latitude}, ${location.longitude}\n" +
+        "Зафіксовано: ${location.capturedAt} (вік ${location.age})\n" +
+        "OSM: ${location.osmUrl}\nGoogle: ${location.googleUrl}\nApple: ${location.appleUrl}"

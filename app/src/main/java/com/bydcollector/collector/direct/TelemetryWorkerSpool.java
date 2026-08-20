@@ -5,6 +5,7 @@ import android.database.Cursor;
 import android.database.DatabaseUtils;
 import android.database.sqlite.SQLiteDatabase;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -14,7 +15,9 @@ import java.util.Set;
 //helper-owned durable raw spool; the app acknowledges a sample only after its own transaction commits
 final class TelemetryWorkerSpool implements AutoCloseable {
     static final String DATABASE_PATH = "/data/local/tmp/bydcollector_telemetry_worker.db";
-    static final int SCHEMA_VERSION = 1;
+    static final int SCHEMA_VERSION = 2;
+    static final long MAX_DATABASE_BYTES = 128L * 1024L * 1024L;
+    private static final long MAX_APPEND_RESERVATION_BYTES = 2L * 1024L * 1024L;
     static final String SAMPLE_TABLE = "telemetry_worker_samples";
     static final String VALUE_TABLE = "telemetry_worker_values";
 
@@ -63,6 +66,7 @@ final class TelemetryWorkerSpool implements AutoCloseable {
             database.enableWriteAheadLogging();
             int version = (int) DatabaseUtils.longForQuery(database, "PRAGMA user_version", null);
             if (version == 0) createSchema(database);
+            else if (version == 1) migrateSchemaV1(database);
             else if (version != SCHEMA_VERSION) {
                 throw new IllegalStateException("unsupported telemetry worker spool schema: " + version);
             }
@@ -77,17 +81,24 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         this.database = database;
     }
 
-    void append(Sample sample) {
+    boolean append(Sample sample) {
         database.beginTransaction();
         try {
+            //reserve room for one bounded sample; unacknowledged rows are never evicted
+            if (databaseFootprintBytes() + MAX_APPEND_RESERVATION_BYTES >= MAX_DATABASE_BYTES) return false;
             database.insertOrThrow(SAMPLE_TABLE, null, sampleValues(sample));
             for (Value value : sample.values) {
                 database.insertOrThrow(VALUE_TABLE, null, valueValues(sample.identity, value));
             }
             database.setTransactionSuccessful();
+            return true;
         } finally {
             database.endTransaction();
         }
+    }
+
+    boolean canAppend() {
+        return databaseFootprintBytes() + MAX_APPEND_RESERVATION_BYTES < MAX_DATABASE_BYTES;
     }
 
     List<Sample> pending(int limit) {
@@ -116,14 +127,23 @@ final class TelemetryWorkerSpool implements AutoCloseable {
 
     int acknowledge(TelemetryWorkerSampleIdentity identity, long acknowledgedAtMs) {
         if (acknowledgedAtMs < 0) throw new IllegalArgumentException("acknowledgedAtMs must be non-negative");
-        ContentValues values = new ContentValues();
-        values.put("acknowledged_at_ms", acknowledgedAtMs);
-        return database.update(
-            SAMPLE_TABLE,
-            values,
-            "boot_id=? AND helper_generation=? AND poll_sequence=?",
-            identityArgs(identity)
-        );
+        int deleted;
+        database.beginTransaction();
+        try {
+            deleted = database.delete(
+                SAMPLE_TABLE,
+                "boot_id=? AND helper_generation=? AND poll_sequence=?",
+                identityArgs(identity)
+            );
+            database.setTransactionSuccessful();
+        } finally {
+            database.endTransaction();
+        }
+        if (deleted == 1) {
+            //checkpoint releases WAL sidecar space so the producer can resume after ACKs
+            runCatchingCheckpoint();
+        }
+        return deleted;
     }
 
     @Override public void close() {
@@ -140,6 +160,41 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         } finally {
             database.endTransaction();
         }
+    }
+
+    private static void migrateSchemaV1(SQLiteDatabase database) {
+        database.beginTransaction();
+        try {
+            //v1 kept acknowledged rows; remove only those already durably imported
+            database.delete(SAMPLE_TABLE, "acknowledged_at_ms IS NOT NULL", null);
+            database.execSQL("PRAGMA user_version=" + SCHEMA_VERSION);
+            database.setTransactionSuccessful();
+        } finally {
+            database.endTransaction();
+        }
+    }
+
+    private long databaseFootprintBytes() {
+        long pageCount = DatabaseUtils.longForQuery(database, "PRAGMA page_count", null);
+        long freePages = DatabaseUtils.longForQuery(database, "PRAGMA freelist_count", null);
+        long pageSize = DatabaseUtils.longForQuery(database, "PRAGMA page_size", null);
+        long usedDatabaseBytes = Math.max(0L, pageCount - freePages) * Math.max(1L, pageSize);
+        return usedDatabaseBytes + fileLength(DATABASE_PATH + "-wal") + fileLength(DATABASE_PATH + "-shm");
+    }
+
+    private void runCatchingCheckpoint() {
+        try {
+            try (Cursor cursor = database.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", null)) {
+                cursor.moveToFirst();
+            }
+        } catch (RuntimeException error) {
+            System.err.println("WARN: telemetry worker spool checkpoint failed: " + error.getMessage());
+        }
+    }
+
+    private static long fileLength(String path) {
+        File file = new File(path);
+        return file.isFile() ? file.length() : 0L;
     }
 
     private List<SampleHeader> pendingHeaders(int limit) {

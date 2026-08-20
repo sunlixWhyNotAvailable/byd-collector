@@ -4,6 +4,8 @@ import android.app.Application
 import android.content.Context
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
+import com.bydcollector.collector.data.trips.TripDatabaseHelper
+import com.bydcollector.collector.data.trips.TripStore
 import com.bydcollector.collector.maintenance.StorageFormatCutoverCoordinator
 import com.bydcollector.collector.maintenance.StorageFormat
 import com.bydcollector.collector.service.CollectorSettings
@@ -13,6 +15,7 @@ import com.bydcollector.collector.update.UpdateAutoCheckRuntime
 //starts process-scoped app bookkeeping before either CollectorService or MainActivity is created
 class BydCollectorApplication : Application() {
     private var telemetryStore: TelemetryStore? = null
+    private var tripsStore: TripStore? = null
     private var cutoverCoordinator: StorageFormatCutoverCoordinator? = null
     private var debugStorageReady: Boolean? = null
     val dashboardUiStateStore by lazy { DashboardUiStateStore() }
@@ -24,6 +27,7 @@ class BydCollectorApplication : Application() {
     }
 
     override fun onTerminate() {
+        tripsStore?.close()
         telemetryStore?.close()
         super.onTerminate()
     }
@@ -65,6 +69,10 @@ class BydCollectorApplication : Application() {
             return (context.applicationContext as BydCollectorApplication).dashboardUiStateStore
         }
 
+        fun trips(context: Context): TripStore {
+            return (context.applicationContext as BydCollectorApplication).trips()
+        }
+
         fun ensureDebugStorageReady(context: Context): Boolean {
             return (context.applicationContext as BydCollectorApplication).ensureDebugStorageReady()
         }
@@ -75,6 +83,15 @@ class BydCollectorApplication : Application() {
         telemetryStore?.let { return it }
         check(coordinator().ensureMainReady()) { "Main telemetry database is not safe to open" }
         return TelemetryStore(applicationContext, TelemetryDatabaseHelper(applicationContext)).also { telemetryStore = it }
+    }
+
+    @Synchronized
+    private fun trips(): TripStore {
+        tripsStore?.let { return it }
+        return TripStore(TripDatabaseHelper(applicationContext)).also { store ->
+            check(store.verify()) { "Trips database is not safe to open" }
+            tripsStore = store
+        }
     }
 
     private fun coordinator(): StorageFormatCutoverCoordinator {

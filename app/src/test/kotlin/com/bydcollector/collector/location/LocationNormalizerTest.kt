@@ -1,0 +1,36 @@
+package com.bydcollector.collector.location
+
+import com.bydcollector.collector.data.normalized.NormalizedQuality
+import com.bydcollector.collector.data.normalized.NormalizedCategory
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertNull
+
+class LocationNormalizerTest {
+    @Test
+    fun emitsLocationFieldsWithoutVehiclePollId() {
+        val observations = LocationNormalizer.observations(
+            GpsLocationSample("2026-08-20T12:00:00Z", 1_000L, 1_000_000_000L, "boot", "segment", 50.0, 30.0, 5.0, 10.0, null, null),
+            nowMs = 2_000L
+        )
+        assertEquals(9, observations.size)
+        assertEquals("location", observations.first().field.category.mqttKey)
+        assertNull(observations.first().sourcePollId)
+        assertEquals(36.0, observations.first { it.field.fieldKey == "location_speed_kmh" }.value.number)
+        assertEquals(1_000.0, observations.first { it.field.fieldKey == "location_fix_age_ms" }.value.number)
+        assertEquals(NormalizedQuality.OK, observations.first().quality)
+    }
+
+    @Test
+    fun locationCategoryHasIndependentOptInDefaults() {
+        assertEquals("location", NormalizedCategory.LOCATION.mqttKey)
+        assertEquals(false, com.bydcollector.collector.mqtt.HaMqttConfig.DEFAULT_CATEGORIES.contains("location"))
+    }
+
+    @Test
+    fun gapMarksAllLocationFieldsMissing() {
+        val gap = LocationNormalizer.gap("2026-08-20T12:00:00Z", "kernel_reboot")
+        assertEquals(9, gap.size)
+        assertEquals(9, gap.count { it.quality == NormalizedQuality.MISSING })
+    }
+}

@@ -162,7 +162,10 @@ class DirectDebugRoundRobinPollerTest {
             .map { Triple(it.dev, it.fid, it.tx) }
         assertEquals(prodSignatures.size, prodSignatures.distinct().size)
 
-        assertEquals(emptySet(), prodSignatures.toSet().intersect(debugSignatures.toSet()))
+        assertEquals(
+            setOf(Triple(1001, 315621418, 5)),
+            prodSignatures.toSet().intersect(debugSignatures.toSet())
+        )
 
         val allReadTxByDumpPair = (rows.filter { it.candidateSource == "fid_catalog_20260804_6e29ad30" }
             .map { Triple(it.dev, it.fid, it.tx) } + prodSignatures)

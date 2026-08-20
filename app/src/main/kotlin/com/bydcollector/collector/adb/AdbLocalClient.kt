@@ -234,6 +234,63 @@ class AdbLocalClient(
         }
     }
 
+    /** Opens an authenticated, unbounded shell stream; closing the handle closes the remote shell. */
+    fun openShellStream(
+        command: String,
+        output: OutputStream,
+        allowAuthorizationPrompt: Boolean = false
+    ): AdbShellStream {
+        require(command.isNotBlank()) { "command must not be blank" }
+        cancellation.throwIfCancelled()
+        if (!tryAcquireAuthLock()) {
+            throw IllegalStateException("adb_authorization_unavailable: ADB auth lock timeout")
+        }
+        try {
+            var lastError: Throwable? = null
+            for (endpoint in endpoints) {
+                var socket: Socket? = null
+                try {
+                    socket = openLocalAdbSocket(endpoint)
+                    val input = socket.getInputStream()
+                    val socketOutput = socket.getOutputStream()
+                    val authResult = connectAuthorized(socket, input, socketOutput, allowAuthorizationPrompt)
+                    if (authResult.category != "adb_authorization_connected") {
+                        throw IllegalStateException("${authResult.category}: ${authResult.message}")
+                    }
+                    socket.soTimeout = 0
+                    val localId = 1
+                    writePacket(socketOutput, COMMAND_OPEN, localId, 0, "shell:$command\u0000".toByteArray())
+                    var remoteId = 0
+                    while (remoteId == 0) {
+                        cancellation.throwIfCancelled()
+                        val packet = readPacket(input)
+                        when (packet.command) {
+                            COMMAND_OKAY -> if (packet.arg1 == localId) remoteId = packet.arg0
+                            COMMAND_WRTE -> if (packet.arg1 == localId) {
+                                remoteId = packet.arg0
+                                output.write(packet.payload)
+                                output.flush()
+                                writePacket(socketOutput, COMMAND_OKAY, localId, remoteId, ByteArray(0))
+                            }
+                            COMMAND_CLSE -> throw IllegalStateException("ADB shell stream closed during open")
+                        }
+                    }
+                    return AdbShellStream(socket, input, socketOutput, output, localId, remoteId)
+                } catch (error: AdbOperationCancelledException) {
+                    socket?.let { runCatching { it.close() }; cancellation.unregister(it) }
+                    throw error
+                } catch (error: Exception) {
+                    lastError = error
+                    socket?.let { runCatching { it.close() }; cancellation.unregister(it) }
+                    if (!shouldTryNextEndpoint(error.message)) throw error
+                }
+            }
+            throw lastError ?: IllegalStateException("adb_authorization_unavailable: Local ADB daemon is not reachable")
+        } finally {
+            AUTH_LOCK.unlock()
+        }
+    }
+
     private inline fun <T> useLocalAdbSocket(endpoint: AdbEndpoint, block: (Socket) -> T): T {
         val socket = openLocalAdbSocket(endpoint)
         return try {
@@ -439,6 +496,80 @@ class AdbLocalClient(
         )
     }
 
+    inner class AdbShellStream internal constructor(
+        private val socket: Socket,
+        private val input: InputStream,
+        private val socketOutput: OutputStream,
+        private val output: OutputStream,
+        private val localId: Int,
+        private val remoteId: Int
+    ) : AutoCloseable {
+        private val closed = AtomicBoolean(false)
+        private val cleaned = AtomicBoolean(false)
+        private val outputLock = Any()
+        private val reader = Thread({ readLoop() }, "bydcollector-adb-shell-stream").apply {
+            isDaemon = true
+            start()
+        }
+
+        val isAlive: Boolean
+            get() = !closed.get() && reader.isAlive
+
+        override fun close() {
+            if (!closed.compareAndSet(false, true)) return
+            synchronized(outputLock) {
+                runCatching { writePacket(socketOutput, COMMAND_CLSE, localId, remoteId, ByteArray(0)) }
+            }
+            runCatching { socket.close() }
+            if (Thread.currentThread() !== reader) runCatching { reader.join(STREAM_CLOSE_JOIN_MS) }
+            cleanup()
+        }
+
+        private fun readLoop() {
+            try {
+                while (!closed.get()) {
+                    cancellation.throwIfCancelled()
+                    val packet = readPacket(input)
+                    when (packet.command) {
+                        COMMAND_WRTE -> if (packet.arg0 == remoteId && packet.arg1 == localId) {
+                            output.write(packet.payload)
+                            output.flush()
+                            synchronized(outputLock) {
+                                if (!closed.get()) writePacket(socketOutput, COMMAND_OKAY, localId, remoteId, ByteArray(0))
+                            }
+                        }
+                        COMMAND_CLSE -> {
+                            synchronized(outputLock) {
+                                runCatching { writePacket(socketOutput, COMMAND_CLSE, localId, remoteId, ByteArray(0)) }
+                            }
+                            closed.set(true)
+                        }
+                    }
+                }
+            } catch (_: AdbOperationCancelledException) {
+                //cancellation is the normal shutdown path for the diagnostic stream
+            } catch (error: Throwable) {
+                if (!closed.get()) {
+                    eventSink?.invoke(
+                        "adb_shell_stream_error",
+                        "ADB shell stream stopped",
+                        "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                    )
+                }
+            } finally {
+                cleanup()
+            }
+        }
+
+        private fun cleanup() {
+            if (!cleaned.compareAndSet(false, true)) return
+            closed.set(true)
+            runCatching { socket.close() }
+            cancellation.unregister(socket)
+            runCatching { output.close() }
+        }
+    }
+
     private fun loadOrCreateKeyPair(): KeyPair {
         val privateFile = File(keyDir, "adb_key.priv")
         val publicFile = File(keyDir, "adb_key.pub")
@@ -616,6 +747,7 @@ class AdbLocalClient(
         private const val AUTH_APPROVAL_TIMEOUT_MS = 60_000
         private const val AUTH_LOCK_TIMEOUT_MS = 70_000L
         private const val SHELL_TIMEOUT_MS = 15_000
+        private const val STREAM_CLOSE_JOIN_MS = 1_000L
         private val AUTH_LOCK = ReentrantLock()
         private val LOCAL_ADB_ENDPOINTS = listOf(
             AdbEndpoint("127.0.0.1", 5555)

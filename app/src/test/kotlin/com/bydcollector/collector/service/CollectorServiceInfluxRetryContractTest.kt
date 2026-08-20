@@ -28,7 +28,10 @@ class CollectorServiceInfluxRetryContractTest {
         assertTrue(influxPath.contains("influxCoordinator.runOneCycle(force = false)"))
         assertTrue(service.contains("influxCoordinator.resumeExport()"))
         assertTrue(maintenance.contains("resetInfluxExecutorForMaintenance()"))
-        assertFalse(debugMaintenance.contains("resetInfluxExecutorForMaintenance"))
+        assertTrue(
+            maintenance.indexOf("if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) return") <
+                maintenance.indexOf("resetInfluxExecutorForMaintenance()")
+        )
         assertTrue(stopInflux.contains("cancelInfluxRetry()"))
         assertTrue(stopInflux.contains("queueInfluxStop(stopServiceWhenIdle = true)"))
         assertFalse(stopInflux.contains("resetInfluxExecutorForMaintenance()"))

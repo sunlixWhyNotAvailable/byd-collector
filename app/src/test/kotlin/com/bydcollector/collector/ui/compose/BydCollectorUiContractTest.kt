@@ -198,12 +198,25 @@ class BydCollectorUiContractTest {
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
 
         assertTrue(app.contains("private fun TabScrollColumn(content: @Composable ColumnScope.() -> Unit)"))
-        assertEquals(7, Regex("TabScrollColumn \\{").findAll(app).count())
+        assertEquals(8, Regex("TabScrollColumn \\{").findAll(app).count())
         assertFalse(app.contains("LazyColumn("))
         assertFalse(app.contains("LazyListScope"))
         assertEquals(3, Regex("\\.verticalScroll\\(").findAll(app).count())
         assertTrue(app.contains(".verticalScroll(releaseNotesScroll)"))
         assertTrue(app.contains(".verticalScroll(rememberScrollState()),"))
+    }
+
+    @Test
+    fun tripsTabPrecedesHaAndExposesApprovedMapContract() {
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val strings = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorStrings.kt").readText()
+        assertInOrder(app, "AppTab.TRIPS to (strings.tripsTab", "AppTab.HA to (strings.haTab")
+        assertTrue(app.contains("© OpenStreetMap contributors"))
+        assertTrue(app.contains("TripRouteDialog("))
+        assertTrue(app.contains("strings.colorBySpeed"))
+        assertTrue(app.contains("strings.colorByConsumption"))
+        assertTrue(strings.contains("tripsTab = \"Поїздки\""))
+        assertTrue(strings.contains("tripsTab = \"Trips\""))
     }
 
     @Test

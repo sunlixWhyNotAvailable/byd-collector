@@ -12,10 +12,13 @@ data class HaMqttConfig(
     val clientId: String,
     val topicPrefix: String,
     val discoveryPrefix: String,
-    val enabledCategories: Set<String>
+    val enabledCategories: Set<String>,
+    /** Location is opt-in independently from the existing dashboard categories. */
+    val locationEnabled: Boolean = false
 ) {
     val serverUri: String get() = "tcp://$host:$port"
-    fun isCategoryEnabled(category: String): Boolean = enabledCategories.contains(category)
+    fun isCategoryEnabled(category: String): Boolean =
+        if (category == "location") locationEnabled else enabledCategories.contains(category)
     fun normalizedTopicPrefix(): String = topicPrefix.trim('/').ifBlank { DEFAULT_TOPIC_PREFIX }
     fun normalizedDiscoveryPrefix(): String = discoveryPrefix.trim('/').ifBlank { DEFAULT_DISCOVERY_PREFIX }
 

@@ -35,6 +35,7 @@ import com.bydcollector.collector.data.polling.TelemetryPoller
 import com.bydcollector.collector.data.polling.TelemetryWorkerReplayCoordinator
 import com.bydcollector.collector.data.polling.TelemetryWorkerReplayPollCycleRunner
 import com.bydcollector.collector.data.local.PollReading
+import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.data.remote.DirectTelemetryClient
 import com.bydcollector.collector.data.remote.DirectBridgeManager
 import com.bydcollector.collector.keepalive.KeepAliveConfig
@@ -61,6 +62,7 @@ import com.bydcollector.collector.mqtt.MqttPublishCoordinator
 import com.bydcollector.collector.mqtt.PahoMqttClientFacade
 import com.bydcollector.collector.system.CollectorAutoStart
 import com.bydcollector.collector.telegram.TelegramCoordinator
+import java.time.Instant
 import com.bydcollector.collector.ui.DashboardDebugPollState
 import com.bydcollector.collector.ui.DashboardMainPollState
 import com.bydcollector.collector.ui.DashboardRowCounts
@@ -96,10 +98,11 @@ class CollectorService : Service() {
     private lateinit var mqttCoordinator: MqttPublishCoordinator
     private lateinit var influxCoordinator: InfluxExportCoordinator
     private lateinit var telegramCoordinator: TelegramCoordinator
+    private lateinit var tripRuntime: TripRuntimeCoordinator
     private lateinit var maintenanceCoordinator: DbMaintenanceCoordinator
     private lateinit var dashboardUiStateStore: DashboardUiStateStore
     private lateinit var dashboardStateProvider: DashboardStateProvider
-    private var mainPollerOwnerMode = DirectHelperOwnerMode.APP
+    private var mainPollerOwnerMode = DirectHelperOwnerMode.AUTONOMOUS_WORKER
     private var debugStorageReady = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var sessionId: Long? = null
@@ -241,6 +244,7 @@ class CollectorService : Service() {
         influxCoordinator = createInfluxCoordinator()
         telegramCoordinator = createTelegramCoordinator()
         normalizedStateChangedCallback = { changedCategories -> publishChangedCategoriesAsync(changedCategories) }
+        tripRuntime = createTripRuntimeCoordinator()
         poller = createTelemetryPoller()
         maintenanceCoordinator = DbMaintenanceCoordinator(
             context = applicationContext,
@@ -347,6 +351,7 @@ class CollectorService : Service() {
         cancelTelegramTick()
         accessSelfCheckScheduled = false
         stopCollection("service_destroyed")
+        if (::tripRuntime.isInitialized) tripRuntime.close()
         keepAliveSupervisor.shutdown()
         debugStartExecutor.shutdownNow()
         maintenanceExecutor.shutdownNow()
@@ -388,7 +393,7 @@ class CollectorService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun createTelemetryPoller(
-        ownerMode: DirectHelperOwnerMode = settings.mainHelperOwnerMode()
+        ownerMode: DirectHelperOwnerMode = DirectHelperOwnerMode.AUTONOMOUS_WORKER
     ): TelemetryPoller {
         val helper = DirectVehicleHelperClient()
         val adbClient = AdbLocalClient(File(applicationContext.filesDir, "adb_keys"))
@@ -455,6 +460,7 @@ class CollectorService : Service() {
                     )
                 )
                 scheduleDatabaseFootprintRefresh(force = false)
+                tripRuntime.onSuccessfulPoll(timestamp, readings, observations)
                 if (settings.isTelegramEnabled()) {
                     executeTelegram(
                         "telegram_event_error",
@@ -469,6 +475,70 @@ class CollectorService : Service() {
                 exportInfluxAfterNormalizedWrite(summary)
             }
         }
+    }
+
+    private fun createTripRuntimeCoordinator(): TripRuntimeCoordinator {
+        return TripRuntimeCoordinator(
+            context = applicationContext,
+            tripStore = BydCollectorApplication.trips(applicationContext),
+            historyEnabled = settings::isTripHistoryEnabled,
+            locationCaptureEnabled = {
+                settings.isTripHistoryEnabled() ||
+                    settings.isTelegramSendLocationEnabled() ||
+                    settings.isMqttLocationEnabled() ||
+                    settings.isInfluxLocationEnabled()
+            },
+            persistLocation = ::persistLocationObservations,
+            onConfirmedPowerOff = ::handleConfirmedPowerOff,
+            recordEvent = store::recordEvent
+        )
+    }
+
+    private fun persistLocationObservations(observations: List<NormalizedObservation>) {
+        val summary = store.applyNormalizedObservations(observations)
+        dashboardUiStateStore.incrementMainRowCounts(
+            normalizedCurrentRows = summary.currentInsertedCount.toLong(),
+            normalizedHistoryRows = summary.historyInsertedCount.toLong()
+        )
+        scheduleDatabaseFootprintRefresh(force = false)
+        if (summary.changedCategories.isNotEmpty()) {
+            normalizedStateChangedCallback?.invoke(summary.changedCategories)
+        }
+        exportInfluxAfterNormalizedWrite(summary)
+    }
+
+    private fun handleConfirmedPowerOff(event: ConfirmedPowerOff) {
+        executeTelegram(
+            "telegram_power_off_error",
+            onSuccess = ::postTelegramTickSchedule
+        ) {
+            val current = event.session
+            telegramCoordinator.onPowerOffConfirmed(
+                snapshot = TelegramPowerOffSnapshot(
+                    odometerKm = current?.lastOdometerKm,
+                    soc = current?.endSoc,
+                    tripEnergyKwh = current?.lastTripEnergyKwh
+                ),
+                location = event.lastLocation?.let(::telegramLocationSnapshot)
+            )
+            telegramCoordinator.flushPending()
+        }
+    }
+
+    private fun telegramLocationSnapshot(sample: com.bydcollector.collector.location.GpsLocationSample): TelegramLocationSnapshot {
+        val latitude = sample.latitude
+        val longitude = sample.longitude
+        val capturedAtMs = runCatching { Instant.parse(sample.observedAt).toEpochMilli() }.getOrDefault(sample.wallTimeMs)
+        val ageSeconds = ((System.currentTimeMillis() - capturedAtMs).coerceAtLeast(0L) / 1_000L)
+        return TelegramLocationSnapshot(
+            latitude = latitude,
+            longitude = longitude,
+            capturedAt = sample.observedAt,
+            age = "${ageSeconds}s",
+            osmUrl = "https://www.openstreetmap.org/?mlat=$latitude&mlon=$longitude#map=17/$latitude/$longitude",
+            googleUrl = "https://www.google.com/maps/search/?api=1&query=$latitude,$longitude",
+            appleUrl = "https://maps.apple.com/?ll=$latitude,$longitude"
+        )
     }
 
     private fun reconcileCollection(debugStartReason: String = DEBUG_REASON_AUTOSTART) {
@@ -564,7 +634,7 @@ class CollectorService : Service() {
             publishDashboardRuntimeFlags()
             return
         }
-        val ownerMode = settings.mainHelperOwnerMode()
+        val ownerMode = DirectHelperOwnerMode.AUTONOMOUS_WORKER
         if (mainPollerOwnerMode != ownerMode) poller = createTelemetryPoller(ownerMode)
         mqttRuntimeActive.set(false)
         mqttOfflineQueued.set(false)
@@ -583,6 +653,7 @@ class CollectorService : Service() {
                 "${error::class.java.simpleName}: ${error.message ?: "no message"}"
             )
         }
+        tripRuntime.resume()
         poller.start(openedSessionId)
         mainPollingRunning.set(true)
         publishDashboardRuntimeFlags()
@@ -856,6 +927,7 @@ class CollectorService : Service() {
     private fun stopMain(reason: String) {
         val wasPolling = poller.isRunning()
         if (wasPolling) poller.stop()
+        if (::tripRuntime.isInitialized && reason != "service_destroyed") tripRuntime.pause(reason)
         stopAutonomousMainWorker(reason)
         mainPollingRunning.set(false)
         sessionId?.let { openedSessionId ->
@@ -1204,6 +1276,11 @@ class CollectorService : Service() {
             error("Debug poller did not stop for database maintenance")
         }
         if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) return
+
+        if (!tripRuntime.pauseAndAwait("database_maintenance")) {
+            maintenanceRuntimeRestoreAllowed.set(false)
+            error("Trip runtime did not pause for database maintenance")
+        }
 
         detached.openedSessionId?.let { openedSessionId ->
             runCatching { store.endSession(openedSessionId, "database_maintenance") }

@@ -26,7 +26,7 @@ interface WorkerPollStorage {
         parameters: List<CatalogParameter>
     ): WorkerPollImportResult
 
-    fun recordEvent(category: String, message: String, detail: String? = null)
+    fun recordEvent(category: String, message: String, detail: String?)
 }
 
 data class WorkerReplayBatchResult(

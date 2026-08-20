@@ -384,6 +384,31 @@ class TelegramEventEngineTest {
     }
 
     @Test
+    fun confirmedPowerOffBypassesParkDelayAndAppendsLocationOnlyWhenOptedIn() {
+        val engine = TelegramEventEngine()
+        engine.onSuccessfulPoll(snapshot(gear = "P", odometer = 100.0, soc = 50.0, tripEnergy = 1.0), config, 0L)
+        engine.onSuccessfulPoll(snapshot(gear = "D", odometer = 100.0, soc = 50.0, tripEnergy = 1.0), config, 1_000L)
+        engine.onSuccessfulPoll(snapshot(gear = "D", odometer = 100.0, soc = 50.0, tripEnergy = 1.0), config, 2_000L)
+
+        val location = TelegramLocationSnapshot(50.0, 30.0, "12:00", "2 s", "osm", "google", "apple")
+        val result = engine.onPowerOffConfirmed(
+            config.copy(sendLocation = true),
+            TelegramPowerOffSnapshot(101.0, 49.0, 2.5),
+            location,
+            3_000L
+        )
+
+        assertEquals(TelegramEventType.TRIP_SUMMARY, result.events.single().type)
+        assertTrue(result.events.single().textSuffix!!.contains("50.0, 30.0"))
+        assertNull(result.state.tripId)
+        val noLocation = TelegramEventEngine()
+        noLocation.onSuccessfulPoll(snapshot(gear = "P", odometer = 100.0, soc = 50.0, tripEnergy = 1.0), config, 0L)
+        noLocation.onSuccessfulPoll(snapshot(gear = "D", odometer = 100.0, soc = 50.0, tripEnergy = 1.0), config, 1_000L)
+        noLocation.onSuccessfulPoll(snapshot(gear = "D", odometer = 100.0, soc = 50.0, tripEnergy = 1.0), config, 2_000L)
+        assertNull(noLocation.onPowerOffConfirmed(config, TelegramPowerOffSnapshot(101.0, 49.0, 2.5), location, 3_000L).events.single().textSuffix)
+    }
+
+    @Test
     fun pendingTripRecoveryWaitsForFreshParkGearBeforeSending() {
         val pending = pendingTripEngine().state
         val restoredState = TelegramEventState.fromJson(pending.toJson())

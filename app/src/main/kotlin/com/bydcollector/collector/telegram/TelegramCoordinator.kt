@@ -9,6 +9,8 @@ import com.bydcollector.collector.service.TelegramEventConfig
 import com.bydcollector.collector.service.TelegramEventEngine
 import com.bydcollector.collector.service.TelegramEventResult
 import com.bydcollector.collector.service.TelegramEventState
+import com.bydcollector.collector.service.TelegramLocationSnapshot
+import com.bydcollector.collector.service.TelegramPowerOffSnapshot
 
 class TelegramCoordinator(
     private val store: TelemetryStore,
@@ -48,6 +50,13 @@ class TelegramCoordinator(
         val result = engine.onTick(eventConfig(), mainCollectionExpected, lastError, nowMs())
         handle(result)
         return nextWakeAt(result.nextWakeAtMs, flushPending())
+    }
+
+    /** Root/service integration hook for confirmed vehicle power-off. */
+    fun onPowerOffConfirmed(snapshot: TelegramPowerOffSnapshot = TelegramPowerOffSnapshot(), location: TelegramLocationSnapshot? = null): Long? {
+        val result = engine.onPowerOffConfirmed(eventConfig(), snapshot, location, nowMs())
+        handle(result)
+        return nextWakeAt(result.nextWakeAtMs, pendingQueueDeadline())
     }
 
     fun testConnection(): TelegramSendResult {
@@ -181,7 +190,7 @@ class TelegramCoordinator(
             )
             return null
         }
-        return TelegramOutboxMessage(event.dedupeKey, event.type.key, payload)
+        return TelegramOutboxMessage(event.dedupeKey, event.type.key, payload + (event.textSuffix ?: ""))
     }
 
     private fun eventConfig(): TelegramEventConfig {
@@ -195,7 +204,8 @@ class TelegramCoordinator(
             chargeStepPercent = settings.telegramChargeStepPercent(),
             lowVoltageThreshold = settings.telegramLowVoltageThreshold().toDouble(),
             unavailableDelayMs = settings.telegramUnavailableDelayMinutes() * 60_000L,
-            tripEndDelayMs = settings.telegramTripEndDelaySeconds() * 1_000L
+            tripEndDelayMs = settings.telegramTripEndDelaySeconds() * 1_000L,
+            sendLocation = settings.isTelegramSendLocationEnabled()
         )
     }
 

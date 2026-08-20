@@ -11,6 +11,7 @@ import com.bydcollector.collector.R
 enum class BottomTabIcon {
     HOME,
     DATABASE,
+    TRIPS,
     HA,
     TELEGRAM,
     STORAGE,
@@ -42,6 +43,7 @@ fun ShutdownIcon(color: Color, modifier: Modifier = Modifier) {
 private fun BottomTabIcon.drawableRes(): Int = when (this) {
     BottomTabIcon.HOME -> R.drawable.ic_tab_home
     BottomTabIcon.DATABASE -> R.drawable.ic_tab_all_data
+    BottomTabIcon.TRIPS -> R.drawable.ic_tab_trips
     BottomTabIcon.HA -> R.drawable.ic_tab_ha_link
     BottomTabIcon.TELEGRAM -> R.drawable.ic_tab_telegram
     BottomTabIcon.STORAGE -> R.drawable.ic_tab_storage

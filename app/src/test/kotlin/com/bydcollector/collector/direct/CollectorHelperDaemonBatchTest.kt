@@ -124,7 +124,8 @@ class CollectorHelperDaemonBatchTest {
         assertEquals(rows.map { Triple(it.tx, it.dev, it.fid) }, sample.values.map { Triple(it.tx, it.dev, it.fid) })
         assertEquals(listOf(110, null), sample.values.map { it.raw })
         assertEquals(listOf(null, "read failed"), sample.values.map { it.error })
-        assertEquals(5_000L, CollectorHelperDaemon.WorkerPollLoop.INTERVAL_MS)
+        assertEquals(500L, CollectorHelperDaemon.WorkerPollLoop.ACTIVE_INTERVAL_MS)
+        assertEquals(5_000L, CollectorHelperDaemon.WorkerPollLoop.DETACHED_INTERVAL_MS)
 
         assertFailsWith<IllegalArgumentException> {
             CollectorHelperDaemon.workerSample(identity, "catalog-a", 100, 90, rows.dropLast(1), result)

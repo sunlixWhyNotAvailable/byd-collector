@@ -7,6 +7,7 @@ object HaMqttFieldFilter {
     private val fieldsByKey = NormalizedFieldCatalog.fields.associateBy { it.fieldKey }
 
     fun isPublishable(field: NormalizedFieldDefinition, config: HaMqttConfig): Boolean {
+        if (field.category.mqttKey == "location") return config.locationEnabled
         if (!config.isCategoryEnabled(field.category.mqttKey)) return false
         return field.mqttDefaultEnabled
     }

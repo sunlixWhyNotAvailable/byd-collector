@@ -3,12 +3,12 @@ package com.bydcollector.collector.diagnostics
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import com.bydcollector.collector.BuildConfig
+import com.bydcollector.collector.adb.AdbLocalClient
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.TimeUnit
 
 //captures a small support bundle without making dashboard refresh perform zip work
 object DiagnosticLogRecorder {
@@ -17,15 +17,16 @@ object DiagnosticLogRecorder {
     private const val EVENTS_SNAPSHOT_NAME = "collector_events_snapshot.txt"
     private const val KEEP_ALIVE_LOG_PATH = "/data/local/tmp/bydcollector_keepalive.log"
     private const val KEEP_ALIVE_LOG_SNAPSHOT_NAME = "bydcollector_keepalive.log"
+    private const val LOGCAT_COMMAND = "logcat -b all -v threadtime"
 
-    @Volatile private var process: Process? = null
+    @Volatile private var adbStream: AdbLocalClient.AdbShellStream? = null
     @Volatile private var activeRunDir: File? = null
     @Volatile private var activeContext: Context? = null
 
     fun isRecording(): Boolean {
-        val current = process
+        val current = adbStream
         if (current?.isAlive == true) return true
-        process = null
+        adbStream = null
         return false
     }
 
@@ -52,25 +53,27 @@ object DiagnosticLogRecorder {
         writeLatestZip(context, runDir)
 
         val logFile = File(runDir, "logcat_threadtime.txt")
-        val started = ProcessBuilder("logcat", "-v", "threadtime", "--pid", android.os.Process.myPid().toString())
-            .redirectErrorStream(true)
-            .redirectOutput(logFile)
-            .start()
-
-        process = started
+        val output = logFile.outputStream()
+        try {
+            adbStream = AdbLocalClient(File(context.filesDir, "adb_keys")).openShellStream(
+                command = LOGCAT_COMMAND,
+                output = output
+            )
+        } catch (error: Throwable) {
+            runCatching { output.close() }
+            File(runDir, "logcat_error.txt").writeText(
+                "full_system_logcat_unavailable=${error::class.java.simpleName}: ${error.message ?: "no message"}\n" +
+                    "command=$LOGCAT_COMMAND\n",
+                Charsets.UTF_8
+            )
+        }
         return runDir
     }
 
     fun stop(): File? {
         val runDir = activeRunDir
-        val current = process
-        if (current != null) {
-            current.destroy()
-            runCatching {
-                if (!current.waitFor(1, TimeUnit.SECONDS)) current.destroyForcibly()
-            }
-        }
-        process = null
+        adbStream?.close()
+        adbStream = null
         runDir?.let {
             File(it, "stopped.txt").writeText("stopped_at=${timestamp()}\n", Charsets.UTF_8)
             activeContext?.let { context -> writeCollectorEventsSnapshot(context, it) }

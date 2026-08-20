@@ -197,7 +197,7 @@ class InfluxExportCoordinator(
 
     private fun effectiveFields(config: InfluxConfig): Set<String> {
         return NormalizedFieldCatalog.fields
-            .filter { field -> config.enabledCategories.contains(field.category.mqttKey) }
+            .filter { field -> config.isCategoryEnabled(field.category.mqttKey) }
             .map { field -> field.fieldKey }
             .toSet()
     }

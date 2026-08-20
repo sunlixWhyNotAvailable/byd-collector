@@ -1,9 +1,11 @@
 package com.bydcollector.collector
 
+import android.Manifest
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
@@ -57,6 +59,9 @@ import com.bydcollector.collector.ui.compose.TelegramMessageType
 import com.bydcollector.collector.ui.compose.TelegramTestStatus
 import com.bydcollector.collector.ui.compose.TelegramUiActions
 import com.bydcollector.collector.ui.compose.TelegramUiState
+import com.bydcollector.collector.ui.compose.TripsUiActions
+import com.bydcollector.collector.ui.compose.TripsUiState
+import com.bydcollector.collector.ui.compose.TripsUiMapper
 import com.bydcollector.collector.ui.compose.UiLanguage
 import com.bydcollector.collector.ui.compose.strings
 import com.bydcollector.collector.update.UpdateAutoCheckAction
@@ -105,6 +110,7 @@ class MainActivity : ComponentActivity() {
     private var mqttDraft by mutableStateOf(MqttDraft())
     private var influxDraft by mutableStateOf(InfluxDraft())
     private var telegramUiState by mutableStateOf(TelegramUiState())
+    private var tripsUiState by mutableStateOf(TripsUiState())
     private var updateUiState by mutableStateOf<UpdateUiState>(UpdateUiState.Hidden)
     private var updateUiGeneration = 0L
     private var pendingMaintenanceOperation by mutableStateOf<DbMaintenanceOperation?>(null)
@@ -120,6 +126,18 @@ class MainActivity : ComponentActivity() {
     private var mqttCredentialRevision = 0L
     private var influxCredentialRevision = 0L
     private var telegramCredentialRevision = 0L
+    private val tripsUiActions = TripsUiActions(
+        onColorMetricChanged = { tripsUiState = tripsUiState.copy(colorMetric = it) },
+        onSpeedThresholdsChanged = { green, yellow ->
+            settings.setTripSpeedThresholds(green, yellow)
+            tripsUiState = tripsUiState.copy(speedGreenThreshold = settings.tripSpeedGreenThreshold(), speedYellowThreshold = settings.tripSpeedYellowThreshold())
+        },
+        onConsumptionThresholdsChanged = { green, yellow ->
+            settings.setTripConsumptionThresholds(green, yellow)
+            tripsUiState = tripsUiState.copy(consumptionGreenThreshold = settings.tripConsumptionGreenThreshold(), consumptionYellowThreshold = settings.tripConsumptionYellowThreshold())
+        },
+        onRouteRequested = { tripId -> loadTripsUi(tripId) }
+    )
 
     private val refreshTask = object : Runnable {
         override fun run() {
@@ -156,12 +174,14 @@ class MainActivity : ComponentActivity() {
         override fun onTabSelected(tab: AppTab) {
             activeTab = tab
             if (tab == AppTab.TELEGRAM) syncTelegramUiRuntimeState()
+            if (tab == AppTab.TRIPS) loadTripsUi()
             refresh()
         }
 
         override fun onLanguageSelected(language: UiLanguage) {
             uiLanguage = language
             dashboardUiStateStore.selectVehicleKpiLanguage(language.vehicleKpiLanguage())
+            if (activeTab == AppTab.TRIPS) loadTripsUi()
         }
 
         override fun onDarkThemeSelected(dark: Boolean) {
@@ -206,6 +226,10 @@ class MainActivity : ComponentActivity() {
         override fun onGrantAdb() {
             requestAdbAuthorizationFlow("grant_button")
             refresh()
+        }
+
+        override fun onRequestLocationPermission() {
+            requestLocationPermissionFromAccessUi()
         }
 
         override fun onOpenBackgroundApps() {
@@ -383,6 +407,11 @@ class MainActivity : ComponentActivity() {
             refresh()
         }
 
+        override fun onToggleMqttLocation(enabled: Boolean) {
+            settings.setMqttLocationEnabled(enabled)
+            refresh()
+        }
+
         override fun onMqttDraftChanged(draft: MqttDraft) {
             if (draft.username != mqttDraft.username || draft.password != mqttDraft.password) {
                 mqttCredentialRevision += 1L
@@ -432,6 +461,11 @@ class MainActivity : ComponentActivity() {
 
         override fun onToggleInfluxCategory(category: String, enabled: Boolean) {
             settings.setInfluxCategoryEnabled(category, enabled)
+            refresh()
+        }
+
+        override fun onToggleInfluxLocation(enabled: Boolean) {
+            settings.setInfluxLocationEnabled(enabled)
             refresh()
         }
 
@@ -539,6 +573,12 @@ class MainActivity : ComponentActivity() {
             measurement = settings.influxMeasurement()
         )
         telegramUiState = loadTelegramUiState()
+        tripsUiState = TripsUiState(
+            speedGreenThreshold = settings.tripSpeedGreenThreshold(),
+            speedYellowThreshold = settings.tripSpeedYellowThreshold(),
+            consumptionGreenThreshold = settings.tripConsumptionGreenThreshold(),
+            consumptionYellowThreshold = settings.tripConsumptionYellowThreshold()
+        )
         //An Activity recreation must render the process cache immediately; only a cold process
         //needs the lightweight initial snapshot before Compose starts collecting the flows.
         if (dashboardUiStateStore.currentChrome() == null) {
@@ -558,6 +598,10 @@ class MainActivity : ComponentActivity() {
                 darkTheme = darkTheme,
                 mqttDraft = mqttDraft,
                 influxDraft = influxDraft,
+                tripsUiState = tripsUiState,
+                tripsUiActions = tripsUiActions,
+                mqttLocationEnabled = settings.isMqttLocationEnabled(),
+                influxLocationEnabled = settings.isInfluxLocationEnabled(),
                 telegramUiState = telegramUiState,
                 telegramActions = telegramActions,
                 appVersionName = BuildConfig.VERSION_NAME,
@@ -896,6 +940,29 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun loadTripsUi(routeTripId: String? = null) {
+        if (destroyed) return
+        val requestedLanguage = uiLanguage
+        tripsUiState = tripsUiState.copy(routeLoadingId = routeTripId)
+        dashboardExecutor.execute {
+            val result = runCatching {
+                val trips = BydCollectorApplication.trips(applicationContext)
+                val groups = trips.queryHierarchy()
+                val routes = routeTripId?.let { id -> mapOf(id to trips.queryRoutePoints(id)) }.orEmpty()
+                TripsUiMapper.years(groups, requestedLanguage, routes)
+            }
+            runOnUiThread {
+                if (destroyed || uiLanguage != requestedLanguage) return@runOnUiThread
+                result.onSuccess { years ->
+                    tripsUiState = tripsUiState.copy(years = years, routeLoadingId = null)
+                }.onFailure { error ->
+                    tripsUiState = tripsUiState.copy(routeLoadingId = null)
+                    recordDashboardRefreshFailure("trips", error)
+                }
+            }
+        }
+    }
+
     private fun refresh(force: Boolean = true) {
         if (destroyed || !foreground) return
         val nowMs = SystemClock.elapsedRealtime()
@@ -1141,6 +1208,30 @@ class MainActivity : ComponentActivity() {
             "source=$source"
         )
         requestAccessCheck(source, AccessCheckMode.FORCE, ::completeStartupAccessFlow)
+    }
+
+    private fun requestLocationPermissionFromAccessUi() {
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+            checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        ) {
+            Toast.makeText(this, "GPS permission already granted", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (runtimePermissionRequestInFlight) return
+        runtimePermissionRequestInFlight = true
+        requestPermissions(
+            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+            LOCATION_PERMISSION_REQUEST_CODE
+        )
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != LOCATION_PERMISSION_REQUEST_CODE) return
+        runtimePermissionRequestInFlight = false
+        val granted = grantResults.any { it == PackageManager.PERMISSION_GRANTED }
+        Toast.makeText(this, if (granted) "GPS permission granted" else "GPS permission denied", Toast.LENGTH_SHORT).show()
+        refresh()
     }
 
     private fun maybeContinueStartupAccessFlow() {
@@ -1443,6 +1534,7 @@ class MainActivity : ComponentActivity() {
                 low12vThresholdVolts = settings.telegramLowVoltageThreshold().toInt(),
                 telemetryUnavailableMinutes = settings.telegramUnavailableDelayMinutes(),
                 tripSummaryDelaySeconds = settings.telegramTripEndDelaySeconds(),
+                sendLocation = settings.isTelegramSendLocationEnabled(),
                 messages = messages
             ),
             testStatus = telegramTestStatus(settings.telegramConnectionStatus())
@@ -1473,6 +1565,9 @@ class MainActivity : ComponentActivity() {
         }
         if (previous.tripSummaryDelaySeconds != config.tripSummaryDelaySeconds) {
             settings.setTelegramTripEndDelaySeconds(config.tripSummaryDelaySeconds)
+        }
+        if (previous.sendLocation != config.sendLocation) {
+            settings.setTelegramSendLocationEnabled(config.sendLocation)
         }
         TelegramMessageType.entries.forEach { type ->
             val oldMessage = previous.messages[type]
@@ -1714,6 +1809,7 @@ class MainActivity : ComponentActivity() {
         private const val KEY_BACKGROUND_SETTINGS_PENDING_RETURN = "background_settings_pending_return"
         private const val STARTUP_ADB_SELF_CHECK_DELAY_MS = 600L
         private const val TELEGRAM_RECONCILE_DELAY_MS = 600L
+        private const val LOCATION_PERMISSION_REQUEST_CODE = 4101
     }
 }
 
@@ -1725,6 +1821,7 @@ internal val DASHBOARD_CHROME_REFRESH_INTERVAL_MS: Long? = null
 internal fun dashboardProfile(tab: AppTab): DashboardLoadProfile? = when (tab) {
     AppTab.MAIN -> DashboardLoadProfile.MAIN
     AppTab.ALL_PARAMETERS -> DashboardLoadProfile.ALL_PARAMETERS
+    AppTab.TRIPS -> null
     AppTab.HA -> DashboardLoadProfile.HA
     AppTab.TELEGRAM -> null
     AppTab.STORAGE -> DashboardLoadProfile.STORAGE
@@ -1737,6 +1834,7 @@ internal fun dashboardTabRefreshIntervalMs(tab: AppTab, storageRefreshPending: B
     //one async reconciliation without polling SQLite on every foreground heartbeat.
     AppTab.MAIN -> null
     AppTab.ALL_PARAMETERS -> null
+    AppTab.TRIPS -> null
     AppTab.HA -> null
     AppTab.TELEGRAM -> null
     AppTab.STORAGE -> if (storageRefreshPending) 1_000L else null

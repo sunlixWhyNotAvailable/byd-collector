@@ -6,7 +6,8 @@ enum class NormalizedCategory(val mqttKey: String, val staleAfterMs: Long) {
     BODY("body", 30_000L),
     CLIMATE("climate", 30_000L),
     SAFETY("safety", 30_000L),
-    COLLECTOR("collector", 60_000L)
+    COLLECTOR("collector", 60_000L),
+    LOCATION("location", 10_000L)
 }
 
 enum class NormalizedValueType {
@@ -76,7 +77,7 @@ data class NormalizedObservation(
     val field: NormalizedFieldDefinition,
     val value: NormalizedValue,
     val quality: NormalizedQuality,
-    val sourcePollId: Long,
+    val sourcePollId: Long?,
     val sourceKey: String?,
     val observedAt: String,
     val reason: String? = null
