@@ -1,6 +1,7 @@
 package com.bydcollector.collector.keepalive
 
 import java.io.File
+import java.nio.file.Files
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -152,6 +153,22 @@ class KeepAliveShellPlannerTest {
             "tail -n 40 /data/local/tmp/bydcollector_keepalive.log 2>/dev/null || true",
             KeepAliveShellPlanner.daemonLogTailCommand()
         )
+    }
+
+    @Test
+    fun daemonLogCapTruncatesAtBoundaryAndIsWiredIntoLog() {
+        val logFile = Files.createTempFile("bydcollector-keepalive", ".log").toFile()
+        logFile.writeBytes(ByteArray(63))
+
+        assertFalse(KeepAliveDaemon.truncateLogIfNeeded(logFile, 64))
+        assertEquals(63L, logFile.length())
+
+        logFile.appendBytes(byteArrayOf(1))
+        assertTrue(KeepAliveDaemon.truncateLogIfNeeded(logFile, 64))
+        assertEquals(0L, logFile.length())
+        val source = sourceFile("com/bydcollector/collector/keepalive/KeepAliveDaemon.java").readText()
+        assertTrue(source.contains("LOG_MAX_BYTES = 1_048_576L"))
+        assertTrue(source.contains("truncateLogIfNeeded(LOG_FILE, LOG_MAX_BYTES);"))
     }
 
     private fun sourceFile(path: String): File {

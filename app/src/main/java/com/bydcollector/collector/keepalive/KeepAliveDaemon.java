@@ -1,6 +1,7 @@
 package com.bydcollector.collector.keepalive;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.InputStream;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
@@ -11,6 +12,8 @@ import java.util.concurrent.TimeUnit;
 //keeps selected dilink radios/service recovery alive from shell while the app process may be backgrounded
 public final class KeepAliveDaemon {
     private static final String PACKAGE_NAME = "com.bydcollector.collector";
+    private static final File LOG_FILE = new File(KeepAliveProtocol.LOG_PATH);
+    private static final long LOG_MAX_BYTES = 1_048_576L;
     private static final String USER_SHUTDOWN_COMMAND = "settings get global bydcollector_user_shutdown";
     private static final String RECOVER_COLLECTOR_COMMAND =
             "am broadcast --include-stopped-packages -a com.bydcollector.collector.action.KEEP_ALIVE_RECOVERY " +
@@ -194,8 +197,22 @@ public final class KeepAliveDaemon {
     }
 
     private static void log(String message) {
+        //stdout is inherited with O_APPEND, so truncating the same file keeps future writes at the new EOF
+        truncateLogIfNeeded(LOG_FILE, LOG_MAX_BYTES);
         System.out.println(System.currentTimeMillis() + " " + message);
         System.out.flush();
+    }
+
+    static boolean truncateLogIfNeeded(File logFile, long maxBytes) {
+        if (!logFile.isFile() || logFile.length() < maxBytes) {
+            return false;
+        }
+        try (RandomAccessFile writable = new RandomAccessFile(logFile, "rw")) {
+            writable.setLength(0L);
+            return true;
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     private static OwnerLock acquireSingleOwnerLock() {
