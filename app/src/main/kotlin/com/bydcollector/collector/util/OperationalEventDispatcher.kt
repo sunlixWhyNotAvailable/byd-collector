@@ -5,16 +5,14 @@ import java.util.concurrent.Executor
 
 private const val TAG = "OperationalEvent"
 
+internal val sharedOperationalEventExecutor: Executor =
+    namedSingleThreadExecutor("byd-operational-events")
+
 /**
- * Runs an operational-event write synchronously only when no executor is
- * supplied; an executor-backed write is always queued and never falls back to
- * the caller thread when the executor rejects it.
+ * Queues operational-event writes and never falls back to the caller thread
+ * when the executor rejects them.
  */
-internal fun dispatchOperationalEvent(executor: Executor?, action: () -> Unit) {
-    if (executor == null) {
-        action()
-        return
-    }
+internal fun dispatchOperationalEvent(executor: Executor, action: () -> Unit) {
     try {
         executor.execute { runOperationalEventTask(action) }
     } catch (error: RuntimeException) {

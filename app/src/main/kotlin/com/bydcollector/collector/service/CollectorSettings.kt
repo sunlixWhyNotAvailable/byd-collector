@@ -16,13 +16,14 @@ import com.bydcollector.collector.maintenance.StorageCutoverJournal
 import com.bydcollector.collector.mqtt.HaMqttConfig
 import com.bydcollector.collector.security.KeystoreSecretStore
 import com.bydcollector.collector.util.dispatchOperationalEvent
+import com.bydcollector.collector.util.sharedOperationalEventExecutor
 import java.util.concurrent.Executor
 
 //persistent user settings facade that also records operational events for later diagnostics
 class CollectorSettings(
     context: Context,
     private val store: TelemetryStore? = null,
-    private val eventExecutor: Executor? = null
+    private val eventExecutor: Executor = sharedOperationalEventExecutor
 ) {
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val secretStore = KeystoreSecretStore(context)

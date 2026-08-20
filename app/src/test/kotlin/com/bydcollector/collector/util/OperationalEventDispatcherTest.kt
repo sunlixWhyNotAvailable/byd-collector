@@ -6,23 +6,11 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class OperationalEventDispatcherTest {
-    @Test
-    fun nullExecutorRunsSynchronouslyAndPreservesFailures() {
-        var ran = false
-        dispatchOperationalEvent(null) { ran = true }
-        assertTrue(ran)
-
-        assertFailsWith<IllegalStateException> {
-            dispatchOperationalEvent(null) { error("synchronous failure") }
-        }
-    }
-
     @Test
     fun executorQueuesAsynchronouslyInFifoOrder() {
         val executor = Executors.newSingleThreadExecutor()

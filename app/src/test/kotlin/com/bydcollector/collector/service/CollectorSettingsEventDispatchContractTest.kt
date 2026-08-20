@@ -7,12 +7,13 @@ import kotlin.test.assertTrue
 
 class CollectorSettingsEventDispatchContractTest {
     @Test
-    fun storeBackedUiSettingsCanDispatchEventsOffTheCallerThread() {
+    fun storeBackedSettingsAlwaysDispatchEventsOffTheCallerThread() {
         val source = sourceFile("com/bydcollector/collector/service/CollectorSettings.kt").readText()
 
-        assertTrue(source.contains("private val eventExecutor: Executor? = null"))
+        assertTrue(source.contains("private val eventExecutor: Executor = sharedOperationalEventExecutor"))
         assertTrue(source.contains("dispatchOperationalEvent(eventExecutor)"))
         assertTrue(source.contains("eventStore.recordEvent(category, message, detail)"))
+        assertFalse(source.contains("Executor? = null"))
         assertFalse(source.contains("store?.recordEvent("))
     }
 
