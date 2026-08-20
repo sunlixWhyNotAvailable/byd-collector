@@ -34,13 +34,15 @@ import java.util.zip.ZipFile;
 
 //runs as shell app_process so the app can read autoservice through a narrow binder bridge
 public final class CollectorHelperDaemon {
-    private static final String WORKER_MODE_ARG = "worker";
-
     private CollectorHelperDaemon() {
     }
 
     public static void main(String[] args) throws Exception {
-        if (args.length < 2 || args.length > 3 || (args.length == 3 && !WORKER_MODE_ARG.equals(args[2]))) {
+        if (
+            args.length < 2 ||
+            args.length > 3 ||
+            (args.length == 3 && !CollectorHelperProtocol.WORKER_MODE_ARG.equals(args[2]))
+        ) {
             System.err.println("ERR: usage: CollectorHelperDaemon <appUid> <apkPath> [worker]");
             System.exit(2);
             return;
@@ -110,6 +112,11 @@ public final class CollectorHelperDaemon {
                     if (reply != null) {
                         reply.writeInt(CollectorHelperProtocol.STATUS_OK);
                         reply.writeInt(CollectorHelperProtocol.PROTOCOL_VERSION);
+                        reply.writeInt(
+                            workerMode
+                                ? CollectorHelperProtocol.OWNER_MODE_AUTONOMOUS_WORKER
+                                : CollectorHelperProtocol.OWNER_MODE_APP
+                        );
                         reply.writeInt(nativeReader.isAvailable() ? 1 : 0);
                         reply.writeString(nativeReader.unavailableReason());
                     }

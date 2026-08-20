@@ -5,6 +5,7 @@ import android.os.Process
 import com.bydcollector.collector.adb.AdbCancellation
 import com.bydcollector.collector.adb.AdbLocalClient
 import com.bydcollector.collector.adb.AdbOperationCancelledException
+import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
 import com.bydcollector.collector.data.direct.DirectVehicleHelper
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.direct.CollectorHelperProtocol
@@ -20,6 +21,7 @@ object DirectBridgeManager {
         context: Context,
         adbClient: AdbLocalClient,
         helper: DirectVehicleHelper = DirectVehicleHelperClient(),
+        ownerMode: DirectHelperOwnerMode = DirectHelperOwnerMode.APP,
         cancellation: AdbCancellation = AdbCancellation()
     ): DirectBridgeResult {
         cancellation.throwIfCancelled()
@@ -31,10 +33,12 @@ object DirectBridgeManager {
         }
         try {
             cancellation.throwIfCancelled()
-            //rechecks under the launch lock so concurrent callers cannot kill a freshly started helper
-            if (helper.isAlive()) return DirectBridgeResult(ok = true, message = "Direct helper already running")
+            //rechecks under the launch lock so concurrent callers cannot replace a correct fresh helper
+            if (helper.ownerMode() == ownerMode) {
+                return DirectBridgeResult(ok = true, message = "Direct helper already running in ${ownerMode.name} mode")
+            }
 
-            val launch = adbClient.execShell(launchCommand(context), timeoutMs = 15_000)
+            val launch = adbClient.execShell(launchCommand(context, ownerMode), timeoutMs = 15_000)
             if (!launch.ok) {
                 return DirectBridgeResult(
                     ok = false,
@@ -50,8 +54,8 @@ object DirectBridgeManager {
                     throw AdbOperationCancelledException()
                 }
                 cancellation.throwIfCancelled()
-                if (helper.isAlive()) {
-                    return DirectBridgeResult(ok = true, message = "Direct helper started")
+                if (helper.ownerMode() == ownerMode) {
+                    return DirectBridgeResult(ok = true, message = "Direct helper started in ${ownerMode.name} mode")
                 }
             }
             return DirectBridgeResult(ok = false, message = "Direct helper did not register Binder service after launch")
@@ -60,19 +64,37 @@ object DirectBridgeManager {
         }
     }
 
-    fun launchCommand(context: Context): String {
-        return launchCommand(apkPath = context.applicationContext.applicationInfo.sourceDir, appUid = Process.myUid())
+    fun launchCommand(
+        context: Context,
+        ownerMode: DirectHelperOwnerMode = DirectHelperOwnerMode.APP
+    ): String {
+        return launchCommand(
+            apkPath = context.applicationContext.applicationInfo.sourceDir,
+            appUid = Process.myUid(),
+            ownerMode = ownerMode
+        )
     }
 
-    fun launchCommand(apkPath: String, appUid: Int): String {
+    fun launchCommand(
+        apkPath: String,
+        appUid: Int,
+        ownerMode: DirectHelperOwnerMode = DirectHelperOwnerMode.APP
+    ): String {
         val quotedApk = shellQuote(apkPath)
-        //clear stale shell helper from prior install before starting the current app-owned helper
+        val modeArgument = if (ownerMode == DirectHelperOwnerMode.AUTONOMOUS_WORKER) {
+            " ${CollectorHelperProtocol.WORKER_MODE_ARG}"
+        } else {
+            ""
+        }
+        //stop and verify the previous owner before removing its lock or starting another reader
         val cleanup = "for pid in ${'$'}(pidof ${CollectorHelperProtocol.PROCESS_NAME} 2>/dev/null); " +
             "do kill \"${'$'}pid\" 2>/dev/null || true; done; " +
+            "for i in 1 2 3 4 5; do pidof ${CollectorHelperProtocol.PROCESS_NAME} >/dev/null || break; sleep 1; done; " +
+            "if pidof ${CollectorHelperProtocol.PROCESS_NAME} >/dev/null; then echo HELPER_STOP_TIMEOUT >&2; exit 73; fi; " +
             "rm -f ${CollectorHelperProtocol.LOCK_PATH}; "
         return cleanup +
             "CLASSPATH=$quotedApk setsid app_process /system/bin --nice-name=${CollectorHelperProtocol.PROCESS_NAME} " +
-            "${CollectorHelperProtocol.HELPER_CLASS} $appUid $quotedApk </dev/null >${CollectorHelperProtocol.LOG_PATH} 2>&1 & " +
+            "${CollectorHelperProtocol.HELPER_CLASS} $appUid $quotedApk$modeArgument </dev/null >${CollectorHelperProtocol.LOG_PATH} 2>&1 & " +
             "for i in 1 2 3; do service list 2>/dev/null | grep -q ${CollectorHelperProtocol.SERVICE_NAME} && break; sleep 1; done"
     }
 

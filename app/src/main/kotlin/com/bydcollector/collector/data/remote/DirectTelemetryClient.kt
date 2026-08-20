@@ -3,6 +3,7 @@ package com.bydcollector.collector.data.remote
 import android.content.Context
 import com.bydcollector.collector.adb.AdbLocalClient
 import com.bydcollector.collector.data.direct.DirectAutoserviceReader
+import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
 import com.bydcollector.collector.data.direct.DirectVehicleHelper
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.data.local.Clock
@@ -21,7 +22,7 @@ class DirectTelemetryClient(
 
     override fun read(): TelemetryReadResult {
         val startedAt = clock.elapsedRealtimeMs()
-        ensureHelperReady(startedAt)?.let { return it }
+        ensureHelperReady(startedAt, DirectHelperOwnerMode.APP)?.let { return it }
 
         val snapshot = reader.readSnapshot()
         return if (snapshot.readings.isEmpty()) {
@@ -47,23 +48,33 @@ class DirectTelemetryClient(
         }
     }
 
-    internal fun ensureHelperReady(): TelemetryReadResult.Failure? {
-        return ensureHelperReady(clock.elapsedRealtimeMs())
+    internal fun ensureHelperReady(
+        ownerMode: DirectHelperOwnerMode = DirectHelperOwnerMode.APP
+    ): TelemetryReadResult.Failure? {
+        return ensureHelperReady(clock.elapsedRealtimeMs(), ownerMode)
     }
 
-    private fun ensureHelperReady(startedAt: Long): TelemetryReadResult.Failure? {
-        if (!helper.isAlive()) {
+    private fun ensureHelperReady(
+        startedAt: Long,
+        ownerMode: DirectHelperOwnerMode
+    ): TelemetryReadResult.Failure? {
+        if (helper.ownerMode() != ownerMode) {
             val now = clock.elapsedRealtimeMs()
             //backs off helper launch failures because adb/app_process startup can block for seconds
             if (now < nextLaunchAttemptAtMs) {
                 return failure("helper_launch_backoff", "Direct helper launch is cooling down after a previous failure", startedAt)
             }
-            val launch = DirectBridgeManager.ensureRunning(appContext, adbClient, helper)
+            val launch = DirectBridgeManager.ensureRunning(
+                context = appContext,
+                adbClient = adbClient,
+                helper = helper,
+                ownerMode = ownerMode
+            )
             if (!launch.ok) {
                 nextLaunchAttemptAtMs = clock.elapsedRealtimeMs() + LAUNCH_FAILURE_BACKOFF_MS
                 return launchFailure(launch, startedAt)
             }
-            if (!waitForHelper()) {
+            if (!waitForHelper(ownerMode)) {
                 nextLaunchAttemptAtMs = clock.elapsedRealtimeMs() + LAUNCH_FAILURE_BACKOFF_MS
                 return failure("helper_unavailable", "Direct helper did not answer Binder ping", startedAt)
             }
@@ -71,9 +82,9 @@ class DirectTelemetryClient(
         return null
     }
 
-    private fun waitForHelper(): Boolean {
+    private fun waitForHelper(ownerMode: DirectHelperOwnerMode): Boolean {
         repeat(10) {
-            if (helper.isAlive()) return true
+            if (helper.ownerMode() == ownerMode) return true
             Thread.sleep(250)
         }
         return false

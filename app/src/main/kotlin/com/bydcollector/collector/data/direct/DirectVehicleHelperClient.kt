@@ -14,9 +14,32 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
     @Volatile
     private var cached: IBinder? = null
 
-    override fun isAlive(): Boolean {
-        val ping = transactScalar(CollectorHelperProtocol.TX_PING) { }
-        return ping?.status == 0 && ping.raw == CollectorHelperProtocol.PROTOCOL_VERSION
+    override fun isAlive(): Boolean = ownerMode() != null
+
+    override fun ownerMode(): DirectHelperOwnerMode? = synchronized(lock) {
+        val binder = ensureBinder() ?: return@synchronized null
+        val data = Parcel.obtain()
+        val reply = Parcel.obtain()
+        try {
+            data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
+            if (!binder.transact(CollectorHelperProtocol.TX_PING, data, reply, 0)) {
+                cached = null
+                return@synchronized null
+            }
+            val status = reply.readInt()
+            val protocolVersion = reply.readInt()
+            val ownerMode = reply.readInt()
+            if (status != CollectorHelperProtocol.STATUS_OK || protocolVersion != CollectorHelperProtocol.PROTOCOL_VERSION) {
+                return@synchronized null
+            }
+            DirectHelperOwnerMode.fromProtocolValue(ownerMode)
+        } catch (_: Exception) {
+            cached = null
+            null
+        } finally {
+            data.recycle()
+            reply.recycle()
+        }
     }
 
     override fun read(entry: DirectFidEntry): DirectHelperReadResult {

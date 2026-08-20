@@ -1,9 +1,11 @@
 package com.bydcollector.collector.direct
 
+import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
 import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class TelemetryWorkerBinderContractTest {
@@ -12,7 +14,7 @@ class TelemetryWorkerBinderContractTest {
         val daemon = source("com/bydcollector/collector/direct/CollectorHelperDaemon.java")
         val client = source("com/bydcollector/collector/data/direct/DirectVehicleHelperClient.kt")
 
-        assertEquals(5, CollectorHelperProtocol.PROTOCOL_VERSION)
+        assertEquals(6, CollectorHelperProtocol.PROTOCOL_VERSION)
         assertEquals(100, CollectorHelperProtocol.MAX_PENDING_WORKER_SAMPLES)
         assertEquals(128, CollectorHelperProtocol.MAX_WORKER_FIELD_COUNT)
         assertTrue(daemon.contains("Binder.getCallingUid() != appUid"))
@@ -21,6 +23,16 @@ class TelemetryWorkerBinderContractTest {
         assertTrue(client.contains("binder.transact(CollectorHelperProtocol.TX_WORKER_PENDING"))
         assertTrue(client.contains("binder.transact(CollectorHelperProtocol.TX_WORKER_ACK"))
         assertTrue(client.contains("fieldIndex == expectedIndex"))
+        assertTrue(client.contains("override fun ownerMode(): DirectHelperOwnerMode?"))
+        assertEquals(
+            DirectHelperOwnerMode.APP,
+            DirectHelperOwnerMode.fromProtocolValue(CollectorHelperProtocol.OWNER_MODE_APP)
+        )
+        assertEquals(
+            DirectHelperOwnerMode.AUTONOMOUS_WORKER,
+            DirectHelperOwnerMode.fromProtocolValue(CollectorHelperProtocol.OWNER_MODE_AUTONOMOUS_WORKER)
+        )
+        assertNull(DirectHelperOwnerMode.fromProtocolValue(-1))
         assertTrue(daemon.contains("final boolean workerMode = args.length == 3"))
         assertTrue(daemon.contains("? new WorkerPollLoop("))
         assertTrue(daemon.contains("spool.append(workerSample("))

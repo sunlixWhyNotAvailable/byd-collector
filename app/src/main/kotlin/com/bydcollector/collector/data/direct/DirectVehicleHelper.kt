@@ -1,9 +1,11 @@
 package com.bydcollector.collector.data.direct
 
+import com.bydcollector.collector.direct.CollectorHelperProtocol
 import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
 
 interface DirectVehicleHelper {
     fun isAlive(): Boolean
+    fun ownerMode(): DirectHelperOwnerMode? = if (isAlive()) DirectHelperOwnerMode.APP else null
     fun read(entry: DirectFidEntry): DirectHelperReadResult
 
     fun readBatch(entries: List<DirectFidEntry>): DirectHelperBatchResult {
@@ -21,6 +23,15 @@ interface DirectVehicleHelper {
                 returnedCount = results.size
             )
         )
+    }
+}
+
+enum class DirectHelperOwnerMode(val protocolValue: Int) {
+    APP(CollectorHelperProtocol.OWNER_MODE_APP),
+    AUTONOMOUS_WORKER(CollectorHelperProtocol.OWNER_MODE_AUTONOMOUS_WORKER);
+
+    companion object {
+        fun fromProtocolValue(value: Int): DirectHelperOwnerMode? = entries.firstOrNull { it.protocolValue == value }
     }
 }
 

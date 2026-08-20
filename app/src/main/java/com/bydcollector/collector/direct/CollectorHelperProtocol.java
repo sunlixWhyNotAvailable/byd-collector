@@ -5,9 +5,10 @@ public final class CollectorHelperProtocol {
     public static final String PROCESS_NAME = "bydcollector_helper";
     public static final String DESCRIPTOR = "com.bydcollector.collector.direct.ICollectorHelper";
     public static final String HELPER_CLASS = "com.bydcollector.collector.direct.CollectorHelperDaemon";
+    public static final String WORKER_MODE_ARG = "worker";
     public static final String LOG_PATH = "/data/local/tmp/bydcollector_helper.log";
     public static final String LOCK_PATH = "/data/local/tmp/bydcollector_helper.lock";
-    public static final int PROTOCOL_VERSION = 5;
+    public static final int PROTOCOL_VERSION = 6;
     public static final int TX_PING = 1;
     public static final int TX_READ = 2;
     public static final int TX_READ_BATCH = 3;
@@ -18,6 +19,8 @@ public final class CollectorHelperProtocol {
     public static final int MAX_BATCH_SIZE = 23_096;
     public static final int MAX_PENDING_WORKER_SAMPLES = 100;
     public static final int MAX_WORKER_FIELD_COUNT = 128;
+    public static final int OWNER_MODE_APP = 0;
+    public static final int OWNER_MODE_AUTONOMOUS_WORKER = 1;
 
     public static final int STATUS_OK = 0;
     public static final int STATUS_INVALID_REQUEST = -910;
