@@ -102,7 +102,7 @@ class CollectorService : Service() {
     private lateinit var maintenanceCoordinator: DbMaintenanceCoordinator
     private lateinit var dashboardUiStateStore: DashboardUiStateStore
     private lateinit var dashboardStateProvider: DashboardStateProvider
-    private var mainPollerOwnerMode = DirectHelperOwnerMode.AUTONOMOUS_WORKER
+    private var mainPollerOwnerMode = DirectHelperOwnerMode.APP_GAP_SPOOL
     private var debugStorageReady = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var sessionId: Long? = null
@@ -393,7 +393,7 @@ class CollectorService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun createTelemetryPoller(
-        ownerMode: DirectHelperOwnerMode = DirectHelperOwnerMode.AUTONOMOUS_WORKER
+        ownerMode: DirectHelperOwnerMode = DirectHelperOwnerMode.APP_GAP_SPOOL
     ): TelemetryPoller {
         val helper = DirectVehicleHelperClient()
         val adbClient = AdbLocalClient(File(applicationContext.filesDir, "adb_keys"))
@@ -401,17 +401,14 @@ class CollectorService : Service() {
         val liveClient = DirectTelemetryClient(
             context = applicationContext,
             adbClient = adbClient,
-            helper = helper
+            helper = helper,
+            expectedOwnerMode = ownerMode
         )
-        val live = if (ownerMode == DirectHelperOwnerMode.APP) {
-            PollPersistenceCoordinator(
-                store = store,
-                client = liveClient,
-                successfulPollObserver = observer
-            )
-        } else {
-            null
-        }
+        val live = PollPersistenceCoordinator(
+            store = store,
+            client = liveClient,
+            successfulPollObserver = observer
+        )
         val replay = TelemetryWorkerReplayCoordinator(
             store = store,
             ensureHelper = {
@@ -634,7 +631,7 @@ class CollectorService : Service() {
             publishDashboardRuntimeFlags()
             return
         }
-        val ownerMode = DirectHelperOwnerMode.AUTONOMOUS_WORKER
+        val ownerMode = DirectHelperOwnerMode.APP_GAP_SPOOL
         if (mainPollerOwnerMode != ownerMode) poller = createTelemetryPoller(ownerMode)
         mqttRuntimeActive.set(false)
         mqttOfflineQueued.set(false)
@@ -928,7 +925,7 @@ class CollectorService : Service() {
         val wasPolling = poller.isRunning()
         if (wasPolling) poller.stop()
         if (::tripRuntime.isInitialized && reason != "service_destroyed") tripRuntime.pause(reason)
-        stopAutonomousMainWorker(reason)
+        stopAppGapSpoolHelper(reason)
         mainPollingRunning.set(false)
         sessionId?.let { openedSessionId ->
             runCatching { store.endSession(openedSessionId, reason) }
@@ -949,7 +946,7 @@ class CollectorService : Service() {
         publishDashboardRuntimeFlags()
     }
 
-    private fun stopAutonomousMainWorker(reason: String) {
+    private fun stopAppGapSpoolHelper(reason: String) {
         if (reason == "service_destroyed") return
         val helper = DirectVehicleHelperClient()
         if (
@@ -959,12 +956,12 @@ class CollectorService : Service() {
         ) {
             debugOwnerHandoffPending.set(true)
         }
-        if (helper.ownerMode() != DirectHelperOwnerMode.AUTONOMOUS_WORKER) return
+        if (helper.ownerMode() != DirectHelperOwnerMode.APP_GAP_SPOOL) return
         if (isDebugPollerRunning()) stopDebug("helper_owner_handoff")
-        val result = helper.requestStop(DirectHelperOwnerMode.AUTONOMOUS_WORKER)
+        val result = helper.requestStop(DirectHelperOwnerMode.APP_GAP_SPOOL)
         store.recordEvent(
-            if (result.ok) "telemetry_worker_stop_requested" else "telemetry_worker_stop_failed",
-            if (result.ok) "Autonomous Main worker stop requested" else "Autonomous Main worker stop failed",
+            if (result.ok) "telemetry_spool_helper_stop_requested" else "telemetry_spool_helper_stop_failed",
+            if (result.ok) "App-gap spool helper stop requested" else "App-gap spool helper stop failed",
             "reason=$reason ${result.error.orEmpty()}".trim()
         )
     }
@@ -1265,6 +1262,9 @@ class CollectorService : Service() {
         if (detached.mainPoller?.stopAndJoin(2_000L) == false) {
             maintenanceRuntimeRestoreAllowed.set(false)
             error("Main poller did not stop for database maintenance")
+        }
+        if (operation != DbMaintenanceOperation.DEBUG_ARCHIVE) {
+            stopAppGapSpoolHelper("database_maintenance")
         }
         val debugStopReason = if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
             "debug_database_maintenance"

@@ -45,7 +45,10 @@ class TelemetryWorkerReplayCoordinatorTest {
         assertFalse(result.needsReplay)
         assertEquals(41L, result.cycleResult?.pollId)
         assertEquals(1L, result.cycleResult?.pollRowsPersisted)
-        assertEquals(listOf("parameters", "insert:7", "observer:41", "ack:999"), actions)
+        assertEquals(
+            listOf("parameters", "insert:7", "observer:41", "ack:999", "event:worker_spool_replayed"),
+            actions
+        )
         assertEquals("1970-01-01T00:00:01Z", storage.input?.timestamp)
         assertEquals(PollReading("test_percent", "72", "72"), storage.input?.readings?.single())
     }
@@ -83,18 +86,24 @@ class TelemetryWorkerReplayCoordinatorTest {
     fun replayCompletesBeforeTheFirstLivePoll() {
         val actions = mutableListOf<String>()
         val storage = FakeWorkerPollStorage(actions)
-        val replay = coordinator(
-            storage = storage,
-            sample = sample(),
-            actions = actions,
-            observer = object : SuccessfulPollObserver {
-                override fun onSuccessfulPoll(
-                    sessionId: Long,
-                    pollId: Long,
-                    timestamp: String,
-                    readings: List<PollReading>
-                ) = Unit
-            }
+        var pendingCalls = 0
+        val replay = TelemetryWorkerReplayCoordinator(
+            store = storage,
+            ensureHelper = { null },
+            pendingSamples = {
+                pendingCalls += 1
+                PendingTelemetryWorkerSamples(
+                    status = CollectorHelperProtocol.STATUS_OK,
+                    samples = if (pendingCalls == 1) listOf(sample()) else emptyList()
+                )
+            },
+            acknowledgeSample = { _, _ ->
+                actions += "ack:999"
+                TelemetryWorkerAckResult(CollectorHelperProtocol.STATUS_OK, updated = true)
+            },
+            successfulPollObserver = null,
+            entries = listOf(TEST_ENTRY),
+            acknowledgedAtMs = { 999L }
         )
         var livePolls = 0
         val runner = TelemetryWorkerReplayPollCycleRunner(
@@ -111,6 +120,7 @@ class TelemetryWorkerReplayCoordinatorTest {
         assertEquals(0, livePolls)
         assertEquals(88L, runner.pollOnce(7L)?.pollId)
         assertEquals(1, livePolls)
+        assertEquals(2, pendingCalls)
     }
 
     @Test

@@ -1,306 +1,322 @@
 package com.bydcollector.collector.direct;
 
-import android.content.ContentValues;
-import android.database.Cursor;
-import android.database.DatabaseUtils;
-import android.database.sqlite.SQLiteDatabase;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileDescriptor;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.Base64;
 
 //helper-owned durable raw spool; the app acknowledges a sample only after its own transaction commits
 final class TelemetryWorkerSpool implements AutoCloseable {
-    static final String DATABASE_PATH = "/data/local/tmp/bydcollector_telemetry_worker.db";
-    static final int SCHEMA_VERSION = 2;
-    static final long MAX_DATABASE_BYTES = 128L * 1024L * 1024L;
-    private static final long MAX_APPEND_RESERVATION_BYTES = 2L * 1024L * 1024L;
-    static final String SAMPLE_TABLE = "telemetry_worker_samples";
-    static final String VALUE_TABLE = "telemetry_worker_values";
+    static final String SPOOL_DIRECTORY_PATH = "/data/local/tmp/bydcollector_telemetry_spool";
+    static final int RECORD_VERSION = 1;
+    static final long MAX_SPOOL_BYTES = 128L * 1024L * 1024L;
+    private static final String READY_SUFFIX = ".ready";
+    private static final String TMP_SUFFIX = ".tmp";
+    private static final String BAD_SUFFIX = ".bad";
+    private static final SampleValidator ACCEPT_ALL = sample -> { };
 
-    static final String CREATE_SAMPLE_TABLE =
-        "CREATE TABLE " + SAMPLE_TABLE + " (" +
-            "boot_id TEXT NOT NULL," +
-            "helper_generation TEXT NOT NULL," +
-            "poll_sequence INTEGER NOT NULL CHECK(poll_sequence >= 0)," +
-            "catalog_version TEXT NOT NULL," +
-            "captured_wall_ms INTEGER NOT NULL," +
-            "captured_elapsed_ms INTEGER NOT NULL CHECK(captured_elapsed_ms >= 0)," +
-            "poll_elapsed_ms INTEGER NOT NULL CHECK(poll_elapsed_ms >= 0)," +
-            "batch_status INTEGER NOT NULL," +
-            "batch_mode INTEGER NOT NULL," +
-            "native_available INTEGER NOT NULL CHECK(native_available IN (0,1))," +
-            "group_failure_count INTEGER NOT NULL CHECK(group_failure_count >= 0)," +
-            "field_count INTEGER NOT NULL CHECK(field_count > 0)," +
-            "error TEXT," +
-            "acknowledged_at_ms INTEGER," +
-            "PRIMARY KEY(boot_id, helper_generation, poll_sequence)" +
-        ") WITHOUT ROWID";
-
-    static final String CREATE_VALUE_TABLE =
-        "CREATE TABLE " + VALUE_TABLE + " (" +
-            "boot_id TEXT NOT NULL," +
-            "helper_generation TEXT NOT NULL," +
-            "poll_sequence INTEGER NOT NULL," +
-            "field_index INTEGER NOT NULL CHECK(field_index >= 0)," +
-            "tx INTEGER NOT NULL CHECK(tx IN (5,7))," +
-            "dev INTEGER NOT NULL," +
-            "fid INTEGER NOT NULL," +
-            "status INTEGER NOT NULL," +
-            "raw INTEGER," +
-            "error TEXT," +
-            "PRIMARY KEY(boot_id, helper_generation, poll_sequence, field_index)," +
-            "FOREIGN KEY(boot_id, helper_generation, poll_sequence) REFERENCES " + SAMPLE_TABLE +
-                "(boot_id, helper_generation, poll_sequence) ON DELETE CASCADE" +
-        ") WITHOUT ROWID";
-
-    private final SQLiteDatabase database;
+    private final File directory;
+    private final long maxBytes;
+    private boolean closed;
 
     static TelemetryWorkerSpool open() {
-        SQLiteDatabase database = SQLiteDatabase.openOrCreateDatabase(DATABASE_PATH, null);
-        try {
-            database.setForeignKeyConstraintsEnabled(true);
-            database.enableWriteAheadLogging();
-            int version = (int) DatabaseUtils.longForQuery(database, "PRAGMA user_version", null);
-            if (version == 0) createSchema(database);
-            else if (version == 1) migrateSchemaV1(database);
-            else if (version != SCHEMA_VERSION) {
-                throw new IllegalStateException("unsupported telemetry worker spool schema: " + version);
-            }
-            return new TelemetryWorkerSpool(database);
-        } catch (RuntimeException error) {
-            database.close();
-            throw error;
+        return open(new File(SPOOL_DIRECTORY_PATH), MAX_SPOOL_BYTES);
+    }
+
+    //package-private seam for deterministic filesystem tests
+    static TelemetryWorkerSpool openForTest(File directory, long maxBytes) {
+        return open(directory, maxBytes);
+    }
+
+    private static TelemetryWorkerSpool open(File directory, long maxBytes) {
+        if (directory == null || (!directory.isDirectory() && !directory.mkdirs())) {
+            throw new IllegalStateException("cannot create telemetry worker spool directory: " + directory);
         }
+        if (maxBytes <= 0) throw new IllegalArgumentException("maxBytes must be positive");
+        return new TelemetryWorkerSpool(directory, maxBytes);
     }
 
-    private TelemetryWorkerSpool(SQLiteDatabase database) {
-        this.database = database;
+    private TelemetryWorkerSpool(File directory, long maxBytes) {
+        this.directory = directory;
+        this.maxBytes = maxBytes;
     }
 
-    boolean append(Sample sample) {
-        database.beginTransaction();
+    synchronized boolean append(Sample sample) {
+        ensureOpen();
+        if (sample == null) throw new IllegalArgumentException("sample is required");
+        File ready = readyFile(sample.identity);
+        File temporary = temporaryFile(sample.identity);
+        if (ready.exists() || temporary.exists()) return false;
+
+        byte[] payload;
         try {
-            //reserve room for one bounded sample; unacknowledged rows are never evicted
-            if (databaseFootprintBytes() + MAX_APPEND_RESERVATION_BYTES >= MAX_DATABASE_BYTES) return false;
-            database.insertOrThrow(SAMPLE_TABLE, null, sampleValues(sample));
-            for (Value value : sample.values) {
-                database.insertOrThrow(VALUE_TABLE, null, valueValues(sample.identity, value));
-            }
-            database.setTransactionSuccessful();
+            payload = encode(sample).toString().getBytes(StandardCharsets.UTF_8);
+        } catch (Exception error) {
+            throw new IllegalStateException("cannot encode telemetry worker sample", error);
+        }
+        long footprint = footprintBytes();
+        if (footprint > maxBytes || payload.length > maxBytes - footprint) return false;
+        try {
+            writeDurably(temporary, payload);
+            Files.move(temporary.toPath(), ready.toPath(), StandardCopyOption.ATOMIC_MOVE);
             return true;
-        } finally {
-            database.endTransaction();
+        } catch (IOException error) {
+            //A .tmp is never visible to pending(); remove only this failed write.
+            if (temporary.isFile()) temporary.delete();
+            throw new IllegalStateException("cannot persist telemetry worker sample", error);
         }
     }
 
-    boolean canAppend() {
-        return databaseFootprintBytes() + MAX_APPEND_RESERVATION_BYTES < MAX_DATABASE_BYTES;
+    synchronized boolean canAppend() {
+        ensureOpen();
+        return footprintBytes() < maxBytes;
     }
 
-    List<Sample> pending(int limit) {
+    synchronized List<Sample> pending(int limit) {
+        return pending(limit, ACCEPT_ALL);
+    }
+
+    synchronized List<Sample> pending(int limit, SampleValidator validator) {
+        ensureOpen();
+        if (validator == null) throw new IllegalArgumentException("sample validator is required");
         if (limit < 1 || limit > CollectorHelperProtocol.MAX_PENDING_WORKER_SAMPLES) {
             throw new IllegalArgumentException("invalid pending sample limit: " + limit);
         }
-        List<Sample> samples = new ArrayList<Sample>();
-        database.beginTransactionNonExclusive();
-        try {
-            List<SampleHeader> headers = pendingHeaders(limit);
-            for (SampleHeader header : headers) {
-                List<Value> values = values(header.identity);
-                if (values.size() != header.fieldCount) {
-                    throw new IllegalStateException(
-                        "worker sample field count mismatch: expected=" + header.fieldCount + " actual=" + values.size()
-                    );
-                }
-                samples.add(header.toSample(values));
+        File[] files = directory.listFiles((dir, name) -> name.endsWith(READY_SUFFIX));
+        if (files == null) throw new IllegalStateException("cannot list telemetry worker spool: " + directory);
+        List<PendingRecord> records = new ArrayList<PendingRecord>();
+        for (File file : files) {
+            try {
+                Sample sample = decode(readBytes(file));
+                if (!file.equals(readyFile(sample.identity))) throw new IllegalArgumentException("record filename does not match identity");
+                validator.validate(sample);
+                records.add(new PendingRecord(file, sample));
+            } catch (Exception error) {
+                quarantine(file);
             }
-            database.setTransactionSuccessful();
-        } finally {
-            database.endTransaction();
         }
-        return samples;
+        Collections.sort(records, new Comparator<PendingRecord>() {
+            @Override public int compare(PendingRecord left, PendingRecord right) {
+                int result = compareLong(left.sample.capturedWallMs, right.sample.capturedWallMs);
+                if (result != 0) return result;
+                result = compareLong(left.sample.capturedElapsedMs, right.sample.capturedElapsedMs);
+                if (result != 0) return result;
+                result = left.sample.identity.bootId.compareTo(right.sample.identity.bootId);
+                if (result != 0) return result;
+                result = left.sample.identity.helperGeneration.compareTo(right.sample.identity.helperGeneration);
+                if (result != 0) return result;
+                return compareLong(left.sample.identity.pollSequence, right.sample.identity.pollSequence);
+            }
+        });
+        List<Sample> result = new ArrayList<Sample>(Math.min(limit, records.size()));
+        for (int index = 0; index < records.size() && index < limit; index++) {
+            result.add(records.get(index).sample);
+        }
+        return result;
     }
 
-    int acknowledge(TelemetryWorkerSampleIdentity identity, long acknowledgedAtMs) {
+    synchronized int acknowledge(TelemetryWorkerSampleIdentity identity, long acknowledgedAtMs) {
+        ensureOpen();
+        if (identity == null) throw new IllegalArgumentException("identity is required");
         if (acknowledgedAtMs < 0) throw new IllegalArgumentException("acknowledgedAtMs must be non-negative");
-        int deleted;
-        database.beginTransaction();
+        File ready = readyFile(identity);
+        if (!ready.isFile()) return 0;
         try {
-            deleted = database.delete(
-                SAMPLE_TABLE,
-                "boot_id=? AND helper_generation=? AND poll_sequence=?",
-                identityArgs(identity)
-            );
-            database.setTransactionSuccessful();
+            Sample sample = decode(readBytes(ready));
+            if (!identity.equals(sample.identity)) return 0;
+        } catch (Exception error) {
+            return 0;
+        }
+        return ready.delete() ? 1 : 0;
+    }
+
+    @Override public synchronized void close() {
+        closed = true;
+    }
+
+    private void ensureOpen() {
+        if (closed) throw new IllegalStateException("telemetry worker spool is closed");
+    }
+
+    private File readyFile(TelemetryWorkerSampleIdentity identity) {
+        return new File(directory, fileStem(identity) + READY_SUFFIX);
+    }
+
+    private File temporaryFile(TelemetryWorkerSampleIdentity identity) {
+        return new File(directory, fileStem(identity) + TMP_SUFFIX);
+    }
+
+    private static String fileStem(TelemetryWorkerSampleIdentity identity) {
+        return "v" + RECORD_VERSION + "_" + encodePart(identity.bootId) + "_" +
+            encodePart(identity.helperGeneration) + "_" + identity.pollSequence;
+    }
+
+    private static String encodePart(String value) {
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(value.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private long footprintBytes() {
+        File[] files = directory.listFiles();
+        if (files == null) throw new IllegalStateException("cannot list telemetry worker spool: " + directory);
+        long total = 0L;
+        for (File file : files) {
+            if (!file.isFile()) continue;
+            long length = file.length();
+            if (Long.MAX_VALUE - total < length) return Long.MAX_VALUE;
+            total += length;
+        }
+        return total;
+    }
+
+    private static void writeDurably(File file, byte[] payload) throws IOException {
+        FileOutputStream output = new FileOutputStream(file, false);
+        try {
+            output.write(payload);
+            output.flush();
+            FileDescriptor descriptor = output.getFD();
+            descriptor.sync();
         } finally {
-            database.endTransaction();
+            output.close();
         }
-        if (deleted == 1) {
-            //checkpoint releases WAL sidecar space so the producer can resume after ACKs
-            runCatchingCheckpoint();
-        }
-        return deleted;
     }
 
-    @Override public void close() {
-        database.close();
-    }
-
-    private static void createSchema(SQLiteDatabase database) {
-        database.beginTransaction();
+    private static byte[] readBytes(File file) throws IOException {
+        FileInputStream input = new FileInputStream(file);
         try {
-            database.execSQL(CREATE_SAMPLE_TABLE);
-            database.execSQL(CREATE_VALUE_TABLE);
-            database.execSQL("PRAGMA user_version=" + SCHEMA_VERSION);
-            database.setTransactionSuccessful();
+            ByteArrayOutputStream output = new ByteArrayOutputStream((int) Math.min(Integer.MAX_VALUE, file.length()));
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = input.read(buffer)) != -1) output.write(buffer, 0, read);
+            return output.toByteArray();
         } finally {
-            database.endTransaction();
+            input.close();
         }
     }
 
-    private static void migrateSchemaV1(SQLiteDatabase database) {
-        database.beginTransaction();
-        try {
-            //v1 kept acknowledged rows; remove only those already durably imported
-            database.delete(SAMPLE_TABLE, "acknowledged_at_ms IS NOT NULL", null);
-            database.execSQL("PRAGMA user_version=" + SCHEMA_VERSION);
-            database.setTransactionSuccessful();
-        } finally {
-            database.endTransaction();
+    private static JSONObject encode(Sample sample) throws Exception {
+        JSONObject json = new JSONObject();
+        json.put("record_version", RECORD_VERSION);
+        json.put("identity", new JSONObject()
+            .put("boot_id", sample.identity.bootId)
+            .put("helper_generation", sample.identity.helperGeneration)
+            .put("poll_sequence", sample.identity.pollSequence));
+        json.put("catalog_version", sample.catalogVersion);
+        json.put("captured_wall_ms", sample.capturedWallMs);
+        json.put("captured_elapsed_ms", sample.capturedElapsedMs);
+        json.put("poll_elapsed_ms", sample.pollElapsedMs);
+        json.put("batch_status", sample.batchStatus);
+        json.put("batch_mode", sample.batchMode);
+        json.put("native_available", sample.nativeAvailable);
+        json.put("group_failure_count", sample.groupFailureCount);
+        json.put("field_count", sample.values.size());
+        json.put("error", sample.error == null ? JSONObject.NULL : sample.error);
+        JSONArray values = new JSONArray();
+        for (Value value : sample.values) {
+            values.put(new JSONObject()
+                .put("field_index", value.fieldIndex)
+                .put("tx", value.tx)
+                .put("dev", value.dev)
+                .put("fid", value.fid)
+                .put("status", value.status)
+                .put("raw", value.raw == null ? JSONObject.NULL : value.raw)
+                .put("error", value.error == null ? JSONObject.NULL : value.error));
+        }
+        json.put("values", values);
+        return json;
+    }
+
+    private static Sample decode(byte[] bytes) throws Exception {
+        JSONObject json = new JSONObject(new String(bytes, StandardCharsets.UTF_8));
+        if (json.getInt("record_version") != RECORD_VERSION) {
+            throw new IllegalArgumentException("unsupported telemetry worker record version");
+        }
+        JSONObject identity = json.getJSONObject("identity");
+        TelemetryWorkerSampleIdentity sampleIdentity = new TelemetryWorkerSampleIdentity(
+            identity.getString("boot_id"),
+            identity.getString("helper_generation"),
+            identity.getLong("poll_sequence")
+        );
+        JSONArray encodedValues = json.getJSONArray("values");
+        int fieldCount = json.getInt("field_count");
+        if (fieldCount != encodedValues.length()) throw new IllegalArgumentException("field count mismatch");
+        List<Value> values = new ArrayList<Value>(encodedValues.length());
+        for (int index = 0; index < encodedValues.length(); index++) {
+            JSONObject value = encodedValues.getJSONObject(index);
+            values.add(new Value(
+                value.getInt("field_index"),
+                value.getInt("tx"),
+                value.getInt("dev"),
+                value.getInt("fid"),
+                value.getInt("status"),
+                nullableInteger(value, "raw"),
+                nullableString(value, "error")
+            ));
+        }
+        return new Sample(
+            sampleIdentity,
+            json.getString("catalog_version"),
+            json.getLong("captured_wall_ms"),
+            json.getLong("captured_elapsed_ms"),
+            json.getLong("poll_elapsed_ms"),
+            json.getInt("batch_status"),
+            json.getInt("batch_mode"),
+            json.getBoolean("native_available"),
+            json.getInt("group_failure_count"),
+            nullableString(json, "error"),
+            values
+        );
+    }
+
+    private static Integer nullableInteger(JSONObject json, String key) throws Exception {
+        if (!json.has(key) || json.isNull(key)) return null;
+        return json.getInt(key);
+    }
+
+    private static String nullableString(JSONObject json, String key) throws Exception {
+        if (!json.has(key) || json.isNull(key)) return null;
+        return json.getString(key);
+    }
+
+    private void quarantine(File file) {
+        File bad = new File(file.getPath() + BAD_SUFFIX);
+        int suffix = 1;
+        while (bad.exists()) bad = new File(file.getPath() + BAD_SUFFIX + "." + suffix++);
+        if (!file.renameTo(bad)) {
+            System.err.println("WARN: cannot quarantine malformed telemetry worker record: " + file);
         }
     }
 
-    private long databaseFootprintBytes() {
-        long pageCount = DatabaseUtils.longForQuery(database, "PRAGMA page_count", null);
-        long freePages = DatabaseUtils.longForQuery(database, "PRAGMA freelist_count", null);
-        long pageSize = DatabaseUtils.longForQuery(database, "PRAGMA page_size", null);
-        long usedDatabaseBytes = Math.max(0L, pageCount - freePages) * Math.max(1L, pageSize);
-        return usedDatabaseBytes + fileLength(DATABASE_PATH + "-wal") + fileLength(DATABASE_PATH + "-shm");
+    private static int compareLong(long left, long right) {
+        return left < right ? -1 : left == right ? 0 : 1;
     }
 
-    private void runCatchingCheckpoint() {
-        try {
-            try (Cursor cursor = database.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", null)) {
-                cursor.moveToFirst();
-            }
-        } catch (RuntimeException error) {
-            System.err.println("WARN: telemetry worker spool checkpoint failed: " + error.getMessage());
+    private static final class PendingRecord {
+        final File file;
+        final Sample sample;
+
+        PendingRecord(File file, Sample sample) {
+            this.file = file;
+            this.sample = sample;
         }
     }
 
-    private static long fileLength(String path) {
-        File file = new File(path);
-        return file.isFile() ? file.length() : 0L;
-    }
-
-    private List<SampleHeader> pendingHeaders(int limit) {
-        List<SampleHeader> headers = new ArrayList<SampleHeader>();
-        try (Cursor cursor = database.query(
-            SAMPLE_TABLE,
-            new String[] {
-                "boot_id", "helper_generation", "poll_sequence", "catalog_version",
-                "captured_wall_ms", "captured_elapsed_ms", "poll_elapsed_ms",
-                "batch_status", "batch_mode", "native_available", "group_failure_count",
-                "field_count", "error"
-            },
-            "acknowledged_at_ms IS NULL",
-            null,
-            null,
-            null,
-            "captured_wall_ms, captured_elapsed_ms, boot_id, helper_generation, poll_sequence",
-            Integer.toString(limit)
-        )) {
-            while (cursor.moveToNext()) {
-                headers.add(new SampleHeader(
-                    new TelemetryWorkerSampleIdentity(cursor.getString(0), cursor.getString(1), cursor.getLong(2)),
-                    cursor.getString(3),
-                    cursor.getLong(4),
-                    cursor.getLong(5),
-                    cursor.getLong(6),
-                    cursor.getInt(7),
-                    cursor.getInt(8),
-                    cursor.getInt(9) == 1,
-                    cursor.getInt(10),
-                    cursor.getInt(11),
-                    cursor.isNull(12) ? null : cursor.getString(12)
-                ));
-            }
-        }
-        return headers;
-    }
-
-    private List<Value> values(TelemetryWorkerSampleIdentity identity) {
-        List<Value> values = new ArrayList<Value>();
-        try (Cursor cursor = database.query(
-            VALUE_TABLE,
-            new String[] {"field_index", "tx", "dev", "fid", "status", "raw", "error"},
-            "boot_id=? AND helper_generation=? AND poll_sequence=?",
-            identityArgs(identity),
-            null,
-            null,
-            "field_index"
-        )) {
-            while (cursor.moveToNext()) {
-                values.add(new Value(
-                    cursor.getInt(0),
-                    cursor.getInt(1),
-                    cursor.getInt(2),
-                    cursor.getInt(3),
-                    cursor.getInt(4),
-                    cursor.isNull(5) ? null : cursor.getInt(5),
-                    cursor.isNull(6) ? null : cursor.getString(6)
-                ));
-            }
-        }
-        return values;
-    }
-
-    private static ContentValues sampleValues(Sample sample) {
-        ContentValues values = identityValues(sample.identity);
-        values.put("catalog_version", sample.catalogVersion);
-        values.put("captured_wall_ms", sample.capturedWallMs);
-        values.put("captured_elapsed_ms", sample.capturedElapsedMs);
-        values.put("poll_elapsed_ms", sample.pollElapsedMs);
-        values.put("batch_status", sample.batchStatus);
-        values.put("batch_mode", sample.batchMode);
-        values.put("native_available", sample.nativeAvailable ? 1 : 0);
-        values.put("group_failure_count", sample.groupFailureCount);
-        values.put("field_count", sample.values.size());
-        values.put("error", sample.error);
-        return values;
-    }
-
-    private static ContentValues valueValues(TelemetryWorkerSampleIdentity identity, Value value) {
-        ContentValues values = identityValues(identity);
-        values.put("field_index", value.fieldIndex);
-        values.put("tx", value.tx);
-        values.put("dev", value.dev);
-        values.put("fid", value.fid);
-        values.put("status", value.status);
-        if (value.raw == null) values.putNull("raw");
-        else values.put("raw", value.raw);
-        values.put("error", value.error);
-        return values;
-    }
-
-    private static ContentValues identityValues(TelemetryWorkerSampleIdentity identity) {
-        ContentValues values = new ContentValues();
-        values.put("boot_id", identity.bootId);
-        values.put("helper_generation", identity.helperGeneration);
-        values.put("poll_sequence", identity.pollSequence);
-        return values;
-    }
-
-    private static String[] identityArgs(TelemetryWorkerSampleIdentity identity) {
-        return new String[] {
-            identity.bootId,
-            identity.helperGeneration,
-            Long.toString(identity.pollSequence)
-        };
+    interface SampleValidator {
+        void validate(Sample sample);
     }
 
     static final class Sample {
@@ -342,8 +358,10 @@ final class TelemetryWorkerSpool implements AutoCloseable {
                 throw new IllegalArgumentException("too many worker fields: " + values.size());
             }
             Set<Integer> indexes = new HashSet<Integer>();
-            for (Value value : values) {
+            for (int index = 0; index < values.size(); index++) {
+                Value value = values.get(index);
                 if (value == null) throw new IllegalArgumentException("values must not contain null");
+                if (value.fieldIndex != index) throw new IllegalArgumentException("values must be in fieldIndex order");
                 if (!indexes.add(value.fieldIndex)) throw new IllegalArgumentException("duplicate fieldIndex: " + value.fieldIndex);
             }
             for (int index = 0; index < values.size(); index++) {
@@ -360,62 +378,6 @@ final class TelemetryWorkerSpool implements AutoCloseable {
             this.groupFailureCount = groupFailureCount;
             this.error = error;
             this.values = Collections.unmodifiableList(new ArrayList<Value>(values));
-        }
-    }
-
-    private static final class SampleHeader {
-        final TelemetryWorkerSampleIdentity identity;
-        final String catalogVersion;
-        final long capturedWallMs;
-        final long capturedElapsedMs;
-        final long pollElapsedMs;
-        final int batchStatus;
-        final int batchMode;
-        final boolean nativeAvailable;
-        final int groupFailureCount;
-        final int fieldCount;
-        final String error;
-
-        SampleHeader(
-            TelemetryWorkerSampleIdentity identity,
-            String catalogVersion,
-            long capturedWallMs,
-            long capturedElapsedMs,
-            long pollElapsedMs,
-            int batchStatus,
-            int batchMode,
-            boolean nativeAvailable,
-            int groupFailureCount,
-            int fieldCount,
-            String error
-        ) {
-            this.identity = identity;
-            this.catalogVersion = catalogVersion;
-            this.capturedWallMs = capturedWallMs;
-            this.capturedElapsedMs = capturedElapsedMs;
-            this.pollElapsedMs = pollElapsedMs;
-            this.batchStatus = batchStatus;
-            this.batchMode = batchMode;
-            this.nativeAvailable = nativeAvailable;
-            this.groupFailureCount = groupFailureCount;
-            this.fieldCount = fieldCount;
-            this.error = error;
-        }
-
-        Sample toSample(List<Value> values) {
-            return new Sample(
-                identity,
-                catalogVersion,
-                capturedWallMs,
-                capturedElapsedMs,
-                pollElapsedMs,
-                batchStatus,
-                batchMode,
-                nativeAvailable,
-                groupFailureCount,
-                error,
-                values
-            );
         }
     }
 

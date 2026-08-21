@@ -41,15 +41,15 @@ public final class CollectorHelperDaemon {
         if (
             args.length < 2 ||
             args.length > 3 ||
-            (args.length == 3 && !CollectorHelperProtocol.WORKER_MODE_ARG.equals(args[2]))
+            (args.length == 3 && !CollectorHelperProtocol.SPOOL_MODE_ARG.equals(args[2]))
         ) {
-            System.err.println("ERR: usage: CollectorHelperDaemon <appUid> <apkPath> [worker]");
+            System.err.println("ERR: usage: CollectorHelperDaemon <appUid> <apkPath> [spool]");
             System.exit(2);
             return;
         }
         final int appUid = Integer.parseInt(args[0]);
         final String apkPath = args[1];
-        final boolean workerMode = args.length == 3;
+        final boolean spoolMode = args.length == 3;
         OwnerLock ownerLock = acquireSingleOwnerLock();
         if (ownerLock == null) {
             System.out.println("ALREADY_RUNNING");
@@ -80,19 +80,22 @@ public final class CollectorHelperDaemon {
         }
         final TelemetryWorkerSpool workerSpool = openedSpool;
         final String workerSpoolError = openedSpoolError;
-        if (workerMode && workerSpool == null) {
-            System.err.println("ERR: worker spool unavailable: " + workerSpoolError);
+        if (spoolMode && workerSpool == null) {
+            System.err.println("ERR: app-gap spool unavailable: " + workerSpoolError);
             ownerLock.close();
             System.exit(4);
             return;
         }
         final Object readLock = new Object();
         final Handler mainHandler = new Handler(Looper.myLooper());
-        final WorkerPollLoop workerPollLoop = workerMode
+        final String mainCatalogVersion = loadMainCatalogVersion();
+        final TelemetryWorkerSpool.SampleValidator replaySampleValidator = sample ->
+            validateWorkerSampleForReplay(sample, mainCatalogVersion, mainRows);
+        final WorkerPollLoop workerPollLoop = spoolMode
             ? new WorkerPollLoop(
                 mainHandler,
                 mainRows,
-                loadMainCatalogVersion(),
+                mainCatalogVersion,
                 readBootId(),
                 UUID.randomUUID().toString(),
                 workerSpool,
@@ -110,12 +113,13 @@ public final class CollectorHelperDaemon {
                 }
                 data.enforceInterface(CollectorHelperProtocol.DESCRIPTOR);
                 if (code == CollectorHelperProtocol.TX_PING) {
+                    if (workerPollLoop != null) workerPollLoop.markConsumerHeartbeat();
                     if (reply != null) {
                         reply.writeInt(CollectorHelperProtocol.STATUS_OK);
                         reply.writeInt(CollectorHelperProtocol.PROTOCOL_VERSION);
                         reply.writeInt(
-                            workerMode
-                                ? CollectorHelperProtocol.OWNER_MODE_AUTONOMOUS_WORKER
+                            spoolMode
+                                ? CollectorHelperProtocol.OWNER_MODE_APP_GAP_SPOOL
                                 : CollectorHelperProtocol.OWNER_MODE_APP
                         );
                         reply.writeInt(nativeReader.isAvailable() ? 1 : 0);
@@ -124,6 +128,7 @@ public final class CollectorHelperDaemon {
                     return true;
                 }
                 if (code == CollectorHelperProtocol.TX_READ) {
+                    if (workerPollLoop != null) workerPollLoop.markConsumerHeartbeat();
                     int tx = data.readInt();
                     int dev = data.readInt();
                     int fid = data.readInt();
@@ -145,6 +150,7 @@ public final class CollectorHelperDaemon {
                         reply.writeInt(status);
                         reply.writeInt(result.raw == null ? 0 : result.raw);
                     }
+                    if (workerPollLoop != null) workerPollLoop.markConsumerHeartbeat();
                     return true;
                 }
                 if (code == CollectorHelperProtocol.TX_READ_BATCH) {
@@ -156,11 +162,24 @@ public final class CollectorHelperDaemon {
                             result = BatchResult.rejected(rows.size(), validationError);
                         } else {
                             synchronized (readLock) {
-                                result = BatchEngine.run(
-                                    rows,
-                                    address -> scalarRead(autoservice, autoserviceDescriptor, address),
-                                    nativeReader
-                                );
+                                if (workerPollLoop != null) workerPollLoop.markConsumerHeartbeat();
+                                if (
+                                    workerSpool != null &&
+                                    workerPollLoop != null &&
+                                    !workerSpool.pending(1, replaySampleValidator).isEmpty()
+                                ) {
+                                    result = BatchResult.rejected(
+                                        rows.size(),
+                                        "app-gap spool pending; replay before live read"
+                                    );
+                                } else {
+                                    result = BatchEngine.run(
+                                        rows,
+                                        address -> scalarRead(autoservice, autoserviceDescriptor, address),
+                                        nativeReader
+                                    );
+                                }
+                                if (workerPollLoop != null) workerPollLoop.markConsumerHeartbeat();
                             }
                         }
                     } catch (Throwable error) {
@@ -181,11 +200,15 @@ public final class CollectorHelperDaemon {
                             );
                         } else {
                             try {
+                                List<TelemetryWorkerSpool.Sample> samples;
+                                synchronized (readLock) {
+                                    samples = workerSpool.pending(data.readInt(), replaySampleValidator);
+                                }
                                 writeWorkerPendingReply(
                                     reply,
                                     CollectorHelperProtocol.STATUS_OK,
                                     null,
-                                    workerSpool.pending(data.readInt())
+                                    samples
                                 );
                             } catch (IllegalArgumentException error) {
                                 writeWorkerPendingReply(
@@ -204,9 +227,11 @@ public final class CollectorHelperDaemon {
                             }
                         }
                     }
+                    if (workerPollLoop != null) workerPollLoop.markConsumerHeartbeat();
                     return true;
                 }
                 if (code == CollectorHelperProtocol.TX_WORKER_ACK) {
+                    if (workerPollLoop != null) workerPollLoop.markConsumerHeartbeat();
                     if (reply != null) {
                         if (workerSpool == null) {
                             writeWorkerAckReply(
@@ -248,12 +273,13 @@ public final class CollectorHelperDaemon {
                             }
                         }
                     }
+                    if (workerPollLoop != null) workerPollLoop.markConsumerHeartbeat();
                     return true;
                 }
                 if (code == CollectorHelperProtocol.TX_STOP_OWNER) {
                     int expectedOwnerMode = data.readInt();
-                    int actualOwnerMode = workerMode
-                        ? CollectorHelperProtocol.OWNER_MODE_AUTONOMOUS_WORKER
+                    int actualOwnerMode = spoolMode
+                        ? CollectorHelperProtocol.OWNER_MODE_APP_GAP_SPOOL
                         : CollectorHelperProtocol.OWNER_MODE_APP;
                     boolean accepted = expectedOwnerMode == actualOwnerMode;
                     if (reply != null) {
@@ -288,7 +314,7 @@ public final class CollectorHelperDaemon {
                     " native=" + nativeReader.isAvailable() +
                     (nativeReader.isAvailable() ? "" : " native_error=" + nativeReader.unavailableReason()) +
                     " spool=" + (workerSpool != null) +
-                    " worker=" + workerMode +
+                    " spool_mode=" + spoolMode +
                     (workerSpoolError == null ? "" : " spool_error=" + workerSpoolError)
             );
             System.out.flush();
@@ -582,9 +608,37 @@ public final class CollectorHelperDaemon {
         );
     }
 
+    static void validateWorkerSampleForReplay(
+        TelemetryWorkerSpool.Sample sample,
+        String catalogVersion,
+        List<Address> rows
+    ) {
+        if (!catalogVersion.equals(sample.catalogVersion)) {
+            throw new IllegalArgumentException(
+                "worker catalog mismatch: expected=" + catalogVersion + " actual=" + sample.catalogVersion
+            );
+        }
+        if (sample.values.size() != rows.size()) {
+            throw new IllegalArgumentException(
+                "worker field count mismatch: expected=" + rows.size() + " actual=" + sample.values.size()
+            );
+        }
+        for (int index = 0; index < rows.size(); index++) {
+            Address row = rows.get(index);
+            TelemetryWorkerSpool.Value value = sample.values.get(index);
+            if (
+                value.fieldIndex != index ||
+                value.tx != row.tx ||
+                value.dev != row.dev ||
+                value.fid != row.fid
+            ) {
+                throw new IllegalArgumentException("worker field mismatch at index=" + index);
+            }
+        }
+    }
+
     static final class WorkerPollLoop implements Runnable {
-        static final long ACTIVE_INTERVAL_MS = 500L;
-        static final long DETACHED_INTERVAL_MS = 5_000L;
+        static final long FALLBACK_INTERVAL_MS = 500L;
         static final long CONSUMER_LEASE_MS = 2_000L;
 
         private final Handler handler;
@@ -596,8 +650,8 @@ public final class CollectorHelperDaemon {
         private final Object readLock;
         private final ScalarReader scalarReader;
         private final NativeReader nativeReader;
+        private final ConsumerLease consumerLease;
         private long sequence;
-        private volatile long lastConsumerHeartbeatElapsedMs;
         private boolean stopped;
         private String lastError;
 
@@ -621,6 +675,10 @@ public final class CollectorHelperDaemon {
             this.readLock = readLock;
             this.scalarReader = scalarReader;
             this.nativeReader = nativeReader;
+            this.consumerLease = new ConsumerLease(
+                SystemClock.elapsedRealtime(),
+                CONSUMER_LEASE_MS
+            );
         }
 
         void start() {
@@ -634,10 +692,16 @@ public final class CollectorHelperDaemon {
 
         void markConsumerHeartbeat() {
             long now = SystemClock.elapsedRealtime();
-            long previous = lastConsumerHeartbeatElapsedMs;
-            lastConsumerHeartbeatElapsedMs = now;
-            if (previous == 0L || now - previous > CONSUMER_LEASE_MS) {
-                //wake a detached loop immediately; repeated active heartbeats do not repost work
+            boolean wakeFallback;
+            synchronized (readLock) {
+                wakeFallback = !consumerLease.isActive(now);
+                if (consumerLease.renew(now)) {
+                    log("INFO: app consumer lease restored");
+                    lastError = null;
+                }
+            }
+            if (wakeFallback) {
+                //wake a fallback loop immediately; repeated active heartbeats do not repost work
                 handler.removeCallbacks(this);
                 if (!stopped) handler.post(this);
             }
@@ -646,61 +710,92 @@ public final class CollectorHelperDaemon {
         @Override public void run() {
             if (stopped) return;
             long cycleStartedAt = SystemClock.elapsedRealtime();
-            long capturedWallMs = System.currentTimeMillis();
-            long capturedElapsedMs = SystemClock.elapsedRealtime();
-            long pollSequence = sequence++;
             try {
-                if (!spool.canAppend()) {
-                    String currentError = "telemetry worker spool cap reached";
-                    if (!currentError.equals(lastError)) {
-                        System.err.println("WARN: " + currentError);
-                        System.err.flush();
-                        lastError = currentError;
-                    }
-                    scheduleNext(cycleStartedAt);
-                    return;
-                }
-                BatchResult result;
                 synchronized (readLock) {
-                    result = BatchEngine.run(rows, scalarReader, nativeReader);
-                }
-                boolean appended = spool.append(workerSample(
-                    new TelemetryWorkerSampleIdentity(bootId, helperGeneration, pollSequence),
-                    catalogVersion,
-                    capturedWallMs,
-                    capturedElapsedMs,
-                    rows,
-                    result
-                ));
-                if (appended) {
-                    lastError = null;
-                } else {
-                    String currentError = "telemetry worker spool cap reached";
-                    if (!currentError.equals(lastError)) {
-                        System.err.println("WARN: " + currentError);
-                        System.err.flush();
-                        lastError = currentError;
+                    long now = SystemClock.elapsedRealtime();
+                    if (!consumerLease.isActive(now)) {
+                        if (consumerLease.beginFallback(now)) {
+                            log("INFO: app consumer lease expired; fallback spool started");
+                        }
+                        if (!spool.canAppend()) {
+                            recordError("app-gap spool cap reached");
+                        } else {
+                            long capturedWallMs = System.currentTimeMillis();
+                            long capturedElapsedMs = SystemClock.elapsedRealtime();
+                            long pollSequence = sequence++;
+                            BatchResult result = BatchEngine.run(rows, scalarReader, nativeReader);
+                            //the read lock also serializes lease renewal, so a restored APP cannot
+                            //race this append and leave a sample after the lease becomes active
+                            if (!consumerLease.isActive(SystemClock.elapsedRealtime())) {
+                                boolean appended = spool.append(workerSample(
+                                    new TelemetryWorkerSampleIdentity(bootId, helperGeneration, pollSequence),
+                                    catalogVersion,
+                                    capturedWallMs,
+                                    capturedElapsedMs,
+                                    rows,
+                                    result
+                                ));
+                                if (!appended) {
+                                    recordError("app-gap spool append rejected (cap or duplicate)");
+                                } else {
+                                    lastError = null;
+                                }
+                            }
+                        }
                     }
                 }
             } catch (Throwable error) {
-                String currentError = describe(error);
-                if (!currentError.equals(lastError)) {
-                    System.err.println("WARN: telemetry worker poll failed: " + currentError);
-                    System.err.flush();
-                    lastError = currentError;
-                }
+                recordError("app-gap spool poll failed: " + describe(error));
             }
             scheduleNext(cycleStartedAt);
         }
 
         private void scheduleNext(long cycleStartedAt) {
             if (!stopped) {
-                long intervalMs = SystemClock.elapsedRealtime() - lastConsumerHeartbeatElapsedMs <= CONSUMER_LEASE_MS
-                    ? ACTIVE_INTERVAL_MS
-                    : DETACHED_INTERVAL_MS;
-                long delayMs = Math.max(0L, intervalMs - (SystemClock.elapsedRealtime() - cycleStartedAt));
+                long delayMs = Math.max(0L, FALLBACK_INTERVAL_MS - (SystemClock.elapsedRealtime() - cycleStartedAt));
                 handler.postDelayed(this, delayMs);
             }
+        }
+
+        private void recordError(String message) {
+            if (!message.equals(lastError)) {
+                log("WARN: " + message);
+                lastError = message;
+            }
+        }
+
+        private static void log(String message) {
+            System.err.println(message);
+            System.err.flush();
+        }
+    }
+
+    static final class ConsumerLease {
+        private final long durationMs;
+        private long expiresAtMs;
+        private boolean fallbackActive;
+
+        ConsumerLease(long startedAtMs, long durationMs) {
+            if (durationMs < 1L) throw new IllegalArgumentException("lease duration must be positive");
+            this.durationMs = durationMs;
+            this.expiresAtMs = startedAtMs + durationMs;
+        }
+
+        synchronized boolean isActive(long nowMs) {
+            return nowMs < expiresAtMs;
+        }
+
+        synchronized boolean renew(long nowMs) {
+            boolean restored = fallbackActive;
+            fallbackActive = false;
+            expiresAtMs = nowMs + durationMs;
+            return restored;
+        }
+
+        synchronized boolean beginFallback(long nowMs) {
+            if (isActive(nowMs) || fallbackActive) return false;
+            fallbackActive = true;
+            return true;
         }
     }
 

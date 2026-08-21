@@ -1,6 +1,7 @@
 package com.bydcollector.collector.direct
 
 import com.bydcollector.collector.data.debug.DirectDebugParameterAsset
+import com.bydcollector.collector.data.direct.DirectFidRegistry
 import java.io.File
 import java.nio.file.Files
 import java.util.zip.ZipEntry
@@ -124,11 +125,55 @@ class CollectorHelperDaemonBatchTest {
         assertEquals(rows.map { Triple(it.tx, it.dev, it.fid) }, sample.values.map { Triple(it.tx, it.dev, it.fid) })
         assertEquals(listOf(110, null), sample.values.map { it.raw })
         assertEquals(listOf(null, "read failed"), sample.values.map { it.error })
-        assertEquals(500L, CollectorHelperDaemon.WorkerPollLoop.ACTIVE_INTERVAL_MS)
-        assertEquals(5_000L, CollectorHelperDaemon.WorkerPollLoop.DETACHED_INTERVAL_MS)
+        assertEquals(500L, CollectorHelperDaemon.WorkerPollLoop.FALLBACK_INTERVAL_MS)
 
         assertFailsWith<IllegalArgumentException> {
             CollectorHelperDaemon.workerSample(identity, "catalog-a", 100, 90, rows.dropLast(1), result)
+        }
+    }
+
+    @Test
+    fun fallbackCatalogIsTheExactOrderedProduction82FieldMain() {
+        val rows = CollectorHelperDaemon.loadMainRows()
+        val expected = DirectFidRegistry.entries
+
+        assertEquals(82, rows.size)
+        assertEquals(
+            expected.map { Triple(it.tx, it.dev, it.fid) },
+            rows.map { Triple(it.tx, it.dev, it.fid) }
+        )
+        val result = CollectorHelperDaemon.BatchResult(
+            CollectorHelperProtocol.STATUS_OK,
+            CollectorHelperProtocol.MODE_NATIVE,
+            true,
+            1,
+            0,
+            0,
+            0,
+            1,
+            Array(rows.size) { CollectorHelperDaemon.ReadValue.ok(it) },
+            null
+        )
+        val sample = CollectorHelperDaemon.workerSample(
+            TelemetryWorkerSampleIdentity("boot-a", "generation-a", 1),
+            DirectFidRegistry.CATALOG_VERSION,
+            100,
+            90,
+            rows,
+            result
+        )
+
+        CollectorHelperDaemon.validateWorkerSampleForReplay(
+            sample,
+            DirectFidRegistry.CATALOG_VERSION,
+            rows
+        )
+        assertFailsWith<IllegalArgumentException> {
+            CollectorHelperDaemon.validateWorkerSampleForReplay(
+                sample,
+                "wrong-catalog",
+                rows
+            )
         }
     }
 
@@ -205,12 +250,26 @@ class CollectorHelperDaemonBatchTest {
     }
 
     @Test
-    fun protocolV7RejectsStaleOrWrongModeHelpersAndExposesReadOnlyEndpointsOnly() {
+    fun consumerLeaseStartsActiveRestoresOnceAndEntersFallbackOnlyAfterExpiry() {
+        val lease = CollectorHelperDaemon.ConsumerLease(1_000L, 2_000L)
+
+        assertTrue(lease.isActive(1_000L))
+        assertTrue(lease.isActive(2_999L))
+        assertTrue(!lease.isActive(3_000L))
+        assertTrue(lease.beginFallback(3_000L))
+        assertTrue(!lease.beginFallback(3_001L))
+        assertTrue(lease.renew(3_100L))
+        assertTrue(lease.isActive(5_099L))
+        assertTrue(!lease.renew(3_200L))
+    }
+
+    @Test
+    fun protocolV8RejectsStaleOrWrongModeHelpersAndExposesReadOnlyEndpointsOnly() {
         val protocol = sourceFile("com/bydcollector/collector/direct/CollectorHelperProtocol.java").readText()
         val daemon = sourceFile("com/bydcollector/collector/direct/CollectorHelperDaemon.java").readText()
         val client = sourceFile("com/bydcollector/collector/data/direct/DirectVehicleHelperClient.kt").readText()
 
-        assertEquals(7, CollectorHelperProtocol.PROTOCOL_VERSION)
+        assertEquals(8, CollectorHelperProtocol.PROTOCOL_VERSION)
         assertTrue(client.contains("protocolVersion != CollectorHelperProtocol.PROTOCOL_VERSION"))
         assertTrue(client.contains("DirectHelperOwnerMode.fromProtocolValue(ownerMode)"))
         assertTrue(client.contains("TX_PING"))

@@ -81,8 +81,8 @@ object DirectBridgeManager {
         ownerMode: DirectHelperOwnerMode = DirectHelperOwnerMode.APP
     ): String {
         val quotedApk = shellQuote(apkPath)
-        val modeArgument = if (ownerMode == DirectHelperOwnerMode.AUTONOMOUS_WORKER) {
-            " ${CollectorHelperProtocol.WORKER_MODE_ARG}"
+        val modeArgument = if (ownerMode == DirectHelperOwnerMode.APP_GAP_SPOOL) {
+            " ${CollectorHelperProtocol.SPOOL_MODE_ARG}"
         } else {
             ""
         }

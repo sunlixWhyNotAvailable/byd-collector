@@ -15,14 +15,15 @@ class DirectTelemetryClient(
     private val clock: Clock = SystemClockAdapter(),
     private val adbClient: AdbLocalClient = AdbLocalClient(File(context.filesDir, "adb_keys")),
     private val helper: DirectVehicleHelper = DirectVehicleHelperClient(),
-    private val reader: DirectAutoserviceReader = DirectAutoserviceReader(helper)
+    private val reader: DirectAutoserviceReader = DirectAutoserviceReader(helper),
+    private val expectedOwnerMode: DirectHelperOwnerMode = DirectHelperOwnerMode.APP
 ) : TelemetryClient {
     private val appContext = context.applicationContext
     @Volatile private var nextLaunchAttemptAtMs: Long = 0
 
     override fun read(): TelemetryReadResult {
         val startedAt = clock.elapsedRealtimeMs()
-        ensureHelperReady(startedAt, DirectHelperOwnerMode.APP)?.let { return it }
+        ensureHelperReady(startedAt, expectedOwnerMode)?.let { return it }
 
         val snapshot = reader.readSnapshot()
         return if (snapshot.readings.isEmpty()) {
@@ -49,7 +50,7 @@ class DirectTelemetryClient(
     }
 
     internal fun ensureHelperReady(
-        ownerMode: DirectHelperOwnerMode = DirectHelperOwnerMode.APP
+        ownerMode: DirectHelperOwnerMode = expectedOwnerMode
     ): TelemetryReadResult.Failure? {
         return ensureHelperReady(clock.elapsedRealtimeMs(), ownerMode)
     }

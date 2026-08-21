@@ -11,15 +11,18 @@ import kotlin.test.assertTrue
 
 class TelemetryWorkerBinderContractTest {
     @Test
-    fun protocolExposesBoundedSpoolAndExactOwnerStopWithOptInWorkerPolling() {
+    fun protocolExposesBoundedSpoolAndExactOwnerStopWithAppGapFallback() {
         val daemon = source("com/bydcollector/collector/direct/CollectorHelperDaemon.java")
         val client = source("com/bydcollector/collector/data/direct/DirectVehicleHelperClient.kt")
         val stopEndpoint = daemon.substringAfter("if (code == CollectorHelperProtocol.TX_STOP_OWNER)")
+        val liveBatchEndpoint = daemon.substringAfter("if (code == CollectorHelperProtocol.TX_READ_BATCH)")
+            .substringBefore("if (code == CollectorHelperProtocol.TX_WORKER_PENDING)")
             .substringBefore("return true;")
         val stopClient = client.substringAfter("fun requestStop(ownerMode: DirectHelperOwnerMode)")
             .substringBefore("private fun readWorkerSample")
 
-        assertEquals(7, CollectorHelperProtocol.PROTOCOL_VERSION)
+        assertEquals(8, CollectorHelperProtocol.PROTOCOL_VERSION)
+        assertEquals("spool", CollectorHelperProtocol.SPOOL_MODE_ARG)
         assertEquals(100, CollectorHelperProtocol.MAX_PENDING_WORKER_SAMPLES)
         assertEquals(128, CollectorHelperProtocol.MAX_WORKER_FIELD_COUNT)
         assertTrue(daemon.contains("Binder.getCallingUid() != appUid"))
@@ -32,14 +35,19 @@ class TelemetryWorkerBinderContractTest {
         assertTrue(stopEndpoint.contains("mainHandler.postDelayed"))
         assertTrue(stopEndpoint.indexOf("if (accepted)") < stopEndpoint.indexOf("mainHandler.postDelayed"))
         assertTrue(stopEndpoint.contains("mainHandler.getLooper().quitSafely()"))
-        assertTrue(daemon.contains("ACTIVE_INTERVAL_MS = 500L"))
-        assertTrue(daemon.contains("DETACHED_INTERVAL_MS = 5_000L"))
+        assertTrue(daemon.contains("FALLBACK_INTERVAL_MS = 500L"))
         assertTrue(daemon.contains("CONSUMER_LEASE_MS = 2_000L"))
         assertTrue(daemon.contains("workerPollLoop.markConsumerHeartbeat()"))
-        assertTrue(daemon.contains("boolean appended = spool.append"))
+        assertTrue(daemon.contains("spool.append(workerSample("))
         assertTrue(daemon.contains("if (!spool.canAppend())"))
         assertTrue(daemon.contains("handler.removeCallbacks(this)"))
-        assertTrue(daemon.contains("now - previous > CONSUMER_LEASE_MS"))
+        assertTrue(daemon.contains("consumerLease.renew(now)"))
+        assertTrue(liveBatchEndpoint.contains("workerSpool.pending(1, replaySampleValidator)"))
+        assertTrue(
+            liveBatchEndpoint.indexOf("workerSpool.pending(1, replaySampleValidator)") <
+                liveBatchEndpoint.indexOf("BatchEngine.run(")
+        )
+        assertTrue(liveBatchEndpoint.contains("synchronized (readLock)"))
         assertTrue(stopEndpoint.contains("}, 100L);"))
         assertTrue(stopClient.contains("data.writeInt(ownerMode.protocolValue)"))
         assertTrue(stopClient.contains("binder.transact(CollectorHelperProtocol.TX_STOP_OWNER"))
@@ -52,15 +60,18 @@ class TelemetryWorkerBinderContractTest {
             DirectHelperOwnerMode.fromProtocolValue(CollectorHelperProtocol.OWNER_MODE_APP)
         )
         assertEquals(
-            DirectHelperOwnerMode.AUTONOMOUS_WORKER,
-            DirectHelperOwnerMode.fromProtocolValue(CollectorHelperProtocol.OWNER_MODE_AUTONOMOUS_WORKER)
+            DirectHelperOwnerMode.APP_GAP_SPOOL,
+            DirectHelperOwnerMode.fromProtocolValue(CollectorHelperProtocol.OWNER_MODE_APP_GAP_SPOOL)
         )
         assertNull(DirectHelperOwnerMode.fromProtocolValue(-1))
         assertTrue(DirectHelperStopResult(CollectorHelperProtocol.STATUS_OK, accepted = true).ok)
         assertFalse(DirectHelperStopResult(CollectorHelperProtocol.STATUS_OK, accepted = false).ok)
-        assertTrue(daemon.contains("final boolean workerMode = args.length == 3"))
+        assertTrue(daemon.contains("final boolean spoolMode = args.length == 3"))
         assertTrue(daemon.contains("? new WorkerPollLoop("))
         assertTrue(daemon.contains("spool.append(workerSample("))
+        assertTrue(daemon.contains("OWNER_MODE_APP_GAP_SPOOL"))
+        assertTrue(daemon.contains("samples = workerSpool.pending(data.readInt(), replaySampleValidator)"))
+        assertTrue(daemon.contains("consumerLease.isActive(now)"))
         assertFalse(daemon.contains("TX_WRITE"))
         assertFalse(daemon.contains("sendCmd"))
         assertFalse(daemon.contains("setXD"))

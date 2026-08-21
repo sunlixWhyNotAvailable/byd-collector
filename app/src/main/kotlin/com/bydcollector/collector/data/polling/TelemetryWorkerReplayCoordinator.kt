@@ -100,6 +100,15 @@ class TelemetryWorkerReplayCoordinator(
                 }
             }
 
+            runCatching {
+                store.recordEvent(
+                    "worker_spool_replayed",
+                    "Replayed helper telemetry samples into app storage",
+                    "count=${pending.samples.size} inserted=$insertedPolls " +
+                        "first=${pending.samples.first().identity} last=${pending.samples.last().identity}"
+                )
+            }
+
             lastFailureKey = null
             return WorkerReplayBatchResult(
                 needsReplay = pending.samples.size == CollectorHelperProtocol.MAX_PENDING_WORKER_SAMPLES,
@@ -234,14 +243,10 @@ class TelemetryWorkerReplayPollCycleRunner(
     private val replay: TelemetryWorkerReplayCoordinator,
     private val live: PollCycleRunner? = null
 ) : PollCycleRunner {
-    private var replayPending = true
-
     override fun pollOnce(sessionId: Long): PollCycleResult? {
-        if (replayPending || live == null) {
-            val result = replay.replayNextBatch(sessionId)
-            replayPending = result.needsReplay
-            result.cycleResult?.let { return it }
-        }
+        //claim and drain the gap spool before every live read; the app writer remains authoritative
+        val result = replay.replayNextBatch(sessionId)
+        result.cycleResult?.let { return it }
         return live?.pollOnce(sessionId)
     }
 }

@@ -28,7 +28,7 @@ interface DirectVehicleHelper {
 
 enum class DirectHelperOwnerMode(val protocolValue: Int) {
     APP(CollectorHelperProtocol.OWNER_MODE_APP),
-    AUTONOMOUS_WORKER(CollectorHelperProtocol.OWNER_MODE_AUTONOMOUS_WORKER);
+    APP_GAP_SPOOL(CollectorHelperProtocol.OWNER_MODE_APP_GAP_SPOOL);
 
     companion object {
         fun fromProtocolValue(value: Int): DirectHelperOwnerMode? = entries.firstOrNull { it.protocolValue == value }

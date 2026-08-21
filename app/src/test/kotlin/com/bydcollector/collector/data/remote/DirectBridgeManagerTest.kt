@@ -31,16 +31,16 @@ class DirectBridgeManagerTest {
     }
 
     @Test
-    fun autonomousWorkerLaunchAddsOnlyTheExplicitModeArgument() {
+    fun appGapSpoolLaunchAddsOnlyTheExplicitModeArgument() {
         val command = DirectBridgeManager.launchCommand(
             apkPath = "/data/app/com.bydcollector.collector/base.apk",
             appUid = 12345,
-            ownerMode = DirectHelperOwnerMode.AUTONOMOUS_WORKER
+            ownerMode = DirectHelperOwnerMode.APP_GAP_SPOOL
         )
 
         assertContains(
             command,
-            "com.bydcollector.collector.direct.CollectorHelperDaemon 12345 '/data/app/com.bydcollector.collector/base.apk' worker"
+            "com.bydcollector.collector.direct.CollectorHelperDaemon 12345 '/data/app/com.bydcollector.collector/base.apk' spool"
         )
     }
 

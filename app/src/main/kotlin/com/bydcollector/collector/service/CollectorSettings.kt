@@ -119,7 +119,7 @@ class CollectorSettings(
             isPollingEnabled() &&
             !isMainManuallyStopped()
         ) {
-            DirectHelperOwnerMode.AUTONOMOUS_WORKER
+            DirectHelperOwnerMode.APP_GAP_SPOOL
         } else {
             DirectHelperOwnerMode.APP
         }
