@@ -46,6 +46,7 @@ data class TripSummaryUi(
 )
 
 data class TripDayUi(
+    val id: String,
     val title: String,
     val distanceKm: Double?,
     val energyKwh: Double?,
@@ -54,6 +55,7 @@ data class TripDayUi(
 )
 
 data class TripMonthUi(
+    val id: String,
     val title: String,
     val distanceKm: Double?,
     val energyKwh: Double?,
@@ -62,6 +64,7 @@ data class TripMonthUi(
 )
 
 data class TripYearUi(
+    val id: String,
     val title: String,
     val distanceKm: Double?,
     val energyKwh: Double?,

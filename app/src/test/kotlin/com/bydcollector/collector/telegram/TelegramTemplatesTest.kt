@@ -53,6 +53,56 @@ class TelegramTemplatesTest {
     }
 
     @Test
+    fun historicalTripBuiltInsMigrateAfterLineEndingAndTrailingWhitespaceNormalization() {
+        val values = mapOf(
+            "trip_distance_km" to "12.3",
+            "trip_duration" to "00:24:18",
+            "trip_energy_kwh" to "3.4",
+            "soc_start" to "81",
+            "soc_end" to "76",
+            "total_distance_km" to "456.7",
+            "total_duration" to "12:34:56",
+            "total_energy_kwh" to "98.7"
+        )
+        val oldUk = "Поїздку завершено\r\nВідстань: {trip_distance_km} км за {trip_duration}   \r\n" +
+            "SOC: {soc_start}% -> {soc_end}%\r\nЕнергія: {trip_energy_kwh} кВт·год  \r\n"
+        val oldEn = "Trip complete\r\nDistance: {trip_distance_km} km in {trip_duration}   \r\n" +
+            "SOC: {soc_start}% -> {soc_end}%\r\nEnergy: {trip_energy_kwh} kWh  \r\n"
+
+        val migratedUk = TelegramBuiltInTemplates.migrateKnownSaved(
+            TelegramEventType.TRIP_SUMMARY.key,
+            oldUk
+        )
+        val migratedEn = TelegramBuiltInTemplates.migrateKnownSaved(
+            TelegramEventType.TRIP_SUMMARY.key,
+            oldEn
+        )
+
+        assertEquals(
+            "Поїздку завершено\nПоточна поїздка: 12.3 км / 00:24:18\n" +
+                "Витрата: 3.4 кВт·год, SOC: 81% -> 76%\n" +
+                "Загалом: 456.7 км / 12:34:56\nВитрата: 98.7 кВт·год",
+            TelegramTemplateRenderer.render(TelegramEventType.TRIP_SUMMARY, migratedUk, values).text
+        )
+        assertEquals(
+            "Trip complete\nCurrent trip: 12.3 km / 00:24:18\n" +
+                "Energy used: 3.4 kWh, SOC: 81% -> 76%\n" +
+                "Total: 456.7 km / 12:34:56\nEnergy used: 98.7 kWh",
+            TelegramTemplateRenderer.render(TelegramEventType.TRIP_SUMMARY, migratedEn, values).text
+        )
+    }
+
+    @Test
+    fun customTemplateRemainsByteForByteUnchangedDuringMigration() {
+        val custom = "Custom\r\n{trip_distance_km}  \n"
+
+        assertEquals(
+            custom,
+            TelegramBuiltInTemplates.migrateKnownSaved(TelegramEventType.TRIP_SUMMARY.key, custom)
+        )
+    }
+
+    @Test
     fun parserAndRendererReplaceOnlyAllowedVariables() {
         val parsed = TelegramTemplateParser.parse("Charge {soc}% at {time}")
         val rendered = TelegramTemplateRenderer.render(

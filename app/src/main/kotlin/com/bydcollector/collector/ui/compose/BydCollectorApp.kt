@@ -2,6 +2,7 @@ package com.bydcollector.collector.ui.compose
 
 import android.content.Context
 import android.graphics.Color as AndroidColor
+import android.graphics.drawable.GradientDrawable
 import android.view.ViewGroup
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -15,6 +16,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -27,6 +29,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
@@ -46,6 +49,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.font.FontFamily
@@ -54,6 +58,10 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -80,6 +88,7 @@ import org.osmdroid.tileprovider.tilesource.XYTileSource
 import org.osmdroid.util.BoundingBox
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
+import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polyline
 
 @Composable
@@ -146,7 +155,7 @@ fun BydCollectorApp(
                             when (activeTab) {
                                 AppTab.MAIN -> MainTab(state, s, actions)
                                 AppTab.ALL_PARAMETERS -> AllParametersTab(state, s, language, actions)
-                                AppTab.TRIPS -> TripsTab(tripsUiState, tripsUiActions, s)
+                                AppTab.TRIPS -> TripsTab(tripsUiState, tripsUiActions, s, language)
                                 AppTab.HA -> HaTab(
                                     state,
                                     s,
@@ -619,9 +628,26 @@ private fun DebugDatabaseCard(state: DashboardState?, strings: UiStrings, action
 private fun TripsTab(
     state: TripsUiState,
     actions: TripsUiActions,
-    strings: UiStrings
+    strings: UiStrings,
+    language: UiLanguage
 ) {
     var selectedTripId by remember { mutableStateOf<String?>(null) }
+    var expandedYears by rememberSaveable { mutableStateOf<List<String>>(emptyList()) }
+    var expandedMonths by rememberSaveable { mutableStateOf<List<String>>(emptyList()) }
+    var expandedDays by rememberSaveable { mutableStateOf<List<String>>(emptyList()) }
+    var expansionInitialized by rememberSaveable { mutableStateOf(false) }
+    val yearIds = state.years.map { it.id }
+    LaunchedEffect(yearIds) {
+        if (!expansionInitialized && state.years.isNotEmpty()) {
+            val year = state.years.first()
+            val month = year.months.firstOrNull()
+            val day = month?.days?.firstOrNull()
+            expandedYears = listOf(year.id)
+            expandedMonths = month?.let { listOf(it.id) }.orEmpty()
+            expandedDays = day?.let { listOf(it.id) }.orEmpty()
+            expansionInitialized = true
+        }
+    }
     val selectedTrip = state.years.asSequence()
         .flatMap { it.months.asSequence() }
         .flatMap { it.days.asSequence() }
@@ -629,46 +655,79 @@ private fun TripsTab(
         .firstOrNull { it.id == selectedTripId }
     TabScrollColumn {
         ScreenTitle(strings.tripsTab, strings.tripsSubtitle)
-        SectionCard(strings.routeColors, modifier = Modifier.fillMaxWidth()) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Text(strings.speed, color = if (state.colorMetric == TripMapMetric.SPEED) LocalBydPalette.current.text else LocalBydPalette.current.muted, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                BydSwitch(
-                    checked = state.colorMetric == TripMapMetric.CONSUMPTION,
-                    onCheckedChange = { actions.onColorMetricChanged(if (it) TripMapMetric.CONSUMPTION else TripMapMetric.SPEED) }
-                )
-                Text(strings.consumption, color = if (state.colorMetric == TripMapMetric.CONSUMPTION) LocalBydPalette.current.text else LocalBydPalette.current.muted, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.weight(1f))
-                TripThresholdRow(
-                    strings = strings,
-                    metric = state.colorMetric,
-                    green = if (state.colorMetric == TripMapMetric.SPEED) state.speedGreenThreshold else state.consumptionGreenThreshold,
-                    yellow = if (state.colorMetric == TripMapMetric.SPEED) state.speedYellowThreshold else state.consumptionYellowThreshold,
-                    onChange = { green, yellow ->
-                        if (state.colorMetric == TripMapMetric.SPEED) actions.onSpeedThresholdsChanged(green, yellow)
-                        else actions.onConsumptionThresholdsChanged(green, yellow)
+        SectionCard(
+            title = strings.routeColors,
+            modifier = Modifier.fillMaxWidth(),
+            bodyPadding = 0.dp,
+            trailing = {
+                Row(horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            strings.speed,
+                            color = if (state.colorMetric == TripMapMetric.SPEED) LocalBydPalette.current.text else LocalBydPalette.current.muted,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        BydSwitch(
+                            checked = state.colorMetric == TripMapMetric.CONSUMPTION,
+                            onCheckedChange = { actions.onColorMetricChanged(if (it) TripMapMetric.CONSUMPTION else TripMapMetric.SPEED) },
+                            binary = true
+                        )
+                        Text(
+                            strings.consumption,
+                            color = if (state.colorMetric == TripMapMetric.CONSUMPTION) LocalBydPalette.current.text else LocalBydPalette.current.muted,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
                     }
-                )
+                    TripThresholdRow(
+                        strings = strings,
+                        metric = state.colorMetric,
+                        green = if (state.colorMetric == TripMapMetric.SPEED) state.speedGreenThreshold else state.consumptionGreenThreshold,
+                        yellow = if (state.colorMetric == TripMapMetric.SPEED) state.speedYellowThreshold else state.consumptionYellowThreshold,
+                        onChange = { green, yellow ->
+                            if (state.colorMetric == TripMapMetric.SPEED) actions.onSpeedThresholdsChanged(green, yellow)
+                            else actions.onConsumptionThresholdsChanged(green, yellow)
+                        }
+                    )
+                }
             }
-        }
-        SectionCard(strings.tripList, modifier = Modifier.fillMaxWidth()) {
+        ) {}
+        SectionCard(strings.tripList, modifier = Modifier.fillMaxWidth(), bodyPadding = 0.dp) {
             if (state.years.isEmpty()) {
                 Text(strings.noTrips, color = LocalBydPalette.current.muted, fontSize = 13.sp, modifier = Modifier.fillMaxWidth().padding(18.dp), textAlign = TextAlign.Center)
             } else {
                 state.years.forEach { year ->
-                    TripGroupRow(strings, year.title, year.distanceKm, year.energyKwh, year.averageConsumptionKwhPer100Km, year.months.sumOf { it.days.sumOf { day -> day.trips.size } })
-                    year.months.forEach { month ->
-                        TripGroupRow(strings, month.title, month.distanceKm, month.energyKwh, month.averageConsumptionKwhPer100Km, month.days.sumOf { it.trips.size }, indent = 12.dp)
-                        month.days.forEach { day ->
-                            TripGroupRow(strings, day.title, day.distanceKm, day.energyKwh, day.averageConsumptionKwhPer100Km, day.trips.size, indent = 24.dp)
-                            TripTableHeader(strings)
-                            day.trips.forEach { trip ->
-                                TripTableRow(strings, trip) {
-                                    selectedTripId = trip.id
-                                    actions.onRouteRequested(trip.id)
+                    val yearExpanded = year.id in expandedYears
+                    TripGroupRow(
+                        strings, language, year.title, year.distanceKm, year.energyKwh,
+                        year.averageConsumptionKwhPer100Km, year.months.sumOf { it.days.sumOf { day -> day.trips.size } },
+                        level = 0, expanded = yearExpanded,
+                        onClick = { expandedYears = toggleExpanded(expandedYears, year.id) }
+                    )
+                    if (yearExpanded) year.months.forEach { month ->
+                        val monthExpanded = month.id in expandedMonths
+                        TripGroupRow(
+                            strings, language, month.title, month.distanceKm, month.energyKwh,
+                            month.averageConsumptionKwhPer100Km, month.days.sumOf { it.trips.size },
+                            level = 1, expanded = monthExpanded,
+                            onClick = { expandedMonths = toggleExpanded(expandedMonths, month.id) }
+                        )
+                        if (monthExpanded) month.days.forEach { day ->
+                            val dayExpanded = day.id in expandedDays
+                            TripGroupRow(
+                                strings, language, day.title, day.distanceKm, day.energyKwh,
+                                day.averageConsumptionKwhPer100Km, day.trips.size,
+                                level = 2, expanded = dayExpanded,
+                                onClick = { expandedDays = toggleExpanded(expandedDays, day.id) }
+                            )
+                            if (dayExpanded) {
+                                TripTableHeader(strings)
+                                day.trips.forEach { trip ->
+                                    TripTableRow(strings, language, trip) {
+                                        selectedTripId = trip.id
+                                        actions.onRouteRequested(trip.id)
+                                    }
                                 }
                             }
                         }
@@ -682,10 +741,14 @@ private fun TripsTab(
             trip = trip,
             state = state,
             strings = strings,
+            language = language,
             onDismiss = { selectedTripId = null }
         )
     }
 }
+
+private fun toggleExpanded(ids: List<String>, id: String): List<String> =
+    if (id in ids) ids - id else ids + id
 
 @Composable
 private fun TripThresholdRow(
@@ -700,33 +763,63 @@ private fun TripThresholdRow(
     val speed = metric == TripMapMetric.SPEED
     val boundary = if (speed) ">=" else "<="
     val between = if (speed) ">" else "<"
-    val p = LocalBydPalette.current
-    Text(strings.green, color = p.green, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-    Text(boundary, color = p.muted, fontSize = 12.sp)
-    TextInput("", greenText, { value -> greenText = value; value.toIntOrNull()?.let { onChange(it, yellowText.toIntOrNull() ?: yellow) } }, Modifier.width(62.dp), keyboardType = KeyboardType.Number)
-    Text(between, color = p.muted, fontSize = 12.sp)
-    Text(strings.yellow, color = p.yellow, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-    Text(boundary, color = p.muted, fontSize = 12.sp)
-    TextInput("", yellowText, { value -> yellowText = value; value.toIntOrNull()?.let { onChange(greenText.toIntOrNull() ?: green, it) } }, Modifier.width(62.dp), keyboardType = KeyboardType.Number)
-    Text(between, color = p.muted, fontSize = 12.sp)
-    Text(strings.red, color = p.red, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+    Row(horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+        TripColorLabel(strings.green, LocalBydPalette.current.green, LocalBydPalette.current.greenSoft)
+        TripRuleSymbol(boundary)
+        TripThresholdField(greenText) { value ->
+            greenText = value
+            value.toIntOrNull()?.let { onChange(it, yellowText.toIntOrNull() ?: yellow) }
+        }
+        TripRuleSymbol(between)
+        TripColorLabel(strings.yellow, LocalBydPalette.current.yellow, LocalBydPalette.current.yellowSoft)
+        TripRuleSymbol(boundary)
+        TripThresholdField(yellowText) { value ->
+            yellowText = value
+            value.toIntOrNull()?.let { onChange(greenText.toIntOrNull() ?: green, it) }
+        }
+        TripRuleSymbol(between)
+        TripColorLabel(strings.red, LocalBydPalette.current.red, LocalBydPalette.current.redSoft)
+    }
 }
 
 @Composable
 private fun TripGroupRow(
     strings: UiStrings,
+    language: UiLanguage,
     title: String,
     distanceKm: Double?,
     energyKwh: Double?,
     averageConsumption: Double?,
     tripCount: Int,
-    indent: Dp = 0.dp
+    level: Int,
+    expanded: Boolean,
+    onClick: () -> Unit
 ) {
     val p = LocalBydPalette.current
-    Column(Modifier.fillMaxWidth().padding(start = indent)) {
-        Row(Modifier.fillMaxWidth().heightIn(min = 42.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text(title, color = p.text, fontSize = if (indent == 0.dp) 16.sp else 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            Text("${formatTripNumber(distanceKm)} ${if (strings.distance == "Відстань") "км" else "km"} • ${formatTripNumber(energyKwh)} ${if (strings.used == "Витрачено") "кВт·год" else "kWh"} • ${formatTripNumber(averageConsumption)} ${if (strings.used == "Витрачено") "кВт·год/100 км" else "kWh/100 km"} • $tripCount", color = p.muted, fontSize = 12.sp, textAlign = TextAlign.End)
+    val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
+    Column(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .height(48.dp)
+                .background(if (pressed) p.activeSoft else if (level == 0) p.panelAlt else Color.Transparent)
+                .clickable(interactionSource = interactionSource, indication = null, onClick = onClick)
+                .padding(start = (12 + level * 18).dp, end = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                DisclosureMark(expanded)
+                Spacer(Modifier.width(8.dp))
+                Text(title, color = p.text, fontSize = if (level == 0) 17.sp else if (level == 1) 14.sp else 13.sp, fontWeight = if (level < 2) FontWeight.SemiBold else FontWeight.Medium)
+            }
+            Text(
+                "${formatTripNumber(distanceKm, language)} ${distanceUnit(language)} • ${formatTripNumber(energyKwh, language)} ${energyUnit(language)} • ${formatTripNumber(averageConsumption, language)} ${consumptionUnit(language)} • ${tripCountLabel(tripCount, language)}",
+                color = p.muted,
+                fontSize = 12.sp,
+                textAlign = TextAlign.End
+            )
         }
         Box(Modifier.fillMaxWidth().height(1.dp).background(p.border))
     }
@@ -734,55 +827,113 @@ private fun TripGroupRow(
 
 @Composable
 private fun TripTableHeader(strings: UiStrings) {
-    Row(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+    Row(Modifier.fillMaxWidth().height(34.dp).background(LocalBydPalette.current.pathField.copy(alpha = 0.48f)).padding(start = 48.dp, end = 12.dp), verticalAlignment = Alignment.CenterVertically) {
         listOf(strings.startEnd, strings.duration, strings.distance, "SOC", strings.used, strings.averageConsumption, strings.route).forEach { label ->
-            Text(label, color = LocalBydPalette.current.muted, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center, modifier = Modifier.weight(1f).padding(horizontal = 3.dp))
+            TripTableCell(label, LocalBydPalette.current.muted, Modifier.weight(1f))
         }
     }
 }
 
 @Composable
-private fun TripTableRow(strings: UiStrings, trip: TripSummaryUi, onRoute: () -> Unit) {
+private fun TripTableRow(strings: UiStrings, language: UiLanguage, trip: TripSummaryUi, onRoute: () -> Unit) {
     val p = LocalBydPalette.current
-    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
-        listOf(
-            "${trip.startAt} → ${trip.endAt}",
-            trip.duration,
-            "${formatTripNumber(trip.distanceKm)} ${if (strings.distance == "Відстань") "км" else "km"}",
-            "${formatTripNumber(trip.socStart)} → ${formatTripNumber(trip.socEnd)}%",
-            "${formatTripNumber(trip.energyKwh)} ${if (strings.used == "Витрачено") "кВт·год" else "kWh"}",
-            "${formatTripNumber(trip.averageConsumptionKwhPer100Km)} ${if (strings.used == "Витрачено") "кВт·год/100 км" else "kWh/100 km"}",
-        ).forEachIndexed { index, value ->
-            Text(value, color = if (index == 5) p.green else p.text, fontSize = 11.sp, fontWeight = if (index == 0 || index == 5) FontWeight.SemiBold else FontWeight.Normal, textAlign = TextAlign.Center, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(horizontal = 3.dp))
-        }
+    Row(Modifier.fillMaxWidth().heightIn(min = 54.dp).padding(start = 48.dp, end = 12.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+        TripTableCell("${trip.startAt} → ${trip.endAt}", p.text, Modifier.weight(1f), FontWeight.SemiBold)
+        TripTableCell(trip.duration, p.text, Modifier.weight(1f))
+        TripTableCell("${formatTripNumber(trip.distanceKm, language)} ${distanceUnit(language)}", p.text, Modifier.weight(1f))
+        TripTableCell("${formatSoc(trip.socStart, language)} → ${formatSoc(trip.socEnd, language)}", p.text, Modifier.weight(1f))
+        TripTableCell("${formatTripNumber(trip.energyKwh, language)} ${energyUnit(language)}", p.text, Modifier.weight(1f))
+        TripTableCell("${formatTripNumber(trip.averageConsumptionKwhPer100Km, language)} ${consumptionUnit(language)}", p.green, Modifier.weight(1f), FontWeight.SemiBold)
         Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
-            ActionButton(strings.route, onRoute, modifier = Modifier.width(92.dp))
+            ActionButton(strings.route, onRoute, primary = true, modifier = Modifier.width(108.dp))
         }
     }
     Box(Modifier.fillMaxWidth().height(1.dp).background(p.border.copy(alpha = 0.55f)))
 }
 
-private fun formatTripNumber(value: Double?): String = value?.takeIf { it.isFinite() }?.let {
-    "%.1f".format(Locale.US, it).trimEnd('0').trimEnd('.')
-} ?: "-"
+@Composable
+private fun RowScope.TripTableCell(text: String, color: Color, modifier: Modifier, weight: FontWeight = FontWeight.Normal) {
+    Text(text, color = color, fontSize = 11.sp, fontWeight = weight, textAlign = TextAlign.Center, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = modifier.padding(horizontal = 4.dp))
+}
+
+@Composable
+private fun DisclosureMark(expanded: Boolean) {
+    val p = LocalBydPalette.current
+    Canvas(Modifier.size(16.dp)) {
+        val stroke = 2.dp.toPx()
+        if (expanded) {
+            drawLine(p.accent, Offset(size.width * 0.22f, size.height * 0.38f), Offset(size.width * 0.50f, size.height * 0.66f), stroke, StrokeCap.Round)
+            drawLine(p.accent, Offset(size.width * 0.50f, size.height * 0.66f), Offset(size.width * 0.78f, size.height * 0.38f), stroke, StrokeCap.Round)
+        } else {
+            drawLine(p.accent, Offset(size.width * 0.38f, size.height * 0.22f), Offset(size.width * 0.66f, size.height * 0.50f), stroke, StrokeCap.Round)
+            drawLine(p.accent, Offset(size.width * 0.66f, size.height * 0.50f), Offset(size.width * 0.38f, size.height * 0.78f), stroke, StrokeCap.Round)
+        }
+    }
+}
+
+private fun formatTripNumber(value: Double?, language: UiLanguage): String = value?.takeIf { it.isFinite() }?.let {
+    "%.1f".format(Locale.US, it).trimEnd('0').trimEnd('.').let { text -> if (language == UiLanguage.UK) text.replace('.', ',') else text }
+} ?: "—"
+
+private fun formatSoc(value: Double?, language: UiLanguage): String = formatTripNumber(value, language).let { if (it == "—") it else "$it%" }
+
+private fun distanceUnit(language: UiLanguage) = if (language == UiLanguage.UK) "км" else "km"
+private fun energyUnit(language: UiLanguage) = if (language == UiLanguage.UK) "кВт·год" else "kWh"
+private fun consumptionUnit(language: UiLanguage) = if (language == UiLanguage.UK) "кВт·год/100 км" else "kWh/100 km"
+private fun tripCountLabel(count: Int, language: UiLanguage): String = if (language == UiLanguage.EN) {
+    "$count ${if (count == 1) "trip" else "trips"}"
+} else {
+    val word = when {
+        count % 10 == 1 && count % 100 != 11 -> "поїздка"
+        count % 10 in 2..4 && count % 100 !in 12..14 -> "поїздки"
+        else -> "поїздок"
+    }
+    "$count $word"
+}
+
+@Composable
+private fun TripColorLabel(text: String, color: Color, background: Color) {
+    Box(Modifier.height(34.dp).width(78.dp).clip(Rounded8).background(background).border(1.dp, color.copy(alpha = 0.58f), Rounded8), contentAlignment = Alignment.Center) {
+        Text(text, color = color, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@Composable
+private fun TripRuleSymbol(symbol: String) {
+    Text(symbol, color = LocalBydPalette.current.muted, fontSize = 14.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center, modifier = Modifier.width(28.dp))
+}
+
+@Composable
+private fun TripThresholdField(value: String, onValueChange: (String) -> Unit) {
+    val p = LocalBydPalette.current
+    BasicTextField(
+        value = value,
+        onValueChange = { onValueChange(it.filter(Char::isDigit).take(3)) },
+        singleLine = true,
+        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = KeyboardType.Number),
+        textStyle = TextStyle(color = p.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center),
+        modifier = Modifier.width(62.dp).height(38.dp).clip(Rounded8).background(p.pathField).border(1.dp, p.borderStrong, Rounded8).padding(horizontal = 8.dp, vertical = 9.dp)
+    )
+}
 
 @Composable
 private fun TripRouteDialog(
     trip: TripSummaryUi,
     state: TripsUiState,
     strings: UiStrings,
+    language: UiLanguage,
     onDismiss: () -> Unit
 ) {
-    var metric by rememberSaveable(trip.id) { mutableStateOf(state.colorMetric) }
+    var metric by rememberSaveable(trip.id) { mutableStateOf(TripMapMetric.SPEED) }
     val p = LocalBydPalette.current
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(dismissOnClickOutside = false, usePlatformDefaultWidth = false)) {
-        Box(Modifier.fillMaxSize().background(p.background.copy(alpha = 0.82f)).padding(28.dp), contentAlignment = Alignment.Center) {
+        Box(Modifier.fillMaxSize().background(p.background.copy(alpha = 0.82f)), contentAlignment = Alignment.Center) {
             ModalInputBlocker()
             Column(Modifier.fillMaxWidth(0.92f).fillMaxHeight(0.86f).background(p.panel, Rounded8).border(1.dp, p.borderStrong, Rounded8).padding(14.dp)) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     Column {
                         Text(strings.tripRoute, color = p.text, fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
-                        Text("${trip.startAt} → ${trip.endAt} • ${formatTripNumber(trip.distanceKm)} km", color = p.muted, fontSize = 12.sp)
+                        Text("${trip.startAt} → ${trip.endAt} • ${formatTripNumber(trip.distanceKm, language)} ${distanceUnit(language)}", color = p.muted, fontSize = 12.sp)
                     }
                 }
                 Spacer(Modifier.height(12.dp))
@@ -798,7 +949,7 @@ private fun TripRouteDialog(
                 Row(Modifier.fillMaxWidth().padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text(strings.colorBySpeed, color = if (metric == TripMapMetric.SPEED) p.text else p.muted, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.width(10.dp))
-                    BydSwitch(metric == TripMapMetric.CONSUMPTION, { metric = if (it) TripMapMetric.CONSUMPTION else TripMapMetric.SPEED })
+                    BydSwitch(metric == TripMapMetric.CONSUMPTION, { metric = if (it) TripMapMetric.CONSUMPTION else TripMapMetric.SPEED }, binary = true)
                     Spacer(Modifier.width(10.dp))
                     Text(strings.colorByConsumption, color = if (metric == TripMapMetric.CONSUMPTION) p.text else p.muted, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.weight(1f))
@@ -859,7 +1010,7 @@ private fun TripMapView(
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
                 factory = { createTripMap(context) },
-                update = { map -> updateTripMap(map, points, metric, speedGreen, speedYellow, consumptionGreen, consumptionYellow) },
+                update = { map -> updateTripMap(map, points, metric, speedGreen, speedYellow, consumptionGreen, consumptionYellow, p.accent.toArgb()) },
                 onRelease = MapView::onDetach
             )
             Text("© OpenStreetMap contributors", color = p.muted, fontSize = 10.sp, modifier = Modifier.align(Alignment.BottomEnd).background(p.surface.copy(alpha = 0.86f), Rounded8).padding(horizontal = 8.dp, vertical = 4.dp))
@@ -874,20 +1025,21 @@ private fun updateTripMap(
     speedGreen: Int,
     speedYellow: Int,
     consumptionGreen: Int,
-    consumptionYellow: Int
+    consumptionYellow: Int,
+    startColor: Int
 ) {
     map.overlays.clear()
     val runs = buildList {
         var run = mutableListOf<TripRoutePointUi>()
         points.forEach { point ->
             if (point.gap || !point.latitude.isFinite() || !point.longitude.isFinite()) {
-                if (run.size > 1) add(run)
+                if (run.isNotEmpty()) add(run)
                 run = mutableListOf()
             } else {
                 run += point
             }
         }
-        if (run.size > 1) add(run)
+        if (run.isNotEmpty()) add(run)
     }
     val p = runs.flatten()
     if (p.isEmpty()) return
@@ -904,6 +1056,10 @@ private fun updateTripMap(
             map.overlays += line
         }
     }
+    map.overlays += tripMapMarker(map, p.first(), startColor)
+    if (p.size > 1) {
+        map.overlays += tripMapMarker(map, p.last(), AndroidColor.rgb(255, 140, 140))
+    }
     map.post {
         if (p.size == 1) {
             map.controller.setCenter(GeoPoint(p.first().latitude, p.first().longitude))
@@ -918,6 +1074,18 @@ private fun updateTripMap(
     }
     map.invalidate()
 }
+
+private fun tripMapMarker(map: MapView, point: TripRoutePointUi, color: Int): Marker =
+    Marker(map).apply {
+        position = GeoPoint(point.latitude, point.longitude)
+        setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+        icon = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(color)
+            val size = (24 * map.resources.displayMetrics.density).toInt()
+            setSize(size, size)
+        }
+    }
 
 private fun routeColor(value: Double?, green: Double, yellow: Double, speed: Boolean): Int = when {
     value == null -> AndroidColor.GRAY
@@ -1389,10 +1557,6 @@ private fun TelegramNumberStepper(
             enabled = setting.value > setting.range.first,
             modifier = Modifier.width(42.dp)
         )
-        if (sendLocationLabel.isNotBlank()) {
-            Text(sendLocationLabel, color = LocalBydPalette.current.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
-            BydSwitch(sendLocationEnabled, onSendLocationChanged)
-        }
         NumericInput(
             value = if (setting.unit == "%") "${setting.value}%" else "${setting.value} ${setting.unit}",
             modifier = Modifier.width(72.dp)
@@ -1405,6 +1569,10 @@ private fun TelegramNumberStepper(
             enabled = setting.value < setting.range.last,
             modifier = Modifier.width(42.dp)
         )
+        if (sendLocationLabel.isNotBlank()) {
+            Text(sendLocationLabel, color = LocalBydPalette.current.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            BydSwitch(sendLocationEnabled, onSendLocationChanged)
+        }
     }
 }
 

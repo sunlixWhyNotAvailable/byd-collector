@@ -41,7 +41,7 @@ class BydCollectorUiContractTest {
         assertTrue(components.contains("tween(durationMillis = 120)"))
         assertTrue(components.contains(".size(width = 56.dp, height = 32.dp)"))
         assertTrue(components.contains(".size(thumbSize)"))
-        assertTrue(components.contains(".background(if (visualChecked || visuallyPending) p.switchThumbOn else p.switchThumbOff)"))
+        assertTrue(components.contains(".background(if (binary || visualChecked || visuallyPending) p.switchThumbOn else p.switchThumbOff)"))
         assertTrue(app.contains(".pressScaleModifier(interactionSource, forcePressed = press.visualPressed)"))
         assertTrue(app.contains(".background(if (selected) p.active else p.surface, Rounded8)"))
     }
@@ -217,6 +217,50 @@ class BydCollectorUiContractTest {
         assertTrue(app.contains("strings.colorByConsumption"))
         assertTrue(strings.contains("tripsTab = \"Поїздки\""))
         assertTrue(strings.contains("tripsTab = \"Trips\""))
+    }
+
+    @Test
+    fun tripsPreviewPortKeepsBinarySelectorsAndCompactHierarchyContract() {
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
+        assertEquals(2, Regex("binary = true").findAll(app).count())
+        assertTrue(components.contains("binary: Boolean = false"))
+        assertTrue(components.contains("if (binary) {\n                    onCheckedChange(!checked)"))
+        assertTrue(app.contains("bodyPadding = 0.dp"))
+        assertTrue(app.contains("rememberSaveable { mutableStateOf<List<String>>(emptyList()) }"))
+        assertTrue(app.contains("year.id in expandedYears"))
+        assertTrue(app.contains(".height(48.dp)"))
+        assertTrue(app.contains(".height(34.dp)"))
+        assertTrue(app.contains(".padding(start = 48.dp, end = 12.dp"))
+        assertTrue(app.contains("heightIn(min = 54.dp)"))
+        assertTrue(app.contains("Modifier.width(108.dp)"))
+        assertTrue(app.contains("formatSoc(trip.socStart, language)"))
+        assertTrue(app.contains("TripGroupRow("))
+        assertTrue(app.contains("DisclosureMark(expanded)"))
+    }
+
+    @Test
+    fun tripRouteAndTelegramControlsMatchApprovedInteractionContract() {
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val strings = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorStrings.kt").readText()
+        val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
+        assertTrue(app.contains("mutableStateOf(TripMapMetric.SPEED)"))
+        assertFalse(app.contains("fillMaxSize().background(p.background.copy(alpha = 0.82f)).padding(28.dp)"))
+        assertTrue(app.contains("tripMapMarker(map, p.first()"))
+        assertTrue(app.contains("tripMapMarker(map, p.last()"))
+        assertTrue(app.contains("p.accent.toArgb()"))
+        assertTrue(app.contains("Marker(map)"))
+        assertTrue(strings.contains("tripDelay = \"Затримка надсилання\""))
+        assertTrue(strings.contains("tripDelay = \"Send delay\""))
+        val stepper = app.substringAfter("private fun TelegramNumberStepper(").substringBefore("private fun telegramNumberSetting(")
+        assertInOrder(stepper, "setting.label", "text = \"-\"")
+        assertInOrder(stepper, "text = \"-\"", "NumericInput(")
+        assertInOrder(stepper, "NumericInput(", "text = \"+\"")
+        assertInOrder(stepper, "text = \"+\"", "Text(sendLocationLabel")
+        assertInOrder(stepper, "Text(sendLocationLabel", "BydSwitch(sendLocationEnabled")
+        assertTrue(components.contains("binary -> 25.dp"))
+        assertTrue(components.contains("binary && pressed -> p.accent.copy"))
+        assertTrue(components.contains("if (binary || visualChecked || visuallyPending) p.switchThumbOn"))
     }
 
     @Test

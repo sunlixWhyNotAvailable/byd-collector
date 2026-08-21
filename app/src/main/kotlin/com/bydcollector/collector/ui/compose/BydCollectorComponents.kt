@@ -303,7 +303,8 @@ fun BydSwitch(
     onCheckedChange: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
-    pending: Boolean = false
+    pending: Boolean = false,
+    binary: Boolean = false
 ) {
     val p = LocalBydPalette.current
     val interactionSource = remember { MutableInteractionSource() }
@@ -313,8 +314,8 @@ fun BydSwitch(
     var localPending by remember { mutableStateOf<SwitchPendingState?>(null) }
     var token by remember { mutableStateOf(0) }
     val pendingState = localPending
-    val visuallyPending = pending || pendingState != null
-    val visualChecked = pendingState?.from ?: checked
+    val visuallyPending = !binary && (pending || pendingState != null)
+    val visualChecked = if (binary) checked else pendingState?.from ?: checked
 
     //centers the knob before executing the setting change, then waits for a real refreshed state
     LaunchedEffect(pendingState?.token) {
@@ -343,7 +344,9 @@ fun BydSwitch(
 
     val track = when {
         !enabled -> p.disabled
+        binary && pressed -> p.accent.copy(alpha = 0.82f)
         pressed -> p.activeSoft
+        binary -> p.accent
         pending -> p.activeSoft
         pendingState != null -> p.activeSoft
         checked -> p.accent
@@ -351,6 +354,7 @@ fun BydSwitch(
     }
     val thumbSize by animateDpAsState(
         targetValue = when {
+            binary -> 25.dp
             visuallyPending -> 22.dp
             visualChecked -> 25.dp
             else -> 19.dp
@@ -359,6 +363,7 @@ fun BydSwitch(
     )
     val thumbOffset by animateDpAsState(
         targetValue = when {
+            binary && checked -> 25.dp
             visuallyPending -> 14.dp
             visualChecked -> 25.dp
             else -> 0.dp
@@ -370,11 +375,15 @@ fun BydSwitch(
             .size(width = 56.dp, height = 32.dp)
             .clip(PillShape)
             .background(track)
-            .border(1.dp, if (checked) p.accent else p.border, PillShape)
-            .clickable(enabled = enabled && localPending == null, interactionSource = interactionSource, indication = null) {
-                val target = !checked
-                token += 1
-                localPending = SwitchPendingState(from = checked, target = target, token = token)
+            .border(1.dp, if (binary || checked) p.accent else p.border, PillShape)
+            .clickable(enabled = enabled && (binary || localPending == null), interactionSource = interactionSource, indication = null) {
+                if (binary) {
+                    onCheckedChange(!checked)
+                } else {
+                    val target = !checked
+                    token += 1
+                    localPending = SwitchPendingState(from = checked, target = target, token = token)
+                }
             }
             .padding(3.dp),
         contentAlignment = Alignment.CenterStart
@@ -384,7 +393,7 @@ fun BydSwitch(
                 .padding(start = thumbOffset)
                 .size(thumbSize)
                 .clip(PillShape)
-                .background(if (visualChecked || visuallyPending) p.switchThumbOn else p.switchThumbOff)
+                .background(if (binary || visualChecked || visuallyPending) p.switchThumbOn else p.switchThumbOff)
         )
     }
 }

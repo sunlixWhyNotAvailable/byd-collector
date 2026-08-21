@@ -252,6 +252,7 @@ Archives can expose vehicle identifiers, raw Chinese descriptions, timestamps, t
 - The full All data catalog is research evidence, not a guaranteed normalized schema. Unknown fields and field-specific enums require new evidence.
 - Main normalized history is currently lossless and unbounded. No retention period, downsampling, `VACUUM`, or size-triggered rotation is enabled.
 - Trip routes are also unbounded until their real multi-day database footprint is measured; online maps require OpenStreetMap tile connectivity.
+- The first physical-vehicle `v2.7.0` gate found blocking startup defects: framework SQLite rejects the shell-UID telemetry helper's package identity while opening its durable spool, so the helper exits before Binder registration and Main, Debug, and trip collection do not start; location permission is declared but its runtime prompt is reachable only through the manual GPS-access button instead of the first-run flow. The candidate must not be relied on until both are fixed and revalidated on the vehicle.
 - The `BODYWORK_POWER_LEVEL` `0/2` boundary and post-kernel-reboot recovery path still require the planned physical-vehicle validation before this build is relied on unattended.
 - MQTT is a live-state channel and can miss updates while the broker is offline. InfluxDB v1 export is cursor/retry based and intentionally paced.
 - Telegram delivery depends on external Bot API reachability and strict FIFO head-of-queue behavior.

@@ -33,19 +33,27 @@ object TelegramBuiltInTemplates {
     const val TRIP_SUMMARY_EN =
         "Trip complete\nCurrent trip: {trip_distance_km} km / {trip_duration}\nEnergy used: {trip_energy_kwh} kWh, SOC: {soc_start}% -> {soc_end}%\nTotal: {total_distance_km} km / {total_duration}\nEnergy used: {total_energy_kwh} kWh"
 
-    fun migrateKnownSaved(eventKey: String, template: String): String = when (eventKey) {
-        TelegramEventType.CHARGING_PROGRESS.key -> when (template) {
-            OLD_CHARGING_PROGRESS_UK -> CHARGING_PROGRESS_UK
-            OLD_CHARGING_PROGRESS_EN, OLD_CHARGING_PROGRESS_RUNTIME -> CHARGING_PROGRESS_EN
+    fun migrateKnownSaved(eventKey: String, template: String): String {
+        val normalized = normalizeForBuiltInMatch(template)
+        return when (eventKey) {
+            TelegramEventType.CHARGING_PROGRESS.key -> when {
+                normalized == normalizeForBuiltInMatch(OLD_CHARGING_PROGRESS_UK) -> CHARGING_PROGRESS_UK
+                normalized == normalizeForBuiltInMatch(OLD_CHARGING_PROGRESS_EN) ||
+                    normalized == normalizeForBuiltInMatch(OLD_CHARGING_PROGRESS_RUNTIME) -> CHARGING_PROGRESS_EN
+                else -> template
+            }
+            TelegramEventType.TRIP_SUMMARY.key -> when {
+                normalized == normalizeForBuiltInMatch(OLD_TRIP_SUMMARY_UK) -> TRIP_SUMMARY_UK
+                normalized == normalizeForBuiltInMatch(OLD_TRIP_SUMMARY_EN) ||
+                    normalized == normalizeForBuiltInMatch(OLD_TRIP_SUMMARY_RUNTIME) -> TRIP_SUMMARY_EN
+                else -> template
+            }
             else -> template
         }
-        TelegramEventType.TRIP_SUMMARY.key -> when (template) {
-            OLD_TRIP_SUMMARY_UK -> TRIP_SUMMARY_UK
-            OLD_TRIP_SUMMARY_EN, OLD_TRIP_SUMMARY_RUNTIME -> TRIP_SUMMARY_EN
-            else -> template
-        }
-        else -> template
     }
+
+    private fun normalizeForBuiltInMatch(template: String): String =
+        template.replace("\r\n", "\n").split('\n').joinToString("\n") { it.trimEnd() }.trimEnd()
 
     private const val OLD_CHARGING_PROGRESS_UK =
         "Заряд: {soc}%\nДодано: {charge_added_percent}% / {charge_added_kwh} кВт·год"
