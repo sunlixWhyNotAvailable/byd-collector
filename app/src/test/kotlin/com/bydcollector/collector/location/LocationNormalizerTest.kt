@@ -2,9 +2,13 @@ package com.bydcollector.collector.location
 
 import com.bydcollector.collector.data.normalized.NormalizedQuality
 import com.bydcollector.collector.data.normalized.NormalizedCategory
+import com.bydcollector.collector.data.normalized.NormalizedFieldCatalog
+import com.bydcollector.collector.ha.HaIntegrationCategories
+import com.bydcollector.collector.mqtt.HaMqttConfig
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class LocationNormalizerTest {
     @Test
@@ -19,12 +23,18 @@ class LocationNormalizerTest {
         assertEquals(36.0, observations.first { it.field.fieldKey == "location_speed_kmh" }.value.number)
         assertEquals(1_000.0, observations.first { it.field.fieldKey == "location_fix_age_ms" }.value.number)
         assertEquals(NormalizedQuality.OK, observations.first().quality)
+        assertEquals("2026-08-20T12:00:00Z", observations.first { it.field.fieldKey == "location_quality" }.observedAt)
     }
 
     @Test
-    fun locationCategoryHasIndependentOptInDefaults() {
+    fun locationCategoryIsVisibleAfterSafetyButOffByDefault() {
         assertEquals("location", NormalizedCategory.LOCATION.mqttKey)
-        assertEquals(false, com.bydcollector.collector.mqtt.HaMqttConfig.DEFAULT_CATEGORIES.contains("location"))
+        assertEquals(
+            listOf("battery", "motion", "body", "climate", "safety", "location"),
+            HaIntegrationCategories.visible
+        )
+        assertEquals(false, HaMqttConfig.DEFAULT_CATEGORIES.contains("location"))
+        assertTrue(NormalizedFieldCatalog.fields.filter { it.category == NormalizedCategory.LOCATION }.all { it.mqttDefaultEnabled })
     }
 
     @Test

@@ -56,7 +56,7 @@ data class RoutePoint(
 ) {
     init {
         require(sequence >= 0L) { "Route sequence must be non-negative" }
-        if (kind == KIND_VALID) {
+        if (kind == KIND_VALID || kind == KIND_UNTRUSTED) {
             require(isValidCoordinate(latitude, longitude)) { "Valid route points require finite coordinates" }
         } else {
             require(latitude == null && longitude == null) { "Gap route points must not carry coordinates" }
@@ -66,6 +66,7 @@ data class RoutePoint(
     companion object {
         const val KIND_VALID = "valid"
         const val KIND_GAP = "gap"
+        const val KIND_UNTRUSTED = "untrusted"
 
         private fun isValidCoordinate(latitude: Double?, longitude: Double?): Boolean =
             latitude != null && longitude != null && latitude.isFinite() && longitude.isFinite() &&

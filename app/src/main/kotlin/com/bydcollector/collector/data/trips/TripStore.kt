@@ -92,7 +92,8 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable {
     }
 
     private fun RoutePoint.toContentValues() = ContentValues().apply {
-        put("trip_id", tripId); put("sequence", sequence); put("kind", kind); put("observed_at", observedAt); putNullable("elapsed_ms", elapsedMs)
+        // SQLite v1 only permits valid/gap; retain untrusted coordinates as a valid-shaped row and recover the model kind from quality.
+        put("trip_id", tripId); put("sequence", sequence); put("kind", if (kind == RoutePoint.KIND_UNTRUSTED) RoutePoint.KIND_VALID else kind); put("observed_at", observedAt); putNullable("elapsed_ms", elapsedMs)
         put("boot_id", bootId); put("segment_id", segmentId); putNullable("latitude", latitude); putNullable("longitude", longitude); putNullable("accuracy_m", accuracyM); putNullable("speed_kmh", speedKmh)
         putNullable("instantaneous_consumption_kwh_per_100km", instantaneousConsumptionKwhPer100Km); putNullable("altitude_m", altitudeM); putNullable("bearing_deg", bearingDeg); put("quality", quality)
         put("is_first", if (isFirst) 1 else 0); put("is_final", if (isFinal) 1 else 0)
@@ -109,7 +110,11 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable {
 
     private fun Cursor.toTripSession() = TripSession(getString(0), getString(1), getString(2), getStringOrNull(3), getLongOrNull(4), getLongOrNull(5), getStringOrNull(6), getStringOrNull(7), getStringOrNull(8), getStringOrNull(9), getInt(10) == 1, getDoubleOrNull(11), getDoubleOrNull(12), getDoubleOrNull(13), getDoubleOrNull(14), getDoubleOrNull(15), getDoubleOrNull(16), getLongOrNull(17), getDoubleOrNull(18), getDoubleOrNull(19), getDoubleOrNull(20), getStringOrNull(21), getString(22), getInt(23) == 1, getInt(24) == 1)
 
-    private fun Cursor.toRoutePoint() = RoutePoint(getString(0), getLong(1), getString(2), getString(3), getLongOrNull(4), getStringOrNull(5), getStringOrNull(6), getDoubleOrNull(7), getDoubleOrNull(8), getDoubleOrNull(9), getDoubleOrNull(10), getDoubleOrNull(11), getDoubleOrNull(12), getDoubleOrNull(13), getString(14), getInt(15) == 1, getInt(16) == 1)
+    private fun Cursor.toRoutePoint(): RoutePoint {
+        val kind = getString(2)
+        val quality = getString(14)
+        return RoutePoint(getString(0), getLong(1), if (kind == RoutePoint.KIND_VALID && quality.startsWith("untrusted:")) RoutePoint.KIND_UNTRUSTED else kind, getString(3), getLongOrNull(4), getStringOrNull(5), getStringOrNull(6), getDoubleOrNull(7), getDoubleOrNull(8), getDoubleOrNull(9), getDoubleOrNull(10), getDoubleOrNull(11), getDoubleOrNull(12), getDoubleOrNull(13), quality, getInt(15) == 1, getInt(16) == 1)
+    }
 
     private fun Cursor.getStringOrNull(index: Int): String? = if (isNull(index)) null else getString(index)
     private fun Cursor.getLongOrNull(index: Int): Long? = if (isNull(index)) null else getLong(index)

@@ -76,7 +76,7 @@ object TripsUiMapper {
                     longitude = point.longitude ?: 0.0,
                     speedKmh = point.speedKmh,
                     consumptionKwhPer100Km = point.instantaneousConsumptionKwhPer100Km,
-                    gap = point.kind == RoutePoint.KIND_GAP
+                    gap = point.kind != RoutePoint.KIND_VALID
                 )
             }
         )

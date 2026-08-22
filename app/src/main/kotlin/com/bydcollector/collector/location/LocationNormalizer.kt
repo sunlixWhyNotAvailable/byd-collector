@@ -20,7 +20,7 @@ object LocationNormalizer {
             number(NormalizedFieldCatalog.locationBearing, sample.bearingDeg, sample.observedAt),
             number(NormalizedFieldCatalog.locationFixAge, ageMs, sample.observedAt),
             text(NormalizedFieldCatalog.locationFixTimestamp, sample.observedAt),
-            text(NormalizedFieldCatalog.locationQuality, quality)
+            text(NormalizedFieldCatalog.locationQuality, quality, observedAt = sample.observedAt)
         )
     }
 

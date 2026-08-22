@@ -180,7 +180,18 @@ class MainActivity : ComponentActivity() {
 
         override fun onLanguageSelected(language: UiLanguage) {
             uiLanguage = language
+            settings.setUiLanguageCode(language.code)
             dashboardUiStateStore.selectVehicleKpiLanguage(language.vehicleKpiLanguage())
+            val previousTelegram = telegramUiState
+            val localizedTelegram = loadTelegramUiState()
+            telegramUiState = localizedTelegram.copy(
+                config = localizedTelegram.config.copy(
+                    botToken = previousTelegram.config.botToken,
+                    botTokenSet = previousTelegram.config.botTokenSet,
+                    chatId = previousTelegram.config.chatId
+                ),
+                testStatus = previousTelegram.testStatus
+            )
             if (activeTab == AppTab.TRIPS) loadTripsUi()
         }
 
@@ -226,10 +237,6 @@ class MainActivity : ComponentActivity() {
         override fun onGrantAdb() {
             requestAdbAuthorizationFlow("grant_button")
             refresh()
-        }
-
-        override fun onRequestLocationPermission() {
-            requestLocationPermissionFromAccessUi()
         }
 
         override fun onOpenBackgroundApps() {
@@ -407,11 +414,6 @@ class MainActivity : ComponentActivity() {
             refresh()
         }
 
-        override fun onToggleMqttLocation(enabled: Boolean) {
-            settings.setMqttLocationEnabled(enabled)
-            refresh()
-        }
-
         override fun onMqttDraftChanged(draft: MqttDraft) {
             if (draft.username != mqttDraft.username || draft.password != mqttDraft.password) {
                 mqttCredentialRevision += 1L
@@ -461,11 +463,6 @@ class MainActivity : ComponentActivity() {
 
         override fun onToggleInfluxCategory(category: String, enabled: Boolean) {
             settings.setInfluxCategoryEnabled(category, enabled)
-            refresh()
-        }
-
-        override fun onToggleInfluxLocation(enabled: Boolean) {
-            settings.setInfluxLocationEnabled(enabled)
             refresh()
         }
 
@@ -547,6 +544,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         settings = CollectorSettings(applicationContext)
+        uiLanguage = UiLanguage.fromCode(settings.uiLanguageCode())
         settingsPreferences = getSharedPreferences(CollectorSettings.PREFS_NAME, MODE_PRIVATE)
         settingsPreferences.registerOnSharedPreferenceChangeListener(settingsChangeListener)
         if (!CollectorService.isMaintenanceRunningInProcess()) {
@@ -600,8 +598,6 @@ class MainActivity : ComponentActivity() {
                 influxDraft = influxDraft,
                 tripsUiState = tripsUiState,
                 tripsUiActions = tripsUiActions,
-                mqttLocationEnabled = settings.isMqttLocationEnabled(),
-                influxLocationEnabled = settings.isInfluxLocationEnabled(),
                 telegramUiState = telegramUiState,
                 telegramActions = telegramActions,
                 appVersionName = BuildConfig.VERSION_NAME,
@@ -1210,28 +1206,17 @@ class MainActivity : ComponentActivity() {
         requestAccessCheck(source, AccessCheckMode.FORCE, ::completeStartupAccessFlow)
     }
 
-    private fun requestLocationPermissionFromAccessUi() {
-        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
-            checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
-        ) {
-            Toast.makeText(this, "GPS permission already granted", Toast.LENGTH_SHORT).show()
-            return
-        }
-        if (runtimePermissionRequestInFlight) return
-        runtimePermissionRequestInFlight = true
-        requestPermissions(
-            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
-            LOCATION_PERMISSION_REQUEST_CODE
-        )
-    }
-
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode != LOCATION_PERMISSION_REQUEST_CODE) return
         runtimePermissionRequestInFlight = false
         val granted = grantResults.any { it == PackageManager.PERMISSION_GRANTED }
-        Toast.makeText(this, if (granted) "GPS permission granted" else "GPS permission denied", Toast.LENGTH_SHORT).show()
+        recordOperationalEvent(
+            "startup_location_permission_result",
+            if (granted) "Startup location permission granted" else "Startup location permission denied"
+        )
         refresh()
+        maybeContinueStartupAccessFlow()
     }
 
     private fun maybeContinueStartupAccessFlow() {
@@ -1239,8 +1224,48 @@ class MainActivity : ComponentActivity() {
         if (startupAdbSelfCheckPosted) return
         if (startupHardFlowBlocked()) return
         if (maybeRunStartupSetup()) return
+        if (maybeRunStartupLocationPermission()) return
         if (startupHardFlowBlocked()) return
         maybeRunStartupAdbSelfCheck(startupAdbSelfCheckSource)
+    }
+
+    private fun maybeRunStartupLocationPermission(): Boolean {
+        val prefs = getSharedPreferences(STARTUP_SETUP_PREFS, MODE_PRIVATE)
+        if (prefs.getBoolean(KEY_LOCATION_PERMISSION_SETUP_CONSUMED, false)) return false
+        if (
+            checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+            checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        ) {
+            prefs.edit().putBoolean(KEY_LOCATION_PERMISSION_SETUP_CONSUMED, true).commit()
+            recordOperationalEvent(
+                "startup_location_permission_already_granted",
+                "Startup location permission already granted"
+            )
+            return false
+        }
+        if (runtimePermissionRequestInFlight) return true
+        prefs.edit().putBoolean(KEY_LOCATION_PERMISSION_SETUP_CONSUMED, true).commit()
+        runtimePermissionRequestInFlight = true
+        recordOperationalEvent(
+            "startup_location_permission_requested",
+            "Requesting startup fine and coarse location permissions"
+        )
+        runCatching {
+            requestPermissions(
+                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+                LOCATION_PERMISSION_REQUEST_CODE
+            )
+        }.onFailure { error ->
+            runtimePermissionRequestInFlight = false
+            recordOperationalEvent(
+                "startup_location_permission_request_failed",
+                "Startup location permission request failed",
+                error::class.java.simpleName
+            )
+            refresh()
+            maybeContinueStartupAccessFlow()
+        }
+        return true
     }
 
     private fun startupHardFlowBlocked(): Boolean {
@@ -1518,23 +1543,26 @@ class MainActivity : ComponentActivity() {
         val localizedMessages = strings(uiLanguage).telegram.messages
         val botToken = ""
         val messages = TelegramMessageType.entries.associateWith { type ->
+            val eventKey = type.eventKey()
+            val savedTemplate = settings.telegramTemplate(eventKey)
             TelegramMessageConfig(
-                enabled = settings.isTelegramEventEnabled(type.eventKey()),
-                template = settings.telegramTemplate(type.eventKey())
-                    ?: localizedMessages.getValue(type).defaultTemplate
+                enabled = settings.isTelegramEventEnabled(eventKey),
+                template = savedTemplate ?: localizedMessages.getValue(type).defaultTemplate,
+                usesDefaultTemplate = savedTemplate == null
             )
         }
         return TelegramUiState(
             config = TelegramConfig(
                 enabled = settings.isTelegramEnabled(),
                 botToken = botToken,
-                botTokenSet = botToken.isNotEmpty(),
+                botTokenSet = settings.isTelegramBotTokenSet(),
                 chatId = settings.telegramChatId(),
                 chargeStepPercent = settings.telegramChargeStepPercent(),
-                low12vThresholdVolts = settings.telegramLowVoltageThreshold().toInt(),
+                low12vThresholdVolts = settings.telegramLowVoltageThreshold(),
                 telemetryUnavailableMinutes = settings.telegramUnavailableDelayMinutes(),
                 tripSummaryDelaySeconds = settings.telegramTripEndDelaySeconds(),
                 sendLocation = settings.isTelegramSendLocationEnabled(),
+                navigatorMask = settings.telegramNavigatorMask(),
                 messages = messages
             ),
             testStatus = telegramTestStatus(settings.telegramConnectionStatus())
@@ -1558,7 +1586,7 @@ class MainActivity : ComponentActivity() {
             settings.setTelegramChargeStepPercent(config.chargeStepPercent)
         }
         if (previous.low12vThresholdVolts != config.low12vThresholdVolts) {
-            settings.setTelegramLowVoltageThreshold(config.low12vThresholdVolts.toFloat())
+            settings.setTelegramLowVoltageThreshold(config.low12vThresholdVolts)
         }
         if (previous.telemetryUnavailableMinutes != config.telemetryUnavailableMinutes) {
             settings.setTelegramUnavailableDelayMinutes(config.telemetryUnavailableMinutes)
@@ -1569,6 +1597,9 @@ class MainActivity : ComponentActivity() {
         if (previous.sendLocation != config.sendLocation) {
             settings.setTelegramSendLocationEnabled(config.sendLocation)
         }
+        if (previous.navigatorMask != config.navigatorMask) {
+            settings.setTelegramNavigatorMask(config.navigatorMask)
+        }
         TelegramMessageType.entries.forEach { type ->
             val oldMessage = previous.messages[type]
             val newMessage = config.messages[type] ?: return@forEach
@@ -1576,7 +1607,9 @@ class MainActivity : ComponentActivity() {
             if (oldMessage?.enabled != newMessage.enabled) {
                 settings.setTelegramEventEnabled(eventKey, newMessage.enabled)
             }
-            if (oldMessage?.template != newMessage.template || settings.telegramTemplate(eventKey) == null) {
+            if (newMessage.usesDefaultTemplate) {
+                if (settings.telegramTemplate(eventKey) != null) settings.clearTelegramTemplate(eventKey)
+            } else if (oldMessage?.template != newMessage.template || settings.telegramTemplate(eventKey) == null) {
                 settings.setTelegramTemplate(eventKey, newMessage.template)
             }
         }
@@ -1807,6 +1840,7 @@ class MainActivity : ComponentActivity() {
         private const val STARTUP_SETUP_PREFS = "startup_setup"
         private const val KEY_BACKGROUND_SETTINGS_VERSION = "background_settings_version"
         private const val KEY_BACKGROUND_SETTINGS_PENDING_RETURN = "background_settings_pending_return"
+        private const val KEY_LOCATION_PERMISSION_SETUP_CONSUMED = "location_permission_setup_consumed"
         private const val STARTUP_ADB_SELF_CHECK_DELAY_MS = 600L
         private const val TELEGRAM_RECONCILE_DELAY_MS = 600L
         private const val LOCATION_PERMISSION_REQUEST_CODE = 4101

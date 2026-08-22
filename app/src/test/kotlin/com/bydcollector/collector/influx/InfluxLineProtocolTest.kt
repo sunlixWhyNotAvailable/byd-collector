@@ -1,6 +1,7 @@
 package com.bydcollector.collector.influx
 
 import kotlin.test.Test
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class InfluxLineProtocolTest {
@@ -76,6 +77,12 @@ class InfluxLineProtocolTest {
         val line = InfluxLineProtocol.toLine(row, config())
 
         assertTrue(line.endsWith("changed_at=\"2026-06-15T10:20:31Z\""))
+    }
+
+    @Test
+    fun locationCategoryUsesTheSameMembershipGate() {
+        assertTrue(config().copy(enabledCategories = setOf("location")).isCategoryEnabled("location"))
+        assertFalse(config().isCategoryEnabled("location"))
     }
 
     private fun config(): InfluxConfig = InfluxConfig(

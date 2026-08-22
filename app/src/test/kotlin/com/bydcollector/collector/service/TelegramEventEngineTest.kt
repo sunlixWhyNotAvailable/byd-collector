@@ -9,6 +9,8 @@ import com.bydcollector.collector.data.normalized.NormalizedValue
 import com.bydcollector.collector.data.normalized.NormalizedValueType
 import com.bydcollector.collector.data.normalized.VehicleStateNormalizer
 import com.bydcollector.collector.telegram.TelegramEventType
+import com.bydcollector.collector.telegram.TelegramNavigatorMask
+import com.bydcollector.collector.telegram.TelegramTemplateLanguage
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -390,7 +392,7 @@ class TelegramEventEngineTest {
         engine.onSuccessfulPoll(snapshot(gear = "D", odometer = 100.0, soc = 50.0, tripEnergy = 1.0), config, 1_000L)
         engine.onSuccessfulPoll(snapshot(gear = "D", odometer = 100.0, soc = 50.0, tripEnergy = 1.0), config, 2_000L)
 
-        val location = TelegramLocationSnapshot(50.0, 30.0, "12:00", "2 s", "osm", "google", "apple")
+        val location = TelegramLocationSnapshot(50.0, 30.0, "12:00", 2L, "osm", "google", "apple")
         val result = engine.onPowerOffConfirmed(
             config.copy(sendLocation = true),
             TelegramPowerOffSnapshot(101.0, 49.0, 2.5),
@@ -406,6 +408,63 @@ class TelegramEventEngineTest {
         noLocation.onSuccessfulPoll(snapshot(gear = "D", odometer = 100.0, soc = 50.0, tripEnergy = 1.0), config, 1_000L)
         noLocation.onSuccessfulPoll(snapshot(gear = "D", odometer = 100.0, soc = 50.0, tripEnergy = 1.0), config, 2_000L)
         assertNull(noLocation.onPowerOffConfirmed(config, TelegramPowerOffSnapshot(101.0, 49.0, 2.5), location, 3_000L).events.single().textSuffix)
+    }
+
+    @Test
+    fun chargingProgressUsesLocalizedStepAndSessionDurations() {
+        val started = startedChargingEngine()
+        val uk = started.onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = 6.0, soc = 55.0),
+            config,
+            19_501_500L
+        ).events.single { it.type == TelegramEventType.CHARGING_PROGRESS }
+        assertEquals("5год 25хв", uk.variables["charge_step_duration"])
+        assertEquals("5год 25хв", uk.variables["charge_duration"])
+
+        val english = startedChargingEngine()
+        val en = english.onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = 6.0, soc = 55.0),
+            config.copy(language = TelegramTemplateLanguage.EN),
+            19_501_500L
+        ).events.single { it.type == TelegramEventType.CHARGING_PROGRESS }
+        assertEquals("5h 25m", en.variables["charge_step_duration"])
+        assertEquals("5h 25m", en.variables["charge_duration"])
+    }
+
+    @Test
+    fun locationUsesSelectedNavigatorOrderAndZeroMaskKeepsCoordinatesOnly() {
+        val engine = pendingTripEngine()
+        val location = TelegramLocationSnapshot(
+            50.0,
+            30.0,
+            "12:00",
+            2L,
+            "osm",
+            "google",
+            "apple",
+            "waze"
+        )
+        val selected = engine.onPowerOffConfirmed(
+            config.copy(sendLocation = true, navigatorMask = TelegramNavigatorMask.GOOGLE or TelegramNavigatorMask.WAZE or TelegramNavigatorMask.OSM),
+            TelegramPowerOffSnapshot(101.0, 49.0, 2.5),
+            location,
+            3_000L
+        ).events.single().textSuffix!!
+        assertTrue(selected.indexOf("Google: google") < selected.indexOf("Waze: waze"))
+        assertTrue(selected.indexOf("Waze: waze") < selected.indexOf("OSM: osm"))
+        assertFalse(selected.contains("Apple: apple"))
+        assertTrue(selected.contains("вік 2с"))
+
+        val noLinksEngine = pendingTripEngine()
+        val noLinks = noLinksEngine.onPowerOffConfirmed(
+            config.copy(sendLocation = true, navigatorMask = 0),
+            TelegramPowerOffSnapshot(101.0, 49.0, 2.5),
+            location,
+            3_000L
+        ).events.single().textSuffix!!
+        assertTrue(noLinks.contains("50.0, 30.0"))
+        assertFalse(noLinks.contains("Google:"))
+        assertFalse(noLinks.contains("Waze:"))
     }
 
     @Test

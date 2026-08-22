@@ -54,6 +54,25 @@ class AccessWorkflowContractTest {
     }
 
     @Test
+    fun startupLocationPermissionIsOneShotBetweenBackgroundSetupAndAdb() {
+        val source = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+
+        assertTrue(source.contains("KEY_LOCATION_PERMISSION_SETUP_CONSUMED = \"location_permission_setup_consumed\""))
+        assertFalse(source.contains("KEY_LOCATION_PERMISSION_SETUP_CONSUMED = BuildConfig.VERSION_CODE"))
+        assertInOrder(source, "if (maybeRunStartupSetup()) return", "if (maybeRunStartupLocationPermission()) return")
+        assertInOrder(source, "if (maybeRunStartupLocationPermission()) return", "maybeRunStartupAdbSelfCheck(startupAdbSelfCheckSource)")
+
+        val permissionFlow = method(source, "private fun maybeRunStartupLocationPermission", "private fun startupHardFlowBlocked")
+        assertTrue(permissionFlow.contains("getBoolean(KEY_LOCATION_PERMISSION_SETUP_CONSUMED, false)"))
+        assertInOrder(permissionFlow, "putBoolean(KEY_LOCATION_PERMISSION_SETUP_CONSUMED, true)", "requestPermissions(")
+        assertTrue(permissionFlow.contains("Manifest.permission.ACCESS_FINE_LOCATION"))
+        assertTrue(permissionFlow.contains("Manifest.permission.ACCESS_COARSE_LOCATION"))
+        assertTrue(source.contains("runtimePermissionRequestInFlight = false"))
+        assertInOrder(source, "runtimePermissionRequestInFlight = false", "maybeContinueStartupAccessFlow()")
+        assertTrue(source.contains("startup_location_permission_result"))
+    }
+
+    @Test
     fun serviceUsesExactActiveWorkAndIndependentFiveMinuteCadence() {
         val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
         val settings = sourceFile("com/bydcollector/collector/service/CollectorSettings.kt").readText()

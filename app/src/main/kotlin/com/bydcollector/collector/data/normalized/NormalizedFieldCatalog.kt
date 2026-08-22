@@ -106,15 +106,15 @@ object NormalizedFieldCatalog {
     val chargerConnected = bool("charger_connected_raw", NormalizedCategory.BATTERY, "Charger connected", "plug", listOf("charging_1009_89128973_5"), "charger_connected_openapi")
     val maxDischargePowerAllow = number("max_discharge_power_allow_raw", NormalizedCategory.BATTERY, "kW", "Max discharge power allow raw", "power", "measurement", listOf("statistic_1014_877658120_5"), "decoded_number_non_negative")
 
-    val locationLatitude = number("location_latitude", NormalizedCategory.LOCATION, "°", "GPS latitude", null, "measurement", listOf("android_gps"), "android_gps", mqttDefaultEnabled = false)
-    val locationLongitude = number("location_longitude", NormalizedCategory.LOCATION, "°", "GPS longitude", null, "measurement", listOf("android_gps"), "android_gps", mqttDefaultEnabled = false)
-    val locationAccuracy = number("location_accuracy_m", NormalizedCategory.LOCATION, "m", "GPS accuracy", "distance", "measurement", listOf("android_gps"), "android_gps", mqttDefaultEnabled = false)
-    val locationSpeed = number("location_speed_kmh", NormalizedCategory.LOCATION, "km/h", "GPS speed", "speed", "measurement", listOf("android_gps"), "android_gps", mqttDefaultEnabled = false)
-    val locationAltitude = number("location_altitude_m", NormalizedCategory.LOCATION, "m", "GPS altitude", "distance", "measurement", listOf("android_gps"), "android_gps", mqttDefaultEnabled = false)
-    val locationBearing = number("location_bearing_deg", NormalizedCategory.LOCATION, "°", "GPS bearing", null, "measurement", listOf("android_gps"), "android_gps", mqttDefaultEnabled = false)
-    val locationFixAge = number("location_fix_age_ms", NormalizedCategory.LOCATION, "ms", "GPS fix age", "duration", "measurement", listOf("android_gps"), "android_gps", mqttDefaultEnabled = false)
-    val locationFixTimestamp = textEnum("location_fix_timestamp", NormalizedCategory.LOCATION, "GPS fix timestamp", "android_gps", "android_gps")
-    val locationQuality = textEnum("location_quality", NormalizedCategory.LOCATION, "GPS quality", "android_gps", "android_gps")
+    val locationLatitude = number("location_latitude", NormalizedCategory.LOCATION, "°", "GPS latitude", null, "measurement", listOf("android_gps"), "android_gps")
+    val locationLongitude = number("location_longitude", NormalizedCategory.LOCATION, "°", "GPS longitude", null, "measurement", listOf("android_gps"), "android_gps")
+    val locationAccuracy = number("location_accuracy_m", NormalizedCategory.LOCATION, "m", "GPS accuracy", "distance", "measurement", listOf("android_gps"), "android_gps")
+    val locationSpeed = number("location_speed_kmh", NormalizedCategory.LOCATION, "km/h", "GPS speed", "speed", "measurement", listOf("android_gps"), "android_gps")
+    val locationAltitude = number("location_altitude_m", NormalizedCategory.LOCATION, "m", "GPS altitude", "distance", "measurement", listOf("android_gps"), "android_gps")
+    val locationBearing = number("location_bearing_deg", NormalizedCategory.LOCATION, "°", "GPS bearing", null, "measurement", listOf("android_gps"), "android_gps")
+    val locationFixAge = number("location_fix_age_ms", NormalizedCategory.LOCATION, "ms", "GPS fix age", "duration", "measurement", listOf("android_gps"), "android_gps")
+    val locationFixTimestamp = textEnum("location_fix_timestamp", NormalizedCategory.LOCATION, "GPS fix timestamp", "android_gps", "android_gps", mqttDefaultEnabled = true)
+    val locationQuality = textEnum("location_quality", NormalizedCategory.LOCATION, "GPS quality", "android_gps", "android_gps", mqttDefaultEnabled = true)
 
     val fields: List<NormalizedFieldDefinition> = listOf(
         soc,
@@ -214,7 +214,8 @@ object NormalizedFieldCatalog {
         category: NormalizedCategory,
         displayName: String,
         sourceKey: String,
-        normalizerId: String
+        normalizerId: String,
+        mqttDefaultEnabled: Boolean = false
     ): NormalizedFieldDefinition {
         return NormalizedFieldDefinition(
             fieldKey = fieldKey,
@@ -227,7 +228,7 @@ object NormalizedFieldCatalog {
             entityPlatform = "sensor",
             sourceKeys = listOf(sourceKey),
             normalizerId = normalizerId,
-            mqttDefaultEnabled = false
+            mqttDefaultEnabled = mqttDefaultEnabled
         )
     }
 

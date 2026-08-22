@@ -8,15 +8,12 @@ data class InfluxConfig(
     val username: String?,
     val password: String?,
     val measurement: String,
-    val enabledCategories: Set<String>,
-    /** Location history is opt-in independently from the existing categories. */
-    val locationEnabled: Boolean = false
+    val enabledCategories: Set<String>
 ) {
     val baseUrl: String get() = "http://${host.trim().trimEnd('/')}:$port"
     fun normalizedDatabase(): String = database.trim().ifBlank { DEFAULT_DATABASE }
     fun normalizedMeasurement(): String = measurement.trim().ifBlank { DEFAULT_MEASUREMENT }
-    fun isCategoryEnabled(category: String): Boolean =
-        if (category == "location") locationEnabled else enabledCategories.contains(category)
+    fun isCategoryEnabled(category: String): Boolean = enabledCategories.contains(category)
 
     companion object {
         const val DEFAULT_PORT = 8086

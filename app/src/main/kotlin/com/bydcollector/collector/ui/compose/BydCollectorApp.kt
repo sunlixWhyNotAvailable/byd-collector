@@ -77,6 +77,7 @@ import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.maintenance.DbMaintenanceUiState
 import com.bydcollector.collector.service.CollectorService
+import com.bydcollector.collector.telegram.TelegramNavigatorMask
 import com.bydcollector.collector.ui.DashboardState
 import com.bydcollector.collector.ui.VehicleKpis
 import com.bydcollector.collector.update.ReleaseNotesSelector
@@ -102,8 +103,6 @@ fun BydCollectorApp(
     influxDraft: InfluxDraft,
     tripsUiState: TripsUiState = TripsUiState(),
     tripsUiActions: TripsUiActions = TripsUiActions(),
-    mqttLocationEnabled: Boolean = false,
-    influxLocationEnabled: Boolean = false,
     telegramUiState: TelegramUiState = TelegramUiState(),
     telegramActions: TelegramUiActions = TelegramUiActions(),
     appVersionName: String = "",
@@ -161,8 +160,6 @@ fun BydCollectorApp(
                                     s,
                                     mqttDraft,
                                     influxDraft,
-                                    mqttLocationEnabled,
-                                    influxLocationEnabled,
                                     actions
                                 )
                                 AppTab.TELEGRAM -> TelegramTab(s, telegramUiState, telegramActions)
@@ -392,8 +389,10 @@ private val TelegramMessageDefinitions = listOf(
             "soc",
             "charge_step_added_percent",
             "charge_step_added_kwh",
+            "charge_step_duration",
             "charge_added_percent",
             "charge_added_kwh",
+            "charge_duration",
             "battery_power_kw"
         )
     ),
@@ -440,11 +439,11 @@ private val TelegramMessageDefinitionRows = TelegramMessageDefinitions.chunked(2
 
 private data class TelegramNumberSetting(
     val label: String,
-    val value: Int,
-    val range: IntRange,
+    val value: Float,
+    val range: ClosedFloatingPointRange<Float>,
     val unit: String,
-    val step: Int = 1,
-    val onValueChange: (Int) -> Unit
+    val step: Float = 1f,
+    val onValueChange: (Float) -> Unit
 )
 
 @Composable
@@ -493,8 +492,6 @@ private fun MainCollectionCard(
         Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(strings.permissions, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(0.75f))
             ActionButton(strings.grantAdb, actions::onGrantAdb, primary = true, modifier = Modifier.weight(0.9f))
-            Spacer(Modifier.width(10.dp))
-            ActionButton(strings.grantLocation, actions::onRequestLocationPermission, modifier = Modifier.weight(0.9f))
             Spacer(Modifier.width(10.dp))
             ActionButton(strings.backgroundWork, actions::onOpenBackgroundApps, modifier = Modifier.weight(0.9f))
         }
@@ -1102,8 +1099,6 @@ private fun HaTab(
     strings: UiStrings,
     mqttDraft: MqttDraft,
     influxDraft: InfluxDraft,
-    mqttLocationEnabled: Boolean,
-    influxLocationEnabled: Boolean,
     actions: BydCollectorActions
 ) {
     TabScrollColumn {
@@ -1114,8 +1109,8 @@ private fun HaTab(
             BydSwitch(state?.haSharedCategoriesEnabled == true, actions::onToggleSharedCategories, enabled = state?.influxEnabled != true)
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            MqttCard(state, strings, mqttDraft, mqttLocationEnabled, actions, Modifier.weight(1f))
-            InfluxCard(state, strings, influxDraft, influxLocationEnabled, actions, Modifier.weight(1f))
+            MqttCard(state, strings, mqttDraft, actions, Modifier.weight(1f))
+            InfluxCard(state, strings, influxDraft, actions, Modifier.weight(1f))
         }
     }
 }
@@ -1125,7 +1120,6 @@ private fun MqttCard(
     state: DashboardState?,
     strings: UiStrings,
     draft: MqttDraft,
-    locationEnabled: Boolean,
     actions: BydCollectorActions,
     modifier: Modifier
 ) {
@@ -1143,7 +1137,6 @@ private fun MqttCard(
         CategoryGrid(strings.mqttCategories, state?.mqttEnabledCategories.orEmpty(), enabled = state?.mqttEnabled != true, strings = strings) { category ->
             actions.onToggleMqttCategory(category, !state?.mqttEnabledCategories.orEmpty().contains(category))
         }
-        SwitchRow(strings.location, locationEnabled, actions::onToggleMqttLocation)
         CredentialGridMqtt(strings, draft, actions)
     }
 }
@@ -1153,7 +1146,6 @@ private fun InfluxCard(
     state: DashboardState?,
     strings: UiStrings,
     draft: InfluxDraft,
-    locationEnabled: Boolean,
     actions: BydCollectorActions,
     modifier: Modifier
 ) {
@@ -1176,7 +1168,6 @@ private fun InfluxCard(
         ) { category ->
             actions.onToggleInfluxCategory(category, !state?.influxEnabledCategories.orEmpty().contains(category))
         }
-        SwitchRow(strings.location, locationEnabled, actions::onToggleInfluxLocation)
         CredentialGridInflux(strings, draft, actions)
     }
 }
@@ -1247,7 +1238,8 @@ private fun CategoryGrid(
             "motion" to strings.motion,
             "body" to strings.body,
             "climate" to strings.climate,
-            "safety" to strings.safety
+            "safety" to strings.safety,
+            "location" to strings.location
         ).chunked(3)
     }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1450,6 +1442,7 @@ private fun TelegramMessageCard(
         )
     }
     var showVariablePicker by remember(definition.type) { mutableStateOf(false) }
+    var showLocationSettings by remember(definition.type) { mutableStateOf(false) }
 
     LaunchedEffect(messageConfig.template) {
         if (template.text != messageConfig.template) {
@@ -1474,12 +1467,36 @@ private fun TelegramMessageCard(
         telegramNumberSetting(definition.type, config, strings.telegram, onConfigChanged)?.let { setting ->
             TelegramNumberStepper(
                 setting = setting,
-                sendLocationEnabled = definition.type == TelegramMessageType.TRIP_SUMMARY && config.sendLocation,
-                onSendLocationChanged = { onConfigChanged(config.copy(sendLocation = it)) },
-                sendLocationLabel = strings.sendLocation.takeIf {
-                    definition.type == TelegramMessageType.TRIP_SUMMARY
-                }.orEmpty()
             )
+        }
+        if (definition.type == TelegramMessageType.TRIP_SUMMARY) {
+            Row(
+                modifier = Modifier.fillMaxWidth().height(42.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                ActionButton(
+                    text = strings.sendLocation,
+                    onClick = { showLocationSettings = true },
+                    modifier = Modifier.width(180.dp)
+                )
+                Box(
+                    modifier = Modifier.width(132.dp).height(38.dp)
+                        .border(1.dp, LocalBydPalette.current.border, Rounded8),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = if (!config.sendLocation) strings.telegram.locationStatusNo
+                        else String.format(strings.telegram.locationStatusYes, Integer.bitCount(config.navigatorMask and TelegramNavigatorMask.ALL)),
+                        color = LocalBydPalette.current.muted,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        textAlign = TextAlign.Center,
+                        maxLines = 1
+                    )
+                }
+                Spacer(Modifier.weight(1f))
+            }
         }
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1504,7 +1521,7 @@ private fun TelegramMessageCard(
             placeholder = strings.telegram.messagePlaceholder,
             onValueChange = { next ->
                 template = next
-                updateMessage(messageConfig.copy(template = next.text))
+                updateMessage(messageConfig.copy(template = next.text, usesDefaultTemplate = false))
             },
             multiline = true,
             modifier = Modifier.fillMaxWidth()
@@ -1520,20 +1537,30 @@ private fun TelegramMessageCard(
             onSelect = { token ->
                 val next = insertTelegramTemplateVariable(template, token)
                 template = next
-                updateMessage(messageConfig.copy(template = next.text))
+                updateMessage(messageConfig.copy(template = next.text, usesDefaultTemplate = false))
                 showVariablePicker = false
             },
             onDismiss = { showVariablePicker = false }
+        )
+    }
+
+    if (showLocationSettings) {
+        TelegramLocationDialog(
+            strings = strings.telegram,
+            enabled = config.sendLocation,
+            navigatorMask = config.navigatorMask,
+            onApply = { enabled, mask ->
+                onConfigChanged(config.copy(sendLocation = enabled, navigatorMask = mask))
+                showLocationSettings = false
+            },
+            onDismiss = { showLocationSettings = false }
         )
     }
 }
 
 @Composable
 private fun TelegramNumberStepper(
-    setting: TelegramNumberSetting,
-    sendLocationEnabled: Boolean = false,
-    onSendLocationChanged: (Boolean) -> Unit = {},
-    sendLocationLabel: String = ""
+    setting: TelegramNumberSetting
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -1552,27 +1579,82 @@ private fun TelegramNumberStepper(
         ActionButton(
             text = "-",
             onClick = {
-                setting.onValueChange((setting.value - setting.step).coerceAtLeast(setting.range.first))
+                setting.onValueChange((setting.value - setting.step).coerceAtLeast(setting.range.start))
             },
-            enabled = setting.value > setting.range.first,
+            enabled = setting.value > setting.range.start + 0.0001f,
             modifier = Modifier.width(42.dp)
         )
         NumericInput(
-            value = if (setting.unit == "%") "${setting.value}%" else "${setting.value} ${setting.unit}",
+            value = formatTelegramNumber(setting.value, setting.unit),
             modifier = Modifier.width(72.dp)
         )
         ActionButton(
             text = "+",
             onClick = {
-                setting.onValueChange((setting.value + setting.step).coerceAtMost(setting.range.last))
+                setting.onValueChange((setting.value + setting.step).coerceAtMost(setting.range.endInclusive))
             },
-            enabled = setting.value < setting.range.last,
+            enabled = setting.value < setting.range.endInclusive - 0.0001f,
             modifier = Modifier.width(42.dp)
         )
-        if (sendLocationLabel.isNotBlank()) {
-            Text(sendLocationLabel, color = LocalBydPalette.current.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
-            BydSwitch(sendLocationEnabled, onSendLocationChanged)
+    }
+}
+
+@Composable
+private fun TelegramLocationDialog(
+    strings: TelegramStrings,
+    enabled: Boolean,
+    navigatorMask: Int,
+    onApply: (Boolean, Int) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val p = LocalBydPalette.current
+    var selectedEnabled by remember(enabled) { mutableStateOf(enabled) }
+    var selectedMask by remember(navigatorMask) { mutableStateOf(TelegramNavigatorMask.sanitize(navigatorMask)) }
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false, dismissOnClickOutside = false)
+    ) {
+        Box(
+            modifier = Modifier.fillMaxSize().background(p.background.copy(alpha = 0.82f)).padding(28.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            ModalInputBlocker()
+            Column(
+                modifier = Modifier.width(520.dp).background(p.panel, Rounded8)
+                    .border(1.dp, p.borderStrong, Rounded8).padding(20.dp)
+            ) {
+                Text(strings.locationSettings, color = p.text, fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(8.dp))
+                Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(strings.locationMaster, color = p.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                    BydSwitch(selectedEnabled, { selectedEnabled = it })
+                }
+                listOf(
+                    TelegramNavigatorMask.GOOGLE to strings.googleNavigator,
+                    TelegramNavigatorMask.WAZE to strings.wazeNavigator,
+                    TelegramNavigatorMask.APPLE to strings.appleNavigator,
+                    TelegramNavigatorMask.OSM to strings.osmNavigator
+                ).forEach { (bit, label) ->
+                    Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(label, color = p.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                        BydSwitch((selectedMask and bit) != 0, { checked ->
+                            selectedMask = if (checked) selectedMask or bit else selectedMask and bit.inv()
+                        })
+                    }
+                }
+                Spacer(Modifier.height(14.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    ActionButton(strings.locationClose, { onApply(selectedEnabled, TelegramNavigatorMask.sanitize(selectedMask)) }, modifier = Modifier.width(140.dp))
+                }
+            }
         }
+    }
+}
+
+private fun formatTelegramNumber(value: Float, unit: String): String {
+    return if (unit == "V") "%.1f V".format(Locale.US, value) else {
+        val number = value.toInt()
+        if (unit == "%") "$number%" else "$number $unit"
     }
 }
 
@@ -1584,29 +1666,30 @@ private fun telegramNumberSetting(
 ): TelegramNumberSetting? = when (type) {
     TelegramMessageType.CHARGING_PROGRESS -> TelegramNumberSetting(
         strings.chargeStep,
-        config.chargeStepPercent,
-        1..99,
+        config.chargeStepPercent.toFloat(),
+        1f..99f,
         "%"
-    ) { onConfigChanged(config.copy(chargeStepPercent = it)) }
+    ) { onConfigChanged(config.copy(chargeStepPercent = it.toInt())) }
     TelegramMessageType.LOW_12V_VOLTAGE -> TelegramNumberSetting(
         strings.low12vThreshold,
         config.low12vThresholdVolts,
-        9..15,
-        "V"
-    ) { onConfigChanged(config.copy(low12vThresholdVolts = it)) }
+        9f..15f,
+        "V",
+        step = 0.1f
+    ) { onConfigChanged(config.copy(low12vThresholdVolts = (kotlin.math.round(it * 10f) / 10f).coerceIn(9f, 15f))) }
     TelegramMessageType.TELEMETRY_UNAVAILABLE -> TelegramNumberSetting(
         strings.telemetryDelay,
-        config.telemetryUnavailableMinutes,
-        1..60,
+        config.telemetryUnavailableMinutes.toFloat(),
+        1f..60f,
         strings.minuteUnit
-    ) { onConfigChanged(config.copy(telemetryUnavailableMinutes = it)) }
+    ) { onConfigChanged(config.copy(telemetryUnavailableMinutes = it.toInt())) }
     TelegramMessageType.TRIP_SUMMARY -> TelegramNumberSetting(
         strings.tripDelay,
-        config.tripSummaryDelaySeconds,
-        5..300,
+        config.tripSummaryDelaySeconds.toFloat(),
+        5f..300f,
         strings.secondUnit,
-        step = 5
-    ) { onConfigChanged(config.copy(tripSummaryDelaySeconds = it)) }
+        step = 5f
+    ) { onConfigChanged(config.copy(tripSummaryDelaySeconds = it.toInt())) }
     else -> null
 }
 

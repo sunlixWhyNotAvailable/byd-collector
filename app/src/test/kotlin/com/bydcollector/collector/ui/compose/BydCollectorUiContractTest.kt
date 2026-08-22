@@ -59,6 +59,21 @@ class BydCollectorUiContractTest {
     }
 
     @Test
+    fun mainAccessActionsKeepOnlyAdbAndBackgroundWork() {
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val actions = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorActions.kt").readText()
+        val strings = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorStrings.kt").readText()
+
+        assertFalse(app.contains("grantLocation"))
+        assertFalse(actions.contains("onRequestLocationPermission"))
+        assertFalse(strings.contains("grantLocation"))
+        val mainCollection = app.substringAfter("private fun MainCollectionCard(").substringBefore("private fun MainStatusCard(")
+        assertTrue(mainCollection.contains("ActionButton(strings.grantAdb, actions::onGrantAdb"))
+        assertTrue(mainCollection.contains("ActionButton(strings.backgroundWork, actions::onOpenBackgroundApps"))
+        assertFalse(mainCollection.contains("ActionButton(strings.grantLocation"))
+    }
+
+    @Test
     fun roundRobinCountIsActualAndReadOnly() {
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
         val actions = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorActions.kt").readText()
@@ -220,6 +235,15 @@ class BydCollectorUiContractTest {
     }
 
     @Test
+    fun optionsTabUsesApprovedUkrainianAndEnglishLabels() {
+        val strings = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorStrings.kt").readText()
+
+        assertTrue(strings.contains("extraTab = \"Опції\""))
+        assertTrue(strings.contains("extraTab = \"Options\""))
+        assertFalse(strings.contains("extraTab = \"Налаштування\""))
+    }
+
+    @Test
     fun tripsPreviewPortKeepsBinarySelectorsAndCompactHierarchyContract() {
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
         val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
@@ -244,20 +268,32 @@ class BydCollectorUiContractTest {
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
         val strings = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorStrings.kt").readText()
         val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
+        val actions = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorActions.kt").readText()
         assertTrue(app.contains("mutableStateOf(TripMapMetric.SPEED)"))
-        assertFalse(app.contains("fillMaxSize().background(p.background.copy(alpha = 0.82f)).padding(28.dp)"))
+        assertTrue(app.contains("private fun TelegramLocationDialog("))
         assertTrue(app.contains("tripMapMarker(map, p.first()"))
         assertTrue(app.contains("tripMapMarker(map, p.last()"))
         assertTrue(app.contains("p.accent.toArgb()"))
         assertTrue(app.contains("Marker(map)"))
-        assertTrue(strings.contains("tripDelay = \"Затримка надсилання\""))
-        assertTrue(strings.contains("tripDelay = \"Send delay\""))
+        assertTrue(strings.contains("tripDelay = \"Завершити після P\""))
+        assertTrue(strings.contains("tripDelay = \"Finish after P\""))
         val stepper = app.substringAfter("private fun TelegramNumberStepper(").substringBefore("private fun telegramNumberSetting(")
         assertInOrder(stepper, "setting.label", "text = \"-\"")
         assertInOrder(stepper, "text = \"-\"", "NumericInput(")
         assertInOrder(stepper, "NumericInput(", "text = \"+\"")
-        assertInOrder(stepper, "text = \"+\"", "Text(sendLocationLabel")
-        assertInOrder(stepper, "Text(sendLocationLabel", "BydSwitch(sendLocationEnabled")
+        assertFalse(stepper.contains("sendLocationLabel"))
+        assertFalse(stepper.contains("sendLocationEnabled"))
+        assertInOrder(app, "text = strings.sendLocation", "String.format(strings.telegram.locationStatusYes")
+        assertInOrder(app, "TelegramLocationDialog(", "TelegramNavigatorMask.GOOGLE")
+        assertInOrder(app, "TelegramNavigatorMask.GOOGLE", "TelegramNavigatorMask.WAZE")
+        assertInOrder(app, "TelegramNavigatorMask.WAZE", "TelegramNavigatorMask.APPLE")
+        assertInOrder(app, "TelegramNavigatorMask.APPLE", "TelegramNavigatorMask.OSM")
+        assertTrue(app.contains("dismissOnClickOutside = false"))
+        assertTrue(app.contains("step = 0.1f"))
+        assertTrue(app.contains("9f..15f"))
+        assertTrue(actions.contains("low12vThresholdVolts: Float"))
+        assertTrue(app.contains("\"charge_step_duration\""))
+        assertTrue(app.contains("\"charge_duration\""))
         assertTrue(components.contains("binary -> 25.dp"))
         assertTrue(components.contains("binary && pressed -> p.accent.copy"))
         assertTrue(components.contains("if (binary || visualChecked || visuallyPending) p.switchThumbOn"))
@@ -330,11 +366,27 @@ class BydCollectorUiContractTest {
 
         assertTrue(actions.contains("tripSummaryDelaySeconds: Int = 10"))
         assertTrue(app.contains("config.tripSummaryDelaySeconds"))
-        assertTrue(app.contains("5..300"))
+        assertTrue(app.contains("5f..300f"))
         assertTrue(app.contains("strings.secondUnit"))
-        assertTrue(app.contains("step = 5"))
+        assertTrue(app.contains("step = 5f"))
         assertTrue(strings.contains("secondUnit = \"с\""))
         assertTrue(strings.contains("secondUnit = \"sec\""))
+    }
+
+    @Test
+    fun telegramDefaultsFollowLanguageWhileCustomTextStaysExact() {
+        val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val actions = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorActions.kt").readText()
+        val strings = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorStrings.kt").readText()
+
+        assertTrue(actions.contains("usesDefaultTemplate: Boolean = true"))
+        assertInOrder(activity, "uiLanguage = UiLanguage.fromCode(settings.uiLanguageCode())", "setContent {")
+        assertInOrder(activity, "settings.setUiLanguageCode(language.code)", "loadTelegramUiState()")
+        assertInOrder(activity, "newMessage.usesDefaultTemplate", "settings.clearTelegramTemplate(eventKey)")
+        assertTrue(activity.contains("settings.setTelegramTemplate(eventKey, newMessage.template)"))
+        assertTrue(strings.contains("TelegramTemplateCatalog.defaultTemplate"))
+        assertTrue(strings.contains("locationSettings = \"Налаштування локації\""))
+        assertTrue(strings.contains("locationSettings = \"Location settings\""))
     }
 
     @Test

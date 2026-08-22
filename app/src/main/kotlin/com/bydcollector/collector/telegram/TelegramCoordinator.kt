@@ -178,8 +178,9 @@ class TelegramCoordinator(
     }
 
     private fun render(event: TelegramDetectedEvent): TelegramOutboxMessage? {
-        val template = settings.telegramTemplate(event.type.key)
-            ?: TelegramTemplateCatalog.spec(event.type).defaultTemplate
+        val language = telegramLanguage()
+        val savedTemplate = settings.telegramTemplate(event.type.key)
+        val template = savedTemplate ?: TelegramTemplateCatalog.defaultTemplate(event.type, language)
         val rendered = TelegramTemplateRenderer.render(event.type, template, event.variables)
         val payload = rendered.text
         if (payload == null) {
@@ -191,6 +192,11 @@ class TelegramCoordinator(
             return null
         }
         return TelegramOutboxMessage(event.dedupeKey, event.type.key, payload + (event.textSuffix ?: ""))
+    }
+
+    private fun telegramLanguage(): TelegramTemplateLanguage = when (settings.uiLanguageCode().trim().lowercase()) {
+        "uk", "ua", "uk-ua" -> TelegramTemplateLanguage.UK
+        else -> TelegramTemplateLanguage.EN
     }
 
     private fun eventConfig(): TelegramEventConfig {
@@ -205,7 +211,9 @@ class TelegramCoordinator(
             lowVoltageThreshold = settings.telegramLowVoltageThreshold().toDouble(),
             unavailableDelayMs = settings.telegramUnavailableDelayMinutes() * 60_000L,
             tripEndDelayMs = settings.telegramTripEndDelaySeconds() * 1_000L,
-            sendLocation = settings.isTelegramSendLocationEnabled()
+            sendLocation = settings.isTelegramSendLocationEnabled(),
+            language = telegramLanguage(),
+            navigatorMask = TelegramNavigatorMask.sanitize(settings.telegramNavigatorMask())
         )
     }
 

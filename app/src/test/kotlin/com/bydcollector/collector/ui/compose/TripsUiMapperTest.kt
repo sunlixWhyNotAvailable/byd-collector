@@ -64,6 +64,19 @@ class TripsUiMapperTest {
         assertEquals(42.0, mapped.route.single().speedKmh)
     }
 
+    @Test
+    fun mapsUntrustedRoutePointsAsGaps() {
+        val mapped = TripsUiMapper.years(
+            listOf(TripDayGroup(2026, 8, 17, listOf(summary("trip-1")))),
+            UiLanguage.EN,
+            routes = mapOf("trip-1" to listOf(
+                RoutePoint("trip-1", 0, RoutePoint.KIND_UNTRUSTED, "2026-08-17T12:00:00Z", latitude = 50.45, longitude = 30.52, quality = "untrusted:mock_source")
+            ))
+        ).single().months.single().days.single().trips.single()
+
+        assertTrue(mapped.route.single().gap)
+    }
+
     private fun summary(id: String) = TripSummary(
         tripId = id,
         startedAt = "2026-08-17T12:00:00Z",

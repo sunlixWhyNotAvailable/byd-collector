@@ -54,4 +54,23 @@ object TripMetrics {
         segmentId = segmentId,
         quality = "gap:$reason"
     )
+
+    fun untrustedPoint(
+        tripId: String,
+        sequence: Long,
+        sample: GpsLocationSample,
+        reason: String
+    ): RoutePoint {
+        val quality = "untrusted:$reason"
+        if (!GpsLocationSample.isValidCoordinate(sample.latitude, sample.longitude)) {
+            return gapPoint(tripId, sequence, sample.observedAt, sample.bootId, sample.segmentId, reason)
+                .copy(quality = quality)
+        }
+        return routePoint(tripId, sequence, sample).copy(
+            kind = RoutePoint.KIND_UNTRUSTED,
+            quality = quality,
+            isFirst = false,
+            isFinal = false
+        )
+    }
 }

@@ -79,7 +79,7 @@ Round-robin storage is cut over and checked before a debug session starts. Stopp
 
 The `Trips` tab stores power-on to confirmed-power-off sessions in a separate app-private `bydcollector_trips.db`. It keeps only trip summaries and GPS route points/gaps; it does not duplicate the full Main telemetry catalogue. Zero-motion sessions remain stored but are hidden from the ordinary list.
 
-Route recording uses Android's GPS provider after the user grants location access. The map uses online OpenStreetMap tiles, shows gaps rather than inventing coordinates, fits the complete recorded route, and can colour segments by speed or instantaneous consumption. Defaults are speed colouring with `90/30 km/h` thresholds and consumption thresholds of `15/20 kWh/100 km`.
+Route recording uses Android's GPS provider after the user grants location access. During serialized first-run setup, the app requests fine/coarse location once before the ADB authorization step; after a denial, access must be granted later in Android settings. Mock, invalid, stale, clock-skewed, or physically impossible fixes are retained only as diagnostics and become route gaps. After a rejection, callback outage, or location-source restart, three mutually consistent fresh fixes are required before location is trusted again. The map uses online OpenStreetMap tiles, fits the trusted route, and can colour segments by speed or instantaneous consumption. Defaults are speed colouring with `90/30 km/h` thresholds and consumption thresholds of `15/20 kWh/100 km`.
 
 There is currently no automatic trip-route retention or trip-database archive action. The maintainer will measure the real database/WAL footprint after several days before selecting a retention policy.
 
@@ -90,8 +90,8 @@ The `HA integration` tab configures the two off-car export channels. They are in
 ### MQTT and Home Assistant
 
 - Publishes Home Assistant MQTT Discovery configuration and live normalized vehicle state.
-- Select categories such as battery, motion, body, climate, safety, and driver assist.
-- Precise location is a separate switch and remains off by default, independently of the ordinary categories.
+- Select battery, motion, body, climate, safety, and location from the ordinary category grid.
+- The location category remains off by default. When enabled, it publishes the latest trusted normalized GPS state; local trip/location recording remains independent of export selection.
 - Configure host, port, username/password, client ID, topic prefix, and discovery prefix.
 - MQTT is for current state. A disconnected Home Assistant broker can mean that a live state is missed; SQLite remains the local source of truth.
 - A failed publish becomes eligible again after 30 seconds. The `v2.7.0` source schedules one persisted single-flight retry at that deadline; the published `v2.6.3` build still waits for the next state update or status heartbeat.
@@ -100,7 +100,7 @@ The `HA integration` tab configures the two off-car export channels. They are in
 
 - Exports normalized history to `InfluxDB v1` for long-term charts and Grafana.
 - Configure host, port, database, measurement, credentials, and categories independently of MQTT.
-- Precise location history is a separate switch and remains off by default.
+- The location category remains off by default. When enabled, timestamped trusted GPS history uses the same durable per-field cursor contract as the other categories.
 - A persisted cursor is kept for each selected field. Export is independent of main polling while the service is alive: successful globally ordered batches contain up to 300 rows and continue once per second while backlog remains; a real write failure uses a 30-second retry delay.
 - `Re-export` is available when new categories are enabled; existing cursor state prevents duplicate history in normal operation.
 
@@ -122,9 +122,9 @@ Supported event templates include:
 - telemetry unavailable; and
 - trip summary.
 
-Charging-progress templates can report both energy/SOC added during the current step and totals for the whole charging session. Trip summaries separate the current `P -> non-P -> P` trip from totals observed during the current vehicle boot. A summary is eligible for an SOC change of at least 1%; otherwise the trip must exceed 0.1 km or 0.1 kWh. The parked summary is persisted, and a resumed drive suppresses a stale completion. Confirmed vehicle power-off bypasses the parked delay and immediately queues and attempts the summary while the network may still be available. A failed send remains in the durable FIFO for Wi-Fi or the next session.
+Charging-progress templates can report energy/SOC and localized duration for both the current step and the whole charging session. Untouched built-in templates follow the persisted app language; edited templates retain their exact text. On this candidate upgrade, an already persisted trip-summary template is replaced once with the expanded built-in and classified as a default. Trip summaries separate the current `P -> non-P -> P` trip from totals observed during the current vehicle boot, and both energy lines include start-to-end SOC. A summary is eligible for an SOC change of at least 1%; otherwise the trip must exceed 0.1 km or 0.1 kWh. The parked summary is persisted, and a resumed drive suppresses a stale completion. Confirmed vehicle power-off bypasses the parked delay and immediately queues and attempts the summary while the network may still be available. A failed send remains in the durable FIFO for Wi-Fi or the next session.
 
-`Send location` is off by default. When enabled, the same trip-summary text receives the last valid coordinate, its age, and OpenStreetMap/Google/Apple navigation links; no second Telegram message or media upload is created.
+Trip-summary location is off by default. The separate `Send location` button opens a blocking modal with independent Google, Waze, Apple, and OSM selections; choosing zero links is allowed. When enabled, the same summary text receives the last trusted coordinate, its original capture age, and only the selected links; no second Telegram message or media upload is created.
 
 The outbox is strict FIFO. Only the oldest queued event is attempted; retry/backoff and permanent-block state stay at the head, and successful backlog messages are paced by at least five seconds. A later event does not discard an earlier one. Trip-summary delay is configurable from 5 to 300 seconds (10 seconds by default).
 
@@ -187,12 +187,13 @@ The collector does not automatically upload telemetry, screenshots, crash report
 
 1. Download the current APK from [GitHub Releases](https://github.com/sunlixWhyNotAvailable/byd-collector/releases/latest) and verify the release checksum when one is published.
 2. Install and open **BYD Collector** on the vehicle tablet.
-3. When Android shows the ADB RSA prompt, confirm it. In the app, use `Grant ADB` to re-check the bridge.
-4. Open the BYD/DiLink background-app settings and set `Disable background Apps -> BYD Collector` to `OFF`.
-5. Start `Main` and confirm that the status changes from waiting to successful polling.
-6. Use `GPS access` if route recording is wanted, and enable precise-location export switches only where needed.
-7. Enable only the integrations and Telegram events you need, then test each connection from its tab.
-8. Start `All data` only for research sessions; it writes a separate, much larger database.
+3. Follow the first-run background-app prompt and set `Disable background Apps -> BYD Collector` to `OFF`.
+4. Accept the one-time Android fine/coarse location request if route recording is wanted. After a denial, grant it later in Android settings; the app does not repeatedly prompt.
+5. When Android shows the ADB RSA prompt, confirm it. In the app, use `Grant ADB` to re-check the bridge.
+6. Start `Main` and confirm that the status changes from waiting to successful polling.
+7. Enable the default-off `location` category only for MQTT/Influx channels that need precise-location export.
+8. Enable only the integrations and Telegram events you need, then test each connection from its tab.
+9. Start `All data` only for research sessions; it writes a separate, much larger database.
 
 ADB is required for direct vehicle reads and for the helper startup. Without an authorized bridge the app can still open and show stored data, settings, and archives, but it cannot collect fresh vehicle telemetry. Re-authorize after a tablet reset, Android security prompt, or changed host key.
 
@@ -252,7 +253,7 @@ Archives can expose vehicle identifiers, raw Chinese descriptions, timestamps, t
 - The full All data catalog is research evidence, not a guaranteed normalized schema. Unknown fields and field-specific enums require new evidence.
 - Main normalized history is currently lossless and unbounded. No retention period, downsampling, `VACUUM`, or size-triggered rotation is enabled.
 - Trip routes are also unbounded until their real multi-day database footprint is measured; online maps require OpenStreetMap tile connectivity.
-- The first physical-vehicle `v2.7.0` gate found blocking startup defects: framework SQLite rejects the shell-UID telemetry helper's package identity while opening its durable spool, so the helper exits before Binder registration and Main, Debug, and trip collection do not start; location permission is declared but its runtime prompt is reachable only through the manual GPS-access button instead of the first-run flow. The candidate must not be relied on until both are fixed and revalidated on the vehicle.
+- The first physical-vehicle `v2.7.0` gate found a shell-UID SQLite spool failure and a missing automatic location prompt. The current candidate replaces shell SQLite with the validated file spool and adds the serialized one-time permission request; these corrections are host-verified but still require installation and revalidation on the vehicle.
 - The `BODYWORK_POWER_LEVEL` `0/2` boundary and post-kernel-reboot recovery path still require the planned physical-vehicle validation before this build is relied on unattended.
 - MQTT is a live-state channel and can miss updates while the broker is offline. InfluxDB v1 export is cursor/retry based and intentionally paced.
 - Telegram delivery depends on external Bot API reachability and strict FIFO head-of-queue behavior.

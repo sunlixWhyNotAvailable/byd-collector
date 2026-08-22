@@ -1,5 +1,7 @@
 package com.bydcollector.collector.ui.compose
 
+import com.bydcollector.collector.telegram.TelegramNavigatorMask
+
 data class MqttDraft(
     val host: String = "",
     val port: String = "",
@@ -103,7 +105,8 @@ enum class TelegramMessageType {
 
 data class TelegramMessageConfig(
     val enabled: Boolean = false,
-    val template: String = ""
+    val template: String = "",
+    val usesDefaultTemplate: Boolean = true
 )
 
 data class TelegramConfig(
@@ -112,10 +115,11 @@ data class TelegramConfig(
     val botTokenSet: Boolean = false,
     val chatId: String = "",
     val chargeStepPercent: Int = 5,
-    val low12vThresholdVolts: Int = 12,
+    val low12vThresholdVolts: Float = 12.0f,
     val telemetryUnavailableMinutes: Int = 1,
     val tripSummaryDelaySeconds: Int = 10,
     val sendLocation: Boolean = false,
+    val navigatorMask: Int = TelegramNavigatorMask.ALL,
     val messages: Map<TelegramMessageType, TelegramMessageConfig> = emptyMap()
 )
 
@@ -147,7 +151,6 @@ interface BydCollectorActions {
     fun onStopMain()
     fun onToggleMainAutoStart(enabled: Boolean)
     fun onGrantAdb()
-    fun onRequestLocationPermission()
     fun onOpenBackgroundApps()
     fun onOpenArchiveDatabase()
     fun onOpenArchiveDebugDatabase()
@@ -168,7 +171,6 @@ interface BydCollectorActions {
     fun onTestMqtt()
     fun onToggleMqttAutoStart(enabled: Boolean)
     fun onToggleMqttCategory(category: String, enabled: Boolean)
-    fun onToggleMqttLocation(enabled: Boolean)
     fun onMqttDraftChanged(draft: MqttDraft)
 
     fun onStartInflux()
@@ -177,7 +179,6 @@ interface BydCollectorActions {
     fun onReExportInflux()
     fun onToggleInfluxAutoStart(enabled: Boolean)
     fun onToggleInfluxCategory(category: String, enabled: Boolean)
-    fun onToggleInfluxLocation(enabled: Boolean)
     fun onInfluxDraftChanged(draft: InfluxDraft)
 
     fun onToggleKeepWifi(enabled: Boolean)

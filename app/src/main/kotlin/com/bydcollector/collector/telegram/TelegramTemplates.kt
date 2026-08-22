@@ -23,56 +23,157 @@ data class TelegramTemplateSpec(
     val allowedVariables: Set<String>
 )
 
+enum class TelegramTemplateLanguage {
+    UK,
+    EN
+}
+
+data class TelegramBuiltInTemplateMatch(
+    val language: TelegramTemplateLanguage,
+    val historic: Boolean
+)
+
 object TelegramBuiltInTemplates {
+    const val CHARGING_STARTED_UK = "Заряджання розпочато\nSOC: {soc}%\nПотужність: {battery_power_kw} кВт"
+    const val CHARGING_STARTED_EN = "Charging started\nSOC: {soc}%\nPower: {battery_power_kw} kW"
     const val CHARGING_PROGRESS_UK =
-        "Заряд: {soc}%\nЗа крок: +{charge_step_added_percent}% / +{charge_step_added_kwh} кВт·год\nЗа сесію: +{charge_added_percent}% / +{charge_added_kwh} кВт·год"
+        "Заряд: {soc}%\nЗа крок: +{charge_step_added_percent}% / +{charge_step_added_kwh} кВт·год\nЧас кроку: {charge_step_duration}\nЗа сесію: +{charge_added_percent}% / +{charge_added_kwh} кВт·год\nЧас сесії: {charge_duration}"
     const val CHARGING_PROGRESS_EN =
-        "Charge: {soc}%\nThis step: +{charge_step_added_percent}% / +{charge_step_added_kwh} kWh\nSession total: +{charge_added_percent}% / +{charge_added_kwh} kWh"
+        "Charge: {soc}%\nThis step: +{charge_step_added_percent}% / +{charge_step_added_kwh} kWh\nStep time: {charge_step_duration}\nSession total: +{charge_added_percent}% / +{charge_added_kwh} kWh\nSession time: {charge_duration}"
+    const val CHARGED_TO_100_UK = "Авто заряджено до 100%\nЕнергія: {remaining_energy_kwh} кВт·год\nЗапас ходу: {range_km} км"
+    const val CHARGED_TO_100_EN = "Vehicle charged to 100%\nEnergy: {remaining_energy_kwh} kWh\nRange: {range_km} km"
+    const val CHARGING_STOPPED_UK = "Заряджання зупинено\nSOC: {soc}%\nТривалість: {charge_duration}"
+    const val CHARGING_STOPPED_EN = "Charging stopped\nSOC: {soc}%\nDuration: {charge_duration}"
+    const val CHARGE_GUN_CONNECTED_UK = "Зарядний кабель підключено\nSOC: {soc}%\nЧас: {time}"
+    const val CHARGE_GUN_CONNECTED_EN = "Charge gun connected\nSOC: {soc}%\nTime: {time}"
+    const val CHARGE_GUN_DISCONNECTED_UK = "Зарядний кабель відключено\nSOC: {soc}%\nЧас: {time}"
+    const val CHARGE_GUN_DISCONNECTED_EN = "Charge gun disconnected\nSOC: {soc}%\nTime: {time}"
+    const val LOW_12V_VOLTAGE_UK = "Низька напруга 12V\nНапруга: {battery_12v} В\nЧас: {time}"
+    const val LOW_12V_VOLTAGE_EN = "Low 12V voltage\nVoltage: {battery_12v} V\nTime: {time}"
+    const val TELEMETRY_UNAVAILABLE_UK = "Телеметрія недоступна\nОстанні дані: {last_data_time}\nПомилка: {error}"
+    const val TELEMETRY_UNAVAILABLE_EN = "Telemetry unavailable\nLast data: {last_data_time}\nError: {error}"
     const val TRIP_SUMMARY_UK =
-        "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\nВитрата: {trip_energy_kwh} кВт·год, SOC: {soc_start}% -> {soc_end}%\nЗагалом: {total_distance_km} км / {total_duration}\nВитрата: {total_energy_kwh} кВт·год"
+        "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\nВитрата: {trip_energy_kwh} кВт·год, SOC: {soc_start}% -> {soc_end}%\nЗагалом: {total_distance_km} км / {total_duration}\nВитрата: {total_energy_kwh} кВт·год, SOC: {soc_start}% -> {soc_end}%"
     const val TRIP_SUMMARY_EN =
-        "Trip complete\nCurrent trip: {trip_distance_km} km / {trip_duration}\nEnergy used: {trip_energy_kwh} kWh, SOC: {soc_start}% -> {soc_end}%\nTotal: {total_distance_km} km / {total_duration}\nEnergy used: {total_energy_kwh} kWh"
+        "Trip complete\nCurrent trip: {trip_distance_km} km / {trip_duration}\nEnergy used: {trip_energy_kwh} kWh, SOC: {soc_start}% -> {soc_end}%\nTotal: {total_distance_km} km / {total_duration}\nEnergy used: {total_energy_kwh} kWh, SOC: {soc_start}% -> {soc_end}%"
+
+    private val current = mapOf(
+        TelegramEventType.CHARGING_STARTED to mapOf(TelegramTemplateLanguage.UK to CHARGING_STARTED_UK, TelegramTemplateLanguage.EN to CHARGING_STARTED_EN),
+        TelegramEventType.CHARGING_PROGRESS to mapOf(TelegramTemplateLanguage.UK to CHARGING_PROGRESS_UK, TelegramTemplateLanguage.EN to CHARGING_PROGRESS_EN),
+        TelegramEventType.CHARGED_TO_100 to mapOf(TelegramTemplateLanguage.UK to CHARGED_TO_100_UK, TelegramTemplateLanguage.EN to CHARGED_TO_100_EN),
+        TelegramEventType.CHARGING_STOPPED to mapOf(TelegramTemplateLanguage.UK to CHARGING_STOPPED_UK, TelegramTemplateLanguage.EN to CHARGING_STOPPED_EN),
+        TelegramEventType.CHARGE_GUN_CONNECTED to mapOf(TelegramTemplateLanguage.UK to CHARGE_GUN_CONNECTED_UK, TelegramTemplateLanguage.EN to CHARGE_GUN_CONNECTED_EN),
+        TelegramEventType.CHARGE_GUN_DISCONNECTED to mapOf(TelegramTemplateLanguage.UK to CHARGE_GUN_DISCONNECTED_UK, TelegramTemplateLanguage.EN to CHARGE_GUN_DISCONNECTED_EN),
+        TelegramEventType.LOW_12V_VOLTAGE to mapOf(TelegramTemplateLanguage.UK to LOW_12V_VOLTAGE_UK, TelegramTemplateLanguage.EN to LOW_12V_VOLTAGE_EN),
+        TelegramEventType.TELEMETRY_UNAVAILABLE to mapOf(TelegramTemplateLanguage.UK to TELEMETRY_UNAVAILABLE_UK, TelegramTemplateLanguage.EN to TELEMETRY_UNAVAILABLE_EN),
+        TelegramEventType.TRIP_SUMMARY to mapOf(TelegramTemplateLanguage.UK to TRIP_SUMMARY_UK, TelegramTemplateLanguage.EN to TRIP_SUMMARY_EN)
+    )
+
+    private val historic = mapOf(
+        TelegramEventType.CHARGING_STARTED to mapOf(
+            TelegramTemplateLanguage.EN to setOf("Charging started at {soc}% ({battery_power_kw} kW) at {time}.")
+        ),
+        TelegramEventType.CHARGING_PROGRESS to mapOf(
+            TelegramTemplateLanguage.UK to setOf(
+                "Заряд: {soc}%\nДодано: {charge_added_percent}% / {charge_added_kwh} кВт·год",
+                "Заряд: {soc}%\nЗа крок: +{charge_step_added_percent}% / +{charge_step_added_kwh} кВт·год\nЗа сесію: +{charge_added_percent}% / +{charge_added_kwh} кВт·год"
+            ),
+            TelegramTemplateLanguage.EN to setOf(
+                "Charge: {soc}%\nAdded: {charge_added_percent}% / {charge_added_kwh} kWh",
+                "Charging progress: {soc}% (+{charge_added_percent}%, {charge_added_kwh} kWh), {battery_power_kw} kW.",
+                "Charge: {soc}%\nThis step: +{charge_step_added_percent}% / +{charge_step_added_kwh} kWh\nSession total: +{charge_added_percent}% / +{charge_added_kwh} kWh"
+            )
+        ),
+        TelegramEventType.TRIP_SUMMARY to mapOf(
+            TelegramTemplateLanguage.UK to setOf(
+                "Поїздку завершено\nВідстань: {trip_distance_km} км за {trip_duration}\nSOC: {soc_start}% -> {soc_end}%\nЕнергія: {trip_energy_kwh} кВт·год",
+                "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\nВитрата: {trip_energy_kwh} кВт·год, SOC: {soc_start}% -> {soc_end}%\nЗагалом: {total_distance_km} км / {total_duration}\nВитрата: {total_energy_kwh} кВт·год"
+            ),
+            TelegramTemplateLanguage.EN to setOf(
+                "Trip complete\nDistance: {trip_distance_km} km in {trip_duration}\nSOC: {soc_start}% -> {soc_end}%\nEnergy: {trip_energy_kwh} kWh",
+                "Trip complete: {trip_distance_km} km, {trip_energy_kwh} kWh at {time}.",
+                "Trip complete\nCurrent trip: {trip_distance_km} km / {trip_duration}\nEnergy used: {trip_energy_kwh} kWh, SOC: {soc_start}% -> {soc_end}%\nTotal: {total_distance_km} km / {total_duration}\nEnergy used: {total_energy_kwh} kWh"
+            )
+        ),
+        TelegramEventType.CHARGED_TO_100 to mapOf(
+            TelegramTemplateLanguage.EN to setOf(
+                "Charging complete: {soc}%, {remaining_energy_kwh} kWh remaining, range {range_km} km at {time}."
+            )
+        ),
+        TelegramEventType.CHARGING_STOPPED to mapOf(
+            TelegramTemplateLanguage.EN to setOf(
+                "Charging stopped at {soc}% after {charge_duration}; added {charge_added_percent}% / {charge_added_kwh} kWh at {time}."
+            )
+        ),
+        TelegramEventType.CHARGE_GUN_CONNECTED to mapOf(
+            TelegramTemplateLanguage.EN to setOf("Charge gun connected at {soc}% at {time}.")
+        ),
+        TelegramEventType.CHARGE_GUN_DISCONNECTED to mapOf(
+            TelegramTemplateLanguage.EN to setOf("Charge gun disconnected at {soc}% at {time}.")
+        ),
+        TelegramEventType.LOW_12V_VOLTAGE to mapOf(
+            TelegramTemplateLanguage.EN to setOf("Low 12 V battery voltage: {battery_12v} V at {time}.")
+        ),
+        TelegramEventType.TELEMETRY_UNAVAILABLE to mapOf(
+            TelegramTemplateLanguage.EN to setOf("Telemetry unavailable since {last_data_time}: {error} ({time}).")
+        )
+    )
+
+    fun defaultTemplate(type: TelegramEventType, language: TelegramTemplateLanguage): String =
+        current.getValue(type).getValue(language)
+
+    fun classify(type: TelegramEventType, template: String): TelegramBuiltInTemplateMatch? {
+        val normalized = normalizeForBuiltInMatch(template)
+        current[type]?.entries?.firstOrNull { normalizeForBuiltInMatch(it.value) == normalized }?.let {
+            return TelegramBuiltInTemplateMatch(it.key, historic = false)
+        }
+        historic[type]?.entries?.firstNotNullOfOrNull { (language, values) ->
+            values.firstOrNull { normalizeForBuiltInMatch(it) == normalized }?.let {
+                TelegramBuiltInTemplateMatch(language, historic = true)
+            }
+        }?.let { return it }
+        return null
+    }
+
+    fun isKnownBuiltIn(eventKey: String, template: String): Boolean =
+        TelegramEventType.fromKey(eventKey)?.let { classify(it, template) != null } == true
+
+    fun isKnownBuiltIn(event: TelegramEventType, template: String): Boolean =
+        classify(event, template) != null
+
+    fun isCurrentBuiltIn(eventKey: String, template: String): Boolean =
+        TelegramEventType.fromKey(eventKey)?.let { classify(it, template)?.historic == false } == true
+
+    fun isCurrentBuiltIn(event: TelegramEventType, template: String): Boolean =
+        classify(event, template)?.historic == false
+
+    fun isHistoricBuiltIn(eventKey: String, template: String): Boolean =
+        TelegramEventType.fromKey(eventKey)?.let { classify(it, template)?.historic == true } == true
+
+    fun isHistoricBuiltIn(event: TelegramEventType, template: String): Boolean =
+        classify(event, template)?.historic == true
+
+    fun classifyKnownSaved(eventKey: String, template: String): TelegramBuiltInTemplateMatch? =
+        TelegramEventType.fromKey(eventKey)?.let { classify(it, template) }
+
+    fun classifySaved(event: TelegramEventType, template: String): TelegramBuiltInTemplateMatch? =
+        classify(event, template)
 
     fun migrateKnownSaved(eventKey: String, template: String): String {
-        val normalized = normalizeForBuiltInMatch(template)
-        return when (eventKey) {
-            TelegramEventType.CHARGING_PROGRESS.key -> when {
-                normalized == normalizeForBuiltInMatch(OLD_CHARGING_PROGRESS_UK) -> CHARGING_PROGRESS_UK
-                normalized == normalizeForBuiltInMatch(OLD_CHARGING_PROGRESS_EN) ||
-                    normalized == normalizeForBuiltInMatch(OLD_CHARGING_PROGRESS_RUNTIME) -> CHARGING_PROGRESS_EN
-                else -> template
-            }
-            TelegramEventType.TRIP_SUMMARY.key -> when {
-                normalized == normalizeForBuiltInMatch(OLD_TRIP_SUMMARY_UK) -> TRIP_SUMMARY_UK
-                normalized == normalizeForBuiltInMatch(OLD_TRIP_SUMMARY_EN) ||
-                    normalized == normalizeForBuiltInMatch(OLD_TRIP_SUMMARY_RUNTIME) -> TRIP_SUMMARY_EN
-                else -> template
-            }
-            else -> template
-        }
+        val type = TelegramEventType.fromKey(eventKey) ?: return template
+        val match = classify(type, template) ?: return template
+        return if (match.historic) defaultTemplate(type, match.language) else template
     }
 
     private fun normalizeForBuiltInMatch(template: String): String =
         template.replace("\r\n", "\n").split('\n').joinToString("\n") { it.trimEnd() }.trimEnd()
 
-    private const val OLD_CHARGING_PROGRESS_UK =
-        "Заряд: {soc}%\nДодано: {charge_added_percent}% / {charge_added_kwh} кВт·год"
-    private const val OLD_CHARGING_PROGRESS_EN =
-        "Charge: {soc}%\nAdded: {charge_added_percent}% / {charge_added_kwh} kWh"
-    private const val OLD_CHARGING_PROGRESS_RUNTIME =
-        "Charging progress: {soc}% (+{charge_added_percent}%, {charge_added_kwh} kWh), {battery_power_kw} kW."
-    private const val OLD_TRIP_SUMMARY_UK =
-        "Поїздку завершено\nВідстань: {trip_distance_km} км за {trip_duration}\nSOC: {soc_start}% -> {soc_end}%\nЕнергія: {trip_energy_kwh} кВт·год"
-    private const val OLD_TRIP_SUMMARY_EN =
-        "Trip complete\nDistance: {trip_distance_km} km in {trip_duration}\nSOC: {soc_start}% -> {soc_end}%\nEnergy: {trip_energy_kwh} kWh"
-    private const val OLD_TRIP_SUMMARY_RUNTIME =
-        "Trip complete: {trip_distance_km} km, {trip_energy_kwh} kWh at {time}."
 }
 
 object TelegramTemplateCatalog {
     private val specs = mapOf(
         TelegramEventType.CHARGING_STARTED to TelegramTemplateSpec(
-            "Charging started at {soc}% ({battery_power_kw} kW) at {time}.",
+            TelegramBuiltInTemplates.CHARGING_STARTED_EN,
             setOf("soc", "battery_power_kw", "time")
         ),
         TelegramEventType.CHARGING_PROGRESS to TelegramTemplateSpec(
@@ -81,33 +182,35 @@ object TelegramTemplateCatalog {
                 "soc",
                 "charge_step_added_percent",
                 "charge_step_added_kwh",
+                "charge_step_duration",
                 "charge_added_percent",
                 "charge_added_kwh",
+                "charge_duration",
                 "battery_power_kw"
             )
         ),
         TelegramEventType.CHARGED_TO_100 to TelegramTemplateSpec(
-            "Charging complete: {soc}%, {remaining_energy_kwh} kWh remaining, range {range_km} km at {time}.",
+            TelegramBuiltInTemplates.CHARGED_TO_100_EN,
             setOf("soc", "remaining_energy_kwh", "range_km", "time")
         ),
         TelegramEventType.CHARGING_STOPPED to TelegramTemplateSpec(
-            "Charging stopped at {soc}% after {charge_duration}; added {charge_added_percent}% / {charge_added_kwh} kWh at {time}.",
+            TelegramBuiltInTemplates.CHARGING_STOPPED_EN,
             setOf("soc", "charge_duration", "charge_added_percent", "charge_added_kwh", "time")
         ),
         TelegramEventType.CHARGE_GUN_CONNECTED to TelegramTemplateSpec(
-            "Charge gun connected at {soc}% at {time}.",
+            TelegramBuiltInTemplates.CHARGE_GUN_CONNECTED_EN,
             setOf("soc", "time")
         ),
         TelegramEventType.CHARGE_GUN_DISCONNECTED to TelegramTemplateSpec(
-            "Charge gun disconnected at {soc}% at {time}.",
+            TelegramBuiltInTemplates.CHARGE_GUN_DISCONNECTED_EN,
             setOf("soc", "time")
         ),
         TelegramEventType.LOW_12V_VOLTAGE to TelegramTemplateSpec(
-            "Low 12 V battery voltage: {battery_12v} V at {time}.",
+            TelegramBuiltInTemplates.LOW_12V_VOLTAGE_EN,
             setOf("battery_12v", "time")
         ),
         TelegramEventType.TELEMETRY_UNAVAILABLE to TelegramTemplateSpec(
-            "Telemetry unavailable since {last_data_time}: {error} ({time}).",
+            TelegramBuiltInTemplates.TELEMETRY_UNAVAILABLE_EN,
             setOf("last_data_time", "error", "time")
         ),
         TelegramEventType.TRIP_SUMMARY to TelegramTemplateSpec(
@@ -129,6 +232,17 @@ object TelegramTemplateCatalog {
     val events: Set<TelegramEventType> = specs.keys
 
     fun spec(event: TelegramEventType): TelegramTemplateSpec = specs.getValue(event)
+
+    fun defaultTemplate(event: TelegramEventType, language: TelegramTemplateLanguage): String =
+        TelegramBuiltInTemplates.defaultTemplate(event, language)
+
+    fun defaultTemplate(event: TelegramEventType): String = spec(event).defaultTemplate
+
+    fun isKnownBuiltIn(eventKey: String, template: String): Boolean =
+        TelegramBuiltInTemplates.isKnownBuiltIn(eventKey, template)
+
+    fun isKnownBuiltIn(event: TelegramEventType, template: String): Boolean =
+        TelegramBuiltInTemplates.isKnownBuiltIn(event, template)
 }
 
 sealed interface TelegramTemplateToken {

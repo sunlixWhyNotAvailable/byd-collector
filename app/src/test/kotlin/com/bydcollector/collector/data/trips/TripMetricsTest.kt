@@ -43,4 +43,25 @@ class TripMetricsTest {
         assertNull(gap.latitude)
         assertNull(gap.longitude)
     }
+
+    @Test
+    fun untrustedPointRetainsRawCoordinatesAndQuality() {
+        val point = TripMetrics.untrustedPoint("trip", 1L, sample(), "mock_source")
+        assertEquals(RoutePoint.KIND_UNTRUSTED, point.kind)
+        assertEquals(50.0, point.latitude)
+        assertEquals("untrusted:mock_source", point.quality)
+    }
+
+    @Test
+    fun invalidUntrustedCoordinateFallsBackToDiagnosticGap() {
+        val point = TripMetrics.untrustedPoint("trip", 2L, sample(latitude = 100.0), "invalid_numeric")
+        assertEquals(RoutePoint.KIND_GAP, point.kind)
+        assertNull(point.latitude)
+        assertNull(point.longitude)
+        assertEquals("untrusted:invalid_numeric", point.quality)
+    }
+
+    private fun sample(latitude: Double = 50.0) = com.bydcollector.collector.location.GpsLocationSample(
+        "2026-08-20T12:00:00Z", 1_000L, 1_000_000_000L, "boot", "segment", latitude, 30.0, 5.0, 10.0, null, null
+    )
 }

@@ -137,6 +137,24 @@ class TelegramRuntimeContractTest {
         assertFalse(client.contains("TelegramRequestEvidence"))
     }
 
+    @Test
+    fun runtimeUsesAppLanguageAndSanitizedNavigatorSelection() {
+        val coordinator = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
+        val engine = sourceFile("com/bydcollector/collector/service/TelegramEventEngine.kt").readText()
+        val mask = sourceFile("com/bydcollector/collector/telegram/TelegramNavigatorMask.kt").readText()
+
+        assertTrue(coordinator.contains("settings.uiLanguageCode()"))
+        assertTrue(coordinator.contains("settings.telegramNavigatorMask()"))
+        assertTrue(coordinator.contains("savedTemplate ?: TelegramTemplateCatalog.defaultTemplate"))
+        assertFalse(coordinator.contains("TelegramBuiltInTemplates.isKnownBuiltIn"))
+        assertTrue(engine.contains("charge_step_duration"))
+        assertTrue(engine.contains("config.navigatorMask"))
+        assertInOrder(engine, "TelegramNavigatorMask.GOOGLE", "TelegramNavigatorMask.WAZE")
+        assertInOrder(engine, "TelegramNavigatorMask.WAZE", "TelegramNavigatorMask.APPLE")
+        assertInOrder(engine, "TelegramNavigatorMask.APPLE", "TelegramNavigatorMask.OSM")
+        assertTrue(mask.contains("const val ALL = 15"))
+    }
+
     private fun sourceFile(path: String): File {
         return listOf(
             File("src/main/kotlin/$path"),

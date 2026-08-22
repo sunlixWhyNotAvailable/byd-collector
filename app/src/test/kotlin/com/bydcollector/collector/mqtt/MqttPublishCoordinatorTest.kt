@@ -59,12 +59,27 @@ class MqttPublishCoordinatorTest {
         )
         val result = HaMqttMessageFactory(
             normalizedProvider = provider,
-            configProvider = { config(enabledCategories = emptySet(), locationEnabled = true) },
+            configProvider = { config(enabledCategories = setOf("location")) },
             clock = FakeClock()
         ).fullResyncMessages() as MqttMessageBuildResult.Success
 
         assertEquals(setOf("location"), provider.requestedCategories.single())
         assertTrue(result.messages.any { it.topic == "bydcollector/state/location" })
+    }
+
+    @Test
+    fun locationCategoryOffSuppressesCoordinates() {
+        val provider = MutableNormalizedProvider(
+            listOf(storedState("location_latitude", "location", valueNumber = 50.0))
+        )
+        val result = HaMqttMessageFactory(
+            normalizedProvider = provider,
+            configProvider = { config(enabledCategories = emptySet()) },
+            clock = FakeClock()
+        ).fullResyncMessages() as MqttMessageBuildResult.Success
+
+        assertEquals(emptySet(), provider.requestedCategories.single())
+        assertFalse(result.messages.any { it.topic == "bydcollector/state/location" })
     }
 
     @Test
@@ -529,8 +544,7 @@ class MqttPublishCoordinatorTest {
     private fun config(
         enabled: Boolean = true,
         discoveryEnabled: Boolean = true,
-        enabledCategories: Set<String> = HaMqttConfig.DEFAULT_CATEGORIES,
-        locationEnabled: Boolean = false
+        enabledCategories: Set<String> = HaMqttConfig.DEFAULT_CATEGORIES
     ): HaMqttConfig {
         return HaMqttConfig(
             enabled = enabled,
@@ -542,8 +556,7 @@ class MqttPublishCoordinatorTest {
             clientId = HaMqttConfig.DEFAULT_CLIENT_ID,
             topicPrefix = HaMqttConfig.DEFAULT_TOPIC_PREFIX,
             discoveryPrefix = HaMqttConfig.DEFAULT_DISCOVERY_PREFIX,
-            enabledCategories = enabledCategories,
-            locationEnabled = locationEnabled
+            enabledCategories = enabledCategories
         )
     }
 

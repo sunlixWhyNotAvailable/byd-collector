@@ -6,9 +6,11 @@ import android.content.pm.PackageManager
 import android.location.LocationListener
 import android.location.LocationManager
 import android.os.Looper
+import java.time.Instant
 
 interface GpsLocationSink {
     fun onLocation(sample: GpsLocationSample, isFinal: Boolean = false)
+    fun onUntrusted(sample: GpsLocationSample, reason: String) = Unit
     fun onGap(reason: String, observedAt: String)
 }
 
@@ -24,12 +26,14 @@ class AndroidGpsLocationSource(
     private val appContext = context.applicationContext
     private val locationManager = appContext.getSystemService(LocationManager::class.java)
     private val gate = GpsSampleGate()
+    private val trustGate = GpsTrustGate()
     private val listener = LocationListener { location ->
         val sample = GpsLocationSample.fromLocation(location, bootIdProvider(), segmentIdProvider(), wallClockMs()) ?: return@LocationListener
-        gate.offer(sample)?.let { sink.onLocation(it) }
+        gate.offer(sample)?.let(::emit)
     }
 
     fun start(): Boolean {
+        trustGate.beginRecovery()
         if (appContext.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED && appContext.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) return false
         if (!locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
             sink.onGap("gps_provider_disabled", java.time.Instant.ofEpochMilli(wallClockMs()).toString())
@@ -46,6 +50,16 @@ class AndroidGpsLocationSource(
 
     fun stop(markFinal: Boolean = false) {
         runCatching { locationManager.removeUpdates(listener) }
-        gate.flushFinal()?.let { sink.onLocation(it, isFinal = markFinal) }
+        gate.flushFinal()?.let { emit(it, markFinal) }
+    }
+
+    private fun emit(sample: GpsLocationSample, isFinal: Boolean = false) {
+        val decision = trustGate.offer(sample)
+        if (decision.callbackGap) {
+            val receivedAt = runCatching { Instant.ofEpochMilli(sample.receiveWallTimeMs).toString() }.getOrElse { sample.observedAt }
+            sink.onGap("gps_callback_gap", receivedAt)
+        }
+        if (decision.trusted) sink.onLocation(sample, isFinal)
+        else sink.onUntrusted(sample, decision.reason ?: "untrusted")
     }
 }

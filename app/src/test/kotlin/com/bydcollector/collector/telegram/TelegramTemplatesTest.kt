@@ -27,10 +27,19 @@ class TelegramTemplatesTest {
         assertTrue("total_distance_km" in trip.allowedVariables)
         assertTrue("total_energy_kwh" in trip.allowedVariables)
         assertTrue("total_duration" in trip.allowedVariables)
+        assertTrue("charge_step_duration" in progress.allowedVariables)
+        assertEquals(
+            TelegramBuiltInTemplates.CHARGING_PROGRESS_UK,
+            TelegramTemplateCatalog.defaultTemplate(TelegramEventType.CHARGING_PROGRESS, TelegramTemplateLanguage.UK)
+        )
+        assertEquals(
+            TelegramBuiltInTemplates.TRIP_SUMMARY_EN,
+            TelegramTemplateCatalog.defaultTemplate(TelegramEventType.TRIP_SUMMARY, TelegramTemplateLanguage.EN)
+        )
     }
 
     @Test
-    fun onlyKnownOldBuiltInsMigrate() {
+    fun knownHistoricBuiltInsMigrate() {
         assertEquals(
             TelegramBuiltInTemplates.CHARGING_PROGRESS_UK,
             TelegramBuiltInTemplates.migrateKnownSaved(
@@ -38,22 +47,15 @@ class TelegramTemplatesTest {
                 "Заряд: {soc}%\nДодано: {charge_added_percent}% / {charge_added_kwh} кВт·год"
             )
         )
+        val legacyTrip = "Trip complete: {trip_distance_km} km, {trip_energy_kwh} kWh at {time}."
         assertEquals(
             TelegramBuiltInTemplates.TRIP_SUMMARY_EN,
-            TelegramBuiltInTemplates.migrateKnownSaved(
-                TelegramEventType.TRIP_SUMMARY.key,
-                "Trip complete: {trip_distance_km} km, {trip_energy_kwh} kWh at {time}."
-            )
-        )
-        val custom = "Custom {trip_distance_km}"
-        assertEquals(
-            custom,
-            TelegramBuiltInTemplates.migrateKnownSaved(TelegramEventType.TRIP_SUMMARY.key, custom)
+            TelegramBuiltInTemplates.migrateKnownSaved(TelegramEventType.TRIP_SUMMARY.key, legacyTrip)
         )
     }
 
     @Test
-    fun historicalTripBuiltInsMigrateAfterLineEndingAndTrailingWhitespaceNormalization() {
+    fun approvedTripBuiltInsRenderExactUkrainianAndEnglishOutput() {
         val values = mapOf(
             "trip_distance_km" to "12.3",
             "trip_duration" to "00:24:18",
@@ -64,31 +66,25 @@ class TelegramTemplatesTest {
             "total_duration" to "12:34:56",
             "total_energy_kwh" to "98.7"
         )
-        val oldUk = "Поїздку завершено\r\nВідстань: {trip_distance_km} км за {trip_duration}   \r\n" +
-            "SOC: {soc_start}% -> {soc_end}%\r\nЕнергія: {trip_energy_kwh} кВт·год  \r\n"
-        val oldEn = "Trip complete\r\nDistance: {trip_distance_km} km in {trip_duration}   \r\n" +
-            "SOC: {soc_start}% -> {soc_end}%\r\nEnergy: {trip_energy_kwh} kWh  \r\n"
-
-        val migratedUk = TelegramBuiltInTemplates.migrateKnownSaved(
-            TelegramEventType.TRIP_SUMMARY.key,
-            oldUk
-        )
-        val migratedEn = TelegramBuiltInTemplates.migrateKnownSaved(
-            TelegramEventType.TRIP_SUMMARY.key,
-            oldEn
-        )
-
         assertEquals(
             "Поїздку завершено\nПоточна поїздка: 12.3 км / 00:24:18\n" +
                 "Витрата: 3.4 кВт·год, SOC: 81% -> 76%\n" +
-                "Загалом: 456.7 км / 12:34:56\nВитрата: 98.7 кВт·год",
-            TelegramTemplateRenderer.render(TelegramEventType.TRIP_SUMMARY, migratedUk, values).text
+                "Загалом: 456.7 км / 12:34:56\nВитрата: 98.7 кВт·год, SOC: 81% -> 76%",
+            TelegramTemplateRenderer.render(
+                TelegramEventType.TRIP_SUMMARY,
+                TelegramBuiltInTemplates.TRIP_SUMMARY_UK,
+                values
+            ).text
         )
         assertEquals(
             "Trip complete\nCurrent trip: 12.3 km / 00:24:18\n" +
                 "Energy used: 3.4 kWh, SOC: 81% -> 76%\n" +
-                "Total: 456.7 km / 12:34:56\nEnergy used: 98.7 kWh",
-            TelegramTemplateRenderer.render(TelegramEventType.TRIP_SUMMARY, migratedEn, values).text
+                "Total: 456.7 km / 12:34:56\nEnergy used: 98.7 kWh, SOC: 81% -> 76%",
+            TelegramTemplateRenderer.render(
+                TelegramEventType.TRIP_SUMMARY,
+                TelegramBuiltInTemplates.TRIP_SUMMARY_EN,
+                values
+            ).text
         )
     }
 
@@ -100,6 +96,15 @@ class TelegramTemplatesTest {
             custom,
             TelegramBuiltInTemplates.migrateKnownSaved(TelegramEventType.TRIP_SUMMARY.key, custom)
         )
+    }
+
+    @Test
+    fun currentAndHistoricBuiltInsAreRecognizedWithoutMatchingCustomText() {
+        val type = TelegramEventType.TRIP_SUMMARY
+        assertTrue(TelegramBuiltInTemplates.isKnownBuiltIn(type, TelegramBuiltInTemplates.TRIP_SUMMARY_UK))
+        assertTrue(TelegramBuiltInTemplates.isCurrentBuiltIn(type.key, TelegramBuiltInTemplates.TRIP_SUMMARY_EN))
+        assertTrue(TelegramBuiltInTemplates.isHistoricBuiltIn(type.key, "Trip complete: {trip_distance_km} km, {trip_energy_kwh} kWh at {time}."))
+        assertFalse(TelegramBuiltInTemplates.isKnownBuiltIn(type.key, "Trip complete {trip_distance_km}"))
     }
 
     @Test

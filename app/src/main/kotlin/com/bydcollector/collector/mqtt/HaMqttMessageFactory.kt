@@ -23,12 +23,11 @@ class HaMqttMessageFactory(
     fun fullResyncMessages(): MqttMessageBuildResult {
         val config = configProvider()
         return runCatching {
-            val categories = config.effectiveCategories()
             //filters at publish time so changing categories does not require rewriting normalized storage
-            val rows = HaMqttFieldFilter.publishableRows(normalizedProvider.currentState(categories), config)
+            val rows = HaMqttFieldFilter.publishableRows(normalizedProvider.currentState(config.enabledCategories), config)
             buildList {
                 add(onlineStatusMessage(config, rows))
-                addAll(categoryStateMessages(config, rows, categories))
+                addAll(categoryStateMessages(config, rows, config.enabledCategories))
             }
         }.fold(
             onSuccess = { MqttMessageBuildResult.Success(it) },
@@ -42,7 +41,7 @@ class HaMqttMessageFactory(
 
     fun changedCategoryMessages(categories: Set<String>): MqttMessageBuildResult {
         val config = configProvider()
-        val enabledChanged = categories.intersect(config.effectiveCategories())
+        val enabledChanged = categories.intersect(config.enabledCategories)
         //skips disabled categories even if their normalized values changed in sqlite
         if (enabledChanged.isEmpty()) return MqttMessageBuildResult.Success(emptyList())
 
@@ -124,6 +123,4 @@ class HaMqttMessageFactory(
         )
     }
 
-    private fun HaMqttConfig.effectiveCategories(): Set<String> =
-        if (locationEnabled) enabledCategories + "location" else enabledCategories
 }

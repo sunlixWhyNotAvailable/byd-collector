@@ -3,6 +3,8 @@ package com.bydcollector.collector.service
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.data.normalized.NormalizedQuality
 import com.bydcollector.collector.telegram.TelegramEventType
+import com.bydcollector.collector.telegram.TelegramNavigatorMask
+import com.bydcollector.collector.telegram.TelegramTemplateLanguage
 import org.json.JSONObject
 import java.util.UUID
 import kotlin.math.abs
@@ -15,17 +17,20 @@ data class TelegramEventConfig(
     val lowVoltageThreshold: Double,
     val unavailableDelayMs: Long,
     val tripEndDelayMs: Long,
-    val sendLocation: Boolean = false
+    val sendLocation: Boolean = false,
+    val language: TelegramTemplateLanguage = TelegramTemplateLanguage.UK,
+    val navigatorMask: Int = TelegramNavigatorMask.ALL
 )
 
 data class TelegramLocationSnapshot(
     val latitude: Double,
     val longitude: Double,
     val capturedAt: String,
-    val age: String,
+    val ageSeconds: Long,
     val osmUrl: String,
     val googleUrl: String,
-    val appleUrl: String
+    val appleUrl: String,
+    val wazeUrl: String = ""
 )
 
 data class TelegramPowerOffSnapshot(
@@ -70,6 +75,7 @@ data class TelegramEventState(
     val chargingStartEnergyKwh: Double? = null,
     val chargingProgressBaselineSoc: Double? = null,
     val chargingProgressBaselineEnergyKwh: Double? = null,
+    val chargingStepStartedAtMs: Long? = null,
     val lastProgressThreshold: Int? = null,
     val fullCandidateCount: Int = 0,
     val fullSent: Boolean = false,
@@ -133,6 +139,7 @@ data class TelegramEventState(
         putNullable("chargingStartEnergyKwh", chargingStartEnergyKwh)
         putNullable("chargingProgressBaselineSoc", chargingProgressBaselineSoc)
         putNullable("chargingProgressBaselineEnergyKwh", chargingProgressBaselineEnergyKwh)
+        putNullable("chargingStepStartedAtMs", chargingStepStartedAtMs)
         putNullable("lastProgressThreshold", lastProgressThreshold)
         put("fullCandidateCount", fullCandidateCount)
         put("fullSent", fullSent)
@@ -187,6 +194,9 @@ data class TelegramEventState(
                     chargingStartEnergyKwh = json.optDoubleOrNull("chargingStartEnergyKwh"),
                     chargingProgressBaselineSoc = json.optDoubleOrNull("chargingProgressBaselineSoc"),
                     chargingProgressBaselineEnergyKwh = json.optDoubleOrNull("chargingProgressBaselineEnergyKwh"),
+                    chargingStepStartedAtMs = json.optLongOrNull("chargingStepStartedAtMs")
+                        ?: json.optLongOrNull("chargingProgressStartedAtMs")
+                        ?: json.optLongOrNull("chargingStartedAtMs"),
                     lastProgressThreshold = json.optIntOrNull("lastProgressThreshold"),
                     fullCandidateCount = json.optInt("fullCandidateCount"),
                     fullSent = json.optBoolean("fullSent"),
@@ -399,7 +409,9 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
                     "total_duration" to formatDuration(totalDurationMs),
                     "time" to formatTime(nowMs)
                 ),
-                textSuffix = location.takeIf { config.sendLocation }?.let(::formatLocation)
+                textSuffix = location.takeIf { config.sendLocation }?.let {
+                    formatLocation(it, config.language, config.navigatorMask)
+                }
             )
         }
         clearTrip()
@@ -491,7 +503,7 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
                 addIfEnabled(
                     events, config, TelegramEventType.CHARGING_STARTED,
                     "${state.chargingSessionId}:started",
-                    chargingVariables(nowMs, soc, remainingEnergy, batteryChargePower)
+                    chargingVariables(nowMs, soc, remainingEnergy, batteryChargePower, config.language)
                 )
             }
             return false
@@ -589,12 +601,12 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
                 if (TelegramEventType.CHARGED_TO_100 in config.enabledEvents) {
                     addIfEnabled(
                         events, config, TelegramEventType.CHARGED_TO_100, "$sessionId:full",
-                        chargingVariables(nowMs, soc, remainingEnergy, batteryChargePower) +
+                        chargingVariables(nowMs, soc, remainingEnergy, batteryChargePower, config.language) +
                             mapOf("remaining_energy_kwh" to formatNumber(remainingEnergy), "range_km" to formatNumber(range))
                     )
                 } else {
-                    val variables = chargingProgressVariables(nowMs, soc, remainingEnergy, batteryChargePower)
-                    advanceChargingProgressBaseline(soc, remainingEnergy)
+                    val variables = chargingProgressVariables(nowMs, soc, remainingEnergy, batteryChargePower, config.language)
+                    advanceChargingProgressBaseline(nowMs, soc, remainingEnergy)
                     addIfEnabled(
                         events, config, TelegramEventType.CHARGING_PROGRESS, "$sessionId:progress:100",
                         variables
@@ -610,8 +622,8 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         val previousThreshold = state.lastProgressThreshold ?: return
         if (threshold <= previousThreshold) return
         state = state.copy(lastProgressThreshold = threshold)
-        val variables = chargingProgressVariables(nowMs, soc, remainingEnergy, batteryChargePower)
-        advanceChargingProgressBaseline(soc, remainingEnergy)
+        val variables = chargingProgressVariables(nowMs, soc, remainingEnergy, batteryChargePower, config.language)
+        advanceChargingProgressBaseline(nowMs, soc, remainingEnergy)
         addIfEnabled(
             events, config, TelegramEventType.CHARGING_PROGRESS, "$sessionId:progress:$threshold",
             variables
@@ -675,7 +687,7 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         val sessionId = state.chargingSessionId ?: return
         addIfEnabled(
             events, config, TelegramEventType.CHARGING_STOPPED, "$sessionId:stopped",
-            chargingVariables(nowMs, soc, remainingEnergy, batteryChargePower)
+            chargingVariables(nowMs, soc, remainingEnergy, batteryChargePower, config.language)
         )
         finishChargingSession(full = false)
     }
@@ -688,6 +700,7 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
             chargingStartEnergyKwh = null,
             chargingProgressBaselineSoc = null,
             chargingProgressBaselineEnergyKwh = null,
+            chargingStepStartedAtMs = null,
             lastProgressThreshold = null,
             fullCandidateCount = 0,
             fullSent = full
@@ -800,6 +813,7 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
             chargingStartEnergyKwh = remainingEnergy?.takeIf { it.isFinite() && it >= 0.0 },
             chargingProgressBaselineSoc = soc?.takeIf { it.isFinite() && it >= 0.0 },
             chargingProgressBaselineEnergyKwh = remainingEnergy?.takeIf { it.isFinite() && it >= 0.0 },
+            chargingStepStartedAtMs = nowMs,
             lastProgressThreshold = soc?.let { (floor(it / step) * step).toInt() },
             fullCandidateCount = 0,
             fullSent = fullAlreadySent
@@ -827,7 +841,8 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         nowMs: Long,
         soc: Double?,
         remainingEnergy: Double?,
-        batteryPower: Double?
+        batteryPower: Double?,
+        language: TelegramTemplateLanguage
     ): Map<String, String> {
         val startSoc = state.chargingStartSoc
         val startEnergy = state.chargingStartEnergyKwh
@@ -838,7 +853,7 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
             "battery_power_kw" to formatNumber(batteryPower),
             "charge_added_percent" to formatNumber(addedPercent),
             "charge_added_kwh" to formatNumber(addedEnergy),
-            "charge_duration" to formatDuration(nowMs - (state.chargingStartedAtMs ?: nowMs)),
+            "charge_duration" to formatChargeDuration(nowMs - (state.chargingStartedAtMs ?: nowMs), language),
             "time" to formatTime(nowMs)
         )
     }
@@ -847,22 +862,28 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         nowMs: Long,
         soc: Double?,
         remainingEnergy: Double?,
-        batteryPower: Double?
+        batteryPower: Double?,
+        language: TelegramTemplateLanguage
     ): Map<String, String> {
-        return chargingVariables(nowMs, soc, remainingEnergy, batteryPower) + mapOf(
+        return chargingVariables(nowMs, soc, remainingEnergy, batteryPower, language) + mapOf(
             "charge_step_added_percent" to formatNumber(
                 nonNegativeDelta(soc, state.chargingProgressBaselineSoc)
             ),
             "charge_step_added_kwh" to formatNumber(
                 nonNegativeDelta(remainingEnergy, state.chargingProgressBaselineEnergyKwh)
+            ),
+            "charge_step_duration" to formatChargeDuration(
+                nowMs - (state.chargingStepStartedAtMs ?: state.chargingStartedAtMs ?: nowMs),
+                language
             )
         )
     }
 
-    private fun advanceChargingProgressBaseline(soc: Double?, remainingEnergy: Double?) {
+    private fun advanceChargingProgressBaseline(nowMs: Long, soc: Double?, remainingEnergy: Double?) {
         state = state.copy(
             chargingProgressBaselineSoc = soc?.takeIf { it.isFinite() && it >= 0.0 },
-            chargingProgressBaselineEnergyKwh = remainingEnergy?.takeIf { it.isFinite() && it >= 0.0 }
+            chargingProgressBaselineEnergyKwh = remainingEnergy?.takeIf { it.isFinite() && it >= 0.0 },
+            chargingStepStartedAtMs = nowMs
         )
     }
 
@@ -1025,11 +1046,51 @@ private fun formatDuration(durationMs: Long): String {
     return "%d:%02d".format(totalMinutes / 60L, totalMinutes % 60L)
 }
 
+private fun formatChargeDuration(durationMs: Long, language: TelegramTemplateLanguage): String {
+    val totalMinutes = durationMs.coerceAtLeast(0L) / 60_000L
+    val hours = totalMinutes / 60L
+    val minutes = totalMinutes % 60L
+    return when (language) {
+        TelegramTemplateLanguage.UK -> buildString {
+            if (hours > 0L) append("${hours}год")
+            if (hours > 0L && minutes > 0L) append(' ')
+            if (minutes > 0L || hours == 0L) append("${minutes}хв")
+        }
+        TelegramTemplateLanguage.EN -> buildString {
+            if (hours > 0L) append("${hours}h")
+            if (hours > 0L && minutes > 0L) append(' ')
+            if (minutes > 0L || hours == 0L) append("${minutes}m")
+        }
+    }
+}
+
 private fun formatTime(timeMs: Long): String {
     return java.text.SimpleDateFormat("dd.MM.yyyy HH:mm", java.util.Locale.getDefault()).format(java.util.Date(timeMs))
 }
 
-private fun formatLocation(location: TelegramLocationSnapshot): String =
-    "\nЛокація: ${location.latitude}, ${location.longitude}\n" +
-        "Зафіксовано: ${location.capturedAt} (вік ${location.age})\n" +
-        "OSM: ${location.osmUrl}\nGoogle: ${location.googleUrl}\nApple: ${location.appleUrl}"
+private fun formatLocation(
+    location: TelegramLocationSnapshot,
+    language: TelegramTemplateLanguage,
+    navigatorMask: Int
+): String {
+    val labels = if (language == TelegramTemplateLanguage.UK) {
+        "Локація" to "Зафіксовано"
+    } else {
+        "Location" to "Captured"
+    }
+    val links = buildList {
+        val mask = TelegramNavigatorMask.sanitize(navigatorMask)
+        if (mask and TelegramNavigatorMask.GOOGLE != 0) add("Google: ${location.googleUrl}")
+        if (mask and TelegramNavigatorMask.WAZE != 0) add("Waze: ${location.wazeUrl}")
+        if (mask and TelegramNavigatorMask.APPLE != 0) add("Apple: ${location.appleUrl}")
+        if (mask and TelegramNavigatorMask.OSM != 0) add("OSM: ${location.osmUrl}")
+    }
+    return buildString {
+        append("\n${labels.first}: ${location.latitude}, ${location.longitude}\n")
+        append("${labels.second}: ${location.capturedAt} (")
+        append(if (language == TelegramTemplateLanguage.UK) "вік" else "age")
+        append(" ${location.ageSeconds}")
+        append(if (language == TelegramTemplateLanguage.UK) "с)" else "s)")
+        links.forEach { append('\n').append(it) }
+    }
+}

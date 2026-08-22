@@ -1,9 +1,11 @@
 package com.bydcollector.collector.service
 
 import android.content.Context
+import android.content.SharedPreferences
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.telegram.TelegramBuiltInTemplates
 import com.bydcollector.collector.telegram.TelegramEventType
+import com.bydcollector.collector.telegram.TelegramNavigatorMask
 import com.bydcollector.collector.ha.HaIntegrationCategories
 import com.bydcollector.collector.influx.InfluxConfig
 import com.bydcollector.collector.keepalive.KeepAliveConfig
@@ -19,6 +21,7 @@ import com.bydcollector.collector.security.KeystoreSecretStore
 import com.bydcollector.collector.util.dispatchOperationalEvent
 import com.bydcollector.collector.util.sharedOperationalEventExecutor
 import java.util.concurrent.Executor
+import kotlin.math.round
 
 //persistent user settings facade that also records operational events for later diagnostics
 class CollectorSettings(
@@ -26,10 +29,17 @@ class CollectorSettings(
     private val store: TelemetryStore? = null,
     private val eventExecutor: Executor = sharedOperationalEventExecutor
 ) {
+    data class LegacyLocationMigration(
+        val mqttCategories: Set<String>,
+        val influxCategories: Set<String>,
+        val sharedCategories: Boolean
+    )
+
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val secretStore = KeystoreSecretStore(context)
 
     init {
+        migrateLegacyLocationCategories()
         migrateTripEndDelayToSeconds()
         migrateTelegramBuiltInTemplates()
         migrateLegacySecret(KEY_MQTT_USERNAME, SECRET_MQTT_USERNAME, KEY_MQTT_ENABLED)
@@ -158,8 +168,7 @@ class CollectorSettings(
             clientId = mqttClientId(),
             topicPrefix = mqttTopicPrefix(),
             discoveryPrefix = mqttDiscoveryPrefix(),
-            enabledCategories = mqttEnabledCategories(),
-            locationEnabled = isMqttLocationEnabled()
+            enabledCategories = mqttEnabledCategories()
         )
     }
 
@@ -259,12 +268,6 @@ class CollectorSettings(
         prefs.edit().putStringSet(KEY_MQTT_CATEGORIES, categories).apply()
     }
 
-    fun isMqttLocationEnabled(): Boolean = prefs.getBoolean(KEY_MQTT_LOCATION, false)
-
-    fun setMqttLocationEnabled(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_MQTT_LOCATION, enabled).apply()
-    }
-
     fun influxConfig(includeCredentials: Boolean = true): InfluxConfig {
         //shares category selection with mqtt by default so ha live state and history stay aligned
         return InfluxConfig(
@@ -275,8 +278,7 @@ class CollectorSettings(
             username = if (includeCredentials) influxUsername().takeIf { it.isNotBlank() } else null,
             password = if (includeCredentials) influxPassword().takeIf { it.isNotBlank() } else null,
             measurement = influxMeasurement(),
-            enabledCategories = effectiveInfluxCategories(),
-            locationEnabled = isInfluxLocationEnabled()
+            enabledCategories = effectiveInfluxCategories()
         )
     }
 
@@ -372,6 +374,14 @@ class CollectorSettings(
         prefs.edit().putBoolean(KEY_TELEGRAM_SEND_LOCATION, enabled).apply()
     }
 
+    fun telegramNavigatorMask(): Int = TelegramNavigatorMask.sanitize(
+        prefs.getInt(KEY_TELEGRAM_NAVIGATOR_MASK, TelegramNavigatorMask.ALL)
+    )
+
+    fun setTelegramNavigatorMask(mask: Int) {
+        prefs.edit().putInt(KEY_TELEGRAM_NAVIGATOR_MASK, TelegramNavigatorMask.sanitize(mask)).apply()
+    }
+
     fun isTripHistoryEnabled(): Boolean = prefs.getBoolean(KEY_TRIP_HISTORY, true)
 
     fun setTripHistoryEnabled(enabled: Boolean) {
@@ -413,6 +423,23 @@ class CollectorSettings(
         prefs.edit().putString("$KEY_TELEGRAM_TEMPLATE_PREFIX$eventKey", template).apply()
     }
 
+    fun clearTelegramTemplate(eventKey: String) {
+        prefs.edit().remove("$KEY_TELEGRAM_TEMPLATE_PREFIX$eventKey").apply()
+    }
+
+    fun uiLanguageCode(): String = when (prefs.getString(KEY_UI_LANGUAGE_CODE, DEFAULT_UI_LANGUAGE_CODE)
+        ?.trim()?.lowercase()) {
+        "en" -> "en"
+        else -> DEFAULT_UI_LANGUAGE_CODE
+    }
+
+    fun setUiLanguageCode(code: String) {
+        prefs.edit().putString(
+            KEY_UI_LANGUAGE_CODE,
+            if (code.trim().lowercase() == "en") "en" else DEFAULT_UI_LANGUAGE_CODE
+        ).apply()
+    }
+
     fun telegramChargeStepPercent(): Int {
         return prefs.getInt(KEY_TELEGRAM_CHARGE_STEP, DEFAULT_TELEGRAM_CHARGE_STEP)
             .coerceIn(MIN_TELEGRAM_CHARGE_STEP, MAX_TELEGRAM_CHARGE_STEP)
@@ -426,14 +453,14 @@ class CollectorSettings(
     }
 
     fun telegramLowVoltageThreshold(): Float {
-        return prefs.getFloat(KEY_TELEGRAM_LOW_VOLTAGE, DEFAULT_TELEGRAM_LOW_VOLTAGE)
+        return (round(prefs.getFloat(KEY_TELEGRAM_LOW_VOLTAGE, DEFAULT_TELEGRAM_LOW_VOLTAGE) * 10f) / 10f)
             .coerceIn(MIN_TELEGRAM_LOW_VOLTAGE, MAX_TELEGRAM_LOW_VOLTAGE)
     }
 
     fun setTelegramLowVoltageThreshold(value: Float) {
         prefs.edit().putFloat(
             KEY_TELEGRAM_LOW_VOLTAGE,
-            value.coerceIn(MIN_TELEGRAM_LOW_VOLTAGE, MAX_TELEGRAM_LOW_VOLTAGE)
+            (round(value * 10f) / 10f).coerceIn(MIN_TELEGRAM_LOW_VOLTAGE, MAX_TELEGRAM_LOW_VOLTAGE)
         ).apply()
     }
 
@@ -789,12 +816,6 @@ class CollectorSettings(
         prefs.edit().putStringSet(KEY_INFLUX_CATEGORIES, categories).apply()
     }
 
-    fun isInfluxLocationEnabled(): Boolean = prefs.getBoolean(KEY_INFLUX_LOCATION, false)
-
-    fun setInfluxLocationEnabled(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_INFLUX_LOCATION, enabled).apply()
-    }
-
     fun keepAliveConfig(): KeepAliveConfig {
         //groups radio/service recovery toggles for foreground-service reconciliation
         return KeepAliveConfig(
@@ -921,22 +942,68 @@ class CollectorSettings(
             .commit()
     }
 
-    private fun migrateTelegramBuiltInTemplates() {
-        val editor = prefs.edit()
-        var changed = false
-        listOf(TelegramEventType.CHARGING_PROGRESS, TelegramEventType.TRIP_SUMMARY).forEach { event ->
-            val key = "$KEY_TELEGRAM_TEMPLATE_PREFIX${event.key}"
-            val saved = runCatching { prefs.getString(key, null) }.getOrNull() ?: return@forEach
-            val migrated = TelegramBuiltInTemplates.migrateKnownSaved(event.key, saved)
-            if (migrated != saved) {
-                editor.putString(key, migrated)
-                changed = true
-            }
-        }
-        if (changed) editor.commit()
+    private fun migrateLegacyLocationCategories() {
+        val mqttLegacy = prefs.getBooleanOrNull(KEY_MQTT_LOCATION)
+        val influxLegacy = prefs.getBooleanOrNull(KEY_INFLUX_LOCATION)
+        if (mqttLegacy == null && influxLegacy == null) return
+
+        val migrated = migrateLegacyLocationCategories(
+            mqttCategories = mqttEnabledCategories(),
+            influxCategories = influxEnabledCategories(),
+            sharedCategories = isHaSharedCategoriesEnabled(),
+            mqttLocation = mqttLegacy,
+            influxLocation = influxLegacy
+        )
+        prefs.edit().apply {
+            putStringSet(KEY_MQTT_CATEGORIES, migrated.mqttCategories)
+            putStringSet(KEY_INFLUX_CATEGORIES, migrated.influxCategories)
+            putBoolean(KEY_HA_SHARED_CATEGORIES, migrated.sharedCategories)
+            remove(KEY_MQTT_LOCATION)
+            remove(KEY_INFLUX_LOCATION)
+        }.commit()
     }
 
+    private fun migrateTelegramBuiltInTemplates() = migrateTelegramBuiltInTemplates(prefs)
+
     companion object {
+        internal fun migrateTelegramBuiltInTemplates(prefs: SharedPreferences) {
+            val editor = prefs.edit()
+            var changed = false
+            val tripMigrationDone = prefs.getBoolean(KEY_TELEGRAM_TRIP_SUMMARY_MIGRATION_DONE, false)
+            if (!tripMigrationDone) {
+                val tripKey = "$KEY_TELEGRAM_TEMPLATE_PREFIX${TelegramEventType.TRIP_SUMMARY.key}"
+                if (prefs.contains(tripKey)) {
+                    editor.putString(tripKey, TelegramBuiltInTemplates.TRIP_SUMMARY_UK)
+                }
+                editor.putBoolean(KEY_TELEGRAM_TRIP_SUMMARY_MIGRATION_DONE, true)
+                changed = true
+            }
+
+            if (!prefs.getBoolean(KEY_TELEGRAM_BUILTIN_DEFAULTS_MIGRATION_DONE, false)) {
+                TelegramEventType.entries.forEach { event ->
+                    val key = "$KEY_TELEGRAM_TEMPLATE_PREFIX${event.key}"
+                    val saved = if (
+                        event == TelegramEventType.TRIP_SUMMARY && !tripMigrationDone && prefs.contains(key)
+                    ) {
+                        TelegramBuiltInTemplates.TRIP_SUMMARY_UK
+                    } else {
+                        runCatching { prefs.getString(key, null) }.getOrNull()
+                    }
+                    if (saved != null && TelegramBuiltInTemplates.isKnownBuiltIn(event.key, saved)) {
+                        editor.remove(key)
+                        changed = true
+                    }
+                }
+                if (!tripMigrationDone) {
+                    val tripKey = "$KEY_TELEGRAM_TEMPLATE_PREFIX${TelegramEventType.TRIP_SUMMARY.key}"
+                    if (prefs.contains(tripKey)) editor.remove(tripKey)
+                }
+                editor.putBoolean(KEY_TELEGRAM_BUILTIN_DEFAULTS_MIGRATION_DONE, true)
+                changed = true
+            }
+            if (changed) editor.commit()
+        }
+
         const val PREFS_NAME = "collector_settings"
         const val KEY_AUTO_START = "autoStart"
         const val KEY_USER_SHUTDOWN = "userShutdown"
@@ -977,6 +1044,8 @@ class CollectorSettings(
         const val KEY_TELEGRAM_CHAT_ID = "telegramChatId"
         const val KEY_TELEGRAM_EVENT_PREFIX = "telegramEvent."
         const val KEY_TELEGRAM_TEMPLATE_PREFIX = "telegramTemplate."
+        const val KEY_TELEGRAM_TRIP_SUMMARY_MIGRATION_DONE = "telegramTripSummaryMigrationDone"
+        const val KEY_TELEGRAM_BUILTIN_DEFAULTS_MIGRATION_DONE = "telegramBuiltInDefaultsMigrationDone"
         const val KEY_TELEGRAM_CHARGE_STEP = "telegramChargeStep"
         const val KEY_TELEGRAM_LOW_VOLTAGE = "telegramLowVoltage"
         const val KEY_TELEGRAM_UNAVAILABLE_DELAY = "telegramUnavailableDelay"
@@ -985,6 +1054,8 @@ class CollectorSettings(
         const val KEY_TELEGRAM_CONNECTION_STATUS = "telegramConnectionStatus"
         const val KEY_TELEGRAM_CONNECTION_MESSAGE = "telegramConnectionMessage"
         const val KEY_TELEGRAM_SEND_LOCATION = "telegramSendLocation"
+        const val KEY_TELEGRAM_NAVIGATOR_MASK = "telegramNavigatorMask"
+        const val KEY_UI_LANGUAGE_CODE = "uiLanguageCode"
         const val KEY_TRIP_HISTORY = "tripHistory"
         const val KEY_TRIP_SPEED_GREEN = "tripSpeedGreen"
         const val KEY_TRIP_SPEED_YELLOW = "tripSpeedYellow"
@@ -1035,6 +1106,8 @@ class CollectorSettings(
         const val MAX_ARCHIVE_STORAGE_LIMIT_GB = 10
         const val DEFAULT_MQTT_PORT = 1883
         const val DEFAULT_TELEGRAM_CHARGE_STEP = 5
+        const val DEFAULT_TELEGRAM_NAVIGATOR_MASK = TelegramNavigatorMask.ALL
+        const val DEFAULT_UI_LANGUAGE_CODE = "uk"
         const val MIN_TELEGRAM_CHARGE_STEP = 1
         const val MAX_TELEGRAM_CHARGE_STEP = 99
         const val DEFAULT_TELEGRAM_LOW_VOLTAGE = 12.0f
@@ -1052,6 +1125,36 @@ class CollectorSettings(
         const val MAX_TELEGRAM_DELAY_MINUTES = 60
         const val AUTO_START_ENABLED_UK = "Автозапуск активовано"
         const val AUTO_START_DISABLED_UK = "Автозапуск деактивовано"
+
+        internal fun migrateLegacyLocationCategories(
+            mqttCategories: Set<String>,
+            influxCategories: Set<String>,
+            sharedCategories: Boolean,
+            mqttLocation: Boolean?,
+            influxLocation: Boolean?
+        ): LegacyLocationMigration {
+            if (mqttLocation == null && influxLocation == null) {
+                return LegacyLocationMigration(mqttCategories, influxCategories, sharedCategories)
+            }
+            val resolvedMqtt = mqttLocation ?: false
+            val resolvedInflux = influxLocation ?: false
+            val splitSharedSelection = sharedCategories && resolvedMqtt != resolvedInflux
+            val mqtt = mqttCategories.toMutableSet()
+            val influx = if (splitSharedSelection) {
+                mqttCategories.toMutableSet()
+            } else {
+                influxCategories.toMutableSet()
+            }
+            if (resolvedMqtt) mqtt.add("location") else mqtt.remove("location")
+            if (resolvedInflux) influx.add("location") else influx.remove("location")
+            val preserveShared = sharedCategories && resolvedMqtt == resolvedInflux
+            return LegacyLocationMigration(mqtt, influx, preserveShared)
+        }
+
+        private fun SharedPreferences.getBooleanOrNull(key: String): Boolean? {
+            if (!contains(key)) return null
+            return runCatching { getBoolean(key, false) }.getOrNull()
+        }
 
         internal fun legacyTripDelaySeconds(minutes: Int): Int {
             return (minutes.toLong() * 60L)

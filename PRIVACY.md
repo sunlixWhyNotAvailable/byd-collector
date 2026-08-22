@@ -8,7 +8,7 @@ BYD Collector is local-first. It does not automatically send vehicle telemetry, 
 
 Main collection stores raw vehicle readings, Chinese field names and descriptions, timestamps, quality and failure metadata, and derived vehicle-state history in app-private SQLite databases.
 
-When trip history is enabled (the default), a separate app-private `bydcollector_trips.db` stores session times, SOC/distance/energy summaries, precise Android GPS route points, speed/consumption values, quality, and explicit location gaps. Location collection starts only after Android location permission is granted.
+When trip history is enabled (the default), a separate app-private `bydcollector_trips.db` stores session times, SOC/distance/energy summaries, received Android GPS route points, speed/consumption values, trust/quality metadata, and explicit location gaps. Location collection starts only after Android location permission is granted. Rejected fixes can remain as local diagnostics, but they are excluded from derived routes, current location, MQTT/InfluxDB location export, and Telegram.
 
 At the start of a main session, the collector can read BYD's `/storage/emulated/0/energydata/EC_database.db` (or its `/sdcard` equivalent) when that file and Android all-files access are available. It opens only those known paths read-only and imports energy-consumption rows such as trip timestamps, duration, distance, electricity, and fuel fields into its private database. It does not modify the BYD-owned source database.
 
@@ -28,7 +28,7 @@ An APK is downloaded from the project's GitHub Releases only after the user acce
 
 MQTT is disabled until configured and enabled by the user. It sends selected normalized current-state fields and Home Assistant discovery messages to the broker specified by the user.
 
-Precise location is excluded unless the separate MQTT location switch is enabled.
+Precise location is excluded unless the ordinary MQTT `location` category is enabled; that category is off by default.
 
 The current MQTT transport uses plain `tcp://` without TLS. MQTT credentials and payloads can therefore be visible to the local network or intermediaries. Use only a trusted network and broker until TLS support is implemented.
 
@@ -36,13 +36,13 @@ The current MQTT transport uses plain `tcp://` without TLS. MQTT credentials and
 
 InfluxDB export is disabled until configured and enabled by the user. It sends selected normalized history, timestamps, field names, values, and tags to the endpoint specified by the user.
 
-Precise location history is excluded unless the separate InfluxDB location switch is enabled.
+Precise location history is excluded unless the ordinary InfluxDB `location` category is enabled; that category is off by default.
 
 The current InfluxDB v1 transport uses plain `http://` without TLS. InfluxDB credentials and telemetry can therefore be visible to the local network or intermediaries. Use only a trusted network and endpoint until TLS support is implemented.
 
 ### Telegram
 
-Telegram is disabled until configured and enabled by the user. It sends only user-selected event messages to the configured chat through the Telegram Bot API over HTTPS. The separate `Send location` switch is off by default; when enabled, the trip-summary text includes the last valid coordinate, its age, and navigation links. The collector does not accept Telegram commands, register a webhook, poll incoming updates, or send media.
+Telegram is disabled until configured and enabled by the user. It sends only user-selected event messages to the configured chat through the Telegram Bot API over HTTPS. Trip-summary location is off by default; its separate button opens a modal for enabling it and selecting Google, Waze, Apple, and OpenStreetMap links. When enabled, the summary includes only the last trusted coordinate, its original capture age, and the selected links. The collector does not accept Telegram commands, register a webhook, poll incoming updates, or send media.
 
 ### OpenStreetMap
 

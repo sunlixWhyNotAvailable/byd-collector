@@ -482,8 +482,8 @@ class CollectorService : Service() {
             locationCaptureEnabled = {
                 settings.isTripHistoryEnabled() ||
                     settings.isTelegramSendLocationEnabled() ||
-                    settings.isMqttLocationEnabled() ||
-                    settings.isInfluxLocationEnabled()
+                    settings.mqttEnabledCategories().contains("location") ||
+                    settings.effectiveInfluxCategories().contains("location")
             },
             persistLocation = ::persistLocationObservations,
             onConfirmedPowerOff = ::handleConfirmedPowerOff,
@@ -531,10 +531,11 @@ class CollectorService : Service() {
             latitude = latitude,
             longitude = longitude,
             capturedAt = sample.observedAt,
-            age = "${ageSeconds}s",
+            ageSeconds = ageSeconds,
             osmUrl = "https://www.openstreetmap.org/?mlat=$latitude&mlon=$longitude#map=17/$latitude/$longitude",
             googleUrl = "https://www.google.com/maps/search/?api=1&query=$latitude,$longitude",
-            appleUrl = "https://maps.apple.com/?ll=$latitude,$longitude"
+            appleUrl = "https://maps.apple.com/?ll=$latitude,$longitude",
+            wazeUrl = "https://www.waze.com/ul?ll=$latitude%2C$longitude&navigate=yes"
         )
     }
 

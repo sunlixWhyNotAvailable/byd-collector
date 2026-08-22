@@ -62,6 +62,10 @@ class TripRuntimeCoordinator(
                 dispatch { handleLocation(sample, isFinal) }
             }
 
+            override fun onUntrusted(sample: GpsLocationSample, reason: String) {
+                dispatch { handleUntrusted(sample, reason) }
+            }
+
             override fun onGap(reason: String, observedAt: String) {
                 dispatch { handleGap(reason, observedAt) }
             }
@@ -272,6 +276,20 @@ class TripRuntimeCoordinator(
         }
     }
 
+    private fun handleUntrusted(sample: GpsLocationSample, reason: String) {
+        if (!running.get()) return
+        val receivedAt = runCatching { Instant.ofEpochMilli(sample.receiveWallTimeMs).toString() }.getOrElse { Instant.now().toString() }
+        recordEvent(
+            "gps_fix_untrusted",
+            "Rejected GPS fix retained outside normalized location state",
+            "reason=$reason source_at=${sample.observedAt} received_at=$receivedAt"
+        )
+        val current = session ?: return
+        tripStore.upsertRoutePoint(
+            TripMetrics.untrustedPoint(current.tripId, nextRouteSequence++, sample, reason)
+        )
+    }
+
     private fun handleGap(reason: String, observedAt: String) {
         persistLocation(LocationNormalizer.gap(observedAt, reason))
         val current = session ?: return
@@ -281,7 +299,7 @@ class TripRuntimeCoordinator(
     }
 
     private fun markLastRoutePointFinal(tripId: String) {
-        tripStore.queryRoutePoints(tripId).lastOrNull()?.let { last ->
+        tripStore.queryRoutePoints(tripId).lastOrNull { it.kind == RoutePoint.KIND_VALID }?.let { last ->
             if (!last.isFinal) tripStore.upsertRoutePoint(last.copy(isFinal = true))
         }
     }

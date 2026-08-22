@@ -1,6 +1,8 @@
 package com.bydcollector.collector.ui.compose
 
-import com.bydcollector.collector.telegram.TelegramBuiltInTemplates
+import com.bydcollector.collector.telegram.TelegramEventType
+import com.bydcollector.collector.telegram.TelegramTemplateCatalog
+import com.bydcollector.collector.telegram.TelegramTemplateLanguage
 
 enum class AppTab {
     MAIN,
@@ -15,7 +17,13 @@ enum class AppTab {
 
 enum class UiLanguage {
     UK,
-    EN
+    EN;
+
+    val code: String get() = if (this == EN) "en" else "uk"
+
+    companion object {
+        fun fromCode(code: String): UiLanguage = if (code.trim().equals("en", ignoreCase = true)) EN else UK
+    }
 }
 
 enum class StatusKind {
@@ -55,6 +63,15 @@ data class TelegramStrings(
     val low12vThreshold: String,
     val telemetryDelay: String,
     val tripDelay: String,
+    val locationSettings: String,
+    val locationMaster: String,
+    val googleNavigator: String,
+    val wazeNavigator: String,
+    val appleNavigator: String,
+    val osmNavigator: String,
+    val locationClose: String,
+    val locationStatusNo: String,
+    val locationStatusYes: String,
     val minuteUnit: String,
     val secondUnit: String,
     val messages: Map<TelegramMessageType, TelegramMessageStrings>,
@@ -99,7 +116,6 @@ data class UiStrings(
     val archiveDatabase: String,
     val archiveDebugDatabase: String,
     val grantAdb: String,
-    val grantLocation: String,
     val backgroundWork: String,
     val backgroundSetupTitle: String,
     val backgroundSetupMessage: String,
@@ -282,45 +298,54 @@ private val telegramUk = TelegramStrings(
     chargeStep = "Крок заряду",
     low12vThreshold = "Поріг напруги",
     telemetryDelay = "Затримка сповіщення",
-    tripDelay = "Затримка надсилання",
+    tripDelay = "Завершити після P",
+    locationSettings = "Налаштування локації",
+    locationMaster = "Надсилати локацію",
+    googleNavigator = "Google",
+    wazeNavigator = "Waze",
+    appleNavigator = "Apple",
+    osmNavigator = "OSM",
+    locationClose = "Готово",
+    locationStatusNo = "ні",
+    locationStatusYes = "так, %d посилань",
     minuteUnit = "хв",
     secondUnit = "с",
     messages = mapOf(
         TelegramMessageType.CHARGING_STARTED to TelegramMessageStrings(
             "Заряджання розпочато",
-            "Заряджання розпочато\nSOC: {soc}%\nПотужність: {battery_power_kw} кВт"
+            TelegramTemplateCatalog.defaultTemplate(TelegramEventType.CHARGING_STARTED, TelegramTemplateLanguage.UK)
         ),
         TelegramMessageType.CHARGING_PROGRESS to TelegramMessageStrings(
             "Прогрес заряджання",
-            TelegramBuiltInTemplates.CHARGING_PROGRESS_UK
+            TelegramTemplateCatalog.defaultTemplate(TelegramEventType.CHARGING_PROGRESS, TelegramTemplateLanguage.UK)
         ),
         TelegramMessageType.CHARGED_TO_100 to TelegramMessageStrings(
             "Заряджено до 100%",
-            "Авто заряджено до 100%\nЕнергія: {remaining_energy_kwh} кВт·год\nЗапас ходу: {range_km} км"
+            TelegramTemplateCatalog.defaultTemplate(TelegramEventType.CHARGED_TO_100, TelegramTemplateLanguage.UK)
         ),
         TelegramMessageType.CHARGING_STOPPED to TelegramMessageStrings(
             "Заряджання зупинено",
-            "Заряджання зупинено\nSOC: {soc}%\nТривалість: {charge_duration}"
+            TelegramTemplateCatalog.defaultTemplate(TelegramEventType.CHARGING_STOPPED, TelegramTemplateLanguage.UK)
         ),
         TelegramMessageType.CHARGE_GUN_CONNECTED to TelegramMessageStrings(
             "Зарядний кабель підключено",
-            "Зарядний кабель підключено\nSOC: {soc}%\nЧас: {time}"
+            TelegramTemplateCatalog.defaultTemplate(TelegramEventType.CHARGE_GUN_CONNECTED, TelegramTemplateLanguage.UK)
         ),
         TelegramMessageType.CHARGE_GUN_DISCONNECTED to TelegramMessageStrings(
             "Зарядний кабель відключено",
-            "Зарядний кабель відключено\nSOC: {soc}%\nЧас: {time}"
+            TelegramTemplateCatalog.defaultTemplate(TelegramEventType.CHARGE_GUN_DISCONNECTED, TelegramTemplateLanguage.UK)
         ),
         TelegramMessageType.LOW_12V_VOLTAGE to TelegramMessageStrings(
             "Низька напруга 12V",
-            "Низька напруга 12V\nНапруга: {battery_12v} В\nЧас: {time}"
+            TelegramTemplateCatalog.defaultTemplate(TelegramEventType.LOW_12V_VOLTAGE, TelegramTemplateLanguage.UK)
         ),
         TelegramMessageType.TELEMETRY_UNAVAILABLE to TelegramMessageStrings(
             "Телеметрія недоступна",
-            "Телеметрія недоступна\nОстанні дані: {last_data_time}\nПомилка: {error}"
+            TelegramTemplateCatalog.defaultTemplate(TelegramEventType.TELEMETRY_UNAVAILABLE, TelegramTemplateLanguage.UK)
         ),
         TelegramMessageType.TRIP_SUMMARY to TelegramMessageStrings(
             "Підсумок поїздки",
-            TelegramBuiltInTemplates.TRIP_SUMMARY_UK
+            TelegramTemplateCatalog.defaultTemplate(TelegramEventType.TRIP_SUMMARY, TelegramTemplateLanguage.UK)
         )
     ),
     variableDescriptions = mapOf(
@@ -367,45 +392,54 @@ private val telegramEn = TelegramStrings(
     chargeStep = "Charge step",
     low12vThreshold = "Voltage threshold",
     telemetryDelay = "Notification delay",
-    tripDelay = "Send delay",
+    tripDelay = "Finish after P",
+    locationSettings = "Location settings",
+    locationMaster = "Send location",
+    googleNavigator = "Google",
+    wazeNavigator = "Waze",
+    appleNavigator = "Apple",
+    osmNavigator = "OSM",
+    locationClose = "Done",
+    locationStatusNo = "no",
+    locationStatusYes = "yes, %d links",
     minuteUnit = "min",
     secondUnit = "sec",
     messages = mapOf(
         TelegramMessageType.CHARGING_STARTED to TelegramMessageStrings(
             "Charging started",
-            "Charging started\nSOC: {soc}%\nPower: {battery_power_kw} kW"
+            TelegramTemplateCatalog.defaultTemplate(TelegramEventType.CHARGING_STARTED, TelegramTemplateLanguage.EN)
         ),
         TelegramMessageType.CHARGING_PROGRESS to TelegramMessageStrings(
             "Charging progress",
-            TelegramBuiltInTemplates.CHARGING_PROGRESS_EN
+            TelegramTemplateCatalog.defaultTemplate(TelegramEventType.CHARGING_PROGRESS, TelegramTemplateLanguage.EN)
         ),
         TelegramMessageType.CHARGED_TO_100 to TelegramMessageStrings(
             "Charged to 100%",
-            "Vehicle charged to 100%\nEnergy: {remaining_energy_kwh} kWh\nRange: {range_km} km"
+            TelegramTemplateCatalog.defaultTemplate(TelegramEventType.CHARGED_TO_100, TelegramTemplateLanguage.EN)
         ),
         TelegramMessageType.CHARGING_STOPPED to TelegramMessageStrings(
             "Charging stopped",
-            "Charging stopped\nSOC: {soc}%\nDuration: {charge_duration}"
+            TelegramTemplateCatalog.defaultTemplate(TelegramEventType.CHARGING_STOPPED, TelegramTemplateLanguage.EN)
         ),
         TelegramMessageType.CHARGE_GUN_CONNECTED to TelegramMessageStrings(
             "Charge gun connected",
-            "Charge gun connected\nSOC: {soc}%\nTime: {time}"
+            TelegramTemplateCatalog.defaultTemplate(TelegramEventType.CHARGE_GUN_CONNECTED, TelegramTemplateLanguage.EN)
         ),
         TelegramMessageType.CHARGE_GUN_DISCONNECTED to TelegramMessageStrings(
             "Charge gun disconnected",
-            "Charge gun disconnected\nSOC: {soc}%\nTime: {time}"
+            TelegramTemplateCatalog.defaultTemplate(TelegramEventType.CHARGE_GUN_DISCONNECTED, TelegramTemplateLanguage.EN)
         ),
         TelegramMessageType.LOW_12V_VOLTAGE to TelegramMessageStrings(
             "Low 12V voltage",
-            "Low 12V voltage\nVoltage: {battery_12v} V\nTime: {time}"
+            TelegramTemplateCatalog.defaultTemplate(TelegramEventType.LOW_12V_VOLTAGE, TelegramTemplateLanguage.EN)
         ),
         TelegramMessageType.TELEMETRY_UNAVAILABLE to TelegramMessageStrings(
             "Telemetry unavailable",
-            "Telemetry unavailable\nLast data: {last_data_time}\nError: {error}"
+            TelegramTemplateCatalog.defaultTemplate(TelegramEventType.TELEMETRY_UNAVAILABLE, TelegramTemplateLanguage.EN)
         ),
         TelegramMessageType.TRIP_SUMMARY to TelegramMessageStrings(
             "Trip summary",
-            TelegramBuiltInTemplates.TRIP_SUMMARY_EN
+            TelegramTemplateCatalog.defaultTemplate(TelegramEventType.TRIP_SUMMARY, TelegramTemplateLanguage.EN)
         )
     ),
     variableDescriptions = mapOf(
@@ -460,7 +494,7 @@ private fun buildStrings(language: UiLanguage): UiStrings {
             haTab = "HA інтеграція",
             tripsTab = "Поїздки",
             storageTab = "Сховище",
-            extraTab = "Налаштування",
+            extraTab = "Опції",
             logsTab = "Логи",
             mainSubtitle = "Керування основним збором, швидка діагностика",
             allSubtitle = "Round-robin збір додаткових параметрів.",
@@ -473,7 +507,6 @@ private fun buildStrings(language: UiLanguage): UiStrings {
             archiveDatabase = "Архівація бази",
             archiveDebugDatabase = "Архівація тестової бази",
             grantAdb = "Видати ADB",
-            grantLocation = "Видати GPS",
             backgroundWork = "Робота у фоні",
             backgroundSetupTitle = "Робота у фоні",
             backgroundSetupMessage = "Set Disable background Apps -> BYD Collector = OFF",
@@ -675,7 +708,6 @@ private fun buildStrings(language: UiLanguage): UiStrings {
             archiveDatabase = "Archive database",
             archiveDebugDatabase = "Archive test database",
             grantAdb = "Grant ADB",
-            grantLocation = "Grant GPS",
             backgroundWork = "Background apps",
             backgroundSetupTitle = "Background work",
             backgroundSetupMessage = "Set Disable background Apps -> BYD Collector = OFF",
