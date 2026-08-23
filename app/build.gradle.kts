@@ -21,6 +21,16 @@ android {
         buildConfigField("String", "ACTION_PREFIX", "\"com.bydcollector.collector\"")
     }
 
+    buildTypes {
+        create("performance") {
+            initWith(getByName("release"))
+            isDebuggable = false
+            isMinifyEnabled = false
+            isShrinkResources = false
+            signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+
     buildFeatures {
         buildConfig = true
         compose = true
@@ -28,6 +38,10 @@ android {
 
     testOptions {
         unitTests.isIncludeAndroidResources = true
+    }
+
+    lint {
+        disable += "ExpiredTargetSdkVersion"
     }
 
     compileOptions {

@@ -1,6 +1,7 @@
 package com.bydcollector.collector.telegram
 
 import com.bydcollector.collector.data.local.TelemetryStore
+import com.bydcollector.collector.data.local.TelegramOutboxEntry
 import com.bydcollector.collector.data.local.TelegramOutboxMessage
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.service.CollectorSettings
@@ -20,8 +21,12 @@ class TelegramCoordinator(
     private val nowMs: () -> Long = System::currentTimeMillis
 ) {
     private var engine = TelegramEventEngine(TelegramEventState.fromJson(store.telegramRuntimeState()))
+    private var enabledRuntimeStartedAtMs: Long? = null
+    private var startupRecoveryPending = true
 
     fun onSuccessfulPoll(observations: List<NormalizedObservation>): Long? {
+        activateEnabledRuntime() ?: return null
+        val startupDeadline = ensureStartupRecovery()
         val previousChargingActive = engine.state.chargingActive
         val result = engine.onSuccessfulPoll(observations, eventConfig(), nowMs())
         handle(result)
@@ -32,14 +37,17 @@ class TelegramCoordinator(
                 "active=${result.state.chargingActive ?: "unknown"} source=${result.state.chargingEvidenceSource ?: "unknown"}"
             )
         }
-        return nextWakeAt(result.nextWakeAtMs, pendingQueueDeadline())
+        return nextWakeAt(result.nextWakeAtMs, nextWakeAt(startupDeadline, pendingQueueDeadline()))
     }
 
     fun tick(
         mainCollectionExpected: Boolean,
         lastError: String?
     ): Long? {
-        val expired = store.pruneTelegramMessages(nowMs())
+        val runtimeStartedAtMs = activateEnabledRuntime() ?: return null
+        val startupDeadline = ensureStartupRecovery()
+        val tickAtMs = nowMs()
+        val expired = store.pruneTelegramMessages(tickAtMs)
         if (expired > 0) {
             store.recordEvent(
                 "telegram_outbox_pruned",
@@ -47,16 +55,26 @@ class TelegramCoordinator(
                 "expired=$expired overflow=0"
             )
         }
-        val result = engine.onTick(eventConfig(), mainCollectionExpected, lastError, nowMs())
+        val result = engine.onTick(
+            eventConfig(),
+            mainCollectionExpected,
+            lastError,
+            tickAtMs,
+            runtimeStartedAtMs
+        )
         handle(result)
-        return nextWakeAt(result.nextWakeAtMs, flushPending())
+        return nextWakeAt(result.nextWakeAtMs, nextWakeAt(startupDeadline, flushPending()))
     }
 
     /** Root/service integration hook for confirmed vehicle power-off. */
     fun onPowerOffConfirmed(snapshot: TelegramPowerOffSnapshot = TelegramPowerOffSnapshot(), location: TelegramLocationSnapshot? = null): Long? {
+        activateEnabledRuntime() ?: return null
+        val startupDeadline = ensureStartupRecovery()
         val result = engine.onPowerOffConfirmed(eventConfig(), snapshot, location, nowMs())
         handle(result)
-        return nextWakeAt(result.nextWakeAtMs, pendingQueueDeadline())
+        val tripSummaryKey = result.events.firstOrNull { it.type == TelegramEventType.TRIP_SUMMARY }?.dedupeKey
+        val deliveryDeadline = tripSummaryKey?.let { flushPending(it, force = true) } ?: flushPending()
+        return nextWakeAt(result.nextWakeAtMs, nextWakeAt(startupDeadline, deliveryDeadline))
     }
 
     fun testConnection(): TelegramSendResult {
@@ -92,17 +110,28 @@ class TelegramCoordinator(
 
     fun integrationDisabled() {
         store.saveTelegramRuntimeState(engine.reset().toJson(), nowMs())
+        enabledRuntimeStartedAtMs = null
+        startupRecoveryPending = true
     }
 
     fun flushPending(): Long? {
+        val entry = store.oldestUnblockedTelegramMessage() ?: return null
+        return attempt(entry, force = false)
+    }
+
+    private fun flushPending(dedupeKey: String, force: Boolean): Long? {
+        val entry = store.telegramMessageByDedupeKey(dedupeKey) ?: return null
+        return attempt(entry, force)
+    }
+
+    private fun attempt(entry: TelegramOutboxEntry, force: Boolean): Long? {
         if (!settings.isTelegramEnabled()) return null
         val token = settings.telegramBotToken()
         val chatId = settings.telegramChatId()
         if (token.isBlank() || chatId.isBlank()) return null
-        val entry = store.oldestTelegramMessage() ?: return null
         if (entry.blocked) return null
         val now = nowMs()
-        if (entry.nextAttemptAtMs > now) return entry.nextAttemptAtMs
+        if (!force && entry.nextAttemptAtMs > now) return entry.nextAttemptAtMs
         if (Thread.currentThread().isInterrupted) return entry.nextAttemptAtMs
         val attemptedAt = nowMs()
         return when (val result = client.sendMessage(TelegramSendMessage(token, chatId, entry.payload))) {
@@ -113,7 +142,7 @@ class TelegramCoordinator(
                     "Telegram message delivered",
                     "event=${entry.eventType}"
                 )
-                store.delayOldestTelegramMessageUntil(nowMs() + BACKLOG_SUCCESS_DELAY_MS)
+                pendingQueueDeadline()
             }
             is TelegramSendResult.Failure -> {
                 val error = failureCode(result)
@@ -124,7 +153,7 @@ class TelegramCoordinator(
                     }
                 } else {
                     store.markTelegramBlocked(entry.id, error, attemptedAt)
-                    null
+                    pendingQueueDeadline()
                 }
                 store.recordEvent(
                     "telegram_message_failed",
@@ -139,7 +168,25 @@ class TelegramCoordinator(
     private fun pendingQueueDeadline(): Long? {
         if (!settings.isTelegramEnabled()) return null
         if (settings.telegramBotToken().isBlank() || settings.telegramChatId().isBlank()) return null
-        return store.oldestTelegramMessage()?.takeUnless { it.blocked }?.nextAttemptAtMs
+        return store.oldestUnblockedTelegramMessage()?.nextAttemptAtMs
+    }
+
+    private fun ensureStartupRecovery(): Long? {
+        if (!startupRecoveryPending) return null
+        val recovered = engine.recoverPendingTrip(eventConfig(), nowMs())
+        handle(recovered)
+        startupRecoveryPending = false
+        val recoveredKey = recovered.events
+            .firstOrNull { it.type == TelegramEventType.TRIP_SUMMARY }
+            ?.dedupeKey
+        val pending = recoveredKey?.let(store::telegramMessageByDedupeKey)?.takeUnless { it.blocked }
+            ?: store.oldestUnblockedTelegramMessage(TelegramEventType.TRIP_SUMMARY.key)
+        return pending?.let { attempt(it, force = true) }
+    }
+
+    private fun activateEnabledRuntime(): Long? {
+        if (!settings.isTelegramEnabled()) return null
+        return enabledRuntimeStartedAtMs ?: nowMs().also { enabledRuntimeStartedAtMs = it }
     }
 
     private fun nextWakeAt(eventDeadlineAtMs: Long?, queueDeadlineAtMs: Long?): Long? {
@@ -229,9 +276,5 @@ class TelegramCoordinator(
         return "kind=${result.kind.name.lowercase()} " +
             "status=${result.httpStatus ?: "none"} " +
             "exception=${result.exceptionClass ?: "none"}"
-    }
-
-    private companion object {
-        const val BACKLOG_SUCCESS_DELAY_MS = 5_000L
     }
 }

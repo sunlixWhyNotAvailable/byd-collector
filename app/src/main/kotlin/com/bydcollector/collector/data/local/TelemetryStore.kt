@@ -546,18 +546,34 @@ class TelemetryStore(
         return TelegramEnqueueResult(inserted, expired, overflow)
     }
 
-    fun oldestTelegramMessage(): TelegramOutboxEntry? {
-        helper.readableDatabase.rawQuery(
+    fun oldestUnblockedTelegramMessage(eventType: String? = null): TelegramOutboxEntry? {
+        val eventFilter = if (eventType == null) "" else " AND event_type = ?"
+        return queryTelegramMessage(
             """
             SELECT id, dedupe_key, event_type, payload, attempt_count, next_attempt_at_ms, blocked
             FROM telegram_outbox
+            WHERE blocked = 0$eventFilter
             ORDER BY id
             LIMIT 1
             """.trimIndent(),
-            emptyArray()
-        ).use { cursor ->
-            if (!cursor.moveToFirst()) return null
-            return TelegramOutboxEntry(
+            if (eventType == null) emptyArray() else arrayOf(eventType)
+        )
+    }
+
+    fun telegramMessageByDedupeKey(dedupeKey: String): TelegramOutboxEntry? = queryTelegramMessage(
+        """
+        SELECT id, dedupe_key, event_type, payload, attempt_count, next_attempt_at_ms, blocked
+        FROM telegram_outbox
+        WHERE dedupe_key = ?
+        LIMIT 1
+        """.trimIndent(),
+        arrayOf(dedupeKey)
+    )
+
+    private fun queryTelegramMessage(sql: String, args: Array<String>): TelegramOutboxEntry? =
+        helper.readableDatabase.rawQuery(sql, args).use { cursor ->
+            if (!cursor.moveToFirst()) return@use null
+            TelegramOutboxEntry(
                 id = cursor.getLong(0),
                 dedupeKey = cursor.getString(1),
                 eventType = cursor.getString(2),
@@ -567,21 +583,6 @@ class TelemetryStore(
                 blocked = cursor.getInt(6) != 0
             )
         }
-    }
-
-    fun delayOldestTelegramMessageUntil(minimumAttemptAtMs: Long): Long? {
-        val entry = oldestTelegramMessage() ?: return null
-        val nextAttemptAtMs = maxOf(entry.nextAttemptAtMs, minimumAttemptAtMs)
-        if (nextAttemptAtMs != entry.nextAttemptAtMs) {
-            helper.writableDatabase.update(
-                "telegram_outbox",
-                ContentValues().apply { put("next_attempt_at_ms", nextAttemptAtMs) },
-                "id = ?",
-                arrayOf(entry.id.toString())
-            )
-        }
-        return nextAttemptAtMs.takeUnless { entry.blocked }
-    }
 
     fun pruneTelegramMessages(nowMs: Long): Int {
         return helper.writableDatabase.delete(

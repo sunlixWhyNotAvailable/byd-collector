@@ -12,6 +12,29 @@ class TripMetricsTest {
     }
 
     @Test
+    fun energyCounterAccumulatesAcrossResetWithoutDoubleCountingNoise() {
+        var state = TripMetrics.advanceEnergyCounter(0.0, 10.0, 10.5)
+        assertEquals(0.5, state.accumulatedKwh)
+        assertEquals(false, state.resetObserved)
+
+        state = TripMetrics.advanceEnergyCounter(state.accumulatedKwh, state.lastCounterKwh, 10.45)
+        assertEquals(0.5, state.accumulatedKwh)
+        assertEquals(10.5, state.lastCounterKwh)
+
+        state = TripMetrics.advanceEnergyCounter(state.accumulatedKwh, state.lastCounterKwh, 0.2)
+        assertEquals(0.5, state.accumulatedKwh)
+        assertEquals(true, state.resetObserved)
+
+        state = TripMetrics.advanceEnergyCounter(state.accumulatedKwh, state.lastCounterKwh, 0.9)
+        assertEquals(1.2, checkNotNull(state.accumulatedKwh), 1e-9)
+
+        state = TripMetrics.advanceEnergyCounter(null, null, 4.0)
+        assertEquals(0.0, state.accumulatedKwh)
+        state = TripMetrics.advanceEnergyCounter(state.accumulatedKwh, state.lastCounterKwh, 4.3)
+        assertEquals(0.3, checkNotNull(state.accumulatedKwh), 1e-9)
+    }
+
+    @Test
     fun instantaneousConsumptionIsNullWhileStationaryAndPreservesRegenSign() {
         assertEquals(40.0, TripMetrics.instantaneousConsumptionKwhPer100Km(8.0, 20.0))
         assertEquals(-40.0, TripMetrics.instantaneousConsumptionKwhPer100Km(-8.0, 20.0))

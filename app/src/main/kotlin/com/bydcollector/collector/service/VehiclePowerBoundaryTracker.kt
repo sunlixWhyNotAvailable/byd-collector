@@ -11,34 +11,24 @@ data class VehiclePowerTransition(
     val current: VehiclePowerState
 )
 
-/** Confirms shutdown conservatively while accepting one valid non-zero wake sample. */
-class VehiclePowerBoundaryTracker(
-    private val offConfirmationCount: Int = 3
-) {
+/** Tracks the first valid vehicle power transition without adding polling delay. */
+class VehiclePowerBoundaryTracker {
     private var state = VehiclePowerState.UNKNOWN
-    private var consecutiveZeroes = 0
-
-    init {
-        require(offConfirmationCount > 0)
-    }
 
     fun current(): VehiclePowerState = state
 
     fun observe(decodedPowerLevel: Int?): VehiclePowerTransition? {
         if (decodedPowerLevel == null || decodedPowerLevel < 0) {
-            consecutiveZeroes = 0
             return null
         }
         if (decodedPowerLevel > 0) {
-            consecutiveZeroes = 0
             return transitionTo(VehiclePowerState.ON)
         }
-        consecutiveZeroes += 1
-        return if (consecutiveZeroes >= offConfirmationCount) {
-            transitionTo(VehiclePowerState.OFF)
-        } else {
-            null
-        }
+        return transitionTo(VehiclePowerState.OFF)
+    }
+
+    fun rollback(transition: VehiclePowerTransition) {
+        if (state == transition.current) state = transition.previous
     }
 
     private fun transitionTo(next: VehiclePowerState): VehiclePowerTransition? {

@@ -2,7 +2,34 @@ package com.bydcollector.collector.data.trips
 
 import com.bydcollector.collector.location.GpsLocationSample
 
+data class EnergyCounterUpdate(
+    val accumulatedKwh: Double?,
+    val lastCounterKwh: Double?,
+    val resetObserved: Boolean
+)
+
 object TripMetrics {
+    fun advanceEnergyCounter(
+        accumulatedKwh: Double?,
+        lastCounterKwh: Double?,
+        currentCounterKwh: Double?,
+        resetToleranceKwh: Double = 0.1
+    ): EnergyCounterUpdate {
+        val accumulated = accumulatedKwh?.takeIf { it.isFinite() && it >= 0.0 }
+        val previous = lastCounterKwh?.takeIf { it.isFinite() && it >= 0.0 }
+        val current = currentCounterKwh?.takeIf { it.isFinite() && it >= 0.0 }
+            ?: return EnergyCounterUpdate(accumulated, previous, false)
+        if (previous == null) return EnergyCounterUpdate(accumulated ?: 0.0, current, false)
+
+        val delta = current - previous
+        return when {
+            delta > 0.0 -> EnergyCounterUpdate((accumulated ?: 0.0) + delta, current, false)
+            delta < -(resetToleranceKwh.coerceAtLeast(0.0) + 1e-9) ->
+                EnergyCounterUpdate(accumulated ?: 0.0, current, true)
+            else -> EnergyCounterUpdate(accumulated, previous, false)
+        }
+    }
+
     fun delta(start: Double?, last: Double?): Double? {
         if (start == null || last == null || !start.isFinite() || !last.isFinite()) return null
         return (last - start).takeIf { it.isFinite() && it >= 0.0 }

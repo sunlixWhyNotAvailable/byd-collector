@@ -42,7 +42,7 @@ The current InfluxDB v1 transport uses plain `http://` without TLS. InfluxDB cre
 
 ### Telegram
 
-Telegram is disabled until configured and enabled by the user. It sends only user-selected event messages to the configured chat through the Telegram Bot API over HTTPS. Trip-summary location is off by default; its separate button opens a modal for enabling it and selecting Google, Waze, Apple, and OpenStreetMap links. When enabled, the summary includes only the last trusted coordinate, its original capture age, and the selected links. The collector does not accept Telegram commands, register a webhook, poll incoming updates, or send media.
+Telegram is disabled until configured and enabled by the user. It sends only user-selected event messages to the configured chat through the Telegram Bot API over HTTPS. Trip-summary location is off by default; its separate button opens a modal for enabling it and selecting Google, Waze, Apple, and OpenStreetMap links. When enabled, the selected navigation links encode the last trusted coordinate, but the summary adds no separate raw-coordinate, capture-time, or age rows. The collector does not accept Telegram commands, register a webhook, poll incoming updates, or send media.
 
 ### OpenStreetMap
 

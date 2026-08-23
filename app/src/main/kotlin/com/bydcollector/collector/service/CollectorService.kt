@@ -518,7 +518,6 @@ class CollectorService : Service() {
                 ),
                 location = event.lastLocation?.let(::telegramLocationSnapshot)
             )
-            telegramCoordinator.flushPending()
         }
     }
 

@@ -42,6 +42,7 @@ class TelegramStorageCutoverStateTest {
             TelegramEventState(lowVoltageSent = true),
             TelegramEventState(telemetryOutageSent = true),
             TelegramEventState(bootTotalDistanceKm = 1.0),
+            TelegramEventState(bootTotalEnergyKwh = 1.0),
             TelegramEventState(bootTotalDurationMs = 60_000L)
         )
 

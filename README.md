@@ -122,11 +122,11 @@ Supported event templates include:
 - telemetry unavailable; and
 - trip summary.
 
-Charging-progress templates can report energy/SOC and localized duration for both the current step and the whole charging session. Untouched built-in templates follow the persisted app language; edited templates retain their exact text. On this candidate upgrade, an already persisted trip-summary template is replaced once with the expanded built-in and classified as a default. Trip summaries separate the current `P -> non-P -> P` trip from totals observed during the current vehicle boot, and both energy lines include start-to-end SOC. A summary is eligible for an SOC change of at least 1%; otherwise the trip must exceed 0.1 km or 0.1 kWh. The parked summary is persisted, and a resumed drive suppresses a stale completion. Confirmed vehicle power-off bypasses the parked delay and immediately queues and attempts the summary while the network may still be available. A failed send remains in the durable FIFO for Wi-Fi or the next session.
+Charging-progress templates can report energy/SOC and localized duration for both the current step and the whole charging session. Untouched built-in templates follow the persisted app language; edited templates retain their exact text. On this candidate upgrade, an already persisted trip-summary template is replaced once with the expanded built-in and classified as a default. Trip summaries separate the current `P -> non-P -> P` trip from totals observed during the current vehicle boot, and both energy lines include start-to-end SOC. A summary is eligible for an SOC change of at least 1%; otherwise the trip must exceed 0.1 km or 0.1 kWh. A short `P` below the configured delay remains part of the same trip; once that deadline expires, the old trip is finalized before a new drive can replace it. A parked trip restored after process loss is finalized before fresh telemetry. The first valid power-off sample bypasses the parked delay and durably queues and immediately attempts the summary while the network may still be available.
 
-Trip-summary location is off by default. The separate `Send location` button opens a blocking modal with independent Google, Waze, Apple, and OSM selections; choosing zero links is allowed. When enabled, the same summary text receives the last trusted coordinate, its original capture age, and only the selected links; no second Telegram message or media upload is created.
+Trip-summary location is off by default. The separate `Send location` button opens a blocking modal with independent Google, Waze, Apple, and OSM selections; choosing zero links is allowed. When enabled, the same summary receives only the selected navigation links in that order, without separate coordinate, capture-time, or age rows. Missing trusted location or an empty selection never blocks the summary; no second Telegram message or media upload is created.
 
-The outbox is strict FIFO. Only the oldest queued event is attempted; retry/backoff and permanent-block state stay at the head, and successful backlog messages are paced by at least five seconds. A later event does not discard an earlier one. Trip-summary delay is configurable from 5 to 300 seconds (10 seconds by default).
+The outbox keeps FIFO order among unblocked ordinary events. Retryable failures retain their backoff; permanently blocked rows remain for diagnosis but do not hold later messages. A summary finalized by the first valid power-off sample is attempted immediately after its durable commit, and a pending summary receives one priority attempt when the enabled Telegram runtime starts. Other events keep ordinary unblocked FIFO order. Successful delivery schedules the next eligible row immediately without a fixed pacing delay. Telemetry-unavailable timing is rebased when the Telegram runtime is enabled, so a kernel/process restart or later enable does not immediately replay an outage from stale timestamps. Trip-summary delay is configurable from 5 to 300 seconds (10 seconds by default).
 
 <p align="center"><img src="docs/screenshots/en/telegram.png" alt="BYD Collector Telegram notification settings" width="100%"></p>
 
@@ -225,7 +225,7 @@ Check endpoint credentials, database/measurement, and category selection. The ex
 
 ### Telegram messages are delayed or missing
 
-Verify the bot token and chat ID with `Test connection`, enable the specific event, and inspect the oldest outbox item. FIFO delivery means a failed or permanently blocked message holds later messages behind it; successful backlog delivery is paced by five seconds.
+Verify the bot token and chat ID with `Test connection`, enable the specific event, and inspect pending outbox rows. Retryable messages wait for their recorded backoff; permanently blocked rows are skipped until a successful connection test or credential change unblocks them.
 
 ### Archive is deferred or maintenance cannot start
 
@@ -256,7 +256,7 @@ Archives can expose vehicle identifiers, raw Chinese descriptions, timestamps, t
 - The first physical-vehicle `v2.7.0` gate found a shell-UID SQLite spool failure and a missing automatic location prompt. The current candidate replaces shell SQLite with the validated file spool and adds the serialized one-time permission request; these corrections are host-verified but still require installation and revalidation on the vehicle.
 - The `BODYWORK_POWER_LEVEL` `0/2` boundary and post-kernel-reboot recovery path still require the planned physical-vehicle validation before this build is relied on unattended.
 - MQTT is a live-state channel and can miss updates while the broker is offline. InfluxDB v1 export is cursor/retry based and intentionally paced.
-- Telegram delivery depends on external Bot API reachability and strict FIFO head-of-queue behavior.
+- Telegram delivery depends on external Bot API reachability; retryable failures remain subject to their persisted backoff.
 - Optional Tailscale activation depends on the vehicle's network and process policy; it is not required for local collection.
 - No physical-vehicle installation or live-car timing claim is implied by a source build or unit-test result; validate changes on the intended tablet before relying on them.
 

@@ -98,10 +98,15 @@ class TripRuntimeCoordinator(
                 ?.trim()
                 ?.toIntOrNull()
             val transition = powerTracker.observe(decodedPower)
-            when (transition?.current) {
-                VehiclePowerState.ON -> handlePowerOn(timestamp, snapshot)
-                VehiclePowerState.OFF -> handlePowerOff(timestamp, snapshot)
-                else -> Unit
+            try {
+                when (transition?.current) {
+                    VehiclePowerState.ON -> handlePowerOn(timestamp, snapshot)
+                    VehiclePowerState.OFF -> handlePowerOff(timestamp, snapshot)
+                    else -> Unit
+                }
+            } catch (error: Throwable) {
+                transition?.let(powerTracker::rollback)
+                throw error
             }
             if (powerTracker.current() == VehiclePowerState.ON) {
                 updateOpenSession(timestamp, snapshot)
@@ -162,6 +167,7 @@ class TripRuntimeCoordinator(
         if (historyEnabled()) {
             if (session == null) {
                 val elapsed = elapsedRealtimeMs()
+                val startEnergy = snapshot.tripEnergyKwh?.takeIf { it.isFinite() && it >= 0.0 }
                 session = TripSession(
                     tripId = TripId.forPowerSession(bootId, elapsed),
                     startedAt = timestamp,
@@ -172,8 +178,9 @@ class TripRuntimeCoordinator(
                     endSoc = snapshot.soc,
                     startOdometerKm = snapshot.odometerKm,
                     lastOdometerKm = snapshot.odometerKm,
-                    startTripEnergyKwh = snapshot.tripEnergyKwh,
-                    lastTripEnergyKwh = snapshot.tripEnergyKwh
+                    startTripEnergyKwh = startEnergy,
+                    lastTripEnergyKwh = startEnergy,
+                    energyKwh = startEnergy?.let { 0.0 }
                 ).also(tripStore::upsertSession)
                 nextRouteSequence = 0L
                 recordEvent("power_trip_started", "Vehicle power session started", "trip_id=${session?.tripId}")
@@ -187,20 +194,31 @@ class TripRuntimeCoordinator(
         val current = session ?: return
         val startSoc = current.startSoc ?: snapshot.soc
         val startOdometer = current.startOdometerKm ?: snapshot.odometerKm
-        val startEnergy = current.startTripEnergyKwh ?: snapshot.tripEnergyKwh
+        val currentEnergy = snapshot.tripEnergyKwh?.takeIf { it.isFinite() && it >= 0.0 }
+        val startEnergy = current.startTripEnergyKwh ?: currentEnergy
         val odometerReset = decreased(snapshot.odometerKm, current.lastOdometerKm)
-        val energyReset = decreased(snapshot.tripEnergyKwh, current.lastTripEnergyKwh)
         val lastOdometer = if (odometerReset) current.lastOdometerKm else snapshot.odometerKm ?: current.lastOdometerKm
-        val lastEnergy = if (energyReset) current.lastTripEnergyKwh else snapshot.tripEnergyKwh ?: current.lastTripEnergyKwh
+        val legacyResetWithoutTotal = current.energyKwh == null && "trip_energy_reset" in current.quality
+        val accumulatedEnergy = if (legacyResetWithoutTotal) {
+            0.0
+        } else {
+            current.energyKwh ?: TripMetrics.delta(startEnergy, current.lastTripEnergyKwh ?: currentEnergy)
+        }
+        val energyUpdate = TripMetrics.advanceEnergyCounter(
+            accumulatedKwh = accumulatedEnergy,
+            lastCounterKwh = currentEnergy.takeIf { legacyResetWithoutTotal }
+                ?: current.lastTripEnergyKwh
+                ?: currentEnergy,
+            currentCounterKwh = currentEnergy
+        )
         val quality = listOfNotNull(
             current.quality.takeUnless { it == TripSession.QUALITY_OK },
             "odometer_reset".takeIf { odometerReset },
-            "trip_energy_reset".takeIf { energyReset }
+            "trip_energy_reset".takeIf { energyUpdate.resetObserved }
         ).flatMap { it.split(',') }.distinct().joinToString(",").ifBlank { TripSession.QUALITY_OK }
         val distance = TripMetrics.delta(startOdometer, lastOdometer)
             .takeUnless { "odometer_reset" in quality }
-        val energy = TripMetrics.delta(startEnergy, lastEnergy)
-            .takeUnless { "trip_energy_reset" in quality }
+        val energy = energyUpdate.accumulatedKwh
         val duration = durationMs(current.startedAt, timestamp)
         session = current.copy(
             movementObserved = current.movementObserved || (snapshot.speedKmh ?: 0.0) > MOVEMENT_THRESHOLD_KMH,
@@ -209,7 +227,7 @@ class TripRuntimeCoordinator(
             startOdometerKm = startOdometer,
             lastOdometerKm = lastOdometer,
             startTripEnergyKwh = startEnergy,
-            lastTripEnergyKwh = lastEnergy,
+            lastTripEnergyKwh = energyUpdate.lastCounterKwh,
             durationMs = duration,
             distanceKm = distance,
             energyKwh = energy,
