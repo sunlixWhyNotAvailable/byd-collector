@@ -27,7 +27,9 @@ data class DashboardRuntimeFlags(
     val permissionsGranted: Boolean,
     val adbAuthorized: Boolean,
     val dbMaintenanceStatus: DbMaintenanceRuntimeStatus,
-    val archiveStorageJobStatus: ArchiveStorageJobStatus
+    val archiveStorageJobStatus: ArchiveStorageJobStatus,
+    val debugRuntimeStatus: DebugRuntimeStatus = if (debugPollingRunning) DebugRuntimeStatus.RUNNING else DebugRuntimeStatus.STOPPED,
+    val debugRuntimeError: String? = null
 )
 
 data class DashboardMainPollState(
@@ -193,7 +195,6 @@ class DashboardUiStateStore(
             countBootstrapInFlight = false
             check(countBootstrapGeneration < Long.MAX_VALUE) { "dashboard count generation overflow" }
             countBootstrapGeneration += 1L
-            updateTargetsLocked(setOf(AppTab.LOGS), includeChrome = false)
         }
     }
 
@@ -208,7 +209,6 @@ class DashboardUiStateStore(
             if (!countBootstrapInFlight || generation != countBootstrapGeneration) return@synchronized false
             rowCounts = counts
             countBootstrapInFlight = false
-            updateTargetsLocked(setOf(AppTab.LOGS), includeChrome = false)
             true
         }
     }
@@ -237,7 +237,6 @@ class DashboardUiStateStore(
                 normalizedCurrentCount = incrementKnownCount(current.normalizedCurrentCount, normalizedCurrentRows),
                 normalizedHistoryCount = incrementKnownCount(current.normalizedHistoryCount, normalizedHistoryRows)
             )
-            updateTargetsLocked(setOf(AppTab.LOGS), includeChrome = false)
         }
     }
 
@@ -246,7 +245,6 @@ class DashboardUiStateStore(
         synchronized(lock) {
             val current = rowCounts ?: return
             rowCounts = current.copy(debugReadingCount = incrementKnownCount(current.debugReadingCount, rows))
-            updateTargetsLocked(setOf(AppTab.LOGS), includeChrome = false)
         }
     }
 
@@ -260,21 +258,21 @@ class DashboardUiStateStore(
     fun publishMainPollState(state: DashboardMainPollState) {
         synchronized(lock) {
             mainPollState = state
-            updateTargetsLocked(setOf(AppTab.MAIN, AppTab.LOGS), includeChrome = true)
+            updateTargetsLocked(setOf(AppTab.MAIN), includeChrome = true)
         }
     }
 
     fun publishDebugPollState(state: DashboardDebugPollState) {
         synchronized(lock) {
             debugPollState = state
-            updateTargetsLocked(setOf(AppTab.ALL_PARAMETERS, AppTab.LOGS), includeChrome = false)
+            updateTargetsLocked(setOf(AppTab.ALL_PARAMETERS), includeChrome = false)
         }
     }
 
     fun publishIntegrationRuntime(state: DashboardState) {
         synchronized(lock) {
             integrationRuntimeState = state
-            updateTargetsLocked(setOf(AppTab.MAIN, AppTab.HA, AppTab.LOGS), includeChrome = true)
+            updateTargetsLocked(setOf(AppTab.MAIN, AppTab.HA), includeChrome = true)
         }
     }
 
@@ -283,7 +281,7 @@ class DashboardUiStateStore(
             mainDatabaseSizeBytes = mainBytes
             debugDatabaseSizeBytes = debugBytes
             updateTargetsLocked(
-                setOf(AppTab.MAIN, AppTab.ALL_PARAMETERS, AppTab.STORAGE, AppTab.LOGS),
+                setOf(AppTab.MAIN, AppTab.ALL_PARAMETERS, AppTab.STORAGE),
                 includeChrome = true
             )
         }
@@ -440,6 +438,8 @@ class DashboardUiStateStore(
                 pollingEnabled = flags.pollingEnabled,
                 debugPollingEnabled = flags.debugPollingEnabled,
                 debugPollingRunning = flags.debugPollingRunning,
+                debugRuntimeStatus = flags.debugRuntimeStatus,
+                debugRuntimeError = flags.debugRuntimeError,
                 mqttEnabled = flags.mqttEnabled,
                 influxEnabled = flags.influxEnabled,
                 permissionsGranted = flags.permissionsGranted,

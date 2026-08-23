@@ -2,7 +2,6 @@ package com.bydcollector.collector.ui.compose
 
 import android.content.Context
 import android.graphics.Color as AndroidColor
-import android.graphics.drawable.GradientDrawable
 import android.view.ViewGroup
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -61,7 +60,6 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -79,6 +77,7 @@ import com.bydcollector.collector.maintenance.DbMaintenanceUiState
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.telegram.TelegramNavigatorMask
 import com.bydcollector.collector.ui.DashboardState
+import com.bydcollector.collector.ui.DebugRuntimeStatus
 import com.bydcollector.collector.ui.VehicleKpis
 import com.bydcollector.collector.update.ReleaseNotesSelector
 import com.bydcollector.collector.update.UpdateInfo
@@ -109,6 +108,7 @@ fun BydCollectorApp(
     updateAutoCheckEnabled: Boolean = true,
     updateUiState: UpdateUiState = UpdateUiState.Hidden,
     databaseMaintenanceUiState: DbMaintenanceUiState? = null,
+    diagnosticsBusy: Boolean = false,
     switchConfirmationVersion: Int = 0,
     actions: BydCollectorActions,
     backgroundSetupPromptVisible: Boolean = false,
@@ -166,8 +166,7 @@ fun BydCollectorApp(
                                 AppTab.STORAGE -> StorageTab(state, s, actions) { ids ->
                                     pendingArchiveDeleteIds = ids
                                 }
-                                AppTab.EXTRA -> ExtraTab(state, s, updateAutoCheckEnabled, actions)
-                                AppTab.LOGS -> LogsTab(state, s, actions)
+                                AppTab.EXTRA -> ExtraTab(state, s, updateAutoCheckEnabled, diagnosticsBusy, actions)
                             }
                         }
                     }
@@ -514,8 +513,8 @@ private fun MainStatusCard(state: DashboardState?, strings: UiStrings, actions: 
             StatusRow(strings.mainPolling, mainPollingStatus.text, mainPollingStatus.kind, modifier = Modifier.weight(1f))
             StatusRow(
                 strings.allParameters,
-                if (state?.debugPollingRunning == true) strings.running else strings.waiting,
-                if (state?.debugPollingRunning == true) StatusKind.OK else StatusKind.WAITING,
+                debugRuntimeDisplay(state, strings).first,
+                debugRuntimeDisplay(state, strings).second,
                 modifier = Modifier.weight(1f)
             )
         }
@@ -550,9 +549,10 @@ private fun AllParametersTab(
             SectionCard(
                     title = strings.controls,
                     trailing = {
+                        val debugStatus = debugRuntimeDisplay(state, strings)
                         StatusPill(
-                            if (state?.debugPollingRunning == true) strings.running else strings.waiting,
-                            if (state?.debugPollingRunning == true) StatusKind.OK else StatusKind.WAITING,
+                            debugStatus.first,
+                            debugStatus.second,
                             compact = true
                         )
                     },
@@ -561,8 +561,9 @@ private fun AllParametersTab(
                         .height(262.dp)
                 ) {
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        ActionButton(strings.start, actions::onStartDebug, primary = true, enabled = state?.debugPollingRunning != true, modifier = Modifier.weight(1f))
-                        ActionButton(strings.stop, actions::onStopDebug, enabled = state?.debugPollingRunning == true, modifier = Modifier.weight(1f))
+                        val startAllowed = state == null || state.debugRuntimeStatus in setOf(DebugRuntimeStatus.STOPPED, DebugRuntimeStatus.ERROR)
+                        ActionButton(strings.start, actions::onStartDebug, primary = true, enabled = startAllowed, modifier = Modifier.weight(1f))
+                        ActionButton(strings.stop, actions::onStopDebug, enabled = state?.debugRuntimeStatus == DebugRuntimeStatus.RUNNING, modifier = Modifier.weight(1f))
                     }
                     Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
                         Text(strings.autoStart, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
@@ -576,6 +577,15 @@ private fun AllParametersTab(
             VehicleKpiCard(state?.vehicleKpis, strings, Modifier.weight(2f).height(262.dp))
         }
         DebugDatabaseCard(state, strings, actions, Modifier.fillMaxWidth())
+    }
+}
+
+private fun debugRuntimeDisplay(state: DashboardState?, strings: UiStrings): Pair<String, StatusKind> {
+    return when (state?.debugRuntimeStatus ?: DebugRuntimeStatus.STOPPED) {
+        DebugRuntimeStatus.STOPPED -> strings.stopped to StatusKind.WAITING
+        DebugRuntimeStatus.STARTING -> strings.starting to StatusKind.WAITING
+        DebugRuntimeStatus.RUNNING -> strings.running to StatusKind.OK
+        DebugRuntimeStatus.ERROR -> strings.error to StatusKind.ERROR
     }
 }
 
@@ -607,7 +617,7 @@ private fun DebugDatabaseCard(state: DashboardState?, strings: UiStrings, action
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             InfoRow(strings.success, state?.debugLastReadingAt ?: "-", modifier = Modifier.weight(1f), divider = false)
-            InfoRow(strings.error, state?.debugLastErrorAt ?: state?.debugLastError ?: "-", modifier = Modifier.weight(1f), divider = false)
+            InfoRow(strings.error, state?.debugRuntimeError ?: state?.debugLastErrorAt ?: state?.debugLastError ?: "-", modifier = Modifier.weight(1f), divider = false)
         }
         Row(Modifier.fillMaxWidth()) {
             Spacer(Modifier.weight(1.15f))
@@ -950,6 +960,10 @@ private fun TripRouteDialog(
                     Spacer(Modifier.width(10.dp))
                     Text(strings.colorByConsumption, color = if (metric == TripMapMetric.CONSUMPTION) p.text else p.muted, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.weight(1f))
+                    TripEndpointLegend(R.drawable.ic_trip_start_marker, strings.tripStart)
+                    Spacer(Modifier.width(12.dp))
+                    TripEndpointLegend(R.drawable.ic_trip_finish_marker, strings.tripFinish)
+                    Spacer(Modifier.width(18.dp))
                     ActionButton(strings.close, onDismiss, modifier = Modifier.width(140.dp))
                 }
             }
@@ -1007,7 +1021,7 @@ private fun TripMapView(
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
                 factory = { createTripMap(context) },
-                update = { map -> updateTripMap(map, points, metric, speedGreen, speedYellow, consumptionGreen, consumptionYellow, p.accent.toArgb()) },
+                update = { map -> updateTripMap(map, points, metric, speedGreen, speedYellow, consumptionGreen, consumptionYellow) },
                 onRelease = MapView::onDetach
             )
             Text("© OpenStreetMap contributors", color = p.muted, fontSize = 10.sp, modifier = Modifier.align(Alignment.BottomEnd).background(p.surface.copy(alpha = 0.86f), Rounded8).padding(horizontal = 8.dp, vertical = 4.dp))
@@ -1022,8 +1036,7 @@ private fun updateTripMap(
     speedGreen: Int,
     speedYellow: Int,
     consumptionGreen: Int,
-    consumptionYellow: Int,
-    startColor: Int
+    consumptionYellow: Int
 ) {
     map.overlays.clear()
     val runs = buildList {
@@ -1053,9 +1066,9 @@ private fun updateTripMap(
             map.overlays += line
         }
     }
-    map.overlays += tripMapMarker(map, p.first(), startColor)
+    map.overlays += tripMapMarker(map, p.first(), R.drawable.ic_trip_start_marker)
     if (p.size > 1) {
-        map.overlays += tripMapMarker(map, p.last(), AndroidColor.rgb(255, 140, 140))
+        map.overlays += tripMapMarker(map, p.last(), R.drawable.ic_trip_finish_marker)
     }
     map.post {
         if (p.size == 1) {
@@ -1072,17 +1085,22 @@ private fun updateTripMap(
     map.invalidate()
 }
 
-private fun tripMapMarker(map: MapView, point: TripRoutePointUi, color: Int): Marker =
+private fun tripMapMarker(map: MapView, point: TripRoutePointUi, drawableRes: Int): Marker =
     Marker(map).apply {
         position = GeoPoint(point.latitude, point.longitude)
         setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-        icon = GradientDrawable().apply {
-            shape = GradientDrawable.OVAL
-            setColor(color)
-            val size = (24 * map.resources.displayMetrics.density).toInt()
-            setSize(size, size)
-        }
+        icon = map.context.getDrawable(drawableRes)
     }
+
+@Composable
+private fun TripEndpointLegend(iconRes: Int, label: String) {
+    val p = LocalBydPalette.current
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Image(painterResource(iconRes), contentDescription = null, modifier = Modifier.size(20.dp))
+        Spacer(Modifier.width(6.dp))
+        Text(label, color = p.muted, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
 
 private fun routeColor(value: Double?, green: Double, yellow: Double, speed: Boolean): Int = when {
     value == null -> AndroidColor.GRAY
@@ -1791,6 +1809,7 @@ private fun ExtraTab(
     state: DashboardState?,
     strings: UiStrings,
     updateAutoCheckEnabled: Boolean,
+    diagnosticsBusy: Boolean,
     actions: BydCollectorActions
 ) {
     val optionsCardHeight = 312.dp
@@ -1817,9 +1836,23 @@ private fun ExtraTab(
                     SwitchRow(
                         strings.restoreCollector,
                         state?.recoverCollectorServiceEnabled == true,
-                        actions::onToggleKeepCollector,
-                        divider = false
+                        actions::onToggleKeepCollector
                     )
+                    Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        ActionButton(
+                            strings.startLogcat,
+                            actions::onStartLogcat,
+                            primary = true,
+                            enabled = state?.logRecording != true && !diagnosticsBusy,
+                            modifier = Modifier.weight(1f)
+                        )
+                        ActionButton(
+                            strings.stopLogcat,
+                            actions::onStopLogcat,
+                            enabled = state?.logRecording == true && !diagnosticsBusy,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
                 }
             }
             SectionCard(strings.appRuntime, Modifier.weight(1f).height(optionsCardHeight)) {
@@ -2740,93 +2773,6 @@ private fun List<ReleaseNotesMarkdownSpan>.toAnnotatedString(): AnnotatedString 
 }
 
 @Composable
-private fun LogsTab(state: DashboardState?, strings: UiStrings, actions: BydCollectorActions) {
-    TabScrollColumn {
-        ScreenTitle(strings.logsTab, strings.logsSubtitle)
-        SectionCard(strings.controls, Modifier.fillMaxWidth()) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                ActionButton(strings.startJournal, actions::onStartJournal, primary = true, enabled = state?.logRecording != true, modifier = Modifier.weight(0.35f))
-                ActionButton(strings.stopJournal, actions::onStopJournal, enabled = state?.logRecording == true, modifier = Modifier.weight(0.15f))
-                ActionButton(strings.startLogcat, actions::onStartLogcat, primary = true, enabled = state?.logRecording != true, modifier = Modifier.weight(0.35f))
-                ActionButton(strings.stopLogcat, actions::onStopLogcat, enabled = state?.logRecording == true, modifier = Modifier.weight(0.15f))
-            }
-        }
-        LogsMetricsGrid(state, strings)
-    }
-}
-
-@Composable
-private fun LogsMetricsGrid(state: DashboardState?, strings: UiStrings) {
-    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            LogCard(
-                title = strings.mainPolling,
-                status = if (state?.running == true) strings.running else strings.waiting,
-                kind = if (state?.running == true) StatusKind.OK else StatusKind.WAITING,
-                rows = listOf(
-                    strings.size to UiSizeFormatter.bytes(state?.databaseSizeBytes ?: 0L, strings),
-                    strings.rows to formatCount(state?.valueRowCount ?: 0L),
-                    strings.lastSuccess to (state?.lastSuccessAt ?: "-"),
-                    strings.lastError to (state?.lastErrorAt ?: "-"),
-                    strings.sessionErrors to errorCount(state)
-                ),
-                modifier = Modifier.weight(1f)
-            )
-            LogCard(
-                title = strings.allParameters,
-                status = if (state?.debugPollingRunning == true) strings.running else strings.waiting,
-                kind = if (state?.debugPollingRunning == true) StatusKind.OK else StatusKind.WAITING,
-                rows = listOf(
-                    strings.size to UiSizeFormatter.bytes(state?.debugDatabaseSizeBytes ?: 0L, strings),
-                    strings.rows to formatCount(state?.debugReadingCount ?: 0L),
-                    strings.lastSuccess to (state?.debugLastReadingAt ?: "-"),
-                    strings.lastError to (state?.debugLastErrorAt ?: state?.debugLastError ?: "-"),
-                    strings.sessionErrors to formatCount(state?.debugErrorCount ?: 0L)
-                ),
-                modifier = Modifier.weight(1f)
-            )
-        }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            LogCard(
-                title = "MQTT",
-                status = compactChannelStatusText(state?.mqttStatus, strings),
-                kind = channelStatusKind(state?.mqttStatus, state?.mqttEnabled == true),
-                rows = listOf(
-                    "" to "",
-                    strings.queued to "${state?.mqttPendingCount ?: 0L} ${strings.messages}",
-                    strings.lastSuccess to (state?.mqttLastPublishedAt ?: "-"),
-                    strings.lastError to (state?.mqttRetryLastFailureAt ?: state?.mqttLastError ?: "-"),
-                    strings.sessionErrors to (state?.mqttRetryFailureCount ?: 0).toString()
-                ),
-                modifier = Modifier.weight(1f)
-            )
-            LogCard(
-                title = "InfluxDB",
-                status = compactChannelStatusText(state?.influxStatus, strings),
-                kind = channelStatusKind(state?.influxStatus, state?.influxEnabled == true),
-                rows = listOf(
-                    strings.exported to "${formatCount(state?.influxExportedRowsTotal ?: 0L)} ${strings.points}",
-                    strings.queued to "${formatCount(state?.influxPendingRows ?: 0L)} ${strings.points}",
-                    strings.lastSuccess to (state?.influxLastSuccessAt ?: "-"),
-                    strings.lastError to (state?.influxLastErrorAt ?: state?.influxLastError ?: "-"),
-                    strings.batch to "300"
-                ),
-                modifier = Modifier.weight(1f)
-            )
-        }
-    }
-}
-
-@Composable
-private fun LogCard(title: String, status: String, kind: StatusKind, rows: List<Pair<String, String>>, modifier: Modifier) {
-    SectionCard(title = title, trailing = { StatusPill(status, kind, compact = true) }, modifier = modifier.height(300.dp)) {
-        rows.forEachIndexed { index, row ->
-            InfoRow(row.first, row.second, divider = index != rows.lastIndex)
-        }
-    }
-}
-
-@Composable
 private fun BottomTabs(activeTab: AppTab, strings: UiStrings, actions: BydCollectorActions) {
     val tabs = listOf(
         AppTab.MAIN to (strings.mainTab to BottomTabIcon.HOME),
@@ -2835,8 +2781,7 @@ private fun BottomTabs(activeTab: AppTab, strings: UiStrings, actions: BydCollec
         AppTab.HA to (strings.haTab to BottomTabIcon.HA),
         AppTab.TELEGRAM to (strings.telegram.tab to BottomTabIcon.TELEGRAM),
         AppTab.STORAGE to (strings.storageTab to BottomTabIcon.DATABASE),
-        AppTab.EXTRA to (strings.extraTab to BottomTabIcon.GEAR),
-        AppTab.LOGS to (strings.logsTab to BottomTabIcon.LOGS)
+        AppTab.EXTRA to (strings.extraTab to BottomTabIcon.GEAR)
     )
     val p = LocalBydPalette.current
     Row(

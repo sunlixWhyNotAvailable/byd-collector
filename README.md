@@ -43,7 +43,7 @@ The UI keeps the latest dashboard snapshot in a process-wide cache. Opening or r
 | Trips | Separate local trip history, GPS routes, configurable speed/consumption colours, and an online OpenStreetMap view |
 | SQLite and archives | Compact-v2 raw/normalized stores, crash-safe database cutover, ZIP archives, sharing, and a shared archive limit |
 | Runtime | Background recovery, optional Tailscale activation, network/Bluetooth keep-alive controls, and explicit shutdown |
-| Diagnostics | Local journal and logcat recording, status/error history, and selected archive sharing |
+| Diagnostics | User-started full-system logcat under `Options -> Keep alive`, local status/error history, and selected archive sharing |
 
 The app UI is available in English and Ukrainian and supports dark and light themes.
 
@@ -79,7 +79,7 @@ Round-robin storage is cut over and checked before a debug session starts. Stopp
 
 The `Trips` tab stores power-on to confirmed-power-off sessions in a separate app-private `bydcollector_trips.db`. It keeps only trip summaries and GPS route points/gaps; it does not duplicate the full Main telemetry catalogue. Zero-motion sessions remain stored but are hidden from the ordinary list.
 
-Route recording uses Android's GPS provider after the user grants location access. During serialized first-run setup, the app requests fine/coarse location once before the ADB authorization step; after a denial, access must be granted later in Android settings. Mock, invalid, stale, clock-skewed, or physically impossible fixes are retained only as diagnostics and become route gaps. After a rejection, callback outage, or location-source restart, three mutually consistent fresh fixes are required before location is trusted again. The map uses online OpenStreetMap tiles, fits the trusted route, and can colour segments by speed or instantaneous consumption. Defaults are speed colouring with `90/30 km/h` thresholds and consumption thresholds of `15/20 kWh/100 km`.
+Route recording uses Android's GPS provider after the user grants location access. During serialized first-run setup, the app requests fine/coarse location once before the ADB authorization step; after a denial, access must be granted later in Android settings. Mock, invalid, stale, clock-skewed, or physically impossible fixes are retained only as diagnostics and become route gaps. After a rejection, callback outage, or location-source restart, three mutually consistent fresh fixes are required before location is trusted again. The map uses online OpenStreetMap tiles, fits the trusted route, and can colour segments by speed or instantaneous consumption. A compact blue dot marks Start; a neutral circle with a white flag marks Finish, with a matching localized legend in the lower control row. Defaults are speed colouring with `90/30 km/h` thresholds and consumption thresholds of `15/20 kWh/100 km`.
 
 There is currently no automatic trip-route retention or trip-database archive action. The maintainer will measure the real database/WAL footprint after several days before selecting a retention policy.
 
@@ -155,6 +155,7 @@ The `Options` tab contains operational controls rather than vehicle-control comm
 - enable automatic start for main collection, All data, MQTT, and InfluxDB where shown;
 - keep Wi-Fi, mobile data, or Bluetooth available while the runtime is active;
 - restore the collector service after supported process/boot events;
+- start or stop the single full-system logcat recorder at the bottom of `Keep alive`;
 - grant and verify the notification-listener lifecycle anchor through the app's local-ADB repair flow; the service reads no notification payloads;
 - keep Wi-Fi and mobile data enabled from the separate detached keep-alive helper every 30 seconds when their switches are enabled;
 - optionally detect and activate Tailscale when a configured endpoint is unreachable, with a delayed launch and foreground-task restoration; and
@@ -164,15 +165,13 @@ The app's keep-alive path is recovery-oriented and idempotent. It does not write
 
 <p align="center"><img src="docs/screenshots/en/options.png" alt="BYD Collector options and runtime settings" width="100%"></p>
 
-## Logs and privacy
+## Diagnostics and privacy
 
-The `Logs` tab is intentionally not a continuously refreshing log viewer. Start the journal or logcat recorder when investigating a reproducible issue, stop it when finished, and use the status cards for last success, last error, and session errors. Logcat capture uses the authorized loopback ADB stream with the exact full-system command `logcat -b all -v threadtime`; it does not silently fall back to a PID-filtered app-only file.
+There is no separate `Logs` tab or duplicate Journal mode. Start and stop the one logcat recorder at the bottom of `Options -> Keep alive` when investigating a reproducible issue. Start waits for the completed ADB authorization check, and recorder start/stop plus snapshot/ZIP work runs away from the UI thread. Capture uses the exact full-system command `logcat -b all -v threadtime`; it does not silently fall back to a PID-filtered app-only file.
 
 Diagnostics stay local unless you explicitly share an archive through the Android chooser. A selected archive can contain raw telemetry, Chinese field names/descriptions, timestamps, quality/failure metadata, vehicle-state history, network endpoint settings, and logcat output if recording was enabled. Review the archive contents and remove unrelated days before sharing. Do not publish bot tokens, passwords, private addresses, or precise trip/location data.
 
 The collector does not automatically upload telemetry, screenshots, crash reports, or logcat to the project. MQTT, InfluxDB, and Telegram are opt-in destinations configured by the user. Read the complete data-handling policy in [PRIVACY.md](PRIVACY.md).
-
-<p align="center"><img src="docs/screenshots/en/logs.png" alt="BYD Collector logs and diagnostics" width="100%"></p>
 
 ## Installation and ADB
 
@@ -205,7 +204,7 @@ ADB is required for direct vehicle reads and for the helper startup. Without an 
 - Press `Grant ADB` and accept the RSA prompt again if Android asks.
 - Set `Disable background Apps -> BYD Collector` to `OFF`.
 - Stop another copy of the collector or an app that may own the local ADB session, then start Main again.
-- Check `Logs` after starting a journal; the UI does not show detailed logcat until recording starts.
+- Start logcat under `Options -> Keep alive`, reproduce the issue, then stop it to finish the diagnostic bundle.
 
 ### Main is successful but a value is blank, stale, or unknown
 
@@ -239,9 +238,9 @@ Open a [GitHub issue](https://github.com/sunlixWhyNotAvailable/byd-collector/iss
 - vehicle model/year, market, DiLink version, and tablet firmware;
 - whether ADB was authorized and which tab/status failed;
 - the approximate local time, expected behavior, and observed behavior; and
-- the smallest relevant selected database archive or Logs archive, after removing secrets and unrelated trips.
+- the smallest relevant selected database or diagnostic archive, after removing secrets and unrelated trips.
 
-For a collection problem, reproduce it once with a journal running. For an integration problem, include the channel status and endpoint type without posting credentials. For a catalog discovery, include the All data archive and explain how the value changed; changing alone is not proof of semantics.
+For a collection problem, reproduce it once with full-system logcat recording. For an integration problem, include the channel status and endpoint type without posting credentials. For a catalog discovery, include the All data archive and explain how the value changed; changing alone is not proof of semantics.
 
 Archives can expose vehicle identifiers, raw Chinese descriptions, timestamps, trips, and location-related values. Review the warning and share the minimum necessary data.
 

@@ -51,12 +51,17 @@ class BydCollectorApplication : Application() {
 
     @Synchronized
     fun ensureDebugStorageReady(): Boolean {
-        return debugStorageReady ?: coordinator().ensureDebugReady().also { debugStorageReady = it }
+        return debugStorageReady ?: coordinator().ensureDebugReady().also { ready ->
+            debugStorageReady = ready.takeIf { it }
+        }
     }
 
     @Synchronized
+    fun isDebugStorageReady(): Boolean = debugStorageReady == true
+
+    @Synchronized
     fun setDebugStorageReadyAfterMaintenance(ready: Boolean) {
-        debugStorageReady = ready
+        debugStorageReady = ready.takeIf { it }
         CollectorSettings(applicationContext).setDebugStorageCutoverError(if (ready) null else "Debug database verification failed")
     }
 
@@ -75,6 +80,10 @@ class BydCollectorApplication : Application() {
 
         fun ensureDebugStorageReady(context: Context): Boolean {
             return (context.applicationContext as BydCollectorApplication).ensureDebugStorageReady()
+        }
+
+        fun isDebugStorageReady(context: Context): Boolean {
+            return (context.applicationContext as BydCollectorApplication).isDebugStorageReady()
         }
     }
 

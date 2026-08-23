@@ -69,6 +69,7 @@ import com.bydcollector.collector.ui.DashboardRowCounts
 import com.bydcollector.collector.ui.DashboardRuntimeFlags
 import com.bydcollector.collector.ui.DashboardStateProvider
 import com.bydcollector.collector.ui.DashboardUiStateStore
+import com.bydcollector.collector.ui.DebugRuntimeStatus
 import com.bydcollector.collector.ui.DisplayTimeFormatter
 import com.bydcollector.collector.ui.VehicleKpiLanguage
 import com.bydcollector.collector.ui.VehicleKpiMapper
@@ -104,6 +105,8 @@ class CollectorService : Service() {
     private lateinit var dashboardStateProvider: DashboardStateProvider
     private var mainPollerOwnerMode = DirectHelperOwnerMode.APP_GAP_SPOOL
     private var debugStorageReady = false
+    @Volatile private var debugRuntimeStatus = DebugRuntimeStatus.STOPPED
+    @Volatile private var debugRuntimeError: String? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var sessionId: Long? = null
     private var debugPoller: DirectDebugRoundRobinPoller? = null
@@ -222,7 +225,7 @@ class CollectorService : Service() {
         running.set(true)
         store = BydCollectorApplication.store(applicationContext)
         settings = CollectorSettings(applicationContext, store)
-        debugStorageReady = BydCollectorApplication.ensureDebugStorageReady(applicationContext)
+        debugStorageReady = BydCollectorApplication.isDebugStorageReady(applicationContext)
         debugStore = DirectDebugStore(applicationContext, DirectDebugDatabaseHelper(applicationContext))
         dashboardUiStateStore = BydCollectorApplication.dashboardUiStateStore(applicationContext)
         dashboardStateProvider = DashboardStateProvider(applicationContext, { store }, settings)
@@ -659,18 +662,24 @@ class CollectorService : Service() {
 
     private fun startDebugIfNeeded(reason: String) {
         if (maintenanceBlocksRuntimeStart(debugRuntime = true)) return
-        if (!debugStorageReady) {
-            updateNotification("Polling error: debug database cutover required")
-            return
-        }
         if (isDebugPollerRunning()) {
-            debugRunning.set(true)
-            publishDashboardRuntimeFlags()
+            setDebugRuntime(DebugRuntimeStatus.RUNNING)
             return
         }
         if (!debugStartInProgress.compareAndSet(false, true)) return
+        setDebugRuntime(DebugRuntimeStatus.STARTING)
         debugStartExecutor.execute {
             try {
+                //Readiness failures are deliberately retried only when a start is requested.
+                debugStorageReady = BydCollectorApplication.ensureDebugStorageReady(applicationContext)
+                if (!debugStorageReady) {
+                    val detail = settings.debugStorageCutoverError() ?: "Debug database readiness failed"
+                    setDebugRuntime(DebugRuntimeStatus.ERROR, detail)
+                    store.recordEvent("debug_polling_start_error", "Debug database is not ready", detail)
+                    updateNotification("Polling error: $detail")
+                    return@execute
+                }
+                scheduleDashboardCountBootstrap(force = true)
                 val parameters = DirectDebugParameterAsset.load(applicationContext)
                 val helper = DirectVehicleHelperClient()
                 val launch = DirectBridgeManager.ensureRunning(
@@ -680,6 +689,7 @@ class CollectorService : Service() {
                     ownerMode = settings.mainHelperOwnerMode()
                 )
                 if (!launch.ok) {
+                    setDebugRuntime(DebugRuntimeStatus.ERROR, launch.message)
                     store.recordEvent("debug_polling_start_error", "Debug direct helper unavailable", launch.message)
                     updateNotification("Polling error: ${PollingErrorSummaries.summary(launch.message)}")
                     return@execute
@@ -748,8 +758,7 @@ class CollectorService : Service() {
                         } else {
                             nextPoller.start(batchSize)
                             debugPoller = nextPoller
-                            debugRunning.set(true)
-                            publishDashboardRuntimeFlags()
+                            setDebugRuntime(DebugRuntimeStatus.RUNNING)
                             true
                         }
                     }
@@ -764,10 +773,12 @@ class CollectorService : Service() {
                     "reason=$reason batch_size=$batchSize parameters=${parameters.size}"
                 )
             } catch (error: RuntimeException) {
+                val detail = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                setDebugRuntime(DebugRuntimeStatus.ERROR, detail)
                 store.recordEvent(
                     "debug_polling_start_error",
                     "Debug round-robin startup failed",
-                    "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                    detail
                 )
                 updateNotification("Polling error: debug startup failed")
             } finally {
@@ -1019,7 +1030,13 @@ class CollectorService : Service() {
 
     private fun stopDebug(reason: String) {
         detachDebugPoller()?.shutdown(reason)
-        debugRunning.set(false)
+        setDebugRuntime(DebugRuntimeStatus.STOPPED)
+    }
+
+    private fun setDebugRuntime(status: DebugRuntimeStatus, error: String? = null) {
+        debugRuntimeStatus = status
+        debugRuntimeError = error
+        debugRunning.set(status == DebugRuntimeStatus.RUNNING)
         publishDashboardRuntimeFlags()
     }
 
@@ -1068,6 +1085,8 @@ class CollectorService : Service() {
                 serviceRunning = running.get(),
                 mainPollingRunning = mainPollingRunning.get(),
                 debugPollingRunning = debugRunning.get(),
+                debugRuntimeStatus = debugRuntimeStatus,
+                debugRuntimeError = debugRuntimeError,
                 pollingEnabled = settings.isPollingEnabled(),
                 debugPollingEnabled = settings.isDebugPollingEnabled(),
                 mqttEnabled = settings.isMqttEnabled(),
@@ -1295,8 +1314,7 @@ class CollectorService : Service() {
         requireRuntimeOwner()
         if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
             val detachedDebugPoller = detachDebugPoller()
-            debugRunning.set(false)
-            publishDashboardRuntimeFlags()
+            setDebugRuntime(DebugRuntimeStatus.STOPPED)
             return DetachedMaintenanceRuntime(debugPoller = detachedDebugPoller)
         }
 
@@ -1308,7 +1326,7 @@ class CollectorService : Service() {
         val openedSessionId = sessionId
         sessionId = null
         mainPollingRunning.set(false)
-        debugRunning.set(false)
+        setDebugRuntime(DebugRuntimeStatus.STOPPED)
         mqttRuntimeActive.set(false)
         mqttOfflineQueued.set(false)
         publishDashboardRuntimeFlags()

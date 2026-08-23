@@ -36,7 +36,7 @@ class MainActivityKpiRefreshContractTest {
         assertEquals(1_000L, dashboardTabRefreshIntervalMs(AppTab.STORAGE, storageRefreshPending = true))
         assertNull(dashboardTabRefreshIntervalMs(AppTab.TELEGRAM, storageRefreshPending = false))
         assertNull(dashboardTabRefreshIntervalMs(AppTab.EXTRA, storageRefreshPending = false))
-        assertEquals(5_000L, dashboardTabRefreshIntervalMs(AppTab.LOGS, storageRefreshPending = false))
+        assertEquals(7, AppTab.entries.size)
         assertTrue(dashboardSnapshotDue(null, 2_000L, 5_000L))
         assertFalse(dashboardSnapshotDue(4_000L, 2_000L, 5_000L))
         assertTrue(dashboardSnapshotDue(3_000L, 2_000L, 5_000L))

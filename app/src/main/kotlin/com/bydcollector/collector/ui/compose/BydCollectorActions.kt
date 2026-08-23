@@ -193,8 +193,6 @@ interface BydCollectorActions {
     fun onInstallUpdate()
     fun onShutdownApp()
 
-    fun onStartJournal()
-    fun onStopJournal()
     fun onStartLogcat()
     fun onStopLogcat()
 }

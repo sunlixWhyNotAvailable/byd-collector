@@ -50,7 +50,13 @@ class AccessWorkflowContractTest {
         assertInOrder(method(source, "override fun onStartDebug", "override fun onStopDebug"), "requestAccessCheck", "CollectorServiceController.startDebug")
         assertInOrder(method(source, "override fun onStartMqtt", "override fun onStopMqtt"), "requestAccessCheck", "CollectorServiceController.startMqttExport")
         assertInOrder(method(source, "override fun onStartInflux", "override fun onStopInflux"), "requestAccessCheck", "CollectorServiceController.startInfluxExport")
-        assertInOrder(method(source, "private fun startDiagnostics", "private fun stopDiagnostics"), "requestAccessCheck", "DiagnosticLogRecorder.start")
+        val logcatStart = method(source, "private fun startLogcatRecording", "private fun stopLogcatRecording")
+        assertInOrder(logcatStart, "requestAccessCheck", "AdbAuthorizationManager.currentSnapshot().adbAuthorized")
+        assertInOrder(logcatStart, "AdbAuthorizationManager.currentSnapshot().adbAuthorized", "diagnosticsExecutor.execute")
+        assertInOrder(logcatStart, "diagnosticsExecutor.execute", "DiagnosticLogRecorder.start")
+        assertTrue(logcatStart.contains("if (!submitted)"))
+        assertTrue(source.contains("private var diagnosticsBusy by mutableStateOf(false)"))
+        assertTrue(source.contains("diagnosticsExecutor.shutdownNow()"))
     }
 
     @Test

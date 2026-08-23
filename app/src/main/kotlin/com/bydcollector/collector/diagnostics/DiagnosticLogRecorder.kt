@@ -66,6 +66,8 @@ object DiagnosticLogRecorder {
                     "command=$LOGCAT_COMMAND\n",
                 Charsets.UTF_8
             )
+            writeLatestZip(context, runDir)
+            throw IllegalStateException("Full system logcat unavailable: ${error.message ?: error::class.java.simpleName}", error)
         }
         return runDir
     }

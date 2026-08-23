@@ -10,15 +10,14 @@ import com.bydcollector.collector.data.trips.TripId
 import com.bydcollector.collector.data.trips.TripMetrics
 import com.bydcollector.collector.data.trips.TripSession
 import com.bydcollector.collector.data.trips.TripStore
+import com.bydcollector.collector.data.trips.TripTime
 import com.bydcollector.collector.location.AndroidGpsLocationSource
 import com.bydcollector.collector.location.GpsLocationSample
 import com.bydcollector.collector.location.GpsLocationSink
 import com.bydcollector.collector.location.LocationNormalizer
 import com.bydcollector.collector.util.namedSingleThreadExecutor
 import java.io.File
-import java.time.Duration
 import java.time.Instant
-import java.time.OffsetDateTime
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -219,7 +218,7 @@ class TripRuntimeCoordinator(
         val distance = TripMetrics.delta(startOdometer, lastOdometer)
             .takeUnless { "odometer_reset" in quality }
         val energy = energyUpdate.accumulatedKwh
-        val duration = durationMs(current.startedAt, timestamp)
+        val duration = TripTime.durationMs(current.startedAt, timestamp)
         session = current.copy(
             movementObserved = current.movementObserved || (snapshot.speedKmh ?: 0.0) > MOVEMENT_THRESHOLD_KMH,
             startSoc = startSoc,
@@ -361,7 +360,7 @@ class TripRuntimeCoordinator(
     private fun RoutePoint.toGpsSample(): GpsLocationSample? {
         val lat = latitude ?: return null
         val lon = longitude ?: return null
-        val wall = runCatching { Instant.parse(observedAt).toEpochMilli() }.getOrDefault(0L)
+        val wall = TripTime.instant(observedAt)?.toEpochMilli() ?: 0L
         return GpsLocationSample(
             observedAt = observedAt,
             wallTimeMs = wall,
@@ -392,10 +391,6 @@ class TripRuntimeCoordinator(
         private const val TELEMETRY_FRESH_MS = 2_000L
         private const val COUNTER_EPSILON = 1e-6
 
-        private fun durationMs(startedAt: String, endedAt: String): Long? = runCatching {
-            Duration.between(Instant.parse(startedAt), Instant.parse(endedAt)).toMillis().coerceAtLeast(0L)
-        }.getOrNull()
-
         private fun readBootId(): String = runCatching {
             File("/proc/sys/kernel/random/boot_id").readText().trim().ifBlank { "unknown" }
         }.getOrDefault("unknown")
@@ -407,6 +402,6 @@ internal fun isLiveTripTelemetryTimestamp(
     nowMs: Long = System.currentTimeMillis(),
     maxAgeMs: Long = 10_000L
 ): Boolean = runCatching {
-    val capturedAtMs = OffsetDateTime.parse(timestamp).toInstant().toEpochMilli()
+    val capturedAtMs = TripTime.instant(timestamp)?.toEpochMilli() ?: return@runCatching false
     capturedAtMs <= nowMs && nowMs - capturedAtMs <= maxAgeMs
 }.getOrDefault(false)

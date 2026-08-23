@@ -6,6 +6,7 @@ import android.util.Log
 import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.adb.AdbAuthorizationManager
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
+import com.bydcollector.collector.data.debug.DirectDebugParameterAsset
 import com.bydcollector.collector.data.debug.DirectDebugStatus
 import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.data.local.CollectorEvent
@@ -77,7 +78,7 @@ class DashboardStateProvider(
         }
         val debugStatusRequested = profile.readsDebugStatus && !debugMaintenanceRunning
         val debugStatusLoaded = debugStatusRequested &&
-            BydCollectorApplication.ensureDebugStorageReady(context)
+            BydCollectorApplication.isDebugStorageReady(context)
         val debugStatus = if (debugStatusLoaded) {
             debugStatusCache.get(nowMs = nowMs) {
                 DirectDebugStore(context).use { debugStore ->
@@ -87,7 +88,7 @@ class DashboardStateProvider(
         } else {
             lightweightDebugStatus()
         }
-        val debugParameterCount = if (debugStatusLoaded) debugStatus.candidateCount else 0
+        val debugParameterCount = DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT
         val runtimeSettingsLoaded = profile.readsRuntimeSettings
         val keepAliveConfig = if (runtimeSettingsLoaded) settings.keepAliveConfig() else null
         val integrationSettingsLoaded = profile.readsIntegrationSettings
@@ -179,6 +180,12 @@ class DashboardStateProvider(
             logRecording = DiagnosticLogRecorder.isRecording(),
             debugPollingEnabled = if (runtimeSettingsLoaded) settings.isDebugPollingEnabled() else false,
             debugPollingRunning = CollectorService.isDebugRunning(),
+            debugRuntimeStatus = if (CollectorService.isDebugRunning()) {
+                DebugRuntimeStatus.RUNNING
+            } else {
+                DebugRuntimeStatus.STOPPED
+            },
+            debugRuntimeError = null,
             debugAutoStartEnabled = if (runtimeSettingsLoaded) settings.isDebugAutoStartEnabled() else false,
             debugParameterCount = debugParameterCount,
             debugDatabasePath = debugStatus.databasePath,
@@ -267,7 +274,7 @@ class DashboardStateProvider(
             integrationSettingsLoaded = integrationSettingsLoaded,
             runtimeSettingsLoaded = runtimeSettingsLoaded,
             archiveDetailsLoaded = archiveDetailsLoaded
-        )
+        ).copy(debugParameterCount = DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT)
     }
 
     fun invalidateArchiveStorageSnapshot() {
@@ -414,7 +421,7 @@ class DashboardStateProvider(
 
     private fun lightweightDebugStatus(): DirectDebugStatus {
         val dbFile = context.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME)
-        //keeps debug card geometry stable without reading round-robin history outside debug/log tabs
+        //keeps debug card geometry stable without reading round-robin history outside All data
         return DirectDebugStatus(
             databasePath = dbFile.absolutePath,
             databaseSizeBytes = sqliteFootprintBytes(dbFile),

@@ -16,6 +16,21 @@ class CollectorServiceDebugPollerContractTest {
     }
 
     @Test
+    fun debugStartRetriesStorageInsideTheStartExecutorAndPublishesRuntimeStates() {
+        val source = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val start = source.substringAfter("private fun startDebugIfNeeded").substringBefore("private fun handleStartFailure")
+
+        assertTrue(start.contains("debugStartExecutor.execute"))
+        assertTrue(start.contains("BydCollectorApplication.ensureDebugStorageReady(applicationContext)"))
+        assertTrue(start.contains("DebugRuntimeStatus.STARTING"))
+        assertTrue(start.contains("DebugRuntimeStatus.ERROR"))
+        assertTrue(start.contains("DebugRuntimeStatus.RUNNING"))
+        assertTrue(source.contains("setDebugRuntime(DebugRuntimeStatus.STOPPED)"))
+        assertTrue(start.contains("settings.debugStorageCutoverError()"))
+        assertTrue(!start.contains("if (!debugStorageReady) {\n            updateNotification"))
+    }
+
+    @Test
     fun debugPollerIsProtectedByLockAndRecheckedBeforeAsyncStart() {
         val source = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
         val start = source.substringAfter("private fun startDebugIfNeeded").substringBefore("private fun handleStartFailure")

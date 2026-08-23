@@ -165,17 +165,19 @@ class StorageFormatCutoverContractTest {
         assertInOrder(store, "telemetryStore?.let", "coordinator().ensureMainReady()", "TelemetryStore(")
         assertTrue(app.contains("fun ensureDebugStorageReady(context: Context): Boolean"))
         assertTrue(app.contains("debugStorageReady ?: coordinator().ensureDebugReady()"))
+        assertTrue(app.contains("debugStorageReady = ready.takeIf { it }"))
     }
 
     @Test
-    fun serviceGatesDebugBeforeOpenAndRetriesPendingArchiveCompression() {
+    fun serviceDefersDebugReadinessToStartAndRetriesPendingArchiveCompression() {
         val service = source("com/bydcollector/collector/service/CollectorService.kt")
         val onCreate = service.substringAfter("override fun onCreate()").substringBefore("override fun onStartCommand")
         val startDebug = service.substringAfter("private fun startDebugIfNeeded").substringBefore("private fun stopDebug")
         val archive = service.substringAfter("private fun enqueueArchiveStorageMaintenance").substringBefore("private fun enqueueArchiveDelete")
 
-        assertInOrder(onCreate, "ensureDebugStorageReady(applicationContext)", "DirectDebugStore(")
-        assertTrue(startDebug.contains("if (!debugStorageReady)"))
+        assertInOrder(onCreate, "isDebugStorageReady(applicationContext)", "DirectDebugStore(")
+        assertFalse(onCreate.contains("ensureDebugStorageReady(applicationContext)"))
+        assertInOrder(startDebug, "ensureDebugStorageReady(applicationContext)", "if (!debugStorageReady)")
         assertTrue(service.contains("reconcilePendingCutoverArchiveStorage(action)"))
         assertInOrder(archive, "compressPendingRawArchives", "check(!rawArchiveRemains)", "enforceRetention", "setCutoverArchiveStoragePending(false)")
     }

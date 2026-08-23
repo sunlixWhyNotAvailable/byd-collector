@@ -44,7 +44,7 @@ class DashboardUiStateStoreTest {
 
         assertEquals(first, store.currentChrome())
         assertEquals(refreshed, store.currentTab(AppTab.MAIN))
-        assertEquals(first, store.currentTab(AppTab.LOGS))
+        assertEquals(first, store.currentTab(AppTab.EXTRA))
     }
 
     @Test
@@ -93,7 +93,7 @@ class DashboardUiStateStoreTest {
 
         assertEquals(chrome, store.chromeState.value?.state)
         assertEquals(main, store.tabState(AppTab.MAIN).value?.state)
-        assertEquals(chrome, store.tabState(AppTab.LOGS).value?.state)
+        assertEquals(chrome, store.tabState(AppTab.EXTRA).value?.state)
         assertNotSame(store.chromeState, store.tabState(AppTab.MAIN))
     }
 
@@ -165,6 +165,7 @@ class DashboardUiStateStoreTest {
         assertEquals("runtime-error", state.influxStatus)
         assertTrue(state.mqttEnabled)
         assertTrue(state.influxEnabled)
+        assertEquals(DebugRuntimeStatus.RUNNING, state.debugRuntimeStatus)
         assertEquals(100L, state.databaseSizeBytes)
         assertEquals(200L, state.debugDatabaseSizeBytes)
         assertTrue(state.dbMaintenanceStatus.running)
@@ -194,9 +195,6 @@ class DashboardUiStateStoreTest {
         store.incrementMainRowCounts(pollRows = 1L, valueRows = 1L)
         store.incrementDebugReadingCount(1L)
 
-        assertEquals(UNKNOWN_DASHBOARD_COUNT, store.currentTab(AppTab.LOGS)?.pollCount)
-        assertEquals(UNKNOWN_DASHBOARD_COUNT, store.currentTab(AppTab.LOGS)?.valueRowCount)
-        assertEquals(UNKNOWN_DASHBOARD_COUNT, store.currentTab(AppTab.LOGS)?.debugReadingCount)
         assertTrue(store.beginCountBootstrap() != null)
         assertNull(store.beginCountBootstrap())
     }

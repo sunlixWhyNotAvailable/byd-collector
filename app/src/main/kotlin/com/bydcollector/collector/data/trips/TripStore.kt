@@ -3,7 +3,7 @@ package com.bydcollector.collector.data.trips
 import android.content.ContentValues
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
-import java.time.OffsetDateTime
+import java.time.Instant
 
 class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable {
     fun upsertSession(session: TripSession) {
@@ -58,10 +58,17 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable {
             emptyArray()
         )
         return rows.groupBy { summary ->
-            val date = runCatching { OffsetDateTime.parse(summary.startedAt).toLocalDate() }.getOrNull()
+            val date = TripTime.localDate(summary.startedAt)
             date?.let { Triple(it.year, it.monthValue, it.dayOfMonth) } ?: Triple(0, 0, 0)
         }.entries.sortedWith(compareByDescending<Map.Entry<Triple<Int, Int, Int>, List<TripSummary>>> { it.key.first }.thenByDescending { it.key.second }.thenByDescending { it.key.third })
-            .map { (date, trips) -> TripDayGroup(date.first, date.second, date.third, trips.sortedByDescending { it.startedAt }) }
+            .map { (date, trips) ->
+                TripDayGroup(
+                    date.first,
+                    date.second,
+                    date.third,
+                    trips.sortedWith(compareByDescending<TripSummary> { TripTime.instant(it.startedAt) ?: Instant.MIN }.thenByDescending { it.startedAt })
+                )
+            }
     }
 
     fun queryRoutePoints(tripId: String): List<RoutePoint> = helper.readableDatabase.rawQuery(

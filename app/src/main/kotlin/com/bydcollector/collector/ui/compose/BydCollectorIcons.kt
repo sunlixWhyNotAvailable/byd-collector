@@ -15,8 +15,7 @@ enum class BottomTabIcon {
     HA,
     TELEGRAM,
     STORAGE,
-    GEAR,
-    LOGS
+    GEAR
 }
 
 @Composable
@@ -48,7 +47,6 @@ private fun BottomTabIcon.drawableRes(): Int = when (this) {
     BottomTabIcon.TELEGRAM -> R.drawable.ic_tab_telegram
     BottomTabIcon.STORAGE -> R.drawable.ic_tab_storage
     BottomTabIcon.GEAR -> R.drawable.ic_tab_options
-    BottomTabIcon.LOGS -> R.drawable.ic_tab_logs
 }
 
 @Composable

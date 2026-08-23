@@ -31,6 +31,16 @@ class MainActivityInitialDashboardStateContractTest {
         assertTrue(activity.contains("val tabSnapshot by dashboardUiStateStore.tabState(activeTab).collectAsStateWithLifecycle()"))
     }
 
+    @Test
+    fun dashboardCountBootstrapNeverRetriesDebugStorageReadiness() {
+        val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val bootstrap = activity.substringAfter("private fun scheduleDashboardCountBootstrap")
+            .substringBefore("private fun hydrateDashboardTabsOnce")
+
+        assertTrue(bootstrap.contains("BydCollectorApplication.isDebugStorageReady(applicationContext)"))
+        assertFalse(bootstrap.contains("BydCollectorApplication.ensureDebugStorageReady(applicationContext)"))
+    }
+
     private fun sourceFile(path: String): File {
         return listOf(
             File("src/main/kotlin/$path"),

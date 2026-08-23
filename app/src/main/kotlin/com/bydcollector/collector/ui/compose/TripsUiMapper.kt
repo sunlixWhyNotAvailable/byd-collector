@@ -4,10 +4,9 @@ import com.bydcollector.collector.data.trips.RoutePoint
 import com.bydcollector.collector.data.trips.TripDayGroup
 import com.bydcollector.collector.data.trips.TripMetrics
 import com.bydcollector.collector.data.trips.TripSummary
-import java.time.Duration
+import com.bydcollector.collector.data.trips.TripTime
 import java.time.LocalDate
 import java.time.Month
-import java.time.OffsetDateTime
 import java.time.format.DateTimeFormatter
 import java.time.format.TextStyle
 import java.util.Locale
@@ -58,13 +57,13 @@ object TripsUiMapper {
     }
 
     private fun TripSummary.toUi(route: List<RoutePoint>): TripSummaryUi {
-        val start = parse(startedAt)
-        val end = endedAt?.let(::parse)
+        val start = TripTime.localTime(startedAt)
+        val end = endedAt?.let(TripTime::localTime)
         return TripSummaryUi(
             id = tripId,
-            startAt = start?.toLocalTime()?.withNano(0)?.toString() ?: startedAt,
-            endAt = end?.toLocalTime()?.withNano(0)?.toString() ?: "—",
-            duration = formatDuration(durationMs ?: durationBetween(start, end)),
+            startAt = start?.withNano(0)?.toString() ?: startedAt,
+            endAt = end?.withNano(0)?.toString() ?: "—",
+            duration = formatDuration(durationMs ?: endedAt?.let { TripTime.durationMs(startedAt, it) }),
             distanceKm = distanceKm,
             socStart = startSoc,
             socEnd = endSoc,
@@ -82,8 +81,6 @@ object TripsUiMapper {
         )
     }
 
-    private fun parse(value: String): OffsetDateTime? = runCatching { OffsetDateTime.parse(value) }.getOrNull()
-
     private fun monthTitle(year: Int, month: Int, locale: Locale): String = runCatching {
         Month.of(month).getDisplayName(TextStyle.FULL_STANDALONE, locale)
             .replaceFirstChar { it.titlecase(locale) } + " $year"
@@ -97,9 +94,6 @@ object TripsUiMapper {
             DateTimeFormatter.ofPattern("MMMM d, EEEE", locale).format(date)
         }
     }.getOrDefault(day.toString().padStart(2, '0'))
-
-    private fun durationBetween(start: OffsetDateTime?, end: OffsetDateTime?): Long? =
-        if (start == null || end == null) null else Duration.between(start, end).toMillis().coerceAtLeast(0L)
 
     private fun formatDuration(durationMs: Long?): String {
         if (durationMs == null) return "—"

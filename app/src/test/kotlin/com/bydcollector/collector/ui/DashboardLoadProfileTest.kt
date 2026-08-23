@@ -22,13 +22,11 @@ class DashboardLoadProfileTest {
         assertEquals(HealthSnapshotDetail.SUMMARY, DashboardLoadProfile.ALL_PARAMETERS.healthDetail)
         assertEquals(HealthSnapshotDetail.INTEGRATIONS, DashboardLoadProfile.MAIN.healthDetail)
         assertEquals(HealthSnapshotDetail.INTEGRATIONS, DashboardLoadProfile.HA.healthDetail)
-        assertEquals(HealthSnapshotDetail.FULL, DashboardLoadProfile.LOGS.healthDetail)
         assertTrue(DashboardLoadProfile.ALL_PARAMETERS.readsDebugStatus)
-        assertTrue(DashboardLoadProfile.LOGS.readsDebugStatus)
         assertFalse(DashboardLoadProfile.MAIN.readsDebugStatus)
         assertTrue(DashboardLoadProfile.ALL_PARAMETERS.readsVehicleKpis)
         assertFalse(DashboardLoadProfile.MAIN.readsVehicleKpis)
-        assertFalse(DashboardLoadProfile.LOGS.readsVehicleKpis)
+        assertFalse(DashboardLoadProfile.entries.any { it.name == "LOGS" })
         assertTrue(DashboardLoadProfile.STORAGE.readsArchiveDetails)
         assertFalse(DashboardLoadProfile.MAIN.readsArchiveDetails)
     }
@@ -47,14 +45,15 @@ class DashboardLoadProfileTest {
     }
 
     @Test
-    fun debugStorageGateRunsBeforeAnyDashboardDebugDatabaseOpen() {
+    fun dashboardDebugStatusUsesOnlyCachedReadinessBeforeAnyDatabaseOpen() {
         val source = sourceFile("com/bydcollector/collector/ui/DashboardStateProvider.kt").readText()
-        val gate = source.indexOf("BydCollectorApplication.ensureDebugStorageReady(context)")
+        val gate = source.indexOf("BydCollectorApplication.isDebugStorageReady(context)")
         val open = source.indexOf("DirectDebugStore(context).use")
 
         assertTrue(gate >= 0)
         assertTrue(open > gate)
         assertTrue(source.contains("val debugStatusLoaded = debugStatusRequested &&"))
+        assertFalse(source.contains("BydCollectorApplication.ensureDebugStorageReady(context)"))
     }
 
     @Test

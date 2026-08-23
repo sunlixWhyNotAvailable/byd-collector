@@ -3,6 +3,7 @@ package com.bydcollector.collector.ui.compose
 import com.bydcollector.collector.data.trips.TripDayGroup
 import com.bydcollector.collector.data.trips.RoutePoint
 import com.bydcollector.collector.data.trips.TripSummary
+import com.bydcollector.collector.data.trips.TripTime
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -75,6 +76,20 @@ class TripsUiMapperTest {
         ).single().months.single().days.single().trips.single()
 
         assertTrue(mapped.route.single().gap)
+    }
+
+    @Test
+    fun displaysMixedZoneTimesAndDerivesOffsetSafeDuration() {
+        val start = "2026-08-23T09:00:00Z"
+        val end = "2026-08-23T12:30:00+03:00"
+        val mapped = TripsUiMapper.years(
+            listOf(TripDayGroup(2026, 8, 23, listOf(summary("trip-1").copy(startedAt = start, endedAt = end, durationMs = null)))),
+            UiLanguage.EN
+        ).single().months.single().days.single().trips.single()
+
+        assertEquals(TripTime.localTime(start)?.withNano(0).toString(), mapped.startAt)
+        assertEquals(TripTime.localTime(end)?.withNano(0).toString(), mapped.endAt)
+        assertEquals("0:30", mapped.duration)
     }
 
     private fun summary(id: String) = TripSummary(

@@ -14,7 +14,7 @@ At the start of a main session, the collector can read BYD's `/storage/emulated/
 
 The optional `All data` collector reads a much broader read-only FID catalogue. Successful values can include vehicle identifiers, configuration and state fields, precise location coordinates, and other values whose meaning has not been confirmed. A field name does not prove that a returned value is valid or correctly decoded.
 
-Operational events and retry or delivery state for enabled integrations are also stored locally. Diagnostic journal and logcat recording starts only when the user enables it from the `Logs` tab. Full-system logcat uses authorized local ADB and can contain system messages and data from unrelated processes, not only BYD Collector.
+Operational events and retry or delivery state for enabled integrations are also stored locally. Full-system logcat recording starts only when the user explicitly starts it under `Options -> Keep alive`; there is no separate Journal mode. It uses authorized local ADB and can contain system messages and data from unrelated processes, not only BYD Collector.
 
 ## Network connections
 

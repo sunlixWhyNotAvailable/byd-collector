@@ -73,14 +73,5 @@ enum class DashboardLoadProfile(
         readsArchiveDetails = false,
         readsIntegrationSettings = false,
         readsRuntimeSettings = true
-    ),
-    LOGS(
-        healthDetail = HealthSnapshotDetail.FULL,
-        readsTelemetryStore = true,
-        readsDebugStatus = true,
-        readsVehicleKpis = false,
-        readsArchiveDetails = false,
-        readsIntegrationSettings = true,
-        readsRuntimeSettings = false
     )
 }

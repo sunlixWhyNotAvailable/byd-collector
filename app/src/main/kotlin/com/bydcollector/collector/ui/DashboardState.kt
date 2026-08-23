@@ -5,6 +5,13 @@ import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.ArchiveStorageSnapshot
 import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
 
+enum class DebugRuntimeStatus {
+    STOPPED,
+    STARTING,
+    RUNNING,
+    ERROR
+}
+
 data class DashboardState(
     val running: Boolean,
     val serviceRunning: Boolean,
@@ -36,6 +43,8 @@ data class DashboardState(
     val logRecording: Boolean,
     val debugPollingEnabled: Boolean,
     val debugPollingRunning: Boolean,
+    val debugRuntimeStatus: DebugRuntimeStatus = if (debugPollingRunning) DebugRuntimeStatus.RUNNING else DebugRuntimeStatus.STOPPED,
+    val debugRuntimeError: String? = null,
     val debugAutoStartEnabled: Boolean,
     val debugParameterCount: Int,
     val debugDatabasePath: String,

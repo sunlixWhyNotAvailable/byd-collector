@@ -51,6 +51,13 @@ class DashboardStateProviderMaintenanceContractTest {
         assertInOrder(load, "val store = if (profile.readsTelemetryStore", "val archiveStorageResult = archiveStorageCache.snapshot(")
     }
 
+    @Test
+    fun providerAlwaysShowsThePackagedDebugCatalogCount() {
+        val source = sourceFile("com/bydcollector/collector/ui/DashboardStateProvider.kt").readText()
+        assertTrue(source.contains("DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT"))
+        assertFalse(source.contains("val debugParameterCount = if (debugStatusLoaded) debugStatus.candidateCount else 0"))
+    }
+
     private fun sourceFile(path: String): File {
         return listOf(
             File("src/main/kotlin/$path"),

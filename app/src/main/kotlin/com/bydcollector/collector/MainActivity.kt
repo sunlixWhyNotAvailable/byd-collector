@@ -88,6 +88,7 @@ class MainActivity : ComponentActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private val dashboardExecutor = namedSingleThreadExecutor("byd-ui-dash")
     private val dashboardCountExecutor = namedSingleThreadExecutor("byd-ui-counts")
+    private val diagnosticsExecutor = namedSingleThreadExecutor("byd-diagnostics")
     private val updateExecutor = namedSingleThreadExecutor("byd-update")
     private val updateChecker by lazy { UpdateChecker(settings) }
     private val updateDownloader by lazy { UpdateDownloader(applicationContext) }
@@ -120,6 +121,7 @@ class MainActivity : ComponentActivity() {
     private var dashboardRefreshVersion by mutableStateOf(0)
     private var backgroundSetupPromptVisible by mutableStateOf(false)
     private var backgroundSetupPromptAutoLaunch = false
+    private var diagnosticsBusy by mutableStateOf(false)
     @Volatile private var forcedRefreshPending = false
     private var credentialsLoadStarted = false
     private var credentialsLoaded = false
@@ -524,20 +526,12 @@ class MainActivity : ComponentActivity() {
             finishAndRemoveTask()
         }
 
-        override fun onStartJournal() {
-            startDiagnostics("journal")
-        }
-
-        override fun onStopJournal() {
-            stopDiagnostics("journal")
-        }
-
         override fun onStartLogcat() {
-            startDiagnostics("logcat")
+            startLogcatRecording()
         }
 
         override fun onStopLogcat() {
-            stopDiagnostics("logcat")
+            stopLogcatRecording()
         }
     }
 
@@ -604,6 +598,7 @@ class MainActivity : ComponentActivity() {
                 updateAutoCheckEnabled = settings.isUpdateAutoCheckEnabled(),
                 updateUiState = updateUiState,
                 databaseMaintenanceUiState = currentMaintenanceUiState(renderedChrome),
+                diagnosticsBusy = diagnosticsBusy,
                 switchConfirmationVersion = dashboardRefreshVersion,
                 actions = uiActions,
                 backgroundSetupPromptVisible = backgroundSetupPromptVisible,
@@ -670,6 +665,7 @@ class MainActivity : ComponentActivity() {
         }
         dashboardExecutor.shutdownNow()
         dashboardCountExecutor.shutdownNow()
+        diagnosticsExecutor.shutdownNow()
         updateExecutor.shutdownNow()
         if (::stateProvider.isInitialized) {
             stateProvider.close()
@@ -848,7 +844,7 @@ class MainActivity : ComponentActivity() {
                 runCatching {
                     android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
                     val main = currentStore().dashboardRowCounts()
-                    val debug = if (BydCollectorApplication.ensureDebugStorageReady(applicationContext)) {
+                    val debug = if (BydCollectorApplication.isDebugStorageReady(applicationContext)) {
                         DirectDebugStore(applicationContext).use { it.dashboardReadingCount() }
                     } else {
                         0L
@@ -882,8 +878,7 @@ class MainActivity : ComponentActivity() {
             AppTab.MAIN to DashboardLoadProfile.MAIN,
             AppTab.ALL_PARAMETERS to DashboardLoadProfile.ALL_PARAMETERS,
             AppTab.HA to DashboardLoadProfile.HA,
-            AppTab.EXTRA to DashboardLoadProfile.EXTRA,
-            AppTab.LOGS to DashboardLoadProfile.LOGS
+            AppTab.EXTRA to DashboardLoadProfile.EXTRA
         )
         runCatching {
             dashboardExecutor.execute {
@@ -1813,26 +1808,65 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun startDiagnostics(source: String) {
+    private fun startLogcatRecording() {
+        if (diagnosticsBusy) return
         refreshStoreBackedState()
-        requestAccessCheck("start_$source", AccessCheckMode.NORMAL)
-        try {
-            val dir = DiagnosticLogRecorder.start(applicationContext)
-            recordOperationalEvent("log_recording_started", "Diagnostic log recording started", "source=$source path=${dir.absolutePath}")
-            Toast.makeText(this, "Запис логів почато", Toast.LENGTH_SHORT).show()
-        } catch (error: Exception) {
-            recordOperationalEvent("log_recording_error", "Diagnostic log recording failed", error.message)
-            Toast.makeText(this, "Помилка запису логів: ${error.message}", Toast.LENGTH_LONG).show()
+        diagnosticsBusy = true
+        val submitted = requestAccessCheck(
+            source = "start_logcat",
+            mode = AccessCheckMode.NORMAL,
+            afterComplete = {
+                if (!AdbAuthorizationManager.currentSnapshot().adbAuthorized) {
+                    recordOperationalEvent("log_recording_error", "Full system logcat authorization failed", "adb_not_authorized")
+                    diagnosticsBusy = false
+                    Toast.makeText(this, "ADB не авторизовано — logcat не запущено", Toast.LENGTH_LONG).show()
+                    refresh()
+                } else {
+                    diagnosticsExecutor.execute {
+                        val result = runCatching { DiagnosticLogRecorder.start(applicationContext) }
+                        handler.post {
+                            if (destroyed) return@post
+                            result.onSuccess { dir ->
+                                recordOperationalEvent("log_recording_started", "Full system logcat recording started", "source=logcat path=${dir.absolutePath}")
+                                Toast.makeText(this, "Запис logcat почато", Toast.LENGTH_SHORT).show()
+                            }.onFailure { error ->
+                                recordOperationalEvent("log_recording_error", "Full system logcat recording failed", error.message)
+                                Toast.makeText(this, "Помилка запису logcat: ${error.message}", Toast.LENGTH_LONG).show()
+                            }
+                            diagnosticsBusy = false
+                            refresh()
+                        }
+                    }
+                }
+            }
+        )
+        if (!submitted) {
+            recordOperationalEvent("log_recording_error", "Full system logcat access check was not started", "adb_self_check_in_progress")
+            diagnosticsBusy = false
+            Toast.makeText(this, "Перевірка ADB вже виконується — повторіть запуск logcat", Toast.LENGTH_LONG).show()
+            refresh()
         }
-        refresh()
     }
 
-    private fun stopDiagnostics(source: String) {
+    private fun stopLogcatRecording() {
+        if (diagnosticsBusy) return
         refreshStoreBackedState()
-        val dir = DiagnosticLogRecorder.stop()
-        recordOperationalEvent("log_recording_stopped", "Diagnostic log recording stopped", "source=$source path=${dir?.absolutePath}")
-        Toast.makeText(this, "Запис логів зупинено", Toast.LENGTH_SHORT).show()
-        refresh()
+        diagnosticsBusy = true
+        diagnosticsExecutor.execute {
+            val result = runCatching { DiagnosticLogRecorder.stop() }
+            handler.post {
+                if (destroyed) return@post
+                result.onSuccess { dir ->
+                    recordOperationalEvent("log_recording_stopped", "Full system logcat recording stopped", "source=logcat path=${dir?.absolutePath}")
+                    Toast.makeText(this, "Запис logcat зупинено", Toast.LENGTH_SHORT).show()
+                }.onFailure { error ->
+                    recordOperationalEvent("log_recording_error", "Full system logcat stop failed", error.message)
+                    Toast.makeText(this, "Помилка зупинки logcat: ${error.message}", Toast.LENGTH_LONG).show()
+                }
+                diagnosticsBusy = false
+                refresh()
+            }
+        }
     }
 
     companion object {
@@ -1860,7 +1894,6 @@ internal fun dashboardProfile(tab: AppTab): DashboardLoadProfile? = when (tab) {
     AppTab.TELEGRAM -> null
     AppTab.STORAGE -> DashboardLoadProfile.STORAGE
     AppTab.EXTRA -> DashboardLoadProfile.EXTRA
-    AppTab.LOGS -> DashboardLoadProfile.LOGS
 }
 
 internal fun dashboardTabRefreshIntervalMs(tab: AppTab, storageRefreshPending: Boolean): Long? = when (tab) {
@@ -1873,7 +1906,6 @@ internal fun dashboardTabRefreshIntervalMs(tab: AppTab, storageRefreshPending: B
     AppTab.TELEGRAM -> null
     AppTab.STORAGE -> if (storageRefreshPending) 1_000L else null
     AppTab.EXTRA -> null
-    AppTab.LOGS -> 5_000L
 }
 
 internal fun dashboardSnapshotDue(
