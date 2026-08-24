@@ -19,7 +19,7 @@ class BydCollectorUiContractTest {
     }
 
     @Test
-    fun tactileControlsKeepPressedAndPendingContracts() {
+    fun tactileControlsKeepPressedAndImmediateSwitchContracts() {
         val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
 
@@ -31,17 +31,19 @@ class BydCollectorUiContractTest {
         assertTrue(components.contains("primary -> p.accentText"))
         assertFalse(components.contains("primary -> p.activeSoft"))
         assertTrue(components.contains("visualPressed -> p.activeSoft"))
-        assertTrue(components.contains("pending: Boolean = false"))
-        assertTrue(components.contains("SWITCH_CENTER_DELAY_MS = 120L"))
+        assertFalse(components.contains("pending: Boolean = false"))
+        assertFalse(components.contains("SwitchPendingState"))
+        assertFalse(components.contains("LocalSwitchConfirmationVersion"))
+        assertFalse(components.contains("SWITCH_CENTER_DELAY_MS"))
+        assertFalse(components.contains("SWITCH_CONFIRM_TIMEOUT_MS"))
         assertTrue(components.contains("animateDpAsState("))
         assertTrue(components.contains("targetValue = when {"))
-        assertTrue(components.contains("visuallyPending -> 14.dp"))
-        assertTrue(components.contains("visuallyPending -> 22.dp"))
         assertTrue(components.contains("else -> 19.dp"))
         assertTrue(components.contains("tween(durationMillis = 120)"))
         assertTrue(components.contains(".size(width = 56.dp, height = 32.dp)"))
         assertTrue(components.contains(".size(thumbSize)"))
-        assertTrue(components.contains(".background(if (binary || visualChecked || visuallyPending) p.switchThumbOn else p.switchThumbOff)"))
+        assertTrue(components.contains(".background(if (binary || checked) p.switchThumbOn else p.switchThumbOff)"))
+        assertTrue(components.contains("onCheckedChange(!checked)"))
         assertTrue(app.contains(".pressScaleModifier(interactionSource, forcePressed = press.visualPressed)"))
         assertTrue(app.contains(".background(if (selected) p.active else p.surface, Rounded8)"))
     }
@@ -51,7 +53,8 @@ class BydCollectorUiContractTest {
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
 
         assertFalse(app.contains("MainChannelsCard("))
-        assertTrue(app.contains("ActionButton(strings.archiveDatabase, actions::onOpenArchiveDatabase, primary = true, modifier = Modifier.fillMaxWidth())"))
+        assertTrue(app.contains("actions::onOpenArchiveDatabase"))
+        assertTrue(app.contains("actionUiState.mainArchivePreflight"))
         assertFalse(app.contains("strings.compactDatabase"))
         assertFalse(app.contains("onOpenCompactDatabase"))
         assertInOrder(app, "StatusRow(strings.mainPolling", "strings.allParameters")
@@ -68,7 +71,8 @@ class BydCollectorUiContractTest {
         assertFalse(actions.contains("onRequestLocationPermission"))
         assertFalse(strings.contains("grantLocation"))
         val mainCollection = app.substringAfter("private fun MainCollectionCard(").substringBefore("private fun MainStatusCard(")
-        assertTrue(mainCollection.contains("ActionButton(strings.grantAdb, actions::onGrantAdb"))
+        assertTrue(mainCollection.contains("actions::onGrantAdb"))
+        assertTrue(mainCollection.contains("actionUiState.adbGrant"))
         assertTrue(mainCollection.contains("ActionButton(strings.backgroundWork, actions::onOpenBackgroundApps"))
         assertFalse(mainCollection.contains("ActionButton(strings.grantLocation"))
     }
@@ -190,7 +194,8 @@ class BydCollectorUiContractTest {
         assertTrue(app.contains("actions.onShareArchives(selectedArchiveIds)"))
         assertTrue(app.contains("ActionButton(sortLabel,"))
         assertTrue(app.contains("modifier = Modifier.width(180.dp)"))
-        assertTrue(app.contains("ActionButton(strings.deleteSelected"))
+        assertTrue(app.contains("actionUiState.archiveDeleteDispatch"))
+        assertTrue(app.contains("strings.deleteSelected"))
         val archiveEntryRow = app.substringAfter("private fun ArchiveEntryRow(").substringBefore("private fun archiveUsageText")
         assertTrue(archiveEntryRow.contains(".height(48.dp)"))
         assertTrue(archiveEntryRow.contains(".size(32.dp)"))
@@ -258,7 +263,7 @@ class BydCollectorUiContractTest {
         val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
         assertEquals(2, Regex("binary = true").findAll(app).count())
         assertTrue(components.contains("binary: Boolean = false"))
-        assertTrue(components.contains("if (binary) {\n                    onCheckedChange(!checked)"))
+        assertTrue(components.contains("onCheckedChange(!checked)"))
         assertTrue(app.contains("bodyPadding = 0.dp"))
         assertTrue(app.contains("rememberSaveable { mutableStateOf<List<String>>(emptyList()) }"))
         assertTrue(app.contains("year.id in expandedYears"))
@@ -340,7 +345,7 @@ class BydCollectorUiContractTest {
         assertTrue(app.contains("\"charge_duration\""))
         assertTrue(components.contains("binary -> 25.dp"))
         assertTrue(components.contains("binary && pressed -> p.accent.copy"))
-        assertTrue(components.contains("if (binary || visualChecked || visuallyPending) p.switchThumbOn"))
+        assertTrue(components.contains("if (binary || checked) p.switchThumbOn"))
     }
 
     @Test
@@ -474,7 +479,7 @@ class BydCollectorUiContractTest {
     }
 
     @Test
-    fun allSwitchesUseUniversalPendingConfirmation() {
+    fun allSwitchesDispatchImmediatelyWithoutPendingConfirmation() {
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
         val actions = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorActions.kt").readText()
         val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
@@ -484,22 +489,21 @@ class BydCollectorUiContractTest {
         assertFalse(app.contains("keepAlivePendingSwitches"))
         assertFalse(activity.contains("keepAlivePendingTargets"))
         assertFalse(activity.contains("clearResolvedKeepAlivePending"))
-        assertTrue(components.contains("LocalSwitchConfirmationVersion"))
-        assertTrue(components.contains("SWITCH_CENTER_DELAY_MS"))
-        assertTrue(components.contains("SWITCH_CONFIRM_TIMEOUT_MS"))
-        assertTrue(components.contains("visuallyPending -> 14.dp"))
-        assertTrue(components.contains("visuallyPending -> 22.dp"))
-        assertTrue(components.contains("else -> 19.dp"))
-        assertTrue(components.contains("onCheckedChange(current.target)"))
-        assertTrue(components.contains("if (checked != current.target) return@LaunchedEffect"))
-        assertTrue(activity.contains("private var dashboardRefreshVersion by mutableStateOf(0)"))
+        assertFalse(components.contains("LocalSwitchConfirmationVersion"))
+        assertFalse(components.contains("SWITCH_CENTER_DELAY_MS"))
+        assertFalse(components.contains("SWITCH_CONFIRM_TIMEOUT_MS"))
+        assertFalse(components.contains("SwitchPendingState"))
+        assertFalse(components.contains("visuallyPending"))
+        assertFalse(components.contains("onCheckedChange(current.target)"))
+        assertTrue(components.contains("onCheckedChange(!checked)"))
+        assertFalse(activity.contains("dashboardRefreshVersion"))
         assertTrue(activity.contains("private var forcedRefreshPending = false"))
-        assertTrue(app.contains("switchConfirmationVersion: Int = 0"))
-        assertTrue(activity.contains("switchConfirmationVersion = dashboardRefreshVersion"))
+        assertFalse(app.contains("switchConfirmationVersion"))
+        assertFalse(activity.contains("switchConfirmationVersion"))
     }
 
     @Test
-    fun buttonLikeControlsKeepForcedPressWhileBottomTabsSwitchImmediately() {
+    fun buttonLikeControlsKeepPressedFeedbackAndDispatchImmediately() {
         val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
         val pressHelper = components
@@ -509,21 +513,49 @@ class BydCollectorUiContractTest {
             .substringAfter("private fun BottomTabs(")
             .substringBefore("private fun Modifier.clickableNoRipple(")
 
-        assertTrue(components.contains("FORCED_PRESS_DELAY_MS"))
+        assertTrue(components.contains("PRESS_FEEDBACK_MS"))
+        assertFalse(components.contains("FORCED_PRESS_DELAY_MS"))
         assertTrue(components.contains("rememberForcedPressClick"))
-        assertTrue(components.contains("delay(FORCED_PRESS_DELAY_MS)"))
+        assertTrue(components.contains("delay(PRESS_FEEDBACK_MS)"))
         assertTrue(components.contains("latestOnClick()"))
-        assertTrue(pressHelper.contains("invokeImmediately: Boolean = false"))
-        assertTrue(pressHelper.contains("if (!invokeImmediately) latestOnClick()"))
-        assertTrue(pressHelper.contains("if (invokeImmediately) latestOnClick()"))
+        assertFalse(pressHelper.contains("invokeImmediately"))
+        assertInOrder(pressHelper, "clickToken += 1", "latestOnClick()")
+        assertTrue(pressHelper.contains("visualPressed = false"))
+        assertTrue(pressHelper.contains("locked = false"))
         assertTrue(components.contains("visualPressed"))
         assertTrue(components.contains(".clickable(enabled = enabled && !press.locked"))
-        assertTrue(bottomTabs.contains("invokeImmediately = true"))
-        assertEquals(1, Regex("invokeImmediately = true").findAll(app).count())
+        assertFalse(bottomTabs.contains("invokeImmediately"))
+        assertFalse(app.contains("invokeImmediately"))
         assertFalse(components.contains("invokeImmediately = true"))
         assertTrue(app.contains("pressScaleModifier(interactionSource, forcePressed = press.visualPressed"))
         assertTrue(app.contains("clickableNoRipple(interactionSource, press.visualPressed"))
         assertTrue(app.contains("ShutdownIconButton(onClick = actions::onShutdownApp)"))
+    }
+
+    @Test
+    fun asynchronousControlsUseNarrowRealOperationState() {
+        val actions = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorActions.kt").readText()
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+
+        listOf(
+            "adbGrant",
+            "mainArchivePreflight",
+            "archiveShare",
+            "archiveDeleteDispatch",
+            "mqttTest",
+            "influxTest",
+            "influxReExport"
+        ).forEach { flag -> assertTrue(actions.contains("val $flag: Boolean = false"), "Missing scoped flag: $flag") }
+        assertTrue(app.contains("state.routeLoadingId == trip.id"))
+        assertTrue(app.contains("testStatus != TelegramTestStatus.TESTING"))
+        assertTrue(app.contains("runtimeStatus != RuntimeActionStatus.STOPPING && runtimeStatus != RuntimeActionStatus.STOPPED"))
+        assertTrue(app.contains("RuntimeActionStatus.ERROR -> MainPollDisplayStatus(strings.error, StatusKind.ERROR)"))
+        assertTrue(app.contains("job?.running != true"))
+        assertTrue(app.contains("job?.takeIf { !it.running && it.error != null }"))
+        assertTrue(activity.contains("archiveJob.updatedAtMs >= dispatchedAtMs"))
+        assertTrue(activity.contains("runCatching { diagnosticsExecutor.execute(task) }.onFailure"))
+        assertTrue(activity.contains("updateExecutor.execute"))
     }
 
     private fun assertInOrder(source: String, first: String, second: String) {

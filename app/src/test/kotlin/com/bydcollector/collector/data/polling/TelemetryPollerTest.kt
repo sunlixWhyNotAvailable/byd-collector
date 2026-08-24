@@ -1,6 +1,9 @@
 package com.bydcollector.collector.data.polling
 
 import com.bydcollector.collector.data.local.Clock
+import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -37,7 +40,8 @@ class TelemetryPollerTest {
     @Test
     fun runtimeFailureReportsCycleResultBeforeContinuing() {
         val clock = FakeClock()
-        val results = mutableListOf<PollCycleResult>()
+        val results = Collections.synchronizedList(mutableListOf<PollCycleResult>())
+        val resultReady = CountDownLatch(1)
         val poller = TelemetryPoller(
             coordinator = object : PollCycleRunner {
                 override fun pollOnce(sessionId: Long): PollCycleResult {
@@ -46,12 +50,15 @@ class TelemetryPollerTest {
             },
             clock = clock,
             intervalMs = 1_000,
-            onCycleResult = { results += it },
+            onCycleResult = {
+                results += it
+                resultReady.countDown()
+            },
             sleeper = { pollerStopSignal() }
         )
 
         poller.start(sessionId = 1L)
-        Thread.sleep(20)
+        assertTrue(resultReady.await(1, TimeUnit.SECONDS))
         poller.stop()
 
         assertTrue(results.isNotEmpty())
@@ -62,16 +69,21 @@ class TelemetryPollerTest {
     @Test
     fun emptyWorkerCycleDoesNotPublishFakeStatus() {
         val results = mutableListOf<PollCycleResult>()
+        val cycleFinished = CountDownLatch(1)
         val poller = TelemetryPoller(
             coordinator = object : PollCycleRunner {
                 override fun pollOnce(sessionId: Long): PollCycleResult? = null
             },
+            clock = FakeClock(),
             onCycleResult = { results += it },
-            sleeper = { pollerStopSignal() }
+            sleeper = {
+                cycleFinished.countDown()
+                pollerStopSignal()
+            }
         )
 
         poller.start(sessionId = 1L)
-        Thread.sleep(20)
+        assertTrue(cycleFinished.await(1, TimeUnit.SECONDS))
         poller.stop()
 
         assertTrue(results.isEmpty())

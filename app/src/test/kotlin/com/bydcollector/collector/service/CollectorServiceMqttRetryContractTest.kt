@@ -34,7 +34,7 @@ class CollectorServiceMqttRetryContractTest {
         assertTrue(retryPath.contains("mqttCoordinator.retryDelayMs()"))
         assertTrue(retryPath.contains("mainHandler.postDelayed(mqttRetryTask, delayMs)"))
         assertTrue(retryPath.contains("mqttRetryScheduled && mqttRetryAtElapsedMs"))
-        assertTrue(mqttExecution.contains("onSuccess = { _, submittedGeneration -> postMqttRetrySchedule(submittedGeneration) }"))
+        assertInOrder(mqttExecution, "onSuccess = { result, submittedGeneration ->", "postMqttRetrySchedule(submittedGeneration)")
         assertTrue(stopMqtt.contains("cancelMqttRetry()"))
         assertTrue(shutdown.contains("cancelMqttRetry()"))
         assertTrue(destroy.contains("cancelMqttRetry()"))
@@ -50,5 +50,14 @@ class CollectorServiceMqttRetryContractTest {
             File("src/main/kotlin/$path"),
             File("app/src/main/kotlin/$path")
         ).firstOrNull { it.isFile } ?: error("Missing source file: $path")
+    }
+
+    private fun assertInOrder(source: String, vararg tokens: String) {
+        var previousIndex = -1
+        tokens.forEach { token ->
+            val index = source.indexOf(token, previousIndex + 1)
+            assertTrue(index >= 0, "Missing token: $token")
+            previousIndex = index
+        }
     }
 }

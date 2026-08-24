@@ -153,6 +153,7 @@ class DashboardStateProvider(
             running = mainPollingRunning,
             serviceRunning = serviceRunning,
             mainPollingRunning = mainPollingRunning,
+            mainRuntimeStatus = CollectorService.mainRuntimeStatus(),
             autoStartEnabled = if (runtimeSettingsLoaded) settings.isAutoStartEnabled() else false,
             pollingEnabled = if (runtimeSettingsLoaded) settings.isPollingEnabled() else false,
             activeSessionId = health.activeSessionId,
@@ -180,11 +181,7 @@ class DashboardStateProvider(
             logRecording = DiagnosticLogRecorder.isRecording(),
             debugPollingEnabled = if (runtimeSettingsLoaded) settings.isDebugPollingEnabled() else false,
             debugPollingRunning = CollectorService.isDebugRunning(),
-            debugRuntimeStatus = if (CollectorService.isDebugRunning()) {
-                DebugRuntimeStatus.RUNNING
-            } else {
-                DebugRuntimeStatus.STOPPED
-            },
+            debugRuntimeStatus = CollectorService.debugRuntimeStatus(),
             debugRuntimeError = null,
             debugAutoStartEnabled = if (runtimeSettingsLoaded) settings.isDebugAutoStartEnabled() else false,
             debugParameterCount = debugParameterCount,
@@ -204,6 +201,7 @@ class DashboardStateProvider(
             keepAliveEnabled = keepAliveConfig?.anyEnabled == true,
             keepAliveStatus = if (keepAliveConfig?.anyEnabled == true) "enabled" else "disabled",
             mqttEnabled = mqttConfig?.enabled == true,
+            mqttRuntimeStatus = CollectorService.mqttRuntimeStatus(),
             mqttAutoStartEnabled = if (integrationSettingsLoaded) settings.isMqttAutoStartEnabled() else false,
             mqttHost = mqttConfig?.host.orEmpty(),
             mqttPort = mqttConfig?.port ?: 0,
@@ -222,6 +220,7 @@ class DashboardStateProvider(
             mqttRetryLastFailureAt = DisplayTimeFormatter.formatNullable(health.mqttRetryLastFailureAt),
             mqttRetryLastSuccessAt = DisplayTimeFormatter.formatNullable(health.mqttRetryLastSuccessAt),
             influxEnabled = influxConfig?.enabled == true,
+            influxRuntimeStatus = CollectorService.influxRuntimeStatus(),
             influxAutoStartEnabled = if (integrationSettingsLoaded) settings.isInfluxAutoStartEnabled() else false,
             haSharedCategoriesEnabled = if (integrationSettingsLoaded) settings.isHaSharedCategoriesEnabled() else false,
             influxHost = influxConfig?.host.orEmpty(),

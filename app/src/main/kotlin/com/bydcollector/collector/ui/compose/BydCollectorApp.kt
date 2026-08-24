@@ -34,7 +34,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -80,6 +79,7 @@ import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.telegram.TelegramNavigatorMask
 import com.bydcollector.collector.ui.DashboardState
 import com.bydcollector.collector.ui.DebugRuntimeStatus
+import com.bydcollector.collector.ui.RuntimeActionStatus
 import com.bydcollector.collector.ui.VehicleKpis
 import com.bydcollector.collector.update.ReleaseNotesSelector
 import com.bydcollector.collector.update.UpdateInfo
@@ -111,7 +111,7 @@ fun BydCollectorApp(
     updateUiState: UpdateUiState = UpdateUiState.Hidden,
     databaseMaintenanceUiState: DbMaintenanceUiState? = null,
     diagnosticsBusy: Boolean = false,
-    switchConfirmationVersion: Int = 0,
+    actionUiState: BydCollectorActionUiState = BydCollectorActionUiState(),
     actions: BydCollectorActions,
     backgroundSetupPromptVisible: Boolean = false,
     onOpenBackgroundSettingsFromPrompt: () -> Unit = {},
@@ -122,12 +122,11 @@ fun BydCollectorApp(
     BydCollectorTheme(darkTheme) {
         val p = LocalBydPalette.current
         var pendingArchiveDeleteIds by remember { mutableStateOf<List<String>>(emptyList()) }
-        CompositionLocalProvider(LocalSwitchConfirmationVersion provides switchConfirmationVersion) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(p.background)
-            ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(p.background)
+        ) {
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
@@ -154,18 +153,19 @@ fun BydCollectorApp(
                         ) {
                             //keeps tabs mounted from one state snapshot so service/runtime facts stay consistent
                             when (activeTab) {
-                                AppTab.MAIN -> MainTab(state, s, actions)
+                                AppTab.MAIN -> MainTab(state, s, actions, actionUiState)
                                 AppTab.ALL_PARAMETERS -> AllParametersTab(state, s, language, actions)
                                 AppTab.TRIPS -> TripsTab(tripsUiState, tripsUiActions, s, language)
-                                AppTab.HA -> HaTab(
-                                    state,
-                                    s,
-                                    mqttDraft,
-                                    influxDraft,
-                                    actions
-                                )
+                                 AppTab.HA -> HaTab(
+                                     state,
+                                     s,
+                                     mqttDraft,
+                                     influxDraft,
+                                     actions,
+                                     actionUiState
+                                 )
                                 AppTab.TELEGRAM -> TelegramTab(s, telegramUiState, telegramActions)
-                                AppTab.STORAGE -> StorageTab(state, s, actions) { ids ->
+                                 AppTab.STORAGE -> StorageTab(state, s, actions, actionUiState) { ids ->
                                     pendingArchiveDeleteIds = ids
                                 }
                                 AppTab.EXTRA -> ExtraTab(state, s, updateAutoCheckEnabled, diagnosticsBusy, actions)
@@ -221,7 +221,6 @@ fun BydCollectorApp(
                     ArchiveStorageProgressDialog(strings = s, status = archiveJob)
                 }
             }
-        }
     }
 }
 
@@ -467,7 +466,12 @@ private fun TabScrollColumn(content: @Composable ColumnScope.() -> Unit) {
 }
 
 @Composable
-private fun MainTab(state: DashboardState?, strings: UiStrings, actions: BydCollectorActions) {
+private fun MainTab(
+    state: DashboardState?,
+    strings: UiStrings,
+    actions: BydCollectorActions,
+    actionUiState: BydCollectorActionUiState
+) {
     TabScrollColumn {
         ScreenTitle(strings.mainTab, strings.mainSubtitle)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -475,12 +479,14 @@ private fun MainTab(state: DashboardState?, strings: UiStrings, actions: BydColl
                 state = state,
                 strings = strings,
                 actions = actions,
+                actionUiState = actionUiState,
                 modifier = Modifier.weight(1.15f)
             )
             MainStatusCard(
                 state = state,
                 strings = strings,
                 actions = actions,
+                actionUiState = actionUiState,
                 modifier = Modifier.weight(1f)
             )
         }
@@ -493,16 +499,35 @@ private fun MainCollectionCard(
     state: DashboardState?,
     strings: UiStrings,
     actions: BydCollectorActions,
+    actionUiState: BydCollectorActionUiState,
     modifier: Modifier
 ) {
     SectionCard(title = strings.dataCollection, modifier = modifier.height(226.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            ActionButton(strings.start, actions::onStartMain, primary = true, enabled = state?.mainPollingRunning != true, modifier = Modifier.weight(1f))
-            ActionButton(strings.stop, actions::onStopMain, enabled = state?.mainPollingRunning == true, modifier = Modifier.weight(1f))
+            val status = state?.mainRuntimeStatus ?: RuntimeActionStatus.STOPPED
+            ActionButton(
+                if (status == RuntimeActionStatus.STARTING) strings.starting else strings.start,
+                actions::onStartMain,
+                primary = true,
+                enabled = status != RuntimeActionStatus.STARTING && status != RuntimeActionStatus.RUNNING,
+                modifier = Modifier.weight(1f)
+            )
+            ActionButton(
+                if (status == RuntimeActionStatus.STOPPING) strings.stopping else strings.stop,
+                actions::onStopMain,
+                enabled = status != RuntimeActionStatus.STOPPING && status != RuntimeActionStatus.STOPPED,
+                modifier = Modifier.weight(1f)
+            )
         }
         Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(strings.permissions, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(0.75f))
-            ActionButton(strings.grantAdb, actions::onGrantAdb, primary = true, modifier = Modifier.weight(0.9f))
+            ActionButton(
+                if (actionUiState.adbGrant) strings.loading else strings.grantAdb,
+                actions::onGrantAdb,
+                primary = true,
+                enabled = !actionUiState.adbGrant,
+                modifier = Modifier.weight(0.9f)
+            )
             Spacer(Modifier.width(10.dp))
             ActionButton(strings.backgroundWork, actions::onOpenBackgroundApps, modifier = Modifier.weight(0.9f))
         }
@@ -514,12 +539,23 @@ private fun MainCollectionCard(
 }
 
 @Composable
-private fun MainStatusCard(state: DashboardState?, strings: UiStrings, actions: BydCollectorActions, modifier: Modifier) {
-    val mainPollingStatus = MainPollStatusFormatter.format(
-        running = state?.mainPollingRunning == true,
-        lastPollStatus = state?.lastPollStatus,
-        strings = strings
-    )
+private fun MainStatusCard(
+    state: DashboardState?,
+    strings: UiStrings,
+    actions: BydCollectorActions,
+    actionUiState: BydCollectorActionUiState,
+    modifier: Modifier
+) {
+    val mainPollingStatus = when (state?.mainRuntimeStatus ?: RuntimeActionStatus.STOPPED) {
+        RuntimeActionStatus.STARTING -> MainPollDisplayStatus(strings.starting, StatusKind.WAITING)
+        RuntimeActionStatus.STOPPING -> MainPollDisplayStatus(strings.stopping, StatusKind.WAITING)
+        RuntimeActionStatus.ERROR -> MainPollDisplayStatus(strings.error, StatusKind.ERROR)
+        else -> MainPollStatusFormatter.format(
+            running = state?.mainPollingRunning == true,
+            lastPollStatus = state?.lastPollStatus,
+            strings = strings
+        )
+    }
     SectionCard(title = strings.status, modifier = modifier.height(226.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             StatusRow(strings.mainPolling, mainPollingStatus.text, mainPollingStatus.kind, modifier = Modifier.weight(1f))
@@ -531,10 +567,16 @@ private fun MainStatusCard(state: DashboardState?, strings: UiStrings, actions: 
             )
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            StatusRow("MQTT", compactChannelStatusText(state?.mqttStatus, strings), channelStatusKind(state?.mqttStatus, state?.mqttEnabled == true), modifier = Modifier.weight(1f))
-            StatusRow("InfluxDB", compactChannelStatusText(state?.influxStatus, strings), channelStatusKind(state?.influxStatus, state?.influxEnabled == true), modifier = Modifier.weight(1f))
+            StatusRow("MQTT", compactChannelStatusText(state?.mqttStatus, strings, state?.mqttRuntimeStatus), channelStatusKind(state?.mqttStatus, state?.mqttEnabled == true, state?.mqttRuntimeStatus), modifier = Modifier.weight(1f))
+            StatusRow("InfluxDB", compactChannelStatusText(state?.influxStatus, strings, state?.influxRuntimeStatus), channelStatusKind(state?.influxStatus, state?.influxEnabled == true, state?.influxRuntimeStatus), modifier = Modifier.weight(1f))
         }
-        ActionButton(strings.archiveDatabase, actions::onOpenArchiveDatabase, primary = true, modifier = Modifier.fillMaxWidth())
+        ActionButton(
+            if (actionUiState.mainArchivePreflight) strings.loading else strings.archiveDatabase,
+            actions::onOpenArchiveDatabase,
+            primary = true,
+            enabled = !actionUiState.mainArchivePreflight,
+            modifier = Modifier.fillMaxWidth()
+        )
     }
 }
 
@@ -573,9 +615,21 @@ private fun AllParametersTab(
                         .height(262.dp)
                 ) {
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        val startAllowed = state == null || state.debugRuntimeStatus in setOf(DebugRuntimeStatus.STOPPED, DebugRuntimeStatus.ERROR)
-                        ActionButton(strings.start, actions::onStartDebug, primary = true, enabled = startAllowed, modifier = Modifier.weight(1f))
-                        ActionButton(strings.stop, actions::onStopDebug, enabled = state?.debugRuntimeStatus == DebugRuntimeStatus.RUNNING, modifier = Modifier.weight(1f))
+                        val debugStatus = state?.debugRuntimeStatus ?: DebugRuntimeStatus.STOPPED
+                        val startAllowed = debugStatus != DebugRuntimeStatus.STARTING && debugStatus != DebugRuntimeStatus.RUNNING
+                        ActionButton(
+                            if (debugStatus == DebugRuntimeStatus.STARTING) strings.starting else strings.start,
+                            actions::onStartDebug,
+                            primary = true,
+                            enabled = startAllowed,
+                            modifier = Modifier.weight(1f)
+                        )
+                        ActionButton(
+                            if (debugStatus == DebugRuntimeStatus.STOPPING) strings.stopping else strings.stop,
+                            actions::onStopDebug,
+                            enabled = debugStatus != DebugRuntimeStatus.STOPPING && debugStatus != DebugRuntimeStatus.STOPPED,
+                            modifier = Modifier.weight(1f)
+                        )
                     }
                     Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
                         Text(strings.autoStart, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
@@ -597,6 +651,7 @@ private fun debugRuntimeDisplay(state: DashboardState?, strings: UiStrings): Pai
         DebugRuntimeStatus.STOPPED -> strings.stopped to StatusKind.WAITING
         DebugRuntimeStatus.STARTING -> strings.starting to StatusKind.WAITING
         DebugRuntimeStatus.RUNNING -> strings.running to StatusKind.OK
+        DebugRuntimeStatus.STOPPING -> strings.stopping to StatusKind.WAITING
         DebugRuntimeStatus.ERROR -> strings.error to StatusKind.ERROR
     }
 }
@@ -743,7 +798,7 @@ private fun TripsTab(
                             if (dayExpanded) {
                                 TripTableHeader(strings)
                                 day.trips.forEach { trip ->
-                                    TripTableRow(strings, language, trip) {
+                                    TripTableRow(strings, language, trip, loading = state.routeLoadingId == trip.id) {
                                         selectedTripId = trip.id
                                         actions.onRouteRequested(trip.id)
                                     }
@@ -854,7 +909,13 @@ private fun TripTableHeader(strings: UiStrings) {
 }
 
 @Composable
-private fun TripTableRow(strings: UiStrings, language: UiLanguage, trip: TripSummaryUi, onRoute: () -> Unit) {
+private fun TripTableRow(
+    strings: UiStrings,
+    language: UiLanguage,
+    trip: TripSummaryUi,
+    loading: Boolean,
+    onRoute: () -> Unit
+) {
     val p = LocalBydPalette.current
     Row(Modifier.fillMaxWidth().heightIn(min = 54.dp).padding(start = 48.dp, end = 12.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
         TripTableCell("${trip.startAt} → ${trip.endAt}", p.text, Modifier.weight(1f), FontWeight.SemiBold)
@@ -864,7 +925,13 @@ private fun TripTableRow(strings: UiStrings, language: UiLanguage, trip: TripSum
         TripTableCell("${formatTripNumber(trip.energyKwh, language)} ${energyUnit(language)}", p.text, Modifier.weight(1f))
         TripTableCell("${formatTripNumber(trip.averageConsumptionKwhPer100Km, language)} ${consumptionUnit(language)}", p.green, Modifier.weight(1f), FontWeight.SemiBold)
         Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
-            ActionButton(strings.route, onRoute, primary = true, modifier = Modifier.width(108.dp))
+            ActionButton(
+                if (loading) strings.loading else strings.route,
+                onRoute,
+                primary = true,
+                enabled = !loading,
+                modifier = Modifier.width(108.dp)
+            )
         }
     }
     Box(Modifier.fillMaxWidth().height(1.dp).background(p.border.copy(alpha = 0.55f)))
@@ -1160,7 +1227,8 @@ private fun HaTab(
     strings: UiStrings,
     mqttDraft: MqttDraft,
     influxDraft: InfluxDraft,
-    actions: BydCollectorActions
+    actions: BydCollectorActions,
+    actionUiState: BydCollectorActionUiState
 ) {
     TabScrollColumn {
         Row(Modifier.fillMaxWidth().height(36.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1170,8 +1238,8 @@ private fun HaTab(
             BydSwitch(state?.haSharedCategoriesEnabled == true, actions::onToggleSharedCategories, enabled = state?.influxEnabled != true)
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            MqttCard(state, strings, mqttDraft, actions, Modifier.weight(1f))
-            InfluxCard(state, strings, influxDraft, actions, Modifier.weight(1f))
+            MqttCard(state, strings, mqttDraft, actions, actionUiState, Modifier.weight(1f))
+            InfluxCard(state, strings, influxDraft, actions, actionUiState, Modifier.weight(1f))
         }
     }
 }
@@ -1182,14 +1250,22 @@ private fun MqttCard(
     strings: UiStrings,
     draft: MqttDraft,
     actions: BydCollectorActions,
+    actionUiState: BydCollectorActionUiState,
     modifier: Modifier
 ) {
     SectionCard(
         title = "MQTT",
-        trailing = { StatusPill(compactChannelStatusText(state?.mqttStatus, strings), channelStatusKind(state?.mqttStatus, state?.mqttEnabled == true), compact = true) },
+        trailing = { StatusPill(compactChannelStatusText(state?.mqttStatus, strings, state?.mqttRuntimeStatus), channelStatusKind(state?.mqttStatus, state?.mqttEnabled == true, state?.mqttRuntimeStatus), compact = true) },
         modifier = modifier.height(686.dp)
     ) {
-        ChannelButtons(strings, onStart = actions::onStartMqtt, onStop = actions::onStopMqtt, onTest = actions::onTestMqtt, running = state?.mqttEnabled == true)
+        ChannelButtons(
+            strings,
+            onStart = actions::onStartMqtt,
+            onStop = actions::onStopMqtt,
+            onTest = actions::onTestMqtt,
+            runtimeStatus = state?.mqttRuntimeStatus ?: RuntimeActionStatus.STOPPED,
+            testInFlight = actionUiState.mqttTest
+        )
         Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(strings.autoStart, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
             BydSwitch(state?.mqttAutoStartEnabled == true, actions::onToggleMqttAutoStart)
@@ -1208,19 +1284,33 @@ private fun InfluxCard(
     strings: UiStrings,
     draft: InfluxDraft,
     actions: BydCollectorActions,
+    actionUiState: BydCollectorActionUiState,
     modifier: Modifier
 ) {
     SectionCard(
         title = "InfluxDB",
-        trailing = { StatusPill(compactChannelStatusText(state?.influxStatus, strings), channelStatusKind(state?.influxStatus, state?.influxEnabled == true), compact = true) },
+        trailing = { StatusPill(compactChannelStatusText(state?.influxStatus, strings, state?.influxRuntimeStatus), channelStatusKind(state?.influxStatus, state?.influxEnabled == true, state?.influxRuntimeStatus), compact = true) },
         modifier = modifier.height(686.dp)
     ) {
-        ChannelButtons(strings, onStart = actions::onStartInflux, onStop = actions::onStopInflux, onTest = actions::onTestInflux, running = state?.influxEnabled == true)
+        ChannelButtons(
+            strings,
+            onStart = actions::onStartInflux,
+            onStop = actions::onStopInflux,
+            onTest = actions::onTestInflux,
+            runtimeStatus = state?.influxRuntimeStatus ?: RuntimeActionStatus.STOPPED,
+            testInFlight = actionUiState.influxTest
+        )
         Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(strings.autoStart, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
             BydSwitch(state?.influxAutoStartEnabled == true, actions::onToggleInfluxAutoStart)
         }
-        ChannelPrelude(strings, mqtt = false, pendingText = "${state?.influxPendingRows ?: 0L} ${strings.points}", actions = actions)
+        ChannelPrelude(
+            strings,
+            mqtt = false,
+            pendingText = "${state?.influxPendingRows ?: 0L} ${strings.points}",
+            actions = actions,
+            reExportInFlight = actionUiState.influxReExport
+        )
         CategoryGrid(
             strings.influxCategories,
             if (state?.haSharedCategoriesEnabled == true) state.mqttEnabledCategories else state?.influxEnabledCategories.orEmpty(),
@@ -1239,6 +1329,7 @@ private fun ChannelPrelude(
     mqtt: Boolean,
     pendingText: String,
     actions: BydCollectorActions,
+    reExportInFlight: Boolean = false,
     height: Dp = 78.dp
 ) {
     Column(
@@ -1256,7 +1347,12 @@ private fun ChannelPrelude(
                 Spacer(Modifier.weight(1f))
             } else {
                 Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-                    ActionButton(strings.reExport, actions::onReExportInflux, modifier = Modifier.fillMaxWidth())
+                    ActionButton(
+                        if (reExportInFlight) strings.loading else strings.reExport,
+                        actions::onReExportInflux,
+                        enabled = !reExportInFlight,
+                        modifier = Modifier.fillMaxWidth()
+                    )
                     Text(
                         strings.reExportHint,
                         color = LocalBydPalette.current.muted,
@@ -1276,11 +1372,34 @@ private fun ChannelPrelude(
 }
 
 @Composable
-private fun ChannelButtons(strings: UiStrings, onStart: () -> Unit, onStop: () -> Unit, onTest: () -> Unit, running: Boolean) {
+private fun ChannelButtons(
+    strings: UiStrings,
+    onStart: () -> Unit,
+    onStop: () -> Unit,
+    onTest: () -> Unit,
+    runtimeStatus: RuntimeActionStatus,
+    testInFlight: Boolean
+) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        ActionButton(strings.start, onStart, primary = true, enabled = !running, modifier = Modifier.weight(1f))
-        ActionButton(strings.stop, onStop, enabled = running, modifier = Modifier.weight(1f))
-        ActionButton(strings.testConnection, onTest, modifier = Modifier.weight(1f))
+        ActionButton(
+            if (runtimeStatus == RuntimeActionStatus.STARTING) strings.starting else strings.start,
+            onStart,
+            primary = true,
+            enabled = runtimeStatus != RuntimeActionStatus.STARTING && runtimeStatus != RuntimeActionStatus.RUNNING,
+            modifier = Modifier.weight(1f)
+        )
+        ActionButton(
+            if (runtimeStatus == RuntimeActionStatus.STOPPING) strings.stopping else strings.stop,
+            onStop,
+            enabled = runtimeStatus != RuntimeActionStatus.STOPPING && runtimeStatus != RuntimeActionStatus.STOPPED,
+            modifier = Modifier.weight(1f)
+        )
+        ActionButton(
+            if (testInFlight) strings.loading else strings.testConnection,
+            onTest,
+            enabled = !testInFlight,
+            modifier = Modifier.weight(1f)
+        )
     }
 }
 
@@ -1471,7 +1590,7 @@ private fun TelegramConnectionCard(
                 text = strings.testConnection,
                 onClick = onTestConnection,
                 primary = true,
-                enabled = config.botTokenSet && config.chatId.isNotBlank(),
+                enabled = config.botTokenSet && config.chatId.isNotBlank() && testStatus != TelegramTestStatus.TESTING,
                 modifier = Modifier.width(180.dp)
             )
             StatusPill(
@@ -2036,6 +2155,7 @@ private fun ShutdownIconButton(onClick: () -> Unit) {
 @Composable
 private fun ArchiveShareIconButton(
     enabled: Boolean,
+    loading: Boolean = false,
     contentDescription: String,
     onClick: () -> Unit
 ) {
@@ -2062,15 +2182,19 @@ private fun ArchiveShareIconButton(
             ) { press.onClick() },
         contentAlignment = Alignment.Center
     ) {
-        ShareIcon(
-            contentDescription = contentDescription,
-            color = when {
-                !enabled -> p.muted.copy(alpha = 0.62f)
-                visualPressed -> p.accentText
-                else -> p.accent
-            },
-            modifier = Modifier.size(24.dp)
-        )
+        if (loading) {
+            CircularProgressIndicator(modifier = Modifier.size(18.dp), color = p.accent, strokeWidth = 2.dp)
+        } else {
+            ShareIcon(
+                contentDescription = contentDescription,
+                color = when {
+                    !enabled -> p.muted.copy(alpha = 0.62f)
+                    visualPressed -> p.accentText
+                    else -> p.accent
+                },
+                modifier = Modifier.size(24.dp)
+            )
+        }
     }
 }
 
@@ -2408,6 +2532,7 @@ private fun StorageTab(
     state: DashboardState?,
     strings: UiStrings,
     actions: BydCollectorActions,
+    actionUiState: BydCollectorActionUiState,
     onRequestDelete: (List<String>) -> Unit
 ) {
     val snapshot = state?.archiveStorageSnapshot
@@ -2527,7 +2652,8 @@ private fun StorageTab(
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     ReadOnlyPathField(snapshot?.archiveRootPath ?: "-", modifier = Modifier.weight(1f))
                     ArchiveShareIconButton(
-                        enabled = shareEnabled,
+                        enabled = shareEnabled && !actionUiState.archiveShare,
+                        loading = actionUiState.archiveShare,
                         contentDescription = strings.shareSelectedArchives,
                         onClick = { actions.onShareArchives(selectedArchiveIds) }
                     )
@@ -2535,6 +2661,9 @@ private fun StorageTab(
                     ActionButton(sortLabel, { newestFirst = !newestFirst }, modifier = Modifier.width(180.dp))
                 }
                 job?.takeIf { it.running }?.let {
+                    ArchiveStorageInlineStatus(strings, it)
+                }
+                job?.takeIf { !it.running && it.error != null }?.let {
                     ArchiveStorageInlineStatus(strings, it)
                 }
                 if (entries.isEmpty()) {
@@ -2561,10 +2690,13 @@ private fun StorageTab(
                     }
                     Spacer(Modifier.height(6.dp))
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                        ActionButton(strings.deleteSelected,
+                        ActionButton(if (actionUiState.archiveDeleteDispatch) strings.loading else strings.deleteSelected,
                             { onRequestDelete(selectedIds.toList()) },
                             primary = true,
-                            enabled = selectedIds.isNotEmpty(),
+                            enabled = selectedIds.isNotEmpty() &&
+                                !actionUiState.archiveDeleteDispatch &&
+                                job?.running != true &&
+                                !CollectorService.isArchiveStorageActive(),
                             modifier = Modifier.width(320.dp)
                         )
                     }
@@ -2577,10 +2709,15 @@ private fun StorageTab(
 private fun ArchiveStorageInlineStatus(strings: UiStrings, status: ArchiveStorageJobStatus) {
     val p = LocalBydPalette.current
     Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        CircularProgressIndicator(modifier = Modifier.size(24.dp), color = p.accent, strokeWidth = 3.dp)
+        if (status.running) {
+            CircularProgressIndicator(modifier = Modifier.size(24.dp), color = p.accent, strokeWidth = 3.dp)
+        } else {
+            StatusPill(strings.error, StatusKind.ERROR, compact = true)
+        }
         Text(
-            text = localizedArchiveStorageMessage(strings, status),
-            color = p.muted,
+            text = status.error?.let { "${localizedArchiveStorageMessage(strings, status)}: $it" }
+                ?: localizedArchiveStorageMessage(strings, status),
+            color = if (status.error != null) p.red else p.muted,
             fontSize = 14.sp,
             fontWeight = FontWeight.SemiBold,
             maxLines = 1,
@@ -2838,8 +2975,7 @@ private fun BottomTabs(activeTab: AppTab, strings: UiStrings, actions: BydCollec
             val selected = tab == activeTab
             val interactionSource = remember { MutableInteractionSource() }
             val press = rememberForcedPressClick(
-                enabled = true,
-                invokeImmediately = true
+                enabled = true
             ) { actions.onTabSelected(tab) }
             Row(
                 modifier = Modifier
@@ -2895,10 +3031,29 @@ private fun errorCount(state: DashboardState?): String {
     return if (state?.lastErrorAt != null || state?.lastError != null) "1" else "0"
 }
 
-private fun compactChannelStatusText(status: String?, strings: UiStrings): String {
+private fun compactChannelStatusText(
+    status: String?,
+    strings: UiStrings,
+    runtimeStatus: RuntimeActionStatus? = null
+): String {
+    when (runtimeStatus) {
+        RuntimeActionStatus.STARTING -> return strings.starting
+        RuntimeActionStatus.STOPPING -> return strings.stopping
+        else -> Unit
+    }
     return ChannelStatusFormatter.compactText(status, strings)
 }
 
-private fun channelStatusKind(status: String?, enabled: Boolean): StatusKind {
+private fun channelStatusKind(
+    status: String?,
+    enabled: Boolean,
+    runtimeStatus: RuntimeActionStatus? = null
+): StatusKind {
+    when (runtimeStatus) {
+        RuntimeActionStatus.STARTING, RuntimeActionStatus.STOPPING -> return StatusKind.WAITING
+        RuntimeActionStatus.ERROR -> return StatusKind.ERROR
+        RuntimeActionStatus.RUNNING -> return StatusKind.OK
+        else -> Unit
+    }
     return ChannelStatusFormatter.kind(status, enabled)
 }

@@ -21,6 +21,16 @@ data class InfluxDraft(
     val measurement: String = ""
 )
 
+data class BydCollectorActionUiState(
+    val adbGrant: Boolean = false,
+    val mainArchivePreflight: Boolean = false,
+    val archiveShare: Boolean = false,
+    val archiveDeleteDispatch: Boolean = false,
+    val mqttTest: Boolean = false,
+    val influxTest: Boolean = false,
+    val influxReExport: Boolean = false
+)
+
 enum class TripMapMetric {
     SPEED,
     CONSUMPTION

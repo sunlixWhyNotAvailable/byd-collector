@@ -37,6 +37,7 @@ import com.bydcollector.collector.maintenance.MainArchivePreflight
 import com.bydcollector.collector.maintenance.StorageFormatCutoverCoordinator
 import com.bydcollector.collector.maintenance.ArchiveStorageManager
 import com.bydcollector.collector.maintenance.ArchiveShareLeaseRegistry
+import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
 import com.bydcollector.collector.mqtt.HaMqttActions
 import com.bydcollector.collector.mqtt.MqttActionResult
 import com.bydcollector.collector.service.CollectorService
@@ -53,6 +54,7 @@ import com.bydcollector.collector.ui.VehicleKpiLanguage
 import com.bydcollector.collector.ui.compose.AppTab
 import com.bydcollector.collector.ui.compose.BydCollectorActions
 import com.bydcollector.collector.ui.compose.BydCollectorApp
+import com.bydcollector.collector.ui.compose.BydCollectorActionUiState
 import com.bydcollector.collector.ui.compose.InfluxDraft
 import com.bydcollector.collector.ui.compose.MqttDraft
 import com.bydcollector.collector.ui.compose.TelegramConfig
@@ -120,10 +122,12 @@ class MainActivity : ComponentActivity() {
     private var pendingMainArchivePreflight by mutableStateOf<MainArchivePreflight?>(null)
     private var maintenanceLaunchOperation by mutableStateOf<DbMaintenanceOperation?>(null)
     private var maintenancePreflightInFlight = false
-    private var dashboardRefreshVersion by mutableStateOf(0)
     private var backgroundSetupPromptVisible by mutableStateOf(false)
     private var backgroundSetupPromptAutoLaunch = false
     private var diagnosticsBusy by mutableStateOf(false)
+    private var actionUiState by mutableStateOf(BydCollectorActionUiState())
+    private var archiveDeleteDispatchStartedAtMs: Long? = null
+    private var tripsRequestGeneration = 0L
     @Volatile private var forcedRefreshPending = false
     private var credentialsLoadStarted = false
     private var credentialsLoaded = false
@@ -239,6 +243,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onGrantAdb() {
+            actionUiState = actionUiState.copy(adbGrant = true)
             requestAdbAuthorizationFlow("grant_button")
             refresh()
         }
@@ -248,6 +253,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onOpenArchiveDatabase() {
+            actionUiState = actionUiState.copy(mainArchivePreflight = true)
             openMainArchiveDialog()
         }
 
@@ -341,12 +347,20 @@ class MainActivity : ComponentActivity() {
 
         override fun onDeleteArchives(ids: List<String>) {
             if (ids.isEmpty()) return
+            archiveDeleteDispatchStartedAtMs = System.currentTimeMillis()
+            actionUiState = actionUiState.copy(archiveDeleteDispatch = true)
             stateProvider.invalidateArchiveStorageSnapshot()
-            CollectorServiceController.deleteArchives(this@MainActivity, ids)
+            runCatching {
+                CollectorServiceController.deleteArchives(this@MainActivity, ids)
+            }.onFailure {
+                archiveDeleteDispatchStartedAtMs = null
+                actionUiState = actionUiState.copy(archiveDeleteDispatch = false)
+            }
             refresh()
         }
 
         override fun onShareArchives(ids: List<String>) {
+            actionUiState = actionUiState.copy(archiveShare = true)
             shareArchives(ids)
         }
 
@@ -402,6 +416,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onTestMqtt() {
+            actionUiState = actionUiState.copy(mqttTest = true)
             runMqttChannelAction("MQTT test") {
                 HaMqttActions.testConnection(currentStore(), settings)
             }
@@ -448,13 +463,15 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onTestInflux() {
-            runInfluxChannelAction("Influx test") {
+            actionUiState = actionUiState.copy(influxTest = true)
+            runInfluxChannelAction("Influx test", clearAction = { it.copy(influxTest = false) }) {
                 InfluxActions.testConnection(currentStore(), settings)
             }
         }
 
         override fun onReExportInflux() {
-            runInfluxChannelAction("Influx re-export") {
+            actionUiState = actionUiState.copy(influxReExport = true)
+            runInfluxChannelAction("Influx re-export", clearAction = { it.copy(influxReExport = false) }) {
                 InfluxActions.reExportNewCategories(currentStore(), settings)
             }
         }
@@ -601,7 +618,7 @@ class MainActivity : ComponentActivity() {
                 updateUiState = updateUiState,
                 databaseMaintenanceUiState = currentMaintenanceUiState(renderedChrome),
                 diagnosticsBusy = diagnosticsBusy,
-                switchConfirmationVersion = dashboardRefreshVersion,
+                actionUiState = actionUiState,
                 actions = uiActions,
                 backgroundSetupPromptVisible = backgroundSetupPromptVisible,
                 onOpenBackgroundSettingsFromPrompt = ::onOpenBackgroundSettingsFromPrompt,
@@ -657,6 +674,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         destroyed = true
+        archiveDeleteDispatchStartedAtMs = null
+        actionUiState = BydCollectorActionUiState()
+        diagnosticsBusy = false
         //asks the watchdog path to recover service work if the user closes only the activity
         if (
             ::settings.isInitialized &&
@@ -754,6 +774,7 @@ class MainActivity : ComponentActivity() {
                     if (destroyed) {
                         CollectorService.archiveShareLeaseRegistry.release(lease)
                         archiveShareInFlight.set(false)
+                        actionUiState = actionUiState.copy(archiveShare = false)
                     } else {
                         openArchiveShareChooser(requestedIds, uris, lease)
                     }
@@ -803,6 +824,7 @@ class MainActivity : ComponentActivity() {
             return
         } finally {
             archiveShareInFlight.set(false)
+            actionUiState = actionUiState.copy(archiveShare = false)
         }
     }
 
@@ -821,6 +843,7 @@ class MainActivity : ComponentActivity() {
         if (!destroyed) {
             handler.post {
                 if (!destroyed) {
+                    actionUiState = actionUiState.copy(archiveShare = false)
                     Toast.makeText(
                         this@MainActivity,
                         strings(uiLanguage).archiveShareFailed,
@@ -908,14 +931,18 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun openMainArchiveDialog() {
-        if (maintenancePreflightInFlight || destroyed) return
+        if (maintenancePreflightInFlight || destroyed) {
+            actionUiState = actionUiState.copy(mainArchivePreflight = false)
+            return
+        }
         maintenancePreflightInFlight = true
-        dashboardExecutor.execute {
+        val task = Runnable {
             val result = runCatching {
                 StorageFormatCutoverCoordinator.readMainPreflight(currentStore().databaseFile())
             }
             runOnUiThread {
                 maintenancePreflightInFlight = false
+                actionUiState = actionUiState.copy(mainArchivePreflight = false)
                 if (destroyed) return@runOnUiThread
                 result
                     .onSuccess { preflight ->
@@ -932,13 +959,24 @@ class MainActivity : ComponentActivity() {
                     }
             }
         }
+        runCatching { dashboardExecutor.execute(task) }.onFailure { error ->
+            maintenancePreflightInFlight = false
+            actionUiState = actionUiState.copy(mainArchivePreflight = false)
+            recordDashboardRefreshFailure("maintenance_preflight", error)
+            pendingMainArchivePreflight = MainArchivePreflight(
+                warning = "${strings(uiLanguage).archivePreflightFailed}: ${dashboardErrorDetail(error)}"
+            )
+            pendingMaintenanceOperation = DbMaintenanceOperation.ARCHIVE
+            refresh()
+        }
     }
 
     private fun loadTripsUi(routeTripId: String? = null) {
         if (destroyed) return
         val requestedLanguage = uiLanguage
+        val requestGeneration = ++tripsRequestGeneration
         tripsUiState = tripsUiState.copy(routeLoadingId = routeTripId)
-        dashboardExecutor.execute {
+        runCatching { dashboardExecutor.execute {
             val result = runCatching {
                 val trips = BydCollectorApplication.trips(applicationContext)
                 val groups = trips.queryHierarchy()
@@ -946,13 +984,18 @@ class MainActivity : ComponentActivity() {
                 TripsUiMapper.years(groups, requestedLanguage, routes)
             }
             runOnUiThread {
-                if (destroyed || uiLanguage != requestedLanguage) return@runOnUiThread
+                if (destroyed || uiLanguage != requestedLanguage || requestGeneration != tripsRequestGeneration) return@runOnUiThread
                 result.onSuccess { years ->
                     tripsUiState = tripsUiState.copy(years = years, routeLoadingId = null)
                 }.onFailure { error ->
                     tripsUiState = tripsUiState.copy(routeLoadingId = null)
                     recordDashboardRefreshFailure("trips", error)
                 }
+            }
+        } }.onFailure { error ->
+            if (!destroyed && requestGeneration == tripsRequestGeneration) {
+                tripsUiState = tripsUiState.copy(routeLoadingId = null)
+                recordDashboardRefreshFailure("trips", error)
             }
         }
     }
@@ -1016,14 +1059,14 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 refreshInFlight = false
                 if (destroyed) return@runOnUiThread
-                var tabPublished = false
                 if (tabGeneration != null && tabResult != null) {
                     tabResult
                         .onSuccess { state ->
                             if (!state.autoStartEnabled && state.debugAutoStartEnabled) {
                                 settings.setDebugAutoStartEnabled(false)
                             }
-                            tabPublished = dashboardUiStateStore.publishTab(tab, tabGeneration, state)
+                            dashboardUiStateStore.publishTab(tab, tabGeneration, state)
+                            reconcileActionUiState(state)
                         }
                         .onFailure { error ->
                             dashboardUiStateStore.failTab(tab, tabGeneration, dashboardErrorDetail(error))
@@ -1032,14 +1075,16 @@ class MainActivity : ComponentActivity() {
                 }
                 if (chromeGeneration != null && chromeResult != null) {
                     chromeResult
-                        .onSuccess { state -> dashboardUiStateStore.publishChrome(chromeGeneration, state) }
+                        .onSuccess { state ->
+                            dashboardUiStateStore.publishChrome(chromeGeneration, state)
+                            reconcileActionUiState(state)
+                        }
                         .onFailure { error ->
                             dashboardUiStateStore.failChrome(chromeGeneration, dashboardErrorDetail(error))
                             recordDashboardRefreshFailure("chrome", error)
                         }
                 }
                 reconcileCutoverArchiveStorageIfNeeded()
-                if (tabPublished) dashboardRefreshVersion += 1
                 if (forcedRefreshPending && !destroyed) {
                     forcedRefreshPending = false
                     refresh(force = true)
@@ -1059,6 +1104,20 @@ class MainActivity : ComponentActivity() {
             )
         }.onFailure { eventError ->
             Log.e(TAG, "Dashboard refresh failure could not be recorded", eventError)
+        }
+    }
+
+    private fun reconcileActionUiState(state: DashboardState) {
+        val archiveJob = state.archiveStorageJobStatus
+        val dispatchedAtMs = archiveDeleteDispatchStartedAtMs
+        if (
+            actionUiState.archiveDeleteDispatch &&
+            dispatchedAtMs != null &&
+            archiveJob.mode == ArchiveStorageJobMode.DELETE &&
+            archiveJob.updatedAtMs >= dispatchedAtMs
+        ) {
+            archiveDeleteDispatchStartedAtMs = null
+            actionUiState = actionUiState.copy(archiveDeleteDispatch = false)
         }
     }
 
@@ -1195,13 +1254,23 @@ class MainActivity : ComponentActivity() {
         return false
     }
 
-    private fun requestAdbAuthorizationFlow(source: String) {
+    private fun requestAdbAuthorizationFlow(source: String): Boolean {
         recordOperationalEvent(
             "adb_authorization_flow_started",
             "Starting local ADB RSA authorization request",
             "source=$source"
         )
-        requestAccessCheck(source, AccessCheckMode.FORCE, ::completeStartupAccessFlow)
+        val submitted = requestAccessCheck(
+            source,
+            AccessCheckMode.FORCE,
+            afterComplete = {
+                actionUiState = actionUiState.copy(adbGrant = false)
+                completeStartupAccessFlow()
+            },
+            onTerminal = { actionUiState = actionUiState.copy(adbGrant = false) }
+        )
+        if (!submitted) actionUiState = actionUiState.copy(adbGrant = false)
+        return submitted
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
@@ -1305,7 +1374,8 @@ class MainActivity : ComponentActivity() {
     private fun requestAccessCheck(
         source: String,
         mode: AccessCheckMode,
-        afterComplete: (() -> Unit)? = null
+        afterComplete: (() -> Unit)? = null,
+        onTerminal: (() -> Unit)? = null
     ): Boolean {
         return AdbAuthorizationManager.request(
             context = applicationContext,
@@ -1319,6 +1389,11 @@ class MainActivity : ComponentActivity() {
                         refresh()
                         afterComplete?.invoke()
                     }
+                }
+            },
+            onTerminal = {
+                handler.post {
+                    if (!destroyed) onTerminal?.invoke()
                 }
             }
         )
@@ -1377,8 +1452,10 @@ class MainActivity : ComponentActivity() {
         if (force) {
             updateUiState = UpdateUiState.Checking
         }
-        updateExecutor.execute {
-            val result = updateChecker.check(force)
+        runCatching {
+            updateExecutor.execute {
+            val result = runCatching { updateChecker.check(force) }
+                .getOrElse { UpdateCheckResult.Error(it.message ?: it::class.java.simpleName) }
             runOnUiThread {
                 updateCheckInFlight = false
                 if (destroyed || !foreground || uiGeneration != updateUiGeneration) return@runOnUiThread
@@ -1388,56 +1465,74 @@ class MainActivity : ComponentActivity() {
                     is UpdateCheckResult.Error -> if (force) UpdateUiState.Error(result.message) else UpdateUiState.Hidden
                 }
             }
+            }
+        }.onFailure { error ->
+            updateCheckInFlight = false
+            if (!destroyed && uiGeneration == updateUiGeneration && force) {
+                updateUiState = UpdateUiState.Error(error.message ?: error::class.java.simpleName)
+            }
         }
     }
 
     private fun startUpdateDownload(info: UpdateInfo) {
         val uiGeneration = ++updateUiGeneration
         updateUiState = UpdateUiState.Downloading(info, 0)
-        updateExecutor.execute {
-            val result = runCatching {
-                val downloadId = updateDownloader.enqueue(info)
-                var progress = 0
-                //polls downloadmanager because install intent should be offered only after the apk is fully written
-                while (progress < 100 && !destroyed) {
-                    Thread.sleep(350L)
-                    progress = updateDownloader.progress(downloadId)
-                    if (progress < 0) error("Update download failed")
-                    runOnUiThread {
-                        if (!destroyed && uiGeneration == updateUiGeneration) {
-                            updateUiState = UpdateUiState.Downloading(info, progress)
-                        }
-                    }
-                }
-                val verifiedFile = updateDownloader.copyDownloadedApkForInstall(info)
-                val validation = updateApkVerifier.validate(verifiedFile)
-                if (!validation.ok) error(validation.message)
-                VerifiedUpdateDownload(
-                    info = info,
-                    file = verifiedFile,
-                    sha256 = validation.sha256 ?: error("APK digest unavailable")
-                )
-            }
-            runOnUiThread {
-                if (destroyed) return@runOnUiThread
-                result
-                    .onSuccess { verified ->
-                        val finalValidation = updateApkVerifier.validate(verified.file)
-                        if (!finalValidation.ok || finalValidation.sha256 != verified.sha256) {
-                            if (uiGeneration == updateUiGeneration) {
-                                updateUiState = UpdateUiState.Error(
-                                    if (!finalValidation.ok) finalValidation.message else "APK digest changed before install"
-                                )
+        runCatching {
+            updateExecutor.execute {
+                val result = runCatching {
+                    val downloadId = updateDownloader.enqueue(info)
+                    var progress = 0
+                    //polls downloadmanager because install intent should be offered only after the apk is fully written
+                    while (progress < 100 && !destroyed) {
+                        Thread.sleep(350L)
+                        progress = updateDownloader.progress(downloadId)
+                        if (progress < 0) error("Update download failed")
+                        runOnUiThread {
+                            if (!destroyed && uiGeneration == updateUiGeneration) {
+                                updateUiState = UpdateUiState.Downloading(info, progress)
                             }
-                            return@onSuccess
-                        }
-                        updateDownloader.install(verified.info, verified.file)
-                    }
-                    .onFailure { error ->
-                        if (uiGeneration == updateUiGeneration) {
-                            updateUiState = UpdateUiState.Error(error.message ?: error::class.java.simpleName)
                         }
                     }
+                    val verifiedFile = updateDownloader.copyDownloadedApkForInstall(info)
+                    val validation = updateApkVerifier.validate(verifiedFile)
+                    if (!validation.ok) error(validation.message)
+                    VerifiedUpdateDownload(
+                        info = info,
+                        file = verifiedFile,
+                        sha256 = validation.sha256 ?: error("APK digest unavailable")
+                    )
+                }
+                runOnUiThread {
+                    if (destroyed) return@runOnUiThread
+                    result
+                        .onSuccess { verified ->
+                            val finalValidation = updateApkVerifier.validate(verified.file)
+                            if (!finalValidation.ok || finalValidation.sha256 != verified.sha256) {
+                                if (uiGeneration == updateUiGeneration) {
+                                    updateUiState = UpdateUiState.Error(
+                                        if (!finalValidation.ok) finalValidation.message else "APK digest changed before install"
+                                    )
+                                }
+                                return@onSuccess
+                            }
+                            runCatching { updateDownloader.install(verified.info, verified.file) }
+                                .onSuccess { if (uiGeneration == updateUiGeneration) updateUiState = UpdateUiState.Hidden }
+                                .onFailure { error ->
+                                    if (uiGeneration == updateUiGeneration) {
+                                        updateUiState = UpdateUiState.Error(error.message ?: error::class.java.simpleName)
+                                    }
+                                }
+                        }
+                        .onFailure { error ->
+                            if (uiGeneration == updateUiGeneration) {
+                                updateUiState = UpdateUiState.Error(error.message ?: error::class.java.simpleName)
+                            }
+                        }
+                }
+            }
+        }.onFailure { error ->
+            if (!destroyed && uiGeneration == updateUiGeneration) {
+                updateUiState = UpdateUiState.Error(error.message ?: error::class.java.simpleName)
             }
         }
     }
@@ -1687,7 +1782,10 @@ class MainActivity : ComponentActivity() {
         }
         telegramUiState = telegramUiState.copy(testStatus = TelegramTestStatus.TESTING)
         settings.setTelegramConnectionStatus("testing", null)
-        CollectorServiceController.testTelegram(this)
+        runCatching { CollectorServiceController.testTelegram(this) }.onFailure { error ->
+            settings.setTelegramConnectionStatus("failed", error.message ?: error::class.java.simpleName)
+            telegramUiState = telegramUiState.copy(testStatus = TelegramTestStatus.FAILED)
+        }
     }
 
     private fun syncTelegramUiRuntimeState() {
@@ -1703,13 +1801,15 @@ class MainActivity : ComponentActivity() {
     private fun runMqttChannelAction(label: String, action: () -> MqttActionResult) {
         refreshStoreBackedState()
         if (!saveMqttDraft()) {
+            actionUiState = actionUiState.copy(mqttTest = false)
             refresh()
             return
         }
-        dashboardExecutor.execute {
+        val task = Runnable {
             val result = runCatching { action() }
             runOnUiThread {
                 if (destroyed) return@runOnUiThread
+                actionUiState = actionUiState.copy(mqttTest = false)
                 result
                     .onSuccess { mqttResult ->
                         val message = if (mqttResult.ok) {
@@ -1733,18 +1833,29 @@ class MainActivity : ComponentActivity() {
                 refresh()
             }
         }
+        runCatching { dashboardExecutor.execute(task) }.onFailure { error ->
+            actionUiState = actionUiState.copy(mqttTest = false)
+            Toast.makeText(this@MainActivity, "$label failed: ${error.message ?: error::class.java.simpleName}", Toast.LENGTH_LONG).show()
+            refresh()
+        }
     }
 
-    private fun runInfluxChannelAction(label: String, action: () -> InfluxActionResult) {
+    private fun runInfluxChannelAction(
+        label: String,
+        clearAction: (BydCollectorActionUiState) -> BydCollectorActionUiState,
+        action: () -> InfluxActionResult
+    ) {
         refreshStoreBackedState()
         if (!saveInfluxDraft()) {
+            actionUiState = clearAction(actionUiState)
             refresh()
             return
         }
-        dashboardExecutor.execute {
+        val task = Runnable {
             val result = runCatching { action() }
             runOnUiThread {
                 if (destroyed) return@runOnUiThread
+                actionUiState = clearAction(actionUiState)
                 result
                     .onSuccess { influxResult ->
                         val message = if (influxResult.ok) {
@@ -1767,6 +1878,11 @@ class MainActivity : ComponentActivity() {
                     }
                 refresh()
             }
+        }
+        runCatching { dashboardExecutor.execute(task) }.onFailure { error ->
+            actionUiState = clearAction(actionUiState)
+            Toast.makeText(this@MainActivity, "$label failed: ${error.message ?: error::class.java.simpleName}", Toast.LENGTH_LONG).show()
+            refresh()
         }
     }
 
@@ -1826,7 +1942,7 @@ class MainActivity : ComponentActivity() {
                     Toast.makeText(this, "ADB не авторизовано — logcat не запущено", Toast.LENGTH_LONG).show()
                     refresh()
                 } else {
-                    diagnosticsExecutor.execute {
+                    val task = Runnable {
                         val result = runCatching { DiagnosticLogRecorder.start(applicationContext) }
                         handler.post {
                             if (destroyed) return@post
@@ -1841,7 +1957,17 @@ class MainActivity : ComponentActivity() {
                             refresh()
                         }
                     }
+                    runCatching { diagnosticsExecutor.execute(task) }.onFailure { error ->
+                        diagnosticsBusy = false
+                        recordOperationalEvent("log_recording_error", "Full system logcat start was rejected", error.message)
+                        Toast.makeText(this, "Помилка запуску logcat: ${error.message}", Toast.LENGTH_LONG).show()
+                        refresh()
+                    }
                 }
+            },
+            onTerminal = {
+                diagnosticsBusy = false
+                refresh()
             }
         )
         if (!submitted) {
@@ -1856,7 +1982,7 @@ class MainActivity : ComponentActivity() {
         if (diagnosticsBusy) return
         refreshStoreBackedState()
         diagnosticsBusy = true
-        diagnosticsExecutor.execute {
+        val task = Runnable {
             val result = runCatching { DiagnosticLogRecorder.stop() }
             handler.post {
                 if (destroyed) return@post
@@ -1870,6 +1996,12 @@ class MainActivity : ComponentActivity() {
                 diagnosticsBusy = false
                 refresh()
             }
+        }
+        runCatching { diagnosticsExecutor.execute(task) }.onFailure { error ->
+            diagnosticsBusy = false
+            recordOperationalEvent("log_recording_error", "Full system logcat stop was rejected", error.message)
+            Toast.makeText(this, "Помилка зупинки logcat: ${error.message}", Toast.LENGTH_LONG).show()
+            refresh()
         }
     }
 

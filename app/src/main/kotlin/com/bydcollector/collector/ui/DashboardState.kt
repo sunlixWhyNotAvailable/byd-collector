@@ -9,6 +9,15 @@ enum class DebugRuntimeStatus {
     STOPPED,
     STARTING,
     RUNNING,
+    STOPPING,
+    ERROR
+}
+
+enum class RuntimeActionStatus {
+    STOPPED,
+    STARTING,
+    RUNNING,
+    STOPPING,
     ERROR
 }
 
@@ -106,7 +115,13 @@ data class DashboardState(
     val recentEvents: List<CollectorEvent>,
     val mainStorageCutoverDeferredReason: String? = null,
     val mainStorageCutoverError: String? = null,
-    val debugStorageCutoverError: String? = null
+    val debugStorageCutoverError: String? = null,
+    val mainRuntimeStatus: RuntimeActionStatus =
+        if (mainPollingRunning) RuntimeActionStatus.RUNNING else RuntimeActionStatus.STOPPED,
+    val mqttRuntimeStatus: RuntimeActionStatus =
+        if (mqttEnabled) RuntimeActionStatus.RUNNING else RuntimeActionStatus.STOPPED,
+    val influxRuntimeStatus: RuntimeActionStatus =
+        if (influxEnabled) RuntimeActionStatus.RUNNING else RuntimeActionStatus.STOPPED
 )
 
 data class VehicleKpis(

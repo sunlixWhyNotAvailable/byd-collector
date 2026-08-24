@@ -29,7 +29,13 @@ data class DashboardRuntimeFlags(
     val dbMaintenanceStatus: DbMaintenanceRuntimeStatus,
     val archiveStorageJobStatus: ArchiveStorageJobStatus,
     val debugRuntimeStatus: DebugRuntimeStatus = if (debugPollingRunning) DebugRuntimeStatus.RUNNING else DebugRuntimeStatus.STOPPED,
-    val debugRuntimeError: String? = null
+    val debugRuntimeError: String? = null,
+    val mainRuntimeStatus: RuntimeActionStatus =
+        if (mainPollingRunning) RuntimeActionStatus.RUNNING else RuntimeActionStatus.STOPPED,
+    val mqttRuntimeStatus: RuntimeActionStatus =
+        if (mqttEnabled) RuntimeActionStatus.RUNNING else RuntimeActionStatus.STOPPED,
+    val influxRuntimeStatus: RuntimeActionStatus =
+        if (influxEnabled) RuntimeActionStatus.RUNNING else RuntimeActionStatus.STOPPED
 )
 
 data class DashboardMainPollState(
@@ -436,12 +442,15 @@ class DashboardUiStateStore(
                 serviceRunning = flags.serviceRunning,
                 mainPollingRunning = flags.mainPollingRunning,
                 pollingEnabled = flags.pollingEnabled,
+                mainRuntimeStatus = flags.mainRuntimeStatus,
                 debugPollingEnabled = flags.debugPollingEnabled,
                 debugPollingRunning = flags.debugPollingRunning,
                 debugRuntimeStatus = flags.debugRuntimeStatus,
                 debugRuntimeError = flags.debugRuntimeError,
                 mqttEnabled = flags.mqttEnabled,
+                mqttRuntimeStatus = flags.mqttRuntimeStatus,
                 influxEnabled = flags.influxEnabled,
+                influxRuntimeStatus = flags.influxRuntimeStatus,
                 permissionsGranted = flags.permissionsGranted,
                 adbAuthorized = flags.adbAuthorized,
                 dbMaintenanceStatus = flags.dbMaintenanceStatus,

@@ -71,6 +71,7 @@ import com.bydcollector.collector.ui.DashboardStateProvider
 import com.bydcollector.collector.ui.DashboardUiStateStore
 import com.bydcollector.collector.ui.DebugRuntimeStatus
 import com.bydcollector.collector.ui.DisplayTimeFormatter
+import com.bydcollector.collector.ui.RuntimeActionStatus
 import com.bydcollector.collector.ui.VehicleKpiLanguage
 import com.bydcollector.collector.ui.VehicleKpiMapper
 import com.bydcollector.collector.ui.VehicleKpis
@@ -86,6 +87,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 //owns the runtime lifecycle so collection, exports, and keep-alive can continue without an open activity
 class CollectorService : Service() {
@@ -105,6 +107,7 @@ class CollectorService : Service() {
     private lateinit var dashboardStateProvider: DashboardStateProvider
     private var mainPollerOwnerMode = DirectHelperOwnerMode.APP_GAP_SPOOL
     private var debugStorageReady = false
+    @Volatile private var mainRuntimeStatus = RuntimeActionStatus.STOPPED
     @Volatile private var debugRuntimeStatus = DebugRuntimeStatus.STOPPED
     @Volatile private var debugRuntimeError: String? = null
     private var wakeLock: PowerManager.WakeLock? = null
@@ -133,10 +136,15 @@ class CollectorService : Service() {
     private val mqttWorkGeneration = AtomicLong(0L)
     private val influxWorkGeneration = AtomicLong(0L)
     private val telegramWorkGeneration = AtomicLong(0L)
+    private val debugWorkGeneration = AtomicLong(0L)
     private val debugStartInProgress = AtomicBoolean(false)
+    private val debugStartQueued = AtomicBoolean(false)
     private val debugOwnerHandoffPending = AtomicBoolean(false)
+    @Volatile private var mqttRuntimeStatus = RuntimeActionStatus.STOPPED
+    @Volatile private var influxRuntimeStatus = RuntimeActionStatus.STOPPED
     private val mqttRuntimeActive = AtomicBoolean(false)
     private val mqttOfflineQueued = AtomicBoolean(false)
+    private val mqttOfflineCompletionGeneration = AtomicLong(0L)
     private val maintenanceActive = AtomicBoolean(false)
     private val maintenanceRuntimeRestoreAllowed = AtomicBoolean(true)
     private val userShutdownFinalizationStarted = AtomicBoolean(false)
@@ -223,6 +231,15 @@ class CollectorService : Service() {
     override fun onCreate() {
         super.onCreate()
         running.set(true)
+        mainRuntimeStatus = RuntimeActionStatus.STOPPED
+        debugRuntimeStatus = DebugRuntimeStatus.STOPPED
+        debugRuntimeError = null
+        mqttRuntimeStatus = RuntimeActionStatus.STOPPED
+        influxRuntimeStatus = RuntimeActionStatus.STOPPED
+        mainRuntimeStatusRef.set(mainRuntimeStatus)
+        debugRuntimeStatusRef.set(debugRuntimeStatus)
+        mqttRuntimeStatusRef.set(mqttRuntimeStatus)
+        influxRuntimeStatusRef.set(influxRuntimeStatus)
         store = BydCollectorApplication.store(applicationContext)
         settings = CollectorSettings(applicationContext, store)
         debugStorageReady = BydCollectorApplication.isDebugStorageReady(applicationContext)
@@ -300,19 +317,24 @@ class CollectorService : Service() {
         }
         when (action) {
             ACTION_STOP -> {
-                settings.setMainManuallyStopped(true)
-                settings.setPollingEnabled(false)
-                stopMain("polling_disabled")
+                //MainActivity commits the desired/manual flags before dispatching this action.
+                //Do not let a delayed stop intent overwrite a newer start intent.
+                if (!settings.isPollingEnabled() && settings.isMainManuallyStopped()) {
+                    settings.setMainManuallyStopped(true)
+                    settings.setPollingEnabled(false)
+                    stopMain("polling_disabled")
+                }
                 reconcileCollection()
             }
             ACTION_START_DEBUG -> {
-                settings.setDebugManuallyStopped(false)
-                settings.setDebugPollingEnabled(true)
                 reconcileCollection(DEBUG_REASON_MANUAL)
             }
             ACTION_STOP_DEBUG -> {
-                settings.setDebugManuallyStopped(true)
-                settings.setDebugPollingEnabled(false)
+                if (!settings.isDebugPollingEnabled() && settings.isDebugManuallyStopped()) {
+                    settings.setDebugManuallyStopped(true)
+                    settings.setDebugPollingEnabled(false)
+                    stopDebug("debug_disabled")
+                }
                 reconcileCollection()
             }
             ACTION_RECONCILE_KEEP_ALIVE -> reconcileKeepAliveOnly()
@@ -368,6 +390,15 @@ class CollectorService : Service() {
         maintenanceRunningInProcess.set(false)
         mainPollingRunning.set(false)
         running.set(false)
+        mainRuntimeStatus = RuntimeActionStatus.STOPPED
+        debugRuntimeStatus = DebugRuntimeStatus.STOPPED
+        debugRuntimeError = null
+        mqttRuntimeStatus = RuntimeActionStatus.STOPPED
+        influxRuntimeStatus = RuntimeActionStatus.STOPPED
+        mainRuntimeStatusRef.set(mainRuntimeStatus)
+        debugRuntimeStatusRef.set(debugRuntimeStatus)
+        mqttRuntimeStatusRef.set(mqttRuntimeStatus)
+        influxRuntimeStatusRef.set(influxRuntimeStatus)
         publishDashboardRuntimeFlags()
         clearDashboardVehicleKpis()
         if (::dashboardStateProvider.isInitialized) dashboardStateProvider.close()
@@ -629,9 +660,11 @@ class CollectorService : Service() {
         if (maintenanceBlocksRuntimeStart()) return
         if (poller.isRunning()) {
             mainPollingRunning.set(true)
+            setMainRuntime(RuntimeActionStatus.RUNNING)
             publishDashboardRuntimeFlags()
             return
         }
+        setMainRuntime(RuntimeActionStatus.STARTING)
         val ownerMode = DirectHelperOwnerMode.APP_GAP_SPOOL
         if (mainPollerOwnerMode != ownerMode) poller = createTelemetryPoller(ownerMode)
         mqttRuntimeActive.set(false)
@@ -652,31 +685,59 @@ class CollectorService : Service() {
             )
         }
         tripRuntime.resume()
+        //The activity owns the desired/manual flags. Recheck immediately before touching the poller
+        //so a delayed start cannot revive a runtime the user just stopped.
+        if (
+            !settings.isPollingEnabled() ||
+            settings.isMainManuallyStopped() ||
+            maintenanceBlocksRuntimeStart()
+        ) {
+            runCatching { store.endSession(openedSessionId, "polling_start_cancelled") }
+            sessionId = null
+            tripRuntime.pause("polling_start_cancelled")
+            setMainRuntime(RuntimeActionStatus.STOPPED)
+            return
+        }
         poller.start(openedSessionId)
         mainPollingRunning.set(true)
+        setMainRuntime(RuntimeActionStatus.RUNNING)
         publishDashboardRuntimeFlags()
         flushPendingMqttAsync(force = false)
     }
 
     private fun startDebugIfNeeded(reason: String) {
+        if (!settings.isDebugPollingEnabled() || settings.isDebugManuallyStopped()) {
+            setDebugRuntime(DebugRuntimeStatus.STOPPED)
+            return
+        }
         if (maintenanceBlocksRuntimeStart(debugRuntime = true)) return
         if (isDebugPollerRunning()) {
             setDebugRuntime(DebugRuntimeStatus.RUNNING)
             return
         }
-        if (!debugStartInProgress.compareAndSet(false, true)) return
-        setDebugRuntime(DebugRuntimeStatus.STARTING)
-        debugStartExecutor.execute {
-            try {
+        val startGeneration = debugWorkGeneration.incrementAndGet()
+        if (!debugStartInProgress.compareAndSet(false, true)) {
+            //A start requested while an older worker is unwinding must run after that worker clears.
+            debugStartQueued.set(true)
+            setDebugRuntime(DebugRuntimeStatus.STARTING, generation = startGeneration)
+            return
+        }
+        setDebugRuntime(DebugRuntimeStatus.STARTING, generation = startGeneration)
+        try {
+            debugStartExecutor.execute {
+                try {
                 //Readiness failures are deliberately retried only when a start is requested.
                 debugStorageReady = BydCollectorApplication.ensureDebugStorageReady(applicationContext)
                 if (!debugStorageReady) {
                     val detail = settings.debugStorageCutoverError() ?: "Debug database readiness failed"
-                    setDebugRuntime(DebugRuntimeStatus.ERROR, detail)
-                    store.recordEvent("debug_polling_start_error", "Debug database is not ready", detail)
-                    updateNotification("Polling error: $detail")
+                    if (debugStartStillCurrent(startGeneration)) {
+                        setDebugRuntime(DebugRuntimeStatus.ERROR, detail, generation = startGeneration)
+                        store.recordEvent("debug_polling_start_error", "Debug database is not ready", detail)
+                        updateNotification("Polling error: $detail")
+                    }
                     return@execute
                 }
+                if (!debugStartStillCurrent(startGeneration)) return@execute
                 scheduleDashboardCountBootstrap(force = true)
                 val parameters = DirectDebugParameterAsset.load(applicationContext)
                 val helper = DirectVehicleHelperClient()
@@ -687,19 +748,22 @@ class CollectorService : Service() {
                     ownerMode = settings.mainHelperOwnerMode()
                 )
                 if (!launch.ok) {
-                    setDebugRuntime(DebugRuntimeStatus.ERROR, launch.message)
-                    store.recordEvent("debug_polling_start_error", "Debug direct helper unavailable", launch.message)
-                    updateNotification("Polling error: ${PollingErrorSummaries.summary(launch.message)}")
+                    if (debugStartStillCurrent(startGeneration)) {
+                        setDebugRuntime(DebugRuntimeStatus.ERROR, launch.message, generation = startGeneration)
+                        store.recordEvent("debug_polling_start_error", "Debug direct helper unavailable", launch.message)
+                        updateNotification("Polling error: ${PollingErrorSummaries.summary(launch.message)}")
+                    }
                     return@execute
                 }
-                if (!settings.isDebugPollingEnabled() || settings.isDebugManuallyStopped()) return@execute
+                if (!debugStartStillCurrent(startGeneration)) return@execute
                 val batchSize = DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT
                 var lastDebugReadModeKey: String? = null
                 val nextPoller = DirectDebugRoundRobinPoller(
                     parameters = parameters,
                     helper = helper,
                     store = debugStore,
-                    onCycle = { summary ->
+                    onCycle = cycle@{ summary ->
+                        if (!debugStartStillCurrent(startGeneration)) return@cycle
                         dashboardUiStateStore.incrementDebugReadingCount(summary.changedCount.toLong())
                         val previous = dashboardUiStateStore.currentTab(AppTab.ALL_PARAMETERS)
                         val completedAt = DisplayTimeFormatter.formatNullable(java.time.Instant.now().toString())
@@ -747,6 +811,7 @@ class CollectorService : Service() {
                     requireRuntimeOwner()
                     synchronized(debugPollerLock) {
                         if (
+                            startGeneration != debugWorkGeneration.get() ||
                             !settings.isDebugPollingEnabled() ||
                             settings.isDebugManuallyStopped() ||
                             maintenanceBlocksRuntimeStart(debugRuntime = true) ||
@@ -756,7 +821,7 @@ class CollectorService : Service() {
                         } else {
                             nextPoller.start(batchSize)
                             debugPoller = nextPoller
-                            setDebugRuntime(DebugRuntimeStatus.RUNNING)
+                            setDebugRuntime(DebugRuntimeStatus.RUNNING, generation = startGeneration)
                             true
                         }
                     }
@@ -765,39 +830,66 @@ class CollectorService : Service() {
                     nextPoller.shutdown("debug_start_cancelled")
                     return@execute
                 }
-                store.recordEvent(
-                    "debug_polling_started",
-                    "Debug round-robin polling started",
-                    "reason=$reason batch_size=$batchSize parameters=${parameters.size}"
-                )
-            } catch (error: RuntimeException) {
-                val detail = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
-                setDebugRuntime(DebugRuntimeStatus.ERROR, detail)
-                store.recordEvent(
-                    "debug_polling_start_error",
-                    "Debug round-robin startup failed",
-                    detail
-                )
-                updateNotification("Polling error: debug startup failed")
-            } finally {
-                debugStartInProgress.set(false)
-                if (debugOwnerHandoffPending.getAndSet(false)) {
-                    mainHandler.post {
-                        if (!running.get()) return@post
-                        val debugAllowed = settings.isDebugPollingEnabled() && !settings.isDebugManuallyStopped()
-                        val ownerMismatch = DirectVehicleHelperClient().ownerMode() != settings.mainHelperOwnerMode()
-                        if (debugAllowed && (!isDebugPollerRunning() || ownerMismatch)) {
-                            stopDebug("helper_owner_handoff")
-                            startDebugIfNeeded(DEBUG_REASON_AUTOSTART)
+                if (debugStartStillCurrent(startGeneration)) {
+                    store.recordEvent(
+                        "debug_polling_started",
+                        "Debug round-robin polling started",
+                        "reason=$reason batch_size=$batchSize parameters=${parameters.size}"
+                    )
+                }
+                } catch (error: RuntimeException) {
+                    val detail = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                    if (debugStartStillCurrent(startGeneration)) {
+                        setDebugRuntime(DebugRuntimeStatus.ERROR, detail, generation = startGeneration)
+                        store.recordEvent(
+                            "debug_polling_start_error",
+                            "Debug round-robin startup failed",
+                            detail
+                        )
+                        updateNotification("Polling error: debug startup failed")
+                    }
+                } finally {
+                    debugStartInProgress.set(false)
+                    if (
+                        debugStartQueued.getAndSet(false) &&
+                        settings.isDebugPollingEnabled() &&
+                        !settings.isDebugManuallyStopped()
+                    ) {
+                        mainHandler.post {
+                            if (running.get()) startDebugIfNeeded(DEBUG_REASON_MANUAL)
+                        }
+                    }
+                    if (debugOwnerHandoffPending.getAndSet(false)) {
+                        mainHandler.post {
+                            if (!running.get()) return@post
+                            val debugAllowed = settings.isDebugPollingEnabled() && !settings.isDebugManuallyStopped()
+                            val ownerMismatch = DirectVehicleHelperClient().ownerMode() != settings.mainHelperOwnerMode()
+                            if (debugAllowed && (!isDebugPollerRunning() || ownerMismatch)) {
+                                stopDebug("helper_owner_handoff")
+                                startDebugIfNeeded(DEBUG_REASON_AUTOSTART)
+                            }
                         }
                     }
                 }
+            }
+        } catch (error: RejectedExecutionException) {
+            debugStartInProgress.set(false)
+            debugStartQueued.set(false)
+            debugOwnerHandoffPending.set(false)
+            val detail = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+            if (startGeneration == debugWorkGeneration.get()) {
+                setDebugRuntime(DebugRuntimeStatus.ERROR, detail, generation = startGeneration)
+                store.recordEvent("debug_polling_start_error", "Debug startup worker rejected", detail)
+                updateNotification("Polling error: debug startup rejected")
             }
         }
     }
 
     private fun handleStartFailure(error: RuntimeException) {
         val detail = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+        if (mainRuntimeStatus == RuntimeActionStatus.STARTING || mainRuntimeStatus == RuntimeActionStatus.STOPPING) {
+            setMainRuntime(RuntimeActionStatus.ERROR)
+        }
         Log.e(TAG, "Collector start failed", error)
         store.recordEvent("service_start_error", "Collector service start failed", detail)
         lastNotificationText = "Polling error: ${PollingErrorSummaries.summary("service_start_error")}"
@@ -920,6 +1012,13 @@ class CollectorService : Service() {
         }
     }
 
+    private fun debugStartStillCurrent(generation: Long): Boolean {
+        return generation == debugWorkGeneration.get() &&
+            settings.isDebugPollingEnabled() &&
+            !settings.isDebugManuallyStopped() &&
+            !maintenanceBlocksRuntimeStart(debugRuntime = true)
+    }
+
     private fun stopServiceAfterUserShutdown() {
         keepAliveSupervisor.reconcileThen(KeepAliveConfig(false, false, false, false)) {
             mainHandler.post {
@@ -931,6 +1030,8 @@ class CollectorService : Service() {
     }
 
     private fun stopMain(reason: String) {
+        val wasActive = mainRuntimeStatus != RuntimeActionStatus.STOPPED
+        if (wasActive) setMainRuntime(RuntimeActionStatus.STOPPING)
         val wasPolling = poller.isRunning()
         if (wasPolling) poller.stop()
         if (::tripRuntime.isInitialized && reason != "service_destroyed") tripRuntime.pause(reason)
@@ -952,6 +1053,11 @@ class CollectorService : Service() {
             disconnectOfflineAsync()
         }
         clearDashboardVehicleKpis()
+        if (!settings.isPollingEnabled() || settings.isMainManuallyStopped() || reason == "service_destroyed") {
+            setMainRuntime(RuntimeActionStatus.STOPPED)
+        } else if (poller.isRunning()) {
+            setMainRuntime(RuntimeActionStatus.RUNNING)
+        }
         publishDashboardRuntimeFlags()
     }
 
@@ -1027,13 +1133,42 @@ class CollectorService : Service() {
     }
 
     private fun stopDebug(reason: String) {
+        val stopGeneration = debugWorkGeneration.incrementAndGet()
+        debugStartQueued.set(false)
+        setDebugRuntime(DebugRuntimeStatus.STOPPING, generation = stopGeneration)
         detachDebugPoller()?.shutdown(reason)
-        setDebugRuntime(DebugRuntimeStatus.STOPPED)
+        if (!settings.isDebugPollingEnabled() || settings.isDebugManuallyStopped()) {
+            setDebugRuntime(DebugRuntimeStatus.STOPPED)
+        }
     }
 
-    private fun setDebugRuntime(status: DebugRuntimeStatus, error: String? = null) {
+    private fun setMainRuntime(status: RuntimeActionStatus) {
+        mainRuntimeStatus = status
+        mainRuntimeStatusRef.set(status)
+        publishDashboardRuntimeFlags()
+    }
+
+    private fun setMqttRuntime(status: RuntimeActionStatus) {
+        mqttRuntimeStatus = status
+        mqttRuntimeStatusRef.set(status)
+        publishDashboardRuntimeFlags()
+    }
+
+    private fun setInfluxRuntime(status: RuntimeActionStatus) {
+        influxRuntimeStatus = status
+        influxRuntimeStatusRef.set(status)
+        publishDashboardRuntimeFlags()
+    }
+
+    private fun setDebugRuntime(
+        status: DebugRuntimeStatus,
+        error: String? = null,
+        generation: Long? = null
+    ) {
+        if (generation != null && generation != debugWorkGeneration.get()) return
         debugRuntimeStatus = status
         debugRuntimeError = error
+        debugRuntimeStatusRef.set(status)
         debugRunning.set(status == DebugRuntimeStatus.RUNNING)
         publishDashboardRuntimeFlags()
     }
@@ -1082,13 +1217,16 @@ class CollectorService : Service() {
             DashboardRuntimeFlags(
                 serviceRunning = running.get(),
                 mainPollingRunning = mainPollingRunning.get(),
+                mainRuntimeStatus = mainRuntimeStatus,
                 debugPollingRunning = debugRunning.get(),
                 debugRuntimeStatus = debugRuntimeStatus,
                 debugRuntimeError = debugRuntimeError,
                 pollingEnabled = settings.isPollingEnabled(),
                 debugPollingEnabled = settings.isDebugPollingEnabled(),
                 mqttEnabled = settings.isMqttEnabled(),
+                mqttRuntimeStatus = mqttRuntimeStatus,
                 influxEnabled = settings.isInfluxEnabled(),
+                influxRuntimeStatus = influxRuntimeStatus,
                 permissionsGranted = access.permissionsGranted,
                 adbAuthorized = access.adbAuthorized,
                 dbMaintenanceStatus = settings.dbMaintenanceStatus(),
@@ -1311,7 +1449,9 @@ class CollectorService : Service() {
     private fun prepareRuntimeStopForMaintenance(operation: DbMaintenanceOperation): DetachedMaintenanceRuntime {
         requireRuntimeOwner()
         if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
+            val stopGeneration = debugWorkGeneration.incrementAndGet()
             val detachedDebugPoller = detachDebugPoller()
+            setDebugRuntime(DebugRuntimeStatus.STOPPING, generation = stopGeneration)
             setDebugRuntime(DebugRuntimeStatus.STOPPED)
             return DetachedMaintenanceRuntime(debugPoller = detachedDebugPoller)
         }
@@ -1319,11 +1459,15 @@ class CollectorService : Service() {
         cancelMqttRetry()
         cancelInfluxRetry()
         cancelTelegramTick()
+        if (mainRuntimeStatus != RuntimeActionStatus.STOPPED) setMainRuntime(RuntimeActionStatus.STOPPING)
         poller.stop()
         val detachedDebugPoller = detachDebugPoller()
         val openedSessionId = sessionId
         sessionId = null
         mainPollingRunning.set(false)
+        setMainRuntime(RuntimeActionStatus.STOPPED)
+        val stopGeneration = debugWorkGeneration.incrementAndGet()
+        setDebugRuntime(DebugRuntimeStatus.STOPPING, generation = stopGeneration)
         setDebugRuntime(DebugRuntimeStatus.STOPPED)
         mqttRuntimeActive.set(false)
         mqttOfflineQueued.set(false)
@@ -1490,8 +1634,11 @@ class CollectorService : Service() {
 
     private fun startMqttExport(clearManualStop: Boolean = true) {
         if (maintenanceBlocksRuntimeStart()) return
+        if (clearManualStop && (!settings.isMqttEnabled() || settings.isMqttManuallyStopped())) return
+        mqttWorkGeneration.incrementAndGet()
         if (clearManualStop) settings.setMqttManuallyStopped(false)
         settings.setMqttEnabled(true)
+        setMqttRuntime(RuntimeActionStatus.STARTING)
         publishDashboardRuntimeFlags()
         ensureForegroundForChannel("MQTT export running")
         mqttRuntimeActive.set(true)
@@ -1501,6 +1648,9 @@ class CollectorService : Service() {
     }
 
     private fun stopMqttExport(manualStop: Boolean = true) {
+        if (manualStop && settings.isMqttEnabled() && !settings.isMqttManuallyStopped()) return
+        mqttWorkGeneration.incrementAndGet()
+        setMqttRuntime(RuntimeActionStatus.STOPPING)
         if (manualStop) settings.setMqttManuallyStopped(true)
         cancelMqttRetry()
         settings.setMqttEnabled(false)
@@ -1508,13 +1658,21 @@ class CollectorService : Service() {
         scheduleIntegrationDashboardRefresh()
         disconnectOfflineAsync()
         mqttRuntimeActive.set(false)
-        stopIfNoActiveRuntime()
+        if (!mqttOfflineQueued.get()) {
+            if (mqttRuntimeStatus == RuntimeActionStatus.STOPPING) {
+                setMqttRuntime(RuntimeActionStatus.STOPPED)
+            }
+            stopIfNoActiveRuntime()
+        }
     }
 
     private fun startInfluxExport(clearManualStop: Boolean = true) {
         if (maintenanceBlocksRuntimeStart()) return
+        if (clearManualStop && (!settings.isInfluxEnabled() || settings.isInfluxManuallyStopped())) return
+        influxWorkGeneration.incrementAndGet()
         if (clearManualStop) settings.setInfluxManuallyStopped(false)
         settings.setInfluxEnabled(true)
+        setInfluxRuntime(RuntimeActionStatus.STARTING)
         publishDashboardRuntimeFlags()
         ensureForegroundForChannel("Influx export running")
         val submittedGeneration = influxWorkGeneration.get()
@@ -1584,6 +1742,9 @@ class CollectorService : Service() {
     }
 
     private fun stopInfluxExport(manualStop: Boolean = true) {
+        if (manualStop && settings.isInfluxEnabled() && !settings.isInfluxManuallyStopped()) return
+        influxWorkGeneration.incrementAndGet()
+        setInfluxRuntime(RuntimeActionStatus.STOPPING)
         if (manualStop) settings.setInfluxManuallyStopped(true)
         settings.setInfluxEnabled(false)
         publishDashboardRuntimeFlags()
@@ -1593,14 +1754,17 @@ class CollectorService : Service() {
 
     private fun queueInfluxStop(stopServiceWhenIdle: Boolean = false) {
         cancelInfluxRetry()
-        val accepted = executeInflux("influx_stop_error", activateTailscaleOnFailure = false) {
-            try {
-                influxCoordinator.stopExport()
-            } finally {
-                if (stopServiceWhenIdle) mainHandler.post { stopIfNoActiveRuntime() }
+        executeInflux(
+            errorCategory = "influx_stop_error",
+            activateTailscaleOnFailure = false,
+            afterComplete = {
+                if (stopServiceWhenIdle) mainHandler.post {
+                    stopIfNoActiveRuntime()
+                }
             }
+        ) {
+            influxCoordinator.stopExport()
         }
-        if (!accepted && stopServiceWhenIdle) stopIfNoActiveRuntime()
     }
 
     private fun reconcileTelegramRuntime(unblockBlocked: Boolean = false) {
@@ -1630,7 +1794,13 @@ class CollectorService : Service() {
 
     private fun testTelegramConnection() {
         ensureForegroundForChannel("Testing Telegram connection")
-        executeTelegram("telegram_test_error") {
+        executeTelegram(
+            errorCategory = "telegram_test_error",
+            onFailedAction = {
+                settings.setTelegramConnectionStatus("failed", "telegram_test_error")
+                mainHandler.post { stopIfNoActiveRuntime() }
+            }
+        ) {
             telegramCoordinator.testConnection()
             mainHandler.post { stopIfNoActiveRuntime() }
         }
@@ -1751,14 +1921,21 @@ class CollectorService : Service() {
 
     private fun disconnectOfflineAsync() {
         if (!mqttRuntimeActive.get() && !settings.isMqttEnabled()) return
-        if (!mqttOfflineQueued.compareAndSet(false, true)) return
+        if (!mqttOfflineQueued.compareAndSet(false, true)) {
+            mqttOfflineCompletionGeneration.set(mqttWorkGeneration.get())
+            return
+        }
         //uses a fresh executor so queued live publishes cannot run after the retained offline message
         val executor = resetMqttExecutorForOffline()
+        val offlineGeneration = mqttWorkGeneration.get()
+        mqttOfflineCompletionGeneration.set(offlineGeneration)
         try {
             executor.execute {
+                var completedOk = false
                 try {
                     runCatching { oneShotMqttCoordinator().disconnectOffline() }
                         .onSuccess { result ->
+                            completedOk = result.ok
                             if (!result.ok) {
                                 store.recordEvent(
                                     "mqtt_offline_publish_error",
@@ -1776,7 +1953,25 @@ class CollectorService : Service() {
                         }
                 } finally {
                     mqttOfflineQueued.set(false)
-                    scheduleIntegrationDashboardRefresh()
+                    val completionGeneration = mqttOfflineCompletionGeneration.get()
+                    mainHandler.post {
+                        if (completionGeneration == mqttWorkGeneration.get()) {
+                            when {
+                                !settings.isMqttEnabled() && mqttRuntimeStatus == RuntimeActionStatus.STOPPING -> {
+                                    setMqttRuntime(
+                                        if (completedOk) RuntimeActionStatus.STOPPED else RuntimeActionStatus.ERROR
+                                    )
+                                    stopIfNoActiveRuntime()
+                                }
+                                settings.isMqttEnabled() && mqttRuntimeStatus == RuntimeActionStatus.STARTING -> {
+                                    setMqttRuntime(
+                                        if (completedOk) RuntimeActionStatus.RUNNING else RuntimeActionStatus.ERROR
+                                    )
+                                }
+                            }
+                        }
+                        scheduleIntegrationDashboardRefresh()
+                    }
                 }
             }
         } catch (error: RejectedExecutionException) {
@@ -1786,6 +1981,13 @@ class CollectorService : Service() {
                 "MQTT offline publish rejected",
                 "${error::class.java.simpleName}: ${error.message ?: "no message"}"
             )
+            if (offlineGeneration == mqttWorkGeneration.get()) {
+                if (!settings.isMqttEnabled() && mqttRuntimeStatus == RuntimeActionStatus.STOPPING) {
+                    setMqttRuntime(RuntimeActionStatus.ERROR)
+                } else if (settings.isMqttEnabled() && mqttRuntimeStatus == RuntimeActionStatus.STARTING) {
+                    setMqttRuntime(RuntimeActionStatus.ERROR)
+                }
+            }
         }
     }
 
@@ -1800,12 +2002,20 @@ class CollectorService : Service() {
         executor = { mqttExecutor },
         generation = mqttWorkGeneration,
         action = action,
-        onSuccess = { _, submittedGeneration -> postMqttRetrySchedule(submittedGeneration) },
+        onSuccess = { result, submittedGeneration ->
+            if (submittedGeneration == mqttWorkGeneration.get()) {
+                if (result.ok && settings.isMqttEnabled()) {
+                    setMqttRuntime(RuntimeActionStatus.RUNNING)
+                } else if (!result.ok && settings.isMqttEnabled()) {
+                    setMqttRuntime(RuntimeActionStatus.ERROR)
+                }
+            }
+            postMqttRetrySchedule(submittedGeneration)
+        },
         onComplete = ::scheduleIntegrationDashboardRefresh,
-        onFailedAction = if (activateTailscaleOnFailure) {
-            { maybeActivateTailscaleAfterHaFailure("mqtt") }
-        } else {
-            null
+        onFailedAction = {
+            if (settings.isMqttEnabled()) setMqttRuntime(RuntimeActionStatus.ERROR)
+            if (activateTailscaleOnFailure) maybeActivateTailscaleAfterHaFailure("mqtt")
         }
     ) { result ->
         ChannelActionStatus(result.ok, result.category, result.message)
@@ -1858,6 +2068,7 @@ class CollectorService : Service() {
     private fun executeInflux(
         errorCategory: String,
         activateTailscaleOnFailure: Boolean = true,
+        afterComplete: (() -> Unit)? = null,
         action: () -> InfluxActionResult
     ) = executeChannel(
         channelName = "Influx",
@@ -1868,11 +2079,24 @@ class CollectorService : Service() {
         lowPriority = true,
         canExecute = { !maintenanceBlocksRuntimeStart() },
         action = action,
-        onComplete = ::scheduleIntegrationDashboardRefresh,
-        onFailedAction = if (activateTailscaleOnFailure) {
-            { maybeActivateTailscaleAfterHaFailure("influx") }
-        } else {
-            null
+        onSuccess = { result, submittedGeneration ->
+            if (submittedGeneration == influxWorkGeneration.get()) {
+                if (result.ok && settings.isInfluxEnabled()) {
+                    setInfluxRuntime(RuntimeActionStatus.RUNNING)
+                } else if (result.ok && !settings.isInfluxEnabled()) {
+                    setInfluxRuntime(RuntimeActionStatus.STOPPED)
+                } else if (!result.ok) {
+                    setInfluxRuntime(RuntimeActionStatus.ERROR)
+                }
+            }
+        },
+        onComplete = {
+            scheduleIntegrationDashboardRefresh()
+            afterComplete?.invoke()
+        },
+        onFailedAction = {
+            setInfluxRuntime(RuntimeActionStatus.ERROR)
+            if (activateTailscaleOnFailure) maybeActivateTailscaleAfterHaFailure("influx")
         }
     ) { result ->
         ChannelActionStatus(result.ok, result.category, result.message)
@@ -1881,6 +2105,7 @@ class CollectorService : Service() {
     private fun <T> executeTelegram(
         errorCategory: String,
         onSuccess: ((T, Long) -> Unit)? = null,
+        onFailedAction: (() -> Unit)? = null,
         action: () -> T
     ) = executeChannel(
         channelName = "Telegram",
@@ -1890,6 +2115,7 @@ class CollectorService : Service() {
         generation = telegramWorkGeneration,
         canExecute = { !maintenanceBlocksRuntimeStart() },
         action = action,
+        onFailedAction = onFailedAction,
         onSuccess = onSuccess
     ) {
         ChannelActionStatus(true, "ok", "ok")
@@ -1909,6 +2135,11 @@ class CollectorService : Service() {
         onComplete: (() -> Unit)? = null,
         status: (T) -> ChannelActionStatus
     ): Boolean {
+        if (!canExecute()) {
+            onFailedAction?.invoke()
+            onComplete?.invoke()
+            return false
+        }
         val submittedGeneration = generation.get()
         val selectedExecutor = synchronized(executorLock) { executor() }
         try {
@@ -1919,6 +2150,7 @@ class CollectorService : Service() {
                 try {
                     runCatching { action() }
                         .onSuccess { result ->
+                            if (submittedGeneration != generation.get() || !canExecute()) return@onSuccess
                             val state = status(result)
                             if (!state.ok) {
                                 store.recordEvent(
@@ -1933,26 +2165,31 @@ class CollectorService : Service() {
                             }
                         }
                         .onFailure { error ->
+                            if (submittedGeneration != generation.get() || !canExecute()) return@onFailure
                             store.recordEvent(
                                 errorCategory,
                                 "$channelName async action failed",
                                 "${error::class.java.simpleName}: ${error.message ?: "no message"}"
                             )
+                            onFailedAction?.invoke()
                         }
                 } finally {
-                    if (submittedGeneration == generation.get()) {
+                    if (submittedGeneration == generation.get() && canExecute()) {
                         onComplete?.invoke()
                     }
                 }
             }
             return true
         } catch (error: RejectedExecutionException) {
-            store.recordEvent(
-                errorCategory,
-                "$channelName async action rejected",
-                "${error::class.java.simpleName}: ${error.message ?: "no message"}"
-            )
-            onComplete?.invoke()
+            if (submittedGeneration == generation.get() && canExecute()) {
+                store.recordEvent(
+                    errorCategory,
+                    "$channelName async action rejected",
+                    "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                )
+                onFailedAction?.invoke()
+                onComplete?.invoke()
+            }
             return false
         }
     }
@@ -2124,7 +2361,7 @@ class CollectorService : Service() {
     }
 
     private fun enqueueArchiveStorageMaintenance(preferredArchivePath: String?) {
-        enqueueArchiveStorageWork("archive_storage_rejected") {
+        enqueueArchiveStorageWork("archive_storage_rejected", ArchiveStorageJobMode.RETENTION) {
             val manager = archiveStorageManager()
             val limitBytes = settings.archiveStorageLimitGb() * 1024L * 1024L * 1024L
             preferredArchivePath
@@ -2152,7 +2389,7 @@ class CollectorService : Service() {
     }
 
     private fun enqueueArchiveDelete(ids: List<String>) {
-        enqueueArchiveStorageWork("archive_storage_delete_rejected") {
+        enqueueArchiveStorageWork("archive_storage_delete_rejected", ArchiveStorageJobMode.DELETE) {
             val manager = archiveStorageManager()
             val limitBytes = settings.archiveStorageLimitGb() * 1024L * 1024L * 1024L
             archiveShareLeaseRegistry.forceRelease(ids)
@@ -2161,8 +2398,17 @@ class CollectorService : Service() {
         }
     }
 
-    private fun enqueueArchiveStorageWork(errorCategory: String, work: () -> Unit) {
-        if (!archiveStorageActiveInProcess.compareAndSet(false, true)) return
+    private fun enqueueArchiveStorageWork(
+        errorCategory: String,
+        requestedMode: ArchiveStorageJobMode,
+        work: () -> Unit
+    ) {
+        if (!archiveStorageActiveInProcess.compareAndSet(false, true)) {
+            publishArchiveStorageTerminalError(requestedMode, "Archive storage is already active")
+            store.recordEvent(errorCategory, "Archive storage action rejected", "archive_storage_active")
+            scheduleIntegrationDashboardRefresh()
+            return
+        }
         try {
             archiveStorageExecutor.execute {
                 try {
@@ -2170,7 +2416,7 @@ class CollectorService : Service() {
                         .onFailure { error ->
                             settings.setArchiveStorageJobStatus(
                                 ArchiveStorageJobStatus(
-                                    mode = ArchiveStorageJobMode.RETENTION,
+                                    mode = requestedMode,
                                     running = false,
                                     error = "${error::class.java.simpleName}: ${error.message ?: "no message"}",
                                     updatedAtMs = System.currentTimeMillis()
@@ -2184,7 +2430,20 @@ class CollectorService : Service() {
                             )
                         }
                     if (settings.archiveStorageJobStatus().error == null) {
-                        settings.clearArchiveStorageJobStatus()
+                        if (requestedMode == ArchiveStorageJobMode.DELETE) {
+                            settings.setArchiveStorageJobStatus(
+                                ArchiveStorageJobStatus(
+                                    mode = requestedMode,
+                                    running = false,
+                                    messageUk = "Видалення архівів завершено",
+                                    messageEn = "Archive deletion completed",
+                                    updatedAtMs = System.currentTimeMillis()
+                                ),
+                                synchronous = true
+                            )
+                        } else {
+                            settings.clearArchiveStorageJobStatus()
+                        }
                     }
                 } finally {
                     archiveStorageActiveInProcess.set(false)
@@ -2193,6 +2452,10 @@ class CollectorService : Service() {
             }
         } catch (error: RejectedExecutionException) {
             archiveStorageActiveInProcess.set(false)
+            publishArchiveStorageTerminalError(
+                requestedMode,
+                "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+            )
             store.recordEvent(
                 errorCategory,
                 "Archive storage action rejected",
@@ -2200,6 +2463,18 @@ class CollectorService : Service() {
             )
             scheduleIntegrationDashboardRefresh()
         }
+    }
+
+    private fun publishArchiveStorageTerminalError(mode: ArchiveStorageJobMode, detail: String) {
+        settings.setArchiveStorageJobStatus(
+            ArchiveStorageJobStatus(
+                mode = mode,
+                running = false,
+                error = detail,
+                updatedAtMs = System.currentTimeMillis()
+            ),
+            synchronous = true
+        )
     }
 
     private fun archiveStorageManager(): ArchiveStorageManager {
@@ -2400,6 +2675,10 @@ class CollectorService : Service() {
         private val running = AtomicBoolean(false)
         private val mainPollingRunning = AtomicBoolean(false)
         private val debugRunning = AtomicBoolean(false)
+        private val mainRuntimeStatusRef = AtomicReference(RuntimeActionStatus.STOPPED)
+        private val debugRuntimeStatusRef = AtomicReference(DebugRuntimeStatus.STOPPED)
+        private val mqttRuntimeStatusRef = AtomicReference(RuntimeActionStatus.STOPPED)
+        private val influxRuntimeStatusRef = AtomicReference(RuntimeActionStatus.STOPPED)
         private val maintenanceRunningInProcess = AtomicBoolean(false)
         private val archiveStorageActiveInProcess = AtomicBoolean(false)
         val archiveShareLeaseRegistry = ArchiveShareLeaseRegistry(
@@ -2409,6 +2688,10 @@ class CollectorService : Service() {
         fun isRunning(): Boolean = running.get()
         fun isMainPollingRunning(): Boolean = mainPollingRunning.get()
         fun isDebugRunning(): Boolean = debugRunning.get()
+        fun mainRuntimeStatus(): RuntimeActionStatus = mainRuntimeStatusRef.get()
+        fun debugRuntimeStatus(): DebugRuntimeStatus = debugRuntimeStatusRef.get()
+        fun mqttRuntimeStatus(): RuntimeActionStatus = mqttRuntimeStatusRef.get()
+        fun influxRuntimeStatus(): RuntimeActionStatus = influxRuntimeStatusRef.get()
         fun isMaintenanceRunningInProcess(): Boolean = maintenanceRunningInProcess.get()
         fun isArchiveStorageActive(): Boolean = archiveStorageActiveInProcess.get()
 

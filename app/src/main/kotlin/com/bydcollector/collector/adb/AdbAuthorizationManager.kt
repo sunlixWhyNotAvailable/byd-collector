@@ -40,13 +40,19 @@ object AdbAuthorizationManager {
         source: String,
         mode: AccessCheckMode,
         helperOwnerMode: DirectHelperOwnerMode = DirectHelperOwnerMode.APP,
-        onComplete: ((AccessRuntimeSnapshot) -> Unit)? = null
+        onComplete: ((AccessRuntimeSnapshot) -> Unit)? = null,
+        onTerminal: (() -> Unit)? = null
     ): Boolean {
         val appContext = context.applicationContext
-        val submitted = coordinator.submit(mode) { lease ->
+        val terminalDelivered = AtomicBoolean(false)
+        val deliverTerminal = {
+            if (terminalDelivered.compareAndSet(false, true)) onTerminal?.invoke()
+        }
+        val submitted = coordinator.submit(mode, onTerminal = deliverTerminal) { lease ->
             runCheck(appContext, store, source, mode, helperOwnerMode, lease, onComplete)
         }
         if (!submitted) {
+            deliverTerminal()
             store.recordEvent(
                 "adb_self_check_in_progress",
                 "ADB access self-check is already running",
@@ -287,14 +293,18 @@ internal class AdbPipelineCoordinator {
     private var generation = 0L
     private var active: AdbPipelineLease? = null
 
-    fun submit(mode: AccessCheckMode, block: (AdbPipelineLease) -> Unit): Boolean {
+    fun submit(
+        mode: AccessCheckMode,
+        onTerminal: (() -> Unit)? = null,
+        block: (AdbPipelineLease) -> Unit
+    ): Boolean {
         synchronized(lock) {
             val previous = active
             val replace = mode == AccessCheckMode.FORCE ||
                 (mode == AccessCheckMode.COLD_START && previous?.mode == AccessCheckMode.NORMAL)
             if (previous != null && !replace) return false
 
-            val lease = AdbPipelineLease(++generation, mode)
+            val lease = AdbPipelineLease(++generation, mode, onTerminal)
             val task = FutureTask<Unit> {
                 try {
                     val shouldRun = synchronized(lock) {
@@ -310,13 +320,32 @@ internal class AdbPipelineCoordinator {
             lease.task = task
             active = lease
             if (previous == null) {
-                executor.execute(task)
+                runCatching { executor.execute(task) }.onFailure {
+                    if (active === lease) active = null
+                    lease.terminal()
+                    return false
+                }
             } else {
-                replacementExecutor.execute {
-                    previous.cancel()
-                    synchronized(lock) {
-                        if (active === lease) executor.execute(task)
+                runCatching {
+                    replacementExecutor.execute {
+                        previous.cancel()
+                        synchronized(lock) {
+                            if (active === lease) {
+                                runCatching { executor.execute(task) }.onFailure {
+                                    active = null
+                                    lease.terminal()
+                                }
+                            } else {
+                                lease.terminal()
+                            }
+                        }
                     }
+                }.onFailure {
+                    synchronized(lock) {
+                        if (active === lease) active = null
+                    }
+                    lease.terminal()
+                    return false
                 }
             }
             return true
@@ -332,12 +361,22 @@ internal class AdbPipelineCoordinator {
     }
 }
 
-internal class AdbPipelineLease(val generation: Long, val mode: AccessCheckMode) {
+internal class AdbPipelineLease(
+    val generation: Long,
+    val mode: AccessCheckMode,
+    private val onTerminal: (() -> Unit)? = null
+) {
     val cancellation = AdbCancellation()
     lateinit var task: FutureTask<Unit>
+    private val terminalDelivered = AtomicBoolean(false)
+
+    fun terminal() {
+        if (terminalDelivered.compareAndSet(false, true)) onTerminal?.invoke()
+    }
 
     fun cancel() {
         cancellation.cancel()
         task.cancel(true)
+        terminal()
     }
 }

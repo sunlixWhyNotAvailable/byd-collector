@@ -33,7 +33,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -57,11 +56,7 @@ import kotlinx.coroutines.delay
 private val CardShape = RoundedCornerShape(8.dp)
 private val ControlShape = RoundedCornerShape(7.dp)
 private val PillShape = RoundedCornerShape(50)
-private const val FORCED_PRESS_DELAY_MS = 100L
-private const val SWITCH_CENTER_DELAY_MS = 120L
-private const val SWITCH_CONFIRM_TIMEOUT_MS = 2_000L
-
-val LocalSwitchConfirmationVersion = staticCompositionLocalOf { 0 }
+private const val PRESS_FEEDBACK_MS = 100L
 
 data class ForcedPressClick(
     val visualPressed: Boolean,
@@ -69,17 +64,9 @@ data class ForcedPressClick(
     val onClick: () -> Unit
 )
 
-private data class SwitchPendingState(
-    val from: Boolean,
-    val target: Boolean,
-    val startedAtVersion: Int? = null,
-    val token: Int
-)
-
 @Composable
 fun rememberForcedPressClick(
     enabled: Boolean,
-    invokeImmediately: Boolean = false,
     onClick: () -> Unit
 ): ForcedPressClick {
     val latestOnClick by rememberUpdatedState(onClick)
@@ -87,13 +74,12 @@ fun rememberForcedPressClick(
     var locked by remember { mutableStateOf(false) }
     var clickToken by remember { mutableStateOf(0) }
 
-    //holds forced feedback and the repeat lock; tabs opt into immediate action
+    //holds forced feedback and the repeat lock while the action runs immediately
     LaunchedEffect(clickToken) {
         if (clickToken == 0) return@LaunchedEffect
-        delay(FORCED_PRESS_DELAY_MS)
+        delay(PRESS_FEEDBACK_MS)
         visualPressed = false
         locked = false
-        if (!invokeImmediately) latestOnClick()
     }
 
     return ForcedPressClick(
@@ -104,7 +90,7 @@ fun rememberForcedPressClick(
             locked = true
             visualPressed = true
             clickToken += 1
-            if (invokeImmediately) latestOnClick()
+            latestOnClick()
         }
     )
 }
@@ -303,60 +289,24 @@ fun BydSwitch(
     onCheckedChange: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
-    pending: Boolean = false,
     binary: Boolean = false
 ) {
     val p = LocalBydPalette.current
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
-    val confirmationVersion = LocalSwitchConfirmationVersion.current
-    val latestConfirmationVersion by rememberUpdatedState(confirmationVersion)
-    var localPending by remember { mutableStateOf<SwitchPendingState?>(null) }
-    var token by remember { mutableStateOf(0) }
-    val pendingState = localPending
-    val visuallyPending = !binary && (pending || pendingState != null)
-    val visualChecked = if (binary) checked else pendingState?.from ?: checked
-
-    //centers the knob before executing the setting change, then waits for a real refreshed state
-    LaunchedEffect(pendingState?.token) {
-        val current = pendingState ?: return@LaunchedEffect
-        delay(SWITCH_CENTER_DELAY_MS)
-        localPending = current.copy(startedAtVersion = latestConfirmationVersion)
-        val applied = runCatching { onCheckedChange(current.target) }.isSuccess
-        if (!applied) {
-            localPending = null
-            return@LaunchedEffect
-        }
-        delay(SWITCH_CONFIRM_TIMEOUT_MS)
-        if (localPending?.token == current.token) {
-            localPending = null
-        }
-    }
-
-    //confirms only when refreshed backing state reaches the requested target
-    LaunchedEffect(confirmationVersion, checked) {
-        val current = localPending ?: return@LaunchedEffect
-        val startedAt = current.startedAtVersion ?: return@LaunchedEffect
-        if (confirmationVersion <= startedAt) return@LaunchedEffect
-        if (checked != current.target) return@LaunchedEffect
-        localPending = null
-    }
 
     val track = when {
         !enabled -> p.disabled
         binary && pressed -> p.accent.copy(alpha = 0.82f)
         pressed -> p.activeSoft
         binary -> p.accent
-        pending -> p.activeSoft
-        pendingState != null -> p.activeSoft
         checked -> p.accent
         else -> p.switchOff
     }
     val thumbSize by animateDpAsState(
         targetValue = when {
             binary -> 25.dp
-            visuallyPending -> 22.dp
-            visualChecked -> 25.dp
+            checked -> 25.dp
             else -> 19.dp
         },
         animationSpec = tween(durationMillis = 120)
@@ -364,8 +314,7 @@ fun BydSwitch(
     val thumbOffset by animateDpAsState(
         targetValue = when {
             binary && checked -> 25.dp
-            visuallyPending -> 14.dp
-            visualChecked -> 25.dp
+            checked -> 25.dp
             else -> 0.dp
         },
         animationSpec = tween(durationMillis = 120)
@@ -376,14 +325,8 @@ fun BydSwitch(
             .clip(PillShape)
             .background(track)
             .border(1.dp, if (binary || checked) p.accent else p.border, PillShape)
-            .clickable(enabled = enabled && (binary || localPending == null), interactionSource = interactionSource, indication = null) {
-                if (binary) {
-                    onCheckedChange(!checked)
-                } else {
-                    val target = !checked
-                    token += 1
-                    localPending = SwitchPendingState(from = checked, target = target, token = token)
-                }
+            .clickable(enabled = enabled, interactionSource = interactionSource, indication = null) {
+                onCheckedChange(!checked)
             }
             .padding(3.dp),
         contentAlignment = Alignment.CenterStart
@@ -393,7 +336,7 @@ fun BydSwitch(
                 .padding(start = thumbOffset)
                 .size(thumbSize)
                 .clip(PillShape)
-                .background(if (binary || visualChecked || visuallyPending) p.switchThumbOn else p.switchThumbOff)
+                .background(if (binary || checked) p.switchThumbOn else p.switchThumbOff)
         )
     }
 }

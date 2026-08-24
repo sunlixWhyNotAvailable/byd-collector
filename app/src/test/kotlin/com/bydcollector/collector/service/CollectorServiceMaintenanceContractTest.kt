@@ -65,10 +65,14 @@ class CollectorServiceMaintenanceContractTest {
             .substringBefore("private fun resetTelegramExecutorForMaintenance")
 
         assertTrue(stop.contains("queueInfluxStop(stopServiceWhenIdle = true)"))
-        assertTrue(stop.contains("executeInflux(\"influx_stop_error\""))
+        assertTrue(stop.contains("errorCategory = \"influx_stop_error\""))
+        assertTrue(stop.contains("afterComplete = {"))
         assertFalse(stop.contains("resetInfluxExecutorForMaintenance()"))
+        assertFalse(stop.contains("finally"))
         assertTrue(source.contains("canExecute = { !maintenanceBlocksRuntimeStart() }"))
-        assertInOrder(stop, "influxCoordinator.stopExport()", "mainHandler.post { stopIfNoActiveRuntime() }")
+        assertTrue(stop.contains("mainHandler.post {"))
+        assertTrue(stop.contains("stopIfNoActiveRuntime()"))
+        assertTrue(stop.contains("influxCoordinator.stopExport()"))
         assertInOrder(
             reset,
             "influxWorkGeneration.incrementAndGet()",

@@ -4,6 +4,7 @@ import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -143,5 +144,25 @@ class AdbPipelineCoordinatorTest {
         assertTrue(throttle.tryAcquire(1_000))
         assertFalse(throttle.tryAcquire(60_999))
         assertTrue(throttle.tryAcquire(61_000))
+    }
+
+    @Test
+    fun forceCancellationDeliversOneTerminalCallback() {
+        val coordinator = AdbPipelineCoordinator()
+        val started = CountDownLatch(1)
+        val terminal = CountDownLatch(1)
+        val terminals = AtomicInteger(0)
+
+        assertTrue(coordinator.submit(AccessCheckMode.NORMAL, onTerminal = {
+            terminals.incrementAndGet()
+            terminal.countDown()
+        }) { lease ->
+            started.countDown()
+            while (!lease.cancellation.isCancelled) Thread.sleep(5)
+        })
+        assertTrue(started.await(1, TimeUnit.SECONDS))
+        assertTrue(coordinator.submit(AccessCheckMode.FORCE) {})
+        assertTrue(terminal.await(1, TimeUnit.SECONDS))
+        assertEquals(1, terminals.get())
     }
 }
