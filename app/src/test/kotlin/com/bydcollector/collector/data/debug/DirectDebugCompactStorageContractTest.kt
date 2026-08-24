@@ -81,7 +81,7 @@ class DirectDebugCompactStorageContractTest {
         assertTrue(store.contains("fun isCompactV2(): Boolean"))
         assertTrue(store.contains("if (!DirectDebugDatabaseHelper.isCompactV2(db)) return legacyStatus"))
         assertTrue(store.contains("Legacy debug database must be archived before round-robin polling starts"))
-        assertTrue(store.contains("fun checkpointForArchive()"))
+        assertFalse(store.contains("fun checkpointForArchive()"))
         assertTrue(store.contains("fun verifyWritableDatabase(): Boolean"))
     }
 

@@ -104,10 +104,19 @@ class StorageFormatCutoverContractTest {
         assertTrue(maintenance.contains("PHASE_ARCHIVING"))
         assertTrue(maintenance.contains("PHASE_CREATING"))
         assertTrue(maintenance.contains("PHASE_VERIFYING"))
-        assertTrue(recovery.contains("activeFormat == journal.sourceFormat && archivedFiles.isEmpty()"))
-        assertTrue(recovery.contains("formatMatches(family, archivedDatabase, journal.sourceFormat)"))
+        assertTrue(maintenance.contains("manual = true"))
+        assertTrue(maintenance.contains("sourceNames = sourceNames"))
+        assertTrue(recovery.contains("val expectedNames = if (journal.manual) journal.sourceNames else allowedNames"))
+        assertTrue(recovery.contains("activeSourceFileSetIntact(databaseFile, expectedNames)"))
+        assertTrue(recovery.contains("archivedFormatMatches(family, archivedDatabase, journal.sourceFormat)"))
         assertTrue(recovery.contains("formatMatches(family, databaseFile, journal.sourceFormat)"))
+        assertTrue(recovery.contains("journal.manual"))
+        assertTrue(recovery.contains("!journal.manual && (!archivedFormatMatches"))
+        assertTrue(recovery.contains("!quickCheck(databaseFile)"))
         assertTrue(settings.contains("KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT"))
+        assertTrue(settings.contains("KEY_STORAGE_CUTOVER_JOURNAL_MANUAL"))
+        assertTrue(settings.contains("KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_NAMES"))
+        assertTrue(settings.contains("putStringSet(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_NAMES"))
         assertTrue(settings.contains("journal.sourceFormat.name"))
         assertTrue(settings.contains("runCatching { journalKeys.none(prefs::contains) }.getOrDefault(false)"))
         assertTrue(settings.contains("fun journalString(key: String): String? = runCatching { prefs.getString(key, null) }.getOrNull()"))
@@ -129,7 +138,7 @@ class StorageFormatCutoverContractTest {
 
         assertInOrder(
             recovery,
-            "activeFormat == journal.sourceFormat && archivedFiles.isEmpty()",
+            "recoveryAction == StorageCutoverRecovery.Action.CLEAR_INTACT_SOURCE",
             "if (journal.phase == PHASE_ROLLBACK) return false",
             "recoveryAction != StorageCutoverRecovery.Action.RESTORE_ARCHIVE",
             "deleteActive = { file ->",
@@ -152,6 +161,26 @@ class StorageFormatCutoverContractTest {
         assertTrue(recovery.contains("deleteExactDatabaseSet(databaseFile)"))
         assertTrue(recovery.contains("StorageFormat.COMPACT_V2"))
         assertFalse(recovery.contains("setCutoverArchiveStoragePending"))
+    }
+
+    @Test
+    fun sqliteInspectionRecoversWalWhenReadOnlyOpenIsRejected() {
+        val source = source("com/bydcollector/collector/maintenance/StorageFormatCutover.kt")
+        val inspection = source.substringAfter("private fun <T> inspectDatabaseFile")
+            .substringBefore("private fun detectFile")
+
+        assertTrue(source.contains("import android.database.sqlite.SQLiteReadOnlyDatabaseException"))
+        assertInOrder(
+            inspection,
+            "open(databaseFile, readOnly = true)",
+            "catch (error: SQLiteReadOnlyDatabaseException)",
+            "if (!recoverWal) throw error",
+            "open(databaseFile, readOnly = false)"
+        )
+        assertTrue(source.contains("detectFile(databaseFile, recoverWal = true, detector = ::detectDebug)"))
+        assertTrue(source.contains("detectFile(databaseFile, recoverWal = false, detector = ::detectDebug)"))
+        assertTrue(source.contains("quickCheckFile(archivedDatabase, recoverWal = false)"))
+        assertTrue(source.contains("internal fun checkpointDatabase(databaseFile: File): Boolean"))
     }
 
     @Test

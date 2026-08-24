@@ -394,7 +394,7 @@ class TelegramEventEngineTest {
 
         val location = TelegramLocationSnapshot(50.0, 30.0, "12:00", 2L, "osm", "google", "apple", "waze")
         val result = engine.onPowerOffConfirmed(
-            config.copy(sendLocation = true),
+            config.copy(sendLocation = true, navigatorMask = TelegramNavigatorMask.ALL),
             TelegramPowerOffSnapshot(101.0, 49.0, 2.5),
             location,
             3_000L
@@ -502,6 +502,84 @@ class TelegramEventEngineTest {
     }
 
     @Test
+    fun oneStopBuiltInSummaryOmitsIdenticalOverallBlockAndPersistsLocationMarker() {
+        val engine = pendingTripEngine()
+        val tripId = engine.state.tripId
+
+        val finalized = engine.onTick(config, false, null, 20_000L)
+        val summary = finalized.events.single()
+
+        assertTrue(summary.omitOverall)
+        assertEquals(tripId, finalized.state.pendingPowerOffLocationTripId)
+        assertFalse(finalized.state.pendingPowerOffLocationSummaryDelivered)
+        assertTrue(finalized.state.hasDeferredStorageWork())
+
+        val restarted = TelegramEventEngine(TelegramEventState.fromJson(finalized.state.toJson()))
+        assertFalse(restarted.state.pendingPowerOffLocationSummaryDelivered)
+        assertNull(restarted.markTripSummaryDelivered("wrong:summary", 20_500L))
+        assertEquals(
+            tripId,
+            restarted.markTripSummaryDelivered("$tripId:summary", 20_500L)?.pendingPowerOffLocationTripId
+        )
+        assertTrue(restarted.state.pendingPowerOffLocationSummaryDelivered)
+        val location = TelegramLocationSnapshot(50.0, 30.0, "12:00", 0L, "osm", "google", "apple", "waze")
+        val followUp = restarted.onPowerOffConfirmed(
+            config.copy(sendLocation = true, navigatorMask = TelegramNavigatorMask.GOOGLE),
+            location = location,
+            nowMs = 21_000L
+        )
+
+        assertEquals("$tripId:location", followUp.events.single().dedupeKey)
+        assertTrue(followUp.events.single().locationOnly)
+        assertEquals("Google: google", followUp.events.single().textSuffix)
+        assertNull(followUp.state.pendingPowerOffLocationTripId)
+        assertFalse(followUp.state.pendingPowerOffLocationSummaryDelivered)
+        assertTrue(restarted.onPowerOffConfirmed(
+            config.copy(sendLocation = true, navigatorMask = TelegramNavigatorMask.GOOGLE),
+            location = location,
+            nowMs = 22_000L
+        ).events.isEmpty())
+    }
+
+    @Test
+    fun actualPowerOffNeverSendsLocationWithoutPersistedSummaryDeliveryProof() {
+        val engine = pendingTripEngine()
+        val tripId = engine.state.tripId
+        engine.onTick(config, false, null, 20_000L)
+
+        val result = engine.onPowerOffConfirmed(
+            config.copy(sendLocation = true, navigatorMask = TelegramNavigatorMask.GOOGLE),
+            location = TelegramLocationSnapshot(50.0, 30.0, "12:00", 0L, "osm", "google", "apple"),
+            nowMs = 21_000L
+        )
+
+        assertTrue(result.events.isEmpty())
+        assertNull(result.state.pendingPowerOffLocationTripId)
+        assertFalse(result.state.pendingPowerOffLocationSummaryDelivered)
+        assertNull(engine.markTripSummaryDelivered("$tripId:summary", 21_500L))
+    }
+
+    @Test
+    fun actualPowerOffClearsDeferredLocationMarkerWhenNoValidLocationCanBeSent() {
+        val engine = pendingTripEngine()
+        engine.onTick(config, false, null, 20_000L)
+        val location = TelegramLocationSnapshot(Double.NaN, 30.0, "12:00", 0L, "osm", "google", "apple")
+
+        val noFix = engine.onPowerOffConfirmed(
+            config.copy(sendLocation = true, navigatorMask = TelegramNavigatorMask.GOOGLE),
+            location = location,
+            nowMs = 21_000L
+        )
+        assertTrue(noFix.events.isEmpty())
+        assertNull(noFix.state.pendingPowerOffLocationTripId)
+        assertTrue(engine.onPowerOffConfirmed(
+            config.copy(sendLocation = true, navigatorMask = TelegramNavigatorMask.GOOGLE),
+            location = TelegramLocationSnapshot(50.0, 30.0, "12:01", 0L, "osm", "google", "apple"),
+            nowMs = 22_000L
+        ).events.isEmpty())
+    }
+
+    @Test
     fun recoveredParkedTripFinalizesBeforeFreshDrivingAndNewCounter() {
         val persisted = pendingTripEngine().state.copy(
             bootTotalDistanceKm = 4.0,
@@ -571,6 +649,7 @@ class TelegramEventEngineTest {
         assertEquals("0.5", first.variables["total_energy_kwh"])
         assertEquals("0:01", first.variables["trip_duration"])
         assertEquals("0:01", first.variables["total_duration"])
+        assertTrue(first.omitOverall)
 
         engine.onSuccessfulPoll(snapshot(gear = "D", odometer = 101.0, soc = 49.0, tripEnergy = 10.5), config, 74_000L)
         engine.onSuccessfulPoll(snapshot(gear = "D", odometer = 101.0, soc = 49.0, tripEnergy = 10.5), config, 75_000L)
@@ -585,6 +664,7 @@ class TelegramEventEngineTest {
         assertEquals("3", second.variables["total_distance_km"])
         assertEquals("1.2", second.variables["total_energy_kwh"])
         assertEquals("0:03", second.variables["total_duration"])
+        assertFalse(second.omitOverall)
         assertEquals(0.0, engine.state.bootTotalEnergyKwh)
     }
 

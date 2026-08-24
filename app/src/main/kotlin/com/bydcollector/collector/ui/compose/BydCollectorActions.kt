@@ -119,7 +119,7 @@ data class TelegramConfig(
     val telemetryUnavailableMinutes: Int = 1,
     val tripSummaryDelaySeconds: Int = 10,
     val sendLocation: Boolean = false,
-    val navigatorMask: Int = TelegramNavigatorMask.ALL,
+    val navigatorMask: Int = TelegramNavigatorMask.NONE,
     val messages: Map<TelegramMessageType, TelegramMessageConfig> = emptyMap()
 )
 

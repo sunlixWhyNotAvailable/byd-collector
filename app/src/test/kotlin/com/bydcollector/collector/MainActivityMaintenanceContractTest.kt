@@ -52,6 +52,8 @@ class MainActivityMaintenanceContractTest {
         assertTrue(source.contains("private fun openMainArchiveDialog()"))
         assertTrue(source.contains("StorageFormatCutoverCoordinator.readMainPreflight(currentStore().databaseFile())"))
         assertTrue(source.contains("pendingMainArchivePreflight = preflight"))
+        assertTrue(source.contains("pendingMainArchivePreflight = MainArchivePreflight("))
+        assertTrue(source.contains("warning = \"${'$'}{strings(uiLanguage).archivePreflightFailed}"))
         assertTrue(source.contains("strings(uiLanguage).archivePreflightFailed"))
         assertFalse(source.contains("\"Не вдалося перевірити стан бази\""))
         assertTrue(strings.contains("archivePreflightFailed = \"Не вдалося перевірити стан бази\""))

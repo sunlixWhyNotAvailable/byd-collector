@@ -45,6 +45,12 @@
             android:foregroundServiceType="dataSync|location" />
 
         <service
+            android:name="com.bydcollector.collector.service.DatabaseMaintenanceService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="dataSync" />
+
+        <service
             android:name="com.bydcollector.collector.system.CollectorNotificationListenerService"
             android:enabled="true"
             android:exported="true"

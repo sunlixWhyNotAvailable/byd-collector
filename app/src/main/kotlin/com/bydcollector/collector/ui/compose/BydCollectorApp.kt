@@ -2,6 +2,7 @@ package com.bydcollector.collector.ui.compose
 
 import android.content.Context
 import android.graphics.Color as AndroidColor
+import android.graphics.Paint
 import android.view.ViewGroup
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -60,6 +61,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -1053,7 +1055,16 @@ private fun updateTripMap(
     }
     val p = runs.flatten()
     if (p.isEmpty()) return
-    runs.forEach { run ->
+    runs.filter { it.size > 1 }.forEach { run ->
+        map.overlays += Polyline(map).apply {
+            setPoints(run.map { GeoPoint(it.latitude, it.longitude) })
+            color = AndroidColor.BLACK
+            width = 12f
+            outlinePaint.strokeCap = Paint.Cap.ROUND
+            outlinePaint.strokeJoin = Paint.Join.ROUND
+        }
+    }
+    runs.filter { it.size > 1 }.forEach { run ->
         run.zipWithNext().forEach { (from, to) ->
             val line = Polyline(map).apply {
                 setPoints(listOf(GeoPoint(from.latitude, from.longitude), GeoPoint(to.latitude, to.longitude)))
@@ -1062,6 +1073,8 @@ private fun updateTripMap(
                     TripMapMetric.CONSUMPTION -> routeColor(from.consumptionKwhPer100Km, consumptionGreen.toDouble(), consumptionYellow.toDouble(), speed = false)
                 }
                 width = 8f
+                outlinePaint.strokeCap = Paint.Cap.ROUND
+                outlinePaint.strokeJoin = Paint.Join.ROUND
             }
             map.overlays += line
         }
@@ -1102,11 +1115,13 @@ private fun TripEndpointLegend(iconRes: Int, label: String) {
     }
 }
 
+private val TripRouteGreen = Color(0xFF147A55)
+
 private fun routeColor(value: Double?, green: Double, yellow: Double, speed: Boolean): Int = when {
     value == null -> AndroidColor.GRAY
-    speed && value >= green -> AndroidColor.rgb(84, 216, 152)
+    speed && value >= green -> TripRouteGreen.toArgb()
     speed && value > yellow -> AndroidColor.rgb(242, 195, 78)
-    !speed && value <= green -> AndroidColor.rgb(84, 216, 152)
+    !speed && value <= green -> TripRouteGreen.toArgb()
     !speed && value <= yellow -> AndroidColor.rgb(242, 195, 78)
     else -> AndroidColor.rgb(255, 140, 140)
 }
@@ -2191,6 +2206,9 @@ private fun DatabaseMaintenanceDialog(
                     state.error != null -> Text("${strings.dbMaintenanceFailed}: ${localizedDbMaintenanceError(strings, state.error)}", color = p.red, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                     state.completed -> {
                         Text(strings.dbMaintenanceComplete, color = p.green, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                        state.warning?.let {
+                            Text(it, color = p.yellow, fontSize = 14.sp, lineHeight = 19.sp)
+                        }
                         state.archivePath?.let {
                             Text("${strings.dbMaintenanceArchivePath} $it", color = p.muted, fontSize = 13.sp, lineHeight = 18.sp)
                         }
@@ -2227,7 +2245,8 @@ private fun DatabaseMaintenanceConfirmBody(
         (preflight?.mqttPending ?: 0L) +
         (preflight?.influxPending ?: 0L)
     val debugArchive = state.operation == DbMaintenanceOperation.DEBUG_ARCHIVE
-    val hasPendingWork = pending > 0L || preflight?.telegramDeferred == true
+    val inspectionWarning = preflight?.warning
+    val hasPendingWork = inspectionWarning == null && (pending > 0L || preflight?.telegramDeferred == true)
     Text(
         if (debugArchive) strings.dbMaintenanceDebugStopWarning else strings.dbMaintenanceStopWarning,
         color = p.text,
@@ -2235,7 +2254,10 @@ private fun DatabaseMaintenanceConfirmBody(
         lineHeight = 19.sp,
         fontWeight = FontWeight.SemiBold
     )
-    if (!debugArchive && pending > 0L) {
+    inspectionWarning?.let {
+        Text(it, color = p.yellow, fontSize = 14.sp, lineHeight = 19.sp)
+    }
+    if (!debugArchive && inspectionWarning == null && pending > 0L) {
         Text(
             String.format(
                 strings.dbMaintenancePendingTemplate,
@@ -2248,7 +2270,7 @@ private fun DatabaseMaintenanceConfirmBody(
             lineHeight = 19.sp
         )
     }
-    if (!debugArchive && preflight?.telegramDeferred == true) {
+    if (!debugArchive && inspectionWarning == null && preflight?.telegramDeferred == true) {
         Text(strings.dbMaintenanceTelegramDeferredWarning, color = p.yellow, fontSize = 14.sp, lineHeight = 19.sp)
     }
     if (!debugArchive && hasPendingWork) {

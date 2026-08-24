@@ -122,6 +122,16 @@ object TelegramBuiltInTemplates {
     fun defaultTemplate(type: TelegramEventType, language: TelegramTemplateLanguage): String =
         current.getValue(type).getValue(language)
 
+    fun tripSummaryTemplate(language: TelegramTemplateLanguage, includeOverall: Boolean): String {
+        if (includeOverall) return defaultTemplate(TelegramEventType.TRIP_SUMMARY, language)
+        return when (language) {
+            TelegramTemplateLanguage.UK ->
+                "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\nВитрата: {trip_energy_kwh} кВт·год, SOC: {soc_start}% -> {soc_end}%"
+            TelegramTemplateLanguage.EN ->
+                "Trip complete\nCurrent trip: {trip_distance_km} km / {trip_duration}\nEnergy used: {trip_energy_kwh} kWh, SOC: {soc_start}% -> {soc_end}%"
+        }
+    }
+
     fun classify(type: TelegramEventType, template: String): TelegramBuiltInTemplateMatch? {
         val normalized = normalizeForBuiltInMatch(template)
         current[type]?.entries?.firstOrNull { normalizeForBuiltInMatch(it.value) == normalized }?.let {
@@ -235,6 +245,17 @@ object TelegramTemplateCatalog {
 
     fun defaultTemplate(event: TelegramEventType, language: TelegramTemplateLanguage): String =
         TelegramBuiltInTemplates.defaultTemplate(event, language)
+
+    fun templateForRendering(
+        event: TelegramEventType,
+        template: String,
+        language: TelegramTemplateLanguage,
+        omitOverall: Boolean
+    ): String {
+        if (event != TelegramEventType.TRIP_SUMMARY || !omitOverall) return template
+        val match = TelegramBuiltInTemplates.classify(event, template) ?: return template
+        return TelegramBuiltInTemplates.tripSummaryTemplate(match.language, includeOverall = false)
+    }
 
     fun defaultTemplate(event: TelegramEventType): String = spec(event).defaultTemplate
 

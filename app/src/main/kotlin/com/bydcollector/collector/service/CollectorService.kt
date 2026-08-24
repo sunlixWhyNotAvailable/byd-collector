@@ -252,8 +252,6 @@ class CollectorService : Service() {
         maintenanceCoordinator = DbMaintenanceCoordinator(
             context = applicationContext,
             settings = settings,
-            storeProvider = { store },
-            debugStoreProvider = { debugStore },
             application = applicationContext as BydCollectorApplication,
             stopRuntime = { stopRuntimeForMaintenance(it) },
             onStoreReopened = { newStore ->

@@ -2,6 +2,7 @@ package com.bydcollector.collector.maintenance
 
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
+import android.database.sqlite.SQLiteReadOnlyDatabaseException
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.service.CollectorSettings
@@ -153,7 +154,9 @@ internal class StorageFormatCutoverCoordinator(
         }
 
         val archivedDatabase = File(plannedDirectory, databaseFile.name)
-        if (!formatMatches(family, archivedDatabase, StorageFormat.LEGACY_V1) || !quickCheck(archivedDatabase)) {
+        if (!archivedFormatMatches(family, archivedDatabase, StorageFormat.LEGACY_V1) ||
+            !quickCheckArchived(archivedDatabase)
+        ) {
             rollbackNewDatabase(databaseFile, family, archive.movedFiles)
             return false
         }
@@ -210,10 +213,23 @@ internal class StorageFormatCutoverCoordinator(
         if (journal.sourceFormat == StorageFormat.ABSENT) {
             return recoverInterruptedFreshCreation(family, databaseFile, journal)
         }
-        if (journal.sourceFormat !in setOf(StorageFormat.LEGACY_V1, StorageFormat.COMPACT_V2)) return false
+        if (journal.sourceFormat !in setOf(StorageFormat.LEGACY_V1, StorageFormat.COMPACT_V2, StorageFormat.UNKNOWN)) {
+            return false
+        }
         val archiveDirectory = validatedArchiveDirectory(databaseFile, journal.archivePath ?: return false) ?: return false
         val archivedFiles = archivedSidecars(databaseFile, archiveDirectory)
-        val activeFormat = detectFormat(family, databaseFile)
+        val allowedNames = DatabaseArchiveManager.sidecarFiles(databaseFile).map { it.name }.toSet()
+        val expectedNames = if (journal.manual) journal.sourceNames else allowedNames
+        if (journal.manual && (
+                expectedNames.isEmpty() ||
+                    databaseFile.name !in expectedNames ||
+                    expectedNames.any { it !in allowedNames }
+                )
+        ) return false
+        val activeNames = activeSidecarNames(databaseFile)
+        val archivedNames = archivedFiles.map { it.name }.toSet()
+        val inspectActive = !journal.manual || archivedNames == expectedNames
+        val activeFormat = if (inspectActive) detectFormat(family, databaseFile) else StorageFormat.UNKNOWN
         val archivedDatabase = File(archiveDirectory, databaseFile.name)
         val recoveryAction = StorageCutoverRecovery.decide(
             StorageCutoverRecovery.Snapshot(
@@ -221,46 +237,55 @@ internal class StorageFormatCutoverCoordinator(
                 sourceFormat = journal.sourceFormat,
                 activeFormat = activeFormat,
                 activeDatabaseExists = databaseFile.isFile,
-                activeQuickCheck = quickCheck(databaseFile),
+                activeQuickCheck = inspectActive && quickCheck(databaseFile),
                 archivedDatabasePresent = archivedDatabase.isFile,
-                archivedFormat = detectFormat(family, archivedDatabase),
-                archivedQuickCheck = quickCheck(archivedDatabase),
-                archivedSidecarNames = archivedFiles.map { it.name }.toSet(),
-                expectedSidecarNames = DatabaseArchiveManager.sidecarFiles(databaseFile).map { it.name }.toSet(),
+                archivedFormat = if (journal.manual) StorageFormat.UNKNOWN else detectArchivedFormat(family, archivedDatabase),
+                archivedQuickCheck = !journal.manual && quickCheckArchived(archivedDatabase),
+                activeSidecarNames = activeNames,
+                archivedSidecarNames = archivedNames,
+                expectedSidecarNames = expectedNames,
                 unknownArchiveFiles = archiveDirectory.listFiles().orEmpty().any {
-                    it.name !in DatabaseArchiveManager.sidecarFiles(databaseFile).map { file -> file.name }
-                }
+                    it.name !in allowedNames
+                },
+                manual = journal.manual,
+                activeDatabaseName = databaseFile.name
             )
         )
 
-        if (activeFormat == journal.sourceFormat && archivedFiles.isEmpty()) {
-            if (recoveryAction != StorageCutoverRecovery.Action.CLEAR_INTACT_SOURCE || !quickCheck(databaseFile)) {
-                return false
-            }
+        if (recoveryAction == StorageCutoverRecovery.Action.CLEAR_INTACT_SOURCE) {
+            if (archivedFiles.isNotEmpty() ||
+                (!journal.manual && (activeFormat != journal.sourceFormat || !quickCheck(databaseFile))) ||
+                (journal.manual && !activeSourceFileSetIntact(databaseFile, expectedNames))
+            ) return false
             return runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)
         }
         // A partial rollback is ambiguous: active sidecars may already contain restored WAL data.
         // Never delete or move anything unless the complete source set above already verifies.
         if (journal.phase == PHASE_ROLLBACK) return false
         if (recoveryAction == StorageCutoverRecovery.Action.COMPLETE_FORWARD) {
-            if (!formatMatches(family, archivedDatabase, journal.sourceFormat) ||
-                !quickCheck(archivedDatabase) ||
+            if ((!journal.manual && (!archivedFormatMatches(family, archivedDatabase, journal.sourceFormat) ||
+                    !quickCheckArchived(archivedDatabase))) ||
                 !quickCheck(databaseFile)
             ) return false
             if (runCatching { settings.setCutoverArchiveStoragePending(true) }.isFailure) return false
             return runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)
         }
         if (recoveryAction != StorageCutoverRecovery.Action.RESTORE_ARCHIVE || archivedFiles.isEmpty()) return false
-        if (journal.phase == PHASE_ARCHIVING && databaseFile.exists()) return false
         return StorageCutoverRecovery.execute(
             action = recoveryAction,
             databaseFile = databaseFile,
             movedFiles = archivedFiles,
             deleteActive = { file ->
-                if (journal.phase == PHASE_ARCHIVING && !file.exists()) true else deleteExactDatabaseSet(file)
+                if (journal.manual && journal.phase == PHASE_ARCHIVING) true else deleteExactDatabaseSet(file)
             },
             restore = { file, moved -> DatabaseArchiveManager.restore(file, moved) },
-            verifyActive = { formatMatches(family, databaseFile, journal.sourceFormat) && quickCheck(databaseFile) },
+            verifyActive = {
+                if (journal.manual) {
+                    activeSourceFileSetIntact(databaseFile, expectedNames)
+                } else {
+                    formatMatches(family, databaseFile, journal.sourceFormat) && quickCheck(databaseFile)
+                }
+            },
             clearJournal = { runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false) },
             cleanupArchive = { archiveDirectory.takeIf { it.listFiles().orEmpty().isEmpty() }?.delete() }
         )
@@ -298,23 +323,14 @@ internal class StorageFormatCutoverCoordinator(
         DirectDebugDatabaseHelper(appContext).use { helper -> helper.writableDatabase }
     }
 
-    private fun checkpoint(databaseFile: File): Boolean = runCatching {
-        open(databaseFile, readOnly = false).use { db ->
-            db.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", emptyArray()).use { cursor ->
-                cursor.moveToFirst() && cursor.getInt(0) == 0
-            }
-        }
-    }.getOrDefault(false)
+    private fun checkpoint(databaseFile: File): Boolean = checkpointFile(databaseFile)
 
     private fun quickCheck(databaseFile: File): Boolean {
-        if (!databaseFile.isFile) return false
-        return runCatching {
-            open(databaseFile, readOnly = true).use { db ->
-                db.rawQuery("PRAGMA quick_check", emptyArray()).use { cursor ->
-                    cursor.moveToFirst() && cursor.getString(0) == "ok"
-                }
-            }
-        }.getOrDefault(false)
+        return quickCheckFile(databaseFile)
+    }
+
+    private fun quickCheckArchived(databaseFile: File): Boolean {
+        return quickCheckFile(databaseFile, recoverWal = false)
     }
 
     private fun deleteExactDatabaseSet(databaseFile: File): Boolean {
@@ -339,6 +355,15 @@ internal class StorageFormatCutoverCoordinator(
         return archiveDirectory.listFiles().orEmpty().filter { it.isFile && it.name in allowed }
     }
 
+    private fun activeSidecarNames(databaseFile: File): Set<String> =
+        DatabaseArchiveManager.sidecarFiles(databaseFile)
+            .filter { it.isFile }
+            .map { it.name }
+            .toSet()
+
+    private fun activeSourceFileSetIntact(databaseFile: File, expectedNames: Set<String>): Boolean =
+        databaseFile.isFile && databaseFile.name in expectedNames && activeSidecarNames(databaseFile) == expectedNames
+
     private fun compactFormat(family: String, databaseFile: File): Boolean = when (family) {
         MAIN_FAMILY -> detectMain(databaseFile) == StorageFormat.COMPACT_V2
         DEBUG_FAMILY -> detectDebug(databaseFile) == StorageFormat.COMPACT_V2
@@ -357,8 +382,17 @@ internal class StorageFormatCutoverCoordinator(
         else -> StorageFormat.UNKNOWN
     }
 
+    private fun detectArchivedFormat(family: String, databaseFile: File): StorageFormat = when (family) {
+        MAIN_FAMILY -> detectArchivedMain(databaseFile)
+        DEBUG_FAMILY -> detectArchivedDebug(databaseFile)
+        else -> StorageFormat.UNKNOWN
+    }
+
     private fun formatMatches(family: String, databaseFile: File, expected: StorageFormat): Boolean =
         detectFormat(family, databaseFile) == expected
+
+    private fun archivedFormatMatches(family: String, databaseFile: File, expected: StorageFormat): Boolean =
+        detectArchivedFormat(family, databaseFile) == expected
 
     private fun mainTerminal(message: String): Boolean {
         settings.setMainStorageCutoverError(message)
@@ -427,9 +461,17 @@ internal class StorageFormatCutoverCoordinator(
             }
         }
 
-        internal fun detectMain(databaseFile: File): StorageFormat = detectFile(databaseFile, ::detectMain)
+        internal fun detectMain(databaseFile: File): StorageFormat =
+            detectFile(databaseFile, recoverWal = true, detector = ::detectMain)
 
-        internal fun detectDebug(databaseFile: File): StorageFormat = detectFile(databaseFile, ::detectDebug)
+        internal fun detectDebug(databaseFile: File): StorageFormat =
+            detectFile(databaseFile, recoverWal = true, detector = ::detectDebug)
+
+        private fun detectArchivedMain(databaseFile: File): StorageFormat =
+            detectFile(databaseFile, recoverWal = false, detector = ::detectMain)
+
+        private fun detectArchivedDebug(databaseFile: File): StorageFormat =
+            detectFile(databaseFile, recoverWal = false, detector = ::detectDebug)
 
         internal fun verifyArchivedSource(
             family: String,
@@ -439,16 +481,36 @@ internal class StorageFormatCutoverCoordinator(
         ): Boolean {
             val archivedDatabase = File(archiveDirectory, databaseFile.name)
             val detected = when (family) {
-                MAIN_FAMILY -> detectMain(archivedDatabase)
-                DEBUG_FAMILY -> detectDebug(archivedDatabase)
+                MAIN_FAMILY -> detectArchivedMain(archivedDatabase)
+                DEBUG_FAMILY -> detectArchivedDebug(archivedDatabase)
                 else -> StorageFormat.UNKNOWN
             }
-            return detected == sourceFormat && quickCheckFile(archivedDatabase)
+            return detected == sourceFormat && quickCheckFile(archivedDatabase, recoverWal = false)
         }
 
         internal fun verifyDatabaseQuickCheck(databaseFile: File): Boolean = quickCheckFile(databaseFile)
 
-        private fun detectFile(databaseFile: File, detector: (SQLiteDatabase) -> StorageFormat): StorageFormat {
+        internal fun checkpointDatabase(databaseFile: File): Boolean = checkpointFile(databaseFile)
+
+        private fun <T> inspectDatabaseFile(
+            databaseFile: File,
+            recoverWal: Boolean,
+            query: (SQLiteDatabase) -> T
+        ): T {
+            return try {
+                open(databaseFile, readOnly = true).use(query)
+            } catch (error: SQLiteReadOnlyDatabaseException) {
+                if (!recoverWal) throw error
+                // DiLink's SQLite needs a writable handle to recover an active WAL after process replacement.
+                open(databaseFile, readOnly = false).use(query)
+            }
+        }
+
+        private fun detectFile(
+            databaseFile: File,
+            recoverWal: Boolean,
+            detector: (SQLiteDatabase) -> StorageFormat
+        ): StorageFormat {
             if (!databaseFile.exists()) {
                 return if (DatabaseArchiveManager.sidecarFiles(databaseFile).drop(1).any { it.exists() }) {
                     StorageFormat.UNKNOWN
@@ -457,7 +519,8 @@ internal class StorageFormatCutoverCoordinator(
                 }
             }
             if (!databaseFile.isFile) return StorageFormat.UNKNOWN
-            return runCatching { open(databaseFile, readOnly = true).use(detector) }.getOrDefault(StorageFormat.UNKNOWN)
+            return runCatching { inspectDatabaseFile(databaseFile, recoverWal, detector) }
+                .getOrDefault(StorageFormat.UNKNOWN)
         }
 
         private fun detectMain(db: SQLiteDatabase): StorageFormat {
@@ -538,15 +601,23 @@ internal class StorageFormatCutoverCoordinator(
             )
         }
 
-        private fun quickCheckFile(databaseFile: File): Boolean {
+        private fun quickCheckFile(databaseFile: File, recoverWal: Boolean = true): Boolean {
             if (!databaseFile.isFile) return false
             return runCatching {
-                open(databaseFile, readOnly = true).use { db ->
+                inspectDatabaseFile(databaseFile, recoverWal) { db ->
                     db.rawQuery("PRAGMA quick_check", emptyArray()).use { cursor ->
                         cursor.moveToFirst() && cursor.getString(0) == "ok"
                     }
                 }
             }.getOrDefault(false)
         }
+
+        private fun checkpointFile(databaseFile: File): Boolean = runCatching {
+            open(databaseFile, readOnly = false).use { db ->
+                db.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", emptyArray()).use { cursor ->
+                    cursor.moveToFirst() && cursor.getInt(0) == 0
+                }
+            }
+        }.getOrDefault(false)
     }
 }

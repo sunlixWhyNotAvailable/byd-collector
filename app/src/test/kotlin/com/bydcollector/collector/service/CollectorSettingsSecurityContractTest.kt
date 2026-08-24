@@ -166,12 +166,18 @@ class CollectorSettingsSecurityContractTest {
     @Test
     fun languageNavigatorAndTemplateResetApisArePersistedBySettingsFacade() {
         val source = sourceFile("com/bydcollector/collector/service/CollectorSettings.kt").readText()
+        val init = source.substringAfter("init {").substringBefore("}")
+        val navigatorGetter = source.substringAfter("fun telegramNavigatorMask(): Int")
+            .substringBefore("fun setTelegramNavigatorMask")
         assertTrue(source.contains("fun uiLanguageCode(): String"))
         assertTrue(source.contains("fun setUiLanguageCode(code: String)"))
         assertTrue(source.contains("DEFAULT_UI_LANGUAGE_CODE = \"uk\""))
         assertTrue(source.contains("fun telegramNavigatorMask(): Int"))
         assertTrue(source.contains("fun setTelegramNavigatorMask(mask: Int)"))
         assertTrue(source.contains("TelegramNavigatorMask.sanitize"))
+        assertTrue(navigatorGetter.contains("DEFAULT_TELEGRAM_NAVIGATOR_MASK"))
+        assertTrue(source.contains("DEFAULT_TELEGRAM_NAVIGATOR_MASK = TelegramNavigatorMask.NONE"))
+        assertFalse(init.contains("NavigatorMask"))
         assertTrue(source.contains("fun clearTelegramTemplate(eventKey: String)"))
     }
 

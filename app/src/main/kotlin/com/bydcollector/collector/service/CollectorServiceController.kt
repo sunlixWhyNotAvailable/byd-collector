@@ -2,6 +2,7 @@ package com.bydcollector.collector.service
 
 import android.content.Context
 import android.os.Build
+import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 
 object CollectorServiceController {
     fun start(context: Context) {
@@ -88,7 +89,11 @@ object CollectorServiceController {
     }
 
     fun archiveDatabase(context: Context) {
-        val intent = CollectorService.archiveDatabaseIntent(context)
+        val intent = if (CollectorService.isRunning()) {
+            CollectorService.archiveDatabaseIntent(context)
+        } else {
+            DatabaseMaintenanceService.archiveIntent(context, DbMaintenanceOperation.ARCHIVE)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             context.startForegroundService(intent)
         } else {
@@ -97,7 +102,11 @@ object CollectorServiceController {
     }
 
     fun archiveDebugDatabase(context: Context) {
-        val intent = CollectorService.archiveDebugDatabaseIntent(context)
+        val intent = if (CollectorService.isRunning()) {
+            CollectorService.archiveDebugDatabaseIntent(context)
+        } else {
+            DatabaseMaintenanceService.archiveIntent(context, DbMaintenanceOperation.DEBUG_ARCHIVE)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             context.startForegroundService(intent)
         } else {
@@ -106,7 +115,12 @@ object CollectorServiceController {
     }
 
     fun cancelDatabaseMaintenance(context: Context) {
-        context.startService(CollectorService.cancelDatabaseMaintenanceIntent(context))
+        val intent = if (DatabaseMaintenanceService.isRunning()) {
+            DatabaseMaintenanceService.cancelIntent(context)
+        } else {
+            CollectorService.cancelDatabaseMaintenanceIntent(context)
+        }
+        context.startService(intent)
     }
 
     fun reconcileArchiveStorage(context: Context) {

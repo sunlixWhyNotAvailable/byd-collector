@@ -70,10 +70,15 @@ class TelegramCoordinator(
     fun onPowerOffConfirmed(snapshot: TelegramPowerOffSnapshot = TelegramPowerOffSnapshot(), location: TelegramLocationSnapshot? = null): Long? {
         activateEnabledRuntime() ?: return null
         val startupDeadline = ensureStartupRecovery()
+        engine.state.pendingPowerOffLocationTripId
+            ?.takeIf { !engine.state.pendingPowerOffLocationSummaryDelivered }
+            ?.let { flushPending("$it:summary", force = true) }
         val result = engine.onPowerOffConfirmed(eventConfig(), snapshot, location, nowMs())
         handle(result)
-        val tripSummaryKey = result.events.firstOrNull { it.type == TelegramEventType.TRIP_SUMMARY }?.dedupeKey
-        val deliveryDeadline = tripSummaryKey?.let { flushPending(it, force = true) } ?: flushPending()
+        val priorityKey = result.events.firstOrNull {
+            it.type == TelegramEventType.TRIP_SUMMARY && !it.locationOnly
+        }?.dedupeKey ?: result.events.firstOrNull { it.locationOnly }?.dedupeKey
+        val deliveryDeadline = priorityKey?.let { flushPending(it, force = true) } ?: flushPending()
         return nextWakeAt(result.nextWakeAtMs, nextWakeAt(startupDeadline, deliveryDeadline))
     }
 
@@ -130,13 +135,26 @@ class TelegramCoordinator(
         val chatId = settings.telegramChatId()
         if (token.isBlank() || chatId.isBlank()) return null
         if (entry.blocked) return null
+        if (entry.dedupeKey.endsWith(":location")) {
+            val summary = store.telegramMessageByDedupeKey(
+                entry.dedupeKey.removeSuffix(":location") + ":summary"
+            )
+            if (summary != null) return summary.nextAttemptAtMs.takeIf { !summary.blocked }
+        }
         val now = nowMs()
         if (!force && entry.nextAttemptAtMs > now) return entry.nextAttemptAtMs
         if (Thread.currentThread().isInterrupted) return entry.nextAttemptAtMs
         val attemptedAt = nowMs()
         return when (val result = client.sendMessage(TelegramSendMessage(token, chatId, entry.payload))) {
             TelegramSendResult.Success -> {
-                store.markTelegramDelivered(entry.id)
+                val deliveredAtMs = nowMs()
+                val deliveredState = engine.markTripSummaryDelivered(entry.dedupeKey, deliveredAtMs)
+                try {
+                    store.markTelegramDelivered(entry.id, deliveredState?.toJson(), deliveredAtMs)
+                } catch (error: RuntimeException) {
+                    engine = TelegramEventEngine(TelegramEventState.fromJson(store.telegramRuntimeState()))
+                    throw error
+                }
                 store.recordEvent(
                     "telegram_message_delivered",
                     "Telegram message delivered",
@@ -228,7 +246,18 @@ class TelegramCoordinator(
         val language = telegramLanguage()
         val savedTemplate = settings.telegramTemplate(event.type.key)
         val template = savedTemplate ?: TelegramTemplateCatalog.defaultTemplate(event.type, language)
-        val rendered = TelegramTemplateRenderer.render(event.type, template, event.variables)
+        if (event.locationOnly) {
+            return event.textSuffix?.takeIf(String::isNotBlank)?.let {
+                TelegramOutboxMessage(event.dedupeKey, event.type.key, it)
+            }
+        }
+        val renderTemplate = TelegramTemplateCatalog.templateForRendering(
+            event.type,
+            template,
+            language,
+            event.omitOverall
+        )
+        val rendered = TelegramTemplateRenderer.render(event.type, renderTemplate, event.variables)
         val payload = rendered.text
         if (payload == null) {
             store.recordEvent(

@@ -108,6 +108,8 @@ class BydCollectorUiContractTest {
         assertInOrder(app, "strings.operationCannotBeStopped", "strings.interruptionDataLossRisk")
         assertTrue(app.contains("color = p.yellow, fontSize = 14.sp"))
         assertTrue(app.contains("strings.dbMaintenanceArchivePendingWarning, color = p.yellow"))
+        assertTrue(app.contains("inspectionWarning?.let"))
+        assertTrue(app.contains("state.warning?.let"))
         assertTrue(app.contains("state.mainArchivePreflight"))
         assertFalse(app.contains("mqttPending = chromeState?.mqttPendingCount"))
         assertTrue(app.contains("fontSize = 15.sp"))
@@ -232,6 +234,13 @@ class BydCollectorUiContractTest {
         assertTrue(app.contains("strings.colorByConsumption"))
         assertTrue(strings.contains("tripsTab = \"Поїздки\""))
         assertTrue(strings.contains("tripsTab = \"Trips\""))
+        val map = app.substringAfter("private fun updateTripMap(").substringBefore("private fun tripMapMarker")
+        assertInOrder(map, "color = AndroidColor.BLACK", "run.zipWithNext()")
+        assertTrue(map.contains("width = 12f"))
+        assertTrue(map.contains("width = 8f"))
+        assertEquals(2, Regex("outlinePaint\\.strokeCap = Paint\\.Cap\\.ROUND").findAll(map).count())
+        assertEquals(2, Regex("outlinePaint\\.strokeJoin = Paint\\.Join\\.ROUND").findAll(map).count())
+        assertTrue(app.contains("private val TripRouteGreen = Color(0xFF147A55)"))
     }
 
     @Test

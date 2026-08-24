@@ -58,6 +58,7 @@ data class DbMaintenanceRuntimeStatus(
     val messageUk: String = "",
     val messageEn: String = "",
     val error: String? = null,
+    val warning: String? = null,
     val archivePath: String? = null,
     val startedAtMs: Long = 0L,
     val updatedAtMs: Long = 0L,
@@ -73,6 +74,7 @@ data class DbMaintenanceUiState(
     val messageUk: String = "",
     val messageEn: String = "",
     val error: String? = null,
+    val warning: String? = null,
     val archivePath: String? = null,
     val cancelAvailable: Boolean = false,
     val mainArchivePreflight: MainArchivePreflight? = null
@@ -81,22 +83,28 @@ data class DbMaintenanceUiState(
 data class DbMaintenanceResult(
     val ok: Boolean,
     val message: String,
-    val archivePath: String? = null
+    val archivePath: String? = null,
+    val warning: String? = null
 )
 
 data class MainArchivePreflight(
     val telegramPending: Long = 0L,
     val mqttPending: Long = 0L,
     val influxPending: Long = 0L,
-    val telegramDeferred: Boolean = false
+    val telegramDeferred: Boolean = false,
+    val warning: String? = null
 ) {
     val blocksAutomaticCutover: Boolean
-        get() = telegramPending > 0L || mqttPending > 0L || influxPending > 0L || telegramDeferred
+        get() = warning != null || telegramPending > 0L || mqttPending > 0L || influxPending > 0L || telegramDeferred
 }
 
 data class StorageCutoverJournal(
     val family: String,
     val archivePath: String?,
     val phase: String,
-    val sourceFormat: StorageFormat
+    val sourceFormat: StorageFormat,
+    /** Manual archives tolerate inspection-only failures; old journals default to strict automatic recovery. */
+    val manual: Boolean = false,
+    /** Exact stable source set captured after SQLite owners are closed. */
+    val sourceNames: Set<String> = emptySet()
 )

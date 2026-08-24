@@ -16,8 +16,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 class DbMaintenanceCoordinator(
     private val context: Context,
     private val settings: CollectorSettings,
-    private val storeProvider: () -> TelemetryStore,
-    private val debugStoreProvider: () -> DirectDebugStore,
     private val application: BydCollectorApplication,
     private val stopRuntime: (DbMaintenanceOperation) -> Unit,
     private val onStoreReopened: (TelemetryStore) -> Unit,
@@ -88,15 +86,25 @@ class DbMaintenanceCoordinator(
 
     private fun archiveMain(operation: DbMaintenanceOperation): DbMaintenanceResult {
         check(settings.storageCutoverJournal() == null) { "Database cutover recovery is pending" }
-        val store = storeProvider()
-        val databaseFile = store.databaseFile()
-        val sourceFormat = StorageFormatCutoverCoordinator.detectMain(databaseFile)
-        check(sourceFormat in setOf(StorageFormat.LEGACY_V1, StorageFormat.COMPACT_V2)) {
-            "Main database format is not recognized"
+        val databaseFile = context.getDatabasePath(TelemetryDatabaseHelper.DATABASE_NAME)
+        val warnings = mutableListOf<String>()
+        check(databaseFile.isFile) { "Main database source is not preservable" }
+        val sourceFormat = runCatching {
+            val sourceFormat = StorageFormatCutoverCoordinator.detectMain(databaseFile)
+            sourceFormat
         }
-        store.checkpointForArchive()
+            .getOrElse { warnings += inspectionWarning("format", it); StorageFormat.UNKNOWN }
+        if (sourceFormat == StorageFormat.UNKNOWN) warnings += inspectionWarning("format")
+        if (!runCatching { verifyWritableDatabaseFile(databaseFile) }.getOrDefault(false)) {
+            warnings += inspectionWarning("quick_check")
+        }
+        if (!runCatching { StorageFormatCutoverCoordinator.checkpointDatabase(databaseFile) }.getOrDefault(false)) {
+            warnings += inspectionWarning("checkpoint")
+        }
         publish(operation, 2)
         application.closeTelemetryStoreForMaintenance()
+        val sourceNames = sourceNames(databaseFile)
+        check(databaseFile.name in sourceNames) { "Main database source is not preservable after close" }
 
         publish(operation, 3)
         val archiveRoot = File(context.filesDir, "db_archive")
@@ -106,7 +114,9 @@ class DbMaintenanceCoordinator(
             TelemetryDatabaseHelper.SCHEMA_FAMILY,
             archiveDirectory.absolutePath,
             PHASE_ARCHIVING,
-            sourceFormat
+            sourceFormat,
+            manual = true,
+            sourceNames = sourceNames
         )
         if (!runCatching { settings.setStorageCutoverJournal(journal) }.getOrDefault(false)) {
             reopenMainAndVerifyRestored(databaseFile)
@@ -117,56 +127,51 @@ class DbMaintenanceCoordinator(
             if (!archive.rollbackOk || !databaseFile.exists()) {
                 throw TerminalArchiveFailure("Database archive failed and original database was not restored: ${archive.error ?: "unknown"}")
             }
-            if (StorageFormatCutoverCoordinator.detectMain(databaseFile) != sourceFormat ||
-                !verifyWritableDatabaseFile(databaseFile)
-            ) {
+            if (!sourceSetRestored(databaseFile, sourceNames)) {
                 throw TerminalArchiveFailure("Database archive failed and original database was not restored: ${archive.error ?: "unknown"}")
             }
-            reopenMainAndVerifyRestored(databaseFile)
+            reopenMainAndVerifyRestored(databaseFile, manual = true)
             if (!runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)) {
                 throw TerminalArchiveFailure("Cannot clear database cutover journal after archive failure")
             }
             error(archive.error ?: "Database archive failed")
         }
-        if (!StorageFormatCutoverCoordinator.verifyArchivedSource(
-                TelemetryDatabaseHelper.SCHEMA_FAMILY,
-                databaseFile,
-                archiveDirectory,
-                sourceFormat
-            )
-        ) {
-            rollbackMain(databaseFile, archive, IllegalStateException("Archived source verification failed"))
+        if (!exactArchiveSourceSet(databaseFile, sourceNames, archive)) {
+            throw TerminalArchiveFailure("Database archive did not preserve the exact source file set")
+        }
+        if (!runCatching { StorageFormatCutoverCoordinator.verifyArchivedSource(
+            TelemetryDatabaseHelper.SCHEMA_FAMILY,
+            databaseFile,
+            archiveDirectory,
+            sourceFormat
+        ) }.getOrDefault(false)) {
+            warnings += inspectionWarning("archived source")
         }
 
         publish(operation, 4)
         val createFailure = runCatching {
             check(settings.setStorageCutoverJournal(
-                StorageCutoverJournal(
-                    TelemetryDatabaseHelper.SCHEMA_FAMILY,
-                    archiveDirectory.absolutePath,
-                    PHASE_CREATING,
-                    sourceFormat
-                )
+                journal.copy(phase = PHASE_CREATING)
             )) { "Cannot persist database creation journal" }
             val newStore = application.reopenTelemetryStoreForMaintenance()
             onStoreReopened(newStore)
             publish(operation, 5)
             check(settings.setStorageCutoverJournal(
-                StorageCutoverJournal(
-                    TelemetryDatabaseHelper.SCHEMA_FAMILY,
-                    archiveDirectory.absolutePath,
-                    PHASE_VERIFYING,
-                    sourceFormat
-                )
+                journal.copy(phase = PHASE_VERIFYING)
             )) { "Cannot persist database verification journal" }
             check(newStore.verifyWritableDatabase()) { "New database quick_check failed" }
         }.exceptionOrNull()
-        if (createFailure != null) rollbackMain(databaseFile, archive, createFailure)
+        if (createFailure != null) rollbackMain(databaseFile, archive, createFailure, manual = true)
 
         if (!runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)) {
             throw RuntimeException("Cannot clear database cutover journal after successful archive")
         }
-        return DbMaintenanceResult(true, "Database archived", archive.archiveDirectory.absolutePath)
+        return DbMaintenanceResult(
+            ok = true,
+            message = "Database archived",
+            archivePath = archive.archiveDirectory.absolutePath,
+            warning = warnings.takeIf { it.isNotEmpty() }?.distinct()?.joinToString("; ")
+        )
     }
 
     private fun verifyWritableDatabaseFile(databaseFile: File): Boolean {
@@ -176,7 +181,8 @@ class DbMaintenanceCoordinator(
     private fun rollbackMain(
         databaseFile: File,
         archive: DatabaseArchiveManager.ArchiveResult,
-        cause: Throwable
+        cause: Throwable,
+        manual: Boolean = false
     ): Nothing {
         runCatching { application.closeTelemetryStoreForMaintenance() }
         markRollbackPhase()
@@ -186,7 +192,7 @@ class DbMaintenanceCoordinator(
         if (!DatabaseArchiveManager.restore(databaseFile, archive.movedFiles)) {
             throw TerminalArchiveFailure("Database archive restore was incomplete after new database failure: ${cause.message ?: cause::class.java.simpleName}")
         }
-        reopenMainAndVerifyRestored(databaseFile)
+        if (manual) reopenMainAndVerifyRestored(databaseFile) else reopenMainAndVerifyRestored(databaseFile, manual = false)
         if (!runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)) {
             throw TerminalArchiveFailure("Cannot clear database rollback journal after restore")
         }
@@ -194,9 +200,10 @@ class DbMaintenanceCoordinator(
         throw RuntimeException(cause.message ?: "New database verification failed", cause)
     }
 
-    private fun reopenMainAndVerifyRestored(databaseFile: File) {
-        val format = StorageFormatCutoverCoordinator.detectMain(databaseFile)
-        if (format != StorageFormat.LEGACY_V1 && format != StorageFormat.COMPACT_V2) {
+    private fun reopenMainAndVerifyRestored(databaseFile: File, manual: Boolean) {
+        val format = runCatching { StorageFormatCutoverCoordinator.detectMain(databaseFile) }
+            .getOrDefault(StorageFormat.UNKNOWN)
+        if (!manual && format != StorageFormat.LEGACY_V1 && format != StorageFormat.COMPACT_V2) {
             throw TerminalArchiveFailure("Restored database format is not recognized")
         }
         val restoredStore = runCatching { application.reopenTelemetryStoreForMaintenance() }
@@ -204,24 +211,37 @@ class DbMaintenanceCoordinator(
                 throw TerminalArchiveFailure("Restored database could not be reopened: ${error.message ?: error::class.java.simpleName}")
             }
         val verified = runCatching { restoredStore.verifyWritableDatabase() }.getOrDefault(false)
-        if (!verified) {
+        if (!verified && !manual) {
             runCatching { application.closeTelemetryStoreForMaintenance() }
             throw TerminalArchiveFailure("Restored database quick_check failed")
         }
         onStoreReopened(restoredStore)
     }
 
+    private fun reopenMainAndVerifyRestored(databaseFile: File) {
+        reopenMainAndVerifyRestored(databaseFile, manual = true)
+    }
+
     private fun archiveDebug(operation: DbMaintenanceOperation): DbMaintenanceResult {
         check(settings.storageCutoverJournal() == null) { "Database cutover recovery is pending" }
-        val debugStore = debugStoreProvider()
-        val databaseFile = debugStore.databaseFile()
-        val sourceFormat = StorageFormatCutoverCoordinator.detectDebug(databaseFile)
-        check(sourceFormat in setOf(StorageFormat.LEGACY_V1, StorageFormat.COMPACT_V2)) {
-            "Debug database format is not recognized"
+        val databaseFile = context.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME)
+        val warnings = mutableListOf<String>()
+        check(databaseFile.isFile) { "Debug database source is not preservable" }
+        val sourceFormat = runCatching {
+            val sourceFormat = StorageFormatCutoverCoordinator.detectDebug(databaseFile)
+            sourceFormat
         }
-        debugStore.checkpointForArchive()
+            .getOrElse { warnings += inspectionWarning("format", it); StorageFormat.UNKNOWN }
+        check(sourceFormat != StorageFormat.ABSENT) { "Debug database does not exist" }
+        val quickCheck = runCatching { verifyWritableDatabaseFile(databaseFile) }.getOrDefault(false)
+        if (!quickCheck) warnings += inspectionWarning("quick_check")
+        if (!runCatching { StorageFormatCutoverCoordinator.checkpointDatabase(databaseFile) }.getOrDefault(false)) {
+            warnings += inspectionWarning("checkpoint")
+        }
         publish(operation, 2)
         closeDebugStore()
+        val sourceNames = sourceNames(databaseFile)
+        check(databaseFile.name in sourceNames) { "Debug database source is not preservable after close" }
 
         publish(operation, 3)
         val archiveRoot = File(context.filesDir, "db_archive")
@@ -231,7 +251,9 @@ class DbMaintenanceCoordinator(
             DirectDebugDatabaseHelper.SCHEMA_FAMILY,
             archiveDirectory.absolutePath,
             PHASE_ARCHIVING,
-            sourceFormat
+            sourceFormat,
+            manual = true,
+            sourceNames = sourceNames
         )
         if (!runCatching { settings.setStorageCutoverJournal(journal) }.getOrDefault(false)) {
             reopenDebugAndVerifyRestored(databaseFile)
@@ -242,61 +264,57 @@ class DbMaintenanceCoordinator(
             if (!archive.rollbackOk || !databaseFile.exists()) {
                 throw TerminalArchiveFailure("Debug database archive failed and original database was not restored: ${archive.error ?: "unknown"}")
             }
-            if (StorageFormatCutoverCoordinator.detectDebug(databaseFile) != sourceFormat ||
-                !verifyWritableDatabaseFile(databaseFile)
-            ) {
+            if (!sourceSetRestored(databaseFile, sourceNames)) {
                 throw TerminalArchiveFailure("Debug database archive failed and original database was not restored: ${archive.error ?: "unknown"}")
             }
-            reopenDebugAndVerifyRestored(databaseFile)
+            reopenDebugAndVerifyRestored(databaseFile, manual = true)
             if (!runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)) {
                 throw TerminalArchiveFailure("Cannot clear debug database cutover journal after archive failure")
             }
             error(archive.error ?: "Debug database archive failed")
         }
-        if (!StorageFormatCutoverCoordinator.verifyArchivedSource(
-                DirectDebugDatabaseHelper.SCHEMA_FAMILY,
-                databaseFile,
-                archiveDirectory,
-                sourceFormat
-            )
-        ) {
-            rollbackDebug(databaseFile, archive, IllegalStateException("Archived debug source verification failed"))
+        if (!exactArchiveSourceSet(databaseFile, sourceNames, archive)) {
+            throw TerminalArchiveFailure("Debug database archive did not preserve the exact source file set")
+        }
+        if (!runCatching { StorageFormatCutoverCoordinator.verifyArchivedSource(
+            DirectDebugDatabaseHelper.SCHEMA_FAMILY,
+            databaseFile,
+            archiveDirectory,
+            sourceFormat
+        ) }.getOrDefault(false)) {
+            warnings += inspectionWarning("archived source")
         }
 
         publish(operation, 4)
         val createFailure = runCatching {
             check(settings.setStorageCutoverJournal(
-                StorageCutoverJournal(
-                    DirectDebugDatabaseHelper.SCHEMA_FAMILY,
-                    archiveDirectory.absolutePath,
-                    PHASE_CREATING,
-                    sourceFormat
-                )
+                journal.copy(phase = PHASE_CREATING)
             )) { "Cannot persist debug database creation journal" }
             val newStore = reopenDebugAndRebind()
             publish(operation, 5)
             check(settings.setStorageCutoverJournal(
-                StorageCutoverJournal(
-                    DirectDebugDatabaseHelper.SCHEMA_FAMILY,
-                    archiveDirectory.absolutePath,
-                    PHASE_VERIFYING,
-                    sourceFormat
-                )
+                journal.copy(phase = PHASE_VERIFYING)
             )) { "Cannot persist debug database verification journal" }
             check(newStore.verifyWritableDatabase()) { "New debug database quick_check failed" }
         }.exceptionOrNull()
-        if (createFailure != null) rollbackDebug(databaseFile, archive, createFailure)
+        if (createFailure != null) rollbackDebug(databaseFile, archive, createFailure, manual = true)
 
         if (!runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)) {
             throw RuntimeException("Cannot clear debug database cutover journal after successful archive")
         }
-        return DbMaintenanceResult(true, "Debug database archived", archive.archiveDirectory.absolutePath)
+        return DbMaintenanceResult(
+            ok = true,
+            message = "Debug database archived",
+            archivePath = archive.archiveDirectory.absolutePath,
+            warning = warnings.takeIf { it.isNotEmpty() }?.distinct()?.joinToString("; ")
+        )
     }
 
     private fun rollbackDebug(
         databaseFile: File,
         archive: DatabaseArchiveManager.ArchiveResult,
-        cause: Throwable
+        cause: Throwable,
+        manual: Boolean = false
     ): Nothing {
         runCatching { closeDebugStore() }
         markRollbackPhase()
@@ -306,7 +324,7 @@ class DbMaintenanceCoordinator(
         if (!DatabaseArchiveManager.restore(databaseFile, archive.movedFiles)) {
             throw TerminalArchiveFailure("Debug database archive restore was incomplete after new database failure: ${cause.message ?: cause::class.java.simpleName}")
         }
-        reopenDebugAndVerifyRestored(databaseFile)
+        if (manual) reopenDebugAndVerifyRestored(databaseFile) else reopenDebugAndVerifyRestored(databaseFile, manual = false)
         if (!runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)) {
             throw TerminalArchiveFailure("Cannot clear debug rollback journal after restore")
         }
@@ -314,21 +332,26 @@ class DbMaintenanceCoordinator(
         throw RuntimeException(cause.message ?: "New debug database verification failed", cause)
     }
 
-    private fun reopenDebugAndVerifyRestored(databaseFile: File) {
-        val format = StorageFormatCutoverCoordinator.detectDebug(databaseFile)
-        if (format != StorageFormat.LEGACY_V1 && format != StorageFormat.COMPACT_V2) {
-            throw TerminalArchiveFailure("Restored debug database format is not recognized")
+    private fun reopenDebugAndVerifyRestored(databaseFile: File, manual: Boolean) {
+        val format = runCatching { StorageFormatCutoverCoordinator.detectDebug(databaseFile) }
+            .getOrDefault(StorageFormat.UNKNOWN)
+        if (!manual && (format == StorageFormat.ABSENT || !verifyWritableDatabaseFile(databaseFile))) {
+            throw TerminalArchiveFailure("Restored debug database integrity check failed")
         }
         val restoredStore = runCatching { DirectDebugStore(context) }
             .getOrElse { error ->
                 throw TerminalArchiveFailure("Restored debug database could not be reopened: ${error.message ?: error::class.java.simpleName}")
             }
         val verified = runCatching { restoredStore.verifyWritableDatabase() }.getOrDefault(false)
-        if (!verified) {
+        if (!verified && !manual) {
             runCatching { restoredStore.close() }
             throw TerminalArchiveFailure("Restored debug database quick_check failed")
         }
         onDebugStoreReopened(restoredStore)
+    }
+
+    private fun reopenDebugAndVerifyRestored(databaseFile: File) {
+        reopenDebugAndVerifyRestored(databaseFile, manual = true)
     }
 
     private fun reopenDebugAndRebind(): DirectDebugStore {
@@ -394,6 +417,7 @@ class DbMaintenanceCoordinator(
                 messageUk = operation.stepsUk.last(),
                 messageEn = operation.stepsEn.last(),
                 archivePath = result.archivePath,
+                warning = result.warning,
                 cancelAvailable = false
             ),
             synchronous = true
@@ -434,6 +458,40 @@ class DbMaintenanceCoordinator(
             ),
             synchronous = true
         )
+    }
+
+    private fun sourceNames(databaseFile: File): Set<String> =
+        DatabaseArchiveManager.sidecarFiles(databaseFile)
+            .filter { it.isFile }
+            .map { it.name }
+            .toSet()
+
+    private fun sourceSetRestored(databaseFile: File, expectedNames: Set<String>): Boolean {
+        if (databaseFile.name !in expectedNames) return false
+        val actualNames = DatabaseArchiveManager.sidecarFiles(databaseFile)
+            .filter { it.isFile }
+            .map { it.name }
+            .toSet()
+        return actualNames == expectedNames
+    }
+
+    private fun exactArchiveSourceSet(
+        databaseFile: File,
+        expectedNames: Set<String>,
+        archive: DatabaseArchiveManager.ArchiveResult
+    ): Boolean {
+        if (databaseFile.name !in expectedNames || archive.movedFiles.map { it.name }.toSet() != expectedNames) return false
+        val archiveDirectory = runCatching { archive.archiveDirectory.canonicalFile }.getOrNull() ?: return false
+        val movedFiles = archive.movedFiles.map { runCatching { it.canonicalFile }.getOrNull() }
+        if (movedFiles.any { it == null || it.parentFile != archiveDirectory || !it.isFile }) return false
+        val archivedNames = archiveDirectory.listFiles().orEmpty().map { it.name }.toSet()
+        if (archivedNames != expectedNames) return false
+        return DatabaseArchiveManager.sidecarFiles(databaseFile).none { it.exists() }
+    }
+
+    private fun inspectionWarning(kind: String, error: Throwable? = null): String {
+        val detail = error?.let { ": ${it::class.java.simpleName}" }.orEmpty()
+        return "Manual archive warning: $kind inspection failed$detail"
     }
 
     private fun timestamp(): String {

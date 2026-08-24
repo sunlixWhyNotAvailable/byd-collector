@@ -114,7 +114,22 @@ class TelegramRuntimeContractTest {
         val unblock = store.substringAfter("fun unblockTelegramMessages")
             .substringBefore("fun telegramRuntimeState")
 
-        assertInOrder(success, "store.markTelegramDelivered(entry.id)", "pendingQueueDeadline()")
+        assertInOrder(
+            success,
+            "engine.markTripSummaryDelivered(entry.dedupeKey, deliveredAtMs)",
+            "store.markTelegramDelivered(entry.id, deliveredState?.toJson(), deliveredAtMs)",
+            "pendingQueueDeadline()"
+        )
+        val deliveryCommit = store.substringAfter("fun markTelegramDelivered")
+            .substringBefore("fun markTelegramRetry")
+        assertInOrder(
+            deliveryCommit,
+            "db.beginTransactionNonExclusive()",
+            "db.delete(\"telegram_outbox\"",
+            "saveTelegramRuntimeState(db",
+            "db.setTransactionSuccessful()",
+            "db.endTransaction()"
+        )
         assertInOrder(permanentFailure, "store.markTelegramBlocked", "pendingQueueDeadline()")
         assertTrue(unblock.contains("next_attempt_at_ms = MAX(next_attempt_at_ms, ?)"))
         assertFalse(unblock.contains("put(\"next_attempt_at_ms\", nowMs)"))
@@ -135,7 +150,15 @@ class TelegramRuntimeContractTest {
 
         assertInOrder(startup, "engine.recoverPendingTrip", "handle(recovered)")
         assertInOrder(startup, "handle(recovered)", "attempt(it, force = true)")
-        assertInOrder(powerOff, "handle(result)", "flushPending(it, force = true)")
+        assertInOrder(
+            powerOff,
+            "engine.state.pendingPowerOffLocationTripId",
+            "flushPending(\"${'$'}it:summary\", force = true)",
+            "engine.onPowerOffConfirmed",
+            "handle(result)",
+            "flushPending(it, force = true)"
+        )
+        assertTrue(powerOff.contains("!engine.state.pendingPowerOffLocationSummaryDelivered"))
         assertTrue(coordinator.contains("val runtimeStartedAtMs = activateEnabledRuntime() ?: return null"))
         assertInOrder(engineTick, "tickAtMs,", "runtimeStartedAtMs")
         assertTrue(coordinator.contains("private var enabledRuntimeStartedAtMs: Long? = null"))
@@ -168,6 +191,7 @@ class TelegramRuntimeContractTest {
         val coordinator = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
         val engine = sourceFile("com/bydcollector/collector/service/TelegramEventEngine.kt").readText()
         val mask = sourceFile("com/bydcollector/collector/telegram/TelegramNavigatorMask.kt").readText()
+        val actions = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorActions.kt").readText()
 
         assertTrue(coordinator.contains("settings.uiLanguageCode()"))
         assertTrue(coordinator.contains("settings.telegramNavigatorMask()"))
@@ -178,7 +202,10 @@ class TelegramRuntimeContractTest {
         assertInOrder(engine, "TelegramNavigatorMask.GOOGLE", "TelegramNavigatorMask.WAZE")
         assertInOrder(engine, "TelegramNavigatorMask.WAZE", "TelegramNavigatorMask.APPLE")
         assertInOrder(engine, "TelegramNavigatorMask.APPLE", "TelegramNavigatorMask.OSM")
+        assertTrue(mask.contains("const val NONE = 0"))
         assertTrue(mask.contains("const val ALL = 15"))
+        assertTrue(engine.contains("val navigatorMask: Int = TelegramNavigatorMask.NONE"))
+        assertTrue(actions.contains("val navigatorMask: Int = TelegramNavigatorMask.NONE"))
     }
 
     private fun sourceFile(path: String): File {
@@ -188,10 +215,13 @@ class TelegramRuntimeContractTest {
         ).firstOrNull { it.isFile } ?: error("Missing source file: $path")
     }
 
-    private fun assertInOrder(source: String, first: String, second: String) {
-        val firstIndex = source.indexOf(first)
-        val secondIndex = source.indexOf(second)
-        assertTrue(firstIndex >= 0, "Missing token: " + first)
-        assertTrue(secondIndex > firstIndex, "Expected " + first + " before " + second)
+    private fun assertInOrder(source: String, vararg tokens: String) {
+        var previousIndex = -1
+        tokens.forEach { token ->
+            val index = source.indexOf(token, previousIndex + 1)
+            assertTrue(index >= 0, "Missing token: $token")
+            assertTrue(index > previousIndex, "Expected tokens in order")
+            previousIndex = index
+        }
     }
 }

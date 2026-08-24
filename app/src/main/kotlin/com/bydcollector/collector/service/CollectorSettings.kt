@@ -375,7 +375,7 @@ class CollectorSettings(
     }
 
     fun telegramNavigatorMask(): Int = TelegramNavigatorMask.sanitize(
-        prefs.getInt(KEY_TELEGRAM_NAVIGATOR_MASK, TelegramNavigatorMask.ALL)
+        prefs.getInt(KEY_TELEGRAM_NAVIGATOR_MASK, DEFAULT_TELEGRAM_NAVIGATOR_MASK)
     )
 
     fun setTelegramNavigatorMask(mask: Int) {
@@ -573,6 +573,7 @@ class CollectorSettings(
             messageUk = prefs.getString(KEY_DB_MAINTENANCE_MESSAGE_UK, "") ?: "",
             messageEn = prefs.getString(KEY_DB_MAINTENANCE_MESSAGE_EN, "") ?: "",
             error = prefs.getString(KEY_DB_MAINTENANCE_ERROR, null),
+            warning = prefs.getString(KEY_DB_MAINTENANCE_WARNING, null),
             archivePath = prefs.getString(KEY_DB_MAINTENANCE_ARCHIVE_PATH, null),
             startedAtMs = prefs.getLong(KEY_DB_MAINTENANCE_STARTED_AT_MS, 0L),
             updatedAtMs = prefs.getLong(KEY_DB_MAINTENANCE_UPDATED_AT_MS, 0L),
@@ -599,6 +600,7 @@ class CollectorSettings(
             putString(KEY_DB_MAINTENANCE_MESSAGE_UK, status.messageUk)
             putString(KEY_DB_MAINTENANCE_MESSAGE_EN, status.messageEn)
             status.error?.let { putString(KEY_DB_MAINTENANCE_ERROR, it) } ?: remove(KEY_DB_MAINTENANCE_ERROR)
+            status.warning?.let { putString(KEY_DB_MAINTENANCE_WARNING, it) } ?: remove(KEY_DB_MAINTENANCE_WARNING)
             status.archivePath?.let { putString(KEY_DB_MAINTENANCE_ARCHIVE_PATH, it) }
                 ?: remove(KEY_DB_MAINTENANCE_ARCHIVE_PATH)
             putLong(KEY_DB_MAINTENANCE_STARTED_AT_MS, startedAt)
@@ -656,6 +658,7 @@ class CollectorSettings(
             .remove(KEY_DB_MAINTENANCE_MESSAGE_UK)
             .remove(KEY_DB_MAINTENANCE_MESSAGE_EN)
             .remove(KEY_DB_MAINTENANCE_ERROR)
+            .remove(KEY_DB_MAINTENANCE_WARNING)
             .remove(KEY_DB_MAINTENANCE_ARCHIVE_PATH)
             .remove(KEY_DB_MAINTENANCE_STARTED_AT_MS)
             .remove(KEY_DB_MAINTENANCE_UPDATED_AT_MS)
@@ -705,7 +708,8 @@ class CollectorSettings(
             KEY_STORAGE_CUTOVER_JOURNAL_FAMILY,
             KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH,
             KEY_STORAGE_CUTOVER_JOURNAL_PHASE,
-            KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT
+            KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT,
+            KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_NAMES
         )
         if (runCatching { journalKeys.none(prefs::contains) }.getOrDefault(false)) return null
         fun journalString(key: String): String? = runCatching { prefs.getString(key, null) }.getOrNull()
@@ -718,7 +722,15 @@ class CollectorSettings(
             family = family,
             archivePath = journalString(KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH),
             phase = phase,
-            sourceFormat = sourceFormat
+            sourceFormat = sourceFormat,
+            manual = runCatching { prefs.getBoolean(KEY_STORAGE_CUTOVER_JOURNAL_MANUAL, false) }
+                .getOrDefault(false),
+            sourceNames = runCatching {
+                prefs.getStringSet(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_NAMES, emptySet())
+                    .orEmpty()
+                    .filter(String::isNotBlank)
+                    .toSet()
+            }.getOrDefault(emptySet())
         )
     }
 
@@ -727,6 +739,8 @@ class CollectorSettings(
             putString(KEY_STORAGE_CUTOVER_JOURNAL_FAMILY, journal.family)
             putString(KEY_STORAGE_CUTOVER_JOURNAL_PHASE, journal.phase)
             putString(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT, journal.sourceFormat.name)
+            putBoolean(KEY_STORAGE_CUTOVER_JOURNAL_MANUAL, journal.manual)
+            putStringSet(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_NAMES, journal.sourceNames.toSet())
             journal.archivePath?.let { putString(KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH, it) }
                 ?: remove(KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH)
         }.commit()
@@ -737,6 +751,8 @@ class CollectorSettings(
             .remove(KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH)
             .remove(KEY_STORAGE_CUTOVER_JOURNAL_PHASE)
             .remove(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT)
+            .remove(KEY_STORAGE_CUTOVER_JOURNAL_MANUAL)
+            .remove(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_NAMES)
             .commit()
 
     fun isCutoverArchiveStoragePending(): Boolean =
@@ -1088,6 +1104,7 @@ class CollectorSettings(
         const val KEY_DB_MAINTENANCE_MESSAGE_UK = "dbMaintenanceMessageUk"
         const val KEY_DB_MAINTENANCE_MESSAGE_EN = "dbMaintenanceMessageEn"
         const val KEY_DB_MAINTENANCE_ERROR = "dbMaintenanceError"
+        const val KEY_DB_MAINTENANCE_WARNING = "dbMaintenanceWarning"
         const val KEY_DB_MAINTENANCE_ARCHIVE_PATH = "dbMaintenanceArchivePath"
         const val KEY_DB_MAINTENANCE_STARTED_AT_MS = "dbMaintenanceStartedAtMs"
         const val KEY_DB_MAINTENANCE_UPDATED_AT_MS = "dbMaintenanceUpdatedAtMs"
@@ -1099,6 +1116,8 @@ class CollectorSettings(
         const val KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH = "storageCutoverJournalArchivePath"
         const val KEY_STORAGE_CUTOVER_JOURNAL_PHASE = "storageCutoverJournalPhase"
         const val KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT = "storageCutoverJournalSourceFormat"
+        const val KEY_STORAGE_CUTOVER_JOURNAL_MANUAL = "storageCutoverJournalManual"
+        const val KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_NAMES = "storageCutoverJournalSourceNames"
         const val KEY_STORAGE_CUTOVER_ARCHIVE_PENDING = "storageCutoverArchivePending"
         const val DB_MAINTENANCE_RECOVERY_GRACE_MS = 15_000L
         const val DEFAULT_ARCHIVE_STORAGE_LIMIT_GB = 2
@@ -1106,7 +1125,7 @@ class CollectorSettings(
         const val MAX_ARCHIVE_STORAGE_LIMIT_GB = 10
         const val DEFAULT_MQTT_PORT = 1883
         const val DEFAULT_TELEGRAM_CHARGE_STEP = 5
-        const val DEFAULT_TELEGRAM_NAVIGATOR_MASK = TelegramNavigatorMask.ALL
+        const val DEFAULT_TELEGRAM_NAVIGATOR_MASK = TelegramNavigatorMask.NONE
         const val DEFAULT_UI_LANGUAGE_CODE = "uk"
         const val MIN_TELEGRAM_CHARGE_STEP = 1
         const val MAX_TELEGRAM_CHARGE_STEP = 99

@@ -9,6 +9,35 @@ import kotlin.test.assertTrue
 
 class StorageCutoverRecoveryTest {
     @Test
+    fun automaticUnknownJournalFailsClosedButManualArchiveCanFinishWithWarning() {
+        val base = StorageCutoverRecovery.Snapshot(
+            phase = StorageCutoverRecovery.PHASE_VERIFYING,
+            sourceFormat = StorageFormat.UNKNOWN,
+            activeFormat = StorageFormat.COMPACT_V2,
+            activeDatabaseExists = true,
+            activeQuickCheck = true,
+            archivedDatabasePresent = true,
+            archivedFormat = StorageFormat.UNKNOWN,
+            archivedQuickCheck = false,
+            archivedSidecarNames = setOf("debug.db"),
+            expectedSidecarNames = setOf("debug.db", "debug.db-wal", "debug.db-shm", "debug.db-journal"),
+            unknownArchiveFiles = false,
+            activeDatabaseName = "debug.db"
+        )
+        assertEquals(StorageCutoverRecovery.Action.FAIL_CLOSED, StorageCutoverRecovery.decide(base))
+        assertEquals(
+            StorageCutoverRecovery.Action.COMPLETE_FORWARD,
+            StorageCutoverRecovery.decide(
+                base.copy(
+                    manual = true,
+                    expectedSidecarNames = setOf("debug.db"),
+                    activeSidecarNames = setOf("debug.db")
+                )
+            )
+        )
+    }
+
+    @Test
     fun restoresPowerLossAfterEachMovedSidecarWithoutDeletingRemainingActiveSidecars() {
         for (movedCount in 1..4) {
             val root = createTempDirectory().toFile()
@@ -91,6 +120,80 @@ class StorageCutoverRecoveryTest {
         )
         assertTrue(pending)
         assertTrue(database.isFile)
+    }
+
+    @Test
+    fun recoversIntegrityCheckedUnknownDebugDatabaseArchive() {
+        val expectedSidecars = setOf(
+            "debug.db",
+            "debug.db-wal",
+            "debug.db-shm",
+            "debug.db-journal"
+        )
+        val intact = StorageCutoverRecovery.Snapshot(
+            phase = StorageCutoverRecovery.PHASE_ARCHIVING,
+            sourceFormat = StorageFormat.UNKNOWN,
+            activeFormat = StorageFormat.UNKNOWN,
+            activeDatabaseExists = true,
+            activeQuickCheck = true,
+            archivedDatabasePresent = false,
+            archivedFormat = StorageFormat.ABSENT,
+            archivedQuickCheck = false,
+            archivedSidecarNames = emptySet(),
+            expectedSidecarNames = expectedSidecars,
+            unknownArchiveFiles = false,
+            manual = true,
+            activeDatabaseName = "debug.db",
+            activeSidecarNames = expectedSidecars
+        )
+        val moved = intact.copy(
+            activeFormat = StorageFormat.ABSENT,
+            activeDatabaseExists = false,
+            activeQuickCheck = false,
+            archivedDatabasePresent = true,
+            archivedFormat = StorageFormat.UNKNOWN,
+            archivedQuickCheck = true,
+            archivedSidecarNames = setOf("debug.db"),
+            activeSidecarNames = expectedSidecars - "debug.db"
+        )
+        val completed = moved.copy(
+            phase = StorageCutoverRecovery.PHASE_VERIFYING,
+            activeFormat = StorageFormat.COMPACT_V2,
+            activeDatabaseExists = true,
+            activeQuickCheck = true,
+            archivedSidecarNames = expectedSidecars,
+            activeSidecarNames = setOf("debug.db")
+        )
+
+        assertEquals(StorageCutoverRecovery.Action.CLEAR_INTACT_SOURCE, StorageCutoverRecovery.decide(intact))
+        assertEquals(StorageCutoverRecovery.Action.RESTORE_ARCHIVE, StorageCutoverRecovery.decide(moved))
+        assertEquals(StorageCutoverRecovery.Action.COMPLETE_FORWARD, StorageCutoverRecovery.decide(completed))
+    }
+
+    @Test
+    fun manualRecoveryFailsClosedWhenThePersistedExactSourceSetIsMissingOrPartial() {
+        val base = StorageCutoverRecovery.Snapshot(
+            phase = StorageCutoverRecovery.PHASE_VERIFYING,
+            sourceFormat = StorageFormat.UNKNOWN,
+            activeFormat = StorageFormat.COMPACT_V2,
+            activeDatabaseExists = true,
+            activeQuickCheck = true,
+            archivedDatabasePresent = true,
+            archivedFormat = StorageFormat.UNKNOWN,
+            archivedQuickCheck = false,
+            archivedSidecarNames = setOf("debug.db"),
+            expectedSidecarNames = setOf("debug.db", "debug.db-wal"),
+            unknownArchiveFiles = false,
+            manual = true,
+            activeDatabaseName = "debug.db",
+            activeSidecarNames = setOf("debug.db")
+        )
+
+        assertEquals(StorageCutoverRecovery.Action.FAIL_CLOSED, StorageCutoverRecovery.decide(base))
+        assertEquals(
+            StorageCutoverRecovery.Action.FAIL_CLOSED,
+            StorageCutoverRecovery.decide(base.copy(expectedSidecarNames = emptySet()))
+        )
     }
 
     @Test

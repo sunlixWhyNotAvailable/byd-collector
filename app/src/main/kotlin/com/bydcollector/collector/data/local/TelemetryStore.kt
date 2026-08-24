@@ -592,8 +592,18 @@ class TelemetryStore(
         )
     }
 
-    fun markTelegramDelivered(id: Long) {
-        helper.writableDatabase.delete("telegram_outbox", "id = ?", arrayOf(id.toString()))
+    fun markTelegramDelivered(id: Long, stateJson: String?, deliveredAtMs: Long) {
+        val db = helper.writableDatabase
+        db.beginTransactionNonExclusive()
+        try {
+            check(db.delete("telegram_outbox", "id = ?", arrayOf(id.toString())) == 1) {
+                "Telegram outbox row disappeared before delivery commit"
+            }
+            stateJson?.let { saveTelegramRuntimeState(db, it, deliveredAtMs) }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
     }
 
     fun markTelegramRetry(id: Long, error: String, attemptedAtMs: Long, nextAttemptAtMs: Long) {

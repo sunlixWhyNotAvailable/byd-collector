@@ -89,6 +89,52 @@ class TelegramTemplatesTest {
     }
 
     @Test
+    fun oneStopBuiltInTripTemplatesOmitOnlyTheOverallBlock() {
+        val values = mapOf(
+            "trip_distance_km" to "12.3",
+            "trip_duration" to "00:24:18",
+            "trip_energy_kwh" to "3.4",
+            "soc_start" to "81",
+            "soc_end" to "76",
+            "total_distance_km" to "12.3",
+            "total_duration" to "00:24:18",
+            "total_energy_kwh" to "3.4"
+        )
+        assertEquals(
+            "Поїздку завершено\nПоточна поїздка: 12.3 км / 00:24:18\n" +
+                "Витрата: 3.4 кВт·год, SOC: 81% -> 76%",
+            TelegramTemplateRenderer.render(
+                TelegramEventType.TRIP_SUMMARY,
+                TelegramBuiltInTemplates.tripSummaryTemplate(TelegramTemplateLanguage.UK, includeOverall = false),
+                values
+            ).text
+        )
+        assertEquals(
+            "Trip complete\nCurrent trip: 12.3 km / 00:24:18\n" +
+                "Energy used: 3.4 kWh, SOC: 81% -> 76%",
+            TelegramTemplateRenderer.render(
+                TelegramEventType.TRIP_SUMMARY,
+                TelegramBuiltInTemplates.tripSummaryTemplate(TelegramTemplateLanguage.EN, includeOverall = false),
+                values
+            ).text
+        )
+    }
+
+    @Test
+    fun dynamicRenderingLeavesCustomTripTemplateExact() {
+        val custom = "Custom\r\n{trip_distance_km}  {total_distance_km}"
+        assertEquals(
+            custom,
+            TelegramTemplateCatalog.templateForRendering(
+                TelegramEventType.TRIP_SUMMARY,
+                custom,
+                TelegramTemplateLanguage.EN,
+                omitOverall = true
+            )
+        )
+    }
+
+    @Test
     fun customTemplateRemainsByteForByteUnchangedDuringMigration() {
         val custom = "Custom\r\n{trip_distance_km}  \n"
 

@@ -1,5 +1,6 @@
 package com.bydcollector.collector.direct;
 
+import android.annotation.SuppressLint;
 import android.os.Binder;
 import android.content.Context;
 import android.os.Handler;
@@ -1030,6 +1031,7 @@ public final class CollectorHelperDaemon {
         private final Method getIntArray;
         private final Method getDoubleArray;
 
+        @SuppressLint("WrongConstant")
         static NativeArrayReader create() {
             try {
                 Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");

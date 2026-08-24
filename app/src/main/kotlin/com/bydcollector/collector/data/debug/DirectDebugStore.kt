@@ -3,7 +3,6 @@ package com.bydcollector.collector.data.debug
 import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
-import android.util.Log
 import com.bydcollector.collector.data.direct.DirectBatchDiagnostics
 import com.bydcollector.collector.data.direct.DirectHelperReadResult
 import com.bydcollector.collector.data.local.Clock
@@ -263,16 +262,6 @@ class DirectDebugStore(
         )
     }
 
-    fun checkpointForArchive() {
-        runCatching {
-            helper.writableDatabase.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", emptyArray()).use { cursor ->
-                while (cursor.moveToNext()) Unit
-            }
-        }.onFailure { error ->
-            Log.w(TAG, "debug database WAL checkpoint failed before archive", error)
-        }
-    }
-
     fun verifyWritableDatabase(): Boolean {
         helper.writableDatabase.rawQuery("PRAGMA quick_check", emptyArray()).use { cursor ->
             return cursor.moveToFirst() && cursor.getString(0) == "ok"
@@ -522,7 +511,6 @@ class DirectDebugStore(
     }
 
     companion object {
-        private const val TAG = "BYDCollectorDebugStore"
         private const val UNKNOWN_READING_COUNT = -1L
     }
 }

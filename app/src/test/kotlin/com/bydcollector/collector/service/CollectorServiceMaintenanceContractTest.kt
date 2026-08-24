@@ -184,7 +184,7 @@ class CollectorServiceMaintenanceContractTest {
         val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
         val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
 
-        assertTrue(activity.contains("if (!CollectorService.isMaintenanceRunningInProcess())"))
+        assertTrue(activity.contains("!CollectorService.isMaintenanceRunningInProcess() && !DatabaseMaintenanceService.isRunning()"))
         assertTrue(activity.contains("settings.recoverInterruptedDbMaintenanceIfNeeded(\"activity_start\")"))
         assertTrue(service.contains("private val maintenanceRunningInProcess = AtomicBoolean(false)"))
         assertTrue(service.contains("fun isMaintenanceRunningInProcess(): Boolean = maintenanceRunningInProcess.get()"))
@@ -294,7 +294,7 @@ class CollectorServiceMaintenanceContractTest {
         assertFalse(debugBranch.contains("mqttCoordinator"))
         assertFalse(debugBranch.contains("resetInfluxExecutorForMaintenance"))
         assertTrue(coordinator.contains("private fun archiveDebug(operation: DbMaintenanceOperation)"))
-        assertTrue(coordinator.contains("debugStore.checkpointForArchive()"))
+        assertTrue(coordinator.contains("StorageFormatCutoverCoordinator.checkpointDatabase(databaseFile)"))
         assertTrue(coordinator.contains("check(newStore.verifyWritableDatabase())"))
         assertTrue(service.contains("snapshot.debugRunning &&"))
         assertTrue(service.contains("maintenanceBlocksRuntimeStart(debugRuntime = true)"))
@@ -305,7 +305,7 @@ class CollectorServiceMaintenanceContractTest {
         assertInOrder(
             "$run\n$archiveDebug",
             "stopRuntime(operation)",
-            "debugStore.checkpointForArchive()",
+            "StorageFormatCutoverCoordinator.checkpointDatabase(databaseFile)",
             "closeDebugStore()",
             "val archive = DatabaseArchiveManager.archive(",
             "val newStore = reopenDebugAndRebind()",
@@ -322,12 +322,44 @@ class CollectorServiceMaintenanceContractTest {
         assertInOrder(
             "$run\n$archiveMain",
             "stopRuntime(operation)",
-            "store.checkpointForArchive()",
+            "StorageFormatCutoverCoordinator.checkpointDatabase(databaseFile)",
             "application.closeTelemetryStoreForMaintenance()",
+            "val sourceNames = sourceNames(databaseFile)",
             "val archive = DatabaseArchiveManager.archive(",
             "val newStore = application.reopenTelemetryStoreForMaintenance()",
             "check(newStore.verifyWritableDatabase())"
         )
+    }
+
+    @Test
+    fun unusableDatabaseCanReachManualRecoveryWithoutCollectorStoreBootstrap() {
+        val controller = sourceFile("com/bydcollector/collector/service/CollectorServiceController.kt").readText()
+        val recoveryService = sourceFile("com/bydcollector/collector/service/DatabaseMaintenanceService.kt").readText()
+        val application = sourceFile("com/bydcollector/collector/BydCollectorApplication.kt").readText()
+        val manifest = listOf(
+            File("src/main/AndroidManifest.xml"),
+            File("app/src/main/AndroidManifest.xml")
+        ).first(File::isFile).readText()
+
+        assertTrue(controller.contains("if (CollectorService.isRunning())"))
+        assertTrue(controller.contains("DatabaseMaintenanceService.archiveIntent"))
+        assertTrue(controller.contains("DbMaintenanceOperation.ARCHIVE"))
+        assertTrue(controller.contains("DbMaintenanceOperation.DEBUG_ARCHIVE"))
+        assertFalse(recoveryService.contains("BydCollectorApplication.store("))
+        assertFalse(recoveryService.contains("DirectDebugStore(applicationContext"))
+        val stopRuntime = recoveryService.substringAfter("private fun stopCollectorRuntime")
+            .substringBefore("private fun closeReopenedDebugStore")
+        assertInOrder(
+            stopRuntime,
+            "stopService(Intent(applicationContext, CollectorService::class.java))",
+            "check(!CollectorService.isRunning())"
+        )
+        assertTrue(recoveryService.contains("val result = coordinator.run(operation)"))
+        assertTrue(recoveryService.contains("settings.setCutoverArchiveStoragePending(true)"))
+        assertTrue(recoveryService.contains("CollectorServiceController.start(applicationContext)"))
+        assertTrue(application.contains("check(coordinator().ensureMainReady())"))
+        assertTrue(manifest.contains("com.bydcollector.collector.service.DatabaseMaintenanceService"))
+        assertTrue(manifest.contains("android:foregroundServiceType=\"dataSync\""))
     }
 
     @Test
@@ -372,9 +404,9 @@ class CollectorServiceMaintenanceContractTest {
         val rollbackDebug = source.substringAfter("private fun rollbackDebug").substringBefore("private fun reopenDebugAndVerifyRestored")
         val exactDelete = source.substringAfter("private fun deleteExactNewDatabaseSet").substringBefore("private fun checkCancelled")
 
-        assertInOrder(archiveMain, "val newStore = application.reopenTelemetryStoreForMaintenance()", "check(newStore.verifyWritableDatabase())", "rollbackMain(databaseFile, archive, createFailure)")
+        assertInOrder(archiveMain, "val newStore = application.reopenTelemetryStoreForMaintenance()", "check(newStore.verifyWritableDatabase())", "rollbackMain(databaseFile, archive, createFailure, manual = true)")
         assertInOrder(rollbackMain, "application.closeTelemetryStoreForMaintenance()", "markRollbackPhase()", "deleteExactNewDatabaseSet(databaseFile)", "DatabaseArchiveManager.restore(databaseFile, archive.movedFiles)", "reopenMainAndVerifyRestored(databaseFile)")
-        assertInOrder(archiveDebug, "val newStore = reopenDebugAndRebind()", "check(newStore.verifyWritableDatabase())", "rollbackDebug(databaseFile, archive, createFailure)")
+        assertInOrder(archiveDebug, "val newStore = reopenDebugAndRebind()", "check(newStore.verifyWritableDatabase())", "rollbackDebug(databaseFile, archive, createFailure, manual = true)")
         assertInOrder(rollbackDebug, "closeDebugStore()", "markRollbackPhase()", "deleteExactNewDatabaseSet(databaseFile)", "DatabaseArchiveManager.restore(databaseFile, archive.movedFiles)", "reopenDebugAndVerifyRestored(databaseFile)")
         assertFalse(rollbackMain.contains("runCatching { markRollbackPhase() }"))
         assertFalse(rollbackDebug.contains("runCatching { markRollbackPhase() }"))
@@ -394,6 +426,21 @@ class CollectorServiceMaintenanceContractTest {
 
         assertInOrder(archiveMain, "check(settings.storageCutoverJournal() == null)", "application.closeTelemetryStoreForMaintenance()", "settings.setStorageCutoverJournal(")
         assertInOrder(archiveDebug, "check(settings.storageCutoverJournal() == null)", "closeDebugStore()", "settings.setStorageCutoverJournal(")
+    }
+
+    @Test
+    fun manualDebugArchiveAcceptsAnIntegrityCheckedUnknownSchemaForRecovery() {
+        val source = sourceFile("com/bydcollector/collector/maintenance/DbMaintenanceCoordinator.kt").readText()
+        val archiveDebug = source.substringAfter("private fun archiveDebug").substringBefore("private fun rollbackDebug")
+        val reopenDebug = source.substringAfter("private fun reopenDebugAndVerifyRestored")
+            .substringBefore("private fun reopenDebugAndRebind")
+
+        assertTrue(archiveDebug.contains("check(sourceFormat != StorageFormat.ABSENT)"))
+        assertTrue(archiveDebug.contains("val quickCheck = runCatching { verifyWritableDatabaseFile(databaseFile) }.getOrDefault(false)"))
+        assertTrue(archiveDebug.contains("warnings += inspectionWarning(\"quick_check\")"))
+        assertFalse(archiveDebug.contains("sourceFormat in setOf(StorageFormat.LEGACY_V1, StorageFormat.COMPACT_V2)"))
+        assertTrue(reopenDebug.contains("format == StorageFormat.ABSENT || !verifyWritableDatabaseFile(databaseFile)"))
+        assertFalse(reopenDebug.contains("Restored debug database format is not recognized"))
     }
 
     @Test

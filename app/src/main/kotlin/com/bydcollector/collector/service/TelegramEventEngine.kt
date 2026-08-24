@@ -20,7 +20,7 @@ data class TelegramEventConfig(
     val tripEndDelayMs: Long,
     val sendLocation: Boolean = false,
     val language: TelegramTemplateLanguage = TelegramTemplateLanguage.UK,
-    val navigatorMask: Int = TelegramNavigatorMask.ALL
+    val navigatorMask: Int = TelegramNavigatorMask.NONE
 )
 
 data class TelegramLocationSnapshot(
@@ -44,7 +44,9 @@ data class TelegramDetectedEvent(
     val type: TelegramEventType,
     val dedupeKey: String,
     val variables: Map<String, String>,
-    val textSuffix: String? = null
+    val textSuffix: String? = null,
+    val omitOverall: Boolean = false,
+    val locationOnly: Boolean = false
 )
 
 data class TelegramEventResult(
@@ -95,6 +97,8 @@ data class TelegramEventState(
     val tripEndSoc: Double? = null,
     val tripEndEnergyKwh: Double? = null,
     val tripAccumulatedEnergyKwh: Double? = null,
+    val pendingPowerOffLocationTripId: String? = null,
+    val pendingPowerOffLocationSummaryDelivered: Boolean = false,
     val bootTotalDistanceKm: Double = 0.0,
     val bootTotalEnergyKwh: Double = 0.0,
     val bootTotalDurationMs: Long = 0L,
@@ -104,6 +108,7 @@ data class TelegramEventState(
     fun hasDeferredStorageWork(): Boolean {
         return tripId != null ||
             tripParkedSinceMs != null ||
+            pendingPowerOffLocationTripId != null ||
             chargingSessionId != null ||
             chargingActive == true ||
             chargingLowPowerSinceMs != null ||
@@ -162,6 +167,8 @@ data class TelegramEventState(
         putNullable("tripEndSoc", tripEndSoc)
         putNullable("tripEndEnergyKwh", tripEndEnergyKwh)
         putNullable("tripAccumulatedEnergyKwh", tripAccumulatedEnergyKwh)
+        putNullable("pendingPowerOffLocationTripId", pendingPowerOffLocationTripId)
+        put("pendingPowerOffLocationSummaryDelivered", pendingPowerOffLocationSummaryDelivered)
         put("bootTotalDistanceKm", bootTotalDistanceKm)
         put("bootTotalEnergyKwh", bootTotalEnergyKwh)
         put("bootTotalDurationMs", bootTotalDurationMs)
@@ -222,6 +229,9 @@ data class TelegramEventState(
                     tripEndEnergyKwh = json.optDoubleOrNull("tripEndEnergyKwh"),
                     tripAccumulatedEnergyKwh = json.optDoubleOrNull("tripAccumulatedEnergyKwh")
                         ?.takeIf { it.isFinite() && it >= 0.0 },
+                    pendingPowerOffLocationTripId = json.optStringOrNull("pendingPowerOffLocationTripId"),
+                    pendingPowerOffLocationSummaryDelivered =
+                        json.optBoolean("pendingPowerOffLocationSummaryDelivered", false),
                     bootTotalDistanceKm = json.optDoubleOrNull("bootTotalDistanceKm")
                         ?.takeIf { it.isFinite() && it >= 0.0 } ?: 0.0,
                     bootTotalEnergyKwh = json.optDoubleOrNull("bootTotalEnergyKwh")
@@ -251,6 +261,17 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
 
     fun reset(): TelegramEventState {
         state = TelegramEventState()
+        return state
+    }
+
+    /** Persists proof only after the matching delayed-P summary leaves the durable outbox. */
+    fun markTripSummaryDelivered(dedupeKey: String, nowMs: Long): TelegramEventState? {
+        val tripId = state.pendingPowerOffLocationTripId ?: return null
+        if (dedupeKey != "$tripId:summary" || state.pendingPowerOffLocationSummaryDelivered) return null
+        state = state.copy(
+            pendingPowerOffLocationSummaryDelivered = true,
+            lastPersistedAtMs = nowMs
+        )
         return state
     }
 
@@ -395,6 +416,32 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         val counterResetObserved = observeTripEnergyCounter(snapshot.tripEnergyKwh)
         val tripId = state.tripId
         if (tripId == null) {
+            val pendingLocationTripId = state.pendingPowerOffLocationTripId
+            val locationLinks = pendingLocationTripId
+                ?.takeIf { state.pendingPowerOffLocationSummaryDelivered }
+                ?.takeIf { TelegramEventType.TRIP_SUMMARY in config.enabledEvents }
+                ?.takeIf { config.sendLocation }
+                ?.takeIf { TelegramNavigatorMask.sanitize(config.navigatorMask) != TelegramNavigatorMask.NONE }
+                ?.let { location?.takeIf(::isActualLocation) }
+                ?.let { formatLocationOnly(it, config.navigatorMask) }
+                ?.takeIf(String::isNotEmpty)
+            if (pendingLocationTripId != null) {
+                if (locationLinks != null) {
+                    addIfEnabled(
+                        events,
+                        config,
+                        TelegramEventType.TRIP_SUMMARY,
+                        "$pendingLocationTripId:location",
+                        emptyMap(),
+                        textSuffix = locationLinks,
+                        locationOnly = true
+                    )
+                }
+                state = state.copy(
+                    pendingPowerOffLocationTripId = null,
+                    pendingPowerOffLocationSummaryDelivered = false
+                )
+            }
             clearPowerSessionTotals()
             return persistedResult(
                 events,
@@ -437,9 +484,19 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
                     "total_duration" to formatDuration(totalDurationMs),
                     "time" to formatTime(nowMs)
                 ),
-                textSuffix = location.takeIf { config.sendLocation }
+                textSuffix = location
+                    ?.takeIf(::isActualLocation)
+                    ?.takeIf { config.sendLocation }
                     ?.let { formatLocation(it, config.navigatorMask) }
-                    ?.takeIf(String::isNotEmpty)
+                    ?.takeIf(String::isNotEmpty),
+                omitOverall = displayedTripTotalsMatch(
+                    distance = distance,
+                    energy = energy,
+                    durationMs = durationMs,
+                    totalDistance = totalDistance,
+                    totalEnergy = totalEnergy,
+                    totalDurationMs = totalDurationMs
+                )
             )
         }
         clearTrip()
@@ -775,8 +832,22 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
                     "total_energy_kwh" to formatNumber(totalEnergy),
                     "total_duration" to formatDuration(totalDurationMs),
                     "time" to formatTime(parkedSince)
+                ),
+                omitOverall = displayedTripTotalsMatch(
+                    distance = distance,
+                    energy = energy,
+                    durationMs = durationMs,
+                    totalDistance = totalDistance,
+                    totalEnergy = totalEnergy,
+                    totalDurationMs = totalDurationMs
                 )
             )
+            if (TelegramEventType.TRIP_SUMMARY in config.enabledEvents) {
+                state = state.copy(
+                    pendingPowerOffLocationTripId = tripId,
+                    pendingPowerOffLocationSummaryDelivered = false
+                )
+            }
         }
         clearTrip()
     }
@@ -848,6 +919,8 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
             tripEndOdometerKm = null,
             tripEndSoc = null,
             tripEndEnergyKwh = null,
+            pendingPowerOffLocationTripId = null,
+            pendingPowerOffLocationSummaryDelivered = false,
             tripAccumulatedEnergyKwh = startEnergy?.let { 0.0 },
             lastTripEnergyCounterKwh = startEnergy ?: state.lastTripEnergyCounterKwh
         )
@@ -941,9 +1014,20 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         type: TelegramEventType,
         dedupeKey: String,
         variables: Map<String, String>,
-        textSuffix: String? = null
+        textSuffix: String? = null,
+        omitOverall: Boolean = false,
+        locationOnly: Boolean = false
     ) {
-        if (type in config.enabledEvents) events += TelegramDetectedEvent(type, dedupeKey, variables, textSuffix)
+        if (type in config.enabledEvents) {
+            events += TelegramDetectedEvent(
+                type = type,
+                dedupeKey = dedupeKey,
+                variables = variables,
+                textSuffix = textSuffix,
+                omitOverall = omitOverall,
+                locationOnly = locationOnly
+            )
+        }
     }
 
     private fun persistedResult(
@@ -1067,18 +1151,56 @@ private fun formatTime(timeMs: Long): String {
     return java.text.SimpleDateFormat("dd.MM.yyyy HH:mm", java.util.Locale.getDefault()).format(java.util.Date(timeMs))
 }
 
+private fun displayedTripTotalsMatch(
+    distance: Double?,
+    energy: Double?,
+    durationMs: Long,
+    totalDistance: Double,
+    totalEnergy: Double,
+    totalDurationMs: Long
+): Boolean {
+    return formatNumber(distance) == formatNumber(totalDistance) &&
+        formatNumber(energy) == formatNumber(totalEnergy) &&
+        formatDuration(durationMs) == formatDuration(totalDurationMs)
+}
+
+private fun isActualLocation(location: TelegramLocationSnapshot): Boolean {
+    return location.latitude.isFinite() && location.longitude.isFinite() &&
+        location.latitude in -90.0..90.0 && location.longitude in -180.0..180.0 &&
+        location.ageSeconds >= 0L
+}
+
 private fun formatLocation(
     location: TelegramLocationSnapshot,
     navigatorMask: Int
 ): String {
-    val links = buildList {
-        val mask = TelegramNavigatorMask.sanitize(navigatorMask)
-        if (mask and TelegramNavigatorMask.GOOGLE != 0) add("Google: ${location.googleUrl}")
-        if (mask and TelegramNavigatorMask.WAZE != 0) add("Waze: ${location.wazeUrl}")
-        if (mask and TelegramNavigatorMask.APPLE != 0) add("Apple: ${location.appleUrl}")
-        if (mask and TelegramNavigatorMask.OSM != 0) add("OSM: ${location.osmUrl}")
-    }
-    return links.takeIf { it.isNotEmpty() }
+    return selectedLocationLinks(location, navigatorMask).takeIf { it.isNotEmpty() }
         ?.joinToString(separator = "\n", prefix = "\n")
         .orEmpty()
+}
+
+private fun formatLocationOnly(
+    location: TelegramLocationSnapshot,
+    navigatorMask: Int
+): String = selectedLocationLinks(location, navigatorMask).joinToString("\n")
+
+private fun selectedLocationLinks(
+    location: TelegramLocationSnapshot,
+    navigatorMask: Int
+): List<String> {
+    val mask = TelegramNavigatorMask.sanitize(navigatorMask)
+    return buildList {
+        if (mask and TelegramNavigatorMask.GOOGLE != 0 && location.googleUrl.isNotBlank()) {
+            add("Google: ${location.googleUrl}")
+        }
+        if (mask and TelegramNavigatorMask.WAZE != 0 && location.wazeUrl.isNotBlank()) {
+            add("Waze: ${location.wazeUrl}")
+        }
+        if (mask and TelegramNavigatorMask.APPLE != 0 && location.appleUrl.isNotBlank()) {
+            add("Apple: ${location.appleUrl}")
+        }
+        if (mask and TelegramNavigatorMask.OSM != 0 && location.osmUrl.isNotBlank()) {
+            add("OSM: ${location.osmUrl}")
+        }
+    }
 }

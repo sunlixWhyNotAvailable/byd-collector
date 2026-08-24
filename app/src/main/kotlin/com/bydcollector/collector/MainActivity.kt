@@ -1,6 +1,7 @@
 package com.bydcollector.collector
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.Intent
@@ -41,6 +42,7 @@ import com.bydcollector.collector.mqtt.MqttActionResult
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorServiceController
 import com.bydcollector.collector.service.CollectorSettings
+import com.bydcollector.collector.service.DatabaseMaintenanceService
 import com.bydcollector.collector.system.CollectorAutoStart
 import com.bydcollector.collector.ui.DashboardState
 import com.bydcollector.collector.ui.DashboardLoadProfile
@@ -541,7 +543,7 @@ class MainActivity : ComponentActivity() {
         uiLanguage = UiLanguage.fromCode(settings.uiLanguageCode())
         settingsPreferences = getSharedPreferences(CollectorSettings.PREFS_NAME, MODE_PRIVATE)
         settingsPreferences.registerOnSharedPreferenceChangeListener(settingsChangeListener)
-        if (!CollectorService.isMaintenanceRunningInProcess()) {
+        if (!CollectorService.isMaintenanceRunningInProcess() && !DatabaseMaintenanceService.isRunning()) {
             settings.recoverInterruptedDbMaintenanceIfNeeded("activity_start")
         }
         val clearedUserShutdown = settings.clearUserShutdownRequestIfSet()
@@ -679,6 +681,7 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
+    @SuppressLint("MissingSuperCall")
     @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
     override fun onBackPressed() {
         moveTaskToBack(true)
@@ -921,11 +924,11 @@ class MainActivity : ComponentActivity() {
                     }
                     .onFailure { error ->
                         recordDashboardRefreshFailure("maintenance_preflight", error)
-                        Toast.makeText(
-                            this@MainActivity,
-                            strings(uiLanguage).archivePreflightFailed,
-                            Toast.LENGTH_LONG
-                        ).show()
+                        pendingMainArchivePreflight = MainArchivePreflight(
+                            warning = "${strings(uiLanguage).archivePreflightFailed}: ${dashboardErrorDetail(error)}"
+                        )
+                        pendingMaintenanceOperation = DbMaintenanceOperation.ARCHIVE
+                        refresh()
                     }
             }
         }
@@ -1783,6 +1786,7 @@ class MainActivity : ComponentActivity() {
                 messageUk = runtime.messageUk,
                 messageEn = runtime.messageEn,
                 error = runtime.error,
+                warning = runtime.warning,
                 archivePath = runtime.archivePath,
                 cancelAvailable = runtime.cancelAvailable
             )

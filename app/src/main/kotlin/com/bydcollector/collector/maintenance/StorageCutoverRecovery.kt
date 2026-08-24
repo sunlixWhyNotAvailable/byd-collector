@@ -31,20 +31,24 @@ internal object StorageCutoverRecovery {
         val archivedQuickCheck: Boolean,
         val archivedSidecarNames: Set<String>,
         val expectedSidecarNames: Set<String>,
-        val unknownArchiveFiles: Boolean
+        val unknownArchiveFiles: Boolean,
+        val manual: Boolean = false,
+        val activeDatabaseName: String = "",
+        val activeSidecarNames: Set<String> = emptySet()
     )
 
     fun decide(snapshot: Snapshot): Action {
         if (snapshot.phase !in setOf(PHASE_ARCHIVING, PHASE_CREATING, PHASE_VERIFYING, PHASE_ROLLBACK)) {
             return Action.FAIL_CLOSED
         }
-        if (snapshot.phase == PHASE_ROLLBACK ||
-            snapshot.sourceFormat !in setOf(StorageFormat.LEGACY_V1, StorageFormat.COMPACT_V2) ||
-            snapshot.unknownArchiveFiles ||
-            snapshot.archivedSidecarNames.any { it !in snapshot.expectedSidecarNames }
-        ) {
+        if (snapshot.phase == PHASE_ROLLBACK || snapshot.sourceFormat == StorageFormat.ABSENT) {
             return Action.FAIL_CLOSED
         }
+        if (snapshot.manual) return decideManual(snapshot)
+        if (snapshot.sourceFormat == StorageFormat.UNKNOWN ||
+            snapshot.unknownArchiveFiles ||
+            snapshot.archivedSidecarNames.any { it !in snapshot.expectedSidecarNames }
+        ) return Action.FAIL_CLOSED
 
         if (snapshot.activeFormat == snapshot.sourceFormat &&
             snapshot.activeQuickCheck &&
@@ -75,6 +79,41 @@ internal object StorageCutoverRecovery {
         return Action.FAIL_CLOSED
     }
 
+    private fun decideManual(snapshot: Snapshot): Action {
+        val databaseName = databaseName(snapshot)
+        val expected = snapshot.expectedSidecarNames
+        val active = snapshot.activeSidecarNames
+        val archived = snapshot.archivedSidecarNames
+        if (databaseName.isBlank() || databaseName !in expected || expected.isEmpty() ||
+            snapshot.unknownArchiveFiles || archived.any { it !in expected }
+        ) return Action.FAIL_CLOSED
+
+        if (archived.isEmpty() && active == expected && snapshot.activeDatabaseExists) {
+            return Action.CLEAR_INTACT_SOURCE
+        }
+        if (archived == expected &&
+            snapshot.activeFormat == StorageFormat.COMPACT_V2 &&
+            snapshot.activeQuickCheck
+        ) {
+            return Action.COMPLETE_FORWARD
+        }
+        if (snapshot.phase == PHASE_ARCHIVING &&
+            archived.isNotEmpty() &&
+            active.intersect(archived).isEmpty() &&
+            active + archived == expected
+        ) {
+            return Action.RESTORE_ARCHIVE
+        }
+        if (snapshot.phase in setOf(PHASE_CREATING, PHASE_VERIFYING) && archived == expected) {
+            return Action.RESTORE_ARCHIVE
+        }
+        return Action.FAIL_CLOSED
+    }
+
+    private fun databaseName(snapshot: Snapshot): String = snapshot.activeDatabaseName.ifBlank {
+        snapshot.expectedSidecarNames.firstOrNull { it.endsWith(".db") }.orEmpty()
+    }
+
     /** Executes only the already-approved action; every mutation is injected for tests. */
     fun execute(
         action: Action,
@@ -100,7 +139,7 @@ internal object StorageCutoverRecovery {
                 }
 
                 Action.RESTORE_ARCHIVE -> {
-                    if (databaseFile.exists() && !deleteActive(databaseFile)) false
+                    if (!deleteActive(databaseFile)) false
                     else if (!restore(databaseFile, movedFiles)) false
                     else if (!verifyActive()) false
                     else clearJournal().also { if (it) cleanupArchive() }
