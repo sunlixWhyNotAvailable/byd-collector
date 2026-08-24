@@ -164,6 +164,40 @@ class CollectorSettingsSecurityContractTest {
     }
 
     @Test
+    fun chargedTo100MigrationRunsAfterGeneralMarkerAndIsIdempotent() {
+        val key = "${CollectorSettings.KEY_TELEGRAM_TEMPLATE_PREFIX}${TelegramEventType.CHARGED_TO_100.key}"
+        val old = "Vehicle charged to 100%\nEnergy: {remaining_energy_kwh} kWh\nRange: {range_km} km"
+        val prefs = InMemorySharedPreferences(
+            mapOf(
+                key to old,
+                CollectorSettings.KEY_TELEGRAM_BUILTIN_DEFAULTS_MIGRATION_DONE to true
+            )
+        )
+
+        CollectorSettings.migrateTelegramBuiltInTemplates(prefs)
+
+        assertFalse(prefs.contains(key))
+        assertTrue(prefs.getBoolean(CollectorSettings.KEY_TELEGRAM_CHARGED_TO_100_MIGRATION_DONE, false))
+        assertTrue(prefs.getBoolean(CollectorSettings.KEY_TELEGRAM_BUILTIN_DEFAULTS_MIGRATION_DONE, false))
+        assertEquals(1, prefs.commitCount)
+
+        CollectorSettings.migrateTelegramBuiltInTemplates(prefs)
+        assertEquals(1, prefs.commitCount)
+    }
+
+    @Test
+    fun chargedTo100MigrationLeavesCustomTextByteExact() {
+        val key = "${CollectorSettings.KEY_TELEGRAM_TEMPLATE_PREFIX}${TelegramEventType.CHARGED_TO_100.key}"
+        val custom = "Vehicle charged to 100%\nEnergy: custom\nRange: custom"
+        val prefs = InMemorySharedPreferences(mapOf(key to custom))
+
+        CollectorSettings.migrateTelegramBuiltInTemplates(prefs)
+
+        assertEquals(custom, prefs.getString(key, null))
+        assertTrue(prefs.getBoolean(CollectorSettings.KEY_TELEGRAM_CHARGED_TO_100_MIGRATION_DONE, false))
+    }
+
+    @Test
     fun languageNavigatorAndTemplateResetApisArePersistedBySettingsFacade() {
         val source = sourceFile("com/bydcollector/collector/service/CollectorSettings.kt").readText()
         val init = source.substringAfter("init {").substringBefore("}")

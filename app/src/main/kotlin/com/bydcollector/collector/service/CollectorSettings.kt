@@ -6,6 +6,7 @@ import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.telegram.TelegramBuiltInTemplates
 import com.bydcollector.collector.telegram.TelegramEventType
 import com.bydcollector.collector.telegram.TelegramNavigatorMask
+import com.bydcollector.collector.telegram.TelegramTemplateLanguage
 import com.bydcollector.collector.ha.HaIntegrationCategories
 import com.bydcollector.collector.influx.InfluxConfig
 import com.bydcollector.collector.keepalive.KeepAliveConfig
@@ -416,7 +417,13 @@ class CollectorSettings(
     }
 
     fun telegramTemplate(eventKey: String): String? {
-        return prefs.getString("$KEY_TELEGRAM_TEMPLATE_PREFIX$eventKey", null)
+        val saved = prefs.getString("$KEY_TELEGRAM_TEMPLATE_PREFIX$eventKey", null) ?: return null
+        val event = TelegramEventType.fromKey(eventKey) ?: return saved
+        if (!TelegramBuiltInTemplates.isKnownBuiltIn(event, saved)) return saved
+        return TelegramBuiltInTemplates.defaultTemplate(
+            event,
+            if (uiLanguageCode() == "en") TelegramTemplateLanguage.EN else TelegramTemplateLanguage.UK
+        )
     }
 
     fun setTelegramTemplate(eventKey: String, template: String) {
@@ -995,6 +1002,17 @@ class CollectorSettings(
                 changed = true
             }
 
+            if (!prefs.getBoolean(KEY_TELEGRAM_CHARGED_TO_100_MIGRATION_DONE, false)) {
+                val chargedKey = "$KEY_TELEGRAM_TEMPLATE_PREFIX${TelegramEventType.CHARGED_TO_100.key}"
+                val saved = runCatching { prefs.getString(chargedKey, null) }.getOrNull()
+                if (saved != null && TelegramBuiltInTemplates.isHistoricBuiltIn(TelegramEventType.CHARGED_TO_100, saved)) {
+                    editor.remove(chargedKey)
+                    changed = true
+                }
+                editor.putBoolean(KEY_TELEGRAM_CHARGED_TO_100_MIGRATION_DONE, true)
+                changed = true
+            }
+
             if (!prefs.getBoolean(KEY_TELEGRAM_BUILTIN_DEFAULTS_MIGRATION_DONE, false)) {
                 TelegramEventType.entries.forEach { event ->
                     val key = "$KEY_TELEGRAM_TEMPLATE_PREFIX${event.key}"
@@ -1062,6 +1080,7 @@ class CollectorSettings(
         const val KEY_TELEGRAM_TEMPLATE_PREFIX = "telegramTemplate."
         const val KEY_TELEGRAM_TRIP_SUMMARY_MIGRATION_DONE = "telegramTripSummaryMigrationDone"
         const val KEY_TELEGRAM_BUILTIN_DEFAULTS_MIGRATION_DONE = "telegramBuiltInDefaultsMigrationDone"
+        const val KEY_TELEGRAM_CHARGED_TO_100_MIGRATION_DONE = "telegramChargedTo100MigrationDone"
         const val KEY_TELEGRAM_CHARGE_STEP = "telegramChargeStep"
         const val KEY_TELEGRAM_LOW_VOLTAGE = "telegramLowVoltage"
         const val KEY_TELEGRAM_UNAVAILABLE_DELAY = "telegramUnavailableDelay"

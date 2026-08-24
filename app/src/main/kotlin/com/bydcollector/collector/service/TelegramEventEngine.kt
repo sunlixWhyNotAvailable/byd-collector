@@ -526,6 +526,7 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         events: MutableList<TelegramDetectedEvent>
     ): Boolean {
         if (evidence.active == null) {
+            clearTentativeChargingBaseline()
             state = state.copy(
                 chargingActiveCandidate = null,
                 chargingActiveCandidateCount = 0,
@@ -553,12 +554,31 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
 
         state = state.copy(chargingLowPowerSinceMs = null)
         if (evidence.active == state.chargingActive) {
+            if (evidence.active == false) clearTentativeChargingBaseline()
             state = state.copy(
                 chargingActiveCandidate = null,
                 chargingActiveCandidateCount = 0,
                 chargingEvidenceSource = evidence.source.key
             )
             return false
+        }
+        if (
+            evidence.active &&
+            state.chargingSessionId == null &&
+            state.chargingActiveCandidate != true
+        ) {
+            val baselineSoc = soc?.takeIf { it.isFinite() && it >= 0.0 }
+            val baselineEnergy = remainingEnergy?.takeIf { it.isFinite() && it >= 0.0 }
+            state = state.copy(
+                chargingStartedAtMs = nowMs,
+                chargingStartSoc = baselineSoc,
+                chargingStartEnergyKwh = baselineEnergy,
+                chargingProgressBaselineSoc = baselineSoc,
+                chargingProgressBaselineEnergyKwh = baselineEnergy,
+                chargingStepStartedAtMs = nowMs
+            )
+        } else if (!evidence.active) {
+            clearTentativeChargingBaseline()
         }
         val count = if (state.chargingActiveCandidate == evidence.active) {
             state.chargingActiveCandidateCount + 1
@@ -582,6 +602,18 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
                     remainingEnergy,
                     config.chargeStepPercent,
                     fullAlreadySent = previous == null && state.fullSent && soc?.let { it >= FULL_SOC_THRESHOLD } == true
+                )
+            } else if (state.chargingStartedAtMs == null) {
+                // A legacy/persisted session without a timestamp is a cold attach: baseline only what was observed now.
+                val baselineSoc = soc?.takeIf { it.isFinite() && it >= 0.0 }
+                val baselineEnergy = remainingEnergy?.takeIf { it.isFinite() && it >= 0.0 }
+                state = state.copy(
+                    chargingStartedAtMs = nowMs,
+                    chargingStartSoc = state.chargingStartSoc ?: baselineSoc,
+                    chargingStartEnergyKwh = state.chargingStartEnergyKwh ?: baselineEnergy,
+                    chargingProgressBaselineSoc = state.chargingProgressBaselineSoc ?: baselineSoc,
+                    chargingProgressBaselineEnergyKwh = state.chargingProgressBaselineEnergyKwh ?: baselineEnergy,
+                    chargingStepStartedAtMs = state.chargingStepStartedAtMs ?: nowMs
                 )
             }
             if (previous == false) {
@@ -893,17 +925,32 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         fullAlreadySent: Boolean = false
     ) {
         val step = chargeStepPercent.coerceIn(1, 99)
+        val startedAtMs = state.chargingStartedAtMs ?: nowMs
+        val startSoc = state.chargingStartSoc ?: soc?.takeIf { it.isFinite() && it >= 0.0 }
+        val startEnergy = state.chargingStartEnergyKwh ?: remainingEnergy?.takeIf { it.isFinite() && it >= 0.0 }
         state = state.copy(
             chargingSessionId = UUID.randomUUID().toString(),
-            chargingStartedAtMs = nowMs,
-            chargingStartSoc = soc?.takeIf { it.isFinite() && it >= 0.0 },
-            chargingStartEnergyKwh = remainingEnergy?.takeIf { it.isFinite() && it >= 0.0 },
-            chargingProgressBaselineSoc = soc?.takeIf { it.isFinite() && it >= 0.0 },
-            chargingProgressBaselineEnergyKwh = remainingEnergy?.takeIf { it.isFinite() && it >= 0.0 },
-            chargingStepStartedAtMs = nowMs,
+            chargingStartedAtMs = startedAtMs,
+            chargingStartSoc = startSoc,
+            chargingStartEnergyKwh = startEnergy,
+            chargingProgressBaselineSoc = state.chargingProgressBaselineSoc ?: startSoc,
+            chargingProgressBaselineEnergyKwh = state.chargingProgressBaselineEnergyKwh ?: startEnergy,
+            chargingStepStartedAtMs = state.chargingStepStartedAtMs ?: startedAtMs,
             lastProgressThreshold = soc?.let { (floor(it / step) * step).toInt() },
             fullCandidateCount = 0,
             fullSent = fullAlreadySent
+        )
+    }
+
+    private fun clearTentativeChargingBaseline() {
+        if (state.chargingSessionId != null) return
+        state = state.copy(
+            chargingStartedAtMs = null,
+            chargingStartSoc = null,
+            chargingStartEnergyKwh = null,
+            chargingProgressBaselineSoc = null,
+            chargingProgressBaselineEnergyKwh = null,
+            chargingStepStartedAtMs = null
         )
     }
 
@@ -943,6 +990,9 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
             "charge_added_percent" to formatNumber(addedPercent),
             "charge_added_kwh" to formatNumber(addedEnergy),
             "charge_duration" to formatChargeDuration(nowMs - (state.chargingStartedAtMs ?: nowMs), language),
+            "charge_start_time" to formatLocalTime(state.chargingStartedAtMs),
+            "charge_end_time" to formatLocalTime(nowMs),
+            "charge_duration_hhmm" to formatChargeDurationHhmm(nowMs - (state.chargingStartedAtMs ?: nowMs)),
             "time" to formatTime(nowMs)
         )
     }
@@ -1145,6 +1195,17 @@ private fun formatChargeDuration(durationMs: Long, language: TelegramTemplateLan
             if (minutes > 0L || hours == 0L) append("${minutes}m")
         }
     }
+}
+
+private fun formatChargeDurationHhmm(durationMs: Long): String {
+    val totalMinutes = durationMs.coerceAtLeast(0L) / 60_000L
+    return "%02d:%02d".format(totalMinutes / 60L, totalMinutes % 60L)
+}
+
+private fun formatLocalTime(timeMs: Long?): String {
+    return timeMs?.let {
+        java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(it))
+    } ?: "n/a"
 }
 
 private fun formatTime(timeMs: Long): String {

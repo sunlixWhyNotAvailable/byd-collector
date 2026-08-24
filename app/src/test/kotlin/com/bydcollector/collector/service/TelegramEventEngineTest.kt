@@ -302,6 +302,89 @@ class TelegramEventEngineTest {
     }
 
     @Test
+    fun fullChargeUsesPersistedSessionBaselineAndUnwrappedPaddedDuration() {
+        val english = config.copy(language = TelegramTemplateLanguage.EN)
+        val engine = TelegramEventEngine()
+        val day = 24L * 60L * 60L * 1_000L
+        engine.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 7.0, soc = 50.0, remainingEnergy = 20.0), english, 0L)
+        engine.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 7.0, soc = 50.0, remainingEnergy = 20.0), english, 500L)
+        engine.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 7.0, soc = 50.0, remainingEnergy = 20.0), english, 1_000L)
+        assertEquals(0L, engine.state.chargingStartedAtMs)
+        val restarted = TelegramEventEngine(TelegramEventState.fromJson(engine.state.toJson()))
+        restarted.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 4.0, soc = 99.6, remainingEnergy = 30.0), english, day + 1_000L)
+        restarted.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 4.0, soc = 99.6, remainingEnergy = 30.0), english, day + 7L * 60L * 1_000L + 1_000L)
+        val full = restarted.onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = 4.0, soc = 99.6, remainingEnergy = 30.0),
+            english,
+            day + 7L * 60L * 1_000L + 2_000L
+        ).events.single()
+
+        assertEquals(TelegramEventType.CHARGED_TO_100, full.type)
+        assertEquals("49.6", full.variables["charge_added_percent"])
+        assertEquals("10", full.variables["charge_added_kwh"])
+        assertEquals("24:07", full.variables["charge_duration_hhmm"])
+        val localTime = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+        assertEquals(localTime.format(java.util.Date(0L)), full.variables["charge_start_time"])
+        assertEquals(localTime.format(java.util.Date(day + 7L * 60L * 1_000L + 2_000L)), full.variables["charge_end_time"])
+    }
+
+    @Test
+    fun coldAttachUsesFirstObservedActiveSampleAsChargeBaseline() {
+        val engine = TelegramEventEngine()
+        val firstObservedAtMs = 59_500L
+        engine.onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = 7.0, soc = 60.0, remainingEnergy = 40.0),
+            config,
+            firstObservedAtMs
+        )
+        val attached = engine.onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = 7.0, soc = 61.0, remainingEnergy = 41.0),
+            config,
+            60_500L
+        )
+        assertTrue(attached.events.isEmpty())
+        assertEquals(firstObservedAtMs, attached.state.chargingStartedAtMs)
+        assertEquals(60.0, attached.state.chargingStartSoc)
+        assertEquals(40.0, attached.state.chargingStartEnergyKwh)
+
+        engine.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 4.0, soc = 99.6, remainingEnergy = 50.0), config, 61_000L)
+        val full = engine.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 4.0, soc = 99.6, remainingEnergy = 50.0), config, 61_500L)
+            .events.single()
+        assertEquals(TelegramEventType.CHARGED_TO_100, full.type)
+        assertEquals("39.6", full.variables["charge_added_percent"])
+        assertEquals("10", full.variables["charge_added_kwh"])
+    }
+
+    @Test
+    fun rejectedActiveCandidateDoesNotLeakItsChargeBaseline() {
+        val engine = TelegramEventEngine()
+        engine.onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = 7.0, soc = 60.0, remainingEnergy = 40.0),
+            config,
+            0L
+        )
+        engine.onSuccessfulPoll(
+            snapshot(chargeGun = false, chargePower = 0.0, soc = 60.0, remainingEnergy = 40.0),
+            config,
+            500L
+        )
+        engine.onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = 7.0, soc = 70.0, remainingEnergy = 45.0),
+            config,
+            1_000L
+        )
+        val attached = engine.onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = 7.0, soc = 71.0, remainingEnergy = 46.0),
+            config,
+            1_500L
+        )
+
+        assertEquals(1_000L, attached.state.chargingStartedAtMs)
+        assertEquals(70.0, attached.state.chargingStartSoc)
+        assertEquals(45.0, attached.state.chargingStartEnergyKwh)
+    }
+
+    @Test
     fun restartAtAnAlreadyReportedFullBaselineDoesNotDuplicateTheFullEvent() {
         val running = TelegramEventEngine()
         running.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 7.0, soc = 99.6), config, 0L)

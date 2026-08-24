@@ -688,7 +688,9 @@ private fun ClearFieldButton(contentDescription: String, onClick: () -> Unit) {
 @Composable
 fun NumericInput(
     value: String,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    emphasized: Boolean = false,
+    textAlign: TextAlign = TextAlign.End
 ) {
     val p = LocalBydPalette.current
     Box(
@@ -702,10 +704,10 @@ fun NumericInput(
     ) {
         Text(
             text = value,
-            color = p.muted.copy(alpha = 0.6f),
+            color = if (emphasized) p.text else p.muted.copy(alpha = 0.6f),
             fontSize = 13.sp,
             fontWeight = FontWeight.Bold,
-            textAlign = TextAlign.End,
+            textAlign = textAlign,
             modifier = Modifier.fillMaxWidth()
         )
     }

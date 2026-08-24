@@ -40,8 +40,18 @@ object TelegramBuiltInTemplates {
         "Заряд: {soc}%\nЗа крок: +{charge_step_added_percent}% / +{charge_step_added_kwh} кВт·год\nЧас кроку: {charge_step_duration}\nЗа сесію: +{charge_added_percent}% / +{charge_added_kwh} кВт·год\nЧас сесії: {charge_duration}"
     const val CHARGING_PROGRESS_EN =
         "Charge: {soc}%\nThis step: +{charge_step_added_percent}% / +{charge_step_added_kwh} kWh\nStep time: {charge_step_duration}\nSession total: +{charge_added_percent}% / +{charge_added_kwh} kWh\nSession time: {charge_duration}"
-    const val CHARGED_TO_100_UK = "Авто заряджено до 100%\nЕнергія: {remaining_energy_kwh} кВт·год\nЗапас ходу: {range_km} км"
-    const val CHARGED_TO_100_EN = "Vehicle charged to 100%\nEnergy: {remaining_energy_kwh} kWh\nRange: {range_km} km"
+    const val CHARGED_TO_100_UK =
+        "Авто заряджено до 100%\nЗаряджено: {charge_added_percent}% / {charge_added_kwh} кВт·год\n" +
+            "Час заряджання: {charge_start_time} → {charge_end_time} ({charge_duration_hhmm})\n" +
+            "Енергія: {remaining_energy_kwh} кВт·год\nЗапас ходу: {range_km} км"
+    const val CHARGED_TO_100_EN =
+        "Vehicle charged to 100%\nCharged: {charge_added_percent}% / {charge_added_kwh} kWh\n" +
+            "Charging time: {charge_start_time} → {charge_end_time} ({charge_duration_hhmm})\n" +
+            "Energy: {remaining_energy_kwh} kWh\nRange: {range_km} km"
+    private const val HISTORIC_CHARGED_TO_100_UK =
+        "Авто заряджено до 100%\nЕнергія: {remaining_energy_kwh} кВт·год\nЗапас ходу: {range_km} км"
+    private const val HISTORIC_CHARGED_TO_100_EN =
+        "Vehicle charged to 100%\nEnergy: {remaining_energy_kwh} kWh\nRange: {range_km} km"
     const val CHARGING_STOPPED_UK = "Заряджання зупинено\nSOC: {soc}%\nТривалість: {charge_duration}"
     const val CHARGING_STOPPED_EN = "Charging stopped\nSOC: {soc}%\nDuration: {charge_duration}"
     const val CHARGE_GUN_CONNECTED_UK = "Зарядний кабель підключено\nSOC: {soc}%\nЧас: {time}"
@@ -96,7 +106,9 @@ object TelegramBuiltInTemplates {
             )
         ),
         TelegramEventType.CHARGED_TO_100 to mapOf(
+            TelegramTemplateLanguage.UK to setOf(HISTORIC_CHARGED_TO_100_UK),
             TelegramTemplateLanguage.EN to setOf(
+                HISTORIC_CHARGED_TO_100_EN,
                 "Charging complete: {soc}%, {remaining_energy_kwh} kWh remaining, range {range_km} km at {time}."
             )
         ),
@@ -201,7 +213,17 @@ object TelegramTemplateCatalog {
         ),
         TelegramEventType.CHARGED_TO_100 to TelegramTemplateSpec(
             TelegramBuiltInTemplates.CHARGED_TO_100_EN,
-            setOf("soc", "remaining_energy_kwh", "range_km", "time")
+            setOf(
+                "soc",
+                "remaining_energy_kwh",
+                "range_km",
+                "time",
+                "charge_added_percent",
+                "charge_added_kwh",
+                "charge_start_time",
+                "charge_end_time",
+                "charge_duration_hhmm"
+            )
         ),
         TelegramEventType.CHARGING_STOPPED to TelegramTemplateSpec(
             TelegramBuiltInTemplates.CHARGING_STOPPED_EN,

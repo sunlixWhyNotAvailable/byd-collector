@@ -36,6 +36,18 @@ class TelegramTemplatesTest {
             TelegramBuiltInTemplates.TRIP_SUMMARY_EN,
             TelegramTemplateCatalog.defaultTemplate(TelegramEventType.TRIP_SUMMARY, TelegramTemplateLanguage.EN)
         )
+        val full = TelegramTemplateCatalog.spec(TelegramEventType.CHARGED_TO_100)
+        assertTrue(
+            full.allowedVariables.containsAll(
+                setOf(
+                    "charge_added_percent",
+                    "charge_added_kwh",
+                    "charge_start_time",
+                    "charge_end_time",
+                    "charge_duration_hhmm"
+                )
+            )
+        )
     }
 
     @Test
@@ -51,6 +63,50 @@ class TelegramTemplatesTest {
         assertEquals(
             TelegramBuiltInTemplates.TRIP_SUMMARY_EN,
             TelegramBuiltInTemplates.migrateKnownSaved(TelegramEventType.TRIP_SUMMARY.key, legacyTrip)
+        )
+        assertTrue(
+            TelegramBuiltInTemplates.isHistoricBuiltIn(
+                TelegramEventType.CHARGED_TO_100,
+                "Авто заряджено до 100%\nЕнергія: {remaining_energy_kwh} кВт·год\nЗапас ходу: {range_km} км"
+            )
+        )
+        assertEquals(
+            TelegramBuiltInTemplates.CHARGED_TO_100_EN,
+            TelegramBuiltInTemplates.migrateKnownSaved(
+                TelegramEventType.CHARGED_TO_100.key,
+                "Vehicle charged to 100%\nEnergy: {remaining_energy_kwh} kWh\nRange: {range_km} km"
+            )
+        )
+    }
+
+    @Test
+    fun chargedTo100BuiltInsRenderTheAcceptedFiveLineTextExactly() {
+        val values = mapOf(
+            "charge_added_percent" to "20",
+            "charge_added_kwh" to "10",
+            "charge_start_time" to "08:03",
+            "charge_end_time" to "09:04",
+            "charge_duration_hhmm" to "25:07",
+            "remaining_energy_kwh" to "40",
+            "range_km" to "300"
+        )
+        assertEquals(
+            "Авто заряджено до 100%\nЗаряджено: 20% / 10 кВт·год\n" +
+                "Час заряджання: 08:03 → 09:04 (25:07)\nЕнергія: 40 кВт·год\nЗапас ходу: 300 км",
+            TelegramTemplateRenderer.render(
+                TelegramEventType.CHARGED_TO_100,
+                TelegramBuiltInTemplates.CHARGED_TO_100_UK,
+                values
+            ).text
+        )
+        assertEquals(
+            "Vehicle charged to 100%\nCharged: 20% / 10 kWh\n" +
+                "Charging time: 08:03 → 09:04 (25:07)\nEnergy: 40 kWh\nRange: 300 km",
+            TelegramTemplateRenderer.render(
+                TelegramEventType.CHARGED_TO_100,
+                TelegramBuiltInTemplates.CHARGED_TO_100_EN,
+                values
+            ).text
         )
     }
 

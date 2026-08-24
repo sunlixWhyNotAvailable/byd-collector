@@ -284,6 +284,39 @@ class BydCollectorUiContractTest {
         assertTrue(app.contains("tripMapMarker(map, p.last(), R.drawable.ic_trip_finish_marker)"))
         assertTrue(app.contains("TripEndpointLegend(R.drawable.ic_trip_start_marker, strings.tripStart)"))
         assertTrue(app.contains("TripEndpointLegend(R.drawable.ic_trip_finish_marker, strings.tripFinish)"))
+        assertTrue(app.contains("TripNoDataLegend(strings.tripNoData)"))
+        assertTrue(app.contains(".background(Color.Gray)"))
+        assertTrue(strings.contains("tripNoData = \"Відсутні дані\""))
+        assertTrue(strings.contains("tripNoData = \"No data\""))
+        val locationRow = app.substringAfter("if (definition.type == TelegramMessageType.TRIP_SUMMARY)")
+            .substringBefore("Row(\n            modifier = Modifier.fillMaxWidth(),")
+        assertTrue(locationRow.contains("Modifier.fillMaxWidth().height(42.dp)"))
+        assertTrue(locationRow.contains("horizontalArrangement = Arrangement.spacedBy(10.dp)"))
+        assertTrue(locationRow.contains("modifier = Modifier.weight(1f)"))
+        assertTrue(locationRow.contains("NumericInput("))
+        assertTrue(locationRow.contains("modifier = Modifier.width(132.dp)"))
+        assertTrue(locationRow.contains("emphasized = true"))
+        assertTrue(locationRow.contains("textAlign = TextAlign.Center"))
+        assertFalse(locationRow.contains("Spacer(Modifier.weight(1f))"))
+        assertTrue(strings.contains("charge_start_time\" to \"Час початку заряджання, HH:mm\""))
+        assertTrue(strings.contains("charge_end_time\" to \"Час завершення заряджання, HH:mm\""))
+        assertTrue(strings.contains("charge_duration_hhmm\" to \"Тривалість заряджання, загальні години HH:mm\""))
+        assertTrue(strings.contains("charge_start_time\" to \"Charging start time, HH:mm\""))
+        assertTrue(strings.contains("charge_end_time\" to \"Charging end time, HH:mm\""))
+        assertTrue(strings.contains("charge_duration_hhmm\" to \"Charging duration, total-hours HH:mm\""))
+        val fullChargeDefinition = app.substringAfter("TelegramMessageType.CHARGED_TO_100,")
+            .substringBefore("TelegramMessageType.CHARGING_STOPPED,")
+        listOf(
+            "charge_added_percent",
+            "charge_added_kwh",
+            "charge_start_time",
+            "charge_end_time",
+            "charge_duration_hhmm"
+        ).forEach { assertTrue(fullChargeDefinition.contains("\"$it\"")) }
+        val numericInput = components.substringAfter("fun NumericInput(").substringBefore("fun CategoryChip(")
+        assertTrue(numericInput.contains("emphasized: Boolean = false"))
+        assertTrue(numericInput.contains("textAlign: TextAlign = TextAlign.End"))
+        assertTrue(numericInput.contains("color = if (emphasized) p.text else p.muted.copy(alpha = 0.6f)"))
         assertFalse(app.contains("AndroidColor.rgb(255, 140, 140))\n    }\n    map.post"))
         assertTrue(app.contains("Marker(map)"))
         assertTrue(strings.contains("tripDelay = \"Завершити після P\""))

@@ -399,7 +399,17 @@ private val TelegramMessageDefinitions = listOf(
     ),
     TelegramMessageDefinition(
         TelegramMessageType.CHARGED_TO_100,
-        listOf("soc", "remaining_energy_kwh", "range_km", "time")
+        listOf(
+            "soc",
+            "remaining_energy_kwh",
+            "range_km",
+            "time",
+            "charge_added_percent",
+            "charge_added_kwh",
+            "charge_start_time",
+            "charge_end_time",
+            "charge_duration_hhmm"
+        )
     ),
     TelegramMessageDefinition(
         TelegramMessageType.CHARGING_STOPPED,
@@ -965,6 +975,8 @@ private fun TripRouteDialog(
                     TripEndpointLegend(R.drawable.ic_trip_start_marker, strings.tripStart)
                     Spacer(Modifier.width(12.dp))
                     TripEndpointLegend(R.drawable.ic_trip_finish_marker, strings.tripFinish)
+                    Spacer(Modifier.width(12.dp))
+                    TripNoDataLegend(strings.tripNoData)
                     Spacer(Modifier.width(18.dp))
                     ActionButton(strings.close, onDismiss, modifier = Modifier.width(140.dp))
                 }
@@ -1110,6 +1122,22 @@ private fun TripEndpointLegend(iconRes: Int, label: String) {
     val p = LocalBydPalette.current
     Row(verticalAlignment = Alignment.CenterVertically) {
         Image(painterResource(iconRes), contentDescription = null, modifier = Modifier.size(20.dp))
+        Spacer(Modifier.width(6.dp))
+        Text(label, color = p.muted, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@Composable
+private fun TripNoDataLegend(label: String) {
+    val p = LocalBydPalette.current
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            Modifier
+                .width(26.dp)
+                .height(8.dp)
+                .background(Color.Gray)
+                .border(1.dp, Color.Black)
+        )
         Spacer(Modifier.width(6.dp))
         Text(label, color = p.muted, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
     }
@@ -1511,24 +1539,15 @@ private fun TelegramMessageCard(
                 ActionButton(
                     text = strings.sendLocation,
                     onClick = { showLocationSettings = true },
-                    modifier = Modifier.width(180.dp)
+                    modifier = Modifier.weight(1f)
                 )
-                Box(
-                    modifier = Modifier.width(132.dp).height(38.dp)
-                        .border(1.dp, LocalBydPalette.current.border, Rounded8),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = if (!config.sendLocation) strings.telegram.locationStatusNo
-                        else String.format(strings.telegram.locationStatusYes, Integer.bitCount(config.navigatorMask and TelegramNavigatorMask.ALL)),
-                        color = LocalBydPalette.current.muted,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        textAlign = TextAlign.Center,
-                        maxLines = 1
-                    )
-                }
-                Spacer(Modifier.weight(1f))
+                NumericInput(
+                    value = if (!config.sendLocation) strings.telegram.locationStatusNo
+                    else String.format(strings.telegram.locationStatusYes, Integer.bitCount(config.navigatorMask and TelegramNavigatorMask.ALL)),
+                    modifier = Modifier.width(132.dp),
+                    emphasized = true,
+                    textAlign = TextAlign.Center
+                )
             }
         }
         Row(
