@@ -193,7 +193,7 @@ class DatabaseMaintenanceService : Service() {
         private const val EXTRA_OPERATION = "operation"
         private const val CHANNEL_ID = "database_maintenance"
         private const val NOTIFICATION_ID = 1002
-        private const val COLLECTOR_STOP_TIMEOUT_MS = 5_000L
+        private const val COLLECTOR_STOP_TIMEOUT_MS = 20_000L
         private const val COLLECTOR_STOP_POLL_MS = 25L
         private const val WAKE_LOCK_TIMEOUT_MS = 30 * 60_000L
         private val running = AtomicBoolean(false)

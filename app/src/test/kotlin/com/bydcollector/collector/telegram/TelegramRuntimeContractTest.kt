@@ -66,6 +66,9 @@ class TelegramRuntimeContractTest {
 
         assertTrue(handle.contains("store.commitTelegramEvents("))
         assertTrue(handle.contains("engine = TelegramEventEngine(TelegramEventState.fromJson(store.telegramRuntimeState()))"))
+        assertTrue(handle.contains("renderTelegramBatch(result.events, ::render)"))
+        assertTrue(handle.contains("if (messages == null)"))
+        assertFalse(handle.contains("mapNotNull"))
         assertFalse(handle.contains("saveTelegramRuntimeState"))
         assertInOrder(commit, "db.beginTransaction()", "enqueueTelegramMessage(db, message, nowMs)")
         assertInOrder(commit, "enqueueTelegramMessage(db, message, nowMs)", "saveTelegramRuntimeState(db, it, nowMs)")
@@ -195,7 +198,8 @@ class TelegramRuntimeContractTest {
 
         assertTrue(coordinator.contains("settings.uiLanguageCode()"))
         assertTrue(coordinator.contains("settings.telegramNavigatorMask()"))
-        assertTrue(coordinator.contains("savedTemplate ?: TelegramTemplateCatalog.defaultTemplate"))
+        assertTrue(coordinator.contains("val defaultTemplate = TelegramTemplateCatalog.defaultTemplate"))
+        assertTrue(coordinator.contains("savedTemplate ?: defaultTemplate"))
         assertFalse(coordinator.contains("TelegramBuiltInTemplates.isKnownBuiltIn"))
         assertTrue(engine.contains("charge_step_duration"))
         assertTrue(engine.contains("config.navigatorMask"))

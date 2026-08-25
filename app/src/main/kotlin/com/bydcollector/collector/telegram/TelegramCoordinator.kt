@@ -212,7 +212,11 @@ class TelegramCoordinator(
     }
 
     private fun handle(result: TelegramEventResult) {
-        val messages = result.events.mapNotNull(::render)
+        val messages = renderTelegramBatch(result.events, ::render)
+        if (messages == null) {
+            engine = TelegramEventEngine(TelegramEventState.fromJson(store.telegramRuntimeState()))
+            return
+        }
         val committedAt = nowMs()
         val outcomes = try {
             store.commitTelegramEvents(
@@ -245,19 +249,7 @@ class TelegramCoordinator(
     private fun render(event: TelegramDetectedEvent): TelegramOutboxMessage? {
         val language = telegramLanguage()
         val savedTemplate = settings.telegramTemplate(event.type.key)
-        val template = savedTemplate ?: TelegramTemplateCatalog.defaultTemplate(event.type, language)
-        if (event.locationOnly) {
-            return event.textSuffix?.takeIf(String::isNotBlank)?.let {
-                TelegramOutboxMessage(event.dedupeKey, event.type.key, it)
-            }
-        }
-        val renderTemplate = TelegramTemplateCatalog.templateForRendering(
-            event.type,
-            template,
-            language,
-            event.omitOverall
-        )
-        val rendered = TelegramTemplateRenderer.render(event.type, renderTemplate, event.variables)
+        val rendered = renderTelegramPayload(event, savedTemplate, language)
         val payload = rendered.text
         if (payload == null) {
             store.recordEvent(
@@ -267,7 +259,7 @@ class TelegramCoordinator(
             )
             return null
         }
-        return TelegramOutboxMessage(event.dedupeKey, event.type.key, payload + (event.textSuffix ?: ""))
+        return TelegramOutboxMessage(event.dedupeKey, event.type.key, payload)
     }
 
     private fun telegramLanguage(): TelegramTemplateLanguage = when (settings.uiLanguageCode().trim().lowercase()) {
@@ -306,4 +298,48 @@ class TelegramCoordinator(
             "status=${result.httpStatus ?: "none"} " +
             "exception=${result.exceptionClass ?: "none"}"
     }
+}
+
+internal fun renderTelegramBatch(
+    events: List<TelegramDetectedEvent>,
+    render: (TelegramDetectedEvent) -> TelegramOutboxMessage?
+): List<TelegramOutboxMessage>? {
+    val rendered = events.map(render)
+    return rendered.filterNotNull().takeIf { it.size == rendered.size }
+}
+
+internal fun renderTelegramPayload(
+    event: TelegramDetectedEvent,
+    savedTemplate: String?,
+    language: TelegramTemplateLanguage
+): TelegramTemplateRenderResult {
+    if (event.locationOnly) {
+        val payload = event.textSuffix.orEmpty()
+        val length = payload.codePointCount(0, payload.length)
+        val errors = when {
+            payload.isBlank() -> listOf(TelegramTemplateError(TelegramTemplateErrorKind.EMPTY))
+            length > TELEGRAM_MESSAGE_MAX_CHARS -> listOf(
+                TelegramTemplateError(TelegramTemplateErrorKind.TOO_LONG, actualLength = length)
+            )
+            else -> emptyList()
+        }
+        return TelegramTemplateRenderResult(payload.takeIf { errors.isEmpty() }, errors)
+    }
+
+    fun render(template: String): TelegramTemplateRenderResult = TelegramTemplateRenderer.render(
+        event.type,
+        TelegramTemplateCatalog.templateForRendering(event.type, template, language, event.omitOverall),
+        event.variables
+    )
+
+    val defaultTemplate = TelegramTemplateCatalog.defaultTemplate(event.type, language)
+    val selected = render(savedTemplate ?: defaultTemplate)
+    val base = selected.text ?: savedTemplate?.let { render(defaultTemplate).text }
+        ?: return selected
+    val suffix = event.textSuffix.orEmpty()
+    val combined = base + suffix
+    val payload = combined.takeIf {
+        it.codePointCount(0, it.length) <= TELEGRAM_MESSAGE_MAX_CHARS
+    } ?: base
+    return TelegramTemplateRenderResult(payload, emptyList())
 }

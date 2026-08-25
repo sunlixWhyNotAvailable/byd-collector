@@ -147,7 +147,6 @@ class CollectorService : Service() {
     @Volatile private var influxRuntimeStatus = RuntimeActionStatus.STOPPED
     private val mqttRuntimeActive = AtomicBoolean(false)
     private val mqttOfflineQueued = AtomicBoolean(false)
-    private val mqttOfflineCompletionGeneration = AtomicLong(0L)
     private val maintenanceActive = AtomicBoolean(false)
     private val maintenanceRuntimeRestoreAllowed = AtomicBoolean(true)
     private val userShutdownFinalizationStarted = AtomicBoolean(false)
@@ -263,7 +262,7 @@ class CollectorService : Service() {
             activate = { scheduleTailscaleActivation() }
         )
         vehicleStateNormalizer = VehicleStateNormalizer()
-        mqttCoordinator = createMqttCoordinator(PahoMqttClientFacade())
+        mqttCoordinator = createMqttCoordinator(processMqttClientFacade)
         influxCoordinator = createInfluxCoordinator()
         telegramCoordinator = createTelegramCoordinator()
         normalizedStateChangedCallback = { changedCategories -> publishChangedCategoriesAsync(changedCategories) }
@@ -396,7 +395,13 @@ class CollectorService : Service() {
         tailscaleExecutor.shutdownNow()
         dashboardMetricsExecutor.shutdownNow()
         dashboardCountExecutor.shutdownNow()
-        shutdownMqttExecutor()
+        val mqttWorker = shutdownMqttExecutor()
+        if (!awaitMqttWorkerTermination(mqttWorker, MQTT_MAINTENANCE_STOP_TIMEOUT_MS)) {
+            store.recordEvent(
+                "mqtt_worker_stop_timeout",
+                "MQTT worker did not stop during service destruction"
+            )
+        }
         shutdownInfluxExecutor()
         shutdownTelegramExecutor()
         activeMaintenanceOperation = null
@@ -752,7 +757,6 @@ class CollectorService : Service() {
         val ownerMode = DirectHelperOwnerMode.APP_GAP_SPOOL
         if (mainPollerOwnerMode != ownerMode) poller = createTelemetryPoller(ownerMode)
         mqttRuntimeActive.set(false)
-        mqttOfflineQueued.set(false)
         val openedSessionId = store.openSession()
         sessionId = openedSessionId
         try {
@@ -1061,6 +1065,7 @@ class CollectorService : Service() {
         if (!userShutdownFinalizationStarted.compareAndSet(false, true)) return
         try {
             maintenanceExecutor.execute {
+                val mqttWorker = shutdownMqttExecutor()
                 val telegramWorker = shutdownTelegramExecutorForUserShutdown()
                 val influxWorker = synchronized(influxExecutorLock) { influxExecutor }
                 val influxStopped = awaitSerializedExecutorAction(
@@ -1075,13 +1080,19 @@ class CollectorService : Service() {
                     executorThreadName = "byd-telegram",
                     timeoutMs = USER_SHUTDOWN_STOP_TIMEOUT_MS
                 )
-                if (!influxStopped || !telegramStopped) {
+                val mqttStopped = awaitMqttWorkerTermination(mqttWorker, USER_SHUTDOWN_STOP_TIMEOUT_MS)
+                if (!mqttStopped || !influxStopped || !telegramStopped) {
                     userShutdownFinalizationStarted.set(false)
                     store.recordEvent(
                         "user_shutdown_worker_stop_timeout",
                         "User shutdown left the service stopped but alive",
-                        "influx_stopped=$influxStopped telegram_stopped=$telegramStopped"
+                        "mqtt_stopped=$mqttStopped influx_stopped=$influxStopped telegram_stopped=$telegramStopped"
                     )
+                    if (!mqttStopped && influxStopped && telegramStopped) {
+                        mainHandler.post {
+                            if (settings.isUserShutdownRequested()) finishUserShutdown()
+                        }
+                    }
                     return@execute
                 }
                 mainHandler.post { stopServiceAfterUserShutdown() }
@@ -1545,7 +1556,6 @@ class CollectorService : Service() {
         detached.openedSessionId?.let { openedSessionId ->
             runCatching { store.endSession(openedSessionId, "database_maintenance") }
         }
-        mqttCoordinator.disconnectForMaintenance()
         resetMqttExecutorForMaintenance()
         resetInfluxExecutorForMaintenance()
         resetTelegramExecutorForMaintenance()
@@ -1592,7 +1602,6 @@ class CollectorService : Service() {
         setDebugRuntime(DebugRuntimeStatus.STOPPING, generation = stopGeneration)
         setDebugRuntime(DebugRuntimeStatus.STOPPED)
         mqttRuntimeActive.set(false)
-        mqttOfflineQueued.set(false)
         publishDashboardRuntimeFlags()
         return DetachedMaintenanceRuntime(
             mainPoller = poller,
@@ -1656,7 +1665,7 @@ class CollectorService : Service() {
         dashboardStateProvider = DashboardStateProvider(applicationContext, { store }, settings)
         keepAliveSupervisor.shutdown()
         keepAliveSupervisor = KeepAliveSupervisor(applicationContext, store)
-        mqttCoordinator = createMqttCoordinator(PahoMqttClientFacade())
+        mqttCoordinator = createMqttCoordinator(processMqttClientFacade)
         influxCoordinator = createInfluxCoordinator()
         telegramCoordinator = createTelegramCoordinator()
         poller = createTelemetryPoller()
@@ -2054,58 +2063,10 @@ class CollectorService : Service() {
 
     private fun disconnectOfflineAsync() {
         if (!mqttRuntimeActive.get() && !settings.isMqttEnabled()) return
-        if (!mqttOfflineQueued.compareAndSet(false, true)) {
-            mqttOfflineCompletionGeneration.set(mqttWorkGeneration.get())
-            return
-        }
-        //uses a fresh executor so queued live publishes cannot run after the retained offline message
-        val executor = resetMqttExecutorForOffline()
-        val offlineGeneration = mqttWorkGeneration.get()
-        mqttOfflineCompletionGeneration.set(offlineGeneration)
+        if (!mqttOfflineQueued.compareAndSet(false, true)) return
         try {
-            executor.execute {
-                var completedOk = false
-                try {
-                    runCatching { oneShotMqttCoordinator().disconnectOffline() }
-                        .onSuccess { result ->
-                            completedOk = result.ok
-                            if (!result.ok) {
-                                store.recordEvent(
-                                    "mqtt_offline_publish_error",
-                                    "MQTT offline publish failed",
-                                    "${result.category}: ${result.message}"
-                                )
-                            }
-                        }
-                        .onFailure { error ->
-                            store.recordEvent(
-                                "mqtt_offline_publish_error",
-                                "MQTT offline publish failed",
-                                "${error::class.java.simpleName}: ${error.message ?: "no message"}"
-                            )
-                        }
-                } finally {
-                    mqttOfflineQueued.set(false)
-                    val completionGeneration = mqttOfflineCompletionGeneration.get()
-                    mainHandler.post {
-                        if (completionGeneration == mqttWorkGeneration.get()) {
-                            when {
-                                !settings.isMqttEnabled() && mqttRuntimeStatus == RuntimeActionStatus.STOPPING -> {
-                                    setMqttRuntime(
-                                        if (completedOk) RuntimeActionStatus.STOPPED else RuntimeActionStatus.ERROR
-                                    )
-                                    stopIfNoActiveRuntime()
-                                }
-                                settings.isMqttEnabled() && mqttRuntimeStatus == RuntimeActionStatus.STARTING -> {
-                                    setMqttRuntime(
-                                        if (completedOk) RuntimeActionStatus.RUNNING else RuntimeActionStatus.ERROR
-                                    )
-                                }
-                            }
-                        }
-                        scheduleIntegrationDashboardRefresh()
-                    }
-                }
+            resetMqttExecutorForOffline { previous ->
+                completeMqttOffline(previous)
             }
         } catch (error: RejectedExecutionException) {
             mqttOfflineQueued.set(false)
@@ -2114,12 +2075,47 @@ class CollectorService : Service() {
                 "MQTT offline publish rejected",
                 "${error::class.java.simpleName}: ${error.message ?: "no message"}"
             )
-            if (offlineGeneration == mqttWorkGeneration.get()) {
-                if (!settings.isMqttEnabled() && mqttRuntimeStatus == RuntimeActionStatus.STOPPING) {
-                    setMqttRuntime(RuntimeActionStatus.ERROR)
-                } else if (settings.isMqttEnabled() && mqttRuntimeStatus == RuntimeActionStatus.STARTING) {
-                    setMqttRuntime(RuntimeActionStatus.ERROR)
+            if (!settings.isMqttEnabled() && mqttRuntimeStatus == RuntimeActionStatus.STOPPING) {
+                setMqttRuntime(RuntimeActionStatus.ERROR)
+            }
+        }
+    }
+
+    private fun completeMqttOffline(previous: ExecutorService) {
+        var completedOk = false
+        try {
+            if (!awaitMqttWorkerTermination(previous, MQTT_MAINTENANCE_STOP_TIMEOUT_MS)) {
+                store.recordEvent(
+                    "mqtt_offline_publish_error",
+                    "MQTT previous worker stop timed out; closing its client session"
+                )
+            }
+            runCatching { mqttCoordinator.disconnectOffline() }
+                .onSuccess { result ->
+                    completedOk = result.ok
+                    if (!result.ok) {
+                        store.recordEvent(
+                            "mqtt_offline_publish_error",
+                            "MQTT offline publish failed",
+                            "${result.category}: ${result.message}"
+                        )
+                    }
                 }
+                .onFailure { error ->
+                    store.recordEvent(
+                        "mqtt_offline_publish_error",
+                        "MQTT offline publish failed",
+                        "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                    )
+                }
+        } finally {
+            mqttOfflineQueued.set(false)
+            mainHandler.post {
+                if (!settings.isMqttEnabled() && mqttRuntimeStatus == RuntimeActionStatus.STOPPING) {
+                    setMqttRuntime(if (completedOk) RuntimeActionStatus.STOPPED else RuntimeActionStatus.ERROR)
+                    stopIfNoActiveRuntime()
+                }
+                scheduleIntegrationDashboardRefresh()
             }
         }
     }
@@ -2154,13 +2150,18 @@ class CollectorService : Service() {
         ChannelActionStatus(result.ok, result.category, result.message)
     }
 
-    private fun resetMqttExecutorForOffline(): ExecutorService {
+    private fun resetMqttExecutorForOffline(action: (ExecutorService) -> Unit) {
         mqttWorkGeneration.incrementAndGet()
-        return synchronized(mqttExecutorLock) {
-            mqttExecutor.shutdownNow()
-            namedSingleThreadExecutor("byd-mqtt").also { replacement ->
-                mqttExecutor = replacement
+        synchronized(mqttExecutorLock) {
+            val previous = mqttExecutor.also { it.shutdownNow() }
+            val replacement = namedSingleThreadExecutor("byd-mqtt")
+            try {
+                replacement.execute { action(previous) }
+            } catch (error: RejectedExecutionException) {
+                replacement.shutdownNow()
+                throw error
             }
+            mqttExecutor = replacement
         }
     }
 
@@ -2169,7 +2170,9 @@ class CollectorService : Service() {
             requireRuntimeOwner()
             mqttWorkGeneration.incrementAndGet()
             synchronized(mqttExecutorLock) {
-                mqttExecutor.also { it.shutdownNow() }
+                mqttExecutor.also {
+                    if (mqttOfflineQueued.get()) it.shutdown() else it.shutdownNow()
+                }
             }
         }
         val stopped = try {
@@ -2180,6 +2183,7 @@ class CollectorService : Service() {
         }
         if (!stopped) maintenanceRuntimeRestoreAllowed.set(false)
         check(stopped) { "MQTT worker did not stop before database maintenance" }
+        mqttCoordinator.disconnectForMaintenance()
         runOnRuntimeOwnerBlocking {
             requireRuntimeOwner()
             synchronized(mqttExecutorLock) {
@@ -2192,9 +2196,18 @@ class CollectorService : Service() {
         }
     }
 
-    private fun shutdownMqttExecutor() {
-        synchronized(mqttExecutorLock) {
-            mqttExecutor.shutdown()
+    private fun shutdownMqttExecutor(): ExecutorService {
+        return synchronized(mqttExecutorLock) {
+            mqttExecutor.also { it.shutdown() }
+        }
+    }
+
+    private fun awaitMqttWorkerTermination(executor: ExecutorService, timeoutMs: Long): Boolean {
+        return try {
+            executor.awaitTermination(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
         }
     }
 
@@ -2707,10 +2720,6 @@ class CollectorService : Service() {
         settings.recoverInterruptedDbMaintenanceIfNeeded("service_start:$action")
     }
 
-    private fun oneShotMqttCoordinator(): MqttPublishCoordinator {
-        return createMqttCoordinator(PahoMqttClientFacade())
-    }
-
     private fun createMqttCoordinator(client: MqttClientFacade): MqttPublishCoordinator {
         return MqttPublishCoordinator(
             client = client,
@@ -2857,6 +2866,7 @@ class CollectorService : Service() {
         private val influxRuntimeStatusRef = AtomicReference(RuntimeActionStatus.STOPPED)
         private val maintenanceRunningInProcess = AtomicBoolean(false)
         private val archiveStorageActiveInProcess = AtomicBoolean(false)
+        private val processMqttClientFacade = PahoMqttClientFacade()
         val archiveShareLeaseRegistry = ArchiveShareLeaseRegistry(
             elapsedRealtimeMs = { SystemClock.elapsedRealtime() }
         )

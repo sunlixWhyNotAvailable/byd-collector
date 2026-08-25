@@ -45,6 +45,40 @@ class CollectorServiceMqttRetryContractTest {
         assertFalse(service.contains("JobScheduler"))
     }
 
+    @Test
+    fun offlineTransitionDrainsTheWorkerAndReusesTheOwnedClient() {
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val maintenanceService = sourceFile("com/bydcollector/collector/service/DatabaseMaintenanceService.kt").readText()
+        val offline = service.substringAfter("private fun disconnectOfflineAsync")
+            .substringBefore("private fun completeMqttOffline")
+        val complete = service.substringAfter("private fun completeMqttOffline")
+            .substringBefore("private fun executeMqtt")
+        val reset = service.substringAfter("private fun resetMqttExecutorForOffline")
+            .substringBefore("private fun resetMqttExecutorForMaintenance")
+        val maintenance = service.substringAfter("private fun resetMqttExecutorForMaintenance")
+            .substringBefore("private fun shutdownMqttExecutor")
+        val destroy = service.substringAfter("override fun onDestroy()")
+            .substringBefore("override fun onTaskRemoved")
+        val startMain = service.substringAfter("private fun startMainIfNeeded")
+            .substringBefore("private fun startDebugIfNeeded")
+
+        assertTrue(offline.contains("resetMqttExecutorForOffline"))
+        assertFalse(startMain.contains("mqttOfflineQueued.set(false)"))
+        assertInOrder(reset, "shutdownNow()", "replacement.execute", "mqttExecutor = replacement")
+        assertInOrder(complete, "awaitMqttWorkerTermination(previous", "mqttCoordinator.disconnectOffline()")
+        assertFalse(
+            complete.substringAfter("if (!awaitMqttWorkerTermination")
+                .substringBefore("runCatching { mqttCoordinator.disconnectOffline() }")
+                .contains("return")
+        )
+        assertFalse(service.contains("oneShotMqttCoordinator"))
+        assertTrue(service.split("mqttCoordinator = createMqttCoordinator(processMqttClientFacade)").size == 3)
+        assertTrue(service.contains("private val processMqttClientFacade = PahoMqttClientFacade()"))
+        assertInOrder(maintenance, "previous.awaitTermination", "mqttCoordinator.disconnectForMaintenance()")
+        assertInOrder(destroy, "shutdownMqttExecutor()", "awaitMqttWorkerTermination(")
+        assertTrue(maintenanceService.contains("COLLECTOR_STOP_TIMEOUT_MS = 20_000L"))
+    }
+
     private fun sourceFile(path: String): File {
         return listOf(
             File("src/main/kotlin/$path"),

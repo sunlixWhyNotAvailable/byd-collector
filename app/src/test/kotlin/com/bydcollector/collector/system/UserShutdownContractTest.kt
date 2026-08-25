@@ -100,7 +100,7 @@ class UserShutdownContractTest {
     }
 
     @Test
-    fun shutdownWaitsForSerializedInfluxStopBeforeStopSelf() {
+    fun shutdownWaitsForMqttInfluxAndTelegramBeforeStopSelf() {
         val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
         val shutdown = service.substringAfter("private fun finishUserShutdown")
             .substringBefore("private fun stopServiceAfterUserShutdown")
@@ -108,7 +108,10 @@ class UserShutdownContractTest {
         assertInOrder(shutdown, "awaitSerializedExecutorAction(", "influxCoordinator.stopExport()")
         assertInOrder(shutdown, "influxCoordinator.stopExport()", "mainHandler.post { stopServiceAfterUserShutdown() }")
         assertInOrder(shutdown, "awaitExecutorTermination(", "mainHandler.post { stopServiceAfterUserShutdown() }")
-        assertTrue(shutdown.contains("if (!influxStopped || !telegramStopped)"))
+        assertInOrder(shutdown, "shutdownMqttExecutor()", "awaitMqttWorkerTermination(")
+        assertTrue(shutdown.contains("if (!mqttStopped || !influxStopped || !telegramStopped)"))
+        assertTrue(shutdown.contains("if (!mqttStopped && influxStopped && telegramStopped)"))
+        assertTrue(shutdown.contains("if (settings.isUserShutdownRequested()) finishUserShutdown()"))
         assertTrue(shutdown.contains("user_shutdown_worker_stop_timeout"))
     }
 

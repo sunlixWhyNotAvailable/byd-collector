@@ -40,9 +40,8 @@ class CollectorServiceRuntimeIntentContractTest {
             .substringBefore("private data class ChannelActionStatus")
         assertTrue(rejectedAction.contains("onFailedAction?.invoke()"))
         assertTrue(service.contains("mqttRuntimeStatus == RuntimeActionStatus.STOPPING"))
-        assertTrue(service.contains("offlineGeneration == mqttWorkGeneration.get()"))
-        assertTrue(service.contains("mqttOfflineCompletionGeneration.set(mqttWorkGeneration.get())"))
-        assertTrue(service.contains("completionGeneration == mqttWorkGeneration.get()"))
+        assertTrue(service.contains("if (!mqttOfflineQueued.compareAndSet(false, true)) return"))
+        assertTrue(!service.contains("mqttOfflineCompletionGeneration"))
         assertTrue(service.contains("if (completedOk) RuntimeActionStatus.STOPPED else RuntimeActionStatus.ERROR"))
         assertTrue(service.contains("settings.setTelegramConnectionStatus(\"failed\", \"telegram_test_error\")"))
     }

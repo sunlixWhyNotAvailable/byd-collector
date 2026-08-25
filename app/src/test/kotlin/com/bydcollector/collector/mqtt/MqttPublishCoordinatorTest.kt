@@ -9,6 +9,19 @@ import kotlin.test.assertTrue
 
 class MqttPublishCoordinatorTest {
     @Test
+    fun failedOfflineConnectStillReleasesTheFacade() {
+        val client = FakeMqttClient(connectResult = MqttActionResult.fail("mqtt_error", "broker down"))
+        val coordinator = coordinator(client = client)
+
+        val result = coordinator.disconnectOffline()
+
+        assertFalse(result.ok)
+        assertEquals(1, client.connectCount)
+        assertEquals(1, client.disconnectCount)
+        assertEquals(listOf<HaMqttMessage?>(null), client.disconnectMessages)
+    }
+
+    @Test
     fun testConnectionOnlyDoesNotPublishDiscoveryOrState() {
         val client = FakeMqttClient()
         val outbox = FakeOutboxStore()
@@ -391,7 +404,9 @@ class MqttPublishCoordinatorTest {
     ) : MqttClientFacade {
         val published = mutableListOf<HaMqttMessage>()
         val willMessages = mutableListOf<HaMqttMessage?>()
+        val disconnectMessages = mutableListOf<HaMqttMessage?>()
         var connectCount = 0
+        var disconnectCount = 0
 
         override fun connect(config: HaMqttConfig, willMessage: HaMqttMessage?): MqttActionResult {
             connectCount += 1
@@ -405,6 +420,8 @@ class MqttPublishCoordinatorTest {
         }
 
         override fun disconnect(gracefulMessage: HaMqttMessage?): MqttActionResult {
+            disconnectCount += 1
+            disconnectMessages += gracefulMessage
             gracefulMessage?.let { published += it }
             return MqttActionResult.ok()
         }

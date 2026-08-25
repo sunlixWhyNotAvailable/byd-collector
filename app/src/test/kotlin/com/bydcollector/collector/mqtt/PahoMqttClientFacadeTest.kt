@@ -23,24 +23,113 @@ class PahoMqttClientFacadeTest {
         assertEquals(1, handles.last().connectCount)
     }
 
+    @Test
+    fun offlineDisconnectReusesAndClosesTheOriginalHandleExactlyOnce() {
+        val handles = mutableListOf<FakeHandle>()
+        val facade = PahoMqttClientFacade { serverUri, clientId ->
+            FakeHandle(serverUri, clientId).also { handles += it }
+        }
+
+        assertTrue(facade.connect(config("bydcollector"), willMessage = null).ok)
+        assertTrue(facade.disconnect(offlineMessage()).ok)
+        assertTrue(facade.disconnect(offlineMessage()).ok)
+
+        assertEquals(1, handles.size)
+        assertEquals(5_000L, handles.single().timeToWaitMs)
+        assertEquals(1, handles.single().publishCount)
+        assertEquals(1, handles.single().disconnectCount)
+        assertEquals(1, handles.single().closeCount)
+    }
+
+    @Test
+    fun gracefulPublishFailureStillDisconnectsAndClosesOnce() {
+        val handle = FakeHandle("tcp://mqtt.local:1883", "bydcollector", failPublish = true)
+        val facade = PahoMqttClientFacade { _, _ -> handle }
+
+        assertTrue(facade.connect(config("bydcollector"), willMessage = null).ok)
+        assertTrue(!facade.disconnect(offlineMessage()).ok)
+
+        assertEquals(1, handle.publishCount)
+        assertEquals(1, handle.disconnectCount)
+        assertEquals(1, handle.closeCount)
+    }
+
+    @Test
+    fun failedConnectClosesTheNewHandleWithoutRetainingIt() {
+        val handles = mutableListOf<FakeHandle>()
+        val facade = PahoMqttClientFacade { serverUri, clientId ->
+            FakeHandle(serverUri, clientId, failConnect = true).also { handles += it }
+        }
+
+        assertTrue(!facade.connect(config("bydcollector"), willMessage = null).ok)
+        assertTrue(facade.disconnect(null).ok)
+
+        assertEquals(1, handles.size)
+        assertEquals(0, handles.single().disconnectCount)
+        assertEquals(1, handles.single().closeCount)
+    }
+
+    @Test
+    fun disconnectFailureStillClosesTheHandleExactlyOnce() {
+        val handle = FakeHandle("tcp://mqtt.local:1883", "bydcollector", failDisconnect = true)
+        val facade = PahoMqttClientFacade { _, _ -> handle }
+
+        assertTrue(facade.connect(config("bydcollector"), willMessage = null).ok)
+        assertTrue(!facade.disconnect(null).ok)
+
+        assertEquals(1, handle.disconnectCount)
+        assertEquals(1, handle.closeCount)
+    }
+
+    @Test
+    fun interruptedRetiredWorkerCannotCreateANewHandle() {
+        val handles = mutableListOf<FakeHandle>()
+        val facade = PahoMqttClientFacade { serverUri, clientId ->
+            FakeHandle(serverUri, clientId).also { handles += it }
+        }
+
+        Thread.currentThread().interrupt()
+        try {
+            assertTrue(!facade.connect(config("bydcollector"), willMessage = null).ok)
+        } finally {
+            Thread.interrupted()
+        }
+
+        assertTrue(handles.isEmpty())
+    }
+
     private class FakeHandle(
         override val serverUri: String,
-        override val clientId: String
+        override val clientId: String,
+        private val failConnect: Boolean = false,
+        private val failPublish: Boolean = false,
+        private val failDisconnect: Boolean = false
     ) : PahoMqttClientHandle {
         override var isConnected: Boolean = false
         var connectCount = 0
+        var publishCount = 0
         var disconnectCount = 0
         var closeCount = 0
+        var timeToWaitMs: Long? = null
+
+        override fun setTimeToWait(timeoutMs: Long) {
+            timeToWaitMs = timeoutMs
+        }
 
         override fun connect(options: MqttConnectOptions) {
             connectCount += 1
+            if (failConnect) error("connect failed")
             isConnected = true
         }
 
-        override fun publish(topic: String, message: MqttMessage) = Unit
+        override fun publish(topic: String, message: MqttMessage) {
+            publishCount += 1
+            if (failPublish) error("publish failed")
+        }
 
         override fun disconnect() {
             disconnectCount += 1
+            if (failDisconnect) error("disconnect failed")
             isConnected = false
         }
 
@@ -63,4 +152,11 @@ class PahoMqttClientFacadeTest {
             enabledCategories = HaMqttConfig.DEFAULT_CATEGORIES
         )
     }
+
+    private fun offlineMessage(): HaMqttMessage = HaMqttMessage(
+        topic = "bydcollector/status",
+        payload = "offline",
+        retained = true,
+        qos = 1
+    )
 }

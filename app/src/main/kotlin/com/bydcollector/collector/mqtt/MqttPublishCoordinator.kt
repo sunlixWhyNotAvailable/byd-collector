@@ -83,6 +83,7 @@ class MqttPublishCoordinator(
         val config = configProvider()
         val connect = client.connect(config, messageFactory.offlineMessage())
         if (!connect.ok) {
+            client.disconnect(null)
             recordRetryFailure(connect.message, retryStateStore.retryState())
             return connect
         }

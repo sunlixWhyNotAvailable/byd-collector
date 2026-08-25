@@ -224,9 +224,13 @@ class CollectorServiceMaintenanceContractTest {
     fun maintenanceClosesMqttWithoutRetainedOfflinePublish() {
         val source = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
         val stop = source.substringAfter("private fun stopRuntimeForMaintenance").substringBefore("private fun restoreRuntimeAfterMaintenance")
+        val reset = source.substringAfter("private fun resetMqttExecutorForMaintenance")
+            .substringBefore("private fun shutdownMqttExecutor")
 
-        assertTrue(stop.contains("mqttCoordinator.disconnectForMaintenance()"))
+        assertTrue(stop.contains("resetMqttExecutorForMaintenance()"))
+        assertInOrder(reset, "previous.awaitTermination", "mqttCoordinator.disconnectForMaintenance()")
         assertFalse(stop.contains("disconnectOfflineAsync()"))
+        assertFalse(reset.contains("disconnectOfflineAsync()"))
     }
 
     @Test
