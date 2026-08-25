@@ -63,8 +63,12 @@ object TelegramBuiltInTemplates {
     const val TELEMETRY_UNAVAILABLE_UK = "Телеметрія недоступна\nОстанні дані: {last_data_time}\nПомилка: {error}"
     const val TELEMETRY_UNAVAILABLE_EN = "Telemetry unavailable\nLast data: {last_data_time}\nError: {error}"
     const val TRIP_SUMMARY_UK =
-        "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\nВитрата: {trip_energy_kwh} кВт·год, SOC: {soc_start}% -> {soc_end}%\nЗагалом: {total_distance_km} км / {total_duration}\nВитрата: {total_energy_kwh} кВт·год, SOC: {soc_start}% -> {soc_end}%"
+        "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\nВитрата: {trip_energy_kwh} кВт·год, SOC: {soc_start}% -> {soc_end}%\nЗагалом: {total_distance_km} км / {total_duration}\nВитрата: {total_energy_kwh} кВт·год, SOC: {total_soc_start}% -> {total_soc_end}%"
     const val TRIP_SUMMARY_EN =
+        "Trip complete\nCurrent trip: {trip_distance_km} km / {trip_duration}\nEnergy used: {trip_energy_kwh} kWh, SOC: {soc_start}% -> {soc_end}%\nTotal: {total_distance_km} km / {total_duration}\nEnergy used: {total_energy_kwh} kWh, SOC: {total_soc_start}% -> {total_soc_end}%"
+    private const val HISTORIC_TRIP_SUMMARY_SAME_SOC_UK =
+        "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\nВитрата: {trip_energy_kwh} кВт·год, SOC: {soc_start}% -> {soc_end}%\nЗагалом: {total_distance_km} км / {total_duration}\nВитрата: {total_energy_kwh} кВт·год, SOC: {soc_start}% -> {soc_end}%"
+    private const val HISTORIC_TRIP_SUMMARY_SAME_SOC_EN =
         "Trip complete\nCurrent trip: {trip_distance_km} km / {trip_duration}\nEnergy used: {trip_energy_kwh} kWh, SOC: {soc_start}% -> {soc_end}%\nTotal: {total_distance_km} km / {total_duration}\nEnergy used: {total_energy_kwh} kWh, SOC: {soc_start}% -> {soc_end}%"
 
     private val current = mapOf(
@@ -97,12 +101,14 @@ object TelegramBuiltInTemplates {
         TelegramEventType.TRIP_SUMMARY to mapOf(
             TelegramTemplateLanguage.UK to setOf(
                 "Поїздку завершено\nВідстань: {trip_distance_km} км за {trip_duration}\nSOC: {soc_start}% -> {soc_end}%\nЕнергія: {trip_energy_kwh} кВт·год",
-                "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\nВитрата: {trip_energy_kwh} кВт·год, SOC: {soc_start}% -> {soc_end}%\nЗагалом: {total_distance_km} км / {total_duration}\nВитрата: {total_energy_kwh} кВт·год"
+                "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\nВитрата: {trip_energy_kwh} кВт·год, SOC: {soc_start}% -> {soc_end}%\nЗагалом: {total_distance_km} км / {total_duration}\nВитрата: {total_energy_kwh} кВт·год",
+                HISTORIC_TRIP_SUMMARY_SAME_SOC_UK
             ),
             TelegramTemplateLanguage.EN to setOf(
                 "Trip complete\nDistance: {trip_distance_km} km in {trip_duration}\nSOC: {soc_start}% -> {soc_end}%\nEnergy: {trip_energy_kwh} kWh",
                 "Trip complete: {trip_distance_km} km, {trip_energy_kwh} kWh at {time}.",
-                "Trip complete\nCurrent trip: {trip_distance_km} km / {trip_duration}\nEnergy used: {trip_energy_kwh} kWh, SOC: {soc_start}% -> {soc_end}%\nTotal: {total_distance_km} km / {total_duration}\nEnergy used: {total_energy_kwh} kWh"
+                "Trip complete\nCurrent trip: {trip_distance_km} km / {trip_duration}\nEnergy used: {trip_energy_kwh} kWh, SOC: {soc_start}% -> {soc_end}%\nTotal: {total_distance_km} km / {total_duration}\nEnergy used: {total_energy_kwh} kWh",
+                HISTORIC_TRIP_SUMMARY_SAME_SOC_EN
             )
         ),
         TelegramEventType.CHARGED_TO_100 to mapOf(
@@ -253,6 +259,8 @@ object TelegramTemplateCatalog {
                 "trip_duration",
                 "soc_start",
                 "soc_end",
+                "total_soc_start",
+                "total_soc_end",
                 "total_distance_km",
                 "total_energy_kwh",
                 "total_duration",

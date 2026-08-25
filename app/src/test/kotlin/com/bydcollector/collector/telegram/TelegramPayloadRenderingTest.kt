@@ -153,6 +153,8 @@ class TelegramPayloadRenderingTest {
             "trip_duration" to "0:24",
             "soc_start" to "81",
             "soc_end" to "76",
+            "total_soc_start" to "81",
+            "total_soc_end" to "76",
             "total_distance_km" to "12.3",
             "total_energy_kwh" to "3.4",
             "total_duration" to "0:24",

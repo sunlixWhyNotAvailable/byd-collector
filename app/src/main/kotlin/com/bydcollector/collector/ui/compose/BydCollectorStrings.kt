@@ -379,6 +379,8 @@ private val telegramUk = TelegramStrings(
         "trip_duration" to "Тривалість поїздки",
         "soc_start" to "SOC на початку поїздки, %",
         "soc_end" to "SOC наприкінці поїздки, %",
+        "total_soc_start" to "SOC на початку загального підсумку, %",
+        "total_soc_end" to "SOC наприкінці загального підсумку, %",
         "total_distance_km" to "Загальна відстань, км",
         "total_energy_kwh" to "Загальна витрата енергії, кВт·год",
         "total_duration" to "Загальна тривалість поїздок"
@@ -478,6 +480,8 @@ private val telegramEn = TelegramStrings(
         "trip_duration" to "Trip duration",
         "soc_start" to "SOC at trip start, %",
         "soc_end" to "SOC at trip end, %",
+        "total_soc_start" to "SOC at overall-summary start, %",
+        "total_soc_end" to "SOC at overall-summary end, %",
         "total_distance_km" to "Total distance, km",
         "total_energy_kwh" to "Total energy used, kWh",
         "total_duration" to "Total trip duration"

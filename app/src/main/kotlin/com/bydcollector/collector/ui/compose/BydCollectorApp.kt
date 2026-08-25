@@ -442,6 +442,8 @@ private val TelegramMessageDefinitions = listOf(
             "trip_duration",
             "soc_start",
             "soc_end",
+            "total_soc_start",
+            "total_soc_end",
             "total_distance_km",
             "total_energy_kwh",
             "total_duration",

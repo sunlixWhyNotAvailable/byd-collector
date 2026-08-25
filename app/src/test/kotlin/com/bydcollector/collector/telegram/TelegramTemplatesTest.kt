@@ -118,6 +118,8 @@ class TelegramTemplatesTest {
             "trip_energy_kwh" to "3.4",
             "soc_start" to "81",
             "soc_end" to "76",
+            "total_soc_start" to "84",
+            "total_soc_end" to "75",
             "total_distance_km" to "456.7",
             "total_duration" to "12:34:56",
             "total_energy_kwh" to "98.7"
@@ -125,7 +127,7 @@ class TelegramTemplatesTest {
         assertEquals(
             "Поїздку завершено\nПоточна поїздка: 12.3 км / 00:24:18\n" +
                 "Витрата: 3.4 кВт·год, SOC: 81% -> 76%\n" +
-                "Загалом: 456.7 км / 12:34:56\nВитрата: 98.7 кВт·год, SOC: 81% -> 76%",
+                "Загалом: 456.7 км / 12:34:56\nВитрата: 98.7 кВт·год, SOC: 84% -> 75%",
             TelegramTemplateRenderer.render(
                 TelegramEventType.TRIP_SUMMARY,
                 TelegramBuiltInTemplates.TRIP_SUMMARY_UK,
@@ -135,7 +137,7 @@ class TelegramTemplatesTest {
         assertEquals(
             "Trip complete\nCurrent trip: 12.3 km / 00:24:18\n" +
                 "Energy used: 3.4 kWh, SOC: 81% -> 76%\n" +
-                "Total: 456.7 km / 12:34:56\nEnergy used: 98.7 kWh, SOC: 81% -> 76%",
+                "Total: 456.7 km / 12:34:56\nEnergy used: 98.7 kWh, SOC: 84% -> 75%",
             TelegramTemplateRenderer.render(
                 TelegramEventType.TRIP_SUMMARY,
                 TelegramBuiltInTemplates.TRIP_SUMMARY_EN,
@@ -152,6 +154,8 @@ class TelegramTemplatesTest {
             "trip_energy_kwh" to "3.4",
             "soc_start" to "81",
             "soc_end" to "76",
+            "total_soc_start" to "81",
+            "total_soc_end" to "76",
             "total_distance_km" to "12.3",
             "total_duration" to "00:24:18",
             "total_energy_kwh" to "3.4"
@@ -197,6 +201,29 @@ class TelegramTemplatesTest {
         assertEquals(
             custom,
             TelegramBuiltInTemplates.migrateKnownSaved(TelegramEventType.TRIP_SUMMARY.key, custom)
+        )
+    }
+
+    @Test
+    fun previousOverallSocBuiltInsMigrateToDistinctTotalSocVariables() {
+        val previousUk =
+            "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\n" +
+                "Витрата: {trip_energy_kwh} кВт·год, SOC: {soc_start}% -> {soc_end}%\n" +
+                "Загалом: {total_distance_km} км / {total_duration}\n" +
+                "Витрата: {total_energy_kwh} кВт·год, SOC: {soc_start}% -> {soc_end}%"
+        val previousEn =
+            "Trip complete\nCurrent trip: {trip_distance_km} km / {trip_duration}\n" +
+                "Energy used: {trip_energy_kwh} kWh, SOC: {soc_start}% -> {soc_end}%\n" +
+                "Total: {total_distance_km} km / {total_duration}\n" +
+                "Energy used: {total_energy_kwh} kWh, SOC: {soc_start}% -> {soc_end}%"
+
+        assertEquals(
+            TelegramBuiltInTemplates.TRIP_SUMMARY_UK,
+            TelegramBuiltInTemplates.migrateKnownSaved(TelegramEventType.TRIP_SUMMARY.key, previousUk)
+        )
+        assertEquals(
+            TelegramBuiltInTemplates.TRIP_SUMMARY_EN,
+            TelegramBuiltInTemplates.migrateKnownSaved(TelegramEventType.TRIP_SUMMARY.key, previousEn)
         )
     }
 

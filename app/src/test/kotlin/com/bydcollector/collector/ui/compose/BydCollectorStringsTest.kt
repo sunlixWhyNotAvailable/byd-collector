@@ -175,5 +175,7 @@ class BydCollectorStringsTest {
         )
         assertEquals("Доданий заряд за поточний крок, %", uk.variableDescriptions["charge_step_added_percent"])
         assertEquals("Total trip duration", en.variableDescriptions["total_duration"])
+        assertEquals("SOC на початку загального підсумку, %", uk.variableDescriptions["total_soc_start"])
+        assertEquals("SOC at overall-summary end, %", en.variableDescriptions["total_soc_end"])
     }
 }
