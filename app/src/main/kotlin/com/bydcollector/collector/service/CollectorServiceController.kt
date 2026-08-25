@@ -53,12 +53,39 @@ object CollectorServiceController {
         }
     }
 
+    fun reconcileDebug(context: Context) {
+        val intent = CollectorService.reconcileDebugIntent(context)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
+    }
+
+    fun reconcileMqttExport(context: Context) {
+        val intent = CollectorService.reconcileMqttExportIntent(context)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
+    }
+
     fun stopMqttExport(context: Context) {
         context.startService(CollectorService.stopMqttExportIntent(context))
     }
 
     fun startInfluxExport(context: Context) {
         val intent = CollectorService.startInfluxExportIntent(context)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
+    }
+
+    fun reconcileInfluxExport(context: Context) {
+        val intent = CollectorService.reconcileInfluxExportIntent(context)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             context.startForegroundService(intent)
         } else {

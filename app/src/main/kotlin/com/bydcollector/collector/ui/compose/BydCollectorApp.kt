@@ -1264,6 +1264,7 @@ private fun MqttCard(
             onStop = actions::onStopMqtt,
             onTest = actions::onTestMqtt,
             runtimeStatus = state?.mqttRuntimeStatus ?: RuntimeActionStatus.STOPPED,
+            channelEnabled = state?.mqttEnabled == true,
             testInFlight = actionUiState.mqttTest
         )
         Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1298,6 +1299,7 @@ private fun InfluxCard(
             onStop = actions::onStopInflux,
             onTest = actions::onTestInflux,
             runtimeStatus = state?.influxRuntimeStatus ?: RuntimeActionStatus.STOPPED,
+            channelEnabled = state?.influxEnabled == true,
             testInFlight = actionUiState.influxTest
         )
         Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1378,6 +1380,7 @@ private fun ChannelButtons(
     onStop: () -> Unit,
     onTest: () -> Unit,
     runtimeStatus: RuntimeActionStatus,
+    channelEnabled: Boolean,
     testInFlight: Boolean
 ) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -1391,7 +1394,8 @@ private fun ChannelButtons(
         ActionButton(
             if (runtimeStatus == RuntimeActionStatus.STOPPING) strings.stopping else strings.stop,
             onStop,
-            enabled = runtimeStatus != RuntimeActionStatus.STOPPING && runtimeStatus != RuntimeActionStatus.STOPPED,
+            enabled = runtimeStatus != RuntimeActionStatus.STOPPING &&
+                (runtimeStatus != RuntimeActionStatus.STOPPED || channelEnabled),
             modifier = Modifier.weight(1f)
         )
         ActionButton(
@@ -3036,12 +3040,7 @@ private fun compactChannelStatusText(
     strings: UiStrings,
     runtimeStatus: RuntimeActionStatus? = null
 ): String {
-    when (runtimeStatus) {
-        RuntimeActionStatus.STARTING -> return strings.starting
-        RuntimeActionStatus.STOPPING -> return strings.stopping
-        else -> Unit
-    }
-    return ChannelStatusFormatter.compactText(status, strings)
+    return ChannelStatusFormatter.compactText(status, strings, runtimeStatus)
 }
 
 private fun channelStatusKind(
@@ -3049,11 +3048,5 @@ private fun channelStatusKind(
     enabled: Boolean,
     runtimeStatus: RuntimeActionStatus? = null
 ): StatusKind {
-    when (runtimeStatus) {
-        RuntimeActionStatus.STARTING, RuntimeActionStatus.STOPPING -> return StatusKind.WAITING
-        RuntimeActionStatus.ERROR -> return StatusKind.ERROR
-        RuntimeActionStatus.RUNNING -> return StatusKind.OK
-        else -> Unit
-    }
-    return ChannelStatusFormatter.kind(status, enabled)
+    return ChannelStatusFormatter.kind(status, enabled, runtimeStatus)
 }

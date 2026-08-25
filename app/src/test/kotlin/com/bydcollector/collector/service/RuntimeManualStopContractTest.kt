@@ -24,12 +24,14 @@ class RuntimeManualStopContractTest {
     @Test
     fun serviceDoesNotAutoStartChannelsHeldByManualStop() {
         val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val settings = sourceFile("com/bydcollector/collector/service/CollectorSettings.kt").readText()
 
         assertTrue(service.contains("val mainAllowed = mainEnabled && !settings.isMainManuallyStopped()"))
         assertTrue(service.contains("val debugAllowed = debugEnabled && !settings.isDebugManuallyStopped()"))
-        assertTrue(service.contains("if (settings.isMqttAutoStartEnabled() && !settings.isMqttManuallyStopped()) startMqttExport(clearManualStop = false)"))
-        assertTrue(service.contains("(settings.isInfluxEnabled() || settings.isInfluxAutoStartEnabled())"))
-        assertTrue(service.contains("!settings.isInfluxManuallyStopped()"))
+        assertTrue(service.contains("if (runtimeDemand.mqtt) startMqttExport(clearManualStop = false)"))
+        assertTrue(service.contains("(settings.isInfluxEnabled() || runtimeDemand.influx)"))
+        assertTrue(settings.contains("isMqttAutoStartEnabled() || includeEnabledExports && isMqttEnabled()"))
+        assertTrue(settings.contains("isInfluxAutoStartEnabled() || includeEnabledExports && isInfluxEnabled()"))
         assertTrue(service.contains("settings.setMqttManuallyStopped(true)"))
         assertTrue(service.contains("settings.setInfluxManuallyStopped(true)"))
     }
@@ -44,6 +46,30 @@ class RuntimeManualStopContractTest {
         assertTrue(service.contains("startInfluxExport(clearManualStop = true)"))
         assertTrue(autoStart.contains("settings.clearRuntimeManualStops()"))
         assertTrue(activity.contains("settings.clearRuntimeManualStops()"))
+    }
+
+    @Test
+    fun recoveryAndStickyRestartRouteOnlyTheDemandedChannels() {
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val autoStart = sourceFile("com/bydcollector/collector/system/CollectorAutoStart.kt").readText()
+        val onStart = service.substringAfter("override fun onStartCommand").substringBefore("override fun onDestroy")
+        val stickyReconcile = service.substringAfter("private fun reconcilePersistedRuntime").substringBefore("private fun reconcileMqttAutoStart")
+        val recoveryDispatch = autoStart.substringAfter("private fun dispatchRuntimeRecovery").substringBeforeLast("}")
+
+        assertFalse(onStart.contains("intent?.action ?: ACTION_START"))
+        assertTrue(onStart.contains("stickyRestart -> reconcilePersistedRuntime()") || onStart.contains("if (stickyRestart)"))
+        assertTrue(
+            onStart.indexOf("if (stickyRestart) reconcilePendingCutoverArchiveStorage(action)") <
+                onStart.indexOf("reconcilePersistedRuntime()")
+        )
+        assertTrue(onStart.contains("ACTION_RECONCILE_KEEP_ALIVE -> reconcilePersistedRuntime(reconcileKeepAliveState = true)"))
+        assertTrue(stickyReconcile.contains("runtimeDemand(includeEnabledExports = true)"))
+        assertTrue(stickyReconcile.contains("RuntimeRecoveryAction.MQTT -> startMqttExport(clearManualStop = false)"))
+        assertTrue(stickyReconcile.contains("RuntimeRecoveryAction.INFLUX -> startInfluxExport(clearManualStop = false)"))
+        assertTrue(stickyReconcile.contains("RuntimeRecoveryAction.TELEGRAM -> reconcileTelegramRuntime"))
+        assertTrue(stickyReconcile.contains("RuntimeRecoveryAction.MAIN -> reconcileCollection()"))
+        assertTrue(recoveryDispatch.contains("RuntimeRecoveryAction.TELEGRAM -> CollectorServiceController.reconcileTelegram(context)"))
+        assertTrue(recoveryDispatch.contains("RuntimeRecoveryAction.MAIN -> CollectorServiceController.start(context)"))
     }
 
     @Test

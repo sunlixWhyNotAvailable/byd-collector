@@ -27,7 +27,7 @@ class UserShutdownContractTest {
         val autoStart = sourceFile("com/bydcollector/collector/system/CollectorAutoStart.kt").readText()
         val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
 
-        assertTrue(autoStart.contains("if (settings.isUserShutdownRequested()) return false"))
+        assertTrue(autoStart.contains("if (settings.isUserShutdownRequested()) {"))
         assertTrue(activity.contains("val clearedUserShutdown = settings.clearUserShutdownRequestIfSet()"))
         assertTrue(activity.contains("if (clearedUserShutdown)"))
         assertTrue(activity.contains("settings.clearRuntimeManualStops()"))
@@ -62,7 +62,7 @@ class UserShutdownContractTest {
         assertFalse(service.contains("settings.setDebugAutoStartEnabled(false)"))
         assertFalse(service.contains("settings.setMqttAutoStartEnabled(false)"))
         assertFalse(service.contains("settings.setInfluxAutoStartEnabled(false)"))
-        assertTrue(autoStart.contains("syncDebugAutoStart(settings)"))
+        assertTrue(autoStart.contains("settings.setDebugPollingEnabled(demand.debug)"))
     }
 
     @Test

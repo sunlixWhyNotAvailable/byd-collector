@@ -13,6 +13,8 @@ import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorServiceController
 import com.bydcollector.collector.service.CollectorSettings
+import com.bydcollector.collector.service.RuntimeDemand
+import com.bydcollector.collector.service.RuntimeRecoveryAction
 
 //restores collector service intent after boot, task removal, ui close, or keep-alive recovery broadcasts
 object CollectorAutoStart {
@@ -30,22 +32,23 @@ object CollectorAutoStart {
         if (CollectorSettings.isDbMaintenanceRunning(appContext)) return
         val store = BydCollectorApplication.store(appContext)
         val settings = CollectorSettings(appContext, store)
-        if (!shouldRunService(settings)) {
-            store.recordEvent("boot_auto_start_skipped", "Auto-start, keep-alive, and Telegram disabled", action)
+        if (settings.isUserShutdownRequested()) {
+            store.recordEvent("boot_auto_start_skipped", "User shutdown blocks runtime recovery", action)
             cancelRetry(appContext)
             cancelWatchdog(appContext)
             return
         }
-
         if (clearsManualStops(action)) {
             settings.clearRuntimeManualStops()
         }
-        if (settings.isAutoStartEnabled()) {
-            //auto-start means main polling should become enabled again after device/process recovery
-            ensurePollingEnabled(settings)
-            syncDebugAutoStart(settings)
+        val demand = prepareRuntimeDemand(settings)
+        if (!demand.any) {
+            store.recordEvent("boot_auto_start_skipped", "No runtime channel is eligible for recovery", action)
+            cancelRetry(appContext)
+            cancelWatchdog(appContext)
+            return
         }
-        if (clearsManualStops(action) && settings.isAutoStartEnabled() && settings.hasActiveAccessWork()) {
+        if (clearsManualStops(action) && demand.main && settings.hasActiveAccessWork()) {
             AdbAuthorizationManager.request(
                 context = appContext,
                 store = store,
@@ -56,7 +59,7 @@ object CollectorAutoStart {
         }
         if (CollectorService.isRunning()) {
             //reconciles an already-running service instead of assuming its previous flags are still correct
-            requestServiceReconcile(appContext, settings, store, action)
+            requestServiceReconcile(appContext, demand, store, action)
             cancelRetry(appContext)
             scheduleWatchdog(appContext, settings, store)
             return
@@ -65,7 +68,7 @@ object CollectorAutoStart {
         attemptStart(
             context = appContext,
             store = store,
-            keepAliveOnly = keepAliveOnly(settings),
+            demand = demand,
             category = if (action == ACTION_RETRY_AUTO_START) "boot_auto_start_retry" else "boot_auto_start_attempt",
             successCategory = "boot_auto_start_requested",
             failureCategory = "boot_auto_start_failure",
@@ -78,20 +81,18 @@ object CollectorAutoStart {
 
     fun recoverFromForeground(context: Context, settings: CollectorSettings, store: TelemetryStore) {
         val appContext = context.applicationContext
-        if (CollectorSettings.isDbMaintenanceRunning(appContext) || !shouldRunService(settings)) return
-        if (settings.isAutoStartEnabled()) {
-            ensurePollingEnabled(settings)
-            syncDebugAutoStart(settings)
-        }
+        if (CollectorSettings.isDbMaintenanceRunning(appContext)) return
+        val demand = prepareRuntimeDemand(settings)
+        if (!demand.any) return
         if (CollectorService.isRunning()) {
-            requestServiceReconcile(appContext, settings, store, "foreground_auto_start_recovery")
+            requestServiceReconcile(appContext, demand, store, "foreground_auto_start_recovery")
             return
         }
 
         attemptStart(
             context = appContext,
             store = store,
-            keepAliveOnly = keepAliveOnly(settings),
+            demand = demand,
             category = "foreground_auto_start_recovery",
             successCategory = "foreground_auto_start_requested",
             failureCategory = "foreground_auto_start_failure",
@@ -107,15 +108,14 @@ object CollectorAutoStart {
     ) {
         val appContext = context.applicationContext
         if (CollectorSettings.isDbMaintenanceRunning(appContext)) return
-        if (!shouldRunService(settings)) {
+        val demand = prepareRuntimeDemand(settings)
+        if (!demand.any) {
             store.recordEvent(
                 "task_removed_no_autostart",
-                "Collector restart ignored after task removal because auto-start, keep-alive, and Telegram are disabled"
+                "Collector restart ignored after task removal because no runtime channel is eligible"
             )
             return
         }
-
-        if (settings.isAutoStartEnabled()) ensurePollingEnabled(settings)
         scheduleRetry(
             context = appContext,
             store = store,
@@ -132,10 +132,10 @@ object CollectorAutoStart {
     ) {
         val appContext = context.applicationContext
         if (CollectorSettings.isDbMaintenanceRunning(appContext)) return
-        if (!shouldRunService(settings)) return
-        if (settings.isAutoStartEnabled()) ensurePollingEnabled(settings)
+        val demand = prepareRuntimeDemand(settings)
+        if (!demand.any) return
         if (CollectorService.isRunning()) {
-            requestServiceReconcile(appContext, settings, store, "ui_closed_restart")
+            requestServiceReconcile(appContext, demand, store, "ui_closed_restart")
             scheduleWatchdog(appContext, settings, store)
             return
         }
@@ -188,30 +188,25 @@ object CollectorAutoStart {
             action != ACTION_KEEP_ALIVE_RECOVERY
     }
 
-    private fun syncDebugAutoStart(settings: CollectorSettings) {
-        if (settings.isDebugAutoStartEnabled()) {
+    private fun prepareRuntimeDemand(settings: CollectorSettings): RuntimeDemand {
+        val demand = settings.runtimeDemand()
+        if (demand.main) {
+            ensurePollingEnabled(settings)
+            settings.setDebugPollingEnabled(demand.debug)
+        } else if (demand.debug) {
             settings.setDebugPollingEnabled(true)
-        } else {
-            settings.setDebugPollingEnabled(false)
         }
+        return demand
     }
 
     private fun shouldRunService(settings: CollectorSettings): Boolean {
-        if (settings.isUserShutdownRequested()) return false
-        //Telegram can drain its durable queue without forcing vehicle polling on.
-        return settings.isAutoStartEnabled() || settings.keepAliveConfig().anyEnabled || settings.isTelegramEnabled()
-    }
-
-    private fun keepAliveOnly(settings: CollectorSettings): Boolean {
-        return !settings.isAutoStartEnabled() &&
-            settings.keepAliveConfig().anyEnabled &&
-            !settings.isTelegramEnabled()
+        return settings.runtimeDemand().any
     }
 
     private fun attemptStart(
         context: Context,
         store: TelemetryStore,
-        keepAliveOnly: Boolean,
+        demand: RuntimeDemand,
         category: String,
         successCategory: String,
         failureCategory: String,
@@ -220,12 +215,7 @@ object CollectorAutoStart {
     ) {
         try {
             store.recordEvent(category, message, detail)
-            //chooses keep-alive-only reconcile when the user wants radios alive but not telemetry polling
-            if (keepAliveOnly) {
-                CollectorServiceController.reconcileKeepAlive(context)
-            } else {
-                CollectorServiceController.start(context)
-            }
+            dispatchRuntimeRecovery(context, demand)
             store.recordEvent(successCategory, "Collector service start requested", detail)
         } catch (error: RuntimeException) {
             store.recordEvent(
@@ -238,29 +228,37 @@ object CollectorAutoStart {
 
     private fun requestServiceReconcile(
         context: Context,
-        settings: CollectorSettings,
+        demand: RuntimeDemand,
         store: TelemetryStore,
         action: String
     ) {
         val appContext = context.applicationContext
-        val keepAliveOnly = keepAliveOnly(settings)
         try {
             store.recordEvent(
                 "auto_start_reconcile_requested",
                 "Collector already running; requested service reconcile",
-                "action=$action keep_alive_only=$keepAliveOnly"
+                "action=$action channels=${demand.recoveryActions().joinToString(",") { it.name }}"
             )
-            if (keepAliveOnly) {
-                CollectorServiceController.reconcileKeepAlive(appContext)
-            } else {
-                CollectorServiceController.start(appContext)
-            }
+            dispatchRuntimeRecovery(appContext, demand)
         } catch (error: RuntimeException) {
             store.recordEvent(
                 "auto_start_reconcile_failure",
                 "Foreground service reconcile request failed",
                 "${error::class.java.simpleName}: ${error.message ?: "no message"}"
             )
+        }
+    }
+
+    private fun dispatchRuntimeRecovery(context: Context, demand: RuntimeDemand) {
+        demand.recoveryActions().forEach { action ->
+            when (action) {
+                RuntimeRecoveryAction.MAIN -> CollectorServiceController.start(context)
+                RuntimeRecoveryAction.DEBUG -> CollectorServiceController.reconcileDebug(context)
+                RuntimeRecoveryAction.MQTT -> CollectorServiceController.reconcileMqttExport(context)
+                RuntimeRecoveryAction.INFLUX -> CollectorServiceController.reconcileInfluxExport(context)
+                RuntimeRecoveryAction.TELEGRAM -> CollectorServiceController.reconcileTelegram(context)
+                RuntimeRecoveryAction.KEEP_ALIVE -> CollectorServiceController.reconcileKeepAlive(context)
+            }
         }
     }
 

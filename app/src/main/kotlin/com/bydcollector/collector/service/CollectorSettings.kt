@@ -51,6 +51,20 @@ class CollectorSettings(
 
     fun isAutoStartEnabled(): Boolean = prefs.getBoolean(KEY_AUTO_START, false)
 
+    fun runtimeDemand(includeEnabledExports: Boolean = false): RuntimeDemand {
+        if (isUserShutdownRequested()) return RuntimeDemand()
+        return RuntimeDemand(
+            main = isAutoStartEnabled() && !isMainManuallyStopped(),
+            debug = isDebugAutoStartEnabled() && !isDebugManuallyStopped(),
+            mqtt = (isMqttAutoStartEnabled() || includeEnabledExports && isMqttEnabled()) &&
+                !isMqttManuallyStopped(),
+            influx = (isInfluxAutoStartEnabled() || includeEnabledExports && isInfluxEnabled()) &&
+                !isInfluxManuallyStopped(),
+            telegram = isTelegramEnabled(),
+            keepAlive = keepAliveConfig().anyEnabled
+        )
+    }
+
     fun hasActiveAccessWork(): Boolean {
         return (isPollingEnabled() && !isMainManuallyStopped()) ||
             (isDebugPollingEnabled() && !isDebugManuallyStopped()) ||

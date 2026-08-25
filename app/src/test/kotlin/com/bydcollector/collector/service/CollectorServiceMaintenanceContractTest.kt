@@ -75,7 +75,7 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(stop.contains("influxCoordinator.stopExport()"))
         assertInOrder(
             reset,
-            "influxWorkGeneration.incrementAndGet()",
+            "advanceInfluxGeneration()",
             "previous.awaitTermination(INFLUX_MAINTENANCE_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)",
             "check(stopped)",
             "influxExecutor = namedSingleThreadExecutor(\"byd-influx\")"
@@ -225,7 +225,8 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(startMaintenance.contains("CollectorAutoStart.cancelScheduled(applicationContext)"))
         assertInOrder(handleBroadcast, "CollectorSettings.isDbMaintenanceRunning(appContext)", "BydCollectorApplication.store(appContext)")
         assertTrue(handleBroadcast.contains("if (CollectorSettings.isDbMaintenanceRunning(appContext)) return"))
-        assertTrue(recoverFromForeground.contains("if (CollectorSettings.isDbMaintenanceRunning(appContext) || !shouldRunService(settings)) return"))
+        assertTrue(recoverFromForeground.contains("if (CollectorSettings.isDbMaintenanceRunning(appContext)) return"))
+        assertTrue(recoverFromForeground.contains("if (!demand.any) return"))
         assertTrue(taskRemoved.contains("if (CollectorSettings.isDbMaintenanceRunning(appContext)) return"))
         assertTrue(uiClosed.contains("if (CollectorSettings.isDbMaintenanceRunning(appContext)) return"))
         assertTrue(watchdog.contains("if (CollectorSettings.isDbMaintenanceRunning(appContext)) return"))
@@ -264,6 +265,9 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(service.contains("private val archiveStorageExecutor = namedSingleThreadExecutor(\"byd-archive-storage\")"))
         assertTrue(service.contains("enqueueArchiveStorageMaintenance(result.archivePath)"))
         assertTrue(service.contains("ACTION_RECONCILE_ARCHIVE_STORAGE"))
+        val pendingArchiveReconcile = service.substringAfter("private fun reconcilePendingCutoverArchiveStorage")
+            .substringBefore("private fun enqueueArchiveDelete")
+        assertTrue(pendingArchiveReconcile.contains("ACTION_RECONCILE_ARCHIVE_STORAGE"))
         assertTrue(service.contains("ACTION_DELETE_ARCHIVES"))
         assertTrue(service.contains("ArchiveStorageManager("))
         assertTrue(service.contains("elapsedRealtimeMs = { SystemClock.elapsedRealtime() }"))

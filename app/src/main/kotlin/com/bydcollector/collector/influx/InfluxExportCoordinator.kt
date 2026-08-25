@@ -29,19 +29,24 @@ class InfluxExportCoordinator(
         store.ensureInfluxCursors(fieldKeys)
         val pending = store.pendingInfluxSummary(fieldKeys)
         val state = store.influxExportState()
+        val preservesFailure = pending.rows > 0L && state.status == STATUS_BACKOFF && !state.nextRetryAt.isNullOrBlank()
         store.updateInfluxExportState(
-            status = if (pending.rows == 0L) "running" else state.status.takeUnless { it == "stopped" } ?: "running",
+            status = when {
+                pending.rows == 0L -> STATUS_IDLE
+                preservesFailure -> STATUS_BACKOFF
+                else -> STATUS_SCHEDULED
+            },
             mode = modeFor(pending.rows),
             pendingRows = pending.rows,
             oldestPendingAt = pending.oldestObservedAt,
             nextRetryAt = when {
-                !state.nextRetryAt.isNullOrBlank() -> state.nextRetryAt
                 pending.rows == 0L -> null
+                !state.nextRetryAt.isNullOrBlank() -> state.nextRetryAt
                 else -> plusSeconds(clock.nowIso(), SUCCESS_BATCH_INTERVAL_SECONDS)
             },
             lastSuccessAt = state.lastSuccessAt,
-            lastErrorAt = state.lastErrorAt,
-            lastError = state.lastError,
+            lastErrorAt = state.lastErrorAt.takeIf { preservesFailure },
+            lastError = state.lastError.takeIf { preservesFailure },
             exportedRowsDelta = 0
         )
         return InfluxActionResult.ok("resumed")
@@ -66,7 +71,7 @@ class InfluxExportCoordinator(
         val pending = store.pendingInfluxSummary(fieldKeys)
         val state = store.influxExportState()
         store.updateInfluxExportState(
-            status = "stopped",
+            status = STATUS_STOPPED,
             mode = modeFor(pending.rows),
             pendingRows = pending.rows,
             oldestPendingAt = pending.oldestObservedAt,
@@ -101,14 +106,14 @@ class InfluxExportCoordinator(
         val fieldKeys = effectiveFields(config)
         if (fieldKeys.isEmpty()) {
             store.updateInfluxExportState(
-                status = "running",
+                status = STATUS_IDLE,
                 mode = "realtime",
                 pendingRows = 0,
                 oldestPendingAt = null,
                 nextRetryAt = null,
                 lastSuccessAt = state.lastSuccessAt,
-                lastErrorAt = state.lastErrorAt,
-                lastError = state.lastError,
+                lastErrorAt = null,
+                lastError = null,
                 exportedRowsDelta = 0
             )
             return InfluxActionResult.ok("no fields enabled")
@@ -118,15 +123,16 @@ class InfluxExportCoordinator(
         val pendingBefore = store.pendingInfluxSummary(fieldKeys)
         //honors the short success pacing and the longer persisted failure backoff
         if (!force && !state.nextRetryAt.isNullOrBlank() && !retryDue(state.nextRetryAt, clock.nowIso())) {
+            val preservesFailure = state.status == STATUS_BACKOFF
             store.updateInfluxExportState(
-                status = state.status,
+                status = if (preservesFailure) STATUS_BACKOFF else STATUS_SCHEDULED,
                 mode = modeFor(pendingBefore.rows),
                 pendingRows = pendingBefore.rows,
                 oldestPendingAt = pendingBefore.oldestObservedAt,
                 nextRetryAt = state.nextRetryAt,
                 lastSuccessAt = state.lastSuccessAt,
-                lastErrorAt = state.lastErrorAt,
-                lastError = state.lastError,
+                lastErrorAt = state.lastErrorAt.takeIf { preservesFailure },
+                lastError = state.lastError.takeIf { preservesFailure },
                 exportedRowsDelta = 0
             )
             return InfluxActionResult.ok("influx next attempt pending")
@@ -135,7 +141,7 @@ class InfluxExportCoordinator(
         val rows = store.pendingInfluxRows(fieldKeys, BATCH_LIMIT)
         if (rows.isEmpty()) {
             store.updateInfluxExportState(
-                status = "running",
+                status = STATUS_IDLE,
                 mode = modeFor(pendingBefore.rows),
                 pendingRows = 0,
                 oldestPendingAt = null,
@@ -148,44 +154,61 @@ class InfluxExportCoordinator(
             return InfluxActionResult.ok("nothing pending")
         }
 
-        val lines = rows.map { InfluxLineProtocol.toLine(it, config) }
-        val write = client.write(config, lines)
-        if (!write.ok) {
-            rows.map { it.fieldKey }.distinct().forEach { fieldKey ->
-                store.updateInfluxCursorError(fieldKey, write.message, clock.nowIso())
-            }
-            recordFailure("backoff", write.message, pendingBefore)
-            return write
-        }
-
-        val exportedAt = clock.nowIso()
-        rows.groupBy { it.fieldKey }.forEach { (fieldKey, fieldRows) ->
-            store.updateInfluxCursorSuccess(fieldKey, fieldRows.maxOf { it.id }, exportedAt)
-        }
-        val pendingAfter = store.pendingInfluxSummary(fieldKeys)
         store.updateInfluxExportState(
-            status = "running",
-            mode = modeFor(pendingAfter.rows),
-            pendingRows = pendingAfter.rows,
-            oldestPendingAt = pendingAfter.oldestObservedAt,
-            nextRetryAt = if (pendingAfter.rows > 0L) {
-                plusSeconds(exportedAt, SUCCESS_BATCH_INTERVAL_SECONDS)
-            } else {
-                null
-            },
-            lastSuccessAt = exportedAt,
+            status = STATUS_EXPORTING,
+            mode = modeFor(pendingBefore.rows),
+            pendingRows = pendingBefore.rows,
+            oldestPendingAt = pendingBefore.oldestObservedAt,
+            nextRetryAt = null,
+            lastSuccessAt = state.lastSuccessAt,
             lastErrorAt = null,
             lastError = null,
-            exportedRowsDelta = rows.size.toLong()
+            exportedRowsDelta = 0
         )
-        store.recordInfluxEvent(
-            eventType = "influx_export_batch",
-            message = "vehicle_state_history batch exported",
-            batchCount = rows.size,
-            fromHistoryId = rows.minOf { it.id },
-            toHistoryId = rows.maxOf { it.id }
-        )
-        return InfluxActionResult.ok("exported ${rows.size} rows")
+        return try {
+            val lines = rows.map { InfluxLineProtocol.toLine(it, config) }
+            val write = client.write(config, lines)
+            if (!write.ok) {
+                rows.map { it.fieldKey }.distinct().forEach { fieldKey ->
+                    store.updateInfluxCursorError(fieldKey, write.message, clock.nowIso())
+                }
+                recordFailure(STATUS_BACKOFF, write.message, pendingBefore)
+                return write
+            }
+
+            val exportedAt = clock.nowIso()
+            rows.groupBy { it.fieldKey }.forEach { (fieldKey, fieldRows) ->
+                store.updateInfluxCursorSuccess(fieldKey, fieldRows.maxOf { it.id }, exportedAt)
+            }
+            val pendingAfter = store.pendingInfluxSummary(fieldKeys)
+            store.updateInfluxExportState(
+                status = if (pendingAfter.rows > 0L) STATUS_SCHEDULED else STATUS_IDLE,
+                mode = modeFor(pendingAfter.rows),
+                pendingRows = pendingAfter.rows,
+                oldestPendingAt = pendingAfter.oldestObservedAt,
+                nextRetryAt = if (pendingAfter.rows > 0L) {
+                    plusSeconds(exportedAt, SUCCESS_BATCH_INTERVAL_SECONDS)
+                } else {
+                    null
+                },
+                lastSuccessAt = exportedAt,
+                lastErrorAt = null,
+                lastError = null,
+                exportedRowsDelta = rows.size.toLong()
+            )
+            store.recordInfluxEvent(
+                eventType = "influx_export_batch",
+                message = "vehicle_state_history batch exported",
+                batchCount = rows.size,
+                fromHistoryId = rows.minOf { it.id },
+                toHistoryId = rows.maxOf { it.id }
+            )
+            InfluxActionResult.ok("exported ${rows.size} rows")
+        } catch (error: RuntimeException) {
+            val detail = "${error::class.java.simpleName}: ${error.message ?: "no message"}".take(512)
+            recordFailure(STATUS_BACKOFF, detail, pendingBefore)
+            InfluxActionResult.fail("influx_export_exception", detail)
+        }
     }
 
     private fun validate(config: InfluxConfig): InfluxActionResult? {
@@ -249,5 +272,10 @@ class InfluxExportCoordinator(
         const val CATCH_UP_THRESHOLD = 1_000
         const val SUCCESS_BATCH_INTERVAL_SECONDS = 1L
         const val FAILURE_RETRY_INTERVAL_SECONDS = 30L
+        const val STATUS_IDLE = "idle"
+        const val STATUS_SCHEDULED = "scheduled"
+        const val STATUS_EXPORTING = "exporting"
+        const val STATUS_BACKOFF = "backoff"
+        const val STATUS_STOPPED = "stopped"
     }
 }

@@ -93,7 +93,7 @@ class AccessWorkflowContractTest {
         assertTrue(settings.contains("isDebugPollingEnabled() && !isDebugManuallyStopped()"))
         assertTrue(settings.contains("isMqttEnabled() && !isMqttManuallyStopped()"))
         assertTrue(settings.contains("isInfluxEnabled() && !isInfluxManuallyStopped()"))
-        assertTrue(autoStart.contains("clearsManualStops(action) && settings.isAutoStartEnabled() && settings.hasActiveAccessWork()"))
+        assertTrue(autoStart.contains("clearsManualStops(action) && demand.main && settings.hasActiveAccessWork()"))
         assertTrue(autoStart.contains("const val WATCHDOG_DELAY_MS = 60_000L"))
     }
 

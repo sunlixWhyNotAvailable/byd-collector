@@ -549,7 +549,7 @@ class BydCollectorUiContractTest {
         ).forEach { flag -> assertTrue(actions.contains("val $flag: Boolean = false"), "Missing scoped flag: $flag") }
         assertTrue(app.contains("state.routeLoadingId == trip.id"))
         assertTrue(app.contains("testStatus != TelegramTestStatus.TESTING"))
-        assertTrue(app.contains("runtimeStatus != RuntimeActionStatus.STOPPING && runtimeStatus != RuntimeActionStatus.STOPPED"))
+        assertTrue(app.contains("runtimeStatus != RuntimeActionStatus.STOPPED || channelEnabled"))
         assertTrue(app.contains("RuntimeActionStatus.ERROR -> MainPollDisplayStatus(strings.error, StatusKind.ERROR)"))
         assertTrue(app.contains("job?.running != true"))
         assertTrue(app.contains("job?.takeIf { !it.running && it.error != null }"))
