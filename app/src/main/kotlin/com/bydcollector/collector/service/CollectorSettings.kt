@@ -6,6 +6,7 @@ import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.telegram.TelegramBuiltInTemplates
 import com.bydcollector.collector.telegram.TelegramEventType
 import com.bydcollector.collector.telegram.TelegramNavigatorMask
+import com.bydcollector.collector.telegram.TelegramPayloadLimitState
 import com.bydcollector.collector.telegram.TelegramTemplateLanguage
 import com.bydcollector.collector.ha.HaIntegrationCategories
 import com.bydcollector.collector.influx.InfluxConfig
@@ -448,6 +449,34 @@ class CollectorSettings(
         prefs.edit().remove("$KEY_TELEGRAM_TEMPLATE_PREFIX$eventKey").apply()
     }
 
+    fun telegramTripTemplateLimitState(): TelegramPayloadLimitState {
+        val saved = prefs.getString(KEY_TELEGRAM_TRIP_TEMPLATE_LIMIT_STATE, null)
+        return TelegramPayloadLimitState.entries.firstOrNull { it.name == saved }
+            ?: TelegramPayloadLimitState.NONE
+    }
+
+    fun telegramTripTemplateLimitRevision(): Long = synchronized(TELEGRAM_TRIP_TEMPLATE_LIMIT_LOCK) {
+        prefs.getLong(KEY_TELEGRAM_TRIP_TEMPLATE_LIMIT_REVISION, 0L)
+    }
+
+    fun setTelegramTripTemplateLimitState(state: TelegramPayloadLimitState, expectedRevision: Long) {
+        synchronized(TELEGRAM_TRIP_TEMPLATE_LIMIT_LOCK) {
+            if (prefs.getLong(KEY_TELEGRAM_TRIP_TEMPLATE_LIMIT_REVISION, 0L) != expectedRevision) return
+            if (telegramTripTemplateLimitState() == state) return
+            prefs.edit().putString(KEY_TELEGRAM_TRIP_TEMPLATE_LIMIT_STATE, state.name).apply()
+        }
+    }
+
+    fun resetTelegramTripTemplateLimitState() {
+        synchronized(TELEGRAM_TRIP_TEMPLATE_LIMIT_LOCK) {
+            val nextRevision = prefs.getLong(KEY_TELEGRAM_TRIP_TEMPLATE_LIMIT_REVISION, 0L) + 1L
+            prefs.edit()
+                .putLong(KEY_TELEGRAM_TRIP_TEMPLATE_LIMIT_REVISION, nextRevision)
+                .putString(KEY_TELEGRAM_TRIP_TEMPLATE_LIMIT_STATE, TelegramPayloadLimitState.NONE.name)
+                .apply()
+        }
+    }
+
     fun uiLanguageCode(): String = when (prefs.getString(KEY_UI_LANGUAGE_CODE, DEFAULT_UI_LANGUAGE_CODE)
         ?.trim()?.lowercase()) {
         "en" -> "en"
@@ -855,9 +884,10 @@ class CollectorSettings(
 
     fun keepAliveConfig(): KeepAliveConfig {
         //groups radio/service recovery toggles for foreground-service reconciliation
+        val recoverConnectivity = isKeepWifiEnabled() || isKeepMobileDataEnabled()
         return KeepAliveConfig(
-            keepWifi = isKeepWifiEnabled(),
-            keepMobileData = isKeepMobileDataEnabled(),
+            keepWifi = recoverConnectivity,
+            keepMobileData = recoverConnectivity,
             keepBluetooth = isKeepBluetoothEnabled(),
             recoverCollectorService = isRecoverCollectorServiceEnabled()
         )
@@ -865,21 +895,16 @@ class CollectorSettings(
 
     fun isKeepWifiEnabled(): Boolean = prefs.getBoolean(KEY_KEEP_WIFI, false)
 
-    fun setKeepWifiEnabled(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_KEEP_WIFI, enabled).apply()
-        recordEvent(
-            category = if (enabled) "keep_alive_wifi_enabled" else "keep_alive_wifi_disabled",
-            message = "Wi-Fi keep-alive ${if (enabled) "enabled" else "disabled"}"
-        )
-    }
-
     fun isKeepMobileDataEnabled(): Boolean = prefs.getBoolean(KEY_KEEP_MOBILE_DATA, false)
 
-    fun setKeepMobileDataEnabled(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_KEEP_MOBILE_DATA, enabled).apply()
+    fun setConnectivityRecoveryEnabled(enabled: Boolean) {
+        prefs.edit()
+            .putBoolean(KEY_KEEP_WIFI, enabled)
+            .putBoolean(KEY_KEEP_MOBILE_DATA, enabled)
+            .apply()
         recordEvent(
-            category = if (enabled) "keep_alive_mobile_data_enabled" else "keep_alive_mobile_data_disabled",
-            message = "Mobile data keep-alive ${if (enabled) "enabled" else "disabled"}"
+            category = if (enabled) "connectivity_recovery_enabled" else "connectivity_recovery_disabled",
+            message = "Wi-Fi and cellular recovery ${if (enabled) "enabled" else "disabled"}"
         )
     }
 
@@ -889,7 +914,7 @@ class CollectorSettings(
         prefs.edit().putBoolean(KEY_KEEP_BLUETOOTH, enabled).apply()
         recordEvent(
             category = if (enabled) "keep_alive_bluetooth_enabled" else "keep_alive_bluetooth_disabled",
-            message = "Bluetooth keep-alive ${if (enabled) "enabled" else "disabled"}"
+            message = "Bluetooth recovery ${if (enabled) "enabled" else "disabled"}"
         )
     }
 
@@ -1092,6 +1117,8 @@ class CollectorSettings(
         const val KEY_TELEGRAM_CHAT_ID = "telegramChatId"
         const val KEY_TELEGRAM_EVENT_PREFIX = "telegramEvent."
         const val KEY_TELEGRAM_TEMPLATE_PREFIX = "telegramTemplate."
+        const val KEY_TELEGRAM_TRIP_TEMPLATE_LIMIT_STATE = "telegramTripTemplateLimitState"
+        private const val KEY_TELEGRAM_TRIP_TEMPLATE_LIMIT_REVISION = "telegramTripTemplateLimitRevision"
         const val KEY_TELEGRAM_TRIP_SUMMARY_MIGRATION_DONE = "telegramTripSummaryMigrationDone"
         const val KEY_TELEGRAM_BUILTIN_DEFAULTS_MIGRATION_DONE = "telegramBuiltInDefaultsMigrationDone"
         const val KEY_TELEGRAM_CHARGED_TO_100_MIGRATION_DONE = "telegramChargedTo100MigrationDone"
@@ -1114,6 +1141,8 @@ class CollectorSettings(
         const val SECRET_MQTT_PASSWORD = "mqtt.password"
         const val SECRET_INFLUX_USERNAME = "influx.username"
         const val SECRET_INFLUX_PASSWORD = "influx.password"
+
+        private val TELEGRAM_TRIP_TEMPLATE_LIMIT_LOCK = Any()
         const val SECRET_TELEGRAM_BOT_TOKEN = "telegram.bot_token"
         const val KEY_UPDATE_AUTO_CHECK = "updateAutoCheck"
         const val KEY_UPDATE_LAST_CHECK_AT_MS = "updateLastCheckAtMs"

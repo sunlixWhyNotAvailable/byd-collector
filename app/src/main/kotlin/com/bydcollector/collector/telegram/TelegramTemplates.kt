@@ -361,9 +361,16 @@ object TelegramTemplateParser {
 
 data class TelegramTemplateRenderResult(
     val text: String?,
-    val errors: List<TelegramTemplateError>
+    val errors: List<TelegramTemplateError>,
+    val limitState: TelegramPayloadLimitState = TelegramPayloadLimitState.NONE
 ) {
     val isSuccess: Boolean get() = errors.isEmpty()
+}
+
+enum class TelegramPayloadLimitState {
+    NONE,
+    TEMPLATE,
+    WITH_LOCATION
 }
 
 object TelegramTemplateRenderer {
@@ -404,7 +411,17 @@ object TelegramTemplateRenderer {
                 )
             }
         }
-        if (errors.isNotEmpty()) return TelegramTemplateRenderResult(null, errors)
+        if (errors.isNotEmpty()) {
+            return TelegramTemplateRenderResult(
+                null,
+                errors,
+                if (errors.any { it.kind == TelegramTemplateErrorKind.TOO_LONG }) {
+                    TelegramPayloadLimitState.TEMPLATE
+                } else {
+                    TelegramPayloadLimitState.NONE
+                }
+            )
+        }
 
         val rendered = buildString {
             parsed.tokens.forEach { token ->
@@ -419,6 +436,14 @@ object TelegramTemplateRenderer {
         if (renderedLength > TELEGRAM_MESSAGE_MAX_CHARS) {
             errors += TelegramTemplateError(TelegramTemplateErrorKind.TOO_LONG, actualLength = renderedLength)
         }
-        return TelegramTemplateRenderResult(rendered.takeIf { errors.isEmpty() }, errors)
+        return TelegramTemplateRenderResult(
+            rendered.takeIf { errors.isEmpty() },
+            errors,
+            if (errors.any { it.kind == TelegramTemplateErrorKind.TOO_LONG }) {
+                TelegramPayloadLimitState.TEMPLATE
+            } else {
+                TelegramPayloadLimitState.NONE
+            }
+        )
     }
 }

@@ -76,7 +76,11 @@ import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.maintenance.DbMaintenanceUiState
 import com.bydcollector.collector.service.CollectorService
+import com.bydcollector.collector.telegram.TelegramEventType
 import com.bydcollector.collector.telegram.TelegramNavigatorMask
+import com.bydcollector.collector.telegram.TelegramPayloadLimitState
+import com.bydcollector.collector.telegram.TelegramTemplateErrorKind
+import com.bydcollector.collector.telegram.TelegramTemplateRenderer
 import com.bydcollector.collector.ui.DashboardState
 import com.bydcollector.collector.ui.DebugRuntimeStatus
 import com.bydcollector.collector.ui.RuntimeActionStatus
@@ -1526,6 +1530,7 @@ private fun TelegramTab(
                         strings = strings,
                         definition = message,
                         config = config,
+                        tripTemplateLimitState = uiState.tripTemplateLimitState,
                         onConfigChanged = updateConfig,
                         modifier = Modifier.weight(1f)
                     )
@@ -1611,6 +1616,7 @@ private fun TelegramMessageCard(
     strings: UiStrings,
     definition: TelegramMessageDefinition,
     config: TelegramConfig,
+    tripTemplateLimitState: TelegramPayloadLimitState,
     onConfigChanged: (TelegramConfig) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -1637,12 +1643,31 @@ private fun TelegramMessageCard(
         }
     }
 
+    val templateLimitWarning = if (definition.type == TelegramMessageType.TRIP_SUMMARY) {
+        val limitState = if (TelegramTemplateRenderer.validate(TelegramEventType.TRIP_SUMMARY, template.text)
+                .any { it.kind == TelegramTemplateErrorKind.TOO_LONG }
+        ) {
+            TelegramPayloadLimitState.TEMPLATE
+        } else {
+            tripTemplateLimitState
+        }
+        when (limitState) {
+            TelegramPayloadLimitState.NONE -> null
+            TelegramPayloadLimitState.TEMPLATE -> strings.telegram.templateLimitWarning
+            TelegramPayloadLimitState.WITH_LOCATION ->
+                "${strings.telegram.templateLimitWarning} ${strings.telegram.templateLimitWithLocation}"
+        }
+    } else {
+        null
+    }
+
     fun updateMessage(next: TelegramMessageConfig) {
         onConfigChanged(config.copy(messages = config.messages + (definition.type to next)))
     }
 
     SectionCard(
         title = localized.title,
+        headerWarning = templateLimitWarning,
         trailing = {
             BydSwitch(messageConfig.enabled, { updateMessage(messageConfig.copy(enabled = it)) })
         },
@@ -1976,14 +2001,9 @@ private fun ExtraTab(
             SectionCard(strings.keepAlive, Modifier.weight(1f).height(optionsCardHeight)) {
                 Column(Modifier.fillMaxWidth()) {
                     SwitchRow(
-                        strings.keepWifi,
-                        state?.keepWifiEnabled == true,
-                        actions::onToggleKeepWifi
-                    )
-                    SwitchRow(
-                        strings.keepMobile,
-                        state?.keepMobileDataEnabled == true,
-                        actions::onToggleKeepMobile
+                        strings.restoreConnectivity,
+                        state?.keepWifiEnabled == true && state?.keepMobileDataEnabled == true,
+                        actions::onToggleConnectivityRecovery
                     )
                     SwitchRow(
                         strings.keepBluetooth,
@@ -2007,6 +2027,21 @@ private fun ExtraTab(
                             strings.stopLogcat,
                             actions::onStopLogcat,
                             enabled = state?.logRecording == true && !diagnosticsBusy,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        ActionButton(
+                            strings.shareLogs,
+                            actions::onShareLogs,
+                            primary = true,
+                            enabled = !diagnosticsBusy,
+                            modifier = Modifier.weight(1f)
+                        )
+                        ActionButton(
+                            strings.clearLogs,
+                            actions::onClearLogs,
+                            enabled = !diagnosticsBusy,
                             modifier = Modifier.weight(1f)
                         )
                     }

@@ -195,6 +195,8 @@ class TelegramRuntimeContractTest {
         val engine = sourceFile("com/bydcollector/collector/service/TelegramEventEngine.kt").readText()
         val mask = sourceFile("com/bydcollector/collector/telegram/TelegramNavigatorMask.kt").readText()
         val actions = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorActions.kt").readText()
+        val settings = sourceFile("com/bydcollector/collector/service/CollectorSettings.kt").readText()
+        val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
 
         assertTrue(coordinator.contains("settings.uiLanguageCode()"))
         assertTrue(coordinator.contains("settings.telegramNavigatorMask()"))
@@ -210,6 +212,13 @@ class TelegramRuntimeContractTest {
         assertTrue(mask.contains("const val ALL = 15"))
         assertTrue(engine.contains("val navigatorMask: Int = TelegramNavigatorMask.NONE"))
         assertTrue(actions.contains("val navigatorMask: Int = TelegramNavigatorMask.NONE"))
+        assertTrue(coordinator.contains("settings.telegramTripTemplateLimitRevision()"))
+        assertTrue(coordinator.contains("settings.setTelegramTripTemplateLimitState(rendered.limitState, tripTemplateLimitRevision)"))
+        assertTrue(settings.contains("KEY_TELEGRAM_TRIP_TEMPLATE_LIMIT_STATE"))
+        assertTrue(settings.contains("expectedRevision: Long"))
+        assertTrue(activity.contains("key == CollectorSettings.KEY_TELEGRAM_TRIP_TEMPLATE_LIMIT_STATE"))
+        assertTrue(activity.contains("tripLimitInputsChanged"))
+        assertTrue(activity.contains("settings.resetTelegramTripTemplateLimitState()"))
     }
 
     private fun sourceFile(path: String): File {

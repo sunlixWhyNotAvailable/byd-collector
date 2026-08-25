@@ -60,12 +60,12 @@ The detached read-only helper and keep-alive component can write operational log
 
 Database archives can contain raw and normalized telemetry, timestamps, trip and charging history, possible location values, quality and error metadata, integration queues, and rendered notification payloads. Diagnostic bundles can contain application events and logcat output recorded during the selected diagnostic session.
 
-The app shares selected archives only after an explicit user action through Android's system share chooser. It does not provide a `Send to developer` upload. The selected receiving application's privacy policy applies once an archive is shared. Source archives are not automatically deleted after sharing.
+The app shares selected archives only after an explicit user action through Android's system share chooser. `Share logs` prepares the current app-private diagnostic ZIP and opens that same chooser; it does not upload automatically or provide a `Send to developer` endpoint. The selected receiving application's privacy policy applies once an archive is shared. Source archives are not automatically deleted after sharing.
 
 Review every archive before sending it. Do not publish precise location or trip history, bot tokens, passwords, private network addresses, personal identifiers, or unrelated logcat data.
 
 ## Retention and deletion
 
-The active main normalized history and the separate trip-route database currently have no automatic retention period. The trip database is not yet part of the archive/retention UI. Database archives are retained locally until the user deletes them or the configured archive storage limit removes the oldest deletable archives. Diagnostic files remain until they are replaced, deleted, or app data is cleared.
+The active main normalized history and the separate trip-route database currently have no automatic retention period. The trip database is not yet part of the archive/retention UI. Database archives are retained locally until the user deletes them or the configured archive storage limit removes the oldest deletable archives. Diagnostic files remain until they are replaced, cleared, or app data is removed. `Clear logs` deletes completed diagnostic captures and generated bundles while preserving an active logcat capture. An immutable copy selected for sharing is protected from cleanup for 10 minutes so the receiving application can finish reading it; after that it is removed by the next Share/Clear action or by Android cache cleanup.
 
 Clearing BYD Collector's app data or uninstalling the app removes its app-private databases, preferences, encrypted secret payloads, and ADB key, subject to Android device behavior. Files under `/data/local/tmp` may require separate removal. Data already sent to MQTT, InfluxDB, Telegram, or another receiving application must be managed at that destination; normal GitHub request metadata follows GitHub's own retention rules.

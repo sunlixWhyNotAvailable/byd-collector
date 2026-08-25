@@ -44,8 +44,8 @@ Interactive controls do not add an artificial callback delay: accepted button, s
 | Telegram | Optional outbound event messages with editable templates and a durable FIFO outbox |
 | Trips | Separate local trip history, GPS routes, configurable speed/consumption colours, and an online OpenStreetMap view |
 | SQLite and archives | Compact-v2 raw/normalized stores, crash-safe database cutover, ZIP archives, sharing, and a shared archive limit |
-| Runtime | Background recovery, optional Tailscale activation, network/Bluetooth keep-alive controls, and explicit shutdown |
-| Diagnostics | User-started full-system logcat under `Options -> Keep alive`, local status/error history, and selected archive sharing |
+| Runtime | Background recovery, optional Tailscale activation, combined Wi-Fi/cellular recovery, Bluetooth recovery, and explicit shutdown |
+| Diagnostics | User-started full-system logcat under `Options -> Keep alive`, local status/error history, native ZIP sharing, and safe completed-log cleanup |
 
 The app UI is available in English and Ukrainian and supports dark and light themes.
 
@@ -116,6 +116,8 @@ Telegram is optional and disabled by default. It sends plain text through the Te
 
 Configure the bot token, chat ID, event switches, delay values, and message templates in the `Telegram` tab. Secrets are stored with the Android Keystore, shown masked by default, and can be cleared explicitly.
 
+The Trip summary header warns immediately when the source template exceeds Telegram's 4,096-character limit; expansion and location-link overflow states update from the actual runtime render. If the template itself fits but the selected location links cause the overflow, the warning explicitly adds `with location`.
+
 Supported event templates include:
 
 - charging started, charging progress, charged to 100%, and charging stopped;
@@ -155,11 +157,11 @@ The `Options` tab contains operational controls rather than vehicle-control comm
 - switch English/Ukrainian and dark/light themes;
 - grant or re-check ADB access and open the DiLink background-app settings;
 - enable automatic start for main collection, All data, MQTT, and InfluxDB where shown;
-- keep Wi-Fi, mobile data, or Bluetooth available while the runtime is active;
+- restore Wi-Fi and cellular together, or Bluetooth independently, while the runtime is active;
 - restore the collector service after supported process/boot events;
-- start or stop the single full-system logcat recorder at the bottom of `Keep alive`;
+- start or stop the single full-system logcat recorder, then share its diagnostic ZIP or clear completed logs at the bottom of `Keep alive`;
 - grant and verify the notification-listener lifecycle anchor through the app's local-ADB repair flow; the service reads no notification payloads;
-- keep Wi-Fi and mobile data enabled from the separate detached keep-alive helper every 30 seconds when their switches are enabled;
+- keep Wi-Fi and cellular enabled from the separate detached keep-alive helper every 30 seconds when their combined switch is enabled;
 - optionally detect and activate Tailscale when a configured endpoint is unreachable, with a delayed launch and foreground-task restoration; and
 - check for a verified update, or use `Shutdown` to stop runtime until the app is opened again.
 
@@ -169,7 +171,7 @@ The app's keep-alive path is recovery-oriented and idempotent. It does not write
 
 ## Diagnostics and privacy
 
-There is no separate `Logs` tab or duplicate Journal mode. Start and stop the one logcat recorder at the bottom of `Options -> Keep alive` when investigating a reproducible issue. Start waits for the completed ADB authorization check, and recorder start/stop plus snapshot/ZIP work runs away from the UI thread. Capture uses the exact full-system command `logcat -b all -v threadtime`; it does not silently fall back to a PID-filtered app-only file.
+There is no separate `Logs` tab or duplicate Journal mode. Start and stop the one logcat recorder at the bottom of `Options -> Keep alive` when investigating a reproducible issue. `Share logs` refreshes the current diagnostic ZIP and opens Android's share chooser with an immutable cache copy. `Clear logs` removes completed captures and generated bundles without interrupting an active capture, but protects a fresh handoff copy for 10 minutes so the receiving app can finish reading it. Expired handoff copies are pruned by the next Share/Clear action and can otherwise remain until Android clears app cache. Recorder, snapshot, ZIP, share preparation, and cleanup work runs away from the UI thread. Start waits for the completed ADB authorization check. Capture uses the exact full-system command `logcat -b all -v threadtime`; it does not silently fall back to a PID-filtered app-only file.
 
 Diagnostics stay local unless you explicitly share an archive through the Android chooser. A selected archive can contain raw telemetry, Chinese field names/descriptions, timestamps, quality/failure metadata, vehicle-state history, network endpoint settings, and logcat output if recording was enabled. Review the archive contents and remove unrelated days before sharing. Do not publish bot tokens, passwords, private addresses, or precise trip/location data.
 

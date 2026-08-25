@@ -59,13 +59,14 @@ class TelegramPayloadRenderingTest {
             event = event(textSuffix = suffix),
             savedTemplate = emoji.repeat(length - suffixLength),
             language = TelegramTemplateLanguage.EN
-        ).text
+        )
 
-        val at4_095 = renderFinalLength(4_095)!!
-        val at4_096 = renderFinalLength(4_096)!!
+        val at4_095 = renderFinalLength(4_095).text!!
+        val at4_096 = renderFinalLength(4_096).text!!
         assertEquals(4_095, at4_095.codePointCount(0, at4_095.length))
         assertEquals(4_096, at4_096.codePointCount(0, at4_096.length))
-        assertTrue(!renderFinalLength(4_097)!!.contains("Google:"))
+        assertTrue(!renderFinalLength(4_097).text!!.contains("Google:"))
+        assertEquals(TelegramPayloadLimitState.WITH_LOCATION, renderFinalLength(4_097).limitState)
 
         listOf(4_095, 4_096).forEach { baseLength ->
             val base = emoji.repeat(baseLength)
@@ -73,21 +74,50 @@ class TelegramPayloadRenderingTest {
                 event = event(textSuffix = suffix),
                 savedTemplate = base,
                 language = TelegramTemplateLanguage.EN
-            ).text
-            assertEquals(base, rendered)
+            )
+            assertEquals(base, rendered.text)
+            assertEquals(TelegramPayloadLimitState.WITH_LOCATION, rendered.limitState)
         }
-        assertEquals(
-            renderTelegramPayload(
+        val invalid = renderTelegramPayload(
                 event = event(textSuffix = suffix),
                 savedTemplate = "{not_allowed}",
                 language = TelegramTemplateLanguage.EN
-            ).text,
-            renderTelegramPayload(
+            )
+        val oversized = renderTelegramPayload(
                 event = event(textSuffix = suffix),
                 savedTemplate = emoji.repeat(4_097),
                 language = TelegramTemplateLanguage.EN
-            ).text
+            )
+        assertEquals(invalid.text, oversized.text)
+        assertEquals(TelegramPayloadLimitState.TEMPLATE, oversized.limitState)
+    }
+
+    @Test
+    fun tripLimitStateUsesTheExactRuntimeRender() {
+        val exact = renderTelegramPayload(
+            event = tripEvent(),
+            savedTemplate = "x".repeat(4_080) + "{time}",
+            language = TelegramTemplateLanguage.EN
         )
+        val oversized = renderTelegramPayload(
+            event = tripEvent(),
+            savedTemplate = "x".repeat(4_081) + "{time}",
+            language = TelegramTemplateLanguage.EN
+        )
+        val oversizedDefault = renderTelegramPayload(
+            event = tripEvent().copy(
+                variables = tripEvent().variables +
+                    ("trip_distance_km" to "x".repeat(TELEGRAM_MESSAGE_MAX_CHARS + 1))
+            ),
+            savedTemplate = null,
+            language = TelegramTemplateLanguage.EN
+        )
+
+        assertEquals(TELEGRAM_MESSAGE_MAX_CHARS, exact.text?.codePointCount(0, exact.text.length))
+        assertEquals(TelegramPayloadLimitState.NONE, exact.limitState)
+        assertEquals(TelegramPayloadLimitState.TEMPLATE, oversized.limitState)
+        assertNull(oversizedDefault.text)
+        assertEquals(TelegramPayloadLimitState.TEMPLATE, oversizedDefault.limitState)
     }
 
     @Test
@@ -100,6 +130,7 @@ class TelegramPayloadRenderingTest {
 
         assertNull(result.text)
         assertEquals(TelegramTemplateErrorKind.TOO_LONG, result.errors.single().kind)
+        assertEquals(TelegramPayloadLimitState.WITH_LOCATION, result.limitState)
     }
 
     private fun event(
@@ -111,5 +142,21 @@ class TelegramPayloadRenderingTest {
         variables = mapOf("battery_12v" to "11.8", "time" to "08:15"),
         textSuffix = textSuffix,
         locationOnly = locationOnly
+    )
+
+    private fun tripEvent() = TelegramDetectedEvent(
+        type = TelegramEventType.TRIP_SUMMARY,
+        dedupeKey = "trip:summary",
+        variables = mapOf(
+            "trip_distance_km" to "12.3",
+            "trip_energy_kwh" to "3.4",
+            "trip_duration" to "0:24",
+            "soc_start" to "81",
+            "soc_end" to "76",
+            "total_distance_km" to "12.3",
+            "total_energy_kwh" to "3.4",
+            "total_duration" to "0:24",
+            "time" to "25.08.2026 12:34"
+        )
     )
 }

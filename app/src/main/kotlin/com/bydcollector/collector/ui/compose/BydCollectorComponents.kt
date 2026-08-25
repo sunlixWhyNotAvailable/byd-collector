@@ -4,6 +4,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -35,8 +36,11 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.TextStyle
@@ -192,6 +196,7 @@ fun DashboardSurface(
 fun SectionCard(
     title: String,
     modifier: Modifier = Modifier,
+    headerWarning: String? = null,
     trailing: (@Composable () -> Unit)? = null,
     bodyPadding: Dp = 14.dp,
     content: @Composable () -> Unit
@@ -211,15 +216,23 @@ fun SectionCard(
                 .padding(horizontal = 14.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                text = title.uppercase(),
-                color = p.muted,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f)
-            )
+            Row(
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = title.uppercase(),
+                    color = p.muted,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                headerWarning?.let {
+                    TemplateLimitWarning(it, Modifier.weight(1f))
+                }
+            }
             if (trailing != null) trailing()
         }
         Column(
@@ -444,6 +457,47 @@ fun ReadOnlyPathField(text: String, modifier: Modifier = Modifier) {
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.fillMaxWidth()
+        )
+    }
+}
+
+@Composable
+private fun TemplateLimitWarning(text: String, modifier: Modifier = Modifier) {
+    val p = LocalBydPalette.current
+    Row(
+        modifier = modifier,
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Canvas(Modifier.size(14.dp)) {
+            val triangle = Path().apply {
+                moveTo(size.width / 2f, 0f)
+                lineTo(size.width, size.height)
+                lineTo(0f, size.height)
+                close()
+            }
+            drawPath(triangle, p.yellow)
+            drawLine(
+                color = p.panelAlt,
+                start = Offset(size.width / 2f, size.height * 0.30f),
+                end = Offset(size.width / 2f, size.height * 0.66f),
+                strokeWidth = 1.6.dp.toPx(),
+                cap = StrokeCap.Round
+            )
+            drawCircle(
+                color = p.panelAlt,
+                radius = 0.9.dp.toPx(),
+                center = Offset(size.width / 2f, size.height * 0.82f)
+            )
+        }
+        Text(
+            text = text,
+            color = p.yellow,
+            fontSize = 10.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f)
         )
     }
 }

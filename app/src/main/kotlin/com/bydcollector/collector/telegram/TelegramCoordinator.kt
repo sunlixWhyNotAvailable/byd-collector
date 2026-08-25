@@ -247,9 +247,17 @@ class TelegramCoordinator(
     }
 
     private fun render(event: TelegramDetectedEvent): TelegramOutboxMessage? {
+        val tripTemplateLimitRevision = if (event.type == TelegramEventType.TRIP_SUMMARY) {
+            settings.telegramTripTemplateLimitRevision()
+        } else {
+            null
+        }
         val language = telegramLanguage()
         val savedTemplate = settings.telegramTemplate(event.type.key)
         val rendered = renderTelegramPayload(event, savedTemplate, language)
+        if (tripTemplateLimitRevision != null) {
+            settings.setTelegramTripTemplateLimitState(rendered.limitState, tripTemplateLimitRevision)
+        }
         val payload = rendered.text
         if (payload == null) {
             store.recordEvent(
@@ -323,7 +331,15 @@ internal fun renderTelegramPayload(
             )
             else -> emptyList()
         }
-        return TelegramTemplateRenderResult(payload.takeIf { errors.isEmpty() }, errors)
+        return TelegramTemplateRenderResult(
+            payload.takeIf { errors.isEmpty() },
+            errors,
+            if (errors.any { it.kind == TelegramTemplateErrorKind.TOO_LONG }) {
+                TelegramPayloadLimitState.WITH_LOCATION
+            } else {
+                TelegramPayloadLimitState.NONE
+            }
+        )
     }
 
     fun render(template: String): TelegramTemplateRenderResult = TelegramTemplateRenderer.render(
@@ -334,12 +350,17 @@ internal fun renderTelegramPayload(
 
     val defaultTemplate = TelegramTemplateCatalog.defaultTemplate(event.type, language)
     val selected = render(savedTemplate ?: defaultTemplate)
+    val templateTooLong = selected.errors.any { it.kind == TelegramTemplateErrorKind.TOO_LONG }
     val base = selected.text ?: savedTemplate?.let { render(defaultTemplate).text }
         ?: return selected
     val suffix = event.textSuffix.orEmpty()
     val combined = base + suffix
-    val payload = combined.takeIf {
-        it.codePointCount(0, it.length) <= TELEGRAM_MESSAGE_MAX_CHARS
-    } ?: base
-    return TelegramTemplateRenderResult(payload, emptyList())
+    val locationTooLong = combined.codePointCount(0, combined.length) > TELEGRAM_MESSAGE_MAX_CHARS
+    val payload = if (locationTooLong) base else combined
+    val limitState = when {
+        templateTooLong -> TelegramPayloadLimitState.TEMPLATE
+        locationTooLong && suffix.isNotEmpty() -> TelegramPayloadLimitState.WITH_LOCATION
+        else -> TelegramPayloadLimitState.NONE
+    }
+    return TelegramTemplateRenderResult(payload, emptyList(), limitState)
 }

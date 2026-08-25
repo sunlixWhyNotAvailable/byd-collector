@@ -1,6 +1,7 @@
 package com.bydcollector.collector.ui.compose
 
 import com.bydcollector.collector.telegram.TelegramNavigatorMask
+import com.bydcollector.collector.telegram.TelegramPayloadLimitState
 
 data class MqttDraft(
     val host: String = "",
@@ -143,7 +144,8 @@ enum class TelegramTestStatus {
 
 data class TelegramUiState(
     val config: TelegramConfig = TelegramConfig(),
-    val testStatus: TelegramTestStatus = TelegramTestStatus.NOT_TESTED
+    val testStatus: TelegramTestStatus = TelegramTestStatus.NOT_TESTED,
+    val tripTemplateLimitState: TelegramPayloadLimitState = TelegramPayloadLimitState.NONE
 )
 
 data class TelegramUiActions(
@@ -191,8 +193,7 @@ interface BydCollectorActions {
     fun onToggleInfluxCategory(category: String, enabled: Boolean)
     fun onInfluxDraftChanged(draft: InfluxDraft)
 
-    fun onToggleKeepWifi(enabled: Boolean)
-    fun onToggleKeepMobile(enabled: Boolean)
+    fun onToggleConnectivityRecovery(enabled: Boolean)
     fun onToggleKeepBluetooth(enabled: Boolean)
     fun onToggleKeepCollector(enabled: Boolean)
     fun onToggleTailscaleActivation(enabled: Boolean)
@@ -205,4 +206,6 @@ interface BydCollectorActions {
 
     fun onStartLogcat()
     fun onStopLogcat()
+    fun onShareLogs()
+    fun onClearLogs()
 }

@@ -3,4 +3,5 @@
     <external-files-path name="downloads" path="Download/" />
     <cache-path name="verified_updates" path="updates/" />
     <files-path name="database_archives" path="db_archive/" />
+    <cache-path name="diagnostic_shares" path="diagnostic_shares/" />
 </paths>

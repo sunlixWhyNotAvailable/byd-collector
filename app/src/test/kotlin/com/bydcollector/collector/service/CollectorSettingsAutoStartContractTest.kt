@@ -23,6 +23,12 @@ class CollectorSettingsAutoStartContractTest {
         assertTrue(settings.contains("prefs.getBoolean(KEY_KEEP_MOBILE_DATA, false)"))
         assertTrue(settings.contains("prefs.getBoolean(KEY_KEEP_BLUETOOTH, false)"))
         assertTrue(settings.contains("prefs.getBoolean(KEY_RECOVER_COLLECTOR_SERVICE, false)"))
+        assertTrue(settings.contains("val recoverConnectivity = isKeepWifiEnabled() || isKeepMobileDataEnabled()"))
+        assertTrue(settings.contains("keepWifi = recoverConnectivity"))
+        assertTrue(settings.contains("keepMobileData = recoverConnectivity"))
+        assertTrue(settings.contains("fun setConnectivityRecoveryEnabled(enabled: Boolean)"))
+        assertTrue(settings.contains(".putBoolean(KEY_KEEP_WIFI, enabled)"))
+        assertTrue(settings.contains(".putBoolean(KEY_KEEP_MOBILE_DATA, enabled)"))
     }
 
     private fun sourceFile(path: String): File {

@@ -45,6 +45,7 @@ import com.bydcollector.collector.service.CollectorServiceController
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.service.DatabaseMaintenanceService
 import com.bydcollector.collector.system.CollectorAutoStart
+import com.bydcollector.collector.telegram.TelegramPayloadLimitState
 import com.bydcollector.collector.ui.DashboardState
 import com.bydcollector.collector.ui.DashboardLoadProfile
 import com.bydcollector.collector.ui.DashboardRowCounts
@@ -156,7 +157,8 @@ class MainActivity : ComponentActivity() {
     private val settingsChangeListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         if (
             key == CollectorSettings.KEY_TELEGRAM_CONNECTION_STATUS ||
-            key == CollectorSettings.KEY_TELEGRAM_CONNECTION_MESSAGE
+            key == CollectorSettings.KEY_TELEGRAM_CONNECTION_MESSAGE ||
+            key == CollectorSettings.KEY_TELEGRAM_TRIP_TEMPLATE_LIMIT_STATE
         ) {
             handler.post {
                 if (!destroyed && ::settings.isInitialized) syncTelegramUiRuntimeState()
@@ -191,6 +193,9 @@ class MainActivity : ComponentActivity() {
             settings.setUiLanguageCode(language.code)
             dashboardUiStateStore.selectVehicleKpiLanguage(language.vehicleKpiLanguage())
             val previousTelegram = telegramUiState
+            if (previousTelegram.config.messages[TelegramMessageType.TRIP_SUMMARY]?.usesDefaultTemplate == true) {
+                settings.resetTelegramTripTemplateLimitState()
+            }
             val localizedTelegram = loadTelegramUiState()
             telegramUiState = localizedTelegram.copy(
                 config = localizedTelegram.config.copy(
@@ -495,12 +500,8 @@ class MainActivity : ComponentActivity() {
             saveInfluxDraft()
         }
 
-        override fun onToggleKeepWifi(enabled: Boolean) {
-            updateKeepAliveSetting(enabled) { settings.setKeepWifiEnabled(it) }
-        }
-
-        override fun onToggleKeepMobile(enabled: Boolean) {
-            updateKeepAliveSetting(enabled) { settings.setKeepMobileDataEnabled(it) }
+        override fun onToggleConnectivityRecovery(enabled: Boolean) {
+            updateKeepAliveSetting(enabled) { settings.setConnectivityRecoveryEnabled(it) }
         }
 
         override fun onToggleKeepBluetooth(enabled: Boolean) {
@@ -551,6 +552,14 @@ class MainActivity : ComponentActivity() {
 
         override fun onStopLogcat() {
             stopLogcatRecording()
+        }
+
+        override fun onShareLogs() {
+            shareDiagnosticLogs()
+        }
+
+        override fun onClearLogs() {
+            clearDiagnosticLogs()
         }
     }
 
@@ -1666,13 +1675,20 @@ class MainActivity : ComponentActivity() {
                 navigatorMask = settings.telegramNavigatorMask(),
                 messages = messages
             ),
-            testStatus = telegramTestStatus(settings.telegramConnectionStatus())
+            testStatus = telegramTestStatus(settings.telegramConnectionStatus()),
+            tripTemplateLimitState = settings.telegramTripTemplateLimitState()
         )
     }
 
     private fun onTelegramConfigChanged(config: TelegramConfig) {
         refreshStoreBackedState()
         val previous = telegramUiState.config
+        val previousTrip = previous.messages[TelegramMessageType.TRIP_SUMMARY]
+        val nextTrip = config.messages[TelegramMessageType.TRIP_SUMMARY]
+        val tripLimitInputsChanged = previous.sendLocation != config.sendLocation ||
+            previous.navigatorMask != config.navigatorMask ||
+            previousTrip?.template != nextTrip?.template ||
+            previousTrip?.usesDefaultTemplate != nextTrip?.usesDefaultTemplate
         if (config.botToken != previous.botToken) telegramCredentialRevision += 1L
         var tokenSet = previous.botTokenSet
         var secretWriteFailed = false
@@ -1714,6 +1730,9 @@ class MainActivity : ComponentActivity() {
                 settings.setTelegramTemplate(eventKey, newMessage.template)
             }
         }
+        if (tripLimitInputsChanged) {
+            settings.resetTelegramTripTemplateLimitState()
+        }
 
         val credentialsChanged = previous.chatId != config.chatId ||
             (config.botToken.isNotBlank() && config.botToken != previous.botToken)
@@ -1735,7 +1754,12 @@ class MainActivity : ComponentActivity() {
         )
         telegramUiState = telegramUiState.copy(
             config = effectiveConfig,
-            testStatus = nextTestStatus
+            testStatus = nextTestStatus,
+            tripTemplateLimitState = if (tripLimitInputsChanged) {
+                TelegramPayloadLimitState.NONE
+            } else {
+                telegramUiState.tripTemplateLimitState
+            }
         )
         if (secretWriteFailed) {
             recordOperationalEvent(
@@ -1802,7 +1826,8 @@ class MainActivity : ComponentActivity() {
             config = telegramUiState.config.copy(
                 enabled = settings.isTelegramEnabled()
             ),
-            testStatus = telegramTestStatus(settings.telegramConnectionStatus())
+            testStatus = telegramTestStatus(settings.telegramConnectionStatus()),
+            tripTemplateLimitState = settings.telegramTripTemplateLimitState()
         )
     }
 
@@ -2009,6 +2034,87 @@ class MainActivity : ComponentActivity() {
             diagnosticsBusy = false
             recordOperationalEvent("log_recording_error", "Full system logcat stop was rejected", error.message)
             Toast.makeText(this, "Помилка зупинки logcat: ${error.message}", Toast.LENGTH_LONG).show()
+            refresh()
+        }
+    }
+
+    private fun shareDiagnosticLogs() {
+        if (diagnosticsBusy) return
+        diagnosticsBusy = true
+        val task = Runnable {
+            val result = runCatching { DiagnosticLogRecorder.prepareShareBundle(applicationContext) }
+            handler.post {
+                if (destroyed) {
+                    diagnosticsBusy = false
+                    return@post
+                }
+                result.mapCatching { bundle ->
+                    val uri = FileProvider.getUriForFile(
+                        this,
+                        "$packageName.fileprovider",
+                        bundle
+                    )
+                    val title = strings(uiLanguage).shareLogs
+                    val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                        type = "application/zip"
+                        putExtra(Intent.EXTRA_SUBJECT, title)
+                        putExtra(Intent.EXTRA_STREAM, uri)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        clipData = ClipData.newUri(contentResolver, title, uri)
+                    }
+                    startActivity(Intent.createChooser(sendIntent, title))
+                    bundle
+                }.onSuccess { bundle ->
+                    recordOperationalEvent(
+                        "diagnostic_share_chooser_opened",
+                        "Diagnostic share chooser opened",
+                        "file=${bundle.name} size=${bundle.length()}"
+                    )
+                }.onFailure { error ->
+                    recordOperationalEvent("diagnostic_share_failed", "Diagnostic share failed", error.message)
+                    Toast.makeText(this, strings(uiLanguage).logsShareFailed, Toast.LENGTH_LONG).show()
+                }
+                diagnosticsBusy = false
+                refresh()
+            }
+        }
+        runCatching { diagnosticsExecutor.execute(task) }.onFailure { error ->
+            diagnosticsBusy = false
+            recordOperationalEvent("diagnostic_share_failed", "Diagnostic share was rejected", error.message)
+            Toast.makeText(this, strings(uiLanguage).logsShareFailed, Toast.LENGTH_LONG).show()
+            refresh()
+        }
+    }
+
+    private fun clearDiagnosticLogs() {
+        if (diagnosticsBusy) return
+        diagnosticsBusy = true
+        val task = Runnable {
+            val result = runCatching { DiagnosticLogRecorder.clearCompleted(applicationContext) }
+            handler.post {
+                if (destroyed) {
+                    diagnosticsBusy = false
+                    return@post
+                }
+                result.onSuccess { removed ->
+                    recordOperationalEvent(
+                        "diagnostic_logs_cleared",
+                        "Completed diagnostic logs cleared",
+                        "removed=$removed active_recording=${DiagnosticLogRecorder.isRecording()}"
+                    )
+                    Toast.makeText(this, strings(uiLanguage).logsCleared, Toast.LENGTH_SHORT).show()
+                }.onFailure { error ->
+                    recordOperationalEvent("diagnostic_clear_failed", "Diagnostic log cleanup failed", error.message)
+                    Toast.makeText(this, strings(uiLanguage).logsClearFailed, Toast.LENGTH_LONG).show()
+                }
+                diagnosticsBusy = false
+                refresh()
+            }
+        }
+        runCatching { diagnosticsExecutor.execute(task) }.onFailure { error ->
+            diagnosticsBusy = false
+            recordOperationalEvent("diagnostic_clear_failed", "Diagnostic cleanup was rejected", error.message)
+            Toast.makeText(this, strings(uiLanguage).logsClearFailed, Toast.LENGTH_LONG).show()
             refresh()
         }
     }
