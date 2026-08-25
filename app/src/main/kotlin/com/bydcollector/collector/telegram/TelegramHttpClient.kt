@@ -1,5 +1,7 @@
 package com.bydcollector.collector.telegram
 
+import com.bydcollector.collector.util.BoundedUtf8Text
+import com.bydcollector.collector.util.readBoundedUtf8
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URLEncoder
@@ -74,7 +76,8 @@ class TelegramHttpClient(
             }
             activeConnection.outputStream.use { it.write(body) }
             val responseStatus = activeConnection.responseCode
-            classify(responseStatus, responseBody(activeConnection, responseStatus))
+            val response = responseBody(activeConnection, responseStatus)
+            if (response.truncated) oversizedResponse(responseStatus) else classify(responseStatus, response.text)
         } catch (error: Exception) {
             failure(
                 TelegramSendFailureKind.NETWORK_ERROR,
@@ -106,9 +109,17 @@ class TelegramHttpClient(
         )
     }
 
-    private fun responseBody(connection: HttpURLConnection, status: Int): String {
+    private fun responseBody(connection: HttpURLConnection, status: Int): BoundedUtf8Text {
         val stream = if (status in 200..299) connection.inputStream else connection.errorStream
-        return stream?.bufferedReader(StandardCharsets.UTF_8)?.use { it.readText() }.orEmpty()
+        return readBoundedUtf8(stream, TELEGRAM_RESPONSE_MAX_CHARS) ?: BoundedUtf8Text("", truncated = false)
+    }
+
+    private fun oversizedResponse(httpStatus: Int): TelegramSendResult.Failure {
+        return if (httpStatus in 200..299) {
+            failure(TelegramSendFailureKind.INVALID_RESPONSE, httpStatus)
+        } else {
+            failure(kindFor(httpStatus), httpStatus, httpStatus)
+        }
     }
 
     private fun kindFor(code: Int): TelegramSendFailureKind = when (code) {
@@ -137,3 +148,5 @@ class TelegramHttpClient(
         const val READ_TIMEOUT_MS = 10_000
     }
 }
+
+internal const val TELEGRAM_RESPONSE_MAX_CHARS = 16_384

@@ -23,6 +23,7 @@ object DiagnosticLogRecorder {
     @Volatile private var activeRunDir: File? = null
     @Volatile private var activeContext: Context? = null
 
+    @Synchronized
     fun isRecording(): Boolean {
         val current = adbStream
         if (current?.isAlive == true) return true
@@ -30,37 +31,43 @@ object DiagnosticLogRecorder {
         return false
     }
 
+    @Synchronized
     fun start(context: Context): File {
         if (isRecording()) return activeRunDir ?: logRoot(context)
 
-        activeContext = context.applicationContext
+        val appContext = context.applicationContext
         //creates one run directory per recording so logs, events, and notes describe the same incident window
-        val runDir = File(logRoot(context), "logcat_${timestamp()}").apply {
-            mkdirs()
-        }
+        val runDir = createDiagnosticRunDirectory(logRoot(appContext), timestamp())
+        activeContext = appContext
         activeRunDir = runDir
-        File(runDir, "diagnostic_info.txt").writeText(
-            buildString {
-                appendLine("started_at=${timestamp()}")
-                appendLine("package=${BuildConfig.APPLICATION_ID}")
-                appendLine("log_dir=${runDir.absolutePath}")
-            },
-            Charsets.UTF_8
-        )
-        writeCollectorEventsSnapshot(context, runDir)
-        writeKeepAliveLogNote(runDir)
-        //updates latest zip only at explicit diagnostics lifecycle points, never from passive ui state loading
-        writeLatestZip(context, runDir)
-
-        val logFile = File(runDir, "logcat_threadtime.txt")
-        val output = logFile.outputStream()
         try {
-            adbStream = AdbLocalClient(File(context.filesDir, "adb_keys")).openShellStream(
-                command = LOGCAT_COMMAND,
-                output = output
+            File(runDir, "diagnostic_info.txt").writeText(
+                buildString {
+                    appendLine("started_at=${timestamp()}")
+                    appendLine("package=${BuildConfig.APPLICATION_ID}")
+                    appendLine("log_dir=${runDir.absolutePath}")
+                },
+                Charsets.UTF_8
             )
+            writeCollectorEventsSnapshot(appContext, runDir)
+            writeKeepAliveLogNote(runDir)
+            //updates latest zip only at explicit diagnostics lifecycle points, never from passive ui state loading
+            writeLatestZip(appContext, runDir)
+
+            val output = File(runDir, "logcat_threadtime.txt").outputStream()
+            try {
+                adbStream = AdbLocalClient(File(appContext.filesDir, "adb_keys")).openShellStream(
+                    command = LOGCAT_COMMAND,
+                    output = output
+                )
+            } catch (error: Throwable) {
+                runCatching { output.close() }
+                throw error
+            }
         } catch (error: Throwable) {
-            runCatching { output.close() }
+            adbStream = null
+            activeRunDir = null
+            activeContext = null
             File(runDir, "logcat_error.txt").writeText(
                 "full_system_logcat_unavailable=${error::class.java.simpleName}: ${error.message ?: "no message"}\n" +
                     "command=$LOGCAT_COMMAND\n",
@@ -72,23 +79,30 @@ object DiagnosticLogRecorder {
         return runDir
     }
 
+    @Synchronized
     fun stop(): File? {
         val runDir = activeRunDir
-        adbStream?.close()
-        adbStream = null
-        runDir?.let {
-            File(it, "stopped.txt").writeText("stopped_at=${timestamp()}\n", Charsets.UTF_8)
-            activeContext?.let { context -> writeCollectorEventsSnapshot(context, it) }
-            writeKeepAliveLogNote(it)
-            writeLatestZipFromRunDir(it)
+        val context = activeContext
+        try {
+            adbStream?.close()
+            runDir?.let {
+                File(it, "stopped.txt").writeText("stopped_at=${timestamp()}\n", Charsets.UTF_8)
+                context?.let { appContext -> writeCollectorEventsSnapshot(appContext, it) }
+                writeKeepAliveLogNote(it)
+                writeLatestZipFromRunDir(it)
+            }
+            return runDir
+        } finally {
+            adbStream = null
+            activeRunDir = null
+            activeContext = null
         }
-        return runDir
     }
 
     private fun logRoot(context: Context): File {
-        return File(context.filesDir, DIAGNOSTICS_DIR).apply {
-            mkdirs()
-        }
+        val root = File(context.filesDir, DIAGNOSTICS_DIR)
+        check(root.isDirectory || root.mkdirs()) { "Failed to create diagnostics directory: ${root.absolutePath}" }
+        return root
     }
 
     private fun latestZip(context: Context): File = File(logRoot(context), LATEST_ZIP_NAME)
@@ -163,5 +177,17 @@ object DiagnosticLogRecorder {
 
     private fun timestamp(): String {
         return SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+    }
+}
+
+internal fun createDiagnosticRunDirectory(root: File, timestamp: String): File {
+    check(root.isDirectory || root.mkdirs()) { "Failed to create diagnostics directory: ${root.absolutePath}" }
+    var suffix = 1
+    while (true) {
+        val name = if (suffix == 1) "logcat_$timestamp" else "logcat_${timestamp}_$suffix"
+        val candidate = File(root, name)
+        if (candidate.mkdir()) return candidate
+        check(candidate.exists()) { "Failed to create diagnostic run directory: ${candidate.absolutePath}" }
+        suffix += 1
     }
 }

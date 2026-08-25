@@ -13,7 +13,8 @@ class InternalAutoStartReceiver : BroadcastReceiver() {
         ) {
             return
         }
-        CollectorAutoStart.handleBroadcast(
+        handoffAutoStartRecovery(
+            receiver = this,
             context = context,
             action = action,
             retryAttempt = intent.getIntExtra(CollectorAutoStart.EXTRA_RETRY_ATTEMPT, 0)

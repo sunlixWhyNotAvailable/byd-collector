@@ -4,6 +4,8 @@ import java.io.File
 import java.nio.file.Files
 import java.util.zip.ZipInputStream
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -31,6 +33,28 @@ class DiagnosticZipWriterTest {
             assertFalse(tempZip.exists())
         } finally {
             runDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun failedPublicationPreservesTheLastGoodZip() {
+        val root = Files.createTempDirectory("bydcollector-diagnostics-publish").toFile()
+        try {
+            File(root, "collector_events_snapshot.txt").writeText("new evidence", Charsets.UTF_8)
+            val zipFile = File(root, "bydcollector_diagnostics_latest.zip")
+            val previous = "last good bundle".toByteArray(Charsets.UTF_8)
+            zipFile.writeBytes(previous)
+
+            assertFailsWith<IllegalStateException> {
+                DiagnosticZipWriter.writeLatestZip(zipFile, root) { _, _ ->
+                    throw IllegalStateException("injected move failure")
+                }
+            }
+
+            assertContentEquals(previous, zipFile.readBytes())
+            assertFalse(root.listFiles().orEmpty().any { it.name.endsWith(".tmp") })
+        } finally {
+            root.deleteRecursively()
         }
     }
 

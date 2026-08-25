@@ -1,8 +1,8 @@
 package com.bydcollector.collector.influx
 
+import com.bydcollector.collector.util.readBoundedUtf8
 import java.io.OutputStreamWriter
 import java.io.InputStream
-import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URLEncoder
 import java.net.URL
@@ -96,17 +96,7 @@ class HttpInfluxClient : InfluxClient {
 }
 
 internal fun boundedInfluxResponse(input: InputStream?, maxChars: Int = 2_048): String? {
-    if (input == null || maxChars <= 0) return null
-    return InputStreamReader(input, StandardCharsets.UTF_8).use { reader ->
-        val output = StringBuilder(minOf(maxChars, 512))
-        val buffer = CharArray(512)
-        while (output.length < maxChars) {
-            val read = reader.read(buffer, 0, minOf(buffer.size, maxChars - output.length))
-            if (read < 0) break
-            output.append(buffer, 0, read)
-        }
-        output.toString()
-    }
+    return readBoundedUtf8(input, maxChars)?.text
 }
 
 internal fun sanitizeInfluxDiagnostic(value: String, config: InfluxConfig): String {

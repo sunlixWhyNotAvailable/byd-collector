@@ -237,9 +237,9 @@ class CollectorServiceMaintenanceContractTest {
     fun databaseMaintenanceCancelsScheduledAutostartAndAutostartSkipsDbWhileRunning() {
         val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
         val autoStart = sourceFile("com/bydcollector/collector/system/CollectorAutoStart.kt").readText()
-        val keepAliveReceiver = sourceFile("com/bydcollector/collector/system/KeepAliveRecoveryReceiver.kt").readText()
         val startMaintenance = service.substringAfter("private fun startDatabaseMaintenance").substringBefore("private fun cancelDatabaseMaintenance")
-        val handleBroadcast = autoStart.substringAfter("fun handleBroadcast").substringBefore("fun recoverFromForeground")
+        val handleBroadcast = autoStart.substringAfter("fun handleBroadcast").substringBefore("fun handleKeepAliveRecovery")
+        val keepAliveRecovery = autoStart.substringAfter("fun handleKeepAliveRecovery").substringBefore("fun recoverFromForeground")
         val recoverFromForeground = autoStart.substringAfter("fun recoverFromForeground").substringBefore("fun scheduleRestartAfterTaskRemoved")
         val taskRemoved = autoStart.substringAfter("fun scheduleRestartAfterTaskRemoved").substringBefore("fun scheduleRestartAfterUiClosed")
         val uiClosed = autoStart.substringAfter("fun scheduleRestartAfterUiClosed").substringBefore("fun scheduleWatchdog")
@@ -253,8 +253,8 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(taskRemoved.contains("if (CollectorSettings.isDbMaintenanceRunning(appContext)) return"))
         assertTrue(uiClosed.contains("if (CollectorSettings.isDbMaintenanceRunning(appContext)) return"))
         assertTrue(watchdog.contains("if (CollectorSettings.isDbMaintenanceRunning(appContext)) return"))
-        assertInOrder(keepAliveReceiver, "CollectorSettings.isDbMaintenanceRunning(appContext)", "BydCollectorApplication.store(appContext)")
-        assertTrue(keepAliveReceiver.contains("if (CollectorSettings.isDbMaintenanceRunning(appContext)) return"))
+        assertInOrder(keepAliveRecovery, "CollectorSettings.isDbMaintenanceRunning(appContext)", "BydCollectorApplication.store(appContext)")
+        assertTrue(keepAliveRecovery.contains("if (CollectorSettings.isDbMaintenanceRunning(appContext)) return"))
     }
 
     @Test

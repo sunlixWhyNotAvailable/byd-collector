@@ -79,6 +79,27 @@ object CollectorAutoStart {
         scheduleWatchdog(appContext, settings, store)
     }
 
+    fun handleKeepAliveRecovery(context: Context, action: String) {
+        val appContext = context.applicationContext
+        if (CollectorSettings.isDbMaintenanceRunning(appContext)) return
+        val store = BydCollectorApplication.store(appContext)
+        val settings = CollectorSettings(appContext, store)
+        store.recordEvent(
+            "keep_alive_recovery_broadcast",
+            "Keep-alive recovery broadcast received",
+            "action=$action"
+        )
+        recoverFromForeground(appContext, settings, store)
+    }
+
+    fun handleRecoveryRequest(context: Context, action: String, retryAttempt: Int = 0) {
+        if (action == ACTION_KEEP_ALIVE_RECOVERY) {
+            handleKeepAliveRecovery(context, action)
+        } else {
+            handleBroadcast(context, action, retryAttempt)
+        }
+    }
+
     fun recoverFromForeground(context: Context, settings: CollectorSettings, store: TelemetryStore) {
         val appContext = context.applicationContext
         if (CollectorSettings.isDbMaintenanceRunning(appContext)) return

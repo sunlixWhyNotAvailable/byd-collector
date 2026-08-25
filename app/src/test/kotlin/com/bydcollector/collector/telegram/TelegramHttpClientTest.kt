@@ -84,6 +84,24 @@ class TelegramHttpClientTest {
     }
 
     @Test
+    fun oversizedResponsesFailAtTheChannelCapWithoutParsingTheRemainder() {
+        val oversized = "x".repeat(TELEGRAM_RESPONSE_MAX_CHARS + 1)
+        val successFailure = assertIs<TelegramSendResult.Failure>(
+            TelegramHttpClient { FakeConnection(200, oversized) }
+                .sendMessage(TelegramSendMessage("123:secret", "42", "hello"))
+        )
+        val rateLimitFailure = assertIs<TelegramSendResult.Failure>(
+            TelegramHttpClient { FakeConnection(429, oversized) }
+                .sendMessage(TelegramSendMessage("123:secret", "42", "hello"))
+        )
+
+        assertEquals(TelegramSendFailureKind.INVALID_RESPONSE, successFailure.kind)
+        assertEquals(TelegramSendFailureKind.RATE_LIMITED, rateLimitFailure.kind)
+        assertEquals(429, rateLimitFailure.telegramErrorCode)
+        assertNull(rateLimitFailure.retryAfterSeconds)
+    }
+
+    @Test
     fun failuresNeverExposeCredentialsOrTelegramDescriptions() {
         val token = "123:top_secret"
         val chatId = "private-chat"

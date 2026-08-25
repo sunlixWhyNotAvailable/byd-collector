@@ -3,15 +3,23 @@ package com.bydcollector.collector.diagnostics
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
 //publishes the latest diagnostics zip atomically while avoiding self-inclusion of zip outputs
 internal object DiagnosticZipWriter {
-    fun writeLatestZip(zipFile: File, runDir: File) {
+    fun writeLatestZip(
+        zipFile: File,
+        runDir: File,
+        publish: (File, File) -> Unit = ::publishLatestZip
+    ) {
         if (!runDir.isDirectory) return
-        zipFile.parentFile?.mkdirs()
-        val tempZip = File(zipFile.parentFile, "${zipFile.name}.tmp")
+        val parent = zipFile.parentFile ?: return
+        check(parent.isDirectory || parent.mkdirs()) { "Failed to create diagnostics directory: ${parent.absolutePath}" }
+        val tempZip = File.createTempFile("${zipFile.name}.", ".tmp", parent)
         val zipCanonical = zipFile.canonicalFile
         val tempZipCanonical = tempZip.canonicalFile
         try {
@@ -22,21 +30,62 @@ internal object DiagnosticZipWriter {
                     .forEach { file ->
                         val fileCanonical = file.canonicalFile
                         //prevents the zip writer from recursively adding its own output or temp file
-                        if (fileCanonical == zipCanonical || fileCanonical == tempZipCanonical) return@forEach
+                        if (
+                            fileCanonical == zipCanonical ||
+                            fileCanonical == tempZipCanonical ||
+                            fileCanonical.parentFile == zipCanonical.parentFile &&
+                            fileCanonical.name.startsWith("${zipCanonical.name}.")
+                        ) return@forEach
                         val entryName = runDir.toPath().relativize(file.toPath()).toString().replace('\\', '/')
                         zip.putNextEntry(ZipEntry(entryName))
                         FileInputStream(file).use { input -> input.copyTo(zip) }
                         zip.closeEntry()
                     }
             }
-            if (zipFile.exists()) zipFile.delete()
-            if (!tempZip.renameTo(zipFile)) {
-                tempZip.delete()
-                throw IllegalStateException("Failed to publish latest diagnostics zip")
-            }
+            publish(tempZip, zipFile)
+            File(parent, "${zipFile.name}.tmp").delete()
         } catch (error: Exception) {
             tempZip.delete()
             throw error
+        }
+    }
+
+    private fun publishLatestZip(tempZip: File, zipFile: File) {
+        try {
+            Files.move(
+                tempZip.toPath(),
+                zipFile.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING
+            )
+        } catch (_: AtomicMoveNotSupportedException) {
+            publishWithBackup(tempZip, zipFile)
+        } catch (_: UnsupportedOperationException) {
+            publishWithBackup(tempZip, zipFile)
+        }
+    }
+
+    private fun publishWithBackup(tempZip: File, zipFile: File) {
+        if (!zipFile.exists()) {
+            Files.move(tempZip.toPath(), zipFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            return
+        }
+        val backup = File.createTempFile("${zipFile.name}.", ".bak", zipFile.parentFile)
+        Files.copy(zipFile.toPath(), backup.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        var removeBackup = false
+        try {
+            Files.move(tempZip.toPath(), zipFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            removeBackup = true
+        } catch (error: Exception) {
+            try {
+                Files.move(backup.toPath(), zipFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
+                removeBackup = true
+            } catch (restoreError: Exception) {
+                error.addSuppressed(restoreError)
+            }
+            throw error
+        } finally {
+            if (removeBackup) backup.delete()
         }
     }
 }
