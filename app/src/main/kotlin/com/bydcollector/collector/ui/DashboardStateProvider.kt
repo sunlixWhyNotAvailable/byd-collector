@@ -57,18 +57,63 @@ class DashboardStateProvider(
 
     fun loadInitial(): DashboardState = load(DashboardLoadProfile.INITIAL)
 
-    @Suppress("UNUSED_PARAMETER")
     fun load(
         profile: DashboardLoadProfile,
         previous: DashboardState? = null,
         vehicleKpiLanguage: VehicleKpiLanguage = VehicleKpiLanguage.UK
     ): DashboardState {
+        val maintenanceStatus = settings.dbMaintenanceStatus()
+        val mainMaintenanceRunning = maintenanceStatus.running &&
+            maintenanceStatus.operation == DbMaintenanceOperation.ARCHIVE
+        val debugMaintenanceRunning = maintenanceStatus.running &&
+            maintenanceStatus.operation == DbMaintenanceOperation.DEBUG_ARCHIVE
+        val application = context.applicationContext as BydCollectorApplication
+        return when {
+            profile.readsTelemetryStore && !mainMaintenanceRunning -> {
+                application.withTelemetryStoreRead {
+                    loadSnapshot(
+                        profile,
+                        previous,
+                        vehicleKpiLanguage,
+                        mainMaintenanceRunning,
+                        debugMaintenanceRunning,
+                        storeProvider()
+                    )
+                }
+            }
+            profile.readsDebugStatus && !debugMaintenanceRunning -> application.withDatabaseRead {
+                loadSnapshot(
+                    profile,
+                    previous,
+                    vehicleKpiLanguage,
+                    mainMaintenanceRunning,
+                    debugMaintenanceRunning,
+                    null
+                )
+            }
+            else -> loadSnapshot(
+                profile,
+                previous,
+                vehicleKpiLanguage,
+                mainMaintenanceRunning,
+                debugMaintenanceRunning,
+                null
+            )
+        }
+    }
+
+    @Suppress("UNUSED_PARAMETER")
+    private fun loadSnapshot(
+        profile: DashboardLoadProfile,
+        previous: DashboardState?,
+        vehicleKpiLanguage: VehicleKpiLanguage,
+        mainMaintenanceRunning: Boolean,
+        debugMaintenanceRunning: Boolean,
+        store: TelemetryStore?
+    ): DashboardState {
         val serviceRunning = CollectorService.isRunning()
         val mainPollingRunning = CollectorService.isMainPollingRunning()
         val maintenanceStatus = settings.dbMaintenanceStatus()
-        val mainMaintenanceRunning = maintenanceStatus.running && maintenanceStatus.operation == DbMaintenanceOperation.ARCHIVE
-        val debugMaintenanceRunning = maintenanceStatus.running && maintenanceStatus.operation == DbMaintenanceOperation.DEBUG_ARCHIVE
-        val store = if (profile.readsTelemetryStore && !mainMaintenanceRunning) storeProvider() else null
         val nowMs = SystemClock.elapsedRealtime()
         val healthDetailLoaded = profile.healthDetail?.takeIf { store != null }
         val health = if (healthDetailLoaded != null) {
@@ -114,11 +159,13 @@ class DashboardStateProvider(
         }
         val influxStateLoaded = integrationSettingsLoaded && store != null
         val influxState = when {
+            mainMaintenanceRunning -> maintenanceInfluxState()
             profile == DashboardLoadProfile.INITIAL -> initialInfluxState(influxConfig?.enabled == true)
             influxStateLoaded -> store!!.influxExportState()
             else -> maintenanceInfluxState()
         }
-        val useInfluxState = influxStateLoaded || profile == DashboardLoadProfile.INITIAL || previous == null
+        val useInfluxState = mainMaintenanceRunning || influxStateLoaded ||
+            profile == DashboardLoadProfile.INITIAL || previous == null
         //KPI values are fed directly by the successful normalized-poll producer; dashboard refresh never rereads them.
         val vehicleKpisLoaded = false
         val vehicleKpis = previous?.vehicleKpis ?: VehicleKpis()

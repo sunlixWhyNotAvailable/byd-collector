@@ -6,6 +6,7 @@ import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.trips.TripDatabaseHelper
 import com.bydcollector.collector.data.trips.TripStore
+import com.bydcollector.collector.maintenance.DatabaseMaintenanceGate
 import com.bydcollector.collector.maintenance.StorageFormatCutoverCoordinator
 import com.bydcollector.collector.maintenance.StorageFormat
 import com.bydcollector.collector.service.CollectorSettings
@@ -18,6 +19,7 @@ class BydCollectorApplication : Application() {
     private var tripsStore: TripStore? = null
     private var cutoverCoordinator: StorageFormatCutoverCoordinator? = null
     private var debugStorageReady: Boolean? = null
+    private val databaseMaintenanceGate = DatabaseMaintenanceGate()
     val dashboardUiStateStore by lazy { DashboardUiStateStore() }
 
     override fun onCreate() {
@@ -34,8 +36,25 @@ class BydCollectorApplication : Application() {
 
     @Synchronized
     fun closeTelemetryStoreForMaintenance() {
-        telemetryStore?.close()
+        val current = telemetryStore
+        telemetryStore = null
+        current?.close()
     }
+
+    fun <T> withDatabaseRead(action: () -> T): T = databaseMaintenanceGate.withRead(action)
+
+    fun <T> withTelemetryStoreRead(action: (TelemetryStore) -> T): T {
+        while (true) {
+            val result = withDatabaseRead {
+                synchronized(this) { telemetryStore }?.let { StoreReadResult(action(it)) }
+            }
+            if (result != null) return result.value
+            store()
+        }
+    }
+
+    fun <T> withExclusiveDatabaseMaintenance(action: () -> T): T =
+        databaseMaintenanceGate.withExclusive(action)
 
     @Synchronized
     fun reopenTelemetryStoreForMaintenance(): TelemetryStore {
@@ -49,10 +68,13 @@ class BydCollectorApplication : Application() {
         }
     }
 
-    @Synchronized
     fun ensureDebugStorageReady(): Boolean {
-        return debugStorageReady ?: coordinator().ensureDebugReady().also { ready ->
-            debugStorageReady = ready.takeIf { it }
+        return withExclusiveDatabaseMaintenance {
+            synchronized(this) {
+                debugStorageReady ?: coordinator().ensureDebugReady().also { ready ->
+                    debugStorageReady = ready.takeIf { it }
+                }
+            }
         }
     }
 
@@ -87,12 +109,20 @@ class BydCollectorApplication : Application() {
         }
     }
 
-    @Synchronized
     private fun store(): TelemetryStore {
-        telemetryStore?.let { return it }
-        check(coordinator().ensureMainReady()) { "Main telemetry database is not safe to open" }
-        return TelemetryStore(applicationContext, TelemetryDatabaseHelper(applicationContext)).also { telemetryStore = it }
+        withDatabaseRead { synchronized(this) { telemetryStore } }?.let { return it }
+        return withExclusiveDatabaseMaintenance {
+            synchronized(this) {
+                telemetryStore?.let { return@synchronized it }
+                check(coordinator().ensureMainReady()) { "Main telemetry database is not safe to open" }
+                TelemetryStore(applicationContext, TelemetryDatabaseHelper(applicationContext)).also {
+                    telemetryStore = it
+                }
+            }
+        }
     }
+
+    private data class StoreReadResult<T>(val value: T)
 
     @Synchronized
     private fun trips(): TripStore {

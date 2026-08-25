@@ -14,6 +14,11 @@ class DashboardStateProviderMaintenanceContractTest {
         assertTrue(source.contains("private val storeProvider: () -> TelemetryStore"))
         assertTrue(load.contains("profile.readsTelemetryStore && !mainMaintenanceRunning"))
         assertTrue(load.contains("storeProvider()"))
+        assertTrue(load.contains("application.withTelemetryStoreRead"))
+        assertTrue(load.contains("application.withDatabaseRead"))
+        assertInOrder(load, "application.withTelemetryStoreRead", "storeProvider()")
+        assertTrue(source.contains("mainMaintenanceRunning: Boolean"))
+        assertTrue(source.contains("debugMaintenanceRunning: Boolean"))
         assertFalse(source.contains("private val store: TelemetryStore,"))
     }
 
@@ -30,6 +35,8 @@ class DashboardStateProviderMaintenanceContractTest {
         assertTrue(source.contains("debugStatusCache.get(nowMs = nowMs)"))
         assertTrue(source.contains("private fun maintenanceHealthSnapshot("))
         assertTrue(source.contains("private fun maintenanceInfluxState()"))
+        assertTrue(source.contains("val useInfluxState = mainMaintenanceRunning || influxStateLoaded"))
+        assertInOrder(source, "mainMaintenanceRunning -> maintenanceInfluxState()", "profile == DashboardLoadProfile.INITIAL")
     }
 
     @Test
@@ -47,8 +54,8 @@ class DashboardStateProviderMaintenanceContractTest {
         assertTrue(load.contains("settings.archiveStorageLimitGb()"))
         assertTrue(load.contains("settings.archiveStorageJobStatus()"))
         assertTrue(load.contains("archiveStorageResult.snapshot"))
-        assertInOrder(load, "val maintenanceStatus = settings.dbMaintenanceStatus()", "val store = if (profile.readsTelemetryStore")
-        assertInOrder(load, "val store = if (profile.readsTelemetryStore", "val archiveStorageResult = archiveStorageCache.snapshot(")
+        assertInOrder(load, "val maintenanceStatus = settings.dbMaintenanceStatus()", "application.withTelemetryStoreRead")
+        assertInOrder(load, "store: TelemetryStore?", "val archiveStorageResult = archiveStorageCache.snapshot(")
     }
 
     @Test

@@ -12,9 +12,9 @@ class MainActivityMaintenanceContractTest {
 
         assertTrue(source.contains("private fun currentStore(): TelemetryStore = BydCollectorApplication.store(applicationContext)"))
         assertTrue(source.contains("private fun refreshStoreBackedState()"))
-        assertTrue(source.contains("HaMqttActions.testConnection(currentStore(), settings)"))
-        assertTrue(source.contains("InfluxActions.testConnection(currentStore(), settings)"))
-        assertTrue(source.contains("InfluxActions.reExportNewCategories(currentStore(), settings)"))
+        assertTrue(source.contains("HaMqttActions.testConnection(actionStore, settings)"))
+        assertTrue(source.contains("InfluxActions.testConnection(actionStore, settings)"))
+        assertTrue(source.contains("InfluxActions.reExportNewCategories(actionStore, settings)"))
         assertTrue(source.contains("CollectorAutoStart.scheduleWatchdog(applicationContext, settings, currentStore())"))
         assertTrue(source.contains("CollectorAutoStart.scheduleRestartAfterUiClosed(applicationContext, settings, currentStore())"))
         assertTrue(source.contains("AdbAuthorizationManager.request("))
@@ -32,7 +32,35 @@ class MainActivityMaintenanceContractTest {
         assertFalse(source.contains("store.recordEvent("))
         assertFalse(source.contains("currentStore().recordEvent("))
         assertTrue(source.contains("dispatchOperationalEvent(dashboardExecutor)"))
-        assertTrue(source.contains("val eventStore = currentStore()"))
+        assertInOrder(source, "dispatchOperationalEvent(dashboardExecutor)", "withTelemetryStoreRead { eventStore ->", "eventStore.recordEvent(")
+    }
+
+    @Test
+    fun queuedDashboardReadersAndPreflightHoldTheApplicationReadLease() {
+        val source = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val counts = source.substringAfter("private fun scheduleDashboardCountBootstrap")
+            .substringBefore("private fun hydrateDashboardTabsOnce")
+        val preflight = source.substringAfter("private fun openMainArchiveDialog")
+            .substringBefore("private fun loadCredentialsAfterFirstFrame")
+
+        assertInOrder(counts, "dashboardCountExecutor.execute", "withTelemetryStoreRead { countStore ->", "countStore.dashboardRowCounts()")
+        assertInOrder(counts, "withTelemetryStoreRead", "DirectDebugStore(applicationContext)")
+        assertInOrder(preflight, "val task = Runnable", "withTelemetryStoreRead { preflightStore ->", "StorageFormatCutoverCoordinator.readMainPreflight")
+        assertTrue(preflight.contains("StorageFormatCutoverCoordinator.readMainPreflight(preflightStore.databaseFile())"))
+    }
+
+    @Test
+    fun oneShotIntegrationActionsHoldTheTelemetryStoreReadLease() {
+        val source = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val mqtt = source.substringAfter("private fun runMqttChannelAction")
+            .substringBefore("private fun runInfluxChannelAction")
+        val influx = source.substringAfter("private fun runInfluxChannelAction")
+            .substringBefore("private fun currentMaintenanceUiState")
+
+        assertTrue(mqtt.contains("action: (TelemetryStore) -> MqttActionResult"))
+        assertTrue(mqtt.contains("runCatching { withTelemetryStoreRead(action) }"))
+        assertTrue(influx.contains("action: (TelemetryStore) -> InfluxActionResult"))
+        assertTrue(influx.contains("runCatching { withTelemetryStoreRead(action) }"))
     }
 
     @Test
@@ -50,7 +78,7 @@ class MainActivityMaintenanceContractTest {
         assertTrue(actions.contains("fun onDismissDatabaseMaintenance()"))
         assertTrue(source.contains("pendingMaintenanceOperation = DbMaintenanceOperation.ARCHIVE"))
         assertTrue(source.contains("private fun openMainArchiveDialog()"))
-        assertTrue(source.contains("StorageFormatCutoverCoordinator.readMainPreflight(currentStore().databaseFile())"))
+        assertTrue(source.contains("StorageFormatCutoverCoordinator.readMainPreflight(preflightStore.databaseFile())"))
         assertTrue(source.contains("pendingMainArchivePreflight = preflight"))
         assertTrue(source.contains("pendingMainArchivePreflight = MainArchivePreflight("))
         assertTrue(source.contains("warning = \"${'$'}{strings(uiLanguage).archivePreflightFailed}"))
@@ -133,11 +161,17 @@ class MainActivityMaintenanceContractTest {
         ).firstOrNull { it.isFile } ?: error("Missing source file: $path")
     }
 
-    private fun assertInOrder(source: String, first: String, second: String) {
-        val firstIndex = source.indexOf(first)
-        val secondIndex = source.indexOf(second)
-        assertTrue(firstIndex >= 0, "Missing first token: $first")
-        assertTrue(secondIndex >= 0, "Missing second token: $second")
-        assertTrue(firstIndex < secondIndex, "Expected `$first` before `$second`")
+    private fun assertInOrder(source: String, vararg tokens: String) {
+        var previousIndex = -1
+        var previousToken: String? = null
+        tokens.forEach { token ->
+            val index = source.indexOf(token, previousIndex + 1)
+            assertTrue(index >= 0, "Missing token: $token")
+            if (previousToken != null) {
+                assertTrue(index > previousIndex, "Expected `$token` after `$previousToken`")
+            }
+            previousIndex = index
+            previousToken = token
+        }
     }
 }

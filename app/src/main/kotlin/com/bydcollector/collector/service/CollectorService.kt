@@ -1346,28 +1346,29 @@ class CollectorService : Service() {
     private fun scheduleDashboardCountBootstrap(force: Boolean) {
         val countGeneration = dashboardUiStateStore.beginCountBootstrap(force) ?: return
         val generation = dashboardMetricsGeneration.get()
-        val mainStore = store
-        val roundRobinStore = debugStore
         try {
             dashboardCountExecutor.execute {
                 runCatching {
                     android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
-                    val main = mainStore.dashboardRowCounts()
-                    val debug = if (debugStorageReady) {
-                        roundRobinStore.dashboardReadingCount()
-                    } else {
-                        0L
+                    (applicationContext as BydCollectorApplication).withDatabaseRead {
+                        if (generation != dashboardMetricsGeneration.get()) return@withDatabaseRead null
+                        val main = store.dashboardRowCounts()
+                        val debug = if (debugStorageReady) {
+                            debugStore.dashboardReadingCount()
+                        } else {
+                            0L
+                        }
+                        DashboardRowCounts(
+                            pollCount = main.pollCount,
+                            valueRowCount = main.valueRowCount,
+                            ecRowCount = main.ecRowCount,
+                            normalizedCurrentCount = main.normalizedCurrentCount,
+                            normalizedHistoryCount = main.normalizedHistoryCount,
+                            debugReadingCount = debug
+                        )
                     }
-                    DashboardRowCounts(
-                        pollCount = main.pollCount,
-                        valueRowCount = main.valueRowCount,
-                        ecRowCount = main.ecRowCount,
-                        normalizedCurrentCount = main.normalizedCurrentCount,
-                        normalizedHistoryCount = main.normalizedHistoryCount,
-                        debugReadingCount = debug
-                    )
                 }.onSuccess { counts ->
-                    if (generation == dashboardMetricsGeneration.get()) {
+                    if (counts != null && generation == dashboardMetricsGeneration.get()) {
                         dashboardUiStateStore.publishRowCountBaseline(countGeneration, counts)
                     }
                 }.onFailure { error ->
@@ -1511,6 +1512,23 @@ class CollectorService : Service() {
         resetMqttExecutorForMaintenance()
         resetInfluxExecutorForMaintenance()
         resetTelegramExecutorForMaintenance()
+        resetKeepAliveSupervisorForMaintenance()
+    }
+
+    private fun resetKeepAliveSupervisorForMaintenance() {
+        val previous = keepAliveSupervisor
+        if (!previous.shutdownAndAwait(2_000L)) {
+            maintenanceRuntimeRestoreAllowed.set(false)
+            error("Keep-alive worker did not stop before database maintenance")
+        }
+        runOnRuntimeOwnerBlocking {
+            requireRuntimeOwner()
+            if (keepAliveSupervisor !== previous) {
+                maintenanceRuntimeRestoreAllowed.set(false)
+                error("Keep-alive supervisor changed during database maintenance")
+            }
+            keepAliveSupervisor = KeepAliveSupervisor(applicationContext, store)
+        }
     }
 
     private fun prepareRuntimeStopForMaintenance(operation: DbMaintenanceOperation): DetachedMaintenanceRuntime {
@@ -2314,6 +2332,9 @@ class CollectorService : Service() {
         val previous = runOnRuntimeOwnerBlocking {
             requireRuntimeOwner()
             advanceInfluxGeneration()
+            if (influxRuntimeStatus != RuntimeActionStatus.STOPPED) {
+                setInfluxRuntime(RuntimeActionStatus.STOPPING)
+            }
             synchronized(influxExecutorLock) {
                 influxExecutor.also { it.shutdownNow() }
             }
@@ -2324,7 +2345,13 @@ class CollectorService : Service() {
             Thread.currentThread().interrupt()
             false
         }
-        if (!stopped) maintenanceRuntimeRestoreAllowed.set(false)
+        if (!stopped) {
+            maintenanceRuntimeRestoreAllowed.set(false)
+            runOnRuntimeOwnerBlocking {
+                requireRuntimeOwner()
+                setInfluxRuntime(RuntimeActionStatus.ERROR)
+            }
+        }
         check(stopped) { "Influx worker did not stop before database maintenance" }
         influxWorkInFlight.set(0)
         runOnRuntimeOwnerBlocking {
@@ -2335,6 +2362,7 @@ class CollectorService : Service() {
                     error("Influx executor changed during database maintenance")
                 }
                 influxExecutor = namedSingleThreadExecutor("byd-influx")
+                setInfluxRuntime(RuntimeActionStatus.STOPPED)
             }
         }
     }
@@ -2402,18 +2430,15 @@ class CollectorService : Service() {
         restoreAfterMaintenance: Boolean
     ) {
         requireRuntimeOwner()
-        try {
-            if (
-                running.get() &&
-                restoreAfterMaintenance &&
-                maintenanceRuntimeRestoreAllowed.get()
-            ) {
-                restoreRuntimeAfterMaintenance(operation, snapshot)
-            }
-        } finally {
-            activeMaintenanceOperation = null
-            maintenanceActive.set(false)
-            maintenanceRunningInProcess.set(false)
+        activeMaintenanceOperation = null
+        maintenanceActive.set(false)
+        maintenanceRunningInProcess.set(false)
+        if (
+            running.get() &&
+            restoreAfterMaintenance &&
+            maintenanceRuntimeRestoreAllowed.get()
+        ) {
+            restoreRuntimeAfterMaintenance(operation, snapshot)
         }
     }
 

@@ -417,8 +417,8 @@ class MainActivity : ComponentActivity() {
 
         override fun onTestMqtt() {
             actionUiState = actionUiState.copy(mqttTest = true)
-            runMqttChannelAction("MQTT test") {
-                HaMqttActions.testConnection(currentStore(), settings)
+            runMqttChannelAction("MQTT test") { actionStore ->
+                HaMqttActions.testConnection(actionStore, settings)
             }
         }
 
@@ -464,15 +464,15 @@ class MainActivity : ComponentActivity() {
 
         override fun onTestInflux() {
             actionUiState = actionUiState.copy(influxTest = true)
-            runInfluxChannelAction("Influx test", clearAction = { it.copy(influxTest = false) }) {
-                InfluxActions.testConnection(currentStore(), settings)
+            runInfluxChannelAction("Influx test", clearAction = { it.copy(influxTest = false) }) { actionStore ->
+                InfluxActions.testConnection(actionStore, settings)
             }
         }
 
         override fun onReExportInflux() {
             actionUiState = actionUiState.copy(influxReExport = true)
-            runInfluxChannelAction("Influx re-export", clearAction = { it.copy(influxReExport = false) }) {
-                InfluxActions.reExportNewCategories(currentStore(), settings)
+            runInfluxChannelAction("Influx re-export", clearAction = { it.copy(influxReExport = false) }) { actionStore ->
+                InfluxActions.reExportNewCategories(actionStore, settings)
             }
         }
 
@@ -709,10 +709,14 @@ class MainActivity : ComponentActivity() {
 
     private fun currentStore(): TelemetryStore = BydCollectorApplication.store(applicationContext)
 
+    private fun <T> withTelemetryStoreRead(action: (TelemetryStore) -> T): T =
+        (applicationContext as BydCollectorApplication).withTelemetryStoreRead(action)
+
     private fun recordOperationalEvent(category: String, message: String, detail: String? = null) {
         dispatchOperationalEvent(dashboardExecutor) {
-            val eventStore = currentStore()
-            eventStore.recordEvent(category, message, detail)
+            withTelemetryStoreRead { eventStore ->
+                eventStore.recordEvent(category, message, detail)
+            }
         }
     }
 
@@ -869,20 +873,22 @@ class MainActivity : ComponentActivity() {
             dashboardCountExecutor.execute {
                 runCatching {
                     android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
-                    val main = currentStore().dashboardRowCounts()
-                    val debug = if (BydCollectorApplication.isDebugStorageReady(applicationContext)) {
-                        DirectDebugStore(applicationContext).use { it.dashboardReadingCount() }
-                    } else {
-                        0L
+                    withTelemetryStoreRead { countStore ->
+                        val main = countStore.dashboardRowCounts()
+                        val debug = if (BydCollectorApplication.isDebugStorageReady(applicationContext)) {
+                            DirectDebugStore(applicationContext).use { it.dashboardReadingCount() }
+                        } else {
+                            0L
+                        }
+                        DashboardRowCounts(
+                            pollCount = main.pollCount,
+                            valueRowCount = main.valueRowCount,
+                            ecRowCount = main.ecRowCount,
+                            normalizedCurrentCount = main.normalizedCurrentCount,
+                            normalizedHistoryCount = main.normalizedHistoryCount,
+                            debugReadingCount = debug
+                        )
                     }
-                    DashboardRowCounts(
-                        pollCount = main.pollCount,
-                        valueRowCount = main.valueRowCount,
-                        ecRowCount = main.ecRowCount,
-                        normalizedCurrentCount = main.normalizedCurrentCount,
-                        normalizedHistoryCount = main.normalizedHistoryCount,
-                        debugReadingCount = debug
-                    )
                 }.onSuccess { counts ->
                     dashboardUiStateStore.publishRowCountBaseline(countGeneration, counts)
                 }
@@ -938,7 +944,9 @@ class MainActivity : ComponentActivity() {
         maintenancePreflightInFlight = true
         val task = Runnable {
             val result = runCatching {
-                StorageFormatCutoverCoordinator.readMainPreflight(currentStore().databaseFile())
+                withTelemetryStoreRead { preflightStore ->
+                    StorageFormatCutoverCoordinator.readMainPreflight(preflightStore.databaseFile())
+                }
             }
             runOnUiThread {
                 maintenancePreflightInFlight = false
@@ -1798,7 +1806,7 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    private fun runMqttChannelAction(label: String, action: () -> MqttActionResult) {
+    private fun runMqttChannelAction(label: String, action: (TelemetryStore) -> MqttActionResult) {
         refreshStoreBackedState()
         if (!saveMqttDraft()) {
             actionUiState = actionUiState.copy(mqttTest = false)
@@ -1806,7 +1814,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         val task = Runnable {
-            val result = runCatching { action() }
+            val result = runCatching { withTelemetryStoreRead(action) }
             runOnUiThread {
                 if (destroyed) return@runOnUiThread
                 actionUiState = actionUiState.copy(mqttTest = false)
@@ -1843,7 +1851,7 @@ class MainActivity : ComponentActivity() {
     private fun runInfluxChannelAction(
         label: String,
         clearAction: (BydCollectorActionUiState) -> BydCollectorActionUiState,
-        action: () -> InfluxActionResult
+        action: (TelemetryStore) -> InfluxActionResult
     ) {
         refreshStoreBackedState()
         if (!saveInfluxDraft()) {
@@ -1852,7 +1860,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         val task = Runnable {
-            val result = runCatching { action() }
+            val result = runCatching { withTelemetryStoreRead(action) }
             runOnUiThread {
                 if (destroyed) return@runOnUiThread
                 actionUiState = clearAction(actionUiState)

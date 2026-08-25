@@ -51,7 +51,9 @@ class DbMaintenanceCoordinator(
             stopRuntime(operation)
             closeCancelWindowAndCheck(operation)
             publish(operation, 1, cancelAvailable = false)
-            val result = archive(operation)
+            val result = application.withExclusiveDatabaseMaintenance {
+                archive(operation)
+            }
             publish(operation, operation.stepsUk.size)
             restoreRuntime()
             restored = true

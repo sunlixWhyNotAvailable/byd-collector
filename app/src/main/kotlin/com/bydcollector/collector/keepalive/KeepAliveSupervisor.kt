@@ -7,6 +7,7 @@ import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.util.namedSingleThreadExecutor
 import java.io.File
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.TimeUnit
 
 //mirrors app keep-alive settings into shell-visible flags and owns the delegate lifecycle
 class KeepAliveSupervisor(
@@ -125,7 +126,17 @@ class KeepAliveSupervisor(
     }
 
     fun shutdown() {
+        shutdownAndAwait(0L)
+    }
+
+    fun shutdownAndAwait(timeoutMs: Long): Boolean {
         executor.shutdownNow()
+        return try {
+            executor.awaitTermination(timeoutMs.coerceAtLeast(0L), TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
     }
 
     private fun runCommand(shell: KeepAliveShell, command: String, category: String): KeepAliveShellResult {
