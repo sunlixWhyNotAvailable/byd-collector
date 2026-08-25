@@ -76,6 +76,12 @@ class TripMetricsTest {
     }
 
     @Test
+    fun routePointPersistsReceiveWallClockForRestartRecovery() {
+        val point = TripMetrics.routePoint("trip", 1L, sample().copy(receiveWallTimeMs = 42_000L))
+        assertEquals(42_000L, point.receiveWallTimeMs)
+    }
+
+    @Test
     fun invalidUntrustedCoordinateFallsBackToDiagnosticGap() {
         val point = TripMetrics.untrustedPoint("trip", 2L, sample(latitude = 100.0), "invalid_numeric")
         assertEquals(RoutePoint.KIND_GAP, point.kind)

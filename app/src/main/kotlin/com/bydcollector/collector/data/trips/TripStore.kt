@@ -72,7 +72,7 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable {
     }
 
     fun queryRoutePoints(tripId: String): List<RoutePoint> = helper.readableDatabase.rawQuery(
-        "SELECT trip_id, sequence, kind, observed_at, elapsed_ms, boot_id, segment_id, latitude, longitude, accuracy_m, speed_kmh, instantaneous_consumption_kwh_per_100km, altitude_m, bearing_deg, quality, is_first, is_final FROM route_points WHERE trip_id = ? ORDER BY sequence",
+        "SELECT trip_id, sequence, kind, observed_at, elapsed_ms, receive_wall_time_ms, boot_id, segment_id, latitude, longitude, accuracy_m, speed_kmh, instantaneous_consumption_kwh_per_100km, altitude_m, bearing_deg, quality, is_first, is_final FROM route_points WHERE trip_id = ? ORDER BY sequence",
         arrayOf(tripId)
     ).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.toRoutePoint()) } }
 
@@ -99,8 +99,8 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable {
     }
 
     private fun RoutePoint.toContentValues() = ContentValues().apply {
-        // SQLite v1 only permits valid/gap; retain untrusted coordinates as a valid-shaped row and recover the model kind from quality.
-        put("trip_id", tripId); put("sequence", sequence); put("kind", if (kind == RoutePoint.KIND_UNTRUSTED) RoutePoint.KIND_VALID else kind); put("observed_at", observedAt); putNullable("elapsed_ms", elapsedMs)
+        // The schema permits valid/gap; retain untrusted coordinates as a valid-shaped row and recover the model kind from quality.
+        put("trip_id", tripId); put("sequence", sequence); put("kind", if (kind == RoutePoint.KIND_UNTRUSTED) RoutePoint.KIND_VALID else kind); put("observed_at", observedAt); putNullable("elapsed_ms", elapsedMs); putNullable("receive_wall_time_ms", receiveWallTimeMs)
         put("boot_id", bootId); put("segment_id", segmentId); putNullable("latitude", latitude); putNullable("longitude", longitude); putNullable("accuracy_m", accuracyM); putNullable("speed_kmh", speedKmh)
         putNullable("instantaneous_consumption_kwh_per_100km", instantaneousConsumptionKwhPer100Km); putNullable("altitude_m", altitudeM); putNullable("bearing_deg", bearingDeg); put("quality", quality)
         put("is_first", if (isFirst) 1 else 0); put("is_final", if (isFinal) 1 else 0)
@@ -119,8 +119,8 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable {
 
     private fun Cursor.toRoutePoint(): RoutePoint {
         val kind = getString(2)
-        val quality = getString(14)
-        return RoutePoint(getString(0), getLong(1), if (kind == RoutePoint.KIND_VALID && quality.startsWith("untrusted:")) RoutePoint.KIND_UNTRUSTED else kind, getString(3), getLongOrNull(4), getStringOrNull(5), getStringOrNull(6), getDoubleOrNull(7), getDoubleOrNull(8), getDoubleOrNull(9), getDoubleOrNull(10), getDoubleOrNull(11), getDoubleOrNull(12), getDoubleOrNull(13), quality, getInt(15) == 1, getInt(16) == 1)
+        val quality = getString(15)
+        return RoutePoint(getString(0), getLong(1), if (kind == RoutePoint.KIND_VALID && quality.startsWith("untrusted:")) RoutePoint.KIND_UNTRUSTED else kind, getString(3), getLongOrNull(4), getLongOrNull(5), getStringOrNull(6), getStringOrNull(7), getDoubleOrNull(8), getDoubleOrNull(9), getDoubleOrNull(10), getDoubleOrNull(11), getDoubleOrNull(12), getDoubleOrNull(13), getDoubleOrNull(14), quality, getInt(16) == 1, getInt(17) == 1)
     }
 
     private fun Cursor.getStringOrNull(index: Int): String? = if (isNull(index)) null else getString(index)

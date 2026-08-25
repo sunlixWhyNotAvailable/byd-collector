@@ -88,6 +88,7 @@ class GpsTrustGate(
     private var pending: GpsLocationSample? = null
     private var pendingCount = 0
 
+    @Synchronized
     fun offer(sample: GpsLocationSample): GpsTrustDecision {
         val previousReceived = lastReceivedElapsedNanos
         val callbackGap = previousReceived != null && elapsedMs(sample.receiveElapsedRealtimeNanos, previousReceived) > maxReceiveAgeMs
@@ -123,9 +124,13 @@ class GpsTrustGate(
             return GpsTrustDecision(sample, GpsTrustStatus.REJECTED, "continuity_speed", callbackGap)
         }
         pending = sample
-        pendingCount += 1
+        pendingCount = (pendingCount + 1).coerceAtMost(recoveryFixes)
         if (pendingCount < recoveryFixes) {
             return GpsTrustDecision(sample, GpsTrustStatus.PENDING, "recovery_pending", callbackGap)
+        }
+        val anchorFailure = recoveryAnchorFailure(sample)
+        if (anchorFailure != null) {
+            return GpsTrustDecision(sample, GpsTrustStatus.PENDING, anchorFailure, callbackGap)
         }
         lastTrusted = sample
         recovering = false
@@ -134,6 +139,7 @@ class GpsTrustGate(
         return GpsTrustDecision(sample, GpsTrustStatus.TRUSTED, "recovered", callbackGap)
     }
 
+    @Synchronized
     fun reset() {
         lastTrusted = null
         lastReceivedElapsedNanos = null
@@ -142,13 +148,16 @@ class GpsTrustGate(
         pendingCount = 0
     }
 
-    fun beginRecovery() {
+    @Synchronized
+    fun beginRecovery(anchor: GpsLocationSample? = null) {
+        lastTrusted = anchor
         lastReceivedElapsedNanos = null
         recovering = true
         pending = null
         pendingCount = 0
     }
 
+    @Synchronized
     fun lastTrusted(): GpsLocationSample? = lastTrusted
 
     private fun hardFailure(sample: GpsLocationSample): String? = when {
@@ -168,6 +177,24 @@ class GpsTrustGate(
     private fun continuityFailure(sample: GpsLocationSample): String? {
         val previous = lastTrusted ?: return null
         return if (impliedSpeedMps(previous, sample)?.let { it > maxImpliedSpeedMps } == true) "continuity_speed" else null
+    }
+
+    private fun recoveryAnchorFailure(sample: GpsLocationSample): String? {
+        val anchor = lastTrusted ?: return null
+        val seconds = recoveryElapsedSeconds(anchor, sample) ?: return "recovery_anchor_time"
+        val speed = distanceM(anchor.latitude, anchor.longitude, sample.latitude, sample.longitude) / seconds
+        return "recovery_anchor_speed".takeIf { speed > maxImpliedSpeedMps }
+    }
+
+    private fun recoveryElapsedSeconds(anchor: GpsLocationSample, sample: GpsLocationSample): Double? {
+        val sameBoot = anchor.bootId.isNotBlank() && anchor.bootId != "unknown" && anchor.bootId == sample.bootId
+        val monotonicMs = if (sameBoot && anchor.elapsedRealtimeNanos > 0L) {
+            elapsedMs(sample.elapsedRealtimeNanos, anchor.elapsedRealtimeNanos).takeIf { it > 0L }
+        } else null
+        val elapsedMs = monotonicMs
+            ?: (sample.receiveWallTimeMs - anchor.receiveWallTimeMs).takeIf { it > 0L }
+            ?: return null
+        return elapsedMs.toDouble() / 1_000.0
     }
 
     private fun mutuallyConsistent(previous: GpsLocationSample, sample: GpsLocationSample): Boolean =
@@ -206,6 +233,7 @@ class GpsSampleGate(private val minIntervalNanos: Long = 1_000_000_000L) {
     private var lastAccepted: GpsLocationSample? = null
     private var pending: GpsLocationSample? = null
 
+    @Synchronized
     fun offer(sample: GpsLocationSample): GpsLocationSample? {
         val previous = lastAccepted
         val latest = pending ?: previous
@@ -222,6 +250,7 @@ class GpsSampleGate(private val minIntervalNanos: Long = 1_000_000_000L) {
         return sample
     }
 
+    @Synchronized
     fun flushFinal(): GpsLocationSample? {
         val final = pending ?: return null
         pending = null

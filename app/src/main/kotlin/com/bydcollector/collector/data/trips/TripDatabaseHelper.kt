@@ -58,6 +58,7 @@ class TripDatabaseHelper(context: Context) : SQLiteOpenHelper(
                 kind TEXT NOT NULL CHECK (kind IN ('valid', 'gap')),
                 observed_at TEXT NOT NULL,
                 elapsed_ms INTEGER,
+                receive_wall_time_ms INTEGER,
                 boot_id TEXT,
                 segment_id TEXT,
                 latitude REAL,
@@ -83,6 +84,7 @@ class TripDatabaseHelper(context: Context) : SQLiteOpenHelper(
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         require(oldVersion <= DATABASE_VERSION) { "Trip database downgrade is unsupported" }
+        if (oldVersion < 2) db.execSQL("ALTER TABLE route_points ADD COLUMN receive_wall_time_ms INTEGER")
         onCreate(db)
     }
 
@@ -92,6 +94,6 @@ class TripDatabaseHelper(context: Context) : SQLiteOpenHelper(
 
     companion object {
         const val DATABASE_NAME = "bydcollector_trips.db"
-        const val DATABASE_VERSION = 1
+        const val DATABASE_VERSION = 2
     }
 }

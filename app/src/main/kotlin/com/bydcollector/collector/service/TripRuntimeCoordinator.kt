@@ -14,6 +14,7 @@ import com.bydcollector.collector.data.trips.TripTime
 import com.bydcollector.collector.location.AndroidGpsLocationSource
 import com.bydcollector.collector.location.GpsLocationSample
 import com.bydcollector.collector.location.GpsLocationSink
+import com.bydcollector.collector.location.GpsStartRetryGate
 import com.bydcollector.collector.location.LocationNormalizer
 import com.bydcollector.collector.util.namedSingleThreadExecutor
 import java.io.File
@@ -51,6 +52,7 @@ class TripRuntimeCoordinator(
     private var session: TripSession? = null
     private var nextRouteSequence = 0L
     private var gpsStarted = false
+    private val gpsStartRetry = GpsStartRetryGate()
     private var lastLocation: GpsLocationSample? = null
     private var latestBatteryPowerKw: Double? = null
     private var latestBatteryPowerAtMs = Long.MIN_VALUE
@@ -67,6 +69,14 @@ class TripRuntimeCoordinator(
 
             override fun onGap(reason: String, observedAt: String) {
                 dispatch { handleGap(reason, observedAt) }
+            }
+
+            override fun onProviderChanged(enabled: Boolean) {
+                dispatch {
+                    gpsStartRetry.reset()
+                    gpsStarted = false
+                    if (enabled && powerTracker.current() == VehiclePowerState.ON && locationCaptureEnabled()) ensureGpsRunning()
+                }
             }
         },
         bootIdProvider = { bootId },
@@ -259,16 +269,21 @@ class TripRuntimeCoordinator(
 
     private fun ensureGpsRunning() {
         if (gpsStarted || !locationCaptureEnabled()) return
-        gpsStarted = locationSource.start()
-        if (!gpsStarted) {
-            recordEvent("gps_capture_unavailable", "GPS route capture did not start", null)
-        }
+        val nowMs = elapsedRealtimeMs()
+        if (!gpsStartRetry.canAttempt(nowMs)) return
+        val result = locationSource.start(lastLocation)
+        gpsStarted = result.started
+        if (gpsStarted) return gpsStartRetry.reset()
+        if (!gpsStartRetry.onFailure(nowMs)) return
+        val reason = result.failureReason ?: "gps_start_failed"
+        if (result.recordGap) handleGap(reason, Instant.now().toString())
+        recordEvent("gps_capture_unavailable", "GPS route capture did not start", "reason=$reason")
     }
 
     private fun stopGps(markFinal: Boolean = false) {
-        if (!gpsStarted) return
         locationSource.stop(markFinal)
         gpsStarted = false
+        gpsStartRetry.reset()
     }
 
     private fun handleLocation(sample: GpsLocationSample, isFinal: Boolean) {
@@ -372,7 +387,8 @@ class TripRuntimeCoordinator(
             accuracyM = accuracyM,
             speedMps = speedKmh?.div(3.6),
             altitudeM = altitudeM,
-            bearingDeg = bearingDeg
+            bearingDeg = bearingDeg,
+            receiveWallTimeMs = receiveWallTimeMs ?: wall
         )
     }
 

@@ -58,6 +58,7 @@ object TripMetrics {
         sequence = sequence,
         observedAt = sample.observedAt,
         elapsedMs = sample.elapsedRealtimeNanos / 1_000_000L,
+        receiveWallTimeMs = sample.receiveWallTimeMs,
         bootId = sample.bootId,
         segmentId = sample.segmentId,
         latitude = sample.latitude,

@@ -41,6 +41,7 @@ data class RoutePoint(
     val kind: String = KIND_VALID,
     val observedAt: String,
     val elapsedMs: Long? = null,
+    val receiveWallTimeMs: Long? = null,
     val bootId: String? = null,
     val segmentId: String? = null,
     val latitude: Double? = null,
