@@ -24,7 +24,8 @@ object KeepAliveShellPlanner {
         "settings put global bluetooth_disabled_profiles 0"
 
     fun daemonStopCommand(): String =
-        "pidof bydcollector_keepalive >/dev/null 2>&1 && kill -TERM \$(pidof bydcollector_keepalive) 2>/dev/null || true"
+        "pidof bydcollector_keepalive >/dev/null 2>&1 && kill -TERM \$(pidof bydcollector_keepalive) 2>/dev/null || true; " +
+            "for i in 1 2 3; do if ! pidof bydcollector_keepalive >/dev/null 2>&1; then exit 0; fi; sleep 1; done; exit 1"
 
     fun daemonLaunchCommand(apkPath: String): String {
         val quotedApk = shellQuote(apkPath)

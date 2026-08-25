@@ -22,75 +22,73 @@ class KeepAliveSupervisor(
     private val reconcileLock = Any()
     private val reconcileState = KeepAliveReconcileState(ALIVE_TTL_MS)
 
-    fun reconcile(config: KeepAliveConfig) {
+    fun reconcile(config: KeepAliveConfig, forceStatusCheck: Boolean = false) {
         executor.execute {
-            runReconcileSerialized(config)
+            runReconcileSerialized(config, forceStatusCheck)
         }
     }
 
-    fun reconcileBlocking(config: KeepAliveConfig) {
-        runReconcileSerialized(config)
+    fun reconcileBlocking(config: KeepAliveConfig, forceStatusCheck: Boolean = false): Boolean {
+        return runReconcileSerialized(config, forceStatusCheck)
     }
 
-    fun reconcileThen(config: KeepAliveConfig, after: () -> Unit) {
+    fun reconcileThen(config: KeepAliveConfig, after: (Boolean) -> Unit) {
         executor.execute {
-            try {
-                runReconcileSerialized(config)
-            } finally {
-                after()
-            }
+            after(retryKeepAliveReconcile { runReconcileSerialized(config, forceStatusCheck = true) })
         }
     }
 
-    private fun runReconcileSerialized(config: KeepAliveConfig) {
-        synchronized(reconcileLock) {
-            runReconcile(config)
+    private fun runReconcileSerialized(config: KeepAliveConfig, forceStatusCheck: Boolean): Boolean {
+        return synchronized(reconcileLock) {
+            runReconcile(config, forceStatusCheck)
         }
     }
 
-    private fun runReconcile(config: KeepAliveConfig) {
-        try {
+    private fun runReconcile(config: KeepAliveConfig, forceStatusCheck: Boolean): Boolean {
+        return try {
             val nowMs = clockMs()
             val userShutdown = CollectorSettings(context.applicationContext, store).isUserShutdownRequested()
             val configChanged = reconcileState.configChanged(config, userShutdown)
-            val shouldStopDisabledDaemon = reconcileState.shouldStopDaemonForDisabledConfig(configChanged)
+            val shouldStopDisabledDaemon = forceStatusCheck ||
+                reconcileState.shouldStopDaemonForDisabledConfig(configChanged)
             if (config.keepBluetooth) reconcileState.markBluetoothProfilesMayBeOverridden()
             val shouldRestoreBluetoothProfiles = reconcileState.shouldRestoreBluetoothProfiles(config)
             if (
-                config.anyEnabled &&
-                !configChanged &&
-                !shouldRestoreBluetoothProfiles &&
-                reconcileState.aliveFresh(nowMs)
-            ) return
-            if (!config.anyEnabled && !shouldStopDisabledDaemon && !shouldRestoreBluetoothProfiles) return
+                canReuseKeepAliveStatus(
+                    anyEnabled = config.anyEnabled,
+                    forceStatusCheck = forceStatusCheck,
+                    configChanged = configChanged,
+                    shouldRestoreBluetoothProfiles = shouldRestoreBluetoothProfiles,
+                    aliveFresh = reconcileState.aliveFresh(nowMs)
+                )
+            ) return true
+            if (!config.anyEnabled && !shouldStopDisabledDaemon && !shouldRestoreBluetoothProfiles) return true
 
             val shell = shellFactory()
-            var configSynchronized = !configChanged
             if (configChanged) {
                 //writes every flag before launch/stop so the daemon loop observes a complete desired state
-                val mirrorResults = KeepAliveShellPlanner.mirrorSettingsCommands(config, userShutdown).map { command ->
-                    runCommand(shell, command, "keep_alive_setting_sync")
+                for (command in KeepAliveShellPlanner.mirrorSettingsCommands(config, userShutdown)) {
+                    if (!runCommand(shell, command, "keep_alive_setting_sync").ok) return false
                 }
-                if (mirrorResults.all { it.ok }) {
-                    reconcileState.markConfigApplied(config, userShutdown)
-                    configSynchronized = true
-                }
+                if (config.anyEnabled) reconcileState.markConfigApplied(config, userShutdown)
             }
-            if (configSynchronized && shouldRestoreBluetoothProfiles) {
+            if (shouldRestoreBluetoothProfiles) {
                 val rollback = runCommand(
                     shell,
                     KeepAliveShellPlanner.bluetoothProfilesRestoreCommand(),
                     "keep_alive_bluetooth_profiles_restore"
                 )
-                if (rollback.ok) reconcileState.markBluetoothProfilesRestored()
+                if (!rollback.ok) return false
+                reconcileState.markBluetoothProfilesRestored()
             }
 
             if (config.anyEnabled) {
                 val status = runCommand(shell, KeepAliveShellPlanner.daemonStatusCommand(), "keep_alive_daemon_status")
                 if (status.ok) {
                     reconcileState.markAlive(clockMs())
-                    return
+                    return true
                 }
+                reconcileState.clearAlive()
                 //starts the delegate only after a stale/failed one-shot status check
                 runCommand(
                     shell,
@@ -98,9 +96,7 @@ class KeepAliveSupervisor(
                     "keep_alive_daemon_start"
                 )
                 val retryStatus = runCommand(shell, KeepAliveShellPlanner.daemonStatusRetryCommand(), "keep_alive_daemon_status")
-                if (retryStatus.ok) {
-                    reconcileState.markAlive(clockMs())
-                } else {
+                if (!retryStatus.ok) {
                     //captures the daemon tail because shell startup failures are otherwise invisible in the app ui
                     val tail = shell.exec(KeepAliveShellPlanner.daemonLogTailCommand(), timeoutMs = 10_000)
                     store.recordEvent(
@@ -108,12 +104,17 @@ class KeepAliveSupervisor(
                         message = "Keep-alive daemon log tail captured",
                         detail = tail.output.take(1_000)
                     )
+                } else {
+                    reconcileState.markAlive(clockMs())
                 }
+                retryStatus.ok
             } else {
                 reconcileState.clearAlive()
-                if (shouldStopDisabledDaemon) {
-                    runCommand(shell, KeepAliveShellPlanner.daemonStopCommand(), "keep_alive_daemon_stop")
-                }
+                //The stop command exits successfully only after the detached daemon is confirmed absent.
+                val stopped = !shouldStopDisabledDaemon ||
+                    runCommand(shell, KeepAliveShellPlanner.daemonStopCommand(), "keep_alive_daemon_stop").ok
+                if (stopped && configChanged) reconcileState.markConfigApplied(config, userShutdown)
+                stopped
             }
         } catch (error: RuntimeException) {
             store.recordEvent(
@@ -121,7 +122,7 @@ class KeepAliveSupervisor(
                 "Keep-alive reconcile failed",
                 "${error::class.java.simpleName}: ${error.message ?: "no message"}"
             )
-        } finally {
+            false
         }
     }
 
@@ -159,4 +160,26 @@ class KeepAliveSupervisor(
     companion object {
         private const val ALIVE_TTL_MS = 10 * 60 * 1000L
     }
+
+}
+
+internal fun retryKeepAliveReconcile(attempt: () -> Boolean): Boolean {
+    repeat(3) {
+        if (attempt()) return true
+    }
+    return false
+}
+
+internal fun canReuseKeepAliveStatus(
+    anyEnabled: Boolean,
+    forceStatusCheck: Boolean,
+    configChanged: Boolean,
+    shouldRestoreBluetoothProfiles: Boolean,
+    aliveFresh: Boolean
+): Boolean {
+    return anyEnabled &&
+        !forceStatusCheck &&
+        !configChanged &&
+        !shouldRestoreBluetoothProfiles &&
+        aliveFresh
 }

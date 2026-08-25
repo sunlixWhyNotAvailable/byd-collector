@@ -109,9 +109,19 @@ class KeepAliveShellPlannerTest {
     @Test
     fun daemonStopCommandIsFixed() {
         assertEquals(
-            "pidof bydcollector_keepalive >/dev/null 2>&1 && kill -TERM \$(pidof bydcollector_keepalive) 2>/dev/null || true",
+            "pidof bydcollector_keepalive >/dev/null 2>&1 && kill -TERM \$(pidof bydcollector_keepalive) 2>/dev/null || true; " +
+                "for i in 1 2 3; do if ! pidof bydcollector_keepalive >/dev/null 2>&1; then exit 0; fi; sleep 1; done; exit 1",
             KeepAliveShellPlanner.daemonStopCommand()
         )
+    }
+
+    @Test
+    fun daemonStopCommandOnlySucceedsAfterPidIsAbsent() {
+        val command = KeepAliveShellPlanner.daemonStopCommand()
+
+        assertTrue(command.contains("for i in 1 2 3"))
+        assertTrue(command.contains("if ! pidof bydcollector_keepalive"))
+        assertTrue(command.endsWith("done; exit 1"))
     }
 
     @Test
@@ -131,6 +141,28 @@ class KeepAliveShellPlannerTest {
 
         assertTrue(mirrorIndex in 0..<rollbackIndex)
         assertTrue(rollbackIndex in 0..<stopIndex)
+    }
+
+    @Test
+    fun supervisorLetsTheWatchdogBypassTheOrdinaryAliveCache() {
+        val source = sourceFile("com/bydcollector/collector/keepalive/KeepAliveSupervisor.kt").readText()
+        val reconcile = source.substringAfter("private fun runReconcile(config: KeepAliveConfig, forceStatusCheck: Boolean)")
+            .substringBefore("fun shutdown()")
+
+        assertTrue(reconcile.contains("daemonStatusCommand()"))
+        assertTrue(reconcile.contains("forceStatusCheck = forceStatusCheck"))
+        assertTrue(reconcile.contains("aliveFresh = reconcileState.aliveFresh(nowMs)"))
+        assertTrue(source.contains("ALIVE_TTL_MS"))
+    }
+
+    @Test
+    fun completionReconcileAlwaysForcesARealDaemonCheck() {
+        val source = sourceFile("com/bydcollector/collector/keepalive/KeepAliveSupervisor.kt").readText()
+        val reconcileThen = source.substringAfter("fun reconcileThen")
+            .substringBefore("private fun runReconcileSerialized")
+
+        assertTrue(reconcileThen.contains("forceStatusCheck = true"))
+        assertTrue(source.contains("val shouldStopDisabledDaemon = forceStatusCheck ||"))
     }
 
     @Test

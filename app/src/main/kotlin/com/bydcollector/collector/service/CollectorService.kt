@@ -303,6 +303,7 @@ class CollectorService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val stickyRestart = intent?.action == null
         val action = intent?.action ?: "sticky_restart"
+        val forceKeepAliveStatusCheck = intent?.getBooleanExtra(EXTRA_FORCE_KEEP_ALIVE_STATUS_CHECK, false) == true
         if (action == ACTION_SHUTDOWN) {
             shutdownByUser()
             return START_NOT_STICKY
@@ -345,7 +346,10 @@ class CollectorService : Service() {
                 }
                 reconcileCollection()
             }
-            ACTION_RECONCILE_KEEP_ALIVE -> reconcilePersistedRuntime(reconcileKeepAliveState = true)
+            ACTION_RECONCILE_KEEP_ALIVE -> reconcilePersistedRuntime(
+                reconcileKeepAliveState = true,
+                forceKeepAliveStatusCheck = forceKeepAliveStatusCheck
+            )
             ACTION_START_MQTT_EXPORT -> startMqttExport(clearManualStop = true)
             ACTION_RECONCILE_MQTT_EXPORT -> reconcileMqttAutoStart()
             ACTION_STOP_MQTT_EXPORT -> stopMqttExport(manualStop = true)
@@ -365,7 +369,7 @@ class CollectorService : Service() {
                 ensureForegroundForChannel("Archive storage")
                 enqueueArchiveDelete(intent?.getStringArrayListExtra(EXTRA_ARCHIVE_IDS).orEmpty())
             }
-            ACTION_START -> reconcileCollection()
+            ACTION_START -> reconcileCollection(forceKeepAliveStatusCheck = forceKeepAliveStatusCheck)
         }
         if (!stickyRestart) reconcilePendingCutoverArchiveStorage(action)
         reconcileAccessSelfCheckSchedule()
@@ -592,20 +596,25 @@ class CollectorService : Service() {
         CollectorAutoStart.scheduleWatchdog(applicationContext, settings, store)
     }
 
-    private fun reconcilePersistedRuntime(reconcileKeepAliveState: Boolean = false) {
+    private fun reconcilePersistedRuntime(
+        reconcileKeepAliveState: Boolean = false,
+        forceKeepAliveStatusCheck: Boolean = false
+    ) {
         val demand = settings.runtimeDemand(includeEnabledExports = true)
         demand.recoveryActions().forEach { recoveryAction ->
             when (recoveryAction) {
-                RuntimeRecoveryAction.MAIN -> reconcileCollection()
+                RuntimeRecoveryAction.MAIN -> reconcileCollection(
+                    forceKeepAliveStatusCheck = forceKeepAliveStatusCheck
+                )
                 RuntimeRecoveryAction.DEBUG -> reconcileDebugRuntime()
                 RuntimeRecoveryAction.MQTT -> startMqttExport(clearManualStop = false)
                 RuntimeRecoveryAction.INFLUX -> startInfluxExport(clearManualStop = false)
                 RuntimeRecoveryAction.TELEGRAM -> reconcileTelegramRuntime(unblockBlocked = true)
-                RuntimeRecoveryAction.KEEP_ALIVE -> reconcileKeepAliveOnly()
+                RuntimeRecoveryAction.KEEP_ALIVE -> reconcileKeepAliveOnly(forceKeepAliveStatusCheck)
             }
         }
         if (reconcileKeepAliveState && !demand.main && !demand.keepAlive) {
-            reconcileKeepAliveOnly()
+            reconcileKeepAliveOnly(forceKeepAliveStatusCheck)
         } else if (!demand.any) {
             stopIfNoActiveRuntime()
         }
@@ -629,7 +638,10 @@ class CollectorService : Service() {
         CollectorAutoStart.scheduleWatchdog(applicationContext, settings, store)
     }
 
-    private fun reconcileCollection(debugStartReason: String = DEBUG_REASON_AUTOSTART) {
+    private fun reconcileCollection(
+        debugStartReason: String = DEBUG_REASON_AUTOSTART,
+        forceKeepAliveStatusCheck: Boolean = false
+    ) {
         if (maintenanceBlocksRuntimeStart()) return
         try {
             val mainEnabled = settings.isPollingEnabled()
@@ -653,7 +665,10 @@ class CollectorService : Service() {
             startForeground(NOTIFICATION_ID, buildNotification(initialNotificationText))
             acquireWakeLock()
             //keeps network/bluetooth policy independent from whether telemetry polling itself is active
-            keepAliveSupervisor.reconcile(keepAliveConfig)
+            keepAliveSupervisor.reconcile(
+                keepAliveConfig,
+                forceStatusCheck = forceKeepAliveStatusCheck && keepAliveEnabled
+            )
 
             if (mainAllowed) {
                 startMainIfNeeded()
@@ -680,7 +695,7 @@ class CollectorService : Service() {
         }
     }
 
-    private fun reconcileKeepAliveOnly() {
+    private fun reconcileKeepAliveOnly(forceKeepAliveStatusCheck: Boolean = false) {
         try {
             val keepAliveConfig = settings.keepAliveConfig()
             val keepAliveEnabled = keepAliveConfig.anyEnabled
@@ -697,7 +712,10 @@ class CollectorService : Service() {
             lastNotificationText = notification
             startForeground(NOTIFICATION_ID, buildNotification(notification))
             acquireWakeLock()
-            keepAliveSupervisor.reconcile(keepAliveConfig)
+            keepAliveSupervisor.reconcile(
+                keepAliveConfig,
+                forceStatusCheck = forceKeepAliveStatusCheck && keepAliveEnabled
+            )
             CollectorAutoStart.scheduleWatchdog(applicationContext, settings, store)
         } catch (error: RuntimeException) {
             handleStartFailure(error)
@@ -708,9 +726,16 @@ class CollectorService : Service() {
         val stoppingText = "Stopping keep-alive"
         lastNotificationText = stoppingText
         runCatching { startForeground(NOTIFICATION_ID, buildNotification(stoppingText)) }
-        keepAliveSupervisor.reconcileThen(keepAliveConfig) {
+        keepAliveSupervisor.reconcileThen(keepAliveConfig) { reconciled ->
             mainHandler.post {
-                stopIfNoActiveRuntime()
+                if (reconciled) {
+                    stopIfNoActiveRuntime()
+                } else {
+                    store.recordEvent(
+                        "keep_alive_stop_deferred",
+                        "Service remains foreground because keep-alive shutdown was not confirmed"
+                    )
+                }
             }
         }
     }
@@ -1079,8 +1104,20 @@ class CollectorService : Service() {
     }
 
     private fun stopServiceAfterUserShutdown() {
-        keepAliveSupervisor.reconcileThen(KeepAliveConfig(false, false, false, false)) {
+        keepAliveSupervisor.reconcileThen(KeepAliveConfig(false, false, false, false)) { reconciled ->
             mainHandler.post {
+                if (!settings.isUserShutdownRequested()) {
+                    userShutdownFinalizationStarted.set(false)
+                    return@post
+                }
+                if (!reconciled) {
+                    userShutdownFinalizationStarted.set(false)
+                    store.recordEvent(
+                        "user_shutdown_keep_alive_failed",
+                        "User shutdown left the service foreground until keep-alive shutdown can be confirmed"
+                    )
+                    return@post
+                }
                 releaseWakeLock()
                 runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
                 stopSelf()
@@ -1917,6 +1954,7 @@ class CollectorService : Service() {
     }
 
     private fun stopIfNoActiveRuntime() {
+        if (settings.isUserShutdownRequested() || userShutdownFinalizationStarted.get()) return
         val liveness = RuntimeLiveness(
             main = poller.isRunning(),
             debug = isDebugPollerRunning(),
@@ -2792,6 +2830,7 @@ class CollectorService : Service() {
         val ACTION_RECONCILE_ARCHIVE_STORAGE: String = "${BuildConfig.ACTION_PREFIX}.action.RECONCILE_ARCHIVE_STORAGE"
         val ACTION_DELETE_ARCHIVES: String = "${BuildConfig.ACTION_PREFIX}.action.DELETE_ARCHIVES"
         const val EXTRA_ARCHIVE_IDS = "archiveIds"
+        private const val EXTRA_FORCE_KEEP_ALIVE_STATUS_CHECK = "forceKeepAliveStatusCheck"
         private const val CHANNEL_ID = "collector"
         private const val NOTIFICATION_ID = 1001
         private const val STATUS_HEARTBEAT_INTERVAL_MS = 30_000L
@@ -2832,9 +2871,11 @@ class CollectorService : Service() {
         fun isMaintenanceRunningInProcess(): Boolean = maintenanceRunningInProcess.get()
         fun isArchiveStorageActive(): Boolean = archiveStorageActiveInProcess.get()
 
-        fun startIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
-            action = ACTION_START
-        }
+        fun startIntent(context: Context, forceKeepAliveStatusCheck: Boolean = false): Intent =
+            Intent(context, CollectorService::class.java).apply {
+                action = ACTION_START
+                putExtra(EXTRA_FORCE_KEEP_ALIVE_STATUS_CHECK, forceKeepAliveStatusCheck)
+            }
 
         fun shutdownIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
             action = ACTION_SHUTDOWN
@@ -2856,9 +2897,11 @@ class CollectorService : Service() {
             action = ACTION_STOP_DEBUG
         }
 
-        fun keepAliveIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
-            action = ACTION_RECONCILE_KEEP_ALIVE
-        }
+        fun keepAliveIntent(context: Context, forceKeepAliveStatusCheck: Boolean = false): Intent =
+            Intent(context, CollectorService::class.java).apply {
+                action = ACTION_RECONCILE_KEEP_ALIVE
+                putExtra(EXTRA_FORCE_KEEP_ALIVE_STATUS_CHECK, forceKeepAliveStatusCheck)
+            }
 
         fun startMqttExportIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
             action = ACTION_START_MQTT_EXPORT

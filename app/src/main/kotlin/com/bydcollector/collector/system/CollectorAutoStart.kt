@@ -239,7 +239,11 @@ object CollectorAutoStart {
                 "Collector already running; requested service reconcile",
                 "action=$action channels=${demand.recoveryActions().joinToString(",") { it.name }}"
             )
-            dispatchRuntimeRecovery(appContext, demand)
+            dispatchRuntimeRecovery(
+                appContext,
+                demand,
+                forceKeepAliveStatusCheck = action == ACTION_WATCHDOG_AUTO_START
+            )
         } catch (error: RuntimeException) {
             store.recordEvent(
                 "auto_start_reconcile_failure",
@@ -249,15 +253,22 @@ object CollectorAutoStart {
         }
     }
 
-    private fun dispatchRuntimeRecovery(context: Context, demand: RuntimeDemand) {
+    private fun dispatchRuntimeRecovery(
+        context: Context,
+        demand: RuntimeDemand,
+        forceKeepAliveStatusCheck: Boolean = false
+    ) {
         demand.recoveryActions().forEach { action ->
             when (action) {
-                RuntimeRecoveryAction.MAIN -> CollectorServiceController.start(context)
+                RuntimeRecoveryAction.MAIN -> CollectorServiceController.start(context, forceKeepAliveStatusCheck)
                 RuntimeRecoveryAction.DEBUG -> CollectorServiceController.reconcileDebug(context)
                 RuntimeRecoveryAction.MQTT -> CollectorServiceController.reconcileMqttExport(context)
                 RuntimeRecoveryAction.INFLUX -> CollectorServiceController.reconcileInfluxExport(context)
                 RuntimeRecoveryAction.TELEGRAM -> CollectorServiceController.reconcileTelegram(context)
-                RuntimeRecoveryAction.KEEP_ALIVE -> CollectorServiceController.reconcileKeepAlive(context)
+                RuntimeRecoveryAction.KEEP_ALIVE -> CollectorServiceController.reconcileKeepAlive(
+                    context,
+                    forceKeepAliveStatusCheck
+                )
             }
         }
     }

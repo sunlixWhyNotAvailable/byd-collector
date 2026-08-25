@@ -113,6 +113,29 @@ class UserShutdownContractTest {
     }
 
     @Test
+    fun shutdownStopsServiceOnlyAfterKeepAliveShutdownIsConfirmed() {
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val ordinaryStop = service.substringAfter("private fun stopAfterKeepAliveReconcile")
+            .substringBefore("private fun startMainIfNeeded")
+        val userStop = service.substringAfter("private fun stopServiceAfterUserShutdown")
+            .substringBefore("private fun stopMain")
+
+        assertTrue(ordinaryStop.contains("{ reconciled ->"))
+        assertInOrder(ordinaryStop, "if (reconciled)", "stopIfNoActiveRuntime()")
+        assertTrue(ordinaryStop.contains("keep_alive_stop_deferred"))
+        assertTrue(userStop.contains("{ reconciled ->"))
+        assertInOrder(userStop, "if (!settings.isUserShutdownRequested())", "if (!reconciled)")
+        assertInOrder(userStop, "if (!reconciled)", "stopSelf()")
+        assertTrue(userStop.contains("userShutdownFinalizationStarted.set(false)"))
+        assertTrue(userStop.contains("user_shutdown_keep_alive_failed"))
+
+        val idleStop = service.substringAfter("private fun stopIfNoActiveRuntime")
+            .substringBefore("private fun postMqttRetrySchedule")
+        assertInOrder(idleStop, "settings.isUserShutdownRequested()", "stopSelf()")
+        assertInOrder(idleStop, "userShutdownFinalizationStarted.get()", "stopSelf()")
+    }
+
+    @Test
     fun serializedStopRunsAfterCurrentWorkAndDoesNotDeadlockOnItsOwnWorker() {
         val releaseCurrent = CountDownLatch(1)
         val currentStarted = CountDownLatch(1)

@@ -62,14 +62,20 @@ class RuntimeManualStopContractTest {
             onStart.indexOf("if (stickyRestart) reconcilePendingCutoverArchiveStorage(action)") <
                 onStart.indexOf("reconcilePersistedRuntime()")
         )
-        assertTrue(onStart.contains("ACTION_RECONCILE_KEEP_ALIVE -> reconcilePersistedRuntime(reconcileKeepAliveState = true)"))
+        assertTrue(onStart.contains("ACTION_RECONCILE_KEEP_ALIVE -> reconcilePersistedRuntime("))
+        assertTrue(onStart.contains("forceKeepAliveStatusCheck = forceKeepAliveStatusCheck"))
         assertTrue(stickyReconcile.contains("runtimeDemand(includeEnabledExports = true)"))
         assertTrue(stickyReconcile.contains("RuntimeRecoveryAction.MQTT -> startMqttExport(clearManualStop = false)"))
         assertTrue(stickyReconcile.contains("RuntimeRecoveryAction.INFLUX -> startInfluxExport(clearManualStop = false)"))
         assertTrue(stickyReconcile.contains("RuntimeRecoveryAction.TELEGRAM -> reconcileTelegramRuntime"))
-        assertTrue(stickyReconcile.contains("RuntimeRecoveryAction.MAIN -> reconcileCollection()"))
+        assertTrue(stickyReconcile.contains("RuntimeRecoveryAction.MAIN -> reconcileCollection("))
         assertTrue(recoveryDispatch.contains("RuntimeRecoveryAction.TELEGRAM -> CollectorServiceController.reconcileTelegram(context)"))
-        assertTrue(recoveryDispatch.contains("RuntimeRecoveryAction.MAIN -> CollectorServiceController.start(context)"))
+        assertTrue(
+            recoveryDispatch.contains(
+                "RuntimeRecoveryAction.MAIN -> CollectorServiceController.start(context, forceKeepAliveStatusCheck)"
+            )
+        )
+        assertTrue(autoStart.contains("forceKeepAliveStatusCheck = action == ACTION_WATCHDOG_AUTO_START"))
     }
 
     @Test

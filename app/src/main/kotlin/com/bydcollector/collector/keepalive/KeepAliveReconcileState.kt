@@ -1,6 +1,6 @@
 package com.bydcollector.collector.keepalive
 
-//remembers steady-state reconcile results so the watchdog does not open local adb every minute
+//remembers ordinary reconcile results; the minute watchdog explicitly bypasses the liveness cache
 class KeepAliveReconcileState(
     private val aliveTtlMs: Long
 ) {

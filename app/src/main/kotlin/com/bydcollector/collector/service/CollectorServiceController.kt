@@ -5,8 +5,8 @@ import android.os.Build
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 
 object CollectorServiceController {
-    fun start(context: Context) {
-        val intent = CollectorService.startIntent(context)
+    fun start(context: Context, forceKeepAliveStatusCheck: Boolean = false) {
+        val intent = CollectorService.startIntent(context, forceKeepAliveStatusCheck)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             context.startForegroundService(intent)
         } else {
@@ -35,8 +35,8 @@ object CollectorServiceController {
         context.startService(CollectorService.stopDebugIntent(context))
     }
 
-    fun reconcileKeepAlive(context: Context) {
-        val intent = CollectorService.keepAliveIntent(context)
+    fun reconcileKeepAlive(context: Context, forceKeepAliveStatusCheck: Boolean = false) {
+        val intent = CollectorService.keepAliveIntent(context, forceKeepAliveStatusCheck)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             context.startForegroundService(intent)
         } else {
