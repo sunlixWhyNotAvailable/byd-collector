@@ -238,17 +238,49 @@ class InfluxExportCoordinatorTest {
     }
 
     @Test
-    fun modeUsesTotalRemainingBacklogInsteadOfBoundedBatchSize() {
-        val catchUpStore = FakeInfluxStore((1L..1_300L).map { id -> row(id, "soc") })
-        val realtimeStore = FakeInfluxStore((1L..1_299L).map { id -> row(id, "soc") })
+    fun catchUpBatchStartsAtTheExactOneThousandRowThreshold() {
+        val realtimeStore = FakeInfluxStore((1L..999L).map { id -> row(id, "soc") })
+        val catchUpStore = FakeInfluxStore((1L..1_000L).map { id -> row(id, "soc") })
+        val realtimeClient = FakeInfluxClient()
+        val catchUpClient = FakeInfluxClient()
 
-        coordinator(catchUpStore, FakeInfluxClient()).runOneCycle(force = true)
-        coordinator(realtimeStore, FakeInfluxClient()).runOneCycle(force = true)
+        coordinator(realtimeStore, realtimeClient).runOneCycle(force = true)
+        coordinator(catchUpStore, catchUpClient).runOneCycle(force = true)
 
-        assertEquals(1_000L, catchUpStore.influxExportState().pendingRows)
-        assertEquals("catch_up", catchUpStore.influxExportState().mode)
-        assertEquals(999L, realtimeStore.influxExportState().pendingRows)
-        assertEquals("realtime", realtimeStore.influxExportState().mode)
+        assertEquals(listOf(300), realtimeStore.pendingBatchLimits)
+        assertEquals(300, realtimeClient.writtenLines.single().size)
+        assertEquals(699L, realtimeStore.influxExportState().pendingRows)
+        assertEquals(listOf(2_000), catchUpStore.pendingBatchLimits)
+        assertEquals(1_000, catchUpClient.writtenLines.single().size)
+        assertEquals(1_000L, catchUpStore.cursor("soc").lastExportedHistoryId)
+        assertEquals(0L, catchUpStore.influxExportState().pendingRows)
+    }
+
+    @Test
+    fun catchUpFallsBackToRealtimeBatchesAsBacklogShrinksWithoutSkippingRows() {
+        val store = FakeInfluxStore((1L..2_501L).map { id -> row(id, "soc") })
+        val client = FakeInfluxClient()
+        val clock = FakeClock()
+        val coordinator = coordinator(store, client, clock)
+
+        coordinator.runOneCycle(force = true)
+        assertEquals(2_000L, store.cursor("soc").lastExportedHistoryId)
+        assertEquals(501L, store.influxExportState().pendingRows)
+        assertEquals("2026-06-15T12:00:01Z", store.influxExportState().nextRetryAt)
+
+        clock.now = "2026-06-15T12:00:01Z"
+        coordinator.runOneCycle(force = false)
+        assertEquals(2_300L, store.cursor("soc").lastExportedHistoryId)
+        assertEquals(201L, store.influxExportState().pendingRows)
+
+        clock.now = "2026-06-15T12:00:02Z"
+        coordinator.runOneCycle(force = false)
+
+        assertEquals(listOf(2_000, 300, 300), store.pendingBatchLimits)
+        assertEquals(listOf(2_000, 300, 201), client.writtenLines.map { it.size })
+        assertEquals(2_501L, store.cursor("soc").lastExportedHistoryId)
+        assertEquals(0L, store.influxExportState().pendingRows)
+        assertEquals(null, store.influxExportState().nextRetryAt)
     }
 
     @Test

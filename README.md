@@ -45,7 +45,7 @@ Interactive controls do not add an artificial callback delay: accepted button, s
 | Trips | Separate local trip history, GPS routes, configurable speed/consumption colours, and an online OpenStreetMap view |
 | SQLite and archives | Compact-v2 raw/normalized stores, crash-safe database cutover, ZIP archives, sharing, and a shared archive limit |
 | Runtime | Background recovery, optional Tailscale activation, combined Wi-Fi/cellular recovery, Bluetooth recovery, and explicit shutdown |
-| Diagnostics | User-started full-system logcat under `Options -> Keep alive`, local status/error history, native ZIP sharing, and safe completed-log cleanup |
+| Diagnostics | An always-on bounded operational journal, optional full-system logcat under `Options -> Keep alive`, fresh native ZIP sharing, and safe log cleanup |
 
 The app UI is available in English and Ukrainian and supports dark and light themes.
 
@@ -103,7 +103,7 @@ The `HA integration` tab configures the two off-car export channels. They are in
 - Exports normalized history to `InfluxDB v1` for long-term charts and Grafana.
 - Configure host, port, database, measurement, credentials, and categories independently of MQTT.
 - The location category remains off by default. When enabled, timestamped trusted GPS history uses the same durable per-field cursor contract as the other categories.
-- A persisted cursor is kept for each selected field. Export is independent of main polling while the service is alive: successful globally ordered batches contain up to 300 rows and continue once per second while backlog remains; a real write failure uses a 30-second retry delay.
+- A persisted cursor is kept for each selected field. Export is independent of main polling while the service is alive: successful globally ordered batches contain up to 300 rows in realtime mode, or up to 2,000 rows when total pending work reaches the existing 1,000-row catch-up threshold. Batches continue once per second while backlog remains; a real write failure uses a 30-second retry delay.
 - `Re-export` is available when new categories are enabled; existing cursor state prevents duplicate history in normal operation.
 
 Transport security and TLS deployment are separate integration decisions. Protect the endpoint and credentials on the network where the collector is used.
@@ -159,7 +159,7 @@ The `Options` tab contains operational controls rather than vehicle-control comm
 - enable automatic start for main collection, All data, MQTT, and InfluxDB where shown;
 - restore Wi-Fi and cellular together, or Bluetooth independently, while the runtime is active;
 - restore the collector service after supported process/boot events;
-- start or stop the single full-system logcat recorder, then share its diagnostic ZIP or clear completed logs at the bottom of `Keep alive`;
+- start or stop the single full-system logcat recorder, then create a fresh diagnostic ZIP or clear local logs at the bottom of `Keep alive`;
 - grant and verify the notification-listener lifecycle anchor through the app's local-ADB repair flow; the service reads no notification payloads;
 - keep Wi-Fi and cellular enabled from the separate detached keep-alive helper every 30 seconds when their combined switch is enabled;
 - optionally detect and activate Tailscale when a configured endpoint is unreachable, with a delayed launch and foreground-task restoration; and
@@ -171,9 +171,13 @@ The app's keep-alive path is recovery-oriented and idempotent. It does not write
 
 ## Diagnostics and privacy
 
-There is no separate `Logs` tab or duplicate Journal mode. Start and stop the one logcat recorder at the bottom of `Options -> Keep alive` when investigating a reproducible issue. `Share logs` refreshes the current diagnostic ZIP and opens Android's share chooser with an immutable cache copy. `Clear logs` removes completed captures and generated bundles without interrupting an active capture, but protects a fresh handoff copy for 10 minutes so the receiving app can finish reading it. Expired handoff copies are pruned by the next Share/Clear action and can otherwise remain until Android clears app cache. Recorder, snapshot, ZIP, share preparation, and cleanup work runs away from the UI thread. Start waits for the completed ADB authorization check. Capture uses the exact full-system command `logcat -b all -v threadtime`; it does not silently fall back to a PID-filtered app-only file.
+There is no separate `Logs` tab or user-controlled Journal mode. The app continuously writes existing operational events—not telemetry samples—to an app-private JSONL journal with one active file plus three 2 MiB rotations (8 MiB maximum). Start and stop the optional full-system logcat recorder at the bottom of `Options -> Keep alive` when investigating a reproducible issue. Start waits for the completed ADB authorization check and uses the exact command `logcat -b all -v threadtime`; it does not silently fall back to a PID-filtered app-only file.
 
-Diagnostics stay local unless you explicitly share an archive through the Android chooser. A selected archive can contain raw telemetry, Chinese field names/descriptions, timestamps, quality/failure metadata, vehicle-state history, network endpoint settings, and logcat output if recording was enabled. Review the archive contents and remove unrelated days before sharing. Do not publish bot tokens, passwords, private addresses, or precise trip/location data.
+Each `Share logs` action creates a new coherent snapshot rather than modifying an old logcat run. The ZIP contains capture metadata, the bounded JSONL journal, up to 200 recent SQLite `collector_events`, provenance plus a best-effort copy of the active or latest logcat run, and up to the last 512 KiB of `/data/local/tmp/bydcollector_keepalive.log`. Missing logcat/helper data is recorded as a controlled status entry and does not block the ZIP. Main, Debug, and Trips databases are not included. Android receives only the ZIP attachment—no prefilled subject or message—and opens the native chooser with an immutable cache copy.
+
+`Clear logs` removes completed captures and generated bundles, resets the JSONL journal, and attempts to truncate the helper log in place without interrupting an active logcat capture. A helper/ADB failure is reported as partial cleanup instead of blocking local cleanup. A fresh handoff copy remains protected for 10 minutes so the receiving app can finish reading it; expired copies are pruned by the next Share/Clear action and can otherwise remain until Android clears app cache. Recorder, snapshot, ZIP, share preparation, and cleanup work runs away from the UI thread.
+
+Diagnostics stay local unless you explicitly share the ZIP through the Android chooser. Operational details, full-system logcat, and helper output can still contain private addresses, identifiers, coordinates, or unrelated process data. Review the archive before sharing it and do not publish credentials or sensitive location data. Database archives are a separate Storage feature and can contain raw telemetry and trip history.
 
 The collector does not automatically upload telemetry, screenshots, crash reports, or logcat to the project. MQTT, InfluxDB, and Telegram are opt-in destinations configured by the user. Read the complete data-handling policy in [PRIVACY.md](PRIVACY.md).
 
@@ -224,7 +228,7 @@ Check the broker host/port, credentials, topic/discovery prefixes, and selected 
 
 ### InfluxDB is behind or shows retries
 
-Check endpoint credentials, database/measurement, and category selection. The exporter retains cursors, drains successful backlog in 300-row batches paced one second apart, and waits 30 seconds only after a real write failure. A successful poll does not imply that every queued history row has already reached InfluxDB.
+Check endpoint credentials, database/measurement, and category selection. The exporter retains cursors, uses 300-row realtime batches and up to 2,000 rows once total pending work reaches 1,000, keeps successful batches one second apart, and waits 30 seconds only after a real write failure. A successful poll does not imply that every queued history row has already reached InfluxDB.
 
 ### Telegram messages are delayed or missing
 

@@ -104,9 +104,48 @@ class DiagnosticLogRecorderContractTest {
         assertTrue(activity.contains("Intent.ACTION_SEND"))
         assertTrue(activity.contains("Intent.createChooser(sendIntent, title)"))
         assertTrue(activity.contains("type = \"application/zip\""))
+        val shareMethod = activity.substringAfter("private fun shareDiagnosticLogs()")
+            .substringBefore("private fun clearDiagnosticLogs()")
+        assertTrue(shareMethod.contains("Intent.EXTRA_STREAM"))
+        assertFalse(shareMethod.contains("Intent.EXTRA_SUBJECT"))
+        assertFalse(shareMethod.contains("Intent.EXTRA_TEXT"))
         assertTrue(activity.contains("DiagnosticLogRecorder.clearCompleted(applicationContext)"))
         assertTrue(paths.contains("<cache-path name=\"diagnostic_shares\" path=\"diagnostic_shares/\" />"))
         assertFalse(paths.contains("<files-path name=\"diagnostics\""))
+    }
+
+    @Test
+    fun eachShareUsesAFreshSnapshotWithBoundedHelperTailAndLogcatProvenance() {
+        val source = projectFile(
+            "app/src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt",
+            "src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt"
+        ).readText()
+        val share = source.substringAfter("fun prepareShareBundle(context: Context)")
+            .substringBefore("fun clearCompleted(context: Context)")
+
+        assertTrue(share.contains("createDiagnosticSnapshotDirectory"))
+        assertTrue(share.contains("writeLogcatSnapshot"))
+        assertTrue(share.contains("writeOperationalJournalSnapshot"))
+        assertTrue(share.contains("writeKeepAliveLogSnapshot"))
+        assertTrue(source.contains("private const val KEEP_ALIVE_LOG_TAIL_BYTES = 512 * 1024"))
+        assertTrue(source.contains("tail -c \$KEEP_ALIVE_LOG_TAIL_BYTES"))
+        assertTrue(source.contains("logcat_provenance.txt"))
+        assertTrue(source.contains(": > \$KEEP_ALIVE_LOG_PATH"))
+    }
+
+    @Test
+    fun latestLogcatSourceIgnoresNewerShareSnapshots() {
+        val root = Files.createTempDirectory("bydcollector-diagnostic-source").toFile()
+        try {
+            val logcat = createDiagnosticRunDirectory(root, "20260825_120000")
+            val snapshot = File(root, "snapshot_20260825_120001").apply { mkdirs() }
+            logcat.setLastModified(1_000L)
+            snapshot.setLastModified(2_000L)
+
+            assertEquals(logcat.canonicalPath, latestCompletedDiagnosticRun(root)?.canonicalPath)
+        } finally {
+            root.deleteRecursively()
+        }
     }
 
     @Test

@@ -6,6 +6,7 @@ import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.util.Log
 import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
+import com.bydcollector.collector.diagnostics.OperationalEventJournal
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.data.normalized.NormalizedQuality
 import com.bydcollector.collector.data.normalized.NormalizedStateStore
@@ -39,7 +40,8 @@ class TelemetryStore(
     private val context: Context,
     private val helper: TelemetryDatabaseHelper,
     private val clock: Clock = SystemClockAdapter(),
-    private val eventRetention: Int = 200
+    private val eventRetention: Int = 200,
+    private val operationalEventJournal: OperationalEventJournal
 ) : PollStorage,
     WorkerPollStorage,
     NormalizedStateProvider,
@@ -276,6 +278,7 @@ class TelemetryStore(
     }
 
     override fun recordEvent(category: String, message: String, detail: String?) {
+        val timestamp = clock.nowIso()
         val logLine = buildString {
             append(category).append(": ").append(message)
             detail?.takeIf { it.isNotBlank() }?.let { append(" detail=").append(it) }
@@ -290,13 +293,24 @@ class TelemetryStore(
             Log.i("BYDCollectorEvent", logLine)
         }
         try {
+            operationalEventJournal.append(
+                timestamp = timestamp,
+                elapsedMs = clock.elapsedRealtimeMs(),
+                category = category,
+                message = message,
+                detail = detail
+            )
+        } catch (error: Exception) {
+            Log.w(TAG, "operational journal write failed: $logLine", error)
+        }
+        try {
             val db = helper.writableDatabase
             //stores only recent operational events so diagnostics stay useful without growing unbounded
             db.insert(
                 "collector_events",
                 null,
                 ContentValues().apply {
-                    put("ts", clock.nowIso())
+                    put("ts", timestamp)
                     put("category", category)
                     put("message", message)
                     put("detail", detail)

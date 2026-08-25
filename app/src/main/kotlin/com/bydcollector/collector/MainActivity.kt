@@ -2057,7 +2057,6 @@ class MainActivity : ComponentActivity() {
                     val title = strings(uiLanguage).shareLogs
                     val sendIntent = Intent(Intent.ACTION_SEND).apply {
                         type = "application/zip"
-                        putExtra(Intent.EXTRA_SUBJECT, title)
                         putExtra(Intent.EXTRA_STREAM, uri)
                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                         clipData = ClipData.newUri(contentResolver, title, uri)
@@ -2096,13 +2095,19 @@ class MainActivity : ComponentActivity() {
                     diagnosticsBusy = false
                     return@post
                 }
-                result.onSuccess { removed ->
+                result.onSuccess { clearResult ->
                     recordOperationalEvent(
                         "diagnostic_logs_cleared",
                         "Completed diagnostic logs cleared",
-                        "removed=$removed active_recording=${DiagnosticLogRecorder.isRecording()}"
+                        "removed=${clearResult.removed} active_recording=${DiagnosticLogRecorder.isRecording()} " +
+                            "warnings=${clearResult.warnings.joinToString(" | ").ifBlank { "none" }}"
                     )
-                    Toast.makeText(this, strings(uiLanguage).logsCleared, Toast.LENGTH_SHORT).show()
+                    val message = if (clearResult.warnings.isEmpty()) {
+                        strings(uiLanguage).logsCleared
+                    } else {
+                        strings(uiLanguage).logsPartiallyCleared
+                    }
+                    Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
                 }.onFailure { error ->
                     recordOperationalEvent("diagnostic_clear_failed", "Diagnostic log cleanup failed", error.message)
                     Toast.makeText(this, strings(uiLanguage).logsClearFailed, Toast.LENGTH_LONG).show()

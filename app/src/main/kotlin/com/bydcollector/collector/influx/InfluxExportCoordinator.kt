@@ -138,7 +138,12 @@ class InfluxExportCoordinator(
             return InfluxActionResult.ok("influx next attempt pending")
         }
 
-        val rows = store.pendingInfluxRows(fieldKeys, BATCH_LIMIT)
+        val batchLimit = if (pendingBefore.rows >= CATCH_UP_THRESHOLD) {
+            CATCH_UP_BATCH_LIMIT
+        } else {
+            REALTIME_BATCH_LIMIT
+        }
+        val rows = store.pendingInfluxRows(fieldKeys, batchLimit)
         if (rows.isEmpty()) {
             store.updateInfluxExportState(
                 status = STATUS_IDLE,
@@ -268,7 +273,8 @@ class InfluxExportCoordinator(
 
     private companion object {
         const val EXPORT_SOURCE_TABLE = "vehicle_state_history"
-        const val BATCH_LIMIT = 300
+        const val REALTIME_BATCH_LIMIT = 300
+        const val CATCH_UP_BATCH_LIMIT = 2_000
         const val CATCH_UP_THRESHOLD = 1_000
         const val SUCCESS_BATCH_INTERVAL_SECONDS = 1L
         const val FAILURE_RETRY_INTERVAL_SECONDS = 30L

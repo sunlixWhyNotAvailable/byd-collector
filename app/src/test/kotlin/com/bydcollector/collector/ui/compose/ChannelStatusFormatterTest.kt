@@ -6,15 +6,51 @@ import kotlin.test.assertEquals
 
 class ChannelStatusFormatterTest {
     @Test
-    fun healthyInfluxBatchScheduleIsWaitingForItsDeadline() {
+    fun healthyInfluxBatchScheduleIsActiveWhileRuntimeIsRunning() {
         val status = "scheduled; pending: 10362; retry at 2026-08-13 17:23:15"
 
         assertEquals(
-            "очікування",
+            "експортує",
             ChannelStatusFormatter.compactText(status, strings(UiLanguage.UK), RuntimeActionStatus.RUNNING)
         )
         assertEquals(
+            StatusKind.OK,
+            ChannelStatusFormatter.kind(status, enabled = true, RuntimeActionStatus.RUNNING)
+        )
+    }
+
+    @Test
+    fun scheduledStoppedAndIdleRunningRemainWaiting() {
+        val strings = strings(UiLanguage.EN)
+
+        assertEquals(
+            "waiting",
+            ChannelStatusFormatter.compactText("scheduled; pending: 42", strings, RuntimeActionStatus.STOPPED)
+        )
+        assertEquals(
             StatusKind.WAITING,
+            ChannelStatusFormatter.kind("scheduled; pending: 42", enabled = true, RuntimeActionStatus.STOPPED)
+        )
+        assertEquals(
+            "waiting",
+            ChannelStatusFormatter.compactText("idle; pending: 0", strings, RuntimeActionStatus.RUNNING)
+        )
+        assertEquals(
+            StatusKind.WAITING,
+            ChannelStatusFormatter.kind("idle; pending: 0", enabled = true, RuntimeActionStatus.RUNNING)
+        )
+    }
+
+    @Test
+    fun enabledMqttRuntimeStillRendersRunningAndGreen() {
+        val status = "enabled; pending: 0"
+
+        assertEquals(
+            "running",
+            ChannelStatusFormatter.compactText(status, strings(UiLanguage.EN), RuntimeActionStatus.RUNNING)
+        )
+        assertEquals(
+            StatusKind.OK,
             ChannelStatusFormatter.kind(status, enabled = true, RuntimeActionStatus.RUNNING)
         )
     }

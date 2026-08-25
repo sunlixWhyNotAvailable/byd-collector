@@ -17,6 +17,7 @@ object ChannelStatusFormatter {
             runtimeStatus == RuntimeActionStatus.STOPPING -> strings.stopping
             runtimeStatus == RuntimeActionStatus.ERROR -> strings.error.lowercase(Locale.getDefault())
             runtimeStatus == RuntimeActionStatus.STOPPED -> strings.waiting
+            runtimeStatus == RuntimeActionStatus.RUNNING && normalized.contains("scheduled") -> strings.exporting
             normalized.contains("catch") || normalized.contains("export") || normalized.contains("run") -> strings.exporting
             normalized.contains("scheduled") || normalized.contains("idle") -> strings.waiting
             normalized.contains("enabled") -> strings.running
@@ -37,6 +38,7 @@ object ChannelStatusFormatter {
             runtimeStatus == RuntimeActionStatus.STARTING ||
                 runtimeStatus == RuntimeActionStatus.STOPPING ||
                 runtimeStatus == RuntimeActionStatus.STOPPED -> StatusKind.WAITING
+            runtimeStatus == RuntimeActionStatus.RUNNING && normalized.contains("scheduled") -> StatusKind.OK
             normalized.contains("scheduled") || normalized.contains("idle") -> StatusKind.WAITING
             runtimeStatus == RuntimeActionStatus.RUNNING -> StatusKind.OK
             enabled || normalized.contains("catch") || normalized.contains("export") || normalized.contains("run") -> StatusKind.OK

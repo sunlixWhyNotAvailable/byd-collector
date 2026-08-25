@@ -2,6 +2,7 @@ package com.bydcollector.collector.data.local
 
 import java.io.File
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -25,7 +26,12 @@ class TelemetryStoreLifecycleContractTest {
 
         val applicationText = sourceFile("com/bydcollector/collector/BydCollectorApplication.kt").readText()
         assertTrue(applicationText.contains("TelemetryDatabaseHelper(applicationContext)"))
-        assertTrue(applicationText.contains("TelemetryStore(applicationContext"))
+        assertTrue(applicationText.contains("TelemetryStore("))
+        assertTrue(applicationText.contains("internal val operationalEventJournal by lazy"))
+        assertEquals(
+            2,
+            applicationText.split("operationalEventJournal = operationalEventJournal").size - 1
+        )
         val onCreate = applicationText.substringAfter("override fun onCreate()").substringBefore("override fun onTerminate()")
         assertFalse(onCreate.contains("TelemetryDatabaseHelper("))
         assertFalse(onCreate.contains("TelemetryStore("))

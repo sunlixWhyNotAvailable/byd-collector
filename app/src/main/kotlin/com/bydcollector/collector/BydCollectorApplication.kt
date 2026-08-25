@@ -6,6 +6,7 @@ import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.trips.TripDatabaseHelper
 import com.bydcollector.collector.data.trips.TripStore
+import com.bydcollector.collector.diagnostics.OperationalEventJournal
 import com.bydcollector.collector.maintenance.DatabaseMaintenanceGate
 import com.bydcollector.collector.maintenance.StorageFormatCutoverCoordinator
 import com.bydcollector.collector.maintenance.StorageFormat
@@ -20,6 +21,7 @@ class BydCollectorApplication : Application() {
     private var cutoverCoordinator: StorageFormatCutoverCoordinator? = null
     private var debugStorageReady: Boolean? = null
     private val databaseMaintenanceGate = DatabaseMaintenanceGate()
+    internal val operationalEventJournal by lazy { OperationalEventJournal(applicationContext) }
     val dashboardUiStateStore by lazy { DashboardUiStateStore() }
 
     override fun onCreate() {
@@ -58,7 +60,11 @@ class BydCollectorApplication : Application() {
 
     @Synchronized
     fun reopenTelemetryStoreForMaintenance(): TelemetryStore {
-        return TelemetryStore(applicationContext, TelemetryDatabaseHelper(applicationContext)).also { store ->
+        return TelemetryStore(
+            applicationContext,
+            TelemetryDatabaseHelper(applicationContext),
+            operationalEventJournal = operationalEventJournal
+        ).also { store ->
             store.ensureCatalogImported()
             store.ensureNormalizedCatalogImported()
             telemetryStore = store
@@ -115,7 +121,11 @@ class BydCollectorApplication : Application() {
             synchronized(this) {
                 telemetryStore?.let { return@synchronized it }
                 check(coordinator().ensureMainReady()) { "Main telemetry database is not safe to open" }
-                TelemetryStore(applicationContext, TelemetryDatabaseHelper(applicationContext)).also {
+                TelemetryStore(
+                    applicationContext,
+                    TelemetryDatabaseHelper(applicationContext),
+                    operationalEventJournal = operationalEventJournal
+                ).also {
                     telemetryStore = it
                 }
             }
