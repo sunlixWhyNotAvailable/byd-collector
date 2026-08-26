@@ -7,6 +7,7 @@ import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
+import java.util.Locale;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -18,7 +19,10 @@ public final class KeepAliveDaemon {
     private static final long LOG_MAX_BYTES = 1_048_576L;
     private static final int COMMAND_OUTPUT_MAX_BYTES = 65_536;
     private static final long OUTPUT_DRAIN_TIMEOUT_MS = 1_000L;
+    private static final long BLUETOOTH_VERIFY_DELAY_MS = 1_000L;
+    private static final int BLUETOOTH_VERIFY_ATTEMPTS = 5;
     private static final String USER_SHUTDOWN_COMMAND = "settings get global bydcollector_user_shutdown";
+    private static final String BLUETOOTH_STATE_COMMAND = "dumpsys bluetooth_manager | grep -E 'enabled:|state:'";
     private static final String RECOVER_COLLECTOR_COMMAND =
             "am broadcast --include-stopped-packages -a com.bydcollector.collector.action.KEEP_ALIVE_RECOVERY " +
                     "-n com.bydcollector.collector/com.bydcollector.collector.system.KeepAliveRecoveryReceiver";
@@ -34,6 +38,7 @@ public final class KeepAliveDaemon {
             "svc bluetooth enable",
             "settings put global bluetooth_disabled_profiles 202803",
             "settings put global bluetooth_disabled_profiles 0",
+            BLUETOOTH_STATE_COMMAND,
             "dumpsys power | grep mWakefulness",
             "pidof com.bydcollector.collector",
             "dumpsys activity services com.bydcollector.collector/.service.CollectorService",
@@ -108,15 +113,69 @@ public final class KeepAliveDaemon {
                     "bluetooth_sleep_keepalive_requested",
                     "settings put global bluetooth_disabled_profiles 202803"
             );
-            runAndLog("bluetooth_enable_requested", "svc bluetooth enable");
         } else {
             //restores normal profile policy while awake so the keep-alive path is not permanently invasive
             runAndLog(
                     "bluetooth_profiles_restored_awake",
                     "settings put global bluetooth_disabled_profiles 0"
             );
-            runAndLog("bluetooth_enable_requested", "svc bluetooth enable");
         }
+
+        Boolean enabled = readBluetoothEnabled();
+        if (Boolean.TRUE.equals(enabled)) {
+            log("bluetooth_already_enabled");
+            return;
+        }
+        if (enabled == null) {
+            log("bluetooth_state_unavailable");
+            return;
+        }
+
+        ShellResult request = run("svc bluetooth enable", 10_000L);
+        log("bluetooth_enable_requested ok=" + request.ok
+                + " elapsed_ms=" + request.elapsedMs
+                + " output=" + sanitize(request.output)
+                + " error=" + sanitize(request.error));
+        for (int attempt = 1; attempt <= BLUETOOTH_VERIFY_ATTEMPTS; attempt++) {
+            try {
+                Thread.sleep(BLUETOOTH_VERIFY_DELAY_MS);
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                log("bluetooth_enable_verification_interrupted");
+                return;
+            }
+            if (Boolean.TRUE.equals(readBluetoothEnabled())) {
+                log("bluetooth_enable_confirmed attempt=" + attempt + " request_ok=" + request.ok);
+                return;
+            }
+        }
+        log("bluetooth_enable_not_confirmed request_ok=" + request.ok + " request_error=" + sanitize(request.error));
+    }
+
+    private static Boolean readBluetoothEnabled() {
+        ShellResult state = run(BLUETOOTH_STATE_COMMAND, 5_000L);
+        return state.ok ? parseBluetoothEnabled(state.output) : null;
+    }
+
+    static Boolean parseBluetoothEnabled(String output) {
+        String normalized = output == null ? "" : output.toLowerCase(Locale.ROOT);
+        Boolean enabled = null;
+        Boolean stateOn = null;
+        for (String line : normalized.split("\\R")) {
+            String value = line.trim();
+            if (enabled == null && value.startsWith("enabled:")) {
+                enabled = value.equals("enabled: true") ? Boolean.TRUE
+                        : value.equals("enabled: false") ? Boolean.FALSE
+                        : null;
+            } else if (stateOn == null && value.startsWith("state:")) {
+                stateOn = value.equals("state: on") ? Boolean.TRUE
+                        : value.equals("state: off") ? Boolean.FALSE
+                        : null;
+            }
+        }
+        if (Boolean.TRUE.equals(enabled) && Boolean.TRUE.equals(stateOn)) return Boolean.TRUE;
+        if (Boolean.FALSE.equals(enabled) && Boolean.FALSE.equals(stateOn)) return Boolean.FALSE;
+        return null;
     }
 
     private static void recoverCollectorServiceIfNeeded() {

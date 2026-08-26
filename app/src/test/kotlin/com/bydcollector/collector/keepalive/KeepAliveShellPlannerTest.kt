@@ -133,6 +133,29 @@ class KeepAliveShellPlannerTest {
     }
 
     @Test
+    fun bluetoothRecoveryUsesActualManagerStateInsteadOfSvcExitCode() {
+        assertEquals(true, KeepAliveDaemon.parseBluetoothEnabled("  enabled: true\n  state: ON"))
+        assertEquals(false, KeepAliveDaemon.parseBluetoothEnabled("  enabled: false\n  state: OFF"))
+        assertEquals(null, KeepAliveDaemon.parseBluetoothEnabled("  enabled: true\n  state: TURNING_ON"))
+        assertEquals(null, KeepAliveDaemon.parseBluetoothEnabled("  enabled: true"))
+        assertEquals(null, KeepAliveDaemon.parseBluetoothEnabled("Bluetooth manager unavailable"))
+
+        val source = sourceFile("com/bydcollector/collector/keepalive/KeepAliveDaemon.java").readText()
+        val method = source.substringAfter("private static void keepBluetoothAlive() {")
+            .substringBefore("    private static Boolean readBluetoothEnabled()")
+
+        assertTrue(method.indexOf("readBluetoothEnabled()") < method.indexOf("run(\"svc bluetooth enable\""))
+        assertTrue(method.contains("bluetooth_already_enabled"))
+        assertTrue(method.contains("bluetooth_state_unavailable"))
+        assertTrue(method.contains("bluetooth_enable_confirmed"))
+        assertTrue(method.contains("bluetooth_enable_not_confirmed"))
+        assertFalse(method.contains("runAndLog(\"bluetooth_enable_requested\""))
+        assertEquals(1, Regex("""run\(\"svc bluetooth enable\"""").findAll(method).count())
+        assertTrue(source.contains("BLUETOOTH_VERIFY_ATTEMPTS = 5"))
+        assertTrue(source.contains("BLUETOOTH_VERIFY_DELAY_MS = 1_000L"))
+    }
+
+    @Test
     fun supervisorMirrorsFlagsBeforeBluetoothRollbackAndStopsAfterIt() {
         val source = sourceFile("com/bydcollector/collector/keepalive/KeepAliveSupervisor.kt").readText()
         val mirrorIndex = source.indexOf("mirrorSettingsCommands")
