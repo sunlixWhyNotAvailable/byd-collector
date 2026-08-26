@@ -52,7 +52,6 @@ body:
     attributes:
       label: Collector version / Версія Collector
       description: Use the version shown in the app header or APK details. / Вкажіть версію із заголовка застосунку або властивостей APK.
-      placeholder: "2.7.1"
     validations:
       required: true
 
