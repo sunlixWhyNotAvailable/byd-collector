@@ -1,0 +1,93 @@
+name: "💡 Suggestion / Пропозиція"
+description: "Suggest a product or workflow improvement / Запропонувати продуктове чи UX-вдосконалення"
+title: "[Suggestion]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem first, then the proposed behavior. BYD Collector production telemetry is read-only; clearly identify any suggestion that may require a new vehicle data source or a control/write path.
+
+        Спочатку опишіть проблему, потім запропоновану поведінку. Production-телеметрія BYD Collector є read-only; явно позначте пропозицію, яка може потребувати нового джерела даних автомобіля або control/write-шляху.
+
+  - type: checkboxes
+    id: existing_issue
+    attributes:
+      label: Existing issue / Наявний issue
+      options:
+        - label: I searched existing issues and did not find the same proposal. / Я перевірив наявні issue та не знайшов такої самої пропозиції.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case / Проблема або сценарій
+      description: What is difficult, missing, or unnecessarily slow today? / Чого зараз бракує або що працює незручно чи надто повільно?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior / Запропонована поведінка
+      description: Describe the user-visible result, not an internal implementation version. / Опишіть видимий користувачу результат, а не версію внутрішньої реалізації.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Product area / Частина продукту
+      options:
+        - Main collection / Основний збір
+        - All data or telemetry catalog / Всі дані або каталог телеметрії
+        - Trips, location, or map / Поїздки, координати або мапа
+        - MQTT or Home Assistant
+        - InfluxDB
+        - Telegram
+        - Storage, archives, or diagnostics / Сховище, архіви або діагностика
+        - Options, recovery, or background runtime / Опції, відновлення або фонова робота
+        - Installation or update / Встановлення або оновлення
+        - Documentation or contribution workflow / Документація або робота з репозиторієм
+        - Other / Інше
+    validations:
+      required: true
+
+  - type: dropdown
+    id: data_boundary
+    attributes:
+      label: Data and safety boundary / Межа даних і безпеки
+      options:
+        - Existing read-only data and UI only / Наявні read-only дані та UI
+        - May need new read-only telemetry / Може потребувати нової read-only телеметрії
+        - May imply vehicle control or writes / Може передбачати керування або запис
+        - Not sure / Не впевнений
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered / Розглянуті альтернативи
+      description: Optional. Explain current workarounds or simpler variants. / Необов'язково. Опишіть поточні обхідні шляхи або простіший варіант.
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: What would make this complete? / Критерій готовності
+      description: List observable outcomes or an example workflow. / Перелічіть перевірювані результати або приклад сценарію.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context / Додатковий контекст
+      description: Add mockups or redacted examples if they materially clarify the proposal. / Додайте макети або очищені приклади, якщо вони суттєво уточнюють пропозицію.
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation / Перевірка приватності
+      options:
+        - label: Any attachments are free of credentials and unnecessary private data. / Вкладення не містять credentials і зайвих приватних даних.
+          required: true

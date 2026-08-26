@@ -1,0 +1,121 @@
+name: "🐛 Bug report / Звіт про помилку"
+description: "Report a reproducible failure or incorrect behavior / Повідомити про відтворювану помилку"
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve BYD Collector.
+
+        Дякуємо, що допомагаєте покращити BYD Collector.
+
+        Diagnostic archives can contain identifiers, timestamps, locations, network details, or data from unrelated processes. Review every attachment and remove credentials or unnecessary private data before uploading it.
+
+        Діагностичні архіви можуть містити ідентифікатори, час, координати, мережеві дані чи інформацію сторонніх процесів. Перевірте кожне вкладення та вилучіть credentials і зайві приватні дані перед завантаженням.
+
+  - type: checkboxes
+    id: existing_issue
+    attributes:
+      label: Existing issue / Наявний issue
+      options:
+        - label: I searched existing issues and did not find the same problem. / Я перевірив наявні issue та не знайшов такої самої проблеми.
+          required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Problem summary / Короткий опис
+      description: What failed, and what were you trying to do? / Що не спрацювало і що ви намагалися зробити?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area / Де виникла проблема
+      options:
+        - Main collection / Основний збір
+        - All data / Всі дані
+        - Trips or map / Поїздки або мапа
+        - MQTT or Home Assistant
+        - InfluxDB
+        - Telegram
+        - Storage or database archive / Сховище або архівація бази
+        - Options, recovery, or diagnostics / Опції, відновлення або діагностика
+        - Installation, ADB, or update / Встановлення, ADB або оновлення
+        - Other / Інше
+    validations:
+      required: true
+
+  - type: input
+    id: collector_version
+    attributes:
+      label: Collector version / Версія Collector
+      description: Use the version shown in the app header or APK details. / Вкажіть версію із заголовка застосунку або властивостей APK.
+      placeholder: "2.7.1"
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Vehicle and tablet / Автомобіль і планшет
+      description: Do not include VIN or other unique vehicle identifiers. / Не додавайте VIN чи інші унікальні ідентифікатори автомобіля.
+      value: |
+        - Vehicle model/year / Модель і рік:
+        - Market / Ринок:
+        - DiLink version / Версія DiLink:
+        - Tablet firmware / Прошивка планшета:
+        - APK source (GitHub Release or self-built) / Джерело APK:
+        - ADB authorized (yes/no/unknown) / ADB авторизовано:
+    validations:
+      required: true
+
+  - type: input
+    id: occurrence_time
+    attributes:
+      label: Approximate occurrence time / Приблизний час
+      description: Include date, local time, and time zone when logs are attached. / Для логів вкажіть дату, локальний час і часовий пояс.
+      placeholder: "2026-08-26 18:30 Europe/Kyiv"
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce / Кроки відтворення
+      placeholder: |
+        1. Open ... / Відкрити ...
+        2. Enable ... / Увімкнути ...
+        3. Observe ... / Перевірити ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior / Очікувана поведінка
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior / Фактична поведінка
+      description: Include the exact status text or error when available. / Додайте точний текст стану або помилки, якщо він є.
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics / Діагностика
+      description: Attach the smallest relevant Share logs ZIP, database archive, screenshot, or redacted excerpt. Drag files into this field. / Додайте найменший доречний ZIP «Поділитись логами», архів бази, скріншот або очищений уривок. Перетягніть файли в це поле.
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation / Перевірка приватності
+      options:
+        - label: I reviewed all attachments and removed credentials and unnecessary private data. / Я перевірив усі вкладення та вилучив credentials і зайві приватні дані.
+          required: true
