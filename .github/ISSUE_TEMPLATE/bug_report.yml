@@ -8,19 +8,17 @@ body:
     attributes:
       value: |
         Thank you for helping improve BYD Collector.
-
-        Дякуємо, що допомагаєте покращити BYD Collector.
-
         Diagnostic archives can contain identifiers, timestamps, locations, network details, or data from unrelated processes. Review every attachment and remove credentials or unnecessary private data before uploading it.
 
-        Діагностичні архіви можуть містити ідентифікатори, час, координати, мережеві дані чи інформацію сторонніх процесів. Перевірте кожне вкладення та вилучіть credentials і зайві приватні дані перед завантаженням.
+        Дякуємо, що допомагаєте покращити BYD Collector.
+        Діагностичні архіви можуть містити ідентифікатори, час, координати, мережеві дані чи інформацію сторонніх процесів. Перевірте кожне вкладення та вилучіть облікові дані й зайві приватні дані перед завантаженням.
 
   - type: checkboxes
     id: existing_issue
     attributes:
-      label: Existing issue / Наявний issue
+      label: Existing issue / Наявна проблема
       options:
-        - label: I searched existing issues and did not find the same problem. / Я перевірив наявні issue та не знайшов такої самої проблеми.
+        - label: I searched existing issues and did not find the same problem. / Я перевірив наявні проблеми та не знайшов такої самої.
           required: true
 
   - type: textarea
@@ -117,5 +115,5 @@ body:
     attributes:
       label: Privacy confirmation / Перевірка приватності
       options:
-        - label: I reviewed all attachments and removed credentials and unnecessary private data. / Я перевірив усі вкладення та вилучив credentials і зайві приватні дані.
+        - label: I reviewed all attachments and removed credentials and unnecessary private data. / Я перевірив усі вкладення та вилучив облікові дані й зайві приватні дані.
           required: true

@@ -14,9 +14,9 @@ body:
   - type: checkboxes
     id: existing_issue
     attributes:
-      label: Existing issue / Наявний issue
+      label: Existing issue / Наявна проблема
       options:
-        - label: I searched existing issues and did not find the same proposal. / Я перевірив наявні issue та не знайшов такої самої пропозиції.
+        - label: I searched existing issues and did not find the same proposal. / Я перевірив наявні проблеми та не знайшов такої самої пропозиції.
           required: true
 
   - type: textarea
@@ -89,5 +89,5 @@ body:
     attributes:
       label: Privacy confirmation / Перевірка приватності
       options:
-        - label: Any attachments are free of credentials and unnecessary private data. / Вкладення не містять credentials і зайвих приватних даних.
+        - label: Any attachments are free of credentials and unnecessary private data. / Вкладення не містять облікових даних і зайвих приватних даних.
           required: true
