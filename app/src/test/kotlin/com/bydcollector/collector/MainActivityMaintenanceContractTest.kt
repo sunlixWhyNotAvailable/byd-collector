@@ -50,6 +50,22 @@ class MainActivityMaintenanceContractTest {
     }
 
     @Test
+    fun dashboardHydrationNeverMutatesAutoStartPreferences() {
+        val source = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val refresh = source.substringAfter("private fun refresh(force: Boolean = true)")
+            .substringBefore("private fun recordDashboardRefreshFailure")
+        val mainToggle = source.substringAfter("override fun onToggleMainAutoStart")
+            .substringBefore("override fun onGrantAdb")
+        val debugToggle = source.substringAfter("override fun onToggleDebugAutoStart")
+            .substringBefore("override fun onToggleSharedCategories")
+
+        assertFalse(refresh.contains("setAutoStartEnabled("))
+        assertFalse(refresh.contains("setDebugAutoStartEnabled("))
+        assertTrue(mainToggle.contains("source=ui control=main_auto_start tab=${'$'}activeTab"))
+        assertTrue(debugToggle.contains("source=ui control=debug_auto_start tab=${'$'}activeTab"))
+    }
+
+    @Test
     fun queuedDashboardReadersAndPreflightHoldTheApplicationReadLease() {
         val source = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
         val counts = source.substringAfter("private fun scheduleDashboardCountBootstrap")

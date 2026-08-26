@@ -26,6 +26,14 @@ class CollectorSettingsEventDispatchContractTest {
         assertTrue(source.contains("if (isInfluxEnabled() == enabled) return"))
     }
 
+    @Test
+    fun autoStartEventsAcceptUiSourceDetail() {
+        val source = sourceFile("com/bydcollector/collector/service/CollectorSettings.kt").readText()
+
+        assertTrue(source.contains("fun setAutoStartEnabled(enabled: Boolean, detail: String? = null)"))
+        assertTrue(source.contains("fun setDebugAutoStartEnabled(enabled: Boolean, detail: String? = null)"))
+    }
+
     private fun sourceFile(path: String): File = listOf(
         File("src/main/kotlin/$path"),
         File("app/src/main/kotlin/$path")

@@ -244,7 +244,10 @@ class MainActivity : ComponentActivity() {
             refreshStoreBackedState()
             if (settings.isAutoStartEnabled() != enabled) {
                 if (enabled) settings.setMainManuallyStopped(false)
-                settings.setAutoStartEnabled(enabled)
+                settings.setAutoStartEnabled(
+                    enabled,
+                    detail = "source=ui control=main_auto_start tab=$activeTab"
+                )
                 val message = if (enabled) {
                     CollectorSettings.AUTO_START_ENABLED_UK
                 } else {
@@ -400,7 +403,10 @@ class MainActivity : ComponentActivity() {
         override fun onToggleDebugAutoStart(enabled: Boolean) {
             if (settings.isDebugAutoStartEnabled() != enabled) {
                 if (enabled) settings.setDebugManuallyStopped(false)
-                settings.setDebugAutoStartEnabled(enabled && settings.isAutoStartEnabled())
+                settings.setDebugAutoStartEnabled(
+                    enabled && settings.isAutoStartEnabled(),
+                    detail = "source=ui control=debug_auto_start tab=$activeTab"
+                )
                 refresh()
             }
         }
@@ -1090,9 +1096,6 @@ class MainActivity : ComponentActivity() {
                 if (tabGeneration != null && tabResult != null) {
                     tabResult
                         .onSuccess { state ->
-                            if (!state.autoStartEnabled && state.debugAutoStartEnabled) {
-                                settings.setDebugAutoStartEnabled(false)
-                            }
                             dashboardUiStateStore.publishTab(tab, tabGeneration, state)
                             reconcileActionUiState(state)
                         }

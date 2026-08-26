@@ -73,11 +73,12 @@ class CollectorSettings(
             (isInfluxEnabled() && !isInfluxManuallyStopped())
     }
 
-    fun setAutoStartEnabled(enabled: Boolean) {
+    fun setAutoStartEnabled(enabled: Boolean, detail: String? = null) {
         prefs.edit().putBoolean(KEY_AUTO_START, enabled).apply()
         recordEvent(
             category = if (enabled) "auto_start_enabled" else "auto_start_disabled",
-            message = if (enabled) AUTO_START_ENABLED_UK else AUTO_START_DISABLED_UK
+            message = if (enabled) AUTO_START_ENABLED_UK else AUTO_START_DISABLED_UK,
+            detail = detail
         )
     }
 
@@ -164,11 +165,12 @@ class CollectorSettings(
 
     fun isDebugAutoStartEnabled(): Boolean = prefs.getBoolean(KEY_DEBUG_AUTO_START, false)
 
-    fun setDebugAutoStartEnabled(enabled: Boolean) {
+    fun setDebugAutoStartEnabled(enabled: Boolean, detail: String? = null) {
         prefs.edit().putBoolean(KEY_DEBUG_AUTO_START, enabled).apply()
         recordEvent(
             category = if (enabled) "debug_auto_start_enabled" else "debug_auto_start_disabled",
-            message = "Debug autostart ${if (enabled) "enabled" else "disabled"}"
+            message = "Debug autostart ${if (enabled) "enabled" else "disabled"}",
+            detail = detail
         )
     }
 
