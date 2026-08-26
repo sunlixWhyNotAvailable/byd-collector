@@ -150,6 +150,10 @@ class MainActivityMaintenanceContractTest {
     @Test
     fun archiveSharingUsesFreshZipResolutionAndReadOnlyContentUris() {
         val source = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val chooser = source.substringAfter("private fun openArchiveShareChooser")
+            .substringBefore("private fun failArchiveShare")
+        val failure = source.substringAfter("private fun failArchiveShare")
+            .substringBefore("private fun refreshStoreBackedState")
         val paths = File("src/main/res/xml/update_file_paths.xml").takeIf { it.isFile }
             ?: File("app/src/main/res/xml/update_file_paths.xml")
 
@@ -166,6 +170,8 @@ class MainActivityMaintenanceContractTest {
         assertTrue(source.contains("lease?.let(CollectorService.archiveShareLeaseRegistry::release)"))
         assertTrue(source.contains("archiveShareInFlight.compareAndSet(false, true)"))
         assertTrue(source.contains("CollectorService.isArchiveStorageActive()"))
+        assertInOrder(chooser, "startActivity(Intent.createChooser", "archiveShareHandoffGeneration =")
+        assertFalse(failure.contains("archiveShareHandoffGeneration"))
         assertFalse(source.contains("zipDirectory"))
         assertTrue(paths.readText().contains("<files-path name=\"database_archives\" path=\"db_archive/\" />"))
     }

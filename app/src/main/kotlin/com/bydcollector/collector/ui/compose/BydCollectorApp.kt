@@ -2597,7 +2597,9 @@ private fun StorageTab(
     val snapshot = state?.archiveStorageSnapshot
     val entries = snapshot?.entries.orEmpty()
     val listKey = entries.joinToString("|") { it.id }
-    var selectedIds by remember(listKey) { mutableStateOf(emptySet<String>()) }
+    var selectedIds by remember(listKey, actionUiState.archiveShareHandoffGeneration) {
+        mutableStateOf(emptySet<String>())
+    }
     val limitGb = state?.archiveStorageLimitGb ?: 2
     var draftLimitGb by remember(limitGb) { mutableStateOf(limitGb) }
     var newestFirst by remember { mutableStateOf(true) }

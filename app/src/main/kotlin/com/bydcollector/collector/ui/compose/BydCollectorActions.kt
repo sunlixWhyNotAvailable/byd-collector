@@ -26,6 +26,7 @@ data class BydCollectorActionUiState(
     val adbGrant: Boolean = false,
     val mainArchivePreflight: Boolean = false,
     val archiveShare: Boolean = false,
+    val archiveShareHandoffGeneration: Long = 0L,
     val archiveDeleteDispatch: Boolean = false,
     val mqttTest: Boolean = false,
     val influxTest: Boolean = false,

@@ -841,6 +841,9 @@ class MainActivity : ComponentActivity() {
                 }
             }
             startActivity(Intent.createChooser(sendIntent, strings(uiLanguage).shareSelectedArchives))
+            actionUiState = actionUiState.copy(
+                archiveShareHandoffGeneration = actionUiState.archiveShareHandoffGeneration + 1L
+            )
             recordOperationalEvent(
                 "archive_share_chooser_opened",
                 "Archive share chooser opened",

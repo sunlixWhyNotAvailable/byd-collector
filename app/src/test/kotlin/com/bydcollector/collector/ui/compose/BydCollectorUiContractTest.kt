@@ -189,6 +189,8 @@ class BydCollectorUiContractTest {
         assertTrue(app.contains("ArchiveShareIconButton("))
         assertTrue(app.contains(".size(42.dp)"))
         assertTrue(app.contains("selectedEntries.all { it.status == ArchiveEntryStatus.COMPRESSED_ZIP }"))
+        assertTrue(actions.contains("val archiveShareHandoffGeneration: Long = 0L"))
+        assertTrue(app.contains("remember(listKey, actionUiState.archiveShareHandoffGeneration)"))
         assertTrue(app.contains("job?.running != true"))
         assertTrue(app.contains("!CollectorService.isArchiveStorageActive()"))
         assertTrue(app.contains("actions.onShareArchives(selectedArchiveIds)"))
