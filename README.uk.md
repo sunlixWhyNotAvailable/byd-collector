@@ -83,7 +83,7 @@ BYD Collector — це збирач телеметрії лише для чит�
 
 Автоматичного retention маршрутів і дії архівування бази поїздок наразі немає. Її реальний розмір разом із WAL буде виміряно після кількох днів, перш ніж обирати політику зберігання.
 
-<!-- Місця для скріншотів: docs/screenshots/uk/trips.png і docs/screenshots/uk/trip-map.png. Контракт зйомки: docs/screenshots/README.md. -->
+<p align="center"><img src="docs/screenshots/uk/trips.png" alt="Історія поїздок BYD Collector" width="100%"></p>
 
 ## MQTT, Home Assistant та InfluxDB
 
@@ -151,6 +151,11 @@ SQLite є довгостроковим джерелом істини. JSON ви�
 Обслуговування архівів може тимчасово зупинити збір та інтеграції. Прочитайте діалог підтвердження: він показує черги MQTT/InfluxDB, що належать Main, окремо повідомляє про помилку міграції Telegram, якщо вона є, і попереджає, коли операцію не можна безпечно зупинити після старту. Активний Telegram-sidecar не ризикує бути заміненим архівуванням Main.
 
 <p align="center"><img src="docs/screenshots/uk/storage.png" alt="Сховище та архіви баз BYD Collector" width="100%"></p>
+
+<p align="center">
+  <a href="docs/screenshots/uk/archive.png"><img src="docs/screenshots/uk/archive.png" alt="Підтвердження архівації бази BYD Collector" width="49%"></a>
+  <a href="docs/screenshots/uk/archive-done.png"><img src="docs/screenshots/uk/archive-done.png" alt="Завершена архівація бази BYD Collector" width="49%"></a>
+</p>
 
 ## Опції та робота застосунку
 

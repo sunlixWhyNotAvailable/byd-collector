@@ -83,7 +83,7 @@ Route recording uses Android's GPS provider after the user grants location acces
 
 There is currently no automatic trip-route retention or trip-database archive action. The maintainer will measure the real database/WAL footprint after several days before selecting a retention policy.
 
-<!-- Screenshot slots: docs/screenshots/en/trips.png and docs/screenshots/en/trip-map.png. Capture contract: docs/screenshots/README.md. -->
+<p align="center"><img src="docs/screenshots/en/trips.png" alt="BYD Collector trip history" width="100%"></p>
 
 ## MQTT, Home Assistant, and InfluxDB
 
@@ -151,6 +151,11 @@ SQLite is the authoritative long-term store. JSON is used for export/transport, 
 Archive maintenance can temporarily stop collection and integrations. Read the confirmation dialog: it shows queued Main-owned MQTT/InfluxDB work, reports a Telegram migration warning separately when applicable, and warns when an operation cannot be stopped safely after it begins. The live Telegram sidecar itself is not at risk from Main archive replacement.
 
 <p align="center"><img src="docs/screenshots/en/storage.png" alt="BYD Collector storage and database archives" width="100%"></p>
+
+<p align="center">
+  <a href="docs/screenshots/en/archive.png"><img src="docs/screenshots/en/archive.png" alt="BYD Collector database archive confirmation" width="49%"></a>
+  <a href="docs/screenshots/en/archive-done.png"><img src="docs/screenshots/en/archive-done.png" alt="BYD Collector completed database archive" width="49%"></a>
+</p>
 
 ## Options and runtime
 
