@@ -8,6 +8,19 @@ import kotlin.test.assertTrue
 
 class BydCollectorUiContractTest {
     @Test
+    fun nativeLaunchThemeMatchesCollectorDarkSurface() {
+        val styles = listOf(
+            File("src/main/res/values/styles.xml"),
+            File("app/src/main/res/values/styles.xml")
+        ).firstOrNull { it.isFile }?.readText() ?: error("Missing styles.xml")
+
+        assertTrue(styles.contains("<item name=\"android:windowBackground\">#080D12</item>"))
+        assertTrue(styles.contains("<item name=\"android:statusBarColor\">#080D12</item>"))
+        assertTrue(styles.contains("<item name=\"android:navigationBarColor\">#080D12</item>"))
+        assertTrue(styles.contains("<item name=\"android:windowLightStatusBar\">false</item>"))
+    }
+
+    @Test
     fun topBarSubtitleUsesTelemetryAndVersionCopy() {
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
         val strings = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorStrings.kt").readText()
