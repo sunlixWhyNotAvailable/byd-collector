@@ -13,7 +13,7 @@ class DirectDebugDatabaseHelper(
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        error("Legacy debug database must be archived before compact-v2 is opened")
+        error("The existing All data database must be archived before the current format is opened")
     }
 
     override fun onDowngrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -133,7 +133,7 @@ class DirectDebugDatabaseHelper(
         const val DATABASE_NAME = "bydcollector_debug_round_robin.db"
         const val SCHEMA_FAMILY = "debug_round_robin"
         const val FORMAT_VERSION = 2
-        // Format evolution is marker-based so a legacy v1 file can still be checkpointed/verified
+        // Marker-based format detection keeps an older file checkpointable and verifiable
         // after a failed archive without SQLiteOpenHelper converting it in place.
         private const val DATABASE_VERSION = 1
 

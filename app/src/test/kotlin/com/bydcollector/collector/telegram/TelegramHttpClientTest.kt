@@ -102,6 +102,31 @@ class TelegramHttpClientTest {
     }
 
     @Test
+    fun acceptsAProvenTopLevelSuccessFromATruncatedResponse() {
+        val oversized = "\n\t{ \"ok\" : true , \"result\" : \"${"x".repeat(TELEGRAM_RESPONSE_MAX_CHARS)}\" }\n"
+        val result = TelegramHttpClient { FakeConnection(200, oversized) }
+            .sendMessage(TelegramSendMessage("123:secret", "42", "hello"))
+
+        assertEquals(TelegramSendResult.Success, result)
+    }
+
+    @Test
+    fun rejectsNestedFalseOrAmbiguousOkFromATruncatedResponse() {
+        val payload = "x".repeat(TELEGRAM_RESPONSE_MAX_CHARS)
+        val nested = """{"result":{"ok":true},"payload":"$payload"}"""
+        val falseValue = """{"ok":false,"payload":"$payload"}"""
+        val stringValue = """{"ok":"true","payload":"$payload"}"""
+
+        listOf(nested, falseValue, stringValue).forEach { body ->
+            val failure = assertIs<TelegramSendResult.Failure>(
+                TelegramHttpClient { FakeConnection(200, body) }
+                    .sendMessage(TelegramSendMessage("123:secret", "42", "hello"))
+            )
+            assertEquals(TelegramSendFailureKind.INVALID_RESPONSE, failure.kind)
+        }
+    }
+
+    @Test
     fun failuresNeverExposeCredentialsOrTelegramDescriptions() {
         val token = "123:top_secret"
         val chatId = "private-chat"

@@ -22,6 +22,15 @@ object CollectorServiceController {
         context.startService(CollectorService.shutdownIntent(context))
     }
 
+    fun retryKeepAliveStop(context: Context, retryAttempt: Int) {
+        val intent = CollectorService.keepAliveStopRetryIntent(context, retryAttempt)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
+    }
+
     fun startDebug(context: Context) {
         val intent = CollectorService.startDebugIntent(context)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

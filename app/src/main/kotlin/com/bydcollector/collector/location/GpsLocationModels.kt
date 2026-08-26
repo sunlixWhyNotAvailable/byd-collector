@@ -3,6 +3,7 @@ package com.bydcollector.collector.location
 import android.location.Location
 import android.os.SystemClock
 import java.time.Instant
+import java.util.ArrayDeque
 import kotlin.math.asin
 import kotlin.math.cos
 import kotlin.math.sin
@@ -82,14 +83,19 @@ class GpsTrustGate(
     private val maxImpliedSpeedMps: Double = 80.0,
     private val recoveryFixes: Int = 3
 ) {
+    companion object {
+        private const val VEHICLE_SPEED_MARGIN_KMH = 40.0
+    }
+
     private var lastTrusted: GpsLocationSample? = null
     private var lastReceivedElapsedNanos: Long? = null
+    private var lastSequenceCandidate: GpsLocationSample? = null
     private var recovering = false
     private var pending: GpsLocationSample? = null
     private var pendingCount = 0
 
     @Synchronized
-    fun offer(sample: GpsLocationSample): GpsTrustDecision {
+    fun offer(sample: GpsLocationSample, vehicleSpeedKmh: Double? = null): GpsTrustDecision {
         val previousReceived = lastReceivedElapsedNanos
         val callbackGap = previousReceived != null && elapsedMs(sample.receiveElapsedRealtimeNanos, previousReceived) > maxReceiveAgeMs
         lastReceivedElapsedNanos = sample.receiveElapsedRealtimeNanos
@@ -97,23 +103,38 @@ class GpsTrustGate(
             recovering = true
             pending = null
             pendingCount = 0
+            lastSequenceCandidate = null
         }
 
-        val hardFailure = hardFailure(sample) ?: continuityFailure(sample).takeUnless { recovering }
+        val hardFailure = hardFailure(sample)
         if (hardFailure != null) {
             recovering = true
             pending = null
             pendingCount = 0
+            lastSequenceCandidate = null
             return GpsTrustDecision(sample, GpsTrustStatus.REJECTED, hardFailure, callbackGap)
         }
 
-        if (lastTrusted == null && !recovering) {
-            lastTrusted = sample
-            recovering = false
-            return GpsTrustDecision(sample, GpsTrustStatus.TRUSTED, callbackGap = callbackGap)
+        if (vehicleSpeedFailure(sample, vehicleSpeedKmh)) {
+            recovering = true
+            pending = null
+            pendingCount = 0
+            lastSequenceCandidate = sample
+            return GpsTrustDecision(sample, GpsTrustStatus.REJECTED, "vehicle_speed_mismatch", callbackGap)
         }
+
+        val continuityFailure = continuityFailure(sample).takeUnless { recovering }
+        if (continuityFailure != null) {
+            recovering = true
+            pending = null
+            pendingCount = 0
+            lastSequenceCandidate = sample
+            return GpsTrustDecision(sample, GpsTrustStatus.REJECTED, continuityFailure, callbackGap)
+        }
+
         if (!recovering) {
             lastTrusted = sample
+            lastSequenceCandidate = sample
             return GpsTrustDecision(sample, GpsTrustStatus.TRUSTED, callbackGap = callbackGap)
         }
 
@@ -121,9 +142,11 @@ class GpsTrustGate(
         if (priorPending != null && !mutuallyConsistent(priorPending, sample)) {
             pending = null
             pendingCount = 0
+            lastSequenceCandidate = sample
             return GpsTrustDecision(sample, GpsTrustStatus.REJECTED, "continuity_speed", callbackGap)
         }
         pending = sample
+        lastSequenceCandidate = sample
         pendingCount = (pendingCount + 1).coerceAtMost(recoveryFixes)
         if (pendingCount < recoveryFixes) {
             return GpsTrustDecision(sample, GpsTrustStatus.PENDING, "recovery_pending", callbackGap)
@@ -143,6 +166,7 @@ class GpsTrustGate(
     fun reset() {
         lastTrusted = null
         lastReceivedElapsedNanos = null
+        lastSequenceCandidate = null
         recovering = false
         pending = null
         pendingCount = 0
@@ -152,6 +176,7 @@ class GpsTrustGate(
     fun beginRecovery(anchor: GpsLocationSample? = null) {
         lastTrusted = anchor
         lastReceivedElapsedNanos = null
+        lastSequenceCandidate = null
         recovering = true
         pending = null
         pendingCount = 0
@@ -177,6 +202,17 @@ class GpsTrustGate(
     private fun continuityFailure(sample: GpsLocationSample): String? {
         val previous = lastTrusted ?: return null
         return if (impliedSpeedMps(previous, sample)?.let { it > maxImpliedSpeedMps } == true) "continuity_speed" else null
+    }
+
+    private fun vehicleSpeedFailure(sample: GpsLocationSample, vehicleSpeedKmh: Double?): Boolean {
+        val canRef = vehicleSpeedKmh?.takeIf { it.isFinite() && it >= 0.0 } ?: return false
+        val reported = sample.speedKmh?.takeIf { it.isFinite() && it >= 0.0 }
+        val implied = lastSequenceCandidate
+            ?.let { impliedSpeedMps(it, sample) }
+            ?.times(3.6)
+            ?.takeIf { it.isFinite() && it >= 0.0 }
+        val gpsRef = listOfNotNull(reported, implied).maxOrNull() ?: return false
+        return gpsRef > canRef + VEHICLE_SPEED_MARGIN_KMH
     }
 
     private fun recoveryAnchorFailure(sample: GpsLocationSample): String? {
@@ -226,6 +262,38 @@ class GpsTrustGate(
         val a = sin(latDelta / 2.0) * sin(latDelta / 2.0) +
             cos(Math.toRadians(lat1)) * cos(Math.toRadians(lat2)) * sin(lonDelta / 2.0) * sin(lonDelta / 2.0)
         return 6_371_000.0 * 2.0 * asin(sqrt(a.coerceIn(0.0, 1.0)))
+    }
+}
+
+/** Keeps the highest valid normalized vehicle speed observed in the recent elapsed-time window. */
+internal class VehicleSpeedReference(
+    private val nowElapsedMs: () -> Long = SystemClock::elapsedRealtime,
+    private val windowMs: Long = 2_000L
+) {
+    private data class Reading(val elapsedMs: Long, val speedKmh: Double)
+
+    private val readings = ArrayDeque<Reading>()
+
+    @Synchronized
+    fun observe(speedKmh: Double?, elapsedMs: Long = nowElapsedMs()) {
+        if (speedKmh == null || !speedKmh.isFinite() || speedKmh < 0.0 || elapsedMs < 0L) return
+        prune(elapsedMs)
+        readings.addLast(Reading(elapsedMs, speedKmh))
+    }
+
+    @Synchronized
+    fun current(elapsedMs: Long = nowElapsedMs()): Double? {
+        if (elapsedMs < 0L) return null
+        prune(elapsedMs)
+        return readings.maxOfOrNull { it.speedKmh }
+    }
+
+    private fun prune(nowMs: Long) {
+        while (true) {
+            val first = readings.peekFirst() ?: return
+            if (nowMs >= first.elapsedMs && nowMs - first.elapsedMs > windowMs) readings.removeFirst()
+            else return
+        }
     }
 }
 

@@ -20,6 +20,7 @@ class PollPersistenceCoordinatorTest {
         var observedPollId: Long? = null
         var observedTimestamp: String? = null
         var observedReadings: List<PollReading>? = null
+        var observedOrigin: PollOrigin? = null
 
         val result = PollPersistenceCoordinator(
             store = store,
@@ -30,12 +31,14 @@ class PollPersistenceCoordinatorTest {
                     sessionId: Long,
                     pollId: Long,
                     timestamp: String,
-                    readings: List<PollReading>
+                    readings: List<PollReading>,
+                    origin: PollOrigin
                 ) {
                     store.actions += "observer:$pollId:$timestamp"
                     observedPollId = pollId
                     observedTimestamp = timestamp
                     observedReadings = readings
+                    observedOrigin = origin
                 }
             }
         ).pollOnce(sessionId = 7L)
@@ -48,6 +51,7 @@ class PollPersistenceCoordinatorTest {
         assertEquals(99L, observedPollId)
         assertEquals(clock.now, observedTimestamp)
         assertSame(readings, observedReadings)
+        assertEquals(PollOrigin.LIVE, observedOrigin)
         assertEquals(
             listOf("getActiveCatalogParameters", "insertPoll:7:${clock.now}", "observer:99:${clock.now}"),
             store.actions
@@ -68,7 +72,8 @@ class PollPersistenceCoordinatorTest {
                     sessionId: Long,
                     pollId: Long,
                     timestamp: String,
-                    readings: List<PollReading>
+                    readings: List<PollReading>,
+                    origin: PollOrigin
                 ) {
                     throw IllegalStateException("normalizer unavailable")
                 }

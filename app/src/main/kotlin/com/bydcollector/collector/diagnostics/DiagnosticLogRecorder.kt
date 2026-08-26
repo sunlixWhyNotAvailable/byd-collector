@@ -22,159 +22,199 @@ object DiagnosticLogRecorder {
     private const val KEEP_ALIVE_LOG_SNAPSHOT_NAME = "bydcollector_keepalive.log"
     private const val KEEP_ALIVE_LOG_STATUS_NAME = "bydcollector_keepalive_status.txt"
     private const val KEEP_ALIVE_LOG_TAIL_BYTES = 512 * 1024
+    private const val SHARE_PREPARE_HEADROOM_BYTES = 16L * 1024L * 1024L
     private const val LOGCAT_COMMAND = "logcat -b all -v threadtime"
+    internal const val LOGCAT_SEGMENT_BYTES = 16L * 1024L * 1024L
+    internal const val LOGCAT_SEGMENT_COUNT = 8
     internal const val SHARE_HANDOFF_RETENTION_MS = ArchiveShareLeaseRegistry.LEASE_TTL_MS
 
+    private val workLock = Any()
+    private val stateLock = Any()
     @Volatile private var adbStream: AdbLocalClient.AdbShellStream? = null
     @Volatile private var activeRunDir: File? = null
     @Volatile private var activeContext: Context? = null
 
-    @Synchronized
     fun isRecording(): Boolean {
-        val current = adbStream
-        if (current?.isAlive == true) return true
-        adbStream = null
-        activeRunDir = null
-        activeContext = null
-        return false
-    }
-
-    @Synchronized
-    fun start(context: Context): File {
-        if (isRecording()) return activeRunDir ?: logRoot(context)
-
-        val appContext = context.applicationContext
-        //creates one run directory per recording so logs, events, and notes describe the same incident window
-        val runDir = createDiagnosticRunDirectory(logRoot(appContext), timestamp())
-        activeContext = appContext
-        activeRunDir = runDir
-        try {
-            File(runDir, "diagnostic_info.txt").writeText(
-                buildString {
-                    appendLine("started_at=${timestamp()}")
-                    appendLine("package=${BuildConfig.APPLICATION_ID}")
-                    appendLine("log_dir=${runDir.absolutePath}")
-                },
-                Charsets.UTF_8
-            )
-            writeCollectorEventsSnapshot(appContext, runDir)
-            writeKeepAliveLogNote(runDir)
-            //updates latest zip only at explicit diagnostics lifecycle points, never from passive ui state loading
-            writeLatestZip(appContext, runDir)
-
-            val output = File(runDir, "logcat_threadtime.txt").outputStream()
-            try {
-                adbStream = AdbLocalClient(File(appContext.filesDir, "adb_keys")).openShellStream(
-                    command = LOGCAT_COMMAND,
-                    output = output
-                )
-            } catch (error: Throwable) {
-                runCatching { output.close() }
-                throw error
+        synchronized(stateLock) {
+            val current = adbStream
+            if (current?.isAlive == true) return true
+            if (current != null || activeRunDir != null || activeContext != null) {
+                adbStream = null
+                activeRunDir = null
+                activeContext = null
             }
-        } catch (error: Throwable) {
-            adbStream = null
-            activeRunDir = null
-            activeContext = null
-            File(runDir, "logcat_error.txt").writeText(
-                "full_system_logcat_unavailable=${error::class.java.simpleName}: ${error.message ?: "no message"}\n" +
-                    "command=$LOGCAT_COMMAND\n",
-                Charsets.UTF_8
-            )
-            writeLatestZip(context, runDir)
-            throw IllegalStateException("Full system logcat unavailable: ${error.message ?: error::class.java.simpleName}", error)
+            return false
         }
-        return runDir
     }
 
-    @Synchronized
-    fun stop(): File? {
-        val runDir = activeRunDir
-        val context = activeContext
-        try {
-            adbStream?.close()
-            runDir?.let {
-                File(it, "stopped.txt").writeText("stopped_at=${timestamp()}\n", Charsets.UTF_8)
-                context?.let { appContext -> writeCollectorEventsSnapshot(appContext, it) }
-                writeKeepAliveLogNote(it)
-                writeLatestZipFromRunDir(it)
+    fun start(context: Context): File {
+        synchronized(workLock) {
+            val current = captureState()
+            if (current.stream?.isAlive == true) return current.runDir ?: logRoot(context)
+
+            val appContext = context.applicationContext
+            //creates one run directory per recording so logs, events, and notes describe the same incident window
+            val runDir = createDiagnosticRunDirectory(logRoot(appContext), timestamp())
+            try {
+                File(runDir, "diagnostic_info.txt").writeText(
+                    buildString {
+                        appendLine("started_at=${timestamp()}")
+                        appendLine("package=${BuildConfig.APPLICATION_ID}")
+                        appendLine("log_dir=${runDir.absolutePath}")
+                    },
+                    Charsets.UTF_8
+                )
+                writeCollectorEventsSnapshot(appContext, runDir)
+                writeKeepAliveLogNote(runDir)
+                //updates latest zip only at explicit diagnostics lifecycle points, never from passive ui state loading
+                writeLatestZip(appContext, runDir)
+
+                val output = DiagnosticLogcatOutputStream(runDir)
+                val stream = try {
+                    AdbLocalClient(File(appContext.filesDir, "adb_keys")).openShellStream(
+                        command = LOGCAT_COMMAND,
+                        output = output
+                    )
+                } catch (error: Throwable) {
+                    runCatching { output.close() }
+                    throw error
+                }
+                synchronized(stateLock) {
+                    adbStream = stream
+                    activeRunDir = runDir
+                    activeContext = appContext
+                }
+            } catch (error: Throwable) {
+                File(runDir, "logcat_error.txt").writeText(
+                    "full_system_logcat_unavailable=${error::class.java.simpleName}: ${error.message ?: "no message"}\n" +
+                        "command=$LOGCAT_COMMAND\n",
+                    Charsets.UTF_8
+                )
+                writeLatestZip(context, runDir)
+                throw IllegalStateException("Full system logcat unavailable: ${error.message ?: error::class.java.simpleName}", error)
             }
             return runDir
-        } finally {
-            adbStream = null
-            activeRunDir = null
-            activeContext = null
         }
     }
 
-    @Synchronized
+    fun stop(): File? {
+        synchronized(workLock) {
+            val state = captureState()
+            try {
+                state.stream?.close()
+                state.runDir?.let {
+                    File(it, "stopped.txt").writeText("stopped_at=${timestamp()}\n", Charsets.UTF_8)
+                    state.context?.let { appContext -> writeCollectorEventsSnapshot(appContext, it) }
+                    writeKeepAliveLogNote(it)
+                    writeLatestZipFromRunDir(it)
+                }
+                return state.runDir
+            } finally {
+                synchronized(stateLock) {
+                    if (adbStream === state.stream) {
+                        adbStream = null
+                        activeRunDir = null
+                        activeContext = null
+                    }
+                }
+            }
+        }
+    }
+
     fun prepareShareBundle(context: Context): File {
-        val appContext = context.applicationContext
-        val root = logRoot(appContext)
-        val captureStamp = timestamp()
-        val snapshotDir = createDiagnosticSnapshotDirectory(root, captureStamp)
-        return try {
-            val logcatStatus = writeLogcatSnapshot(root, snapshotDir)
-            val journalStatus = writeOperationalJournalSnapshot(appContext, snapshotDir)
-            val databaseStatus = writeCollectorEventsSnapshot(appContext, snapshotDir)
-            val helperStatus = writeKeepAliveLogSnapshot(appContext, snapshotDir)
-            File(snapshotDir, "diagnostic_info.txt").writeText(
-                buildString {
-                    appendLine("captured_at=${timestampIso()}")
-                    appendLine("package=${BuildConfig.APPLICATION_ID}")
-                    appendLine("version=${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
-                    appendLine("snapshot=${snapshotDir.name}")
-                    appendLine("logcat=$logcatStatus")
-                    appendLine("operational_journal=$journalStatus")
-                    appendLine("collector_events=$databaseStatus")
-                    appendLine("keep_alive_log=$helperStatus")
-                },
-                Charsets.UTF_8
-            )
-            val latestZip = latestZip(appContext).also { writeLatestZip(it, snapshotDir) }
+        synchronized(workLock) {
+            val appContext = context.applicationContext
+            val root = logRoot(appContext)
+            val captureStamp = timestamp()
+            val sourceSize = diagnosticLogcatSourceBytes(root, captureState().runDir)
             val shareRoot = shareRoot(appContext)
-            pruneExpiredDiagnosticShareFiles(shareRoot, System.currentTimeMillis(), SHARE_HANDOFF_RETENTION_MS)
-            createDiagnosticShareCopy(latestZip, shareRoot, captureStamp)
-        } finally {
-            snapshotDir.deleteRecursively()
+            check(
+                hasDiagnosticShareSpace(
+                    usableBytes = shareRoot.usableSpace,
+                    sourceBytes = sourceSize,
+                    headroomBytes = SHARE_PREPARE_HEADROOM_BYTES
+                )
+            ) { "Insufficient storage for diagnostics share" }
+            val snapshotDir = createDiagnosticSnapshotDirectory(root, captureStamp)
+            return try {
+                val logcatStatus = writeLogcatSnapshot(root, snapshotDir)
+                val journalStatus = writeOperationalJournalSnapshot(appContext, snapshotDir)
+                val databaseStatus = writeCollectorEventsSnapshot(appContext, snapshotDir)
+                val helperStatus = writeKeepAliveLogSnapshot(appContext, snapshotDir)
+                File(snapshotDir, "diagnostic_info.txt").writeText(
+                    buildString {
+                        appendLine("captured_at=${timestampIso()}")
+                        appendLine("package=${BuildConfig.APPLICATION_ID}")
+                        appendLine("version=${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
+                        appendLine("snapshot=${snapshotDir.name}")
+                        appendLine("logcat=$logcatStatus")
+                        appendLine("operational_journal=$journalStatus")
+                        appendLine("collector_events=$databaseStatus")
+                        appendLine("keep_alive_log=$helperStatus")
+                    },
+                    Charsets.UTF_8
+                )
+                val latestZip = latestZip(appContext).also { writeLatestZip(it, snapshotDir) }
+                val handedOff = createDiagnosticShareCopy(latestZip, shareRoot, captureStamp)
+                pruneExpiredDiagnosticShareFiles(
+                    shareRoot,
+                    System.currentTimeMillis(),
+                    SHARE_HANDOFF_RETENTION_MS,
+                    protectedFile = handedOff
+                )
+                handedOff
+            } finally {
+                snapshotDir.deleteRecursively()
+            }
         }
     }
 
-    @Synchronized
     fun clearCompleted(context: Context): DiagnosticClearResult {
-        val appContext = context.applicationContext
-        val active = activeRunDir?.takeIf { isRecording() }
-        var removed = 0
-        val warnings = mutableListOf<String>()
-        runCatching { clearCompletedDiagnosticFiles(logRoot(appContext), active) }
-            .onSuccess { removed += it }
-            .onFailure { warnings += "diagnostic_files=${it::class.java.simpleName}: ${it.message ?: "no message"}" }
-        runCatching {
-            pruneExpiredDiagnosticShareFiles(
-                File(appContext.cacheDir, DIAGNOSTIC_SHARES_DIR),
-                System.currentTimeMillis(),
-                SHARE_HANDOFF_RETENTION_MS
-            )
-        }.onSuccess { removed += it }
-            .onFailure { warnings += "share_cache=${it::class.java.simpleName}: ${it.message ?: "no message"}" }
-        runCatching {
-            (appContext as BydCollectorApplication).operationalEventJournal.clear()
-        }.onSuccess { removed += it }
-            .onFailure { warnings += "operational_journal=${it::class.java.simpleName}: ${it.message ?: "no message"}" }
-        val helperResult = runCatching {
-            AdbLocalClient(File(appContext.filesDir, "adb_keys")).execShell(
-                command = ": > $KEEP_ALIVE_LOG_PATH",
-                timeoutMs = 10_000,
-                allowAuthorizationPrompt = false
-            )
-        }.getOrElse { error ->
-            warnings += "keep_alive_log=${error::class.java.simpleName}: ${error.message ?: "no message"}"
-            null
+        synchronized(workLock) {
+            val appContext = context.applicationContext
+            val active = captureState().runDir?.takeIf { isRecording() }
+            var removed = 0
+            val warnings = mutableListOf<String>()
+            runCatching { clearCompletedDiagnosticFiles(logRoot(appContext), active) }
+                .onSuccess { removed += it }
+                .onFailure { warnings += "diagnostic_files=${it::class.java.simpleName}: ${it.message ?: "no message"}" }
+            runCatching {
+                pruneExpiredDiagnosticShareFiles(
+                    File(appContext.cacheDir, DIAGNOSTIC_SHARES_DIR),
+                    System.currentTimeMillis(),
+                    SHARE_HANDOFF_RETENTION_MS
+                )
+            }.onSuccess { removed += it }
+                .onFailure { warnings += "share_cache=${it::class.java.simpleName}: ${it.message ?: "no message"}" }
+            runCatching {
+                (appContext as BydCollectorApplication).operationalEventJournal.clear()
+            }.onSuccess { removed += it }
+                .onFailure { warnings += "operational_journal=${it::class.java.simpleName}: ${it.message ?: "no message"}" }
+            val helperResult = runCatching {
+                AdbLocalClient(File(appContext.filesDir, "adb_keys")).execShell(
+                    command = ": > $KEEP_ALIVE_LOG_PATH",
+                    timeoutMs = 10_000,
+                    allowAuthorizationPrompt = false
+                )
+            }.getOrElse { error ->
+                warnings += "keep_alive_log=${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                null
+            }
+            if (helperResult != null && !helperResult.ok) {
+                warnings += "keep_alive_log=${helperResult.error ?: "truncate failed"}"
+            }
+            return DiagnosticClearResult(removed = removed, warnings = warnings)
         }
-        if (helperResult != null && !helperResult.ok) {
-            warnings += "keep_alive_log=${helperResult.error ?: "truncate failed"}"
-        }
-        return DiagnosticClearResult(removed = removed, warnings = warnings)
+    }
+
+    private data class CaptureState(
+        val stream: AdbLocalClient.AdbShellStream?,
+        val runDir: File?,
+        val context: Context?
+    )
+
+    private fun captureState(): CaptureState = synchronized(stateLock) {
+        CaptureState(adbStream, activeRunDir, activeContext)
     }
 
     private fun logRoot(context: Context): File {
@@ -220,7 +260,8 @@ object DiagnosticLogRecorder {
     }
 
     private fun writeLogcatSnapshot(root: File, runDir: File): String {
-        val active = activeRunDir?.takeIf { isRecording() && it.isDirectory }
+        val stateSnapshot = captureState()
+        val active = stateSnapshot.runDir?.takeIf { stateSnapshot.stream?.isAlive == true && it.isDirectory }
         val source = active ?: latestCompletedDiagnosticRun(root)
         val state = when {
             source == null -> "none"
@@ -243,6 +284,7 @@ object DiagnosticLogRecorder {
                         file.isFile && (
                             file.name.startsWith("logcat_") ||
                                 file.name == "diagnostic_info.txt" ||
+                                file.name == "logcat_error.txt" ||
                                 file.name == "stopped.txt"
                             )
                     }
@@ -391,6 +433,20 @@ internal fun createDiagnosticRunDirectory(root: File, timestamp: String): File {
     return createUniqueDiagnosticDirectory(root, "logcat", timestamp)
 }
 
+internal fun diagnosticLogcatSourceBytes(root: File, activeRunDir: File? = null): Long {
+    val source = activeRunDir?.takeIf { it.isDirectory } ?: latestCompletedDiagnosticRun(root)
+    return source?.listFiles().orEmpty()
+        .filter { it.isFile && it.name.startsWith("logcat_") }
+        .sumOf(File::length)
+}
+
+internal fun hasDiagnosticShareSpace(usableBytes: Long, sourceBytes: Long, headroomBytes: Long): Boolean {
+    if (usableBytes < 0L || sourceBytes < 0L || headroomBytes < 0L) return false
+    if (sourceBytes > (Long.MAX_VALUE - headroomBytes) / 4L) return false
+    val required = sourceBytes * 4L + headroomBytes
+    return usableBytes >= required
+}
+
 private fun createDiagnosticSnapshotDirectory(root: File, timestamp: String): File {
     return createUniqueDiagnosticDirectory(root, "snapshot", timestamp)
 }
@@ -440,12 +496,18 @@ internal fun createDiagnosticShareCopy(sourceZip: File, shareRoot: File, timesta
     }
 }
 
-internal fun pruneExpiredDiagnosticShareFiles(root: File, nowMs: Long, retentionMs: Long): Int {
+internal fun pruneExpiredDiagnosticShareFiles(
+    root: File,
+    nowMs: Long,
+    retentionMs: Long,
+    protectedFile: File? = null
+): Int {
     if (!root.isDirectory) return 0
     val cutoff = nowMs - retentionMs
+    val protectedCanonical = protectedFile?.canonicalFile
     var removed = 0
     root.listFiles().orEmpty()
-        .filter { it.isFile && it.lastModified() <= cutoff }
+        .filter { it.isFile && it.canonicalFile != protectedCanonical && it.lastModified() <= cutoff }
         .forEach { file ->
             check(file.delete() || !file.exists()) {
                 "Failed to delete diagnostic share file: ${file.absolutePath}"

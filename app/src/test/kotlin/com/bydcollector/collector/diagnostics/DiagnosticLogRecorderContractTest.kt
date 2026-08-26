@@ -24,6 +24,65 @@ class DiagnosticLogRecorderContractTest {
     }
 
     @Test
+    fun activeCaptureStateUsesSeparateLocksAndPublishesAfterStreamOpen() {
+        val source = projectFile(
+            "app/src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt",
+            "src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt"
+        ).readText()
+
+        assertTrue(source.contains("private val workLock = Any()"))
+        assertTrue(source.contains("private val stateLock = Any()"))
+        assertTrue(source.indexOf("val stream = try") < source.indexOf("adbStream = stream"))
+    }
+
+    @Test
+    fun activeLogcatUsesEightSixteenMiBSegmentsAndDropsTheOldest() {
+        val root = Files.createTempDirectory("bydcollector-logcat-rotation").toFile()
+        try {
+            assertEquals(16L * 1024L * 1024L, DiagnosticLogRecorder.LOGCAT_SEGMENT_BYTES)
+            assertEquals(8, DiagnosticLogRecorder.LOGCAT_SEGMENT_COUNT)
+            DiagnosticLogcatOutputStream(root, segmentBytes = 4L, segmentCount = 8).use { output ->
+                output.write(ByteArray(4 * 9) { it.toByte() })
+            }
+
+            val segments = root.listFiles().orEmpty()
+                .filter { it.isFile && it.name.startsWith("logcat_") }
+                .sortedBy { it.name }
+            assertEquals(8, segments.size)
+            assertTrue(segments.all { it.length() <= 4L })
+            assertEquals(4L, File(root, "logcat_0.txt").length())
+            assertEquals(4L, File(root, "logcat_7.txt").length())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun shareSpacePreflightIncludesFourCopiesAndFixedHeadroom() {
+        assertTrue(hasDiagnosticShareSpace(4_000L + 128L, 1_000L, 128L))
+        assertFalse(hasDiagnosticShareSpace(4_000L + 127L, 1_000L, 128L))
+        assertFalse(hasDiagnosticShareSpace(Long.MAX_VALUE, Long.MAX_VALUE, 128L))
+    }
+
+    @Test
+    fun postPublicationPruneProtectsTheHandedOffFile() {
+        val root = Files.createTempDirectory("bydcollector-diagnostic-prune-protected").toFile()
+        try {
+            val expired = File(root, "expired.zip").apply { writeText("old") }
+            val protected = File(root, "handed-off.zip").apply { writeText("new") }
+            val now = 1_800_000L
+            expired.setLastModified(now - 1_000L)
+            protected.setLastModified(now - 1_000L)
+
+            assertEquals(1, pruneExpiredDiagnosticShareFiles(root, now, 500L, protectedFile = protected))
+            assertFalse(expired.exists())
+            assertTrue(protected.exists())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun sameSecondRunsUseDistinctDirectoriesWithoutTruncatingPriorEvidence() {
         val root = Files.createTempDirectory("bydcollector-diagnostic-runs").toFile()
         try {
@@ -106,7 +165,12 @@ class DiagnosticLogRecorderContractTest {
         assertTrue(activity.contains("type = \"application/zip\""))
         val shareMethod = activity.substringAfter("private fun shareDiagnosticLogs()")
             .substringBefore("private fun clearDiagnosticLogs()")
+        val workerBody = shareMethod.substringBefore("handler.post")
         assertTrue(shareMethod.contains("Intent.EXTRA_STREAM"))
+        assertTrue(workerBody.contains("FileProvider.getUriForFile"))
+        assertTrue(workerBody.contains("ClipData.newUri"))
+        assertTrue(workerBody.contains("bundle.length()"))
+        assertTrue(shareMethod.contains("runCatching { startActivity(Intent.createChooser(sendIntent, title)) }"))
         assertFalse(shareMethod.contains("Intent.EXTRA_SUBJECT"))
         assertFalse(shareMethod.contains("Intent.EXTRA_TEXT"))
         assertTrue(activity.contains("DiagnosticLogRecorder.clearCompleted(applicationContext)"))
@@ -130,7 +194,10 @@ class DiagnosticLogRecorderContractTest {
         assertTrue(source.contains("private const val KEEP_ALIVE_LOG_TAIL_BYTES = 512 * 1024"))
         assertTrue(source.contains("tail -c \$KEEP_ALIVE_LOG_TAIL_BYTES"))
         assertTrue(source.contains("logcat_provenance.txt"))
+        assertTrue(source.contains("file.name == \"logcat_error.txt\""))
         assertTrue(source.contains(": > \$KEEP_ALIVE_LOG_PATH"))
+        assertFalse(source.contains("DirectDebugDatabaseHelper"))
+        assertFalse(source.contains("TripsDatabase"))
     }
 
     @Test

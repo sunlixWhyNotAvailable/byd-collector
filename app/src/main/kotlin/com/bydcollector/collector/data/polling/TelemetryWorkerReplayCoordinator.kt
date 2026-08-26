@@ -83,7 +83,8 @@ class TelemetryWorkerReplayCoordinator(
                         sessionId,
                         imported.pollId,
                         input.timestamp,
-                        input.readings
+                        input.readings,
+                        PollOrigin.REPLAY
                     )
                 }
                 val ack = acknowledgeSample(sample.identity, acknowledgedAtMs())

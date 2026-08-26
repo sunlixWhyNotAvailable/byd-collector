@@ -62,7 +62,11 @@ class UserShutdownContractTest {
         assertFalse(service.contains("settings.setDebugAutoStartEnabled(false)"))
         assertFalse(service.contains("settings.setMqttAutoStartEnabled(false)"))
         assertFalse(service.contains("settings.setInfluxAutoStartEnabled(false)"))
-        assertTrue(autoStart.contains("settings.setDebugPollingEnabled(demand.debug)"))
+        assertTrue(
+            autoStart.contains(
+                "if (!CollectorService.isRunning()) settings.setDebugPollingEnabled(demand.debug)"
+            )
+        )
     }
 
     @Test
@@ -131,6 +135,9 @@ class UserShutdownContractTest {
         assertInOrder(userStop, "if (!reconciled)", "stopSelf()")
         assertTrue(userStop.contains("userShutdownFinalizationStarted.set(false)"))
         assertTrue(userStop.contains("user_shutdown_keep_alive_failed"))
+        assertTrue(userStop.contains("finishKeepAliveStopAfterFailure(retryAttempt = 0"))
+        assertTrue(userStop.contains("CollectorAutoStart.cancelKeepAliveStopRetry(applicationContext)"))
+        assertInOrder(userStop, "if (!settings.isUserShutdownRequested())", "CollectorAutoStart.cancelKeepAliveStopRetry(applicationContext)")
 
         val idleStop = service.substringAfter("private fun stopIfNoActiveRuntime")
             .substringBefore("private fun postMqttRetrySchedule")

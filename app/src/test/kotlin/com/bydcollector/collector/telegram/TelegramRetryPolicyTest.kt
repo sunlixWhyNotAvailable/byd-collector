@@ -25,4 +25,12 @@ class TelegramRetryPolicyTest {
         assertEquals(120_000L, policy.delayForFailure(3, retryAfterSeconds = 10))
         assertEquals(0, policy.failureCountAfterSuccess())
     }
+
+    @Test
+    fun retryAfterIsClampedBeforeConvertingToMilliseconds() {
+        val policy = TelegramRetryPolicy()
+
+        assertEquals(86_400_000L, policy.delayForFailure(1, retryAfterSeconds = Long.MAX_VALUE))
+        assertEquals(30_000L, policy.delayForFailure(1, retryAfterSeconds = -1))
+    }
 }

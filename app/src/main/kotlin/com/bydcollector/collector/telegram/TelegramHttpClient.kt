@@ -77,7 +77,15 @@ class TelegramHttpClient(
             activeConnection.outputStream.use { it.write(body) }
             val responseStatus = activeConnection.responseCode
             val response = responseBody(activeConnection, responseStatus)
-            if (response.truncated) oversizedResponse(responseStatus) else classify(responseStatus, response.text)
+            if (response.truncated) {
+                if (responseStatus in 200..299 && TRUNCATED_SUCCESS_PREFIX.containsMatchIn(response.text)) {
+                    TelegramSendResult.Success
+                } else {
+                    oversizedResponse(responseStatus)
+                }
+            } else {
+                classify(responseStatus, response.text)
+            }
         } catch (error: Exception) {
             failure(
                 TelegramSendFailureKind.NETWORK_ERROR,
@@ -144,6 +152,7 @@ class TelegramHttpClient(
 
     private companion object {
         val BOT_TOKEN = Regex("[A-Za-z0-9:_-]+")
+        val TRUNCATED_SUCCESS_PREFIX = Regex("^\\s*\\{\\s*\"ok\"\\s*:\\s*true(?=\\s*(?:[,}]))")
         const val CONNECT_TIMEOUT_MS = 5_000
         const val READ_TIMEOUT_MS = 10_000
     }

@@ -29,6 +29,7 @@ import com.bydcollector.collector.data.local.HealthSnapshotDetail
 import com.bydcollector.collector.data.normalized.NormalizedWriteSummary
 import com.bydcollector.collector.data.normalized.PollingErrorSummaries
 import com.bydcollector.collector.data.normalized.VehicleStateNormalizer
+import com.bydcollector.collector.data.polling.PollOrigin
 import com.bydcollector.collector.data.polling.PollPersistenceCoordinator
 import com.bydcollector.collector.data.polling.SuccessfulPollObserver
 import com.bydcollector.collector.data.polling.TelemetryPoller
@@ -150,6 +151,7 @@ class CollectorService : Service() {
     private val maintenanceActive = AtomicBoolean(false)
     private val maintenanceRuntimeRestoreAllowed = AtomicBoolean(true)
     private val userShutdownFinalizationStarted = AtomicBoolean(false)
+    private val keepAliveStopGeneration = AtomicLong(0L)
     @Volatile
     private var activeMaintenanceOperation: DbMaintenanceOperation? = null
     private val tailscaleSequenceActive = AtomicBoolean(false)
@@ -303,6 +305,16 @@ class CollectorService : Service() {
         val stickyRestart = intent?.action == null
         val action = intent?.action ?: "sticky_restart"
         val forceKeepAliveStatusCheck = intent?.getBooleanExtra(EXTRA_FORCE_KEEP_ALIVE_STATUS_CHECK, false) == true
+        if (action == CollectorAutoStart.ACTION_KEEP_ALIVE_STOP_RETRY) {
+            val retryAttempt =
+                intent?.getIntExtra(CollectorAutoStart.EXTRA_KEEP_ALIVE_STOP_RETRY_ATTEMPT, 0) ?: 0
+            if (keepAliveStopRetryBlockedByMaintenance()) {
+                CollectorAutoStart.deferKeepAliveStopRetry(applicationContext, retryAttempt)
+            } else {
+                reconcileKeepAliveStopRetry(retryAttempt)
+            }
+            return START_STICKY
+        }
         if (action == ACTION_SHUTDOWN) {
             shutdownByUser()
             return START_NOT_STICKY
@@ -321,7 +333,7 @@ class CollectorService : Service() {
         }
         if (stickyRestart) reconcilePendingCutoverArchiveStorage(action)
         if (stickyRestart) {
-            reconcilePersistedRuntime()
+            reconcilePersistedRuntime(resetDebugToAutoStartDemand = true)
         } else when (action) {
             ACTION_STOP -> {
                 //MainActivity commits the desired/manual flags before dispatching this action.
@@ -395,13 +407,7 @@ class CollectorService : Service() {
         tailscaleExecutor.shutdownNow()
         dashboardMetricsExecutor.shutdownNow()
         dashboardCountExecutor.shutdownNow()
-        val mqttWorker = shutdownMqttExecutor()
-        if (!awaitMqttWorkerTermination(mqttWorker, MQTT_MAINTENANCE_STOP_TIMEOUT_MS)) {
-            store.recordEvent(
-                "mqtt_worker_stop_timeout",
-                "MQTT worker did not stop during service destruction"
-            )
-        }
+        shutdownMqttExecutor(interrupt = true)
         shutdownInfluxExecutor()
         shutdownTelegramExecutor()
         activeMaintenanceOperation = null
@@ -489,7 +495,8 @@ class CollectorService : Service() {
                 sessionId: Long,
                 pollId: Long,
                 timestamp: String,
-                readings: List<PollReading>
+                readings: List<PollReading>,
+                origin: PollOrigin
             ) {
                 val observations = vehicleStateNormalizer.normalize(
                     pollId = pollId,
@@ -508,7 +515,12 @@ class CollectorService : Service() {
                     )
                 )
                 scheduleDatabaseFootprintRefresh(force = false)
-                tripRuntime.onSuccessfulPoll(timestamp, readings, observations)
+                tripRuntime.onSuccessfulPoll(
+                    timestamp,
+                    readings,
+                    observations,
+                    liveTelemetry = origin == PollOrigin.LIVE
+                )
                 if (settings.isTelegramEnabled()) {
                     executeTelegram(
                         "telegram_event_error",
@@ -603,9 +615,12 @@ class CollectorService : Service() {
 
     private fun reconcilePersistedRuntime(
         reconcileKeepAliveState: Boolean = false,
-        forceKeepAliveStatusCheck: Boolean = false
+        forceKeepAliveStatusCheck: Boolean = false,
+        resetDebugToAutoStartDemand: Boolean = false
     ) {
         val demand = settings.runtimeDemand(includeEnabledExports = true)
+        // Sticky recovery follows auto-start demand, never a stale manual debug flag.
+        if (resetDebugToAutoStartDemand) settings.setDebugPollingEnabled(demand.debug)
         demand.recoveryActions().forEach { recoveryAction ->
             when (recoveryAction) {
                 RuntimeRecoveryAction.MAIN -> reconcileCollection(
@@ -728,21 +743,113 @@ class CollectorService : Service() {
     }
 
     private fun stopAfterKeepAliveReconcile(keepAliveConfig: KeepAliveConfig) {
+        val generation = keepAliveStopGeneration.incrementAndGet()
         val stoppingText = "Stopping keep-alive"
         lastNotificationText = stoppingText
         runCatching { startForeground(NOTIFICATION_ID, buildNotification(stoppingText)) }
         keepAliveSupervisor.reconcileThen(keepAliveConfig) { reconciled ->
             mainHandler.post {
+                if (generation != keepAliveStopGeneration.get()) return@post
+                if (!settings.isUserShutdownRequested() && settings.keepAliveConfig().anyEnabled) {
+                    CollectorAutoStart.cancelKeepAliveStopRetry(applicationContext)
+                    reconcilePersistedRuntime(
+                        reconcileKeepAliveState = true,
+                        forceKeepAliveStatusCheck = true
+                    )
+                    return@post
+                }
                 if (reconciled) {
+                    CollectorAutoStart.cancelKeepAliveStopRetry(applicationContext)
+                    if (settings.isUserShutdownRequested()) {
+                        lastNotificationText = null
+                    } else {
+                        reconcilePersistedRuntime(forceKeepAliveStatusCheck = true)
+                        restoreNotificationAfterKeepAliveStop()
+                    }
                     stopIfNoActiveRuntime()
                 } else {
-                    store.recordEvent(
-                        "keep_alive_stop_deferred",
-                        "Service remains foreground because keep-alive shutdown was not confirmed"
-                    )
+                    finishKeepAliveStopAfterFailure(retryAttempt = 0, "keep_alive_stop_deferred")
                 }
             }
         }
+    }
+
+    private fun reconcileKeepAliveStopRetry(retryAttempt: Int) {
+        val keepAliveEnabled = settings.keepAliveConfig().anyEnabled
+        if (!settings.isUserShutdownRequested() && keepAliveEnabled) {
+            CollectorAutoStart.cancelKeepAliveStopRetry(applicationContext)
+            reconcilePersistedRuntime(
+                reconcileKeepAliveState = true,
+                forceKeepAliveStatusCheck = true
+            )
+            return
+        }
+
+        val generation = keepAliveStopGeneration.incrementAndGet()
+        if (!hasRuntimeOwner()) {
+            lastNotificationText = "Stopping keep-alive"
+            runCatching { startForeground(NOTIFICATION_ID, buildNotification(lastNotificationText!!)) }
+            acquireWakeLock()
+        }
+        keepAliveSupervisor.reconcileThen(KeepAliveConfig(false, false, false, false)) { reconciled ->
+            mainHandler.post {
+                if (generation != keepAliveStopGeneration.get()) return@post
+                if (!settings.isUserShutdownRequested() && settings.keepAliveConfig().anyEnabled) {
+                    CollectorAutoStart.cancelKeepAliveStopRetry(applicationContext)
+                    reconcilePersistedRuntime(
+                        reconcileKeepAliveState = true,
+                        forceKeepAliveStatusCheck = true
+                    )
+                    return@post
+                }
+                if (reconciled) {
+                    CollectorAutoStart.cancelKeepAliveStopRetry(applicationContext)
+                    if (settings.isUserShutdownRequested()) {
+                        lastNotificationText = null
+                        userShutdownFinalizationStarted.set(false)
+                        releaseWakeLock()
+                        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+                        stopSelf()
+                    } else {
+                        reconcilePersistedRuntime(forceKeepAliveStatusCheck = true)
+                        restoreNotificationAfterKeepAliveStop()
+                        stopIfNoActiveRuntime()
+                    }
+                } else {
+                    finishKeepAliveStopAfterFailure(retryAttempt, "keep_alive_stop_retry_failed")
+                }
+            }
+        }
+    }
+
+    private fun finishKeepAliveStopAfterFailure(retryAttempt: Int, category: String) {
+        runCatching {
+            store.recordEvent(
+                category,
+                "Keep-alive shutdown was not confirmed",
+                "attempt=$retryAttempt"
+            )
+        }
+        runCatching {
+            CollectorAutoStart.scheduleKeepAliveStopRetry(applicationContext, store, retryAttempt)
+        }
+        if (settings.isUserShutdownRequested()) {
+            lastNotificationText = null
+            releaseWakeLock()
+            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+            userShutdownFinalizationStarted.set(false)
+            stopSelf()
+            return
+        }
+        if (hasRuntimeOwner()) {
+            reconcilePersistedRuntime(forceKeepAliveStatusCheck = true)
+            restoreNotificationAfterKeepAliveStop()
+            return
+        }
+        lastNotificationText = null
+        releaseWakeLock()
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+        stopSelf()
     }
 
     private fun startMainIfNeeded() {
@@ -1115,20 +1222,22 @@ class CollectorService : Service() {
     }
 
     private fun stopServiceAfterUserShutdown() {
+        val generation = keepAliveStopGeneration.incrementAndGet()
         keepAliveSupervisor.reconcileThen(KeepAliveConfig(false, false, false, false)) { reconciled ->
             mainHandler.post {
+                if (generation != keepAliveStopGeneration.get()) return@post
                 if (!settings.isUserShutdownRequested()) {
+                    CollectorAutoStart.cancelKeepAliveStopRetry(applicationContext)
                     userShutdownFinalizationStarted.set(false)
                     return@post
                 }
                 if (!reconciled) {
                     userShutdownFinalizationStarted.set(false)
-                    store.recordEvent(
-                        "user_shutdown_keep_alive_failed",
-                        "User shutdown left the service foreground until keep-alive shutdown can be confirmed"
-                    )
+                    finishKeepAliveStopAfterFailure(retryAttempt = 0, "user_shutdown_keep_alive_failed")
                     return@post
                 }
+                CollectorAutoStart.cancelKeepAliveStopRetry(applicationContext)
+                lastNotificationText = null
                 releaseWakeLock()
                 runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
                 stopSelf()
@@ -1962,9 +2071,8 @@ class CollectorService : Service() {
         telegramTickAtMs = null
     }
 
-    private fun stopIfNoActiveRuntime() {
-        if (settings.isUserShutdownRequested() || userShutdownFinalizationStarted.get()) return
-        val liveness = RuntimeLiveness(
+    private fun currentRuntimeLiveness(): RuntimeLiveness {
+        return RuntimeLiveness(
             main = poller.isRunning(),
             debug = isDebugPollerRunning(),
             keepAlive = settings.keepAliveConfig().anyEnabled,
@@ -1976,6 +2084,27 @@ class CollectorService : Service() {
             maintenance = maintenanceActive.get(),
             archiveStorage = archiveStorageActiveInProcess.get()
         )
+    }
+
+    private fun hasRuntimeOwner(): Boolean {
+        return settings.runtimeDemand().any || currentRuntimeLiveness().active
+    }
+
+    private fun restoreNotificationAfterKeepAliveStop() {
+        if (!hasRuntimeOwner()) return
+        updateNotification(
+            notificationText(
+                mainEnabled = poller.isRunning(),
+                debugEnabled = isDebugPollerRunning(),
+                keepAliveEnabled = settings.keepAliveConfig().anyEnabled,
+                telegramEnabled = settings.isTelegramEnabled()
+            )
+        )
+    }
+
+    private fun stopIfNoActiveRuntime() {
+        if (settings.isUserShutdownRequested() || userShutdownFinalizationStarted.get()) return
+        val liveness = currentRuntimeLiveness()
         if (liveness.active) return
         if (!settings.runtimeDemand().requiresPersistentOwner) {
             CollectorAutoStart.cancelScheduled(applicationContext)
@@ -2157,11 +2286,13 @@ class CollectorService : Service() {
             val replacement = namedSingleThreadExecutor("byd-mqtt")
             try {
                 replacement.execute { action(previous) }
+                mqttExecutor = replacement
             } catch (error: RejectedExecutionException) {
                 replacement.shutdownNow()
+                //Keep the next MQTT action on a fresh executor even when the first submission rejects.
+                mqttExecutor = namedSingleThreadExecutor("byd-mqtt")
                 throw error
             }
-            mqttExecutor = replacement
         }
     }
 
@@ -2196,9 +2327,11 @@ class CollectorService : Service() {
         }
     }
 
-    private fun shutdownMqttExecutor(): ExecutorService {
+    private fun shutdownMqttExecutor(interrupt: Boolean = false): ExecutorService {
         return synchronized(mqttExecutorLock) {
-            mqttExecutor.also { it.shutdown() }
+            mqttExecutor.also {
+                if (interrupt) it.shutdownNow() else it.shutdown()
+            }
         }
     }
 
@@ -2425,7 +2558,7 @@ class CollectorService : Service() {
         maintenanceRuntimeRestoreAllowed.set(true)
         maintenanceRunningInProcess.set(true)
         if (operation == DbMaintenanceOperation.ARCHIVE) {
-            CollectorAutoStart.cancelScheduled(applicationContext)
+            CollectorAutoStart.cancelRuntimeRecovery(applicationContext)
         }
         val snapshot = runtimeSnapshot()
         ensureForegroundForChannel("Database maintenance")
@@ -2687,6 +2820,10 @@ class CollectorService : Service() {
         return false
     }
 
+    private fun keepAliveStopRetryBlockedByMaintenance(): Boolean {
+        return maintenanceActive.get() || CollectorSettings.isDbMaintenanceRunning(applicationContext)
+    }
+
     private fun isRuntimeOwner(): Boolean = Looper.myLooper() == mainHandler.looper
 
     private fun requireRuntimeOwner() {
@@ -2911,6 +3048,12 @@ class CollectorService : Service() {
             Intent(context, CollectorService::class.java).apply {
                 action = ACTION_RECONCILE_KEEP_ALIVE
                 putExtra(EXTRA_FORCE_KEEP_ALIVE_STATUS_CHECK, forceKeepAliveStatusCheck)
+            }
+
+        fun keepAliveStopRetryIntent(context: Context, retryAttempt: Int): Intent =
+            Intent(context, CollectorService::class.java).apply {
+                action = CollectorAutoStart.ACTION_KEEP_ALIVE_STOP_RETRY
+                putExtra(CollectorAutoStart.EXTRA_KEEP_ALIVE_STOP_RETRY_ATTEMPT, retryAttempt)
             }
 
         fun startMqttExportIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {

@@ -4,6 +4,7 @@ import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import com.bydcollector.collector.data.normalized.NormalizedFieldCatalog
 import java.time.OffsetDateTime
+import java.util.Locale
 
 //exports normalized vehicle_state_history to influx as the durable analytics channel
 class InfluxExportCoordinator(
@@ -12,6 +13,8 @@ class InfluxExportCoordinator(
     private val configProvider: () -> InfluxConfig,
     private val clock: Clock = SystemClockAdapter()
 ) {
+    private var currentBatchSize: Int? = null
+
     fun testConnection(): InfluxActionResult {
         val config = configProvider()
         return client.test(config)
@@ -138,11 +141,7 @@ class InfluxExportCoordinator(
             return InfluxActionResult.ok("influx next attempt pending")
         }
 
-        val batchLimit = if (pendingBefore.rows >= CATCH_UP_THRESHOLD) {
-            CATCH_UP_BATCH_LIMIT
-        } else {
-            REALTIME_BATCH_LIMIT
-        }
+        val batchLimit = nextBatchLimit(pendingBefore.rows)
         val rows = store.pendingInfluxRows(fieldKeys, batchLimit)
         if (rows.isEmpty()) {
             store.updateInfluxExportState(
@@ -171,21 +170,23 @@ class InfluxExportCoordinator(
             exportedRowsDelta = 0
         )
         return try {
-            val lines = rows.map { InfluxLineProtocol.toLine(it, config) }
-            val write = client.write(config, lines)
-            if (!write.ok) {
-                rows.map { it.fieldKey }.distinct().forEach { fieldKey ->
-                    store.updateInfluxCursorError(fieldKey, write.message, clock.nowIso())
+            val exportedAt = clock.nowIso()
+            val batch = exportRows(config, rows, exportedAt)
+            batch.failure?.let { failure ->
+                val pendingAfterFailure = store.pendingInfluxSummary(fieldKeys)
+                if (isTransientFailure(failure)) {
+                    deescalateBatchSize(pendingAfterFailure.rows)
                 }
-                recordFailure(STATUS_BACKOFF, write.message, pendingBefore)
-                return write
+                recordFailure(STATUS_BACKOFF, failure.message, pendingAfterFailure)
+                return failure
             }
 
-            val exportedAt = clock.nowIso()
-            rows.groupBy { it.fieldKey }.forEach { (fieldKey, fieldRows) ->
-                store.updateInfluxCursorSuccess(fieldKey, fieldRows.maxOf { it.id }, exportedAt)
-            }
             val pendingAfter = store.pendingInfluxSummary(fieldKeys)
+            if (batch.exportedRows > 0) {
+                rampBatchSize(pendingAfter.rows)
+            } else if (influxDesiredBatchLimit(pendingAfter.rows) == REALTIME_BATCH_LIMIT) {
+                currentBatchSize = REALTIME_BATCH_LIMIT
+            }
             store.updateInfluxExportState(
                 status = if (pendingAfter.rows > 0L) STATUS_SCHEDULED else STATUS_IDLE,
                 mode = modeFor(pendingAfter.rows),
@@ -199,19 +200,23 @@ class InfluxExportCoordinator(
                 lastSuccessAt = exportedAt,
                 lastErrorAt = null,
                 lastError = null,
-                exportedRowsDelta = rows.size.toLong()
+                exportedRowsDelta = batch.exportedRows.toLong()
             )
-            store.recordInfluxEvent(
-                eventType = "influx_export_batch",
-                message = "vehicle_state_history batch exported",
-                batchCount = rows.size,
-                fromHistoryId = rows.minOf { it.id },
-                toHistoryId = rows.maxOf { it.id }
-            )
-            InfluxActionResult.ok("exported ${rows.size} rows")
+            if (batch.exportedRows > 0) {
+                store.recordInfluxEvent(
+                    eventType = "influx_export_batch",
+                    message = "vehicle_state_history batch exported",
+                    batchCount = batch.exportedRows,
+                    fromHistoryId = rows.minOf { it.id },
+                    toHistoryId = rows.maxOf { it.id }
+                )
+            }
+            val poisonSuffix = if (batch.poisonRows > 0) "; quarantined ${batch.poisonRows} poison rows" else ""
+            InfluxActionResult.ok("exported ${batch.exportedRows} rows$poisonSuffix")
         } catch (error: RuntimeException) {
             val detail = "${error::class.java.simpleName}: ${error.message ?: "no message"}".take(512)
-            recordFailure(STATUS_BACKOFF, detail, pendingBefore)
+            deescalateBatchSize(pendingBefore.rows)
+            recordFailure(STATUS_BACKOFF, detail, store.pendingInfluxSummary(fieldKeys))
             InfluxActionResult.fail("influx_export_exception", detail)
         }
     }
@@ -228,6 +233,92 @@ class InfluxExportCoordinator(
             .filter { field -> config.isCategoryEnabled(field.category.mqttKey) }
             .map { field -> field.fieldKey }
             .toSet()
+    }
+
+    private fun nextBatchLimit(pendingRows: Long): Int {
+        val desired = influxDesiredBatchLimit(pendingRows)
+        if (desired == REALTIME_BATCH_LIMIT) {
+            currentBatchSize = REALTIME_BATCH_LIMIT
+            return REALTIME_BATCH_LIMIT
+        }
+        val next = (currentBatchSize ?: desired).coerceIn(REALTIME_BATCH_LIMIT, desired)
+        currentBatchSize = next
+        return next
+    }
+
+    private fun rampBatchSize(pendingRows: Long) {
+        val desired = influxDesiredBatchLimit(pendingRows)
+        if (desired == REALTIME_BATCH_LIMIT) {
+            currentBatchSize = REALTIME_BATCH_LIMIT
+            return
+        }
+        val current = currentBatchSize ?: REALTIME_BATCH_LIMIT
+        currentBatchSize = minOf(desired, maxOf(REALTIME_BATCH_LIMIT, current * 2))
+    }
+
+    private fun deescalateBatchSize(pendingRows: Long) {
+        val desired = influxDesiredBatchLimit(pendingRows)
+        if (desired == REALTIME_BATCH_LIMIT) {
+            currentBatchSize = REALTIME_BATCH_LIMIT
+            return
+        }
+        val current = currentBatchSize ?: desired
+        currentBatchSize = when {
+            current >= CATCH_UP_BATCH_LIMIT -> 1_000
+            current >= 1_000 -> 500
+            else -> REALTIME_BATCH_LIMIT
+        }.coerceIn(REALTIME_BATCH_LIMIT, desired)
+    }
+
+    private fun exportRows(
+        config: InfluxConfig,
+        rows: List<InfluxPendingHistoryRow>,
+        exportedAt: String
+    ): BatchExportResult {
+        if (rows.isEmpty()) return BatchExportResult()
+        val write = client.write(config, rows.map { InfluxLineProtocol.toLine(it, config) })
+        if (write.ok) {
+            rows.groupBy { it.fieldKey }.forEach { (fieldKey, fieldRows) ->
+                store.updateInfluxCursorSuccess(fieldKey, fieldRows.maxOf { it.id }, exportedAt)
+            }
+            return BatchExportResult(exportedRows = rows.size)
+        }
+        if (isInfluxLineProtocolDataFailure(write)) {
+            if (rows.size == 1) {
+                val row = rows.single()
+                store.updateInfluxCursorSuccess(row.fieldKey, row.id, exportedAt)
+                store.recordInfluxEvent(
+                    eventType = "influx_export_poison_row",
+                    message = "field=${row.fieldKey} history_id=${row.id} reason=${influxDataFormatReason(write)}",
+                    batchCount = null,
+                    fromHistoryId = row.id,
+                    toHistoryId = row.id
+                )
+                return BatchExportResult(poisonRows = 1)
+            }
+            val midpoint = rows.size / 2
+            val left = exportRows(config, rows.subList(0, midpoint), exportedAt)
+            left.failure?.let { return left }
+            val right = exportRows(config, rows.subList(midpoint, rows.size), exportedAt)
+            return BatchExportResult(
+                exportedRows = left.exportedRows + right.exportedRows,
+                poisonRows = left.poisonRows + right.poisonRows,
+                failure = right.failure
+            )
+        }
+        rows.map { it.fieldKey }.distinct().forEach { fieldKey ->
+            store.updateInfluxCursorError(fieldKey, write.message, exportedAt)
+        }
+        return BatchExportResult(failure = write)
+    }
+
+    private fun isTransientFailure(result: InfluxActionResult): Boolean {
+        val detail = "${result.category} ${result.message}".lowercase(Locale.US)
+        return result.httpStatus?.let { it in 500..599 } == true ||
+            detail.contains("network") ||
+            detail.contains("timeout") ||
+            detail.contains("timed out") ||
+            detail.contains("exception")
     }
 
     private fun recordFailure(
@@ -275,7 +366,7 @@ class InfluxExportCoordinator(
         const val EXPORT_SOURCE_TABLE = "vehicle_state_history"
         const val REALTIME_BATCH_LIMIT = 300
         const val CATCH_UP_BATCH_LIMIT = 2_000
-        const val CATCH_UP_THRESHOLD = 1_000
+        const val CATCH_UP_THRESHOLD = 5_000
         const val SUCCESS_BATCH_INTERVAL_SECONDS = 1L
         const val FAILURE_RETRY_INTERVAL_SECONDS = 30L
         const val STATUS_IDLE = "idle"
@@ -285,3 +376,28 @@ class InfluxExportCoordinator(
         const val STATUS_STOPPED = "stopped"
     }
 }
+
+internal fun influxDesiredBatchLimit(pendingRows: Long): Int {
+    return if (pendingRows >= 5_000L) 2_000 else 300
+}
+
+internal fun isInfluxLineProtocolDataFailure(result: InfluxActionResult): Boolean {
+    return influxDataFormatReason(result) != null
+}
+
+internal fun influxDataFormatReason(result: InfluxActionResult): String? {
+    if (result.httpStatus != 400) return null
+    val text = "${result.category} ${result.message}".lowercase(Locale.US)
+    return when {
+        text.contains("partial write") -> "partial_write"
+        text.contains("field type conflict") -> "field_type_conflict"
+        text.contains("unable to parse") -> "unable_to_parse"
+        else -> null
+    }
+}
+
+private data class BatchExportResult(
+    val exportedRows: Int = 0,
+    val poisonRows: Int = 0,
+    val failure: InfluxActionResult? = null
+)

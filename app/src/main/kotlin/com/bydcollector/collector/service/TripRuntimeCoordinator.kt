@@ -16,6 +16,7 @@ import com.bydcollector.collector.location.GpsLocationSample
 import com.bydcollector.collector.location.GpsLocationSink
 import com.bydcollector.collector.location.GpsStartRetryGate
 import com.bydcollector.collector.location.LocationNormalizer
+import com.bydcollector.collector.location.VehicleSpeedReference
 import com.bydcollector.collector.util.namedSingleThreadExecutor
 import java.io.File
 import java.time.Instant
@@ -56,6 +57,7 @@ class TripRuntimeCoordinator(
     private var lastLocation: GpsLocationSample? = null
     private var latestBatteryPowerKw: Double? = null
     private var latestBatteryPowerAtMs = Long.MIN_VALUE
+    private val vehicleSpeedReference = VehicleSpeedReference(nowElapsedMs = elapsedRealtimeMs)
     private val locationSource = AndroidGpsLocationSource(
         context = context,
         sink = object : GpsLocationSink {
@@ -80,17 +82,18 @@ class TripRuntimeCoordinator(
             }
         },
         bootIdProvider = { bootId },
-        segmentIdProvider = { segmentId }
+        segmentIdProvider = { segmentId },
+        vehicleSpeedReferenceKmh = vehicleSpeedReference::current
     )
 
     fun onSuccessfulPoll(
         timestamp: String,
         readings: List<PollReading>,
-        observations: List<NormalizedObservation>
+        observations: List<NormalizedObservation>,
+        liveTelemetry: Boolean
     ) {
         dispatch {
             ensureInitialized()
-            val liveTelemetry = isLiveTripTelemetryTimestamp(timestamp)
             val values = observations.associateBy { it.field.fieldKey }
             val snapshot = TelemetrySnapshot(
                 soc = values.number("soc"),
@@ -99,6 +102,7 @@ class TripRuntimeCoordinator(
                 speedKmh = values.number("speed_kmh"),
                 batteryPowerKw = values.number("battery_power_kw")
             )
+            if (liveTelemetry) vehicleSpeedReference.observe(snapshot.speedKmh)
             latestBatteryPowerKw = snapshot.batteryPowerKw
             latestBatteryPowerAtMs = elapsedRealtimeMs()
 
@@ -412,12 +416,3 @@ class TripRuntimeCoordinator(
         }.getOrDefault("unknown")
     }
 }
-
-internal fun isLiveTripTelemetryTimestamp(
-    timestamp: String,
-    nowMs: Long = System.currentTimeMillis(),
-    maxAgeMs: Long = 10_000L
-): Boolean = runCatching {
-    val capturedAtMs = TripTime.instant(timestamp)?.toEpochMilli() ?: return@runCatching false
-    capturedAtMs <= nowMs && nowMs - capturedAtMs <= maxAgeMs
-}.getOrDefault(false)

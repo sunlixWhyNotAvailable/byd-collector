@@ -33,8 +33,32 @@ class KeepAliveSupervisor(
     }
 
     fun reconcileThen(config: KeepAliveConfig, after: (Boolean) -> Unit) {
-        executor.execute {
-            after(retryKeepAliveReconcile { runReconcileSerialized(config, forceStatusCheck = true) })
+        val task = Runnable {
+            val reconciled = try {
+                retryKeepAliveReconcile { runReconcileSerialized(config, forceStatusCheck = true) }
+            } catch (error: Throwable) {
+                recordReconcileThenFailure("keep_alive_reconcile_then_error", error)
+                false
+            }
+            runCatching { after(reconciled) }
+                .onFailure { error -> recordReconcileThenFailure("keep_alive_reconcile_callback_error", error) }
+        }
+        try {
+            executor.execute(task)
+        } catch (error: Throwable) {
+            recordReconcileThenFailure("keep_alive_reconcile_submit_failed", error)
+            runCatching { after(false) }
+                .onFailure { callbackError -> recordReconcileThenFailure("keep_alive_reconcile_callback_error", callbackError) }
+        }
+    }
+
+    private fun recordReconcileThenFailure(category: String, error: Throwable) {
+        runCatching {
+            store.recordEvent(
+                category,
+                "Keep-alive reconcile completion failed",
+                "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+            )
         }
     }
 

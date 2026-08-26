@@ -35,8 +35,8 @@ class RuntimeDemandTest {
     }
 
     @Test
-    fun influxWorkOwnsServiceOnlyWhileQueuedRunningOrScheduled() {
-        assertFalse(RuntimeDemand(influx = true).requiresPersistentOwner)
+    fun influxDemandRetainsRecoveryOwnerAndLivenessTracksWork() {
+        assertTrue(RuntimeDemand(influx = true).requiresPersistentOwner)
         val lifecycle = listOf(
             RuntimeLiveness(influxQueued = true),
             RuntimeLiveness(influxInFlight = true),

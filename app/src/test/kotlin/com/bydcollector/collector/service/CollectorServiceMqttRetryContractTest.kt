@@ -65,6 +65,7 @@ class CollectorServiceMqttRetryContractTest {
         assertTrue(offline.contains("resetMqttExecutorForOffline"))
         assertFalse(startMain.contains("mqttOfflineQueued.set(false)"))
         assertInOrder(reset, "shutdownNow()", "replacement.execute", "mqttExecutor = replacement")
+        assertInOrder(reset, "catch (error: RejectedExecutionException)", "mqttExecutor = namedSingleThreadExecutor")
         assertInOrder(complete, "awaitMqttWorkerTermination(previous", "mqttCoordinator.disconnectOffline()")
         assertFalse(
             complete.substringAfter("if (!awaitMqttWorkerTermination")
@@ -75,7 +76,8 @@ class CollectorServiceMqttRetryContractTest {
         assertTrue(service.split("mqttCoordinator = createMqttCoordinator(processMqttClientFacade)").size == 3)
         assertTrue(service.contains("private val processMqttClientFacade = PahoMqttClientFacade()"))
         assertInOrder(maintenance, "previous.awaitTermination", "mqttCoordinator.disconnectForMaintenance()")
-        assertInOrder(destroy, "shutdownMqttExecutor()", "awaitMqttWorkerTermination(")
+        assertTrue(destroy.contains("shutdownMqttExecutor(interrupt = true)"))
+        assertFalse(destroy.contains("awaitMqttWorkerTermination("))
         assertTrue(maintenanceService.contains("COLLECTOR_STOP_TIMEOUT_MS = 20_000L"))
     }
 

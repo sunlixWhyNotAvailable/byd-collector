@@ -786,6 +786,40 @@ class TelegramEventEngineTest {
     }
 
     @Test
+    fun firstMovingPollWithoutSocBackfillsOverallStartFromTheFirstLaterValidSample() {
+        val engine = TelegramEventEngine()
+
+        engine.onSuccessfulPoll(snapshot(gear = "D", soc = null, odometer = 100.0, tripEnergy = 2.5), config, 0L)
+        assertNull(engine.state.bootStartSoc)
+
+        val later = engine.onSuccessfulPoll(
+            snapshot(gear = "D", soc = 63.0, odometer = 100.0, tripEnergy = 2.5),
+            config,
+            500L
+        )
+
+        assertEquals(63.0, later.state.bootStartSoc)
+        assertEquals(63.0, later.state.bootEndSoc)
+    }
+
+    @Test
+    fun laterSocDoesNotBackfillAnAccumulatedLegacySession() {
+        val engine = TelegramEventEngine(
+            TelegramEventState(
+                initialized = true,
+                gear = "D",
+                tripId = "legacy",
+                bootTotalDistanceKm = 2.0
+            )
+        )
+
+        val result = engine.onSuccessfulPoll(snapshot(gear = "D", soc = 63.0), config, 500L)
+
+        assertNull(result.state.bootStartSoc)
+        assertEquals(63.0, result.state.bootEndSoc)
+    }
+
+    @Test
     fun legacyFirstActiveTripRecoversExactOverallSocButPriorTotalsDoNotFabricateIt() {
         val firstTrip = TelegramEventEngine(
             TelegramEventState(

@@ -14,7 +14,14 @@ class InfluxClientContractTest {
 
         assertTrue(source.contains("var connection: HttpURLConnection? = null"))
         assertTrue(source.contains("finally"))
+        assertTrue(source.contains("httpStatus = code"))
         assertInOrder(source, "finally", "connection?.disconnect()")
+    }
+
+    @Test
+    fun actionResultCarriesHttpStatusOnlyForFailures() {
+        assertEquals(400, InfluxActionResult.fail("influx_http_error", "bad request", 400).httpStatus)
+        assertEquals(null, InfluxActionResult.ok().httpStatus)
     }
 
     @Test

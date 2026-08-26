@@ -12,8 +12,8 @@ android {
         applicationId = "com.bydcollector.collector"
         minSdk = 26
         targetSdk = 29
-        versionCode = 271
-        versionName = "2.7.1"
+        versionCode = 272
+        versionName = "2.7.2"
         manifestPlaceholders["collectorLabel"] = "BYD Collector"
         buildConfigField("String", "COLLECTOR_DISPLAY_NAME", "\"BYD Collector\"")
         buildConfigField("String", "COLLECTOR_DATABASE_NAME", "\"bydcollector_telemetry.db\"")

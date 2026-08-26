@@ -528,7 +528,7 @@ class TelemetryStore(
         val payload = message.payload
         val expired = db.delete(
             "telegram_outbox",
-            "created_at_ms < ?",
+            "created_at_ms < ? AND attempt_count > 0",
             arrayOf((nowMs - TELEGRAM_RETENTION_MS).toString())
         )
         if (telegramMessageExists(db, dedupeKey)) {
@@ -601,7 +601,7 @@ class TelemetryStore(
     fun pruneTelegramMessages(nowMs: Long): Int {
         return helper.writableDatabase.delete(
             "telegram_outbox",
-            "created_at_ms < ?",
+            "created_at_ms < ? AND attempt_count > 0",
             arrayOf((nowMs - TELEGRAM_RETENTION_MS).toString())
         )
     }

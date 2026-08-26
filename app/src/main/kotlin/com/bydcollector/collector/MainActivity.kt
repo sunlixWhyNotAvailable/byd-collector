@@ -230,6 +230,17 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onToggleMainAutoStart(enabled: Boolean) {
+            if (
+                CollectorSettings.isDbMaintenanceRunning(applicationContext) ||
+                CollectorService.isMaintenanceRunningInProcess()
+            ) {
+                Toast.makeText(
+                    this@MainActivity,
+                    strings(uiLanguage).dbMaintenanceAlreadyRunning,
+                    Toast.LENGTH_SHORT
+                ).show()
+                return
+            }
             refreshStoreBackedState()
             if (settings.isAutoStartEnabled() != enabled) {
                 if (enabled) settings.setMainManuallyStopped(false)
@@ -2041,34 +2052,42 @@ class MainActivity : ComponentActivity() {
     private fun shareDiagnosticLogs() {
         if (diagnosticsBusy) return
         diagnosticsBusy = true
+        val title = strings(uiLanguage).shareLogs
         val task = Runnable {
-            val result = runCatching { DiagnosticLogRecorder.prepareShareBundle(applicationContext) }
+            val result = runCatching {
+                val bundle = DiagnosticLogRecorder.prepareShareBundle(applicationContext)
+                val appContext = applicationContext
+                val uri = FileProvider.getUriForFile(
+                    appContext,
+                    "${appContext.packageName}.fileprovider",
+                    bundle
+                )
+                val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                    type = "application/zip"
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    clipData = ClipData.newUri(appContext.contentResolver, title, uri)
+                }
+                Triple(bundle, sendIntent, bundle.length())
+            }
             handler.post {
                 if (destroyed) {
                     diagnosticsBusy = false
                     return@post
                 }
-                result.mapCatching { bundle ->
-                    val uri = FileProvider.getUriForFile(
-                        this,
-                        "$packageName.fileprovider",
-                        bundle
-                    )
-                    val title = strings(uiLanguage).shareLogs
-                    val sendIntent = Intent(Intent.ACTION_SEND).apply {
-                        type = "application/zip"
-                        putExtra(Intent.EXTRA_STREAM, uri)
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                        clipData = ClipData.newUri(contentResolver, title, uri)
-                    }
-                    startActivity(Intent.createChooser(sendIntent, title))
-                    bundle
-                }.onSuccess { bundle ->
-                    recordOperationalEvent(
-                        "diagnostic_share_chooser_opened",
-                        "Diagnostic share chooser opened",
-                        "file=${bundle.name} size=${bundle.length()}"
-                    )
+                result.onSuccess { (bundle, sendIntent, bundleSize) ->
+                    runCatching { startActivity(Intent.createChooser(sendIntent, title)) }
+                        .onSuccess {
+                            recordOperationalEvent(
+                                "diagnostic_share_chooser_opened",
+                                "Diagnostic share chooser opened",
+                                "file=${bundle.name} size=$bundleSize"
+                            )
+                        }
+                        .onFailure { error ->
+                            recordOperationalEvent("diagnostic_share_failed", "Diagnostic share failed", error.message)
+                            Toast.makeText(this, strings(uiLanguage).logsShareFailed, Toast.LENGTH_LONG).show()
+                        }
                 }.onFailure { error ->
                     recordOperationalEvent("diagnostic_share_failed", "Diagnostic share failed", error.message)
                     Toast.makeText(this, strings(uiLanguage).logsShareFailed, Toast.LENGTH_LONG).show()

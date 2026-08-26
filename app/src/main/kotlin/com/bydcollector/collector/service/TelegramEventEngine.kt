@@ -937,7 +937,16 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
             state.bootTotalDurationMs == 0L
         ) return
         val current = validSoc(soc) ?: return
-        state = state.copy(bootEndSoc = current)
+        val canBackfillStart = state.tripId != null &&
+            state.gear != PARK &&
+            state.bootStartSoc == null &&
+            state.bootTotalDistanceKm == 0.0 &&
+            state.bootTotalEnergyKwh == 0.0 &&
+            state.bootTotalDurationMs == 0L
+        state = state.copy(
+            bootStartSoc = if (canBackfillStart) current else state.bootStartSoc,
+            bootEndSoc = current
+        )
     }
 
     private fun clearPendingTrip() {

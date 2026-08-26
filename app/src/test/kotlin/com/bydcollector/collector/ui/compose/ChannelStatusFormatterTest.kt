@@ -20,6 +20,20 @@ class ChannelStatusFormatterTest {
     }
 
     @Test
+    fun inFlightExportIsActiveWhileRuntimeIsRunning() {
+        val status = "exporting; pending: 1"
+
+        assertEquals(
+            "exporting",
+            ChannelStatusFormatter.compactText(status, strings(UiLanguage.EN), RuntimeActionStatus.RUNNING)
+        )
+        assertEquals(
+            StatusKind.OK,
+            ChannelStatusFormatter.kind(status, enabled = true, RuntimeActionStatus.RUNNING)
+        )
+    }
+
+    @Test
     fun scheduledStoppedAndIdleRunningRemainWaiting() {
         val strings = strings(UiLanguage.EN)
 
@@ -88,6 +102,14 @@ class ChannelStatusFormatterTest {
         assertEquals(
             StatusKind.WAITING,
             ChannelStatusFormatter.kind(status, enabled = true, RuntimeActionStatus.STOPPED)
+        )
+    }
+
+    @Test
+    fun enabledFallbackRemainsAvailableWhenRuntimeStatusIsMissing() {
+        assertEquals(
+            StatusKind.OK,
+            ChannelStatusFormatter.kind("unknown", enabled = true, runtimeStatus = null)
         )
     }
 }

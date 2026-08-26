@@ -247,7 +247,7 @@ class TelegramCoordinator(
     }
 
     private fun render(event: TelegramDetectedEvent): TelegramOutboxMessage? {
-        val tripTemplateLimitRevision = if (event.type == TelegramEventType.TRIP_SUMMARY) {
+        val tripTemplateLimitRevision = if (event.type == TelegramEventType.TRIP_SUMMARY && !event.locationOnly) {
             settings.telegramTripTemplateLimitRevision()
         } else {
             null
@@ -257,6 +257,13 @@ class TelegramCoordinator(
         val rendered = renderTelegramPayload(event, savedTemplate, language)
         if (tripTemplateLimitRevision != null) {
             settings.setTelegramTripTemplateLimitState(rendered.limitState, tripTemplateLimitRevision)
+        }
+        if (rendered.usedFallback) {
+            store.recordEvent(
+                "telegram_template_fallback",
+                "Telegram custom template was invalid; built-in fallback rendered",
+                "event=${event.type.key} reason=invalid_custom_template"
+            )
         }
         val payload = rendered.text
         if (payload == null) {
@@ -351,8 +358,8 @@ internal fun renderTelegramPayload(
     val defaultTemplate = TelegramTemplateCatalog.defaultTemplate(event.type, language)
     val selected = render(savedTemplate ?: defaultTemplate)
     val templateTooLong = selected.errors.any { it.kind == TelegramTemplateErrorKind.TOO_LONG }
-    val base = selected.text ?: savedTemplate?.let { render(defaultTemplate).text }
-        ?: return selected
+    val fallback = savedTemplate?.takeIf { selected.text == null }?.let { render(defaultTemplate) }
+    val base = selected.text ?: fallback?.text ?: return selected
     val suffix = event.textSuffix.orEmpty()
     val combined = base + suffix
     val locationTooLong = combined.codePointCount(0, combined.length) > TELEGRAM_MESSAGE_MAX_CHARS
@@ -362,5 +369,10 @@ internal fun renderTelegramPayload(
         locationTooLong && suffix.isNotEmpty() -> TelegramPayloadLimitState.WITH_LOCATION
         else -> TelegramPayloadLimitState.NONE
     }
-    return TelegramTemplateRenderResult(payload, emptyList(), limitState)
+    return TelegramTemplateRenderResult(
+        payload,
+        emptyList(),
+        limitState,
+        usedFallback = fallback?.text != null && selected.errors.any { it.kind != TelegramTemplateErrorKind.TOO_LONG }
+    )
 }

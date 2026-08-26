@@ -19,8 +19,9 @@ internal fun readBoundedUtf8(input: InputStream?, maxChars: Int): BoundedUtf8Tex
             if (read <= 0) break
             output.append(buffer, 0, read)
         }
+        val bounded = output.substring(0, minOf(output.length, maxChars))
         BoundedUtf8Text(
-            text = output.substring(0, minOf(output.length, maxChars)),
+            text = if (bounded.lastOrNull()?.isHighSurrogate() == true) bounded.dropLast(1) else bounded,
             truncated = output.length > maxChars
         )
     }

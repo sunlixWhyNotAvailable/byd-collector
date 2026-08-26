@@ -21,10 +21,13 @@ object CollectorAutoStart {
     val ACTION_RETRY_AUTO_START: String = "${BuildConfig.ACTION_PREFIX}.action.RETRY_AUTO_START"
     val ACTION_WATCHDOG_AUTO_START: String = "${BuildConfig.ACTION_PREFIX}.action.WATCHDOG_AUTO_START"
     val ACTION_KEEP_ALIVE_RECOVERY: String = "${BuildConfig.ACTION_PREFIX}.action.KEEP_ALIVE_RECOVERY"
+    val ACTION_KEEP_ALIVE_STOP_RETRY: String = "${BuildConfig.ACTION_PREFIX}.action.KEEP_ALIVE_STOP_RETRY"
     const val EXTRA_RETRY_ATTEMPT = "retry_attempt"
+    const val EXTRA_KEEP_ALIVE_STOP_RETRY_ATTEMPT = "keep_alive_stop_retry_attempt"
     const val RETRY_DELAY_MS = 30_000L
     const val WATCHDOG_DELAY_MS = 60_000L
     const val TASK_REMOVED_RETRY_DELAY_MS = 5_000L
+    const val KEEP_ALIVE_MAINTENANCE_DEFER_MS = 60_000L
     const val MAX_RETRY_ATTEMPTS = 20
 
     fun handleBroadcast(context: Context, action: String, retryAttempt: Int = 0) {
@@ -95,8 +98,70 @@ object CollectorAutoStart {
     fun handleRecoveryRequest(context: Context, action: String, retryAttempt: Int = 0) {
         if (action == ACTION_KEEP_ALIVE_RECOVERY) {
             handleKeepAliveRecovery(context, action)
+        } else if (action == ACTION_KEEP_ALIVE_STOP_RETRY) {
+            val appContext = context.applicationContext
+            if (
+                CollectorSettings.isDbMaintenanceRunning(appContext) ||
+                CollectorService.isMaintenanceRunningInProcess()
+            ) {
+                deferKeepAliveStopRetry(appContext, retryAttempt)
+            } else {
+                CollectorServiceController.retryKeepAliveStop(appContext, retryAttempt)
+            }
         } else {
             handleBroadcast(context, action, retryAttempt)
+        }
+    }
+
+    fun scheduleKeepAliveStopRetry(context: Context, store: TelemetryStore, retryAttempt: Int) {
+        val delayMs = KeepAliveStopRetrySchedule.delayMs(retryAttempt)
+        if (delayMs == null) {
+            cancelKeepAliveStopRetry(context)
+            store.recordEvent(
+                "keep_alive_stop_retry_exhausted",
+                "Keep-alive stop retry limit reached",
+                "attempt=$retryAttempt"
+            )
+            return
+        }
+        val appContext = context.applicationContext
+        val nextAttempt = retryAttempt + 1
+        runCatching {
+            appContext.getSystemService(AlarmManager::class.java).set(
+                AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                SystemClock.elapsedRealtime() + delayMs,
+                keepAliveStopRetryIntent(appContext, nextAttempt)
+            )
+        }.onSuccess {
+            store.recordEvent(
+                "keep_alive_stop_retry_scheduled",
+                "Scheduled keep-alive stop retry",
+                "attempt=$nextAttempt delay_ms=$delayMs"
+            )
+        }.onFailure { error ->
+            store.recordEvent(
+                "keep_alive_stop_retry_schedule_failed",
+                "Keep-alive stop retry scheduling failed",
+                "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+            )
+        }
+    }
+
+    fun cancelKeepAliveStopRetry(context: Context) {
+        val appContext = context.applicationContext
+        appContext.getSystemService(AlarmManager::class.java).cancel(keepAliveStopRetryIntent(appContext, 0))
+    }
+
+    fun deferKeepAliveStopRetry(context: Context, retryAttempt: Int) {
+        val appContext = context.applicationContext
+        runCatching {
+            appContext.getSystemService(AlarmManager::class.java).set(
+                AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                SystemClock.elapsedRealtime() + KEEP_ALIVE_MAINTENANCE_DEFER_MS,
+                keepAliveStopRetryIntent(appContext, retryAttempt)
+            )
+        }.onFailure { error ->
+            android.util.Log.e("CollectorAutoStart", "Failed to defer keep-alive stop retry", error)
         }
     }
 
@@ -193,6 +258,12 @@ object CollectorAutoStart {
 
     fun cancelScheduled(context: Context) {
         val appContext = context.applicationContext
+        cancelRuntimeRecovery(appContext)
+        cancelKeepAliveStopRetry(appContext)
+    }
+
+    fun cancelRuntimeRecovery(context: Context) {
+        val appContext = context.applicationContext
         cancelRetry(appContext)
         cancelWatchdog(appContext)
     }
@@ -213,10 +284,9 @@ object CollectorAutoStart {
         val demand = settings.runtimeDemand()
         if (demand.main) {
             ensurePollingEnabled(settings)
-            settings.setDebugPollingEnabled(demand.debug)
-        } else if (demand.debug) {
-            settings.setDebugPollingEnabled(true)
         }
+        // Cold recovery follows auto-start demand; a live manual All-data owner keeps its explicit flag.
+        if (!CollectorService.isRunning()) settings.setDebugPollingEnabled(demand.debug)
         return demand
     }
 
@@ -365,5 +435,27 @@ object CollectorAutoStart {
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+    }
+
+    private fun keepAliveStopRetryIntent(context: Context, retryAttempt: Int): PendingIntent {
+        val intent = Intent(context, InternalAutoStartReceiver::class.java).apply {
+            action = ACTION_KEEP_ALIVE_STOP_RETRY
+            putExtra(EXTRA_KEEP_ALIVE_STOP_RETRY_ATTEMPT, retryAttempt)
+        }
+        return PendingIntent.getBroadcast(
+            context,
+            2,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+}
+
+internal object KeepAliveStopRetrySchedule {
+    fun delayMs(retryAttempt: Int): Long? = when (retryAttempt) {
+        0 -> 60_000L
+        1 -> 5 * 60_000L
+        2 -> 15 * 60_000L
+        else -> null
     }
 }

@@ -33,6 +33,7 @@ class TelegramPayloadRenderingTest {
         )
 
         assertTrue(result.isSuccess)
+        assertTrue(result.usedFallback)
         assertEquals(
             TelegramTemplateRenderer.render(
                 TelegramEventType.LOW_12V_VOLTAGE,
@@ -44,6 +45,19 @@ class TelegramPayloadRenderingTest {
             ).text,
             result.text
         )
+    }
+
+    @Test
+    fun mixedLengthAndValidationErrorsStillRecordThatFallbackWasNeeded() {
+        val result = renderTelegramPayload(
+            event = event(),
+            savedTemplate = "x".repeat(TELEGRAM_MESSAGE_MAX_CHARS + 1) + "{not_allowed}",
+            language = TelegramTemplateLanguage.EN
+        )
+
+        assertTrue(result.isSuccess)
+        assertTrue(result.usedFallback)
+        assertEquals(TelegramPayloadLimitState.TEMPLATE, result.limitState)
     }
 
     @Test

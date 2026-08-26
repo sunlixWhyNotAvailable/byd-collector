@@ -11,6 +11,15 @@ import kotlin.test.assertTrue
 
 class DiagnosticZipWriterTest {
     @Test
+    fun writerDoesNotDeleteUnrelatedFixedNameTempFile() {
+        val source = listOf(
+            File("app/src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticZipWriter.kt"),
+            File("src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticZipWriter.kt")
+        ).firstOrNull(File::isFile)?.readText() ?: error("Missing DiagnosticZipWriter.kt")
+        assertFalse(source.contains("File(parent, \"\${zipFile.name}.tmp\").delete()"))
+    }
+
+    @Test
     fun latestZipSkipsExistingArchiveAndTempOutputWhenRunDirIsDiagnosticsRoot() {
         val runDir = Files.createTempDirectory("bydcollector-diagnostics").toFile()
         try {
@@ -20,17 +29,12 @@ class DiagnosticZipWriterTest {
             val zipFile = File(runDir, "bydcollector_diagnostics_latest.zip").apply {
                 writeText("previous zip placeholder", Charsets.UTF_8)
             }
-            val tempZip = File(runDir, "bydcollector_diagnostics_latest.zip.tmp").apply {
-                writeText("stale temp placeholder", Charsets.UTF_8)
-            }
-
             DiagnosticZipWriter.writeLatestZip(zipFile = zipFile, runDir = runDir)
 
             val entries = zipEntries(zipFile)
             assertTrue(eventSnapshot.name in entries)
             assertFalse(zipFile.name in entries)
-            assertFalse(tempZip.name in entries)
-            assertFalse(tempZip.exists())
+            assertFalse(runDir.listFiles().orEmpty().any { it.name.endsWith(".tmp") })
         } finally {
             runDir.deleteRecursively()
         }

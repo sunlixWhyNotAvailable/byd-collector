@@ -43,7 +43,6 @@ internal object DiagnosticZipWriter {
                     }
             }
             publish(tempZip, zipFile)
-            File(parent, "${zipFile.name}.tmp").delete()
         } catch (error: Exception) {
             tempZip.delete()
             throw error

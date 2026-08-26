@@ -68,7 +68,7 @@ class HttpInfluxClient : InfluxClient {
                     val message = response?.takeIf { it.isNotBlank() }
                         ?.let { "HTTP $code: $it" }
                         ?: "HTTP $code"
-                    InfluxActionResult.fail("influx_http_error", message)
+                    InfluxActionResult.fail("influx_http_error", message, httpStatus = code)
                 }
             } finally {
                 connection?.disconnect()

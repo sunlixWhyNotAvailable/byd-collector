@@ -90,6 +90,21 @@ class BydCollectorStringsTest {
     }
 
     @Test
+    fun clearLogsConfirmationIsLocalized() {
+        val uk = strings(UiLanguage.UK)
+        val en = strings(UiLanguage.EN)
+
+        assertEquals("Очистити логи?", uk.clearLogsTitle)
+        assertEquals("Буде видалено завершені записи logcat, журнал подій, підготовлені архіви та журнал helper. Активний запис logcat не зупиниться.", uk.clearLogsScope)
+        assertEquals("Цю дію неможливо скасувати.", uk.clearLogsIrreversible)
+        assertEquals("Очистити", uk.clearLogsConfirm)
+        assertEquals("Clear logs?", en.clearLogsTitle)
+        assertEquals("Completed logcat captures, the event journal, prepared bundles, and the helper log will be cleared. An active logcat capture will not stop.", en.clearLogsScope)
+        assertEquals("This action cannot be undone.", en.clearLogsIrreversible)
+        assertEquals("Clear", en.clearLogsConfirm)
+    }
+
+    @Test
     fun kpiLabelsLiveInUiStrings() {
         val uk = strings(UiLanguage.UK)
         val en = strings(UiLanguage.EN)
@@ -115,7 +130,9 @@ class BydCollectorStringsTest {
 
         assertEquals("Поточні бази", uk.activeDatabase)
         assertEquals("%s: основна %s + тестова %s", uk.activeDatabaseSizeTemplate)
-        assertEquals("Main DB v2: перехід відкладено до ручної архівації.", uk.mainStorageCutoverDeferred)
+        assertEquals("Перехід основної бази відкладено до ручної архівації.", uk.mainStorageCutoverDeferred)
+        assertEquals("Основна база: %s", uk.mainStorageCutoverErrorTemplate)
+        assertEquals("База «Всі дані»: %s", uk.debugStorageCutoverErrorTemplate)
         assertEquals("Архіви", uk.archiveStorage)
         assertEquals("Архівів немає", uk.archiveStorageEmpty)
         assertEquals("Сховище сканується...", uk.archiveStorageScanning)
@@ -134,7 +151,9 @@ class BydCollectorStringsTest {
 
         assertEquals("Active databases", en.activeDatabase)
         assertEquals("%s: main %s + test %s", en.activeDatabaseSizeTemplate)
-        assertEquals("Main DB v2: transition deferred until manual archive.", en.mainStorageCutoverDeferred)
+        assertEquals("Main database transition deferred until manual archive.", en.mainStorageCutoverDeferred)
+        assertEquals("Main database: %s", en.mainStorageCutoverErrorTemplate)
+        assertEquals("All data database: %s", en.debugStorageCutoverErrorTemplate)
         assertEquals("Archives", en.archiveStorage)
         assertEquals("No archives", en.archiveStorageEmpty)
         assertEquals("Scanning storage...", en.archiveStorageScanning)
@@ -177,5 +196,9 @@ class BydCollectorStringsTest {
         assertEquals("Total trip duration", en.variableDescriptions["total_duration"])
         assertEquals("SOC на початку загального підсумку, %", uk.variableDescriptions["total_soc_start"])
         assertEquals("SOC at overall-summary end, %", en.variableDescriptions["total_soc_end"])
+        assertEquals("Перевищено обмеження шаблону 4 096 символів", uk.templateLimitWarning)
+        assertEquals("Перевищено обмеження шаблону 4 096 символів із локацією", uk.templateLimitWithLocation)
+        assertEquals("Template exceeds the 4,096-character limit", en.templateLimitWarning)
+        assertEquals("Template exceeds the 4,096-character limit with location", en.templateLimitWithLocation)
     }
 }

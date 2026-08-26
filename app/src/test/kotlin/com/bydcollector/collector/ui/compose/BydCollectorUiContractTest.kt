@@ -328,8 +328,8 @@ class BydCollectorUiContractTest {
         assertTrue(strings.contains("tripDelay = \"Finish after P\""))
         assertTrue(strings.contains("templateLimitWarning = \"Перевищено обмеження шаблону 4 096 символів\""))
         assertTrue(strings.contains("templateLimitWarning = \"Template exceeds the 4,096-character limit\""))
-        assertTrue(strings.contains("templateLimitWithLocation = \"із локацією\""))
-        assertTrue(strings.contains("templateLimitWithLocation = \"with location\""))
+        assertTrue(strings.contains("templateLimitWithLocation = \"Перевищено обмеження шаблону 4 096 символів із локацією\""))
+        assertTrue(strings.contains("templateLimitWithLocation = \"Template exceeds the 4,096-character limit with location\""))
         assertTrue(components.contains("headerWarning: String? = null"))
         assertTrue(components.contains("private fun TemplateLimitWarning("))
         assertTrue(components.contains("color = p.yellow"))
@@ -504,6 +504,39 @@ class BydCollectorUiContractTest {
         assertTrue(app.contains("val buttonBackground = if (visualPressed) p.redSoft else p.redSoft.copy(alpha = 0.56f)"))
         assertTrue(app.contains(".background(buttonBackground, Rounded8)"))
         assertTrue(app.contains("actions::onShutdownApp"))
+    }
+
+    @Test
+    fun clearLogsUsesBlockingLocalizedConfirmationBeforeAction() {
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val strings = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorStrings.kt").readText()
+        val extra = app.substringAfter("private fun ExtraTab(").substringBefore("private fun TailscaleRuntimeRow(")
+        val confirm = app.substringAfter("if (showClearLogsDialog)").substringBefore("@Composable\nprivate fun BackgroundAppsSetupPrompt")
+        val dialog = app.substringAfter("private fun ClearLogsDialog(").substringBefore("private fun DownloadingUpdateHeader(")
+
+        assertTrue(app.contains("var showClearLogsDialog by rememberSaveable"))
+        assertTrue(app.contains("onRequestClearLogs = { showClearLogsDialog = true }"))
+        assertTrue(extra.contains("onRequestClearLogs"))
+        assertFalse(extra.contains("actions::onClearLogs"))
+        assertFalse(extra.contains("actions.onClearLogs()"))
+        assertInOrder(confirm, "showClearLogsDialog = false", "actions.onClearLogs()")
+        assertTrue(dialog.contains(".background(p.background.copy(alpha = 0.82f))"))
+        assertTrue(dialog.contains("ModalInputBlocker()"))
+        assertTrue(dialog.contains(".width(520.dp)"))
+        assertTrue(dialog.contains(".background(p.panel, Rounded8)"))
+        assertTrue(dialog.contains(".border(1.dp, p.borderStrong, Rounded8)"))
+        assertTrue(dialog.contains(".padding(20.dp)"))
+        assertTrue(dialog.contains("verticalArrangement = Arrangement.spacedBy(14.dp)"))
+        assertTrue(dialog.contains("val p = LocalBydPalette.current"))
+        assertFalse(dialog.contains("if (language"))
+        assertInOrder(dialog, "strings.clearLogsTitle", "strings.clearLogsScope")
+        assertInOrder(dialog, "strings.clearLogsScope", "strings.clearLogsIrreversible")
+        assertInOrder(dialog, "strings.clearLogsConfirm", "strings.cancel")
+        assertTrue(dialog.contains("primary = true"))
+        assertTrue(strings.contains("val clearLogsTitle: String"))
+        assertTrue(strings.contains("val clearLogsScope: String"))
+        assertTrue(strings.contains("val clearLogsIrreversible: String"))
+        assertTrue(strings.contains("val clearLogsConfirm: String"))
     }
 
     @Test

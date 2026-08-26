@@ -13,8 +13,11 @@ import android.util.Log
 import com.bydcollector.collector.BuildConfig
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.util.namedSingleThreadExecutor
-import com.bydcollector.collector.util.sharedOperationalEventExecutor
 import java.util.concurrent.Executor
+
+// Keeps broadcast completion independent from the shared operational-event queue for this process.
+internal val autoStartRecoveryHandoffExecutor: Executor =
+    namedSingleThreadExecutor("byd-auto-start-recovery-handoff")
 
 /** Foregrounds boot recovery before any database readiness work begins. */
 class AutoStartRecoveryService : Service() {
@@ -87,14 +90,12 @@ class AutoStartRecoveryService : Service() {
 
     companion object {
         private const val TAG = "AutoStartRecovery"
-        private val ACTION_RECOVER = "${BuildConfig.ACTION_PREFIX}.action.RUN_AUTO_START_RECOVERY"
         private const val EXTRA_RECOVERY_ACTION = "recovery_action"
         private const val CHANNEL_ID = "auto_start_recovery"
         private const val NOTIFICATION_ID = 1003
 
         fun enqueue(context: Context, action: String, retryAttempt: Int) {
             val intent = Intent(context, AutoStartRecoveryService::class.java).apply {
-                this.action = ACTION_RECOVER
                 putExtra(EXTRA_RECOVERY_ACTION, action)
                 putExtra(CollectorAutoStart.EXTRA_RETRY_ATTEMPT, retryAttempt)
             }
@@ -142,7 +143,7 @@ internal fun handoffAutoStartRecovery(
     val appContext = context.applicationContext
     val request = AutoStartRecoveryRequest(action, retryAttempt)
     fun submitToRunningOwner(): Boolean {
-        val runner = AutoStartRecoveryRunner(sharedOperationalEventExecutor) { queued ->
+        val runner = AutoStartRecoveryRunner(autoStartRecoveryHandoffExecutor) { queued ->
             CollectorAutoStart.handleRecoveryRequest(appContext, queued.action, queued.retryAttempt)
         }
         return runner.submit(request, pendingResult::finish)

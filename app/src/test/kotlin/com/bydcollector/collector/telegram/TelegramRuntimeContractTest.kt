@@ -108,6 +108,19 @@ class TelegramRuntimeContractTest {
     }
 
     @Test
+    fun ageRetentionNeverDeletesNeverAttemptedOutboxRows() {
+        val store = sourceFile("com/bydcollector/collector/data/local/TelemetryStore.kt").readText()
+        val enqueue = store.substringAfter("private fun enqueueTelegramMessage")
+            .substringBefore("fun oldestUnblockedTelegramMessage")
+        val prune = store.substringAfter("fun pruneTelegramMessages")
+            .substringBefore("fun markTelegramDelivered")
+
+        assertTrue(enqueue.contains("created_at_ms < ? AND attempt_count > 0"))
+        assertTrue(prune.contains("created_at_ms < ? AND attempt_count > 0"))
+        assertTrue(enqueue.contains("id IN (SELECT id FROM telegram_outbox ORDER BY id LIMIT ?)"))
+    }
+
+    @Test
     fun successfulAndBlockedAttemptsScheduleTheNextUnblockedMessageImmediately() {
         val coordinator = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
         val store = sourceFile("com/bydcollector/collector/data/local/TelemetryStore.kt").readText()
@@ -219,6 +232,29 @@ class TelegramRuntimeContractTest {
         assertTrue(activity.contains("key == CollectorSettings.KEY_TELEGRAM_TRIP_TEMPLATE_LIMIT_STATE"))
         assertTrue(activity.contains("tripLimitInputsChanged"))
         assertTrue(activity.contains("settings.resetTelegramTripTemplateLimitState()"))
+    }
+
+    @Test
+    fun delayedLocationOnlyFollowUpDoesNotRewriteTemplateLimitOrHideFallbackDiagnostics() {
+        val coordinator = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
+        val render = coordinator.substringAfter("private fun render(event: TelegramDetectedEvent)")
+            .substringBefore("private fun telegramLanguage")
+
+        assertTrue(render.contains("event.type == TelegramEventType.TRIP_SUMMARY && !event.locationOnly"))
+        assertTrue(render.contains("if (rendered.usedFallback)"))
+        assertTrue(render.contains("\"telegram_template_fallback\""))
+        assertTrue(render.contains("reason=invalid_custom_template"))
+    }
+
+    @Test
+    fun productionUsesCompleteDedicatedLocationLimitWarning() {
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val strings = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorStrings.kt").readText()
+
+        assertFalse(app.contains("\"${'$'}{strings.telegram.templateLimitWarning} ${'$'}{strings.telegram.templateLimitWithLocation}\""))
+        assertTrue(app.contains("TelegramPayloadLimitState.WITH_LOCATION -> strings.telegram.templateLimitWithLocation"))
+        assertTrue(strings.contains("templateLimitWithLocation = \"Перевищено обмеження шаблону 4 096 символів із локацією\""))
+        assertTrue(strings.contains("templateLimitWithLocation = \"Template exceeds the 4,096-character limit with location\""))
     }
 
     private fun sourceFile(path: String): File {

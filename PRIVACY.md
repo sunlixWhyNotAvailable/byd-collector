@@ -14,7 +14,7 @@ At the start of a main session, the collector can read BYD's `/storage/emulated/
 
 The optional `All data` collector reads a much broader read-only FID catalogue. Successful values can include vehicle identifiers, configuration and state fields, precise location coordinates, and other values whose meaning has not been confirmed. A field name does not prove that a returned value is valid or correctly decoded.
 
-Operational events and retry or delivery state for enabled integrations are also stored locally. Existing application events are continuously mirrored—not telemetry samples—to an app-private JSONL journal with one active file plus three 2 MiB rotations (8 MiB maximum). There is no separate Journal UI. Full-system logcat recording starts only when the user explicitly starts it under `Options -> Keep alive`; it uses authorized local ADB and can contain system messages and data from unrelated processes, not only BYD Collector.
+Operational events and retry or delivery state for enabled integrations are also stored locally. Existing application events are continuously mirrored—not telemetry samples—to an app-private JSONL journal with one active file plus three 2 MiB rotations (8 MiB maximum). There is no separate Journal UI. Full-system logcat recording starts only when the user explicitly starts it under `Options -> Keep alive`; it uses authorized local ADB, is capped at eight 16 MiB segments (128 MiB total), and can contain system messages and data from unrelated processes, not only BYD Collector.
 
 ## Network connections
 

@@ -3,6 +3,7 @@ package com.bydcollector.collector.location
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class GpsTrustGateTest {
@@ -99,6 +100,94 @@ class GpsTrustGateTest {
         assertTrue(gate.offer(sample(3_000_000_000L, 51.00002, wall = 4_603_000L, receiveWall = 4_603_000L)).trusted)
     }
 
+    @Test
+    fun reportedGpsSpeedMismatchIsRejected() {
+        val gate = GpsTrustGate()
+        assertTrue(gate.offer(sample(1_000_000_000L, 50.0, speedMps = 0.0), vehicleSpeedKmh = 0.0).trusted)
+
+        assertEquals(
+            "vehicle_speed_mismatch",
+            gate.offer(sample(2_000_000_000L, 50.0, speedMps = 20.0), vehicleSpeedKmh = 0.0).reason
+        )
+    }
+
+    @Test
+    fun pairwiseImpliedGpsSpeedMismatchIsRejectedWhenReportedSpeedIsAbsent() {
+        val gate = GpsTrustGate()
+        assertTrue(gate.offer(sample(1_000_000_000L, 50.0, speedMps = 0.0), vehicleSpeedKmh = 0.0).trusted)
+
+        assertEquals(
+            "vehicle_speed_mismatch",
+            gate.offer(sample(2_000_000_000L, 50.001, speedMps = null), vehicleSpeedKmh = 0.0).reason
+        )
+    }
+
+    @Test
+    fun gpsSpeedAtCanPlusFortyIsAccepted() {
+        val gate = GpsTrustGate()
+        assertTrue(gate.offer(sample(1_000_000_000L, 50.0, speedMps = 0.0), vehicleSpeedKmh = 60.0).trusted)
+
+        assertTrue(gate.offer(sample(2_000_000_000L, 50.0, speedMps = 100.0 / 3.6), vehicleSpeedKmh = 60.0).trusted)
+    }
+
+    @Test
+    fun missingCanSkipsOnlyNewVeto() {
+        val gate = GpsTrustGate()
+        assertTrue(gate.offer(sample(1_000_000_000L, 50.0, speedMps = 0.0)).trusted)
+
+        assertTrue(gate.offer(sample(2_000_000_000L, 50.0, speedMps = 200.0)).trusted)
+    }
+
+    @Test
+    fun callbackGapStartsNewGpsSpeedSequenceThenChecksFollowingPair() {
+        val gate = GpsTrustGate()
+        assertTrue(gate.offer(sample(1_000_000_000L, 50.0, speedMps = 0.0), vehicleSpeedKmh = 0.0).trusted)
+
+        val firstAfterGap = gate.offer(
+            sample(10_000_000_000L, 50.001, speedMps = null, receiveElapsed = 10_000_000_000L),
+            vehicleSpeedKmh = 0.0
+        )
+        assertEquals(GpsTrustStatus.PENDING, firstAfterGap.status)
+        assertEquals("recovery_pending", firstAfterGap.reason)
+
+        assertEquals(
+            "vehicle_speed_mismatch",
+            gate.offer(
+                sample(11_000_000_000L, 50.002, speedMps = null, receiveElapsed = 11_000_000_000L),
+                vehicleSpeedKmh = 0.0
+            ).reason
+        )
+    }
+
+    @Test
+    fun vehicleSpeedMismatchStillRequiresThreeRecoveryFixes() {
+        val gate = GpsTrustGate()
+        assertTrue(gate.offer(sample(1_000_000_000L, 50.0, speedMps = 0.0), vehicleSpeedKmh = 0.0).trusted)
+        assertEquals(
+            "vehicle_speed_mismatch",
+            gate.offer(sample(2_000_000_000L, 50.0, speedMps = 20.0), vehicleSpeedKmh = 0.0).reason
+        )
+
+        assertEquals(GpsTrustStatus.PENDING, gate.offer(sample(3_000_000_000L, 50.0, speedMps = 0.0), vehicleSpeedKmh = 0.0).status)
+        assertEquals(GpsTrustStatus.PENDING, gate.offer(sample(4_000_000_000L, 50.0, speedMps = 0.0), vehicleSpeedKmh = 0.0).status)
+        assertTrue(gate.offer(sample(5_000_000_000L, 50.0, speedMps = 0.0), vehicleSpeedKmh = 0.0).trusted)
+    }
+
+    @Test
+    fun vehicleSpeedReferenceKeepsMaxFreshFiniteNonnegativeValue() {
+        var nowMs = 1_000L
+        val reference = VehicleSpeedReference(nowElapsedMs = { nowMs })
+        reference.observe(20.0)
+        reference.observe(80.0)
+        reference.observe(-1.0)
+        reference.observe(Double.NaN)
+        reference.observe(Double.POSITIVE_INFINITY)
+
+        assertEquals(80.0, reference.current())
+        nowMs = 3_001L
+        assertNull(reference.current())
+    }
+
     private fun sample(
         elapsed: Long,
         latitude: Double,
@@ -106,7 +195,8 @@ class GpsTrustGateTest {
         receiveWall: Long = wall,
         receiveElapsed: Long = elapsed,
         isMock: Boolean = false,
-        bootId: String = "boot"
+        bootId: String = "boot",
+        speedMps: Double? = 10.0
     ) = GpsLocationSample(
         observedAt = "2026-08-20T12:00:00Z",
         wallTimeMs = wall,
@@ -116,7 +206,7 @@ class GpsTrustGateTest {
         latitude = latitude,
         longitude = 30.0,
         accuracyM = 5.0,
-        speedMps = 10.0,
+        speedMps = speedMps,
         altitudeM = null,
         bearingDeg = null,
         receiveWallTimeMs = receiveWall,

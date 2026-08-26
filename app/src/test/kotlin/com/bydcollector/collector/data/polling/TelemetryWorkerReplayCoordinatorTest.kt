@@ -24,6 +24,7 @@ class TelemetryWorkerReplayCoordinatorTest {
         val actions = mutableListOf<String>()
         val storage = FakeWorkerPollStorage(actions)
         val sample = sample()
+        var observedOrigin: PollOrigin? = null
         val coordinator = coordinator(
             storage = storage,
             sample = sample,
@@ -33,9 +34,11 @@ class TelemetryWorkerReplayCoordinatorTest {
                     sessionId: Long,
                     pollId: Long,
                     timestamp: String,
-                    readings: List<PollReading>
+                    readings: List<PollReading>,
+                    origin: PollOrigin
                 ) {
                     actions += "observer:$pollId"
+                    observedOrigin = origin
                 }
             }
         )
@@ -51,6 +54,7 @@ class TelemetryWorkerReplayCoordinatorTest {
         )
         assertEquals("1970-01-01T00:00:01Z", storage.input?.timestamp)
         assertEquals(PollReading("test_percent", "72", "72"), storage.input?.readings?.single())
+        assertEquals(PollOrigin.REPLAY, observedOrigin)
     }
 
     @Test
@@ -66,7 +70,8 @@ class TelemetryWorkerReplayCoordinatorTest {
                     sessionId: Long,
                     pollId: Long,
                     timestamp: String,
-                    readings: List<PollReading>
+                    readings: List<PollReading>,
+                    origin: PollOrigin
                 ) {
                     actions += "observer:$pollId"
                     throw IllegalStateException("normalizer unavailable")

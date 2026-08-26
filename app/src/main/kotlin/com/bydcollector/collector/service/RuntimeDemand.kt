@@ -21,7 +21,7 @@ data class RuntimeDemand(
         get() = main || debug || mqtt || influx || telegram || keepAlive
 
     val requiresPersistentOwner: Boolean
-        get() = main || debug || mqtt || telegram || keepAlive
+        get() = main || debug || mqtt || influx || telegram || keepAlive
 
     fun recoveryActions(): List<RuntimeRecoveryAction> {
         if (main) return listOf(RuntimeRecoveryAction.MAIN)

@@ -36,6 +36,20 @@ class MainActivityMaintenanceContractTest {
     }
 
     @Test
+    fun mainAutoStartToggleRejectsDuringDatabaseMaintenanceBeforeStoreAccess() {
+        val source = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val toggle = source
+            .substringAfter("override fun onToggleMainAutoStart")
+            .substringBefore("override fun onGrantAdb")
+
+        assertTrue(toggle.contains("CollectorSettings.isDbMaintenanceRunning(applicationContext)"))
+        assertTrue(toggle.contains("CollectorService.isMaintenanceRunningInProcess()"))
+        assertTrue(toggle.contains("strings(uiLanguage).dbMaintenanceAlreadyRunning"))
+        assertTrue(toggle.contains("Toast.makeText"))
+        assertInOrder(toggle, "CollectorSettings.isDbMaintenanceRunning(applicationContext)", "refreshStoreBackedState()")
+    }
+
+    @Test
     fun queuedDashboardReadersAndPreflightHoldTheApplicationReadLease() {
         val source = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
         val counts = source.substringAfter("private fun scheduleDashboardCountBootstrap")

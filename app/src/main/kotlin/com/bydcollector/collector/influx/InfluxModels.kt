@@ -3,11 +3,13 @@ package com.bydcollector.collector.influx
 data class InfluxActionResult(
     val ok: Boolean,
     val category: String,
-    val message: String
+    val message: String,
+    val httpStatus: Int? = null
 ) {
     companion object {
         fun ok(message: String = "ok") = InfluxActionResult(true, "ok", message)
-        fun fail(category: String, message: String) = InfluxActionResult(false, category, message)
+        fun fail(category: String, message: String, httpStatus: Int? = null) =
+            InfluxActionResult(false, category, message, httpStatus)
     }
 }
 

@@ -55,12 +55,13 @@ class RuntimeManualStopContractTest {
         val onStart = service.substringAfter("override fun onStartCommand").substringBefore("override fun onDestroy")
         val stickyReconcile = service.substringAfter("private fun reconcilePersistedRuntime").substringBefore("private fun reconcileMqttAutoStart")
         val recoveryDispatch = autoStart.substringAfter("private fun dispatchRuntimeRecovery").substringBeforeLast("}")
+        val stickyCall = "reconcilePersistedRuntime(resetDebugToAutoStartDemand = true)"
 
         assertFalse(onStart.contains("intent?.action ?: ACTION_START"))
-        assertTrue(onStart.contains("stickyRestart -> reconcilePersistedRuntime()") || onStart.contains("if (stickyRestart)"))
+        assertTrue(onStart.contains(stickyCall))
         assertTrue(
             onStart.indexOf("if (stickyRestart) reconcilePendingCutoverArchiveStorage(action)") <
-                onStart.indexOf("reconcilePersistedRuntime()")
+                onStart.indexOf(stickyCall)
         )
         assertTrue(onStart.contains("ACTION_RECONCILE_KEEP_ALIVE -> reconcilePersistedRuntime("))
         assertTrue(onStart.contains("forceKeepAliveStatusCheck = forceKeepAliveStatusCheck"))
@@ -69,6 +70,7 @@ class RuntimeManualStopContractTest {
         assertTrue(stickyReconcile.contains("RuntimeRecoveryAction.INFLUX -> startInfluxExport(clearManualStop = false)"))
         assertTrue(stickyReconcile.contains("RuntimeRecoveryAction.TELEGRAM -> reconcileTelegramRuntime"))
         assertTrue(stickyReconcile.contains("RuntimeRecoveryAction.MAIN -> reconcileCollection("))
+        assertTrue(stickyReconcile.contains("if (resetDebugToAutoStartDemand) settings.setDebugPollingEnabled(demand.debug)"))
         assertTrue(recoveryDispatch.contains("RuntimeRecoveryAction.TELEGRAM -> CollectorServiceController.reconcileTelegram(context)"))
         assertTrue(
             recoveryDispatch.contains(
@@ -76,6 +78,21 @@ class RuntimeManualStopContractTest {
             )
         )
         assertTrue(autoStart.contains("forceKeepAliveStatusCheck = action == ACTION_WATCHDOG_AUTO_START"))
+        assertTrue(
+            autoStart.contains(
+                "if (!CollectorService.isRunning()) settings.setDebugPollingEnabled(demand.debug)"
+            )
+        )
+    }
+
+    @Test
+    fun manualDebugStartStillUsesItsExplicitPollingFlag() {
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val manualStart = service
+            .substringAfter("ACTION_START_DEBUG -> {")
+            .substringBefore("ACTION_RECONCILE_DEBUG")
+
+        assertTrue(manualStart.contains("reconcileCollection(DEBUG_REASON_MANUAL)"))
     }
 
     @Test

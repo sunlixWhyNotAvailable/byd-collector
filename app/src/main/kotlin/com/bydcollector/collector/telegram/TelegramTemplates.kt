@@ -370,7 +370,8 @@ object TelegramTemplateParser {
 data class TelegramTemplateRenderResult(
     val text: String?,
     val errors: List<TelegramTemplateError>,
-    val limitState: TelegramPayloadLimitState = TelegramPayloadLimitState.NONE
+    val limitState: TelegramPayloadLimitState = TelegramPayloadLimitState.NONE,
+    val usedFallback: Boolean = false
 ) {
     val isSuccess: Boolean get() = errors.isEmpty()
 }

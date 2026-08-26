@@ -3,6 +3,7 @@ package com.bydcollector.collector
 import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertTrue
 
 class ProductionReadOnlySourceContractTest {
     @Test
@@ -24,10 +25,16 @@ class ProductionReadOnlySourceContractTest {
         assertEquals(emptyList(), matches)
     }
 
+    @Test
+    fun arrayWriteApisRemainCoveredByTheReadOnlyGuard() {
+        assertTrue(FORBIDDEN_API_PATTERN.containsMatchIn("setIntArray"))
+        assertTrue(FORBIDDEN_API_PATTERN.containsMatchIn("setDoubleArray"))
+    }
+
     companion object {
         private val SOURCE_EXTENSIONS = setOf("kt", "java", "xml")
         private val FORBIDDEN_API_PATTERN = Regex(
-            "\\b(?:sendCmd|setXD|setTrigger|wakeUpMcu|setAction|setActionsBatch|TX_WRITE)\\b"
+            "\\b(?:sendCmd|setXD|setTrigger|wakeUpMcu|setAction|setActionsBatch|setIntArray|setDoubleArray|TX_WRITE)\\b"
         )
     }
 }

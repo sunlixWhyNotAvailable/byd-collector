@@ -31,8 +31,19 @@ interface PollStorage {
     fun recordEvent(category: String, message: String, detail: String? = null)
 }
 
+enum class PollOrigin {
+    LIVE,
+    REPLAY
+}
+
 interface SuccessfulPollObserver {
-    fun onSuccessfulPoll(sessionId: Long, pollId: Long, timestamp: String, readings: List<PollReading>)
+    fun onSuccessfulPoll(
+        sessionId: Long,
+        pollId: Long,
+        timestamp: String,
+        readings: List<PollReading>,
+        origin: PollOrigin
+    )
 }
 
 //ties one vehicle read to raw persistence, normalized observers, and explicit failure records
@@ -74,7 +85,13 @@ class PollPersistenceCoordinator(
                     )
                     persistDiagnosticTransition(result)
                     try {
-                        successfulPollObserver?.onSuccessfulPoll(sessionId, pollId, timestamp, result.readings)
+                        successfulPollObserver?.onSuccessfulPoll(
+                            sessionId,
+                            pollId,
+                            timestamp,
+                            result.readings,
+                            PollOrigin.LIVE
+                        )
                     } catch (error: RuntimeException) {
                         //keeps raw polling alive even if normalized state/export logic has a bug
                         val detail = "${error::class.java.simpleName}: ${error.message ?: "no message"}"

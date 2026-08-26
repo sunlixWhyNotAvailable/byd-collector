@@ -126,6 +126,7 @@ fun BydCollectorApp(
     BydCollectorTheme(darkTheme) {
         val p = LocalBydPalette.current
         var pendingArchiveDeleteIds by remember { mutableStateOf<List<String>>(emptyList()) }
+        var showClearLogsDialog by rememberSaveable { mutableStateOf(false) }
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -172,7 +173,14 @@ fun BydCollectorApp(
                                  AppTab.STORAGE -> StorageTab(state, s, actions, actionUiState) { ids ->
                                     pendingArchiveDeleteIds = ids
                                 }
-                                AppTab.EXTRA -> ExtraTab(state, s, updateAutoCheckEnabled, diagnosticsBusy, actions)
+                                AppTab.EXTRA -> ExtraTab(
+                                    state = state,
+                                    strings = s,
+                                    updateAutoCheckEnabled = updateAutoCheckEnabled,
+                                    diagnosticsBusy = diagnosticsBusy,
+                                    actions = actions,
+                                    onRequestClearLogs = { showClearLogsDialog = true },
+                                )
                             }
                         }
                     }
@@ -223,6 +231,16 @@ fun BydCollectorApp(
                 val archiveJob = chromeState?.archiveStorageJobStatus
                 if (archiveJob?.running == true && archiveJob.mode == ArchiveStorageJobMode.DELETE) {
                     ArchiveStorageProgressDialog(strings = s, status = archiveJob)
+                }
+                if (showClearLogsDialog) {
+                    ClearLogsDialog(
+                        strings = s,
+                        onConfirm = {
+                            showClearLogsDialog = false
+                            actions.onClearLogs()
+                        },
+                        onDismiss = { showClearLogsDialog = false },
+                    )
                 }
             }
     }
@@ -1656,8 +1674,7 @@ private fun TelegramMessageCard(
         when (limitState) {
             TelegramPayloadLimitState.NONE -> null
             TelegramPayloadLimitState.TEMPLATE -> strings.telegram.templateLimitWarning
-            TelegramPayloadLimitState.WITH_LOCATION ->
-                "${strings.telegram.templateLimitWarning} ${strings.telegram.templateLimitWithLocation}"
+            TelegramPayloadLimitState.WITH_LOCATION -> strings.telegram.templateLimitWithLocation
         }
     } else {
         null
@@ -1994,7 +2011,8 @@ private fun ExtraTab(
     strings: UiStrings,
     updateAutoCheckEnabled: Boolean,
     diagnosticsBusy: Boolean,
-    actions: BydCollectorActions
+    actions: BydCollectorActions,
+    onRequestClearLogs: () -> Unit,
 ) {
     val optionsCardHeight = 312.dp
     TabScrollColumn {
@@ -2042,7 +2060,7 @@ private fun ExtraTab(
                         )
                         ActionButton(
                             strings.clearLogs,
-                            actions::onClearLogs,
+                            onRequestClearLogs,
                             enabled = !diagnosticsBusy,
                             modifier = Modifier.weight(1f)
                         )
@@ -2877,6 +2895,39 @@ private fun AvailableUpdateNotes(strings: UiStrings, info: UpdateInfo, language:
     )
     Spacer(Modifier.height(12.dp))
     MarkdownPatchNotesText(selectedReleaseNotes)
+}
+
+@Composable
+private fun ClearLogsDialog(
+    strings: UiStrings,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val p = LocalBydPalette.current
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(p.background.copy(alpha = 0.82f)),
+        contentAlignment = Alignment.Center,
+    ) {
+        ModalInputBlocker()
+        Column(
+            modifier = Modifier
+                .width(520.dp)
+                .background(p.panel, Rounded8)
+                .border(1.dp, p.borderStrong, Rounded8)
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Text(strings.clearLogsTitle, color = p.text, fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
+            Text(strings.clearLogsScope, color = p.text, fontSize = 14.sp, lineHeight = 19.sp, fontWeight = FontWeight.SemiBold)
+            Text(strings.clearLogsIrreversible, color = p.red, fontSize = 14.sp, lineHeight = 19.sp, fontWeight = FontWeight.SemiBold)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                ActionButton(strings.clearLogsConfirm, onConfirm, primary = true, modifier = Modifier.weight(1f))
+                ActionButton(strings.cancel, onDismiss, modifier = Modifier.weight(1f))
+            }
+        }
+    }
 }
 
 @Composable

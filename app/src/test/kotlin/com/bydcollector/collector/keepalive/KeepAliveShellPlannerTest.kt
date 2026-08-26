@@ -162,7 +162,50 @@ class KeepAliveShellPlannerTest {
             .substringBefore("private fun runReconcileSerialized")
 
         assertTrue(reconcileThen.contains("forceStatusCheck = true"))
+        assertTrue(reconcileThen.contains("catch (error: Throwable)"))
+        assertTrue(reconcileThen.contains("executor.execute(task)"))
+        assertTrue(reconcileThen.contains("after(false)"))
         assertTrue(source.contains("val shouldStopDisabledDaemon = forceStatusCheck ||"))
+    }
+
+    @Test
+    fun keepAliveStopRetryUsesExistingReceiverHandoffAndBoundedSchedule() {
+        val autoStart = sourceFile("com/bydcollector/collector/system/CollectorAutoStart.kt").readText()
+        val receiver = sourceFile("com/bydcollector/collector/system/InternalAutoStartReceiver.kt").readText()
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val retry = service.substringAfter("private fun reconcileKeepAliveStopRetry")
+            .substringBefore("private fun finishKeepAliveStopAfterFailure")
+        val failure = service.substringAfter("private fun finishKeepAliveStopAfterFailure")
+            .substringBefore("private fun startMainIfNeeded")
+
+        assertTrue(autoStart.contains("ACTION_KEEP_ALIVE_STOP_RETRY"))
+        assertTrue(autoStart.contains("KeepAliveStopRetrySchedule.delayMs(retryAttempt)"))
+        assertTrue(autoStart.contains("AlarmManager.ELAPSED_REALTIME_WAKEUP"))
+        assertTrue(autoStart.contains("keepAliveStopRetryIntent(appContext, nextAttempt)"))
+        assertTrue(autoStart.contains("KEEP_ALIVE_MAINTENANCE_DEFER_MS = 60_000L"))
+        assertTrue(autoStart.contains("keepAliveStopRetryIntent(appContext, retryAttempt)"))
+        assertTrue(receiver.contains("ACTION_KEEP_ALIVE_STOP_RETRY"))
+        assertTrue(service.contains("reconcileKeepAliveStopRetry("))
+        assertTrue(service.contains("finishKeepAliveStopAfterFailure("))
+        assertTrue(service.contains("keepAliveStopGeneration"))
+        assertTrue(service.contains("stopForeground(STOP_FOREGROUND_REMOVE)"))
+        assertTrue(retry.contains("if (!settings.isUserShutdownRequested() && keepAliveEnabled)"))
+        assertFalse(retry.contains("settings.runtimeDemand().any"))
+        assertTrue(retry.contains("if (!hasRuntimeOwner())"))
+        assertTrue(retry.contains("reconcilePersistedRuntime(forceKeepAliveStatusCheck = true)"))
+        assertTrue(retry.contains("restoreNotificationAfterKeepAliveStop()"))
+        assertTrue(retry.contains("stopIfNoActiveRuntime()"))
+        assertTrue(failure.contains("if (hasRuntimeOwner())"))
+        assertTrue(failure.contains("reconcilePersistedRuntime(forceKeepAliveStatusCheck = true)"))
+        assertTrue(failure.contains("restoreNotificationAfterKeepAliveStop()"))
+        val normalSuccessIndex = retry.indexOf("reconcilePersistedRuntime(forceKeepAliveStatusCheck = true)")
+        assertTrue(normalSuccessIndex >= 0)
+        assertTrue(retry.indexOf("stopSelf()", normalSuccessIndex) < 0)
+        val retainedRuntimeIndex = failure.indexOf("if (hasRuntimeOwner())")
+        val retainedReturnIndex = failure.indexOf("return", retainedRuntimeIndex)
+        val releaseIndex = failure.indexOf("releaseWakeLock()", retainedRuntimeIndex)
+        assertTrue(retainedRuntimeIndex >= 0)
+        assertTrue(retainedReturnIndex > retainedRuntimeIndex && retainedReturnIndex < releaseIndex)
     }
 
     @Test
