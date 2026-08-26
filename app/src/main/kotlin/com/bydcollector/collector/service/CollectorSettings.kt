@@ -553,6 +553,14 @@ class CollectorSettings(
         }.apply()
     }
 
+    fun telegramLegacyMigrationRequired(): Boolean =
+        prefs.getBoolean(KEY_TELEGRAM_LEGACY_MIGRATION_REQUIRED, false)
+
+    fun setTelegramLegacyMigrationRequired(required: Boolean): Boolean = prefs.edit().apply {
+        if (required) putBoolean(KEY_TELEGRAM_LEGACY_MIGRATION_REQUIRED, true)
+        else remove(KEY_TELEGRAM_LEGACY_MIGRATION_REQUIRED)
+    }.commit()
+
     fun archiveStorageLimitGb(): Int = prefs.getInt(KEY_ARCHIVE_STORAGE_LIMIT_GB, DEFAULT_ARCHIVE_STORAGE_LIMIT_GB)
         .coerceIn(MIN_ARCHIVE_STORAGE_LIMIT_GB, MAX_ARCHIVE_STORAGE_LIMIT_GB)
 
@@ -1131,6 +1139,7 @@ class CollectorSettings(
         const val KEY_TELEGRAM_TRIP_END_DELAY_SECONDS = "telegramTripEndDelaySeconds"
         const val KEY_TELEGRAM_CONNECTION_STATUS = "telegramConnectionStatus"
         const val KEY_TELEGRAM_CONNECTION_MESSAGE = "telegramConnectionMessage"
+        const val KEY_TELEGRAM_LEGACY_MIGRATION_REQUIRED = "telegramLegacyMigrationRequired"
         const val KEY_TELEGRAM_SEND_LOCATION = "telegramSendLocation"
         const val KEY_TELEGRAM_NAVIGATOR_MASK = "telegramNavigatorMask"
         const val KEY_UI_LANGUAGE_CODE = "uiLanguageCode"

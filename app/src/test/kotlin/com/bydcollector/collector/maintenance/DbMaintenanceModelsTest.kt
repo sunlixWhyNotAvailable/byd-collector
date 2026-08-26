@@ -45,7 +45,8 @@ class DbMaintenanceModelsTest {
         assertTrue(MainArchivePreflight(telegramPending = 1).blocksAutomaticCutover)
         assertTrue(MainArchivePreflight(mqttPending = 1).blocksAutomaticCutover)
         assertTrue(MainArchivePreflight(influxPending = 1).blocksAutomaticCutover)
-        assertTrue(MainArchivePreflight(telegramDeferred = true).blocksAutomaticCutover)
+        assertTrue(MainArchivePreflight(telegramStatePresent = true).blocksAutomaticCutover)
+        assertFalse(MainArchivePreflight(telegramStorageWarning = "manual warning").blocksAutomaticCutover)
     }
 
     @Test

@@ -16,6 +16,8 @@ class TelegramRuntimeContractTest {
         assertTrue(poll.contains("handle(result)"))
         assertFalse(coordinator.contains("deleteUndeliveredTelegramMessages"))
         assertFalse(store.contains("fun deleteUndeliveredTelegramMessages"))
+        assertFalse(store.contains("fun commitTelegramEvents"))
+        assertTrue(sourceFile("com/bydcollector/collector/data/local/TelegramStore.kt").readText().contains("fun commitTelegramEvents"))
         assertTrue(coordinator.contains("telegramTripEndDelaySeconds() * 1_000L"))
     }
 
@@ -60,18 +62,18 @@ class TelegramRuntimeContractTest {
         val coordinator = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
         val handle = coordinator.substringAfter("private fun handle")
             .substringBefore("private fun render")
-        val store = sourceFile("com/bydcollector/collector/data/local/TelemetryStore.kt").readText()
+        val store = sourceFile("com/bydcollector/collector/data/local/TelegramStore.kt").readText()
         val commit = store.substringAfter("fun commitTelegramEvents")
             .substringBefore("private fun enqueueTelegramMessage")
 
-        assertTrue(handle.contains("store.commitTelegramEvents("))
-        assertTrue(handle.contains("engine = TelegramEventEngine(TelegramEventState.fromJson(store.telegramRuntimeState()))"))
+        assertTrue(handle.contains("commitTelegramEvents("))
+        assertTrue(handle.contains("TelegramEventState.fromJson"))
         assertTrue(handle.contains("renderTelegramBatch(result.events, ::render)"))
         assertTrue(handle.contains("if (messages == null)"))
         assertFalse(handle.contains("mapNotNull"))
         assertFalse(handle.contains("saveTelegramRuntimeState"))
-        assertInOrder(commit, "db.beginTransaction()", "enqueueTelegramMessage(db, message, nowMs)")
-        assertInOrder(commit, "enqueueTelegramMessage(db, message, nowMs)", "saveTelegramRuntimeState(db, it, nowMs)")
+        assertInOrder(commit, "db.beginTransaction()", "enqueueTelegramMessage(db, it, nowMs)")
+        assertInOrder(commit, "enqueueTelegramMessage(db, it, nowMs)", "saveTelegramRuntimeState(db, it, nowMs)")
         assertInOrder(commit, "saveTelegramRuntimeState(db, it, nowMs)", "db.setTransactionSuccessful()")
         assertInOrder(commit, "db.setTransactionSuccessful()", "db.endTransaction()")
     }
@@ -79,7 +81,8 @@ class TelegramRuntimeContractTest {
     @Test
     fun outboxFlushSkipsBlockedRowsAndAttemptsOnlyOncePerTick() {
         val coordinator = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
-        val store = sourceFile("com/bydcollector/collector/data/local/TelemetryStore.kt").readText()
+        val store = sourceFile("com/bydcollector/collector/data/local/TelegramStore.kt").readText()
+        val helper = sourceFile("com/bydcollector/collector/data/local/TelegramDatabaseHelper.kt").readText()
         val flush = coordinator.substringAfter("fun flushPending").substringBefore("private fun pendingQueueDeadline")
         val attempt = coordinator.substringAfter("private fun attempt").substringBefore("private fun pendingQueueDeadline")
         val oldest = store.substringAfter("fun oldestUnblockedTelegramMessage")
@@ -92,24 +95,24 @@ class TelegramRuntimeContractTest {
         assertTrue(oldest.contains("ORDER BY id"))
         assertTrue(oldest.contains("LIMIT 1"))
         assertTrue(oldest.contains("WHERE blocked = 0"))
-        assertTrue(flush.contains("store.oldestUnblockedTelegramMessage()"))
+        assertTrue(flush.contains("oldestUnblockedTelegramMessage()"))
         assertInOrder(attempt, "if (entry.blocked) return null", "entry.nextAttemptAtMs > now")
         assertInOrder(attempt, "entry.nextAttemptAtMs > now", "Thread.currentThread().isInterrupted")
         assertInOrder(attempt, "Thread.currentThread().isInterrupted", "client.sendMessage")
         assertFalse(flush.contains("for ("))
         assertTrue(attempt.contains("entry.attemptCount + 1, result.retryAfterSeconds"))
-        assertTrue(attempt.contains("store.markTelegramBlocked"))
+        assertTrue(attempt.contains("markTelegramBlocked"))
         assertFalse(coordinator.contains("BACKLOG_SUCCESS_DELAY_MS"))
         assertFalse(store.contains("delayOldestTelegramMessageUntil"))
-        assertTrue(store.contains("TELEGRAM_MAX_PENDING = 1_000L"))
-        assertTrue(store.contains("TELEGRAM_RETENTION_MS = 30L * 24L * 60L * 60L * 1_000L"))
-        assertInOrder(connectionTest, "client.sendMessage", "store.unblockTelegramMessages(nowMs())")
-        assertTrue(credentialsChanged.contains("store.unblockTelegramMessages(nowMs())"))
+        assertTrue(helper.contains("MAX_PENDING = 1_000L"))
+        assertTrue(helper.contains("RETENTION_MS = 30L * 24L * 60L * 60L * 1_000L"))
+        assertInOrder(connectionTest, "client.sendMessage", "unblockTelegramMessages(nowMs())")
+        assertTrue(credentialsChanged.contains("unblockTelegramMessages(nowMs())"))
     }
 
     @Test
     fun ageRetentionNeverDeletesNeverAttemptedOutboxRows() {
-        val store = sourceFile("com/bydcollector/collector/data/local/TelemetryStore.kt").readText()
+        val store = sourceFile("com/bydcollector/collector/data/local/TelegramStore.kt").readText()
         val enqueue = store.substringAfter("private fun enqueueTelegramMessage")
             .substringBefore("fun oldestUnblockedTelegramMessage")
         val prune = store.substringAfter("fun pruneTelegramMessages")
@@ -123,17 +126,17 @@ class TelegramRuntimeContractTest {
     @Test
     fun successfulAndBlockedAttemptsScheduleTheNextUnblockedMessageImmediately() {
         val coordinator = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
-        val store = sourceFile("com/bydcollector/collector/data/local/TelemetryStore.kt").readText()
+        val store = sourceFile("com/bydcollector/collector/data/local/TelegramStore.kt").readText()
         val attempt = coordinator.substringAfter("private fun attempt").substringBefore("private fun pendingQueueDeadline")
         val success = attempt.substringAfter("TelegramSendResult.Success").substringBefore("is TelegramSendResult.Failure")
-        val permanentFailure = attempt.substringAfter("} else {").substringBefore("store.recordEvent(")
+        val permanentFailure = attempt.substringAfter("} else {").substringBefore("recordEvent(")
         val unblock = store.substringAfter("fun unblockTelegramMessages")
             .substringBefore("fun telegramRuntimeState")
 
         assertInOrder(
             success,
             "engine.markTripSummaryDelivered(entry.dedupeKey, deliveredAtMs)",
-            "store.markTelegramDelivered(entry.id, deliveredState?.toJson(), deliveredAtMs)",
+            "markTelegramDelivered(entry.id, deliveredState?.toJson(), deliveredAtMs)",
             "pendingQueueDeadline()"
         )
         val deliveryCommit = store.substringAfter("fun markTelegramDelivered")
@@ -146,7 +149,9 @@ class TelegramRuntimeContractTest {
             "db.setTransactionSuccessful()",
             "db.endTransaction()"
         )
-        assertInOrder(permanentFailure, "store.markTelegramBlocked", "pendingQueueDeadline()")
+        assertInOrder(permanentFailure, "markTelegramBlocked", "pendingQueueDeadline()")
+        val blockedCommit = store.substringAfter("fun markTelegramBlocked").substringBefore("fun unblockTelegramMessages")
+        assertTrue(blockedCommit.contains("put(\"last_attempt_at_ms\", attemptedAtMs)"))
         assertTrue(unblock.contains("next_attempt_at_ms = MAX(next_attempt_at_ms, ?)"))
         assertFalse(unblock.contains("put(\"next_attempt_at_ms\", nowMs)"))
     }
@@ -181,8 +186,26 @@ class TelegramRuntimeContractTest {
         assertTrue(coordinator.contains("enabledRuntimeStartedAtMs = null"))
         assertTrue(coordinator.contains("if (!settings.isTelegramEnabled()) return null"))
         assertTrue(powerOff.contains("activateEnabledRuntime() ?: return null"))
-        assertTrue(servicePowerOff.contains("telegramCoordinator.onPowerOffConfirmed("))
-        assertFalse(servicePowerOff.contains("telegramCoordinator.flushPending()"))
+        assertTrue(servicePowerOff.contains("coordinator.onPowerOffConfirmed("))
+        assertFalse(servicePowerOff.contains("coordinator.flushPending()"))
+    }
+
+    @Test
+    fun runtimeSidecarSqliteFailureClosesStorageAndTurnsTelegramRed() {
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val application = sourceFile("com/bydcollector/collector/BydCollectorApplication.kt").readText()
+        val execute = service.substringAfter("private fun <T> executeTelegram")
+            .substringBefore("private fun <T> executeChannel")
+        val failure = service.substringAfter("private fun handleTelegramExecutionFailure")
+            .substringBefore("private fun shutdownInfluxExecutor")
+
+        assertTrue(execute.contains("onException = ::handleTelegramExecutionFailure"))
+        assertTrue(failure.contains("error !is SQLiteException"))
+        assertTrue(failure.contains("markTelegramStorageUnavailable(store, error)"))
+        assertTrue(failure.contains("telegramCoordinator = null"))
+        assertTrue(failure.contains("telegramWorkGeneration.incrementAndGet()"))
+        assertTrue(application.contains("markTelegramStorageFailure(mainStore, error)"))
+        assertTrue(application.contains("setTelegramConnectionStatus(\"storage_error\", TELEGRAM_STORAGE_ERROR)"))
     }
 
     @Test

@@ -248,12 +248,6 @@ class MainActivity : ComponentActivity() {
                     enabled,
                     detail = "source=ui control=main_auto_start tab=$activeTab"
                 )
-                val message = if (enabled) {
-                    CollectorSettings.AUTO_START_ENABLED_UK
-                } else {
-                    CollectorSettings.AUTO_START_DISABLED_UK
-                }
-                Toast.makeText(this@MainActivity, message, Toast.LENGTH_SHORT).show()
                 if (enabled) {
                     CollectorAutoStart.scheduleWatchdog(applicationContext, settings, currentStore())
                 }
@@ -983,14 +977,14 @@ class MainActivity : ComponentActivity() {
                 if (destroyed) return@runOnUiThread
                 result
                     .onSuccess { preflight ->
-                        pendingMainArchivePreflight = preflight
+                        pendingMainArchivePreflight = withTelegramStorageWarning(preflight)
                         pendingMaintenanceOperation = DbMaintenanceOperation.ARCHIVE
                     }
                     .onFailure { error ->
                         recordDashboardRefreshFailure("maintenance_preflight", error)
-                        pendingMainArchivePreflight = MainArchivePreflight(
+                        pendingMainArchivePreflight = withTelegramStorageWarning(MainArchivePreflight(
                             warning = "${strings(uiLanguage).archivePreflightFailed}: ${dashboardErrorDetail(error)}"
-                        )
+                        ))
                         pendingMaintenanceOperation = DbMaintenanceOperation.ARCHIVE
                         refresh()
                     }
@@ -1000,12 +994,22 @@ class MainActivity : ComponentActivity() {
             maintenancePreflightInFlight = false
             actionUiState = actionUiState.copy(mainArchivePreflight = false)
             recordDashboardRefreshFailure("maintenance_preflight", error)
-            pendingMainArchivePreflight = MainArchivePreflight(
+            pendingMainArchivePreflight = withTelegramStorageWarning(MainArchivePreflight(
                 warning = "${strings(uiLanguage).archivePreflightFailed}: ${dashboardErrorDetail(error)}"
-            )
+            ))
             pendingMaintenanceOperation = DbMaintenanceOperation.ARCHIVE
             refresh()
         }
+    }
+
+    private fun withTelegramStorageWarning(preflight: MainArchivePreflight): MainArchivePreflight {
+        val error = (applicationContext as BydCollectorApplication).telegramStorageError() ?: return preflight
+        return preflight.copy(
+            telegramStorageWarning = String.format(
+                strings(uiLanguage).dbMaintenanceTelegramStorageWarningTemplate,
+                error.take(300)
+            )
+        )
     }
 
     private fun loadTripsUi(routeTripId: String? = null) {

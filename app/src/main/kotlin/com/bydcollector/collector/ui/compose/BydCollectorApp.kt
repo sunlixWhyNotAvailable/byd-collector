@@ -2443,12 +2443,11 @@ private fun DatabaseMaintenanceConfirmBody(
 ) {
     val p = LocalBydPalette.current
     val preflight = state.mainArchivePreflight
-    val pending = (preflight?.telegramPending ?: 0L) +
-        (preflight?.mqttPending ?: 0L) +
+    val pending = (preflight?.mqttPending ?: 0L) +
         (preflight?.influxPending ?: 0L)
     val debugArchive = state.operation == DbMaintenanceOperation.DEBUG_ARCHIVE
     val inspectionWarning = preflight?.warning
-    val hasPendingWork = inspectionWarning == null && (pending > 0L || preflight?.telegramDeferred == true)
+    val hasPendingWork = inspectionWarning == null && pending > 0L
     Text(
         if (debugArchive) strings.dbMaintenanceDebugStopWarning else strings.dbMaintenanceStopWarning,
         color = p.text,
@@ -2459,11 +2458,13 @@ private fun DatabaseMaintenanceConfirmBody(
     inspectionWarning?.let {
         Text(it, color = p.yellow, fontSize = 14.sp, lineHeight = 19.sp)
     }
+    preflight?.telegramStorageWarning?.let {
+        Text(it, color = p.yellow, fontSize = 14.sp, lineHeight = 19.sp)
+    }
     if (!debugArchive && inspectionWarning == null && pending > 0L) {
         Text(
             String.format(
                 strings.dbMaintenancePendingTemplate,
-                preflight?.telegramPending ?: 0L,
                 preflight?.mqttPending ?: 0L,
                 preflight?.influxPending ?: 0L
             ),
@@ -2471,9 +2472,6 @@ private fun DatabaseMaintenanceConfirmBody(
             fontSize = 14.sp,
             lineHeight = 19.sp
         )
-    }
-    if (!debugArchive && inspectionWarning == null && preflight?.telegramDeferred == true) {
-        Text(strings.dbMaintenanceTelegramDeferredWarning, color = p.yellow, fontSize = 14.sp, lineHeight = 19.sp)
     }
     if (!debugArchive && hasPendingWork) {
         Text(strings.dbMaintenanceArchivePendingWarning, color = p.yellow, fontSize = 14.sp, lineHeight = 19.sp)

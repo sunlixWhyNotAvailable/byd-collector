@@ -39,7 +39,7 @@ Interactive controls do not add an artificial callback delay: accepted button, s
 | Normalized state | SOC, SOH, range, odometer, battery energy, charging, power, temperatures, doors, tires, climate, speed, radar, and related vehicle fields |
 | MQTT / Home Assistant | Home Assistant MQTT Discovery and live current-state topics for selected categories |
 | InfluxDB | Independent `InfluxDB v1` historical export with durable cursors and retry state |
-| Telegram | Optional outbound event messages with editable templates and a durable FIFO outbox |
+| Telegram | Optional outbound event messages with editable templates and a dedicated archive-safe SQLite FIFO outbox |
 | Trips | Separate local trip history, GPS routes, configurable speed/consumption colours, and an online OpenStreetMap view |
 | SQLite and archives | Compact SQLite stores for raw and normalized data, crash-safe database cutover, ZIP archives, sharing, and a shared archive limit |
 | Runtime | Background recovery, optional Tailscale activation, combined Wi-Fi/cellular recovery, Bluetooth recovery, and explicit shutdown |
@@ -132,6 +132,8 @@ Trip-summary location is off by default. The separate `Send location` action has
 
 The outbox keeps FIFO order among unblocked ordinary events. Retryable failures retain their backoff; permanently blocked rows remain for diagnosis but do not hold later messages. A summary finalized by the first valid power-off sample is attempted immediately after its durable commit, and a pending summary receives one priority attempt when the enabled Telegram runtime starts. Other events keep ordinary unblocked FIFO order. Successful delivery schedules the next eligible row immediately without a fixed pacing delay. Telemetry-unavailable timing is rebased when the Telegram runtime is enabled, so a kernel/process restart or later enable does not immediately replay an outage from stale timestamps. Trip-summary delay is configurable from 5 to 300 seconds (10 seconds by default).
 
+The outbox and its single runtime-state row live in the separate app-private `bydcollector_telegram.db`, so Main or round-robin archive maintenance cannot replace queued messages or in-progress event state. A one-time validated transaction imports legacy Main Telegram rows before the Telegram runtime starts; a failed import disables only Telegram, reports a storage error, and leaves manual Main recovery available. A persistent fail-closed marker prevents a fresh Main database from being mistaken for a successful migration after an interrupted or failed archive; unresolved legacy Telegram rows remain in the preserved Main archive until explicitly recovered. Malformed live sidecar state or a runtime sidecar SQLite failure also closes and gates only Telegram with the red storage status; Bot API/network errors remain ordinary transport failures. The sidecar keeps at most 1,000 pending rows, prunes only previously attempted rows after 30 days, deletes delivered rows, and relies on normal SQLite page reuse without vehicle-side `VACUUM`. It is not included in Main/Debug archives, diagnostic ZIPs, or `Clear logs`.
+
 <p align="center"><img src="docs/screenshots/en/telegram.png" alt="BYD Collector Telegram notification settings" width="100%"></p>
 
 ## Storage and archives
@@ -141,12 +143,12 @@ SQLite is the authoritative long-term store. JSON is used for export/transport, 
 - Fresh installations use compact main and round-robin SQLite schemas.
 - Raw readings are retained before normalization; normalized current state and history use compact identifiers and quality codes while preserving queryability.
 - Existing databases are archived before the format cutover; they are not migrated in place or deleted as part of that transition.
-- Main cutover is automatic only when Telegram, MQTT, and all InfluxDB cursors have no queued work and Telegram has no unfinished event state. Otherwise the app records a defer state and waits for an explicitly confirmed manual archive.
+- Main cutover is automatic only when MQTT and all InfluxDB cursors have no queued work. During the one-time upgrade, any not-yet-migrated legacy Telegram queue or unfinished legacy event state also defers cutover until it is safely copied into the dedicated sidecar.
 - Automatic startup cutover remains fail-closed on format, checkpoint, integrity, or recovery uncertainty. Explicit Main and round-robin archive actions are recovery overrides: inspection failures are preserved as warnings instead of disabling the user's only in-app reset path. Both lanes still use exact SQLite sidecar sets, crash journals, and rollback boundaries; a manual archive stops if the source set cannot be preserved without overwrite/data loss or if a fresh writable database cannot be created and verified.
 - The `Storage` tab shows active databases, archive size/count, sort order, and the configured shared archive limit. It can share selected ZIP archives or delete selected archives after confirmation.
 - The limit applies to completed archives; the oldest archives are removed after the configured limit is exceeded. The active main normalized history remains unbounded until a future retention decision.
 
-Archive maintenance can temporarily stop collection and integrations. Read the confirmation dialog: it shows queued Telegram/MQTT/InfluxDB work and warns when an operation cannot be stopped safely after it begins.
+Archive maintenance can temporarily stop collection and integrations. Read the confirmation dialog: it shows queued Main-owned MQTT/InfluxDB work, reports a Telegram migration warning separately when applicable, and warns when an operation cannot be stopped safely after it begins. The live Telegram sidecar itself is not at risk from Main archive replacement.
 
 <p align="center"><img src="docs/screenshots/en/storage.png" alt="BYD Collector storage and database archives" width="100%"></p>
 
@@ -236,7 +238,7 @@ Verify the bot token and chat ID with `Test connection`, enable the specific eve
 
 ### Archive is deferred or maintenance cannot start
 
-Finish or explicitly review queued Telegram/MQTT/InfluxDB work. Main cutover waits for empty integration queues and no unfinished Telegram event state. Use the confirmation dialog and do not interrupt a running archive operation.
+Finish or explicitly review queued Main-owned MQTT/InfluxDB work. During the one-time upgrade, Main cutover also waits for any legacy Telegram queue or unfinished state to be copied into the dedicated sidecar. Use the confirmation dialog and do not interrupt a running archive operation.
 
 ## Report a problem
 

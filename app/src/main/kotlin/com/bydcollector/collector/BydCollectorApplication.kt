@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
+import com.bydcollector.collector.data.local.TelegramStore
 import com.bydcollector.collector.data.trips.TripDatabaseHelper
 import com.bydcollector.collector.data.trips.TripStore
 import com.bydcollector.collector.diagnostics.OperationalEventJournal
@@ -17,6 +18,9 @@ import com.bydcollector.collector.update.UpdateAutoCheckRuntime
 //starts process-scoped app bookkeeping before either CollectorService or MainActivity is created
 class BydCollectorApplication : Application() {
     private var telemetryStore: TelemetryStore? = null
+    private var telegramStore: TelegramStore? = null
+    private var telegramStorageError: String? = null
+    private var telegramLegacyMigrationUnresolved = false
     private var tripsStore: TripStore? = null
     private var cutoverCoordinator: StorageFormatCutoverCoordinator? = null
     private var debugStorageReady: Boolean? = null
@@ -33,6 +37,7 @@ class BydCollectorApplication : Application() {
     override fun onTerminate() {
         tripsStore?.close()
         telemetryStore?.close()
+        telegramStore?.close()
         super.onTerminate()
     }
 
@@ -59,6 +64,17 @@ class BydCollectorApplication : Application() {
         databaseMaintenanceGate.withExclusive(action)
 
     @Synchronized
+    fun telegramStoreOrNull(): TelegramStore? = telegramStore.takeIf { telegramStorageError == null }
+
+    @Synchronized
+    fun telegramStorageError(): String? = telegramStorageError
+
+    @Synchronized
+    fun markTelegramStorageUnavailable(mainStore: TelemetryStore, error: Throwable) {
+        markTelegramStorageFailure(mainStore, error)
+    }
+
+    @Synchronized
     fun reopenTelemetryStoreForMaintenance(): TelemetryStore {
         return TelemetryStore(
             applicationContext,
@@ -68,6 +84,7 @@ class BydCollectorApplication : Application() {
             store.ensureCatalogImported()
             store.ensureNormalizedCatalogImported()
             telemetryStore = store
+            initializeTelegramStorage(store)
             if (StorageFormatCutoverCoordinator.detectMain(store.databaseFile()) == StorageFormat.COMPACT_V2) {
                 CollectorSettings(applicationContext).clearMainStorageCutoverStatus()
             }
@@ -94,6 +111,8 @@ class BydCollectorApplication : Application() {
     }
 
     companion object {
+        const val TELEGRAM_STORAGE_ERROR = "telegram_storage_migration_failed"
+
         fun store(context: Context): TelemetryStore {
             return (context.applicationContext as BydCollectorApplication).store()
         }
@@ -127,6 +146,7 @@ class BydCollectorApplication : Application() {
                     operationalEventJournal = operationalEventJournal
                 ).also {
                     telemetryStore = it
+                    initializeTelegramStorage(it)
                 }
             }
         }
@@ -149,4 +169,97 @@ class BydCollectorApplication : Application() {
             CollectorSettings(applicationContext)
         ).also { cutoverCoordinator = it }
     }
+
+    @Synchronized
+    private fun initializeTelegramStorage(mainStore: TelemetryStore) {
+        val settings = CollectorSettings(applicationContext, mainStore)
+        val snapshot = mainStore.readLegacyTelegramSnapshot()
+        if (snapshot.requiresPreservation) {
+            telegramLegacyMigrationUnresolved = true
+            if (!settings.setTelegramLegacyMigrationRequired(true)) {
+                markTelegramStorageFailure(mainStore, IllegalStateException("Cannot persist Telegram migration requirement"))
+                return
+            }
+        }
+        val sidecar = telegramStore ?: runCatching { TelegramStore(applicationContext) }
+            .getOrElse { error ->
+                markTelegramStorageFailure(mainStore, error)
+                return
+            }
+            .also { telegramStore = it }
+        if (
+            (settings.telegramLegacyMigrationRequired() || telegramLegacyMigrationUnresolved) &&
+            !snapshot.requiresPreservation
+        ) {
+            markTelegramStorageFailure(
+                mainStore,
+                IllegalStateException("Legacy Telegram data remains in an archived Main database")
+            )
+            return
+        }
+        val migration = runCatching { sidecar.importLegacySnapshot(snapshot) }
+            .getOrElse { error ->
+                markTelegramStorageFailure(mainStore, error)
+                return
+            }
+        if (!migration.verified) {
+            markTelegramStorageFailure(
+                mainStore,
+                IllegalStateException(migration.errorMessage ?: "Telegram sidecar migration was not verified")
+            )
+            return
+        }
+        val sidecarStateValid = runCatching { sidecar.verifyRuntimeState() }
+            .getOrElse { error ->
+                markTelegramStorageFailure(mainStore, error)
+                return
+            }
+        if (!sidecarStateValid) {
+            markTelegramStorageFailure(mainStore, IllegalStateException("Telegram sidecar runtime state is malformed"))
+            return
+        }
+        if (!settings.setTelegramLegacyMigrationRequired(false)) {
+            markTelegramStorageFailure(mainStore, IllegalStateException("Cannot clear Telegram migration requirement"))
+            return
+        }
+        val cleaned = runCatching { mainStore.cleanupLegacyTelegramStorage(snapshot, migration) }
+            .getOrDefault(false)
+        if (!cleaned) {
+            telegramLegacyMigrationUnresolved = true
+            settings.setTelegramLegacyMigrationRequired(true)
+            markTelegramStorageFailure(mainStore, IllegalStateException("Legacy Telegram cleanup was not verified"))
+            return
+        }
+        telegramLegacyMigrationUnresolved = false
+        telegramStorageError = null
+        if (
+            settings.telegramConnectionStatus() == "storage_error" &&
+            settings.telegramConnectionMessage() == TELEGRAM_STORAGE_ERROR
+        ) {
+            settings.setTelegramConnectionStatus("not_tested", null)
+        }
+        if (settings.mainStorageCutoverDeferredReason() != null) {
+            runCatching { StorageFormatCutoverCoordinator.readMainPreflight(mainStore.databaseFile()) }
+                .getOrNull()
+                ?.takeUnless { it.blocksAutomaticCutover }
+                ?.let { settings.clearMainStorageCutoverStatus() }
+        }
+    }
+
+    private fun markTelegramStorageFailure(mainStore: TelemetryStore, error: Throwable) {
+        val detail = (error.message ?: error::class.java.simpleName).take(300)
+        telegramStore?.let { runCatching { it.close() } }
+        telegramStore = null
+        telegramStorageError = detail
+        CollectorSettings(applicationContext, mainStore)
+            .setTelegramConnectionStatus("storage_error", TELEGRAM_STORAGE_ERROR)
+        runCatching {
+            mainStore.recordEvent(
+                TELEGRAM_STORAGE_ERROR,
+                "Telegram sidecar migration failed",
+                detail
+            )
+        }
+    }
+
 }

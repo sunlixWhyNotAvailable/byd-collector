@@ -1,6 +1,7 @@
 package com.bydcollector.collector.telegram
 
 import com.bydcollector.collector.data.local.TelemetryStore
+import com.bydcollector.collector.data.local.TelegramStore
 import com.bydcollector.collector.data.local.TelegramOutboxEntry
 import com.bydcollector.collector.data.local.TelegramOutboxMessage
 import com.bydcollector.collector.data.normalized.NormalizedObservation
@@ -14,13 +15,14 @@ import com.bydcollector.collector.service.TelegramLocationSnapshot
 import com.bydcollector.collector.service.TelegramPowerOffSnapshot
 
 class TelegramCoordinator(
-    private val store: TelemetryStore,
+    private val eventStore: TelemetryStore,
+    private val telegramStore: TelegramStore,
     private val settings: CollectorSettings,
     private val client: TelegramHttpClient = TelegramHttpClient(),
     private val retryPolicy: TelegramRetryPolicy = TelegramRetryPolicy(),
     private val nowMs: () -> Long = System::currentTimeMillis
 ) {
-    private var engine = TelegramEventEngine(TelegramEventState.fromJson(store.telegramRuntimeState()))
+    private var engine = TelegramEventEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
     private var enabledRuntimeStartedAtMs: Long? = null
     private var startupRecoveryPending = true
 
@@ -31,7 +33,7 @@ class TelegramCoordinator(
         val result = engine.onSuccessfulPoll(observations, eventConfig(), nowMs())
         handle(result)
         if (result.state.chargingActive != previousChargingActive) {
-            store.recordEvent(
+            eventStore.recordEvent(
                 "telegram_charging_transition",
                 "Telegram charging evidence changed",
                 "active=${result.state.chargingActive ?: "unknown"} source=${result.state.chargingEvidenceSource ?: "unknown"}"
@@ -47,9 +49,9 @@ class TelegramCoordinator(
         val runtimeStartedAtMs = activateEnabledRuntime() ?: return null
         val startupDeadline = ensureStartupRecovery()
         val tickAtMs = nowMs()
-        val expired = store.pruneTelegramMessages(tickAtMs)
+        val expired = telegramStore.pruneTelegramMessages(tickAtMs)
         if (expired > 0) {
-            store.recordEvent(
+            eventStore.recordEvent(
                 "telegram_outbox_pruned",
                 "Telegram outbox retention removed messages",
                 "expired=$expired overflow=0"
@@ -94,12 +96,12 @@ class TelegramCoordinator(
         when (result) {
             TelegramSendResult.Success -> {
                 settings.setTelegramConnectionStatus("success", null)
-                store.unblockTelegramMessages(nowMs())
-                store.recordEvent("telegram_connection_test_success", "Telegram connection test succeeded")
+                telegramStore.unblockTelegramMessages(nowMs())
+                eventStore.recordEvent("telegram_connection_test_success", "Telegram connection test succeeded")
             }
             is TelegramSendResult.Failure -> {
                 settings.setTelegramConnectionStatus("failed", result.kind.name.lowercase())
-                store.recordEvent(
+                eventStore.recordEvent(
                     "telegram_connection_test_failed",
                     "Telegram connection test failed",
                     failureDetail(result)
@@ -110,22 +112,22 @@ class TelegramCoordinator(
     }
 
     fun credentialsChanged() {
-        store.unblockTelegramMessages(nowMs())
+        telegramStore.unblockTelegramMessages(nowMs())
     }
 
     fun integrationDisabled() {
-        store.saveTelegramRuntimeState(engine.reset().toJson(), nowMs())
+        telegramStore.saveTelegramRuntimeState(engine.reset().toJson(), nowMs())
         enabledRuntimeStartedAtMs = null
         startupRecoveryPending = true
     }
 
     fun flushPending(): Long? {
-        val entry = store.oldestUnblockedTelegramMessage() ?: return null
+        val entry = telegramStore.oldestUnblockedTelegramMessage() ?: return null
         return attempt(entry, force = false)
     }
 
     private fun flushPending(dedupeKey: String, force: Boolean): Long? {
-        val entry = store.telegramMessageByDedupeKey(dedupeKey) ?: return null
+        val entry = telegramStore.telegramMessageByDedupeKey(dedupeKey) ?: return null
         return attempt(entry, force)
     }
 
@@ -136,7 +138,7 @@ class TelegramCoordinator(
         if (token.isBlank() || chatId.isBlank()) return null
         if (entry.blocked) return null
         if (entry.dedupeKey.endsWith(":location")) {
-            val summary = store.telegramMessageByDedupeKey(
+            val summary = telegramStore.telegramMessageByDedupeKey(
                 entry.dedupeKey.removeSuffix(":location") + ":summary"
             )
             if (summary != null) return summary.nextAttemptAtMs.takeIf { !summary.blocked }
@@ -150,12 +152,12 @@ class TelegramCoordinator(
                 val deliveredAtMs = nowMs()
                 val deliveredState = engine.markTripSummaryDelivered(entry.dedupeKey, deliveredAtMs)
                 try {
-                    store.markTelegramDelivered(entry.id, deliveredState?.toJson(), deliveredAtMs)
+                    telegramStore.markTelegramDelivered(entry.id, deliveredState?.toJson(), deliveredAtMs)
                 } catch (error: RuntimeException) {
-                    engine = TelegramEventEngine(TelegramEventState.fromJson(store.telegramRuntimeState()))
+                    engine = TelegramEventEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
                     throw error
                 }
-                store.recordEvent(
+                eventStore.recordEvent(
                     "telegram_message_delivered",
                     "Telegram message delivered",
                     "event=${entry.eventType}"
@@ -167,13 +169,13 @@ class TelegramCoordinator(
                 val nextAttemptAtMs = if (result.kind.retryable) {
                     val delay = retryPolicy.delayForFailure(entry.attemptCount + 1, result.retryAfterSeconds)
                     (attemptedAt + delay).also {
-                        store.markTelegramRetry(entry.id, error, attemptedAt, it)
+                        telegramStore.markTelegramRetry(entry.id, error, attemptedAt, it)
                     }
                 } else {
-                    store.markTelegramBlocked(entry.id, error, attemptedAt)
+                    telegramStore.markTelegramBlocked(entry.id, error, attemptedAt)
                     pendingQueueDeadline()
                 }
-                store.recordEvent(
+                eventStore.recordEvent(
                     "telegram_message_failed",
                     "Telegram message delivery failed",
                     "event=${entry.eventType} ${failureDetail(result)}"
@@ -186,7 +188,7 @@ class TelegramCoordinator(
     private fun pendingQueueDeadline(): Long? {
         if (!settings.isTelegramEnabled()) return null
         if (settings.telegramBotToken().isBlank() || settings.telegramChatId().isBlank()) return null
-        return store.oldestUnblockedTelegramMessage()?.nextAttemptAtMs
+        return telegramStore.oldestUnblockedTelegramMessage()?.nextAttemptAtMs
     }
 
     private fun ensureStartupRecovery(): Long? {
@@ -197,8 +199,8 @@ class TelegramCoordinator(
         val recoveredKey = recovered.events
             .firstOrNull { it.type == TelegramEventType.TRIP_SUMMARY }
             ?.dedupeKey
-        val pending = recoveredKey?.let(store::telegramMessageByDedupeKey)?.takeUnless { it.blocked }
-            ?: store.oldestUnblockedTelegramMessage(TelegramEventType.TRIP_SUMMARY.key)
+        val pending = recoveredKey?.let(telegramStore::telegramMessageByDedupeKey)?.takeUnless { it.blocked }
+            ?: telegramStore.oldestUnblockedTelegramMessage(TelegramEventType.TRIP_SUMMARY.key)
         return pending?.let { attempt(it, force = true) }
     }
 
@@ -214,30 +216,30 @@ class TelegramCoordinator(
     private fun handle(result: TelegramEventResult) {
         val messages = renderTelegramBatch(result.events, ::render)
         if (messages == null) {
-            engine = TelegramEventEngine(TelegramEventState.fromJson(store.telegramRuntimeState()))
+            engine = TelegramEventEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
             return
         }
         val committedAt = nowMs()
         val outcomes = try {
-            store.commitTelegramEvents(
+            telegramStore.commitTelegramEvents(
                 messages = messages,
                 stateJson = result.state.toJson().takeIf { result.shouldPersist },
                 nowMs = committedAt
             )
         } catch (error: RuntimeException) {
-            engine = TelegramEventEngine(TelegramEventState.fromJson(store.telegramRuntimeState()))
+            engine = TelegramEventEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
             throw error
         }
         messages.zip(outcomes).forEach { (message, queued) ->
             if (queued.inserted) {
-                store.recordEvent(
+                eventStore.recordEvent(
                     "telegram_event_queued",
                     "Telegram event queued",
                     "event=${message.eventType}"
                 )
             }
             if (queued.expiredCount > 0 || queued.overflowCount > 0) {
-                store.recordEvent(
+                eventStore.recordEvent(
                     "telegram_outbox_pruned",
                     "Telegram outbox retention removed messages",
                     "expired=${queued.expiredCount} overflow=${queued.overflowCount}"
@@ -259,7 +261,7 @@ class TelegramCoordinator(
             settings.setTelegramTripTemplateLimitState(rendered.limitState, tripTemplateLimitRevision)
         }
         if (rendered.usedFallback) {
-            store.recordEvent(
+            eventStore.recordEvent(
                 "telegram_template_fallback",
                 "Telegram custom template was invalid; built-in fallback rendered",
                 "event=${event.type.key} reason=invalid_custom_template"
@@ -267,7 +269,7 @@ class TelegramCoordinator(
         }
         val payload = rendered.text
         if (payload == null) {
-            store.recordEvent(
+            eventStore.recordEvent(
                 "telegram_template_invalid",
                 "Telegram event skipped because its template is invalid",
                 "event=${event.type.key} errors=${rendered.errors.joinToString(",") { it.kind.name.lowercase() }}"

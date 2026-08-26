@@ -2,6 +2,7 @@ package com.bydcollector.collector
 
 import java.io.File
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -47,6 +48,40 @@ class MainActivityMaintenanceContractTest {
         assertTrue(toggle.contains("strings(uiLanguage).dbMaintenanceAlreadyRunning"))
         assertTrue(toggle.contains("Toast.makeText"))
         assertInOrder(toggle, "CollectorSettings.isDbMaintenanceRunning(applicationContext)", "refreshStoreBackedState()")
+    }
+
+    @Test
+    fun ordinaryToggleHandlersDoNotLaunchTransientUi() {
+        val source = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val handlers = listOf(
+            "onToggleMainAutoStart" to "onGrantAdb",
+            "onToggleDebugAutoStart" to "onToggleSharedCategories",
+            "onToggleSharedCategories" to "onStartMqtt",
+            "onToggleMqttAutoStart" to "onToggleMqttCategory",
+            "onToggleMqttCategory" to "onMqttDraftChanged",
+            "onToggleInfluxAutoStart" to "onToggleInfluxCategory",
+            "onToggleInfluxCategory" to "onInfluxDraftChanged",
+            "onToggleConnectivityRecovery" to "onToggleKeepBluetooth",
+            "onToggleKeepBluetooth" to "onToggleKeepCollector",
+            "onToggleKeepCollector" to "onToggleTailscaleActivation",
+            "onToggleTailscaleActivation" to "onToggleUpdateAutoCheck"
+        )
+
+        handlers.forEach { (name, next) ->
+            var body = source
+                .substringAfter("override fun $name")
+                .substringBefore("override fun $next")
+            if (name == "onToggleMainAutoStart") {
+                assertEquals(1, body.split("Toast.makeText").size - 1)
+                assertTrue(body.indexOf("Toast.makeText") < body.indexOf("refreshStoreBackedState()"))
+                body = body.substringAfter("refreshStoreBackedState()")
+            }
+            assertFalse(body.contains("Toast.makeText"), "$name must not show an ordinary-setting Toast")
+            assertFalse(body.contains("startActivity("), "$name must not launch an Activity")
+            assertFalse(body.contains("AlertDialog"), "$name must not open a dialog")
+            assertFalse(body.contains("Dialog"), "$name must not open a dialog")
+        }
+        // onToggleUpdateAutoCheck is intentionally excluded: it is the update flow entry point.
     }
 
     @Test
@@ -109,8 +144,9 @@ class MainActivityMaintenanceContractTest {
         assertTrue(source.contains("pendingMaintenanceOperation = DbMaintenanceOperation.ARCHIVE"))
         assertTrue(source.contains("private fun openMainArchiveDialog()"))
         assertTrue(source.contains("StorageFormatCutoverCoordinator.readMainPreflight(preflightStore.databaseFile())"))
-        assertTrue(source.contains("pendingMainArchivePreflight = preflight"))
-        assertTrue(source.contains("pendingMainArchivePreflight = MainArchivePreflight("))
+        assertTrue(source.contains("pendingMainArchivePreflight = withTelegramStorageWarning(preflight)"))
+        assertTrue(source.contains("withTelegramStorageWarning(MainArchivePreflight("))
+        assertTrue(source.contains("telegramStorageError()"))
         assertTrue(source.contains("warning = \"${'$'}{strings(uiLanguage).archivePreflightFailed}"))
         assertTrue(source.contains("strings(uiLanguage).archivePreflightFailed"))
         assertFalse(source.contains("\"Не вдалося перевірити стан бази\""))

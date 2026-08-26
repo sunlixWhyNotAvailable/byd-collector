@@ -27,6 +27,7 @@ import com.bydcollector.collector.mqtt.MqttRetryStateStore
 import com.bydcollector.collector.mqtt.PendingMqttMessage
 import com.bydcollector.collector.mqtt.MqttPublishStateRecorder
 import com.bydcollector.collector.mqtt.NormalizedStateProvider
+import com.bydcollector.collector.service.TelegramEventState
 import com.bydcollector.collector.util.sqliteFootprintBytes
 import java.io.Closeable
 import java.io.File
@@ -498,192 +499,183 @@ class TelemetryStore(
 
     override fun pendingCount(): Long = safeScalarLong("SELECT COUNT(*) FROM mqtt_outbox")
 
-    fun commitTelegramEvents(
-        messages: List<TelegramOutboxMessage>,
-        stateJson: String?,
-        nowMs: Long
-    ): List<TelegramEnqueueResult> {
-        if (messages.isEmpty() && stateJson == null) return emptyList()
+    /**
+     * Reads both pre-sidecar Telegram tables under one Main read transaction.
+     * The extra row detects an outbox that exceeded the established 1,000-row bound
+     * without allowing an unbounded migration read.
+     */
+    fun readLegacyTelegramSnapshot(limit: Int = TELEGRAM_MAX_PENDING.toInt()): TelegramLegacySnapshot {
+        require(limit in 1..TELEGRAM_MAX_PENDING.toInt()) { "Telegram legacy snapshot limit must be 1..$TELEGRAM_MAX_PENDING" }
         val db = helper.writableDatabase
+        var snapshot: TelegramLegacySnapshot? = null
+        var readError: String? = null
         db.beginTransaction()
         try {
-            val results = messages.map { message ->
-                enqueueTelegramMessage(db, message, nowMs)
+            val outbox = mutableListOf<TelegramLegacyOutboxRow>()
+            var truncated = false
+            if (mainTableExists(db, "telegram_outbox")) {
+                db.rawQuery(
+                    """
+                    SELECT id, dedupe_key, event_type, payload, created_at_ms,
+                           next_attempt_at_ms, attempt_count, last_attempt_at_ms,
+                           last_error, blocked
+                    FROM telegram_outbox
+                    ORDER BY id
+                    LIMIT ?
+                    """.trimIndent(),
+                    arrayOf((limit + 1).toString())
+                ).use { cursor ->
+                    while (cursor.moveToNext()) {
+                        if (outbox.size == limit) {
+                            truncated = true
+                            continue
+                        }
+                        outbox += TelegramLegacyOutboxRow(
+                            id = cursor.getLong(0),
+                            dedupeKey = cursor.getString(1),
+                            eventType = cursor.getString(2),
+                            payload = cursor.getString(3),
+                            createdAtMs = cursor.getLong(4),
+                            nextAttemptAtMs = cursor.getLong(5),
+                            attemptCount = cursor.getInt(6),
+                            lastAttemptAtMs = if (cursor.isNull(7)) null else cursor.getLong(7),
+                            lastError = if (cursor.isNull(8)) null else cursor.getString(8),
+                            blocked = cursor.getInt(9) != 0,
+                            blockedCode = cursor.getInt(9)
+                        )
+                    }
+                }
             }
-            stateJson?.let { saveTelegramRuntimeState(db, it, nowMs) }
+
+            var runtimeStateJson: String? = null
+            var runtimeStateUpdatedAtMs: Long? = null
+            var runtimeStateRowPresent = false
+            if (mainTableExists(db, "telegram_runtime_state")) {
+                db.rawQuery(
+                    "SELECT state_json, updated_at_ms FROM telegram_runtime_state WHERE id = 1 LIMIT 1",
+                    emptyArray()
+                ).use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        runtimeStateRowPresent = true
+                        runtimeStateJson = if (cursor.isNull(0)) null else cursor.getString(0)
+                        runtimeStateUpdatedAtMs = if (cursor.isNull(1)) null else cursor.getLong(1)
+                    }
+                }
+            }
+            val runtimeStateValid = !runtimeStateRowPresent ||
+                (runtimeStateJson?.isNotBlank() == true &&
+                    runtimeStateUpdatedAtMs != null &&
+                    TelegramEventState.fromJsonOrNull(runtimeStateJson) != null)
+            snapshot = TelegramLegacySnapshot(
+                outbox = outbox,
+                runtimeStateJson = runtimeStateJson,
+                runtimeStateUpdatedAtMs = runtimeStateUpdatedAtMs,
+                runtimeStatePresent = runtimeStateRowPresent,
+                runtimeStateValid = runtimeStateValid,
+                truncated = truncated
+            )
             db.setTransactionSuccessful()
-            return results
+        } catch (error: RuntimeException) {
+            readError = error.message ?: error::class.java.simpleName
         } finally {
             db.endTransaction()
         }
+        return snapshot ?: TelegramLegacySnapshot(readError = readError ?: "Legacy Telegram snapshot failed")
     }
 
-    private fun enqueueTelegramMessage(
-        db: SQLiteDatabase,
-        message: TelegramOutboxMessage,
-        nowMs: Long
-    ): TelegramEnqueueResult {
-        val dedupeKey = message.dedupeKey
-        val eventType = message.eventType
-        val payload = message.payload
-        val expired = db.delete(
-            "telegram_outbox",
-            "created_at_ms < ? AND attempt_count > 0",
-            arrayOf((nowMs - TELEGRAM_RETENTION_MS).toString())
-        )
-        if (telegramMessageExists(db, dedupeKey)) {
-            return TelegramEnqueueResult(inserted = false, expiredCount = expired, overflowCount = 0)
-        }
-        val pending = db.rawQuery("SELECT COUNT(*) FROM telegram_outbox", emptyArray()).use { cursor ->
-            if (cursor.moveToFirst()) cursor.getLong(0) else 0L
-        }
-        val overflow = (pending - TELEGRAM_MAX_PENDING + 1L).coerceAtLeast(0L).toInt()
-        if (overflow > 0) {
-            db.delete(
-                "telegram_outbox",
-                "id IN (SELECT id FROM telegram_outbox ORDER BY id LIMIT ?)",
-                arrayOf(overflow.toString())
-            )
-        }
-        val inserted = db.insertWithOnConflict(
-            "telegram_outbox",
-            null,
-            ContentValues().apply {
-                put("dedupe_key", dedupeKey)
-                put("event_type", eventType)
-                put("payload", payload)
-                put("created_at_ms", nowMs)
-                put("next_attempt_at_ms", nowMs)
-            },
-            SQLiteDatabase.CONFLICT_IGNORE
-        ) != -1L
-        return TelegramEnqueueResult(inserted, expired, overflow)
-    }
-
-    fun oldestUnblockedTelegramMessage(eventType: String? = null): TelegramOutboxEntry? {
-        val eventFilter = if (eventType == null) "" else " AND event_type = ?"
-        return queryTelegramMessage(
-            """
-            SELECT id, dedupe_key, event_type, payload, attempt_count, next_attempt_at_ms, blocked
-            FROM telegram_outbox
-            WHERE blocked = 0$eventFilter
-            ORDER BY id
-            LIMIT 1
-            """.trimIndent(),
-            if (eventType == null) emptyArray() else arrayOf(eventType)
-        )
-    }
-
-    fun telegramMessageByDedupeKey(dedupeKey: String): TelegramOutboxEntry? = queryTelegramMessage(
-        """
-        SELECT id, dedupe_key, event_type, payload, attempt_count, next_attempt_at_ms, blocked
-        FROM telegram_outbox
-        WHERE dedupe_key = ?
-        LIMIT 1
-        """.trimIndent(),
-        arrayOf(dedupeKey)
-    )
-
-    private fun queryTelegramMessage(sql: String, args: Array<String>): TelegramOutboxEntry? =
-        helper.readableDatabase.rawQuery(sql, args).use { cursor ->
-            if (!cursor.moveToFirst()) return@use null
-            TelegramOutboxEntry(
-                id = cursor.getLong(0),
-                dedupeKey = cursor.getString(1),
-                eventType = cursor.getString(2),
-                payload = cursor.getString(3),
-                attemptCount = cursor.getInt(4),
-                nextAttemptAtMs = cursor.getLong(5),
-                blocked = cursor.getInt(6) != 0
-            )
-        }
-
-    fun pruneTelegramMessages(nowMs: Long): Int {
-        return helper.writableDatabase.delete(
-            "telegram_outbox",
-            "created_at_ms < ? AND attempt_count > 0",
-            arrayOf((nowMs - TELEGRAM_RETENTION_MS).toString())
-        )
-    }
-
-    fun markTelegramDelivered(id: Long, stateJson: String?, deliveredAtMs: Long) {
+    /**
+     * Deletes only the captured legacy rows/state, and only after the caller has
+     * verified the sidecar transaction.  A false verification is a no-op.
+     */
+    fun cleanupLegacyTelegramStorage(
+        snapshot: TelegramLegacySnapshot,
+        sidecarCommitVerified: Boolean
+    ): Boolean {
+        if (!sidecarCommitVerified || !snapshot.validForImport) return false
         val db = helper.writableDatabase
-        db.beginTransactionNonExclusive()
-        try {
-            check(db.delete("telegram_outbox", "id = ?", arrayOf(id.toString())) == 1) {
-                "Telegram outbox row disappeared before delivery commit"
+        return runCatching {
+            db.beginTransaction()
+            try {
+                if (mainTableExists(db, "telegram_outbox")) {
+                    // Refuse to remove a row that changed after the snapshot. Deleting
+                    // by id alone could erase a newer event that reused that id.
+                    if (snapshot.outbox.any { !legacyOutboxRowMatches(db, it) }) return@runCatching false
+                    snapshot.outbox.forEach { db.delete("telegram_outbox", "id = ?", arrayOf(it.id.toString())) }
+                    if (snapshot.outbox.any { legacyOutboxIdExists(db, it.id) }) return@runCatching false
+                    if (legacyTableRowCount(db, "telegram_outbox") != 0L) return@runCatching false
+                }
+                if (snapshot.runtimeStateJson != null && mainTableExists(db, "telegram_runtime_state")) {
+                    if (!legacyRuntimeStateMatches(db, snapshot)) return@runCatching false
+                    db.delete(
+                        "telegram_runtime_state",
+                        "id = 1 AND state_json = ? AND updated_at_ms = ?",
+                        arrayOf(snapshot.runtimeStateJson, (snapshot.runtimeStateUpdatedAtMs ?: Long.MIN_VALUE).toString())
+                    )
+                    if (legacyRuntimeStateExists(db)) return@runCatching false
+                }
+                if (
+                    snapshot.runtimeStateJson == null &&
+                    mainTableExists(db, "telegram_runtime_state") &&
+                    legacyTableRowCount(db, "telegram_runtime_state") != 0L
+                ) return@runCatching false
+                db.setTransactionSuccessful()
+                true
+            } finally {
+                db.endTransaction()
             }
-            stateJson?.let { saveTelegramRuntimeState(db, it, deliveredAtMs) }
-            db.setTransactionSuccessful()
-        } finally {
-            db.endTransaction()
-        }
+        }.getOrDefault(false)
     }
 
-    fun markTelegramRetry(id: Long, error: String, attemptedAtMs: Long, nextAttemptAtMs: Long) {
-        helper.writableDatabase.update(
-            "telegram_outbox",
-            ContentValues().apply {
-                put("attempt_count", telegramAttemptCount(id) + 1)
-                put("last_attempt_at_ms", attemptedAtMs)
-                put("next_attempt_at_ms", nextAttemptAtMs)
-                put("last_error", error.truncateForStorage(MAX_ERROR_TEXT_LENGTH))
-                put("blocked", 0)
-            },
-            "id = ?",
-            arrayOf(id.toString())
-        )
+    fun cleanupLegacyTelegramStorage(
+        snapshot: TelegramLegacySnapshot,
+        migration: TelegramMigrationResult
+    ): Boolean = cleanupLegacyTelegramStorage(snapshot, migration.verified)
+
+    private fun mainTableExists(db: SQLiteDatabase, tableName: String): Boolean = db.rawQuery(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+        arrayOf(tableName)
+    ).use { cursor -> cursor.moveToFirst() }
+
+    private fun legacyOutboxRowMatches(db: SQLiteDatabase, row: TelegramLegacyOutboxRow): Boolean = db.rawQuery(
+        """
+        SELECT dedupe_key, event_type, payload, created_at_ms, next_attempt_at_ms,
+               attempt_count, last_attempt_at_ms, last_error, blocked
+        FROM telegram_outbox WHERE id = ?
+        """.trimIndent(),
+        arrayOf(row.id.toString())
+    ).use { cursor ->
+        if (!cursor.moveToFirst()) return@use true
+        cursor.getString(0) == row.dedupeKey && cursor.getString(1) == row.eventType &&
+            cursor.getString(2) == row.payload && cursor.getLong(3) == row.createdAtMs &&
+            cursor.getLong(4) == row.nextAttemptAtMs && cursor.getInt(5) == row.attemptCount &&
+            (if (cursor.isNull(6)) null else cursor.getLong(6)) == row.lastAttemptAtMs &&
+            (if (cursor.isNull(7)) null else cursor.getString(7)) == row.lastError &&
+            cursor.getInt(8) == row.blockedCode
     }
 
-    fun markTelegramBlocked(id: Long, error: String, attemptedAtMs: Long) {
-        helper.writableDatabase.update(
-            "telegram_outbox",
-            ContentValues().apply {
-                put("attempt_count", telegramAttemptCount(id) + 1)
-                put("last_attempt_at_ms", attemptedAtMs)
-                put("last_error", error.truncateForStorage(MAX_ERROR_TEXT_LENGTH))
-                put("blocked", 1)
-            },
-            "id = ?",
-            arrayOf(id.toString())
-        )
-    }
+    private fun legacyOutboxIdExists(db: SQLiteDatabase, id: Long): Boolean = db.rawQuery(
+        "SELECT 1 FROM telegram_outbox WHERE id = ? LIMIT 1", arrayOf(id.toString())
+    ).use { cursor -> cursor.moveToFirst() }
 
-    fun unblockTelegramMessages(nowMs: Long) {
-        helper.writableDatabase.execSQL(
-            """
-            UPDATE telegram_outbox
-            SET blocked = 0,
-                next_attempt_at_ms = MAX(next_attempt_at_ms, ?)
-            WHERE blocked = 1
-            """.trimIndent(),
-            arrayOf(nowMs)
-        )
-    }
-
-    fun telegramRuntimeState(): String? {
-        helper.readableDatabase.rawQuery(
-            "SELECT state_json FROM telegram_runtime_state WHERE id = 1",
+    private fun legacyRuntimeStateMatches(db: SQLiteDatabase, snapshot: TelegramLegacySnapshot): Boolean =
+        db.rawQuery(
+            "SELECT state_json, updated_at_ms FROM telegram_runtime_state WHERE id = 1",
             emptyArray()
-        ).use { cursor -> return if (cursor.moveToFirst()) cursor.getString(0) else null }
-    }
+        ).use { cursor ->
+            !cursor.moveToFirst() || (
+                cursor.getString(0) == snapshot.runtimeStateJson &&
+                    cursor.getLong(1) == (snapshot.runtimeStateUpdatedAtMs ?: Long.MIN_VALUE)
+                )
+        }
 
-    fun saveTelegramRuntimeState(stateJson: String, nowMs: Long) {
-        saveTelegramRuntimeState(helper.writableDatabase, stateJson, nowMs)
-    }
+    private fun legacyRuntimeStateExists(db: SQLiteDatabase): Boolean = db.rawQuery(
+        "SELECT 1 FROM telegram_runtime_state WHERE id = 1 LIMIT 1", emptyArray()
+    ).use { cursor -> cursor.moveToFirst() }
 
-    private fun saveTelegramRuntimeState(db: SQLiteDatabase, stateJson: String, nowMs: Long) {
-        db.insertWithOnConflict(
-            "telegram_runtime_state",
-            null,
-            ContentValues().apply {
-                put("id", 1)
-                put("state_json", stateJson)
-                put("updated_at_ms", nowMs)
-            },
-            SQLiteDatabase.CONFLICT_REPLACE
-        )
-    }
+    private fun legacyTableRowCount(db: SQLiteDatabase, tableName: String): Long =
+        db.rawQuery("SELECT COUNT(*) FROM $tableName", emptyArray()).use { cursor ->
+            if (cursor.moveToFirst()) cursor.getLong(0) else -1L
+        }
 
     override fun ensureInfluxCursors(fieldKeys: Set<String>) {
         if (fieldKeys.isEmpty()) return
@@ -1422,22 +1414,6 @@ class TelemetryStore(
         }
     }
 
-    private fun telegramAttemptCount(id: Long): Int {
-        helper.readableDatabase.rawQuery(
-            "SELECT attempt_count FROM telegram_outbox WHERE id = ?",
-            arrayOf(id.toString())
-        ).use { cursor ->
-            return if (cursor.moveToFirst()) cursor.getInt(0) else 0
-        }
-    }
-
-    private fun telegramMessageExists(db: SQLiteDatabase, dedupeKey: String): Boolean {
-        db.rawQuery(
-            "SELECT 1 FROM telegram_outbox WHERE dedupe_key = ? LIMIT 1",
-            arrayOf(dedupeKey)
-        ).use { cursor -> return cursor.moveToFirst() }
-    }
-
     private fun scalarString(sql: String): String? {
         helper.readableDatabase.rawQuery(sql, emptyArray()).use { cursor ->
             return if (cursor.moveToFirst()) cursor.getString(0) else null
@@ -1524,6 +1500,5 @@ class TelemetryStore(
         private const val UNKNOWN_COUNT = -1L
         private const val DECODED_VALUE_CACHE_SIZE = 2_048
         private const val TELEGRAM_MAX_PENDING = 1_000L
-        private const val TELEGRAM_RETENTION_MS = 30L * 24L * 60L * 60L * 1_000L
     }
 }

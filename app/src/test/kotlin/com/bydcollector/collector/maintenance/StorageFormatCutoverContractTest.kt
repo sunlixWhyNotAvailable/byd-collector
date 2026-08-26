@@ -38,9 +38,11 @@ class StorageFormatCutoverContractTest {
         assertTrue(preflight.contains("JOIN influx_export_cursor c ON c.field_key = h.field_key"))
         assertTrue(preflight.contains("check(json.isNotBlank())"))
         assertTrue(preflight.contains("TelegramEventState.fromJsonOrNull(json)"))
-        assertTrue(preflight.contains("hasDeferredStorageWork()"))
+        assertTrue(preflight.contains("telegramStatePresent"))
+        assertFalse(preflight.contains("hasDeferredStorageWork()"))
         assertFalse(preflight.contains("telemetryExpectedSinceMs"))
         assertTrue(source.contains("settings.mainStorageCutoverDeferredReason() == reason"))
+        assertFalse(source.contains("if (settings.mainStorageCutoverDeferredReason() != null) return true"))
     }
 
     @Test

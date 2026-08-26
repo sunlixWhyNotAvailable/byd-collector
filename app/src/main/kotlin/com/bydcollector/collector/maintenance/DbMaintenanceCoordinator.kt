@@ -90,6 +90,7 @@ class DbMaintenanceCoordinator(
         check(settings.storageCutoverJournal() == null) { "Database cutover recovery is pending" }
         val databaseFile = context.getDatabasePath(TelemetryDatabaseHelper.DATABASE_NAME)
         val warnings = mutableListOf<String>()
+        application.telegramStorageError()?.let { warnings += telegramStorageWarning(it) }
         check(databaseFile.isFile) { "Main database source is not preservable" }
         val sourceFormat = runCatching {
             val sourceFormat = StorageFormatCutoverCoordinator.detectMain(databaseFile)
@@ -156,6 +157,7 @@ class DbMaintenanceCoordinator(
                 journal.copy(phase = PHASE_CREATING)
             )) { "Cannot persist database creation journal" }
             val newStore = application.reopenTelemetryStoreForMaintenance()
+            application.telegramStorageError()?.let { warnings += telegramStorageWarning(it) }
             onStoreReopened(newStore)
             publish(operation, 5)
             check(settings.setStorageCutoverJournal(
@@ -495,6 +497,9 @@ class DbMaintenanceCoordinator(
         val detail = error?.let { ": ${it::class.java.simpleName}" }.orEmpty()
         return "Manual archive warning: $kind inspection failed$detail"
     }
+
+    private fun telegramStorageWarning(detail: String): String =
+        "Telegram storage migration warning: ${detail.take(300)}"
 
     private fun timestamp(): String {
         return SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())

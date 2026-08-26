@@ -91,11 +91,12 @@ data class MainArchivePreflight(
     val telegramPending: Long = 0L,
     val mqttPending: Long = 0L,
     val influxPending: Long = 0L,
-    val telegramDeferred: Boolean = false,
+    val telegramStatePresent: Boolean = false,
+    val telegramStorageWarning: String? = null,
     val warning: String? = null
 ) {
     val blocksAutomaticCutover: Boolean
-        get() = warning != null || telegramPending > 0L || mqttPending > 0L || influxPending > 0L || telegramDeferred
+        get() = warning != null || telegramPending > 0L || mqttPending > 0L || influxPending > 0L || telegramStatePresent
 }
 
 data class StorageCutoverJournal(

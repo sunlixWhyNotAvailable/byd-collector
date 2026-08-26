@@ -59,14 +59,13 @@ internal class StorageFormatCutoverCoordinator(
     }
 
     private fun ensureLegacyMain(databaseFile: File): Boolean {
-        if (settings.mainStorageCutoverDeferredReason() != null) return true
         val preflight = runCatching { readMainPreflight(databaseFile) }.getOrElse { error ->
             return deferMain("preflight_error:${error::class.java.simpleName}")
         }
         if (preflight.blocksAutomaticCutover) {
             return deferMain(
                 "telegram=${preflight.telegramPending};mqtt=${preflight.mqttPending};" +
-                    "influx=${preflight.influxPending};telegram_state=${preflight.telegramDeferred}"
+                    "influx=${preflight.influxPending};telegram_state=${preflight.telegramStatePresent}"
             )
         }
         val ready = cutoverLegacy(databaseFile, MAIN_FAMILY, ::createMainDatabase)
@@ -441,7 +440,7 @@ internal class StorageFormatCutoverCoordinator(
                             """.trimIndent()
                         }
                     )
-                    val telegramDeferred = db.rawQuery(
+                    val telegramStatePresent = db.rawQuery(
                         "SELECT state_json FROM telegram_runtime_state WHERE id = 1",
                         emptyArray()
                     ).use { cursor ->
@@ -450,11 +449,17 @@ internal class StorageFormatCutoverCoordinator(
                             check(json.isNotBlank()) { "Stored Telegram state is blank" }
                             checkNotNull(TelegramEventState.fromJsonOrNull(json)) {
                                 "Stored Telegram state is malformed"
-                            }.hasDeferredStorageWork()
+                            }
+                            true
                         }
                     }
                     db.setTransactionSuccessful()
-                    return MainArchivePreflight(telegramPending, mqttPending, influxPending, telegramDeferred)
+                    return MainArchivePreflight(
+                        telegramPending = telegramPending,
+                        mqttPending = mqttPending,
+                        influxPending = influxPending,
+                        telegramStatePresent = telegramStatePresent
+                    )
                 } finally {
                     db.endTransaction()
                 }
