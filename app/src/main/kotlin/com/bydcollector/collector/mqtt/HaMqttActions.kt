@@ -1,15 +1,30 @@
 package com.bydcollector.collector.mqtt
 
 import com.bydcollector.collector.data.local.TelemetryStore
+import com.bydcollector.collector.ha.HaEndpointProfile
 import com.bydcollector.collector.service.CollectorSettings
+import java.util.UUID
 
 object HaMqttActions {
     fun testConnection(
         store: TelemetryStore,
         settings: CollectorSettings,
-        client: MqttClientFacade = PahoMqttClientFacade()
+        client: MqttClientFacade = PahoMqttClientFacade(),
+        profile: HaEndpointProfile = HaEndpointProfile.PRIMARY
     ): MqttActionResult {
-        return runOneShot(store, settings, client) { testConnectionOnly() }
+        val base = settings.mqttConfig()
+        base.validateProfile(profile)?.let {
+            return MqttActionResult.fail("mqtt_endpoint_invalid", it, MqttFailureKind.PROTOCOL)
+        }
+        val selected = runCatching { base.forProfile(profile) }.getOrElse {
+            return MqttActionResult.fail(
+                "mqtt_endpoint_invalid",
+                it.message ?: "MQTT endpoint is not configured",
+                MqttFailureKind.PROTOCOL
+            )
+        }
+        val testConfig = selected.copy(clientId = uniqueTestClientId())
+        return runOneShot(store, settings, client) { testConnectionOnly(testConfig) }
     }
 
     private fun runOneShot(
@@ -41,5 +56,9 @@ object HaMqttActions {
             ),
             configProvider = { settings.mqttConfig() }
         )
+    }
+
+    private fun uniqueTestClientId(): String {
+        return "bydtest-${UUID.randomUUID().toString().replace("-", "").take(10)}"
     }
 }

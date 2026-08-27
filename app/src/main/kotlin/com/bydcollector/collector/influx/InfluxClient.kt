@@ -1,13 +1,19 @@
 package com.bydcollector.collector.influx
 
 import com.bydcollector.collector.util.readBoundedUtf8
+import java.io.IOException
+import java.net.ConnectException
 import java.io.OutputStreamWriter
 import java.io.InputStream
 import java.net.HttpURLConnection
+import java.net.NoRouteToHostException
+import java.net.ProtocolException
+import java.net.SocketTimeoutException
 import java.net.URLEncoder
 import java.net.URL
 import java.nio.charset.StandardCharsets
 import java.util.Base64
+import javax.net.ssl.SSLException
 
 interface InfluxClient {
     fun test(config: InfluxConfig): InfluxActionResult
@@ -68,15 +74,33 @@ class HttpInfluxClient : InfluxClient {
                     val message = response?.takeIf { it.isNotBlank() }
                         ?.let { "HTTP $code: $it" }
                         ?: "HTTP $code"
-                    InfluxActionResult.fail("influx_http_error", message, httpStatus = code)
+                    InfluxActionResult.fail(
+                        "influx_http_error",
+                        message,
+                        httpStatus = code,
+                        failureKind = when {
+                            code == 401 || code == 403 -> InfluxFailureKind.AUTHENTICATION
+                            code == 400 || code == 422 -> InfluxFailureKind.DATA
+                            code in 502..504 -> InfluxFailureKind.TRANSPORT
+                            else -> InfluxFailureKind.OTHER
+                        }
+                    )
                 }
             } finally {
                 connection?.disconnect()
             }
         }.getOrElse { error ->
             val detail = sanitizeInfluxDiagnostic(error.message ?: "no message", config)
-            InfluxActionResult.fail("influx_network_error", "${error::class.java.simpleName}: $detail")
+            InfluxActionResult.fail(
+                "influx_network_error",
+                "${error::class.java.simpleName}: $detail",
+                failureKind = classifyNetworkFailure(error)
+            )
         }
+    }
+
+    private fun classifyNetworkFailure(error: Throwable): InfluxFailureKind {
+        return classifyInfluxNetworkFailure(error)
     }
 
     private fun InfluxConfig.basicAuthHeader(): String? {
@@ -93,6 +117,26 @@ class HttpInfluxClient : InfluxClient {
         const val CONNECT_TIMEOUT_MS = 5_000
         const val READ_TIMEOUT_MS = 10_000
     }
+}
+
+internal fun classifyInfluxNetworkFailure(error: Throwable): InfluxFailureKind {
+    var transportCause = false
+    var current: Throwable? = error
+    var depth = 0
+    while (current != null && depth++ < 16) {
+        if (current is SSLException) return InfluxFailureKind.AUTHENTICATION
+        if (current is ProtocolException) return InfluxFailureKind.PROTOCOL
+        if (
+            current is SocketTimeoutException ||
+            current is ConnectException ||
+            current is NoRouteToHostException ||
+            current is IOException
+        ) {
+            transportCause = true
+        }
+        current = current.cause
+    }
+    return if (transportCause) InfluxFailureKind.TRANSPORT else InfluxFailureKind.OTHER
 }
 
 internal fun boundedInfluxResponse(input: InputStream?, maxChars: Int = 2_048): String? {

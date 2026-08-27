@@ -13,9 +13,8 @@ class MainActivityMaintenanceContractTest {
 
         assertTrue(source.contains("private fun currentStore(): TelemetryStore = BydCollectorApplication.store(applicationContext)"))
         assertTrue(source.contains("private fun refreshStoreBackedState()"))
-        assertTrue(source.contains("HaMqttActions.testConnection(actionStore, settings)"))
-        assertTrue(source.contains("InfluxActions.testConnection(actionStore, settings)"))
-        assertTrue(source.contains("InfluxActions.reExportNewCategories(actionStore, settings)"))
+        assertTrue(source.contains("HaMqttActions.testConnection(actionStore, settings, profile = selected)"))
+        assertTrue(source.contains("InfluxActions.testConnection(actionStore, settings, profile = selected)"))
         assertTrue(source.contains("CollectorAutoStart.scheduleWatchdog(applicationContext, settings, currentStore())"))
         assertTrue(source.contains("CollectorAutoStart.scheduleRestartAfterUiClosed(applicationContext, settings, currentStore())"))
         assertTrue(source.contains("AdbAuthorizationManager.request("))
@@ -23,7 +22,7 @@ class MainActivityMaintenanceContractTest {
         assertTrue(source.contains("store = currentStore()"))
         assertFalse(source.contains("HaMqttActions.testConnection(store, settings)"))
         assertFalse(source.contains("InfluxActions.testConnection(store, settings)"))
-        assertFalse(source.contains("InfluxActions.reExportNewCategories(store, settings)"))
+        assertFalse(source.contains("onReExportInflux"))
     }
 
     @Test

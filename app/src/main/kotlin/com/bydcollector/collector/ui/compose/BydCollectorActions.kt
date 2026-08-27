@@ -2,6 +2,13 @@ package com.bydcollector.collector.ui.compose
 
 import com.bydcollector.collector.telegram.TelegramNavigatorMask
 import com.bydcollector.collector.telegram.TelegramPayloadLimitState
+import com.bydcollector.collector.ha.HaEndpointProfile
+
+internal fun validEndpointDraft(host: String, port: String, optional: Boolean = false): Boolean {
+    if (optional && host.isBlank() && port.isBlank()) return true
+    return host.isNotBlank() && host.trim().none { it.isWhitespace() || it == '/' || it == '\\' } &&
+        port.toIntOrNull()?.let { it in 1..65535 } == true
+}
 
 data class MqttDraft(
     val host: String = "",
@@ -10,7 +17,10 @@ data class MqttDraft(
     val password: String = "",
     val clientId: String = "",
     val topicPrefix: String = "",
-    val discoveryPrefix: String = ""
+    val discoveryPrefix: String = "",
+    val alternativeHost: String = "",
+    val alternativePort: String = "",
+    val editingProfile: HaEndpointProfile = HaEndpointProfile.PRIMARY
 )
 
 data class InfluxDraft(
@@ -19,7 +29,10 @@ data class InfluxDraft(
     val username: String = "",
     val password: String = "",
     val database: String = "",
-    val measurement: String = ""
+    val measurement: String = "",
+    val alternativeHost: String = "",
+    val alternativePort: String = "",
+    val editingProfile: HaEndpointProfile = HaEndpointProfile.PRIMARY
 )
 
 data class BydCollectorActionUiState(
@@ -29,8 +42,7 @@ data class BydCollectorActionUiState(
     val archiveShareHandoffGeneration: Long = 0L,
     val archiveDeleteDispatch: Boolean = false,
     val mqttTest: Boolean = false,
-    val influxTest: Boolean = false,
-    val influxReExport: Boolean = false
+    val influxTest: Boolean = false
 )
 
 enum class TripMapMetric {
@@ -93,14 +105,18 @@ data class TripsUiState(
     val speedYellowThreshold: Int = 30,
     val consumptionGreenThreshold: Int = 15,
     val consumptionYellowThreshold: Int = 20,
-    val routeLoadingId: String? = null
+    val routeLoadingId: String? = null,
+    val databasePath: String = "",
+    val databaseSizeBytes: Long = 0L
 )
 
 data class TripsUiActions(
     val onColorMetricChanged: (TripMapMetric) -> Unit = {},
     val onSpeedThresholdsChanged: (green: Int, yellow: Int) -> Unit = { _, _ -> },
     val onConsumptionThresholdsChanged: (green: Int, yellow: Int) -> Unit = { _, _ -> },
-    val onRouteRequested: (String) -> Unit = {}
+    val onRouteRequested: (String) -> Unit = {},
+    val onCompressDatabase: () -> Unit = {},
+    val onRefreshRequested: () -> Unit = {}
 )
 
 enum class TelegramMessageType {
@@ -127,7 +143,7 @@ data class TelegramConfig(
     val botTokenSet: Boolean = false,
     val chatId: String = "",
     val chargeStepPercent: Int = 5,
-    val low12vThresholdVolts: Float = 12.0f,
+    val low12vThresholdVolts: Float = 12.5f,
     val telemetryUnavailableMinutes: Int = 1,
     val tripSummaryDelaySeconds: Int = 10,
     val sendLocation: Boolean = false,
@@ -189,7 +205,6 @@ interface BydCollectorActions {
     fun onStartInflux()
     fun onStopInflux()
     fun onTestInflux()
-    fun onReExportInflux()
     fun onToggleInfluxAutoStart(enabled: Boolean)
     fun onToggleInfluxCategory(category: String, enabled: Boolean)
     fun onInfluxDraftChanged(draft: InfluxDraft)

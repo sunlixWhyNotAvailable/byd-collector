@@ -1,7 +1,9 @@
 package com.bydcollector.collector.service
 
 import android.content.Context
+import android.content.Intent
 import android.os.Build
+import com.bydcollector.collector.ha.HaConnectionOwnership
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 
 object CollectorServiceController {
@@ -54,12 +56,7 @@ object CollectorServiceController {
     }
 
     fun startMqttExport(context: Context) {
-        val intent = CollectorService.startMqttExportIntent(context)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.startForegroundService(intent)
-        } else {
-            context.startService(intent)
-        }
+        startOwnedChannel(context, CollectorService.mqttConnection, CollectorService.startMqttExportIntent(context))
     }
 
     fun reconcileDebug(context: Context) {
@@ -72,38 +69,45 @@ object CollectorServiceController {
     }
 
     fun reconcileMqttExport(context: Context) {
-        val intent = CollectorService.reconcileMqttExportIntent(context)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.startForegroundService(intent)
-        } else {
-            context.startService(intent)
-        }
+        startOwnedChannel(context, CollectorService.mqttConnection, CollectorService.reconcileMqttExportIntent(context))
     }
 
     fun stopMqttExport(context: Context) {
-        context.startService(CollectorService.stopMqttExportIntent(context))
+        stopOwnedChannel(context, CollectorService.mqttConnection, CollectorService.stopMqttExportIntent(context))
     }
 
     fun startInfluxExport(context: Context) {
-        val intent = CollectorService.startInfluxExportIntent(context)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.startForegroundService(intent)
-        } else {
-            context.startService(intent)
-        }
+        startOwnedChannel(context, CollectorService.influxConnection, CollectorService.startInfluxExportIntent(context))
     }
 
     fun reconcileInfluxExport(context: Context) {
-        val intent = CollectorService.reconcileInfluxExportIntent(context)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.startForegroundService(intent)
-        } else {
-            context.startService(intent)
-        }
+        startOwnedChannel(context, CollectorService.influxConnection, CollectorService.reconcileInfluxExportIntent(context))
     }
 
     fun stopInfluxExport(context: Context) {
-        context.startService(CollectorService.stopInfluxExportIntent(context))
+        stopOwnedChannel(context, CollectorService.influxConnection, CollectorService.stopInfluxExportIntent(context))
+    }
+
+    private fun startOwnedChannel(context: Context, owner: HaConnectionOwnership, intent: Intent) {
+        if (owner.stopping) return
+        val reserved = owner.reserve()
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent)
+            else context.startService(intent)
+        } catch (error: RuntimeException) {
+            if (reserved) owner.release()
+            throw error
+        }
+    }
+
+    private fun stopOwnedChannel(context: Context, owner: HaConnectionOwnership, intent: Intent) {
+        owner.beginStop()
+        try {
+            context.startService(intent)
+        } catch (error: RuntimeException) {
+            owner.stopSubmissionFailed()
+            throw error
+        }
     }
 
     fun reconcileTelegram(context: Context) {

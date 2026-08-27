@@ -3,6 +3,7 @@ package com.bydcollector.collector.influx
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import com.bydcollector.collector.data.normalized.NormalizedFieldCatalog
+import com.bydcollector.collector.ha.HaEndpointProfile
 import java.time.OffsetDateTime
 import java.util.Locale
 
@@ -14,10 +15,22 @@ class InfluxExportCoordinator(
     private val clock: Clock = SystemClockAdapter()
 ) {
     private var currentBatchSize: Int? = null
+    private var sessionConnection: InfluxConfig? = null
 
-    fun testConnection(): InfluxActionResult {
-        val config = configProvider()
+    @Volatile
+    private var currentRoute: HaEndpointProfile? = null
+
+    val activeRoute: HaEndpointProfile?
+        get() = currentRoute
+
+    fun testConnection(configOverride: InfluxConfig? = null): InfluxActionResult {
+        val config = configOverride ?: configProvider()
         return client.test(config)
+    }
+
+    fun endSession() {
+        sessionConnection = null
+        currentRoute = null
     }
 
     fun startExport(): InfluxActionResult {
@@ -26,7 +39,12 @@ class InfluxExportCoordinator(
     }
 
     fun resumeExport(): InfluxActionResult {
-        val config = configProvider()
+        val liveConfig = configProvider()
+        if (sessionConnection == null) {
+            validate(liveConfig)?.let { return it }
+            captureSession(liveConfig)
+        }
+        val config = runtimeConfig(liveConfig)
         validate(config)?.let { return it }
         val fieldKeys = effectiveFields(config)
         store.ensureInfluxCursors(fieldKeys)
@@ -56,7 +74,7 @@ class InfluxExportCoordinator(
     }
 
     fun retryDelayMs(): Long? {
-        val config = configProvider()
+        val config = runtimeConfig(configProvider())
         if (validate(config) != null) return null
         val fieldKeys = effectiveFields(config)
         if (fieldKeys.isEmpty() || store.pendingInfluxSummary(fieldKeys).rows == 0L) return null
@@ -68,42 +86,36 @@ class InfluxExportCoordinator(
     }
 
     fun stopExport(): InfluxActionResult {
-        val config = configProvider()
-        val fieldKeys = effectiveFields(config)
-        store.ensureInfluxCursors(fieldKeys)
-        val pending = store.pendingInfluxSummary(fieldKeys)
-        val state = store.influxExportState()
-        store.updateInfluxExportState(
-            status = STATUS_STOPPED,
-            mode = modeFor(pending.rows),
-            pendingRows = pending.rows,
-            oldestPendingAt = pending.oldestObservedAt,
-            nextRetryAt = null,
-            lastSuccessAt = state.lastSuccessAt,
-            lastErrorAt = state.lastErrorAt,
-            lastError = state.lastError,
-            exportedRowsDelta = 0
-        )
-        return InfluxActionResult.ok("stopped")
-    }
-
-    fun reExportNewCategories(): InfluxActionResult {
-        val config = configProvider()
-        validate(config)?.let { return it }
-        //adds missing cursors without rewinding existing ones, useful after enabling more categories
-        store.ensureInfluxCursors(effectiveFields(config))
-        store.recordInfluxEvent(
-            eventType = "influx_reexport_prepared",
-            message = "Missing cursors created for enabled categories",
-            batchCount = null,
-            fromHistoryId = null,
-            toHistoryId = null
-        )
-        return InfluxActionResult.ok("missing cursors ensured")
+        return try {
+            val config = configProvider()
+            val fieldKeys = effectiveFields(config)
+            store.ensureInfluxCursors(fieldKeys)
+            val pending = store.pendingInfluxSummary(fieldKeys)
+            val state = store.influxExportState()
+            store.updateInfluxExportState(
+                status = STATUS_STOPPED,
+                mode = modeFor(pending.rows),
+                pendingRows = pending.rows,
+                oldestPendingAt = pending.oldestObservedAt,
+                nextRetryAt = null,
+                lastSuccessAt = state.lastSuccessAt,
+                lastErrorAt = state.lastErrorAt,
+                lastError = state.lastError,
+                exportedRowsDelta = 0
+            )
+            InfluxActionResult.ok("stopped")
+        } finally {
+            endSession()
+        }
     }
 
     fun runOneCycle(force: Boolean = false): InfluxActionResult {
-        val config = configProvider()
+        val liveConfig = configProvider()
+        if (sessionConnection == null) {
+            validate(liveConfig)?.let { return it }
+            captureSession(liveConfig)
+        }
+        val config = runtimeConfig(liveConfig)
         validate(config)?.let { return it }
         val state = store.influxExportState()
         val fieldKeys = effectiveFields(config)
@@ -223,9 +235,28 @@ class InfluxExportCoordinator(
 
     private fun validate(config: InfluxConfig): InfluxActionResult? {
         if (!config.enabled) return InfluxActionResult.fail("influx_disabled", "InfluxDB export is disabled")
-        if (config.host.isBlank()) return InfluxActionResult.fail("influx_host_missing", "InfluxDB host is blank")
+        config.validateEndpoints()?.let {
+            return InfluxActionResult.fail(
+                "influx_endpoint_invalid",
+                it,
+                failureKind = InfluxFailureKind.PROTOCOL
+            )
+        }
         if (config.normalizedDatabase().isBlank()) return InfluxActionResult.fail("influx_database_missing", "InfluxDB database is blank")
         return null
+    }
+
+    private fun captureSession(config: InfluxConfig) {
+        sessionConnection = config.copy(enabledCategories = config.enabledCategories.toSet())
+        currentRoute = null
+    }
+
+    private fun runtimeConfig(live: InfluxConfig): InfluxConfig {
+        val frozen = sessionConnection ?: live
+        return frozen.copy(
+            enabled = live.enabled,
+            enabledCategories = live.enabledCategories.toSet()
+        )
     }
 
     private fun effectiveFields(config: InfluxConfig): Set<String> {
@@ -273,11 +304,21 @@ class InfluxExportCoordinator(
     private fun exportRows(
         config: InfluxConfig,
         rows: List<InfluxPendingHistoryRow>,
-        exportedAt: String
+        exportedAt: String,
+        pinnedRoute: HaEndpointProfile? = null
     ): BatchExportResult {
         if (rows.isEmpty()) return BatchExportResult()
-        val write = client.write(config, rows.map { InfluxLineProtocol.toLine(it, config) })
+        val route = pinnedRoute ?: currentRoute ?: HaEndpointProfile.PRIMARY
+        val lines = rows.map { InfluxLineProtocol.toLine(it, config) }
+        val writeAttempt = if (pinnedRoute == null) {
+            writeWithFailover(config, route, lines)
+        } else {
+            RouteWriteResult(route, writeOnce(config, route, lines))
+        }
+        val write = writeAttempt.result
+        val actualRoute = writeAttempt.route
         if (write.ok) {
+            currentRoute = actualRoute
             rows.groupBy { it.fieldKey }.forEach { (fieldKey, fieldRows) ->
                 store.updateInfluxCursorSuccess(fieldKey, fieldRows.maxOf { it.id }, exportedAt)
             }
@@ -297,9 +338,9 @@ class InfluxExportCoordinator(
                 return BatchExportResult(poisonRows = 1)
             }
             val midpoint = rows.size / 2
-            val left = exportRows(config, rows.subList(0, midpoint), exportedAt)
+            val left = exportRows(config, rows.subList(0, midpoint), exportedAt, pinnedRoute = actualRoute)
             left.failure?.let { return left }
-            val right = exportRows(config, rows.subList(midpoint, rows.size), exportedAt)
+            val right = exportRows(config, rows.subList(midpoint, rows.size), exportedAt, pinnedRoute = actualRoute)
             return BatchExportResult(
                 exportedRows = left.exportedRows + right.exportedRows,
                 poisonRows = left.poisonRows + right.poisonRows,
@@ -311,6 +352,64 @@ class InfluxExportCoordinator(
         }
         return BatchExportResult(failure = write)
     }
+
+    private fun writeWithFailover(
+        config: InfluxConfig,
+        preferred: HaEndpointProfile,
+        lines: List<String>
+    ): RouteWriteResult {
+        val first = writeOnce(config, preferred, lines)
+        if (first.ok || !isFallbackEligible(first)) {
+            return RouteWriteResult(preferred, first)
+        }
+        val alternate = otherProfile(config, preferred) ?: run {
+            currentRoute = null
+            return RouteWriteResult(preferred, first)
+        }
+        val second = writeOnce(config, alternate, lines)
+        if (!second.ok) currentRoute = null
+        return RouteWriteResult(alternate, second)
+    }
+
+    private fun writeOnce(
+        config: InfluxConfig,
+        route: HaEndpointProfile,
+        lines: List<String>
+    ): InfluxActionResult {
+        return runCatching { client.write(config.forProfile(route), lines) }.getOrElse {
+            InfluxActionResult.fail(
+                "influx_write_exception",
+                "${it::class.java.simpleName}: ${it.message ?: "no message"}",
+                failureKind = InfluxFailureKind.OTHER
+            )
+        }
+    }
+
+    private fun isFallbackEligible(result: InfluxActionResult): Boolean {
+        if (result.ok) return false
+        if (result.failureKind == InfluxFailureKind.AUTHENTICATION ||
+            result.failureKind == InfluxFailureKind.DATA ||
+            result.failureKind == InfluxFailureKind.PROTOCOL
+        ) return false
+        return result.failureKind == InfluxFailureKind.TRANSPORT ||
+            result.httpStatus in 502..504 ||
+            (result.failureKind == null && result.category == "influx_network_error")
+    }
+
+    private fun otherProfile(config: InfluxConfig, profile: HaEndpointProfile): HaEndpointProfile? {
+        return when (profile) {
+            HaEndpointProfile.PRIMARY -> {
+                if (config.alternativeHost.isNullOrBlank() && config.alternativePort == null) null
+                else HaEndpointProfile.ALTERNATIVE
+            }
+            HaEndpointProfile.ALTERNATIVE -> HaEndpointProfile.PRIMARY
+        }
+    }
+
+    private data class RouteWriteResult(
+        val route: HaEndpointProfile,
+        val result: InfluxActionResult
+    )
 
     private fun isTransientFailure(result: InfluxActionResult): Boolean {
         val detail = "${result.category} ${result.message}".lowercase(Locale.US)

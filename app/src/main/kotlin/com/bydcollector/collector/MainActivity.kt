@@ -39,11 +39,14 @@ import com.bydcollector.collector.maintenance.ArchiveStorageManager
 import com.bydcollector.collector.maintenance.ArchiveShareLeaseRegistry
 import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
 import com.bydcollector.collector.mqtt.HaMqttActions
+import com.bydcollector.collector.ha.HaEndpointProfile
+import com.bydcollector.collector.ui.compose.validEndpointDraft
 import com.bydcollector.collector.mqtt.MqttActionResult
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorServiceController
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.service.DatabaseMaintenanceService
+import com.bydcollector.collector.service.TripCompressionService
 import com.bydcollector.collector.system.CollectorAutoStart
 import com.bydcollector.collector.telegram.TelegramPayloadLimitState
 import com.bydcollector.collector.ui.DashboardState
@@ -79,6 +82,7 @@ import com.bydcollector.collector.update.UpdateInfo
 import com.bydcollector.collector.update.UpdateUiState
 import com.bydcollector.collector.util.dispatchOperationalEvent
 import com.bydcollector.collector.util.namedSingleThreadExecutor
+import com.bydcollector.collector.util.sqliteFootprintBytes
 import java.io.File
 import java.util.ArrayList
 import java.util.concurrent.atomic.AtomicBoolean
@@ -145,7 +149,13 @@ class MainActivity : ComponentActivity() {
             settings.setTripConsumptionThresholds(green, yellow)
             tripsUiState = tripsUiState.copy(consumptionGreenThreshold = settings.tripConsumptionGreenThreshold(), consumptionYellowThreshold = settings.tripConsumptionYellowThreshold())
         },
-        onRouteRequested = { tripId -> loadTripsUi(tripId) }
+        onRouteRequested = { tripId -> loadTripsUi(tripId) },
+        onCompressDatabase = { TripCompressionService.start(applicationContext) },
+        onRefreshRequested = {
+            loadTripsUi()
+            stateProvider.invalidateArchiveStorageSnapshot()
+            refresh()
+        }
     )
 
     private val refreshTask = object : Runnable {
@@ -412,6 +422,8 @@ class MainActivity : ComponentActivity() {
 
         override fun onStartMqtt() {
             refreshStoreBackedState()
+            if (actionUiState.mqttTest || CollectorService.mqttConnection.stopping) return
+            if (!CollectorService.mqttConnection.owned && !validateMqttDraft()) return
             requestAccessCheck("start_mqtt", AccessCheckMode.NORMAL)
             if (!saveMqttDraft()) {
                 refresh()
@@ -419,7 +431,10 @@ class MainActivity : ComponentActivity() {
             }
             settings.setMqttManuallyStopped(false)
             settings.setMqttEnabled(true)
-            CollectorServiceController.startMqttExport(this@MainActivity)
+            runCatching { CollectorServiceController.startMqttExport(this@MainActivity) }.onFailure { error ->
+                if (!CollectorService.mqttConnection.owned) settings.setMqttEnabled(false)
+                Toast.makeText(this@MainActivity, "MQTT: ${error.message}", Toast.LENGTH_LONG).show()
+            }
             refresh()
         }
 
@@ -427,14 +442,18 @@ class MainActivity : ComponentActivity() {
             refreshStoreBackedState()
             settings.setMqttManuallyStopped(true)
             settings.setMqttEnabled(false)
-            CollectorServiceController.stopMqttExport(this@MainActivity)
+            runCatching { CollectorServiceController.stopMqttExport(this@MainActivity) }.onFailure { error ->
+                Toast.makeText(this@MainActivity, "MQTT: ${error.message}", Toast.LENGTH_LONG).show()
+            }
             refresh()
         }
 
         override fun onTestMqtt() {
+            if (actionUiState.mqttTest || !validateMqttDraft(mqttDraft.editingProfile)) return
+            val selected = mqttDraft.editingProfile
             actionUiState = actionUiState.copy(mqttTest = true)
             runMqttChannelAction("MQTT test") { actionStore ->
-                HaMqttActions.testConnection(actionStore, settings)
+                HaMqttActions.testConnection(actionStore, settings, profile = selected)
             }
         }
 
@@ -450,6 +469,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onMqttDraftChanged(draft: MqttDraft) {
+            if (CollectorService.mqttConnection.owned || actionUiState.mqttTest) return
             if (draft.username != mqttDraft.username || draft.password != mqttDraft.password) {
                 mqttCredentialRevision += 1L
             }
@@ -459,6 +479,8 @@ class MainActivity : ComponentActivity() {
 
         override fun onStartInflux() {
             refreshStoreBackedState()
+            if (actionUiState.influxTest || CollectorService.influxConnection.stopping) return
+            if (!CollectorService.influxConnection.owned && !validateInfluxDraft()) return
             requestAccessCheck("start_influx", AccessCheckMode.NORMAL)
             if (!saveInfluxDraft()) {
                 refresh()
@@ -466,7 +488,10 @@ class MainActivity : ComponentActivity() {
             }
             settings.setInfluxManuallyStopped(false)
             settings.setInfluxEnabled(true)
-            CollectorServiceController.startInfluxExport(this@MainActivity)
+            runCatching { CollectorServiceController.startInfluxExport(this@MainActivity) }.onFailure { error ->
+                if (!CollectorService.influxConnection.owned) settings.setInfluxEnabled(false)
+                Toast.makeText(this@MainActivity, "InfluxDB: ${error.message}", Toast.LENGTH_LONG).show()
+            }
             refresh()
         }
 
@@ -474,21 +499,18 @@ class MainActivity : ComponentActivity() {
             refreshStoreBackedState()
             settings.setInfluxManuallyStopped(true)
             settings.setInfluxEnabled(false)
-            CollectorServiceController.stopInfluxExport(this@MainActivity)
+            runCatching { CollectorServiceController.stopInfluxExport(this@MainActivity) }.onFailure { error ->
+                Toast.makeText(this@MainActivity, "InfluxDB: ${error.message}", Toast.LENGTH_LONG).show()
+            }
             refresh()
         }
 
         override fun onTestInflux() {
+            if (actionUiState.influxTest || !validateInfluxDraft(influxDraft.editingProfile)) return
+            val selected = influxDraft.editingProfile
             actionUiState = actionUiState.copy(influxTest = true)
             runInfluxChannelAction("Influx test", clearAction = { it.copy(influxTest = false) }) { actionStore ->
-                InfluxActions.testConnection(actionStore, settings)
-            }
-        }
-
-        override fun onReExportInflux() {
-            actionUiState = actionUiState.copy(influxReExport = true)
-            runInfluxChannelAction("Influx re-export", clearAction = { it.copy(influxReExport = false) }) { actionStore ->
-                InfluxActions.reExportNewCategories(actionStore, settings)
+                InfluxActions.testConnection(actionStore, settings, profile = selected)
             }
         }
 
@@ -504,6 +526,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onInfluxDraftChanged(draft: InfluxDraft) {
+            if (CollectorService.influxConnection.owned || actionUiState.influxTest) return
             if (draft.username != influxDraft.username || draft.password != influxDraft.password) {
                 influxCredentialRevision += 1L
             }
@@ -595,13 +618,17 @@ class MainActivity : ComponentActivity() {
             port = settings.mqttPort().toString(),
             clientId = settings.mqttClientId(),
             topicPrefix = settings.mqttTopicPrefix(),
-            discoveryPrefix = settings.mqttDiscoveryPrefix()
+            discoveryPrefix = settings.mqttDiscoveryPrefix(),
+            alternativeHost = settings.mqttAlternativeHost().orEmpty(),
+            alternativePort = settings.mqttAlternativePort()?.toString().orEmpty()
         )
         influxDraft = InfluxDraft(
             host = settings.influxHost(),
             port = settings.influxPort().toString(),
             database = settings.influxDatabase(),
-            measurement = settings.influxMeasurement()
+            measurement = settings.influxMeasurement(),
+            alternativeHost = settings.influxAlternativeHost().orEmpty(),
+            alternativePort = settings.influxAlternativePort()?.toString().orEmpty()
         )
         telegramUiState = loadTelegramUiState()
         tripsUiState = TripsUiState(
@@ -775,7 +802,8 @@ class MainActivity : ComponentActivity() {
                     ArchiveStorageManager(
                         archiveRoot = File(filesDir, "db_archive"),
                         mainDatabaseFile = currentStore().databaseFile(),
-                        debugDatabaseFile = getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME)
+                        debugDatabaseFile = getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME),
+                        tripsDatabaseFile = getDatabasePath(com.bydcollector.collector.data.trips.TripDatabaseHelper.DATABASE_NAME)
                     ).resolveShareZipFiles(requestedIds)
                 }.getOrNull()
                 if (files == null) {
@@ -1022,12 +1050,25 @@ class MainActivity : ComponentActivity() {
                 val trips = BydCollectorApplication.trips(applicationContext)
                 val groups = trips.queryHierarchy()
                 val routes = routeTripId?.let { id -> mapOf(id to trips.queryRoutePoints(id)) }.orEmpty()
-                TripsUiMapper.years(groups, requestedLanguage, routes)
+                val tripsBytes = sqliteFootprintBytes(trips.databaseFile)
+                dashboardUiStateStore.publishDatabaseFootprints(
+                    sqliteFootprintBytes(getDatabasePath(com.bydcollector.collector.data.local.TelemetryDatabaseHelper.DATABASE_NAME)),
+                    sqliteFootprintBytes(getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME)),
+                    tripsBytes
+                )
+                Triple(
+                    TripsUiMapper.years(groups, requestedLanguage, routes),
+                    trips.databaseFile.absolutePath,
+                    tripsBytes
+                )
             }
             runOnUiThread {
                 if (destroyed || uiLanguage != requestedLanguage || requestGeneration != tripsRequestGeneration) return@runOnUiThread
-                result.onSuccess { years ->
-                    tripsUiState = tripsUiState.copy(years = years, routeLoadingId = null)
+                result.onSuccess { (years, path, size) ->
+                    tripsUiState = tripsUiState.copy(
+                        years = years, routeLoadingId = null,
+                        databasePath = path, databaseSizeBytes = size
+                    )
                 }.onFailure { error ->
                     tripsUiState = tripsUiState.copy(routeLoadingId = null)
                     recordDashboardRefreshFailure("trips", error)
@@ -1626,9 +1667,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun saveMqttDraft(): Boolean {
+        if (CollectorService.mqttConnection.owned) return true
         //keeps saved passwords sticky while empty password fields mean "leave existing secret unchanged"
         settings.setMqttHost(mqttDraft.host)
-        settings.setMqttPort(mqttDraft.port.toIntOrNull() ?: settings.mqttPort())
+        settings.setMqttPort(mqttDraft.port.toIntOrNull() ?: 0)
+        settings.setMqttAlternativeHost(mqttDraft.alternativeHost)
+        settings.setMqttAlternativePort(if (mqttDraft.alternativePort.isBlank()) null else mqttDraft.alternativePort.toIntOrNull() ?: 0)
         val usernameStored = if (credentialsLoaded || mqttDraft.username.isNotBlank()) {
             settings.setMqttUsername(mqttDraft.username)
         } else {
@@ -1648,10 +1692,24 @@ class MainActivity : ComponentActivity() {
         return stored
     }
 
+    private fun validateMqttDraft(selected: HaEndpointProfile? = null): Boolean {
+        val valid = when (selected) {
+            HaEndpointProfile.PRIMARY -> validEndpointDraft(mqttDraft.host, mqttDraft.port)
+            HaEndpointProfile.ALTERNATIVE -> validEndpointDraft(mqttDraft.alternativeHost, mqttDraft.alternativePort)
+            null -> validEndpointDraft(mqttDraft.host, mqttDraft.port) &&
+                validEndpointDraft(mqttDraft.alternativeHost, mqttDraft.alternativePort, optional = true)
+        }
+        if (!valid) Toast.makeText(this, strings(uiLanguage).invalidEndpoint, Toast.LENGTH_LONG).show()
+        return valid
+    }
+
     private fun saveInfluxDraft(): Boolean {
+        if (CollectorService.influxConnection.owned) return true
         //mirrors mqtt draft semantics so editing non-secret influx fields never clears the stored password
         settings.setInfluxHost(influxDraft.host)
-        settings.setInfluxPort(influxDraft.port.toIntOrNull() ?: settings.influxPort())
+        settings.setInfluxPort(influxDraft.port.toIntOrNull() ?: 0)
+        settings.setInfluxAlternativeHost(influxDraft.alternativeHost)
+        settings.setInfluxAlternativePort(if (influxDraft.alternativePort.isBlank()) null else influxDraft.alternativePort.toIntOrNull() ?: 0)
         val usernameStored = if (credentialsLoaded || influxDraft.username.isNotBlank()) {
             settings.setInfluxUsername(influxDraft.username)
         } else {
@@ -1668,6 +1726,17 @@ class MainActivity : ComponentActivity() {
             )
         }
         return stored
+    }
+
+    private fun validateInfluxDraft(selected: HaEndpointProfile? = null): Boolean {
+        val valid = when (selected) {
+            HaEndpointProfile.PRIMARY -> validEndpointDraft(influxDraft.host, influxDraft.port)
+            HaEndpointProfile.ALTERNATIVE -> validEndpointDraft(influxDraft.alternativeHost, influxDraft.alternativePort)
+            null -> validEndpointDraft(influxDraft.host, influxDraft.port) &&
+                validEndpointDraft(influxDraft.alternativeHost, influxDraft.alternativePort, optional = true)
+        }
+        if (!valid) Toast.makeText(this, strings(uiLanguage).invalidEndpoint, Toast.LENGTH_LONG).show()
+        return valid
     }
 
     private fun loadTelegramUiState(): TelegramUiState {

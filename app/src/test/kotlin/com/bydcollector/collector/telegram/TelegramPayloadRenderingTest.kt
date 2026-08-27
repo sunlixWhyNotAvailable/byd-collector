@@ -25,6 +25,28 @@ class TelegramPayloadRenderingTest {
     }
 
     @Test
+    fun renderedLocationEventCarriesSummaryDependency() {
+        val event = event().copy(
+            dedupeKey = "trip:location",
+            locationOnly = true,
+            textSuffix = "Google: https://maps.example/1",
+            waitsForSummaryKey = "trip:summary"
+        )
+        val messages = renderTelegramBatch(listOf(event)) {
+            renderTelegramPayload(it, null, TelegramTemplateLanguage.EN).text?.let { payload ->
+                TelegramOutboxMessage(
+                    dedupeKey = it.dedupeKey,
+                    eventType = it.type.key,
+                    payload = payload,
+                    waitsForSummaryKey = it.waitsForSummaryKey
+                )
+            }
+        }
+
+        assertEquals("trip:summary", messages?.single()?.waitsForSummaryKey)
+    }
+
+    @Test
     fun invalidCustomTemplateFallsBackToTheLocalizedBuiltIn() {
         val result = renderTelegramPayload(
             event = event(),

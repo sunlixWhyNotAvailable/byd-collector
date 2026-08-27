@@ -24,6 +24,24 @@ class PahoMqttClientFacadeTest {
     }
 
     @Test
+    fun explicitTestConnectionOmitsRuntimeDefaultWill() {
+        val handles = mutableListOf<FakeHandle>()
+        val facade = PahoMqttClientFacade { serverUri, clientId ->
+            FakeHandle(serverUri, clientId).also { handles += it }
+        }
+
+        assertTrue(
+            facade.connect(
+                config("bydcollector"),
+                willMessage = null,
+                purpose = MqttConnectionPurpose.TEST_NO_WILL
+            ).ok
+        )
+
+        assertEquals(null, handles.single().lastOptions?.willDestination)
+    }
+
+    @Test
     fun offlineDisconnectReusesAndClosesTheOriginalHandleExactlyOnce() {
         val handles = mutableListOf<FakeHandle>()
         val facade = PahoMqttClientFacade { serverUri, clientId ->
@@ -111,6 +129,7 @@ class PahoMqttClientFacadeTest {
         var disconnectCount = 0
         var closeCount = 0
         var timeToWaitMs: Long? = null
+        var lastOptions: MqttConnectOptions? = null
 
         override fun setTimeToWait(timeoutMs: Long) {
             timeToWaitMs = timeoutMs
@@ -118,6 +137,7 @@ class PahoMqttClientFacadeTest {
 
         override fun connect(options: MqttConnectOptions) {
             connectCount += 1
+            lastOptions = options
             if (failConnect) error("connect failed")
             isConnected = true
         }

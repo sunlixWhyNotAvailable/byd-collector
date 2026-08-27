@@ -82,6 +82,7 @@ class DashboardLoadProfileTest {
                 archiveRootPath = "next-archive",
                 mainDatabaseSizeBytes = 0L,
                 debugDatabaseSizeBytes = 0L,
+                tripsDatabaseSizeBytes = 333L,
                 archiveBytes = 0L,
                 archiveLimitBytes = 0L,
                 entries = emptyList()
@@ -105,6 +106,8 @@ class DashboardLoadProfileTest {
         assertEquals(8L, merged.debugReadingCount)
         assertEquals("88%", merged.vehicleKpis.socPercent)
         assertEquals("previous-archive", merged.archiveStorageSnapshot.archiveRootPath)
+        assertEquals(333L, merged.archiveStorageSnapshot.tripsDatabaseSizeBytes)
+        assertEquals(333L, merged.archiveStorageSnapshot.activeDatabaseSizeBytes)
     }
 
     @Test

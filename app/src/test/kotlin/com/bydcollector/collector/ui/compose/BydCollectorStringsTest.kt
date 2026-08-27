@@ -129,7 +129,7 @@ class BydCollectorStringsTest {
         val en = strings(UiLanguage.EN)
 
         assertEquals("Поточні бази", uk.activeDatabase)
-        assertEquals("%s: основна %s + тестова %s", uk.activeDatabaseSizeTemplate)
+        assertEquals("%s: основна %s + тестова %s + поїздки %s", uk.activeDatabaseSizeTemplate)
         assertEquals("Перехід основної бази відкладено до ручної архівації.", uk.mainStorageCutoverDeferred)
         assertEquals("Основна база: %s", uk.mainStorageCutoverErrorTemplate)
         assertEquals("База «Всі дані»: %s", uk.debugStorageCutoverErrorTemplate)
@@ -150,7 +150,7 @@ class BydCollectorStringsTest {
         assertEquals("(%d арх.)", uk.archiveCountShortTemplate)
 
         assertEquals("Active databases", en.activeDatabase)
-        assertEquals("%s: main %s + test %s", en.activeDatabaseSizeTemplate)
+        assertEquals("%s: main %s + test %s + trips %s", en.activeDatabaseSizeTemplate)
         assertEquals("Main database transition deferred until manual archive.", en.mainStorageCutoverDeferred)
         assertEquals("Main database: %s", en.mainStorageCutoverErrorTemplate)
         assertEquals("All data database: %s", en.debugStorageCutoverErrorTemplate)

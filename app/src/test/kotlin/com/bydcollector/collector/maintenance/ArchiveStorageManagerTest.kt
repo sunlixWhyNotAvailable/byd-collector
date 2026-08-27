@@ -86,10 +86,13 @@ class ArchiveStorageManagerTest {
     }
 
     @Test
-    fun snapshotAndCompressionIncludeDebugArchivesAndBothActiveDatabases() {
+    fun snapshotAndCompressionIncludeDebugArchivesAndAllActiveDatabaseFootprints() {
         val root = createTempDirectory().toFile()
         val main = File(root, "bydcollector_telemetry.db").apply { writeText("main") }
         val debug = File(root, "bydcollector_debug_round_robin.db").apply { writeText("debug") }
+        val trips = File(root, "bydcollector_trips.db").apply { writeText("trips") }
+        File(root, trips.name + "-wal").writeText("wal")
+        File(root, main.name + "-journal").writeText("journal")
         val archiveRoot = File(root, "db_archive")
         val raw = File(archiveRoot, "bydcollector_debug_round_robin_20260713_120000").apply { mkdirs() }
         File(raw, debug.name).writeText("archived-debug")
@@ -98,9 +101,10 @@ class ArchiveStorageManagerTest {
         assertTrue(manager.compressRawArchiveDirectory(raw))
         val snapshot = manager.snapshot(1024L)
 
-        assertEquals(main.length(), snapshot.mainDatabaseSizeBytes)
+        assertEquals(main.length() + 7L, snapshot.mainDatabaseSizeBytes)
         assertEquals(debug.length(), snapshot.debugDatabaseSizeBytes)
-        assertEquals(main.length() + debug.length(), snapshot.activeDatabaseSizeBytes)
+        assertEquals(8L, snapshot.tripsDatabaseSizeBytes)
+        assertEquals(main.length() + debug.length() + 7L + 8L, snapshot.activeDatabaseSizeBytes)
         assertEquals(1, snapshot.entries.size)
         assertTrue(snapshot.entries.single().id.startsWith(ArchiveStorageManager.DEBUG_ARCHIVE_PREFIX))
     }

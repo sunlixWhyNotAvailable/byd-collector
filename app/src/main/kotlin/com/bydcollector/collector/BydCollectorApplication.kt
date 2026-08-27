@@ -7,6 +7,8 @@ import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.local.TelegramStore
 import com.bydcollector.collector.data.trips.TripDatabaseHelper
 import com.bydcollector.collector.data.trips.TripStore
+import com.bydcollector.collector.data.trips.TripCompression
+import java.util.concurrent.locks.ReentrantLock
 import com.bydcollector.collector.diagnostics.OperationalEventJournal
 import com.bydcollector.collector.maintenance.DatabaseMaintenanceGate
 import com.bydcollector.collector.maintenance.StorageFormatCutoverCoordinator
@@ -25,6 +27,8 @@ class BydCollectorApplication : Application() {
     private var cutoverCoordinator: StorageFormatCutoverCoordinator? = null
     private var debugStorageReady: Boolean? = null
     private val databaseMaintenanceGate = DatabaseMaintenanceGate()
+    // Only file barriers and archive's runtime-stop boundary share this lock, not ongoing collection.
+    internal val tripsFileOperationLock = ReentrantLock(true)
     internal val operationalEventJournal by lazy { OperationalEventJournal(applicationContext) }
     val dashboardUiStateStore by lazy { DashboardUiStateStore() }
 
@@ -157,6 +161,7 @@ class BydCollectorApplication : Application() {
     @Synchronized
     private fun trips(): TripStore {
         tripsStore?.let { return it }
+        TripCompression.recoverBeforeOpen(applicationContext)
         return TripStore(TripDatabaseHelper(applicationContext)).also { store ->
             check(store.verify()) { "Trips database is not safe to open" }
             tripsStore = store

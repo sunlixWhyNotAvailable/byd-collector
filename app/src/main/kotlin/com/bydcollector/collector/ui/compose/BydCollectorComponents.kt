@@ -516,7 +516,8 @@ fun TextInput(
     hidePasswordContentDescription: String? = null,
     clearContentDescription: String? = null,
     onClear: (() -> Unit)? = null,
-    showClearWhenEmpty: Boolean = false
+    showClearWhenEmpty: Boolean = false,
+    trailing: (@Composable () -> Unit)? = null
 ) {
     val p = LocalBydPalette.current
     var passwordVisible by remember { mutableStateOf(false) }
@@ -541,7 +542,7 @@ fun TextInput(
                 .clip(ControlShape)
                 .background(if (enabled) p.pathField else p.disabled.copy(alpha = 0.30f))
                 .border(1.dp, p.pathBorder, ControlShape)
-                .padding(start = 10.dp, end = if (onClear != null || hasVisibilityToggle) 3.dp else 10.dp),
+                .padding(start = 10.dp, end = if (onClear != null || hasVisibilityToggle || trailing != null) 3.dp else 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             BasicTextField(
@@ -550,7 +551,7 @@ fun TextInput(
                 enabled = enabled,
                 singleLine = true,
                 textStyle = TextStyle(
-                    color = if (enabled) p.text else p.muted.copy(alpha = 0.6f),
+                    color = if (enabled) p.text else p.muted,
                     fontSize = 14.sp,
                     fontWeight = FontWeight.Normal
                 ),
@@ -585,6 +586,7 @@ fun TextInput(
             if (onClear != null && clearContentDescription != null && (value.isNotEmpty() || showClearWhenEmpty)) {
                 ClearFieldButton(clearContentDescription, onClear)
             }
+            trailing?.invoke()
         }
     }
 }
@@ -616,7 +618,8 @@ fun TextValueInput(
             value = value,
             onValueChange = onValueChange,
             singleLine = !multiline,
-            maxLines = if (multiline) 6 else 1,
+            minLines = if (multiline) 7 else 1,
+            maxLines = if (multiline) 7 else 1,
             textStyle = TextStyle(
                 color = p.text,
                 fontSize = 14.sp,
@@ -627,7 +630,7 @@ fun TextValueInput(
             keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
             modifier = Modifier
                 .fillMaxWidth()
-                .height(if (multiline) 104.dp else 38.dp)
+                .then(if (multiline) Modifier else Modifier.height(38.dp))
                 .clip(ControlShape)
                 .background(p.pathField)
                 .border(1.dp, p.pathBorder, ControlShape)

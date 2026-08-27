@@ -12,6 +12,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.withLock
 
 class DbMaintenanceCoordinator(
     private val context: Context,
@@ -48,7 +49,8 @@ class DbMaintenanceCoordinator(
         var skipRestore = false
         return try {
             publish(operation, 1, cancelAvailable = true)
-            stopRuntime(operation)
+            // Wait before the timed runtime stop, so a Trips file copy cannot cause its 2s timeout.
+            application.tripsFileOperationLock.withLock { stopRuntime(operation) }
             closeCancelWindowAndCheck(operation)
             publish(operation, 1, cancelAvailable = false)
             val result = application.withExclusiveDatabaseMaintenance {

@@ -1,5 +1,7 @@
 package com.bydcollector.collector.maintenance
 
+import com.bydcollector.collector.data.trips.TripDatabaseHelper
+import com.bydcollector.collector.util.sqliteFootprintBytes
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.File
@@ -13,6 +15,7 @@ class ArchiveStorageManager(
     private val archiveRoot: File,
     private val mainDatabaseFile: File,
     private val debugDatabaseFile: File,
+    private val tripsDatabaseFile: File = File(mainDatabaseFile.parentFile, TripDatabaseHelper.DATABASE_NAME),
     private val clock: () -> Long = { System.currentTimeMillis() },
     private val isRetentionProtected: (String) -> Boolean = { false }
 ) {
@@ -24,8 +27,9 @@ class ArchiveStorageManager(
             .sortedWith(compareByDescending<ArchiveStorageEntry> { it.createdAtMs }.thenBy { it.id })
         return ArchiveStorageSnapshot(
             archiveRootPath = archiveRoot.absolutePath,
-            mainDatabaseSizeBytes = mainDatabaseFile.takeIf { it.exists() }?.length() ?: 0L,
-            debugDatabaseSizeBytes = debugDatabaseFile.takeIf { it.exists() }?.length() ?: 0L,
+            mainDatabaseSizeBytes = sqliteFootprintBytes(mainDatabaseFile),
+            debugDatabaseSizeBytes = sqliteFootprintBytes(debugDatabaseFile),
+            tripsDatabaseSizeBytes = sqliteFootprintBytes(tripsDatabaseFile),
             archiveBytes = entries.sumOf { it.sizeBytes },
             archiveLimitBytes = limitBytes,
             entries = entries

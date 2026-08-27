@@ -615,6 +615,8 @@ class TelegramEventEngineTest {
         assertEquals("$tripId:location", followUp.events.single().dedupeKey)
         assertTrue(followUp.events.single().locationOnly)
         assertEquals("Google: google", followUp.events.single().textSuffix)
+        assertNull(followUp.events.single().waitsForSummaryKey)
+        assertEquals("ready", followUp.locationEligibilityReason)
         assertNull(followUp.state.pendingPowerOffLocationTripId)
         assertFalse(followUp.state.pendingPowerOffLocationSummaryDelivered)
         assertTrue(restarted.onPowerOffConfirmed(
@@ -625,7 +627,7 @@ class TelegramEventEngineTest {
     }
 
     @Test
-    fun actualPowerOffNeverSendsLocationWithoutPersistedSummaryDeliveryProof() {
+    fun actualPowerOffQueuesLocationUntilPersistedSummaryDeliveryProof() {
         val engine = pendingTripEngine()
         val tripId = engine.state.tripId
         engine.onTick(config, false, null, 20_000L)
@@ -636,10 +638,57 @@ class TelegramEventEngineTest {
             nowMs = 21_000L
         )
 
-        assertTrue(result.events.isEmpty())
+        assertEquals("$tripId:location", result.events.single().dedupeKey)
+        assertTrue(result.events.single().locationOnly)
+        assertEquals("$tripId:summary", result.events.single().waitsForSummaryKey)
+        assertEquals("waiting_summary", result.locationEligibilityReason)
         assertNull(result.state.pendingPowerOffLocationTripId)
         assertFalse(result.state.pendingPowerOffLocationSummaryDelivered)
         assertNull(engine.markTripSummaryDelivered("$tripId:summary", 21_500L))
+    }
+
+    @Test
+    fun frozenPowerOffLocationSurvivesRestartAndNewTripWithoutRegeneration() {
+        val engine = pendingTripEngine()
+        val tripId = engine.state.tripId
+        engine.onTick(config, false, null, 20_000L)
+        val frozen = engine.onPowerOffConfirmed(
+            config.copy(sendLocation = true, navigatorMask = TelegramNavigatorMask.GOOGLE),
+            location = TelegramLocationSnapshot(50.0, 30.0, "12:00", 0L, "osm", "google", "apple"),
+            nowMs = 21_000L
+        ).events.single()
+
+        val restarted = TelegramEventEngine(TelegramEventState.fromJson(engine.state.toJson()))
+        restarted.onSuccessfulPoll(snapshot(gear = "D", odometer = 102.0, soc = 48.0, tripEnergy = 0.0), config, 22_000L)
+        val newTrip = restarted.onSuccessfulPoll(
+            snapshot(gear = "D", odometer = 102.0, soc = 48.0, tripEnergy = 0.0),
+            config,
+            22_500L
+        )
+
+        assertEquals("$tripId:location", frozen.dedupeKey)
+        assertEquals("$tripId:summary", frozen.waitsForSummaryKey)
+        assertTrue(restarted.state.tripId != null && restarted.state.tripId != tripId)
+        assertNull(restarted.state.pendingPowerOffLocationTripId)
+        assertTrue(newTrip.events.none { it.dedupeKey == frozen.dedupeKey })
+    }
+
+    @Test
+    fun locationEligibilityReportsSummaryDisabledBeforeOtherGates() {
+        val engine = pendingTripEngine()
+        engine.onTick(config, false, null, 20_000L)
+        val result = engine.onPowerOffConfirmed(
+            config.copy(
+                enabledEvents = config.enabledEvents - TelegramEventType.TRIP_SUMMARY,
+                sendLocation = false,
+                navigatorMask = 0
+            ),
+            location = TelegramLocationSnapshot(50.0, 30.0, "12:00", 0L, "osm", "google", "apple"),
+            nowMs = 21_000L
+        )
+
+        assertEquals("summary_disabled", result.locationEligibilityReason)
+        assertTrue(result.events.isEmpty())
     }
 
     @Test
@@ -654,6 +703,7 @@ class TelegramEventEngineTest {
             nowMs = 21_000L
         )
         assertTrue(noFix.events.isEmpty())
+        assertEquals("invalid_fix", noFix.locationEligibilityReason)
         assertNull(noFix.state.pendingPowerOffLocationTripId)
         assertTrue(engine.onPowerOffConfirmed(
             config.copy(sendLocation = true, navigatorMask = TelegramNavigatorMask.GOOGLE),

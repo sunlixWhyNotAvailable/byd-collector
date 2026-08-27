@@ -32,7 +32,8 @@ class TelegramDatabaseHelper(
                 attempt_count INTEGER NOT NULL DEFAULT 0,
                 last_attempt_at_ms INTEGER,
                 last_error TEXT,
-                blocked INTEGER NOT NULL DEFAULT 0 CHECK (blocked IN (0, 1))
+                blocked INTEGER NOT NULL DEFAULT 0 CHECK (blocked IN (0, 1)),
+                waits_for_summary_key TEXT
             )
             """.trimIndent()
         )
@@ -73,7 +74,10 @@ class TelegramDatabaseHelper(
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        if (oldVersion < DATABASE_VERSION) onCreate(db)
+        if (oldVersion < 2) {
+            db.execSQL("ALTER TABLE telegram_outbox ADD COLUMN waits_for_summary_key TEXT")
+        }
+        onCreate(db)
     }
 
     override fun onDowngrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -84,7 +88,7 @@ class TelegramDatabaseHelper(
 
     companion object {
         const val DATABASE_NAME = "bydcollector_telegram.db"
-        const val DATABASE_VERSION = 1
+        const val DATABASE_VERSION = 2
         const val MAX_PENDING = 1_000L
         const val RETENTION_MS = 30L * 24L * 60L * 60L * 1_000L
     }

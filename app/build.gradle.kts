@@ -10,16 +10,19 @@ android {
 
     defaultConfig {
         applicationId = "com.bydcollector.collector"
+        testInstrumentationRunner = "com.bydcollector.collector.NativeSqliteInstrumentation"
         minSdk = 26
         targetSdk = 29
-        versionCode = 272
-        versionName = "2.7.2"
+        versionCode = 273
+        versionName = "2.7.3"
         manifestPlaceholders["collectorLabel"] = "BYD Collector"
         buildConfigField("String", "COLLECTOR_DISPLAY_NAME", "\"BYD Collector\"")
         buildConfigField("String", "COLLECTOR_DATABASE_NAME", "\"bydcollector_telemetry.db\"")
         buildConfigField("String", "UPDATE_RELEASES_API_URL", "\"https://api.github.com/repos/sunlixWhyNotAvailable/byd-collector/releases/latest\"")
         buildConfigField("String", "ACTION_PREFIX", "\"com.bydcollector.collector\"")
     }
+
+    testBuildType = "performance"
 
     buildTypes {
         create("performance") {

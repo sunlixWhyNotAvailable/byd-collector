@@ -77,6 +77,13 @@ class TelegramCoordinator(
             ?.let { flushPending("$it:summary", force = true) }
         val result = engine.onPowerOffConfirmed(eventConfig(), snapshot, location, nowMs())
         handle(result)
+        result.locationEligibilityReason?.let { reason ->
+            eventStore.recordEvent(
+                "telegram_location_eligibility",
+                "Telegram power-off location eligibility evaluated",
+                "trigger=power_off reason=$reason"
+            )
+        }
         val priorityKey = result.events.firstOrNull {
             it.type == TelegramEventType.TRIP_SUMMARY && !it.locationOnly
         }?.dedupeKey ?: result.events.firstOrNull { it.locationOnly }?.dedupeKey
@@ -137,11 +144,9 @@ class TelegramCoordinator(
         val chatId = settings.telegramChatId()
         if (token.isBlank() || chatId.isBlank()) return null
         if (entry.blocked) return null
-        if (entry.dedupeKey.endsWith(":location")) {
-            val summary = telegramStore.telegramMessageByDedupeKey(
-                entry.dedupeKey.removeSuffix(":location") + ":summary"
-            )
-            if (summary != null) return summary.nextAttemptAtMs.takeIf { !summary.blocked }
+        entry.waitsForSummaryKey?.let { dependencyKey ->
+            val summary = telegramStore.telegramMessageByDedupeKey(dependencyKey)
+            return summary?.takeIf { !it.blocked }?.nextAttemptAtMs
         }
         val now = nowMs()
         if (!force && entry.nextAttemptAtMs > now) return entry.nextAttemptAtMs
@@ -276,7 +281,12 @@ class TelegramCoordinator(
             )
             return null
         }
-        return TelegramOutboxMessage(event.dedupeKey, event.type.key, payload)
+        return TelegramOutboxMessage(
+            dedupeKey = event.dedupeKey,
+            eventType = event.type.key,
+            payload = payload,
+            waitsForSummaryKey = event.waitsForSummaryKey
+        )
     }
 
     private fun telegramLanguage(): TelegramTemplateLanguage = when (settings.uiLanguageCode().trim().lowercase()) {

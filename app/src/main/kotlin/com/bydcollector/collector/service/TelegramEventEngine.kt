@@ -46,14 +46,16 @@ data class TelegramDetectedEvent(
     val variables: Map<String, String>,
     val textSuffix: String? = null,
     val omitOverall: Boolean = false,
-    val locationOnly: Boolean = false
+    val locationOnly: Boolean = false,
+    val waitsForSummaryKey: String? = null
 )
 
 data class TelegramEventResult(
     val state: TelegramEventState,
     val events: List<TelegramDetectedEvent>,
     val shouldPersist: Boolean,
-    val nextWakeAtMs: Long?
+    val nextWakeAtMs: Long?,
+    val locationEligibilityReason: String? = null
 )
 
 data class TelegramEventState(
@@ -438,8 +440,19 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         val tripId = state.tripId
         if (tripId == null) {
             val pendingLocationTripId = state.pendingPowerOffLocationTripId
+            val locationEligibilityReason = pendingLocationTripId?.let {
+                when {
+                    TelegramEventType.TRIP_SUMMARY !in config.enabledEvents -> "summary_disabled"
+                    !config.sendLocation -> "disabled"
+                    TelegramNavigatorMask.sanitize(config.navigatorMask) == TelegramNavigatorMask.NONE -> "no_navigator"
+                    location == null -> "no_fix"
+                    !isActualLocation(location) -> "invalid_fix"
+                    selectedLocationLinks(location, config.navigatorMask).isEmpty() -> "no_links"
+                    state.pendingPowerOffLocationSummaryDelivered -> "ready"
+                    else -> "waiting_summary"
+                }
+            }
             val locationLinks = pendingLocationTripId
-                ?.takeIf { state.pendingPowerOffLocationSummaryDelivered }
                 ?.takeIf { TelegramEventType.TRIP_SUMMARY in config.enabledEvents }
                 ?.takeIf { config.sendLocation }
                 ?.takeIf { TelegramNavigatorMask.sanitize(config.navigatorMask) != TelegramNavigatorMask.NONE }
@@ -455,7 +468,10 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
                         "$pendingLocationTripId:location",
                         emptyMap(),
                         textSuffix = locationLinks,
-                        locationOnly = true
+                        locationOnly = true,
+                        waitsForSummaryKey = pendingLocationTripId
+                            .takeUnless { state.pendingPowerOffLocationSummaryDelivered }
+                            ?.let { "$it:summary" }
                     )
                 }
                 state = state.copy(
@@ -468,7 +484,8 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
                 events,
                 nowMs,
                 force = counterResetObserved || state != original,
-                config = config
+                config = config,
+                locationEligibilityReason = locationEligibilityReason
             )
         }
         state = state.copy(
@@ -1129,7 +1146,8 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         variables: Map<String, String>,
         textSuffix: String? = null,
         omitOverall: Boolean = false,
-        locationOnly: Boolean = false
+        locationOnly: Boolean = false,
+        waitsForSummaryKey: String? = null
     ) {
         if (type in config.enabledEvents) {
             events += TelegramDetectedEvent(
@@ -1138,7 +1156,8 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
                 variables = variables,
                 textSuffix = textSuffix,
                 omitOverall = omitOverall,
-                locationOnly = locationOnly
+                locationOnly = locationOnly,
+                waitsForSummaryKey = waitsForSummaryKey
             )
         }
     }
@@ -1147,11 +1166,18 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         events: List<TelegramDetectedEvent>,
         nowMs: Long,
         force: Boolean,
-        config: TelegramEventConfig
+        config: TelegramEventConfig,
+        locationEligibilityReason: String? = null
     ): TelegramEventResult {
         val persist = force || events.isNotEmpty()
         if (persist) state = state.copy(lastPersistedAtMs = nowMs)
-        return TelegramEventResult(state, events, persist, pendingTripDeadline(config))
+        return TelegramEventResult(
+            state = state,
+            events = events,
+            shouldPersist = persist,
+            nextWakeAtMs = pendingTripDeadline(config),
+            locationEligibilityReason = locationEligibilityReason
+        )
     }
 
     private fun pendingTripDeadline(config: TelegramEventConfig): Long? {

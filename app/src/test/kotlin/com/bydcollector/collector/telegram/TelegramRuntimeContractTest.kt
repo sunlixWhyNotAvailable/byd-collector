@@ -102,6 +102,9 @@ class TelegramRuntimeContractTest {
         assertFalse(flush.contains("for ("))
         assertTrue(attempt.contains("entry.attemptCount + 1, result.retryAfterSeconds"))
         assertTrue(attempt.contains("markTelegramBlocked"))
+        assertTrue(attempt.contains("entry.waitsForSummaryKey"))
+        assertTrue(attempt.contains("telegramMessageByDedupeKey(dependencyKey)"))
+        assertInOrder(attempt, "entry.waitsForSummaryKey", "client.sendMessage")
         assertFalse(coordinator.contains("BACKLOG_SUCCESS_DELAY_MS"))
         assertFalse(store.contains("delayOldestTelegramMessageUntil"))
         assertTrue(helper.contains("MAX_PENDING = 1_000L"))
@@ -144,7 +147,9 @@ class TelegramRuntimeContractTest {
         assertInOrder(
             deliveryCommit,
             "db.beginTransactionNonExclusive()",
+            "SELECT dedupe_key FROM telegram_outbox",
             "db.delete(\"telegram_outbox\"",
+            "waits_for_summary_key = ?",
             "saveTelegramRuntimeState(db",
             "db.setTransactionSuccessful()",
             "db.endTransaction()"
@@ -188,6 +193,8 @@ class TelegramRuntimeContractTest {
         assertTrue(powerOff.contains("activateEnabledRuntime() ?: return null"))
         assertTrue(servicePowerOff.contains("coordinator.onPowerOffConfirmed("))
         assertFalse(servicePowerOff.contains("coordinator.flushPending()"))
+        assertTrue(coordinator.contains("telegram_location_eligibility"))
+        assertTrue(coordinator.contains("trigger=power_off reason="))
     }
 
     @Test

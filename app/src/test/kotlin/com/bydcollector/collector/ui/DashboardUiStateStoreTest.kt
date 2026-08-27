@@ -150,7 +150,7 @@ class DashboardUiStateStoreTest {
                 archiveStorageJobStatus = ArchiveStorageJobStatus(running = true)
             )
         )
-        store.publishDatabaseFootprints(100L, 200L)
+        store.publishDatabaseFootprints(100L, 200L, 300L)
 
         val generation = store.beginTabRefresh(AppTab.ALL_PARAMETERS)
         assertTrue(store.publishTab(AppTab.ALL_PARAMETERS, generation, dashboardState("stale")))
@@ -168,6 +168,8 @@ class DashboardUiStateStoreTest {
         assertEquals(DebugRuntimeStatus.RUNNING, state.debugRuntimeStatus)
         assertEquals(100L, state.databaseSizeBytes)
         assertEquals(200L, state.debugDatabaseSizeBytes)
+        assertEquals(300L, state.archiveStorageSnapshot.tripsDatabaseSizeBytes)
+        assertEquals(600L, state.archiveStorageSnapshot.activeDatabaseSizeBytes)
         assertTrue(state.dbMaintenanceStatus.running)
         assertTrue(state.archiveStorageJobStatus.running)
 

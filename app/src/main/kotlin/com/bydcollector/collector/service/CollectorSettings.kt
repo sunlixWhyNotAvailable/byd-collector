@@ -186,7 +186,9 @@ class CollectorSettings(
             clientId = mqttClientId(),
             topicPrefix = mqttTopicPrefix(),
             discoveryPrefix = mqttDiscoveryPrefix(),
-            enabledCategories = mqttEnabledCategories()
+            enabledCategories = mqttEnabledCategories(),
+            alternativeHost = mqttAlternativeHost(),
+            alternativePort = mqttAlternativePort()
         )
     }
 
@@ -217,10 +219,35 @@ class CollectorSettings(
         prefs.edit().putString(KEY_MQTT_HOST, host.trim()).apply()
     }
 
-    fun mqttPort(): Int = prefs.getInt(KEY_MQTT_PORT, DEFAULT_MQTT_PORT).coerceIn(1, 65535)
+    fun mqttPort(): Int = prefs.getInt(KEY_MQTT_PORT, DEFAULT_MQTT_PORT)
 
     fun setMqttPort(port: Int) {
-        prefs.edit().putInt(KEY_MQTT_PORT, port.coerceIn(1, 65535)).apply()
+        prefs.edit().putInt(KEY_MQTT_PORT, port).apply()
+    }
+
+    fun mqttAlternativeHost(): String? {
+        return prefs.getString(KEY_MQTT_ALTERNATIVE_HOST, null)
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+    }
+
+    fun setMqttAlternativeHost(host: String?) {
+        prefs.edit().apply {
+            if (host.isNullOrBlank()) remove(KEY_MQTT_ALTERNATIVE_HOST)
+            else putString(KEY_MQTT_ALTERNATIVE_HOST, host.trim())
+        }.apply()
+    }
+
+    fun mqttAlternativePort(): Int? {
+        if (!prefs.contains(KEY_MQTT_ALTERNATIVE_PORT)) return null
+        return prefs.getInt(KEY_MQTT_ALTERNATIVE_PORT, 0)
+    }
+
+    fun setMqttAlternativePort(port: Int?) {
+        prefs.edit().apply {
+            if (port == null) remove(KEY_MQTT_ALTERNATIVE_PORT)
+            else putInt(KEY_MQTT_ALTERNATIVE_PORT, port)
+        }.apply()
     }
 
     fun mqttUsername(): String = secretValue(SECRET_MQTT_USERNAME)
@@ -296,7 +323,9 @@ class CollectorSettings(
             username = if (includeCredentials) influxUsername().takeIf { it.isNotBlank() } else null,
             password = if (includeCredentials) influxPassword().takeIf { it.isNotBlank() } else null,
             measurement = influxMeasurement(),
-            enabledCategories = effectiveInfluxCategories()
+            enabledCategories = effectiveInfluxCategories(),
+            alternativeHost = influxAlternativeHost(),
+            alternativePort = influxAlternativePort()
         )
     }
 
@@ -836,10 +865,35 @@ class CollectorSettings(
         prefs.edit().putString(KEY_INFLUX_HOST, host.trim()).apply()
     }
 
-    fun influxPort(): Int = prefs.getInt(KEY_INFLUX_PORT, InfluxConfig.DEFAULT_PORT).coerceIn(1, 65535)
+    fun influxPort(): Int = prefs.getInt(KEY_INFLUX_PORT, InfluxConfig.DEFAULT_PORT)
 
     fun setInfluxPort(port: Int) {
-        prefs.edit().putInt(KEY_INFLUX_PORT, port.coerceIn(1, 65535)).apply()
+        prefs.edit().putInt(KEY_INFLUX_PORT, port).apply()
+    }
+
+    fun influxAlternativeHost(): String? {
+        return prefs.getString(KEY_INFLUX_ALTERNATIVE_HOST, null)
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+    }
+
+    fun setInfluxAlternativeHost(host: String?) {
+        prefs.edit().apply {
+            if (host.isNullOrBlank()) remove(KEY_INFLUX_ALTERNATIVE_HOST)
+            else putString(KEY_INFLUX_ALTERNATIVE_HOST, host.trim())
+        }.apply()
+    }
+
+    fun influxAlternativePort(): Int? {
+        if (!prefs.contains(KEY_INFLUX_ALTERNATIVE_PORT)) return null
+        return prefs.getInt(KEY_INFLUX_ALTERNATIVE_PORT, 0)
+    }
+
+    fun setInfluxAlternativePort(port: Int?) {
+        prefs.edit().apply {
+            if (port == null) remove(KEY_INFLUX_ALTERNATIVE_PORT)
+            else putInt(KEY_INFLUX_ALTERNATIVE_PORT, port)
+        }.apply()
     }
 
     fun influxDatabase(): String {
@@ -1044,8 +1098,10 @@ class CollectorSettings(
             val tripMigrationDone = prefs.getBoolean(KEY_TELEGRAM_TRIP_SUMMARY_MIGRATION_DONE, false)
             if (!tripMigrationDone) {
                 val tripKey = "$KEY_TELEGRAM_TEMPLATE_PREFIX${TelegramEventType.TRIP_SUMMARY.key}"
-                if (prefs.contains(tripKey)) {
-                    editor.putString(tripKey, TelegramBuiltInTemplates.TRIP_SUMMARY_UK)
+                val saved = runCatching { prefs.getString(tripKey, null) }.getOrNull()
+                if (saved != null && TelegramBuiltInTemplates.isKnownBuiltIn(TelegramEventType.TRIP_SUMMARY, saved)) {
+                    editor.remove(tripKey)
+                    changed = true
                 }
                 editor.putBoolean(KEY_TELEGRAM_TRIP_SUMMARY_MIGRATION_DONE, true)
                 changed = true
@@ -1054,7 +1110,7 @@ class CollectorSettings(
             if (!prefs.getBoolean(KEY_TELEGRAM_CHARGED_TO_100_MIGRATION_DONE, false)) {
                 val chargedKey = "$KEY_TELEGRAM_TEMPLATE_PREFIX${TelegramEventType.CHARGED_TO_100.key}"
                 val saved = runCatching { prefs.getString(chargedKey, null) }.getOrNull()
-                if (saved != null && TelegramBuiltInTemplates.isHistoricBuiltIn(TelegramEventType.CHARGED_TO_100, saved)) {
+                if (saved != null && TelegramBuiltInTemplates.isKnownBuiltIn(TelegramEventType.CHARGED_TO_100, saved)) {
                     editor.remove(chargedKey)
                     changed = true
                 }
@@ -1065,21 +1121,11 @@ class CollectorSettings(
             if (!prefs.getBoolean(KEY_TELEGRAM_BUILTIN_DEFAULTS_MIGRATION_DONE, false)) {
                 TelegramEventType.entries.forEach { event ->
                     val key = "$KEY_TELEGRAM_TEMPLATE_PREFIX${event.key}"
-                    val saved = if (
-                        event == TelegramEventType.TRIP_SUMMARY && !tripMigrationDone && prefs.contains(key)
-                    ) {
-                        TelegramBuiltInTemplates.TRIP_SUMMARY_UK
-                    } else {
-                        runCatching { prefs.getString(key, null) }.getOrNull()
-                    }
+                    val saved = runCatching { prefs.getString(key, null) }.getOrNull()
                     if (saved != null && TelegramBuiltInTemplates.isKnownBuiltIn(event.key, saved)) {
                         editor.remove(key)
                         changed = true
                     }
-                }
-                if (!tripMigrationDone) {
-                    val tripKey = "$KEY_TELEGRAM_TEMPLATE_PREFIX${TelegramEventType.TRIP_SUMMARY.key}"
-                    if (prefs.contains(tripKey)) editor.remove(tripKey)
                 }
                 editor.putBoolean(KEY_TELEGRAM_BUILTIN_DEFAULTS_MIGRATION_DONE, true)
                 changed = true
@@ -1105,6 +1151,8 @@ class CollectorSettings(
         const val KEY_MQTT_AUTO_START = "mqttAutoStart"
         const val KEY_MQTT_HOST = "mqttHost"
         const val KEY_MQTT_PORT = "mqttPort"
+        const val KEY_MQTT_ALTERNATIVE_HOST = "mqttAlternativeHost"
+        const val KEY_MQTT_ALTERNATIVE_PORT = "mqttAlternativePort"
         const val KEY_MQTT_USERNAME = "mqttUsername"
         const val KEY_MQTT_PASSWORD = "mqttPassword"
         const val KEY_MQTT_CLIENT_ID = "mqttClientId"
@@ -1117,6 +1165,8 @@ class CollectorSettings(
         const val KEY_HA_SHARED_CATEGORIES = "haSharedCategories"
         const val KEY_INFLUX_HOST = "influxHost"
         const val KEY_INFLUX_PORT = "influxPort"
+        const val KEY_INFLUX_ALTERNATIVE_HOST = "influxAlternativeHost"
+        const val KEY_INFLUX_ALTERNATIVE_PORT = "influxAlternativePort"
         const val KEY_INFLUX_DATABASE = "influxDatabase"
         const val KEY_INFLUX_USERNAME = "influxUsername"
         const val KEY_INFLUX_PASSWORD = "influxPassword"
@@ -1202,7 +1252,7 @@ class CollectorSettings(
         const val DEFAULT_UI_LANGUAGE_CODE = "uk"
         const val MIN_TELEGRAM_CHARGE_STEP = 1
         const val MAX_TELEGRAM_CHARGE_STEP = 99
-        const val DEFAULT_TELEGRAM_LOW_VOLTAGE = 12.0f
+        const val DEFAULT_TELEGRAM_LOW_VOLTAGE = 12.5f
         const val MIN_TELEGRAM_LOW_VOLTAGE = 9.0f
         const val MAX_TELEGRAM_LOW_VOLTAGE = 15.0f
         const val DEFAULT_TELEGRAM_UNAVAILABLE_DELAY = 1

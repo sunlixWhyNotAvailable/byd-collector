@@ -3,6 +3,7 @@ package com.bydcollector.collector.ui
 import android.os.SystemClock
 import com.bydcollector.collector.maintenance.ArchiveStorageManager
 import com.bydcollector.collector.maintenance.ArchiveStorageSnapshot
+import com.bydcollector.collector.data.trips.TripDatabaseHelper
 import com.bydcollector.collector.util.namedSingleThreadExecutor
 import com.bydcollector.collector.util.sqliteFootprintBytes
 import java.io.File
@@ -19,6 +20,7 @@ class ArchiveStorageSnapshotCache(
     private val archiveRoot: File,
     private val mainDatabaseFile: File,
     private val debugDatabaseFile: File,
+    private val tripsDatabaseFile: File = File(mainDatabaseFile.parentFile, TripDatabaseHelper.DATABASE_NAME),
     private val ttlMs: Long = 30_000L,
     private val clock: () -> Long = { SystemClock.elapsedRealtime() },
     private val executor: Executor = namedSingleThreadExecutor("byd-archive-snapshot"),
@@ -26,7 +28,8 @@ class ArchiveStorageSnapshotCache(
         ArchiveStorageManager(
             archiveRoot = archiveRoot,
             mainDatabaseFile = mainDatabaseFile,
-            debugDatabaseFile = debugDatabaseFile
+            debugDatabaseFile = debugDatabaseFile,
+            tripsDatabaseFile = tripsDatabaseFile
         ).snapshot(limitBytes)
     }
 ) {
@@ -133,6 +136,7 @@ class ArchiveStorageSnapshotCache(
             archiveRootPath = archiveRoot.absolutePath,
             mainDatabaseSizeBytes = databaseSize(mainDatabaseFile),
             debugDatabaseSizeBytes = databaseSize(debugDatabaseFile),
+            tripsDatabaseSizeBytes = databaseSize(tripsDatabaseFile),
             archiveBytes = 0L,
             archiveLimitBytes = limitBytes,
             entries = emptyList()
@@ -143,6 +147,7 @@ class ArchiveStorageSnapshotCache(
         return copy(
             mainDatabaseSizeBytes = databaseSize(mainDatabaseFile),
             debugDatabaseSizeBytes = databaseSize(debugDatabaseFile),
+            tripsDatabaseSizeBytes = databaseSize(tripsDatabaseFile),
             archiveLimitBytes = limitBytes
         )
     }

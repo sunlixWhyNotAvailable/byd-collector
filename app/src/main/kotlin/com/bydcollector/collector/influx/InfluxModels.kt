@@ -1,15 +1,28 @@
 package com.bydcollector.collector.influx
 
+enum class InfluxFailureKind {
+    TRANSPORT,
+    AUTHENTICATION,
+    DATA,
+    PROTOCOL,
+    OTHER
+}
+
 data class InfluxActionResult(
     val ok: Boolean,
     val category: String,
     val message: String,
-    val httpStatus: Int? = null
+    val httpStatus: Int? = null,
+    val failureKind: InfluxFailureKind? = null
 ) {
     companion object {
         fun ok(message: String = "ok") = InfluxActionResult(true, "ok", message)
-        fun fail(category: String, message: String, httpStatus: Int? = null) =
-            InfluxActionResult(false, category, message, httpStatus)
+        fun fail(
+            category: String,
+            message: String,
+            httpStatus: Int? = null,
+            failureKind: InfluxFailureKind? = null
+        ) = InfluxActionResult(false, category, message, httpStatus, failureKind)
     }
 }
 

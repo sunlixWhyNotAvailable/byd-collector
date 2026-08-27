@@ -7,7 +7,8 @@ data class TelegramOutboxEntry(
     val payload: String,
     val attemptCount: Int,
     val nextAttemptAtMs: Long,
-    val blocked: Boolean
+    val blocked: Boolean,
+    val waitsForSummaryKey: String? = null
 )
 
 data class TelegramEnqueueResult(
@@ -19,7 +20,8 @@ data class TelegramEnqueueResult(
 data class TelegramOutboxMessage(
     val dedupeKey: String,
     val eventType: String,
-    val payload: String
+    val payload: String,
+    val waitsForSummaryKey: String? = null
 )
 
 /** A lossless copy of one row from the pre-sidecar Main database. */

@@ -92,19 +92,13 @@ class TripRuntimeCoordinator(
         observations: List<NormalizedObservation>,
         liveTelemetry: Boolean
     ) {
+        val receivedElapsedMs = elapsedRealtimeMs()
+        val snapshot = computeTelemetrySnapshot(observations, receivedElapsedMs)
+        if (liveTelemetry) vehicleSpeedReference.observe(snapshot.speedKmh, receivedElapsedMs)
         dispatch {
             ensureInitialized()
-            val values = observations.associateBy { it.field.fieldKey }
-            val snapshot = TelemetrySnapshot(
-                soc = values.number("soc"),
-                odometerKm = values.number("odometer_km"),
-                tripEnergyKwh = values.number("trip_energy_kwh"),
-                speedKmh = values.number("speed_kmh"),
-                batteryPowerKw = values.number("battery_power_kw")
-            )
-            if (liveTelemetry) vehicleSpeedReference.observe(snapshot.speedKmh)
             latestBatteryPowerKw = snapshot.batteryPowerKw
-            latestBatteryPowerAtMs = elapsedRealtimeMs()
+            latestBatteryPowerAtMs = snapshot.receivedElapsedMs
 
             val decodedPower = readings.firstOrNull { it.rawKey == POWER_FIELD_KEY }
                 ?.descValue
@@ -179,12 +173,11 @@ class TripRuntimeCoordinator(
         if (session == null) lastLocation = null
         if (historyEnabled()) {
             if (session == null) {
-                val elapsed = elapsedRealtimeMs()
                 val startEnergy = snapshot.tripEnergyKwh?.takeIf { it.isFinite() && it >= 0.0 }
                 session = TripSession(
-                    tripId = TripId.forPowerSession(bootId, elapsed),
+                    tripId = TripId.forPowerSession(bootId, snapshot.receivedElapsedMs),
                     startedAt = timestamp,
-                    startElapsedMs = elapsed,
+                    startElapsedMs = snapshot.receivedElapsedMs,
                     startBootId = bootId,
                     startSegmentId = segmentId,
                     startSoc = snapshot.soc,
@@ -257,7 +250,7 @@ class TripRuntimeCoordinator(
             current.copy(
                 state = TripSession.STATE_CLOSED,
                 endedAt = timestamp,
-                endElapsedMs = elapsedRealtimeMs(),
+                endElapsedMs = snapshot.receivedElapsedMs,
                 endBootId = bootId,
                 endSegmentId = segmentId,
                 termination = "power_off"
@@ -293,10 +286,11 @@ class TripRuntimeCoordinator(
     private fun handleLocation(sample: GpsLocationSample, isFinal: Boolean) {
         if (!running.get()) return
         lastLocation = sample
-        persistLocation(LocationNormalizer.observations(sample, System.currentTimeMillis()))
+        persistLocation(LocationNormalizer.observations(sample, sample.receiveWallTimeMs))
         val current = session ?: return
+        val powerAgeMs = sample.receiveElapsedRealtimeNanos / 1_000_000L - latestBatteryPowerAtMs
         val power = latestBatteryPowerKw.takeIf {
-            elapsedRealtimeMs() - latestBatteryPowerAtMs <= TELEMETRY_FRESH_MS
+            powerAgeMs in 0L..TELEMETRY_FRESH_MS
         }
         val point = TripMetrics.routePoint(
             tripId = current.tripId,
@@ -373,6 +367,21 @@ class TripRuntimeCoordinator(
         return observation.value.number?.takeIf(Double::isFinite)
     }
 
+    private fun computeTelemetrySnapshot(
+        observations: List<NormalizedObservation>,
+        receivedElapsedMs: Long
+    ): TelemetrySnapshot {
+        val values = observations.associateBy { it.field.fieldKey }
+        return TelemetrySnapshot(
+            soc = values.number("soc"),
+            odometerKm = values.number("odometer_km"),
+            tripEnergyKwh = values.number("trip_energy_kwh"),
+            speedKmh = values.number("speed_kmh"),
+            batteryPowerKw = values.number("battery_power_kw"),
+            receivedElapsedMs = receivedElapsedMs
+        )
+    }
+
     private fun decreased(value: Double?, previous: Double?): Boolean =
         value != null && previous != null && value.isFinite() && previous.isFinite() && value + COUNTER_EPSILON < previous
 
@@ -401,7 +410,8 @@ class TripRuntimeCoordinator(
         val odometerKm: Double?,
         val tripEnergyKwh: Double?,
         val speedKmh: Double?,
-        val batteryPowerKw: Double?
+        val batteryPowerKw: Double?,
+        val receivedElapsedMs: Long
     )
 
     companion object {

@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Color as AndroidColor
 import android.graphics.Paint
 import android.view.ViewGroup
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -32,6 +33,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -45,6 +48,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextRange
@@ -68,6 +76,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.viewinterop.AndroidView
 import com.bydcollector.collector.R
+import com.bydcollector.collector.ha.HaEndpointProfile
 import com.bydcollector.collector.maintenance.ArchiveEntryStatus
 import com.bydcollector.collector.maintenance.ArchiveStorageSnapshot
 import com.bydcollector.collector.maintenance.ArchiveStorageEntry
@@ -76,6 +85,8 @@ import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.maintenance.DbMaintenanceUiState
 import com.bydcollector.collector.service.CollectorService
+import com.bydcollector.collector.service.TripCompressionService
+import com.bydcollector.collector.service.TripCompressionState
 import com.bydcollector.collector.telegram.TelegramEventType
 import com.bydcollector.collector.telegram.TelegramNavigatorMask
 import com.bydcollector.collector.telegram.TelegramPayloadLimitState
@@ -127,6 +138,8 @@ fun BydCollectorApp(
         val p = LocalBydPalette.current
         var pendingArchiveDeleteIds by remember { mutableStateOf<List<String>>(emptyList()) }
         var showClearLogsDialog by rememberSaveable { mutableStateOf(false) }
+        var showTripsCompressionConfirm by rememberSaveable { mutableStateOf(false) }
+        val tripsCompression by TripCompressionService.state.collectAsStateWithLifecycle()
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -160,7 +173,12 @@ fun BydCollectorApp(
                             when (activeTab) {
                                 AppTab.MAIN -> MainTab(state, s, actions, actionUiState)
                                 AppTab.ALL_PARAMETERS -> AllParametersTab(state, s, language, actions)
-                                AppTab.TRIPS -> TripsTab(tripsUiState, tripsUiActions, s, language)
+                                AppTab.TRIPS -> TripsTab(
+                                    tripsUiState,
+                                    tripsUiActions.copy(onCompressDatabase = { showTripsCompressionConfirm = true }),
+                                    s,
+                                    language
+                                )
                                  AppTab.HA -> HaTab(
                                      state,
                                      s,
@@ -240,6 +258,21 @@ fun BydCollectorApp(
                             actions.onClearLogs()
                         },
                         onDismiss = { showClearLogsDialog = false },
+                    )
+                }
+                if (showTripsCompressionConfirm || tripsCompression.running ||
+                    tripsCompression.completed || tripsCompression.error != null) {
+                    TripsCompressionDialog(
+                        strings = s,
+                        state = tripsCompression,
+                        onConfirm = {
+                            showTripsCompressionConfirm = false
+                            tripsUiActions.onCompressDatabase()
+                        },
+                        onDismiss = {
+                            showTripsCompressionConfirm = false
+                            if (TripCompressionService.dismissResult()) tripsUiActions.onRefreshRequested()
+                        }
                     )
                 }
             }
@@ -415,7 +448,8 @@ private val TelegramMessageDefinitions = listOf(
             "charge_added_percent",
             "charge_added_kwh",
             "charge_duration",
-            "battery_power_kw"
+            "battery_power_kw",
+            "time"
         )
     ),
     TelegramMessageDefinition(
@@ -753,6 +787,17 @@ private fun TripsTab(
         .firstOrNull { it.id == selectedTripId }
     TabScrollColumn {
         ScreenTitle(strings.tripsTab, strings.tripsSubtitle)
+        SectionCard(title = strings.database, modifier = Modifier.fillMaxWidth()) {
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                InfoRow(strings.size, UiSizeFormatter.bytes(state.databaseSizeBytes, strings), modifier = Modifier.weight(0.84f))
+                ReadOnlyPathField(state.databasePath.ifBlank { "—" }, modifier = Modifier.weight(1.06f))
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Spacer(Modifier.weight(0.84f))
+                ActionButton(strings.compressDatabase, actions.onCompressDatabase, primary = true, modifier = Modifier.weight(1.06f))
+            }
+        }
         SectionCard(
             title = strings.routeColors,
             modifier = Modifier.fillMaxWidth(),
@@ -1277,6 +1322,7 @@ private fun MqttCard(
     actionUiState: BydCollectorActionUiState,
     modifier: Modifier
 ) {
+    val connection by CollectorService.mqttConnection.state.collectAsStateWithLifecycle()
     SectionCard(
         title = "MQTT",
         trailing = { StatusPill(compactChannelStatusText(state?.mqttStatus, strings, state?.mqttRuntimeStatus), channelStatusKind(state?.mqttStatus, state?.mqttEnabled == true, state?.mqttRuntimeStatus), compact = true) },
@@ -1289,17 +1335,17 @@ private fun MqttCard(
             onTest = actions::onTestMqtt,
             runtimeStatus = state?.mqttRuntimeStatus ?: RuntimeActionStatus.STOPPED,
             channelEnabled = state?.mqttEnabled == true,
-            testInFlight = actionUiState.mqttTest
+            testInFlight = actionUiState.mqttTest,
+            connectionOwned = connection.owned,
+            connectionStopping = connection.stopping
         )
-        Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text(strings.autoStart, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            BydSwitch(state?.mqttAutoStartEnabled == true, actions::onToggleMqttAutoStart)
-        }
-        ChannelPrelude(strings, mqtt = true, pendingText = "${state?.mqttPendingCount ?: 0L} ${strings.messages}", actions = actions)
+        ChannelQueueRow(strings, "${state?.mqttPendingCount ?: 0L} ${strings.messages}",
+            state?.mqttAutoStartEnabled == true, actions::onToggleMqttAutoStart)
         CategoryGrid(strings.mqttCategories, state?.mqttEnabledCategories.orEmpty(), enabled = state?.mqttEnabled != true, strings = strings) { category ->
             actions.onToggleMqttCategory(category, !state?.mqttEnabledCategories.orEmpty().contains(category))
         }
-        CredentialGridMqtt(strings, draft, actions)
+        CredentialGridMqtt(strings, draft, actions, connection.activeRoute, !connection.owned && !actionUiState.mqttTest)
+        if (connection.owned) Text(strings.stopChannelToEdit, color = LocalBydPalette.current.muted, fontSize = 12.sp)
     }
 }
 
@@ -1312,6 +1358,7 @@ private fun InfluxCard(
     actionUiState: BydCollectorActionUiState,
     modifier: Modifier
 ) {
+    val connection by CollectorService.influxConnection.state.collectAsStateWithLifecycle()
     SectionCard(
         title = "InfluxDB",
         trailing = { StatusPill(compactChannelStatusText(state?.influxStatus, strings, state?.influxRuntimeStatus), channelStatusKind(state?.influxStatus, state?.influxEnabled == true, state?.influxRuntimeStatus), compact = true) },
@@ -1324,19 +1371,12 @@ private fun InfluxCard(
             onTest = actions::onTestInflux,
             runtimeStatus = state?.influxRuntimeStatus ?: RuntimeActionStatus.STOPPED,
             channelEnabled = state?.influxEnabled == true,
-            testInFlight = actionUiState.influxTest
+            testInFlight = actionUiState.influxTest,
+            connectionOwned = connection.owned,
+            connectionStopping = connection.stopping
         )
-        Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text(strings.autoStart, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            BydSwitch(state?.influxAutoStartEnabled == true, actions::onToggleInfluxAutoStart)
-        }
-        ChannelPrelude(
-            strings,
-            mqtt = false,
-            pendingText = "${state?.influxPendingRows ?: 0L} ${strings.points}",
-            actions = actions,
-            reExportInFlight = actionUiState.influxReExport
-        )
+        ChannelQueueRow(strings, "${state?.influxPendingRows ?: 0L} ${strings.points}",
+            state?.influxAutoStartEnabled == true, actions::onToggleInfluxAutoStart)
         CategoryGrid(
             strings.influxCategories,
             if (state?.haSharedCategoriesEnabled == true) state.mqttEnabledCategories else state?.influxEnabledCategories.orEmpty(),
@@ -1345,55 +1385,29 @@ private fun InfluxCard(
         ) { category ->
             actions.onToggleInfluxCategory(category, !state?.influxEnabledCategories.orEmpty().contains(category))
         }
-        CredentialGridInflux(strings, draft, actions)
+        CredentialGridInflux(strings, draft, actions, connection.activeRoute, !connection.owned && !actionUiState.influxTest)
+        if (connection.owned) Text(strings.stopChannelToEdit, color = LocalBydPalette.current.muted, fontSize = 12.sp)
     }
 }
 
 @Composable
-private fun ChannelPrelude(
+private fun ChannelQueueRow(
     strings: UiStrings,
-    mqtt: Boolean,
     pendingText: String,
-    actions: BydCollectorActions,
-    reExportInFlight: Boolean = false,
-    height: Dp = 78.dp
+    autoStart: Boolean,
+    onAutoStartChanged: (Boolean) -> Unit
 ) {
-    Column(
-        modifier = Modifier.height(height),
-        verticalArrangement = Arrangement.Top
+    Row(
+        modifier = Modifier.fillMaxWidth().height(42.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Spacer(Modifier.height(8.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            verticalAlignment = Alignment.Top
-        ) {
-            InfoRow(strings.queued, pendingText, modifier = Modifier.weight(1f))
-            if (mqtt) {
-                Spacer(Modifier.weight(1f))
-            } else {
-                Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-                    ActionButton(
-                        if (reExportInFlight) strings.loading else strings.reExport,
-                        actions::onReExportInflux,
-                        enabled = !reExportInFlight,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Text(
-                        strings.reExportHint,
-                        color = LocalBydPalette.current.muted,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        textAlign = TextAlign.Center,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 6.dp)
-                    )
-                }
-            }
+        Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+            Text(strings.autoStart, color = LocalBydPalette.current.text, fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+            BydSwitch(autoStart, onAutoStartChanged)
         }
+        ReadOnlyPathField("${strings.queued}:   $pendingText", Modifier.weight(1f).padding(horizontal = 24.dp))
     }
 }
 
@@ -1405,21 +1419,26 @@ private fun ChannelButtons(
     onTest: () -> Unit,
     runtimeStatus: RuntimeActionStatus,
     channelEnabled: Boolean,
-    testInFlight: Boolean
+    testInFlight: Boolean,
+    connectionOwned: Boolean = false,
+    connectionStopping: Boolean = false
 ) {
+    val starting = runtimeStatus == RuntimeActionStatus.STARTING ||
+        (connectionOwned && runtimeStatus == RuntimeActionStatus.STOPPED)
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         ActionButton(
-            if (runtimeStatus == RuntimeActionStatus.STARTING) strings.starting else strings.start,
+            if (starting) strings.starting else strings.start,
             onStart,
             primary = true,
-            enabled = runtimeStatus != RuntimeActionStatus.STARTING && runtimeStatus != RuntimeActionStatus.RUNNING,
+            enabled = !testInFlight && !starting && !connectionStopping &&
+                runtimeStatus != RuntimeActionStatus.RUNNING && runtimeStatus != RuntimeActionStatus.STOPPING,
             modifier = Modifier.weight(1f)
         )
         ActionButton(
-            if (runtimeStatus == RuntimeActionStatus.STOPPING) strings.stopping else strings.stop,
+            if (connectionStopping || runtimeStatus == RuntimeActionStatus.STOPPING) strings.stopping else strings.stop,
             onStop,
-            enabled = runtimeStatus != RuntimeActionStatus.STOPPING &&
-                (runtimeStatus != RuntimeActionStatus.STOPPED || channelEnabled),
+            enabled = !connectionStopping && runtimeStatus != RuntimeActionStatus.STOPPING &&
+                (runtimeStatus != RuntimeActionStatus.STOPPED || channelEnabled || connectionOwned),
             modifier = Modifier.weight(1f)
         )
         ActionButton(
@@ -1462,57 +1481,111 @@ private fun CategoryGrid(
 }
 
 @Composable
-private fun CredentialGridMqtt(strings: UiStrings, draft: MqttDraft, actions: BydCollectorActions) {
+private fun CredentialGridMqtt(
+    strings: UiStrings, draft: MqttDraft, actions: BydCollectorActions,
+    activeRoute: HaEndpointProfile?, enabled: Boolean
+) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        val alternative = draft.editingProfile == HaEndpointProfile.ALTERNATIVE
+        HaEndpointFields(strings, "MQTT", draft.editingProfile, activeRoute, enabled,
+            if (alternative) draft.alternativeHost else draft.host,
+            if (alternative) draft.alternativePort else draft.port, "1883",
+            { actions.onMqttDraftChanged(if (alternative) draft.copy(alternativeHost = it) else draft.copy(host = it)) },
+            { actions.onMqttDraftChanged(if (alternative) draft.copy(alternativePort = it) else draft.copy(port = it)) },
+            { actions.onMqttDraftChanged(draft.copy(editingProfile = it)) })
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            TextInput(strings.host, draft.host, { actions.onMqttDraftChanged(draft.copy(host = it)) }, Modifier.weight(1f))
-            TextInput(strings.port, draft.port, { actions.onMqttDraftChanged(draft.copy(port = it)) }, Modifier.weight(1f), keyboardType = KeyboardType.Number)
-        }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            TextInput(strings.username, draft.username, { actions.onMqttDraftChanged(draft.copy(username = it)) }, Modifier.weight(1f))
+            TextInput(strings.username, draft.username, { actions.onMqttDraftChanged(draft.copy(username = it)) }, Modifier.weight(1f), enabled = enabled)
             TextInput(
                 strings.password,
                 draft.password,
                 { actions.onMqttDraftChanged(draft.copy(password = it)) },
                 Modifier.weight(1f),
                 password = true,
+                enabled = enabled,
                 showPasswordContentDescription = strings.showSecret,
                 hidePasswordContentDescription = strings.hideSecret
             )
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            TextInput(strings.clientId, draft.clientId, { actions.onMqttDraftChanged(draft.copy(clientId = it)) }, Modifier.weight(1f))
-            TextInput(strings.topicPrefix, draft.topicPrefix, { actions.onMqttDraftChanged(draft.copy(topicPrefix = it)) }, Modifier.weight(1f))
+            TextInput(strings.clientId, draft.clientId, { actions.onMqttDraftChanged(draft.copy(clientId = it)) }, Modifier.weight(1f), enabled = enabled)
+            TextInput(strings.topicPrefix, draft.topicPrefix, { actions.onMqttDraftChanged(draft.copy(topicPrefix = it)) }, Modifier.weight(1f), enabled = enabled)
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            TextInput(strings.discoveryPrefix, draft.discoveryPrefix, { actions.onMqttDraftChanged(draft.copy(discoveryPrefix = it)) }, Modifier.weight(1f))
+            TextInput(strings.discoveryPrefix, draft.discoveryPrefix, { actions.onMqttDraftChanged(draft.copy(discoveryPrefix = it)) }, Modifier.weight(1f), enabled = enabled)
             Spacer(Modifier.weight(1f))
         }
     }
 }
 
 @Composable
-private fun CredentialGridInflux(strings: UiStrings, draft: InfluxDraft, actions: BydCollectorActions) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            TextInput(strings.host, draft.host, { actions.onInfluxDraftChanged(draft.copy(host = it)) }, Modifier.weight(1f))
-            TextInput(strings.port, draft.port, { actions.onInfluxDraftChanged(draft.copy(port = it)) }, Modifier.weight(1f), keyboardType = KeyboardType.Number)
+private fun HaEndpointFields(
+    strings: UiStrings, channel: String, editing: HaEndpointProfile, active: HaEndpointProfile?,
+    enabled: Boolean, host: String, port: String, portHint: String,
+    onHost: (String) -> Unit, onPort: (String) -> Unit, onProfile: (HaEndpointProfile) -> Unit
+) {
+    val p = LocalBydPalette.current
+    val focus = LocalFocusManager.current
+    val interactionSource = remember { MutableInteractionSource() }
+    var expanded by remember { mutableStateOf(false) }
+    LaunchedEffect(enabled) { if (!enabled) { expanded = false; focus.clearFocus() } }
+    fun name(profile: HaEndpointProfile) = if (profile == HaEndpointProfile.PRIMARY) strings.primaryProfile else strings.alternativeProfile
+    val suffix = "${name(editing)} · ${strings.activeProfile}: ${active?.let(::name) ?: "—"}"
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Box(Modifier.weight(1f)) {
+            TextInput("${strings.host} · $suffix", host, onHost, enabled = enabled,
+                placeholder = if (editing == HaEndpointProfile.PRIMARY) "192.168.x.y" else "100.x.y.z",
+                trailing = {
+                    Box(Modifier.size(32.dp).pressScaleModifier(interactionSource, enabled).clip(Rounded8)
+                        .semantics { contentDescription = "$channel ${strings.connectionProfile}" }
+                        .clickable(enabled = enabled, interactionSource = interactionSource, indication = null, role = Role.Button) {
+                            focus.clearFocus(); expanded = !expanded
+                        },
+                        contentAlignment = Alignment.Center) { DisclosureMark(true) }
+                })
+            DropdownMenu(expanded && enabled, { expanded = false }, modifier = Modifier.width(216.dp).background(p.panel)) {
+                HaEndpointProfile.entries.forEach { profile ->
+                    DropdownMenuItem(
+                        text = { Text(name(profile), color = p.text, fontSize = 13.sp) },
+                        onClick = { if (enabled) onProfile(profile); expanded = false },
+                        modifier = Modifier.background(if (profile == editing) p.active else Color.Transparent)
+                    )
+                }
+            }
         }
+        TextInput("${strings.port} · $suffix", port, onPort, Modifier.weight(1f), enabled = enabled,
+            keyboardType = KeyboardType.Number, placeholder = portHint)
+    }
+}
+
+@Composable
+private fun CredentialGridInflux(
+    strings: UiStrings, draft: InfluxDraft, actions: BydCollectorActions,
+    activeRoute: HaEndpointProfile?, enabled: Boolean
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        val alternative = draft.editingProfile == HaEndpointProfile.ALTERNATIVE
+        HaEndpointFields(strings, "InfluxDB", draft.editingProfile, activeRoute, enabled,
+            if (alternative) draft.alternativeHost else draft.host,
+            if (alternative) draft.alternativePort else draft.port, "8086",
+            { actions.onInfluxDraftChanged(if (alternative) draft.copy(alternativeHost = it) else draft.copy(host = it)) },
+            { actions.onInfluxDraftChanged(if (alternative) draft.copy(alternativePort = it) else draft.copy(port = it)) },
+            { actions.onInfluxDraftChanged(draft.copy(editingProfile = it)) })
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            TextInput(strings.username, draft.username, { actions.onInfluxDraftChanged(draft.copy(username = it)) }, Modifier.weight(1f))
+            TextInput(strings.username, draft.username, { actions.onInfluxDraftChanged(draft.copy(username = it)) }, Modifier.weight(1f), enabled = enabled)
             TextInput(
                 strings.password,
                 draft.password,
                 { actions.onInfluxDraftChanged(draft.copy(password = it)) },
                 Modifier.weight(1f),
                 password = true,
+                enabled = enabled,
                 showPasswordContentDescription = strings.showSecret,
                 hidePasswordContentDescription = strings.hideSecret
             )
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            TextInput(strings.databaseField, draft.database, { actions.onInfluxDraftChanged(draft.copy(database = it)) }, Modifier.weight(1f))
-            TextInput(strings.measurement, draft.measurement, { actions.onInfluxDraftChanged(draft.copy(measurement = it)) }, Modifier.weight(1f))
+            TextInput(strings.databaseField, draft.database, { actions.onInfluxDraftChanged(draft.copy(database = it)) }, Modifier.weight(1f), enabled = enabled)
+            TextInput(strings.measurement, draft.measurement, { actions.onInfluxDraftChanged(draft.copy(measurement = it)) }, Modifier.weight(1f), enabled = enabled)
         }
     }
 }
@@ -1692,17 +1765,18 @@ private fun TelegramMessageCard(
         },
         modifier = modifier
     ) {
-        telegramNumberSetting(definition.type, config, strings.telegram, onConfigChanged)?.let { setting ->
-            TelegramNumberStepper(
-                setting = setting,
-            )
+        val setting = telegramNumberSetting(definition.type, config, strings.telegram, onConfigChanged)
+        if (setting != null) {
+            TelegramNumberStepper(setting)
+        } else {
+            Spacer(Modifier.height(42.dp))
         }
-        if (definition.type == TelegramMessageType.TRIP_SUMMARY) {
-            Row(
-                modifier = Modifier.fillMaxWidth().height(42.dp),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().height(42.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (definition.type == TelegramMessageType.TRIP_SUMMARY) {
                 ActionButton(
                     text = strings.sendLocation,
                     onClick = { showLocationSettings = true },
@@ -1715,19 +1789,15 @@ private fun TelegramMessageCard(
                     emphasized = true,
                     textAlign = TextAlign.Center
                 )
+            } else {
+                Text(
+                    strings.telegram.messageTemplate,
+                    color = LocalBydPalette.current.muted,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f)
+                )
             }
-        }
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                strings.telegram.messageTemplate,
-                color = LocalBydPalette.current.muted,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.SemiBold
-            )
             ActionButton(
                 text = "{}",
                 onClick = { showVariablePicker = true },
@@ -1953,33 +2023,37 @@ private fun TelegramVariableDialog(
                     fontWeight = FontWeight.SemiBold
                 )
                 Spacer(Modifier.height(12.dp))
-                variables.forEachIndexed { index, variable ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 48.dp)
-                            .clickable { onSelect(variable.first) }
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(16.dp)
-                    ) {
-                        Text(
-                            text = variable.first,
-                            color = p.accent,
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            fontFamily = FontFamily.Monospace,
-                            modifier = Modifier.weight(0.45f)
-                        )
-                        Text(
-                            text = variable.second,
-                            color = p.text,
-                            fontSize = 13.sp,
-                            modifier = Modifier.weight(0.55f)
-                        )
-                    }
-                    if (index != variables.lastIndex) {
-                        Box(Modifier.fillMaxWidth().height(1.dp).background(p.border))
+                Column(
+                    modifier = Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())
+                ) {
+                    variables.forEachIndexed { index, variable ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp)
+                                .clickable { onSelect(variable.first) }
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(16.dp)
+                        ) {
+                            Text(
+                                text = variable.first,
+                                color = p.accent,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                fontFamily = FontFamily.Monospace,
+                                modifier = Modifier.weight(0.45f)
+                            )
+                            Text(
+                                text = variable.second,
+                                color = p.text,
+                                fontSize = 13.sp,
+                                modifier = Modifier.weight(0.55f)
+                            )
+                        }
+                        if (index != variables.lastIndex) {
+                            Box(Modifier.fillMaxWidth().height(1.dp).background(p.border))
+                        }
                     }
                 }
                 Spacer(Modifier.height(14.dp))
@@ -2366,6 +2440,76 @@ private fun UpdateCheckDialog(
 }
 
 @Composable
+private fun TripsCompressionDialog(
+    strings: UiStrings,
+    state: TripCompressionState,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val p = LocalBydPalette.current
+    BackHandler { if (!state.running) onDismiss() }
+    Box(
+        Modifier.fillMaxSize().background(p.background.copy(alpha = 0.82f)).padding(28.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        ModalInputBlocker()
+        Column(
+            Modifier.width(560.dp).height(340.dp).background(p.panel, Rounded8)
+                .border(1.dp, p.borderStrong, Rounded8).padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Text(strings.tripsCompressionTitle, color = p.text, fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
+            Column(
+                Modifier.weight(1f).fillMaxWidth().background(p.pathField, Rounded8)
+                    .border(1.dp, p.border, Rounded8).padding(12.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                when {
+                    state.running -> {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            CircularProgressIndicator(Modifier.size(28.dp), color = p.accent, strokeWidth = 3.dp)
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text("${strings.step} ${state.stepIndex + 1}/${strings.tripsCompressionSteps.size}", color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                                Text(strings.tripsCompressionSteps[state.stepIndex.coerceIn(0, strings.tripsCompressionSteps.lastIndex)], color = p.muted, fontSize = 14.sp, lineHeight = 19.sp)
+                            }
+                        }
+                        Text(strings.tripsCompressionWarning, color = p.muted, fontSize = 14.sp, lineHeight = 19.sp)
+                    }
+                    state.error != null -> {
+                        Text(strings.tripsCompressionFailed, color = p.red, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                        Text(state.error, color = p.muted, fontSize = 13.sp, lineHeight = 18.sp)
+                    }
+                    state.completed -> {
+                        Text(strings.tripsCompressionComplete, color = p.green, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                        Text("${UiSizeFormatter.bytes(state.beforeBytes, strings)} → ${UiSizeFormatter.bytes(state.afterBytes, strings)}", color = p.text, fontSize = 15.sp)
+                        val saved = (state.beforeBytes - state.afterBytes).coerceAtLeast(0L)
+                        Text(
+                            if (saved == 0L) strings.tripsCompressionNoSavings
+                            else String.format(strings.tripsCompressionSaved, UiSizeFormatter.bytes(saved, strings)),
+                            color = p.muted, fontSize = 14.sp, lineHeight = 19.sp
+                        )
+                    }
+                    else -> {
+                        Text(strings.tripsCompressionWarning, color = p.text, fontSize = 14.sp, lineHeight = 19.sp)
+                        Text(strings.tripsCompressionConfirm, color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+            if (!state.running) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    if (state.error != null || state.completed) {
+                        ActionButton(strings.ok, onDismiss, modifier = Modifier.weight(1f))
+                    } else {
+                        ActionButton(strings.yes, onConfirm, primary = true, modifier = Modifier.weight(1f))
+                        ActionButton(strings.no, onDismiss, modifier = Modifier.weight(1f))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun DatabaseMaintenanceDialog(
     strings: UiStrings,
     state: DbMaintenanceUiState,
@@ -2636,15 +2780,15 @@ private fun StorageTab(
                         Text(
                             String.format(
                                 strings.activeDatabaseSizeTemplate,
-                                UiSizeFormatter.bytes(snapshot?.activeDatabaseSizeBytes ?: ((state?.databaseSizeBytes ?: 0L) + (state?.debugDatabaseSizeBytes ?: 0L)), strings),
+                                UiSizeFormatter.bytes(snapshot?.activeDatabaseSizeBytes ?: 0L, strings),
                                 UiSizeFormatter.bytes(snapshot?.mainDatabaseSizeBytes ?: state?.databaseSizeBytes ?: 0L, strings),
-                                UiSizeFormatter.bytes(snapshot?.debugDatabaseSizeBytes ?: state?.debugDatabaseSizeBytes ?: 0L, strings)
+                                UiSizeFormatter.bytes(snapshot?.debugDatabaseSizeBytes ?: state?.debugDatabaseSizeBytes ?: 0L, strings),
+                                UiSizeFormatter.bytes(snapshot?.tripsDatabaseSizeBytes ?: 0L, strings)
                             ),
                             color = LocalBydPalette.current.text,
                             fontSize = 14.sp,
                             fontWeight = FontWeight.SemiBold,
                             textAlign = TextAlign.End,
-                            modifier = Modifier.weight(2.8f),
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )

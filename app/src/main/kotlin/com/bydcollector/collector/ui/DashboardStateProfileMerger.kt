@@ -131,7 +131,12 @@ internal object DashboardStateProfileMerger {
         }
         if (!archiveDetailsLoaded) {
             merged = merged.copy(
-                archiveStorageSnapshot = previous.archiveStorageSnapshot,
+                archiveStorageSnapshot = previous.archiveStorageSnapshot.copy(
+                    // File footprints are always sampled, even when the archive list is cached.
+                    mainDatabaseSizeBytes = next.archiveStorageSnapshot.mainDatabaseSizeBytes,
+                    debugDatabaseSizeBytes = next.archiveStorageSnapshot.debugDatabaseSizeBytes,
+                    tripsDatabaseSizeBytes = next.archiveStorageSnapshot.tripsDatabaseSizeBytes
+                ),
                 archiveStorageScanPending = previous.archiveStorageScanPending
             )
         }

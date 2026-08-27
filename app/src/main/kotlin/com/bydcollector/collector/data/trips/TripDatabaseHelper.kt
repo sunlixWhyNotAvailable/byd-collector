@@ -6,13 +6,16 @@ import android.database.sqlite.SQLiteOpenHelper
 import java.io.File
 
 /** Separate, app-private trip history database. It deliberately has no outbox/meta domain table. */
-class TripDatabaseHelper(context: Context) : SQLiteOpenHelper(
+class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME) : SQLiteOpenHelper(
     context.applicationContext,
-    DATABASE_NAME,
+    databaseName,
     null,
     DATABASE_VERSION
 ) {
-    val databaseFile: File get() = File(readableDatabase.path)
+    private val databasePath = context.applicationContext.getDatabasePath(databaseName)
+
+    /** Resolves the file without opening SQLite; required while preparing a snapshot/candidate. */
+    val databaseFile: File get() = databasePath
     override fun onConfigure(db: SQLiteDatabase) {
         db.setForeignKeyConstraintsEnabled(true)
         db.enableWriteAheadLogging()
@@ -80,11 +83,13 @@ class TripDatabaseHelper(context: Context) : SQLiteOpenHelper(
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_trip_sessions_started_at ON trip_sessions(started_at DESC)")
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_trip_sessions_state_movement ON trip_sessions(state, movement_observed, started_at DESC)")
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_route_points_trip_order ON route_points(trip_id, sequence)")
+        createRouteChunks(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         require(oldVersion <= DATABASE_VERSION) { "Trip database downgrade is unsupported" }
         if (oldVersion < 2) db.execSQL("ALTER TABLE route_points ADD COLUMN receive_wall_time_ms INTEGER")
+        if (oldVersion < 3) createRouteChunks(db)
         onCreate(db)
     }
 
@@ -92,8 +97,30 @@ class TripDatabaseHelper(context: Context) : SQLiteOpenHelper(
         error("Trip database downgrade $oldVersion->$newVersion is unsupported; archive first")
     }
 
+    private fun createRouteChunks(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS route_chunks (
+                trip_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL CHECK (chunk_index >= 0),
+                first_sequence INTEGER NOT NULL CHECK (first_sequence >= 0),
+                last_sequence INTEGER NOT NULL CHECK (last_sequence >= first_sequence),
+                point_count INTEGER NOT NULL CHECK (point_count > 0),
+                first_observed_at TEXT NOT NULL,
+                last_observed_at TEXT NOT NULL,
+                uncompressed_size INTEGER NOT NULL CHECK (uncompressed_size BETWEEN 1 AND 32768),
+                compressed_size INTEGER NOT NULL CHECK (compressed_size BETWEEN 1 AND 65536),
+                payload BLOB NOT NULL CHECK (length(payload) BETWEEN 1 AND 65536 AND length(payload) = compressed_size),
+                PRIMARY KEY (trip_id, chunk_index),
+                CHECK (last_sequence = first_sequence + point_count - 1),
+                FOREIGN KEY (trip_id) REFERENCES trip_sessions(trip_id) ON DELETE CASCADE
+            )
+            """.trimIndent()
+        )
+    }
+
     companion object {
         const val DATABASE_NAME = "bydcollector_trips.db"
-        const val DATABASE_VERSION = 2
+        const val DATABASE_VERSION = 3
     }
 }

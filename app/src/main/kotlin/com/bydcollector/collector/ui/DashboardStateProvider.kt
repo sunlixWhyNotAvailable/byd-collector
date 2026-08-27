@@ -14,6 +14,7 @@ import com.bydcollector.collector.data.local.HealthSnapshot
 import com.bydcollector.collector.data.local.HealthSnapshotDetail
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
+import com.bydcollector.collector.data.trips.TripDatabaseHelper
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
 import com.bydcollector.collector.influx.InfluxExportStateSnapshot
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
@@ -48,7 +49,8 @@ class DashboardStateProvider(
     private val archiveStorageCache = ArchiveStorageSnapshotCache(
         archiveRoot = File(context.filesDir, "db_archive"),
         mainDatabaseFile = context.getDatabasePath(TelemetryDatabaseHelper.DATABASE_NAME),
-        debugDatabaseFile = context.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME)
+        debugDatabaseFile = context.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME),
+        tripsDatabaseFile = context.getDatabasePath(TripDatabaseHelper.DATABASE_NAME)
     )
     private val healthCacheRunning = mutableMapOf<HealthSnapshotDetail, Boolean>()
     private var recentEventsSource: List<CollectorEvent>? = null

@@ -9,6 +9,52 @@ import kotlin.test.assertTrue
 
 class ArchiveStorageSnapshotCacheTest {
     @Test
+    fun allThreeFootprintsStayFreshIncludingWalAndFailedArchiveScans() {
+        val root = Files.createTempDirectory("byd-three-footprints").toFile()
+        try {
+            val main = root.resolve("bydcollector_telemetry.db").apply { writeText("main") }
+            val debug = root.resolve("bydcollector_debug_round_robin.db").apply { writeText("debug") }
+            val trips = root.resolve("bydcollector_trips.db").apply { writeBytes(ByteArray(10)) }
+            val wal = root.resolve(trips.name + "-wal").apply { writeBytes(ByteArray(20)) }
+            root.resolve(trips.name + "-shm").writeBytes(ByteArray(30))
+            root.resolve(trips.name + "-journal").writeBytes(ByteArray(40))
+            val archives = root.resolve("db_archive")
+            var now = 100L
+            var scans = 0
+            var fail = false
+            val cache = ArchiveStorageSnapshotCache(
+                archiveRoot = archives, mainDatabaseFile = main, debugDatabaseFile = debug,
+                tripsDatabaseFile = trips, clock = { now }, executor = { it.run() }
+            ) { limit ->
+                scans++
+                if (fail) error("archive scan failed")
+                com.bydcollector.collector.maintenance.ArchiveStorageManager(archives, main, debug, trips).snapshot(limit)
+            }
+            val light = cache.snapshot(1024L, includeDetails = false).snapshot
+            assertEquals(100L, light.tripsDatabaseSizeBytes)
+            assertEquals(109L, light.activeDatabaseSizeBytes)
+            assertEquals(0, scans)
+            cache.snapshot(1024L, includeDetails = true)
+            assertEquals(1, scans)
+            assertTrue(wal.delete())
+            val cached = cache.snapshot(1024L, includeDetails = true).snapshot
+            assertEquals(80L, cached.tripsDatabaseSizeBytes)
+            assertEquals(89L, cached.activeDatabaseSizeBytes)
+            now += 31_000L
+            fail = true
+            cache.snapshot(1024L, includeDetails = true)
+            trips.writeBytes(ByteArray(5))
+            val fallback = cache.snapshot(1024L, includeDetails = true)
+            assertNotNull(fallback.error)
+            assertEquals(75L, fallback.snapshot.tripsDatabaseSizeBytes)
+            assertEquals(84L, fallback.snapshot.activeDatabaseSizeBytes)
+            cache.close()
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun storageScanRunsOnlyWhenRequestedAndCachesForTtl() {
         val root = Files.createTempDirectory("byd-archive-cache").toFile()
         val active = root.resolve("bydcollector_telemetry.db").apply { writeText("active") }

@@ -81,6 +81,7 @@ class DashboardUiStateStore(
     private var integrationRuntimeState: DashboardState? = null
     private var mainDatabaseSizeBytes: Long? = null
     private var debugDatabaseSizeBytes: Long? = null
+    private var tripsDatabaseSizeBytes: Long? = null
 
     val chromeState: StateFlow<CachedDashboardState?> = chrome.asStateFlow()
     private val tabFlows = tabs.mapValues { (_, flow) -> flow.asStateFlow() }
@@ -282,10 +283,11 @@ class DashboardUiStateStore(
         }
     }
 
-    fun publishDatabaseFootprints(mainBytes: Long, debugBytes: Long) {
+    fun publishDatabaseFootprints(mainBytes: Long, debugBytes: Long, tripsBytes: Long) {
         synchronized(lock) {
             mainDatabaseSizeBytes = mainBytes
             debugDatabaseSizeBytes = debugBytes
+            tripsDatabaseSizeBytes = tripsBytes
             updateTargetsLocked(
                 setOf(AppTab.MAIN, AppTab.ALL_PARAMETERS, AppTab.STORAGE),
                 includeChrome = true
@@ -459,6 +461,11 @@ class DashboardUiStateStore(
         }
         mainDatabaseSizeBytes?.let { state = state.copy(databaseSizeBytes = it) }
         debugDatabaseSizeBytes?.let { state = state.copy(debugDatabaseSizeBytes = it) }
+        state = state.copy(archiveStorageSnapshot = state.archiveStorageSnapshot.copy(
+            mainDatabaseSizeBytes = mainDatabaseSizeBytes ?: state.archiveStorageSnapshot.mainDatabaseSizeBytes,
+            debugDatabaseSizeBytes = debugDatabaseSizeBytes ?: state.archiveStorageSnapshot.debugDatabaseSizeBytes,
+            tripsDatabaseSizeBytes = tripsDatabaseSizeBytes ?: state.archiveStorageSnapshot.tripsDatabaseSizeBytes
+        ))
         return state
     }
 

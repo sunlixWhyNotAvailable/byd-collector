@@ -69,6 +69,7 @@ class TelegramStore(
                 put("dedupe_key", message.dedupeKey)
                 put("event_type", message.eventType)
                 put("payload", message.payload)
+                message.waitsForSummaryKey?.let { put("waits_for_summary_key", it) }
                 put("created_at_ms", nowMs)
                 put("next_attempt_at_ms", nowMs)
             },
@@ -81,9 +82,10 @@ class TelegramStore(
         val filter = if (eventType == null) "" else " AND event_type = ?"
         return queryTelegramMessage(
             """
-            SELECT id, dedupe_key, event_type, payload, attempt_count, next_attempt_at_ms, blocked
+            SELECT id, dedupe_key, event_type, payload, attempt_count, next_attempt_at_ms, blocked,
+                   waits_for_summary_key
             FROM telegram_outbox
-            WHERE blocked = 0$filter
+            WHERE blocked = 0 AND waits_for_summary_key IS NULL$filter
             ORDER BY id
             LIMIT 1
             """.trimIndent(),
@@ -93,10 +95,11 @@ class TelegramStore(
 
     fun telegramMessageByDedupeKey(dedupeKey: String): TelegramOutboxEntry? = queryTelegramMessage(
         """
-        SELECT id, dedupe_key, event_type, payload, attempt_count, next_attempt_at_ms, blocked
-        FROM telegram_outbox
-        WHERE dedupe_key = ?
-        LIMIT 1
+            SELECT id, dedupe_key, event_type, payload, attempt_count, next_attempt_at_ms, blocked,
+                   waits_for_summary_key
+            FROM telegram_outbox
+            WHERE dedupe_key = ?
+            LIMIT 1
         """.trimIndent(),
         arrayOf(dedupeKey)
     )
@@ -111,7 +114,8 @@ class TelegramStore(
                 payload = cursor.getString(3),
                 attemptCount = cursor.getInt(4),
                 nextAttemptAtMs = cursor.getLong(5),
-                blocked = cursor.getInt(6) != 0
+                blocked = cursor.getInt(6) != 0,
+                waitsForSummaryKey = if (cursor.isNull(7)) null else cursor.getString(7)
             )
         }
 
@@ -125,9 +129,22 @@ class TelegramStore(
         val db = helper.writableDatabase
         db.beginTransactionNonExclusive()
         try {
+            val dedupeKey = db.rawQuery(
+                "SELECT dedupe_key FROM telegram_outbox WHERE id = ?",
+                arrayOf(id.toString())
+            ).use { cursor ->
+                check(cursor.moveToFirst()) { "Telegram outbox row disappeared before delivery commit" }
+                cursor.getString(0)
+            }
             check(db.delete("telegram_outbox", "id = ?", arrayOf(id.toString())) == 1) {
                 "Telegram outbox row disappeared before delivery commit"
             }
+            db.update(
+                "telegram_outbox",
+                ContentValues().apply { putNull("waits_for_summary_key") },
+                "waits_for_summary_key = ?",
+                arrayOf(dedupeKey)
+            )
             stateJson?.let { saveTelegramRuntimeState(db, it, deliveredAtMs) }
             db.setTransactionSuccessful()
         } finally {
@@ -300,10 +317,10 @@ class TelegramStore(
                 check(copiedCount == snapshot.outbox.size) {
                     "Telegram outbox migration copied $copiedCount/${snapshot.outbox.size} rows"
                 }
-                val stateCopied = exactRuntimeState(db, snapshot, nowMs)
-                check(stateCopied == (snapshot.runtimeStateJson != null)) {
+                check(exactRuntimeState(db, snapshot, nowMs)) {
                     "Telegram runtime state migration verification failed"
                 }
+                val stateCopied = snapshot.runtimeStateJson != null
                 check(exactSnapshot(db, snapshot, nowMs)) {
                     "Telegram outbox migration column verification failed"
                 }

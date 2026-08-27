@@ -1,5 +1,6 @@
 package com.bydcollector.collector.influx
 
+import com.bydcollector.collector.ha.HaEndpointProfile
 import com.bydcollector.collector.data.local.Clock
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -398,13 +399,13 @@ class InfluxExportCoordinatorTest {
     }
 
     @Test
-    fun reExportCreatesMissingCursorsWithoutResettingExisting() {
+    fun normalResumeCreatesMissingCursorsWithoutResettingExisting() {
         val store = FakeInfluxStore(rows = emptyList())
         store.ensureInfluxCursors(setOf("soc"))
         store.updateInfluxCursorSuccess("soc", 99, "2026-06-15T12:00:00Z")
         val coordinator = coordinator(store, FakeInfluxClient())
 
-        val result = coordinator.reExportNewCategories()
+        val result = coordinator.resumeExport()
 
         assertTrue(result.ok)
         assertEquals(99, store.cursor("soc").lastExportedHistoryId)
@@ -416,20 +417,199 @@ class InfluxExportCoordinatorTest {
         )))
     }
 
+    @Test
+    fun transportFailureFallsBackToAlternativeAndSticksForNextBatch() {
+        val store = FakeInfluxStore(rows = listOf(row(id = 1, fieldKey = "soc")))
+        val client = ScriptedInfluxClient(
+            InfluxActionResult.fail("influx_network_error", "primary offline", failureKind = InfluxFailureKind.TRANSPORT),
+            InfluxActionResult.ok(),
+            InfluxActionResult.ok()
+        )
+        val coordinator = coordinator(
+            store,
+            client,
+            influxConfig = config(alternativeHost = "influx-alt.local", alternativePort = 8087)
+        )
+
+        assertTrue(coordinator.runOneCycle(force = true).ok)
+        store.addRow(row(id = 2, fieldKey = "soc"))
+        assertTrue(coordinator.runOneCycle(force = true).ok)
+
+        assertEquals(listOf("influx.local", "influx-alt.local", "influx-alt.local"), client.configs.map { it.host })
+        assertEquals(client.writtenLines[0], client.writtenLines[1])
+        assertEquals(HaEndpointProfile.ALTERNATIVE, coordinator.activeRoute)
+    }
+
+    @Test
+    fun alternativeFailureFallsBackToPrimaryAndBothFailuresResetForNextCycle() {
+        val store = FakeInfluxStore(rows = listOf(row(id = 1, fieldKey = "soc")))
+        val client = ScriptedInfluxClient(
+            InfluxActionResult.fail("influx_network_error", "primary offline", failureKind = InfluxFailureKind.TRANSPORT),
+            InfluxActionResult.ok(),
+            InfluxActionResult.fail("influx_network_error", "alternative offline", failureKind = InfluxFailureKind.TRANSPORT),
+            InfluxActionResult.ok(),
+            InfluxActionResult.fail("influx_network_error", "primary offline", failureKind = InfluxFailureKind.TRANSPORT),
+            InfluxActionResult.fail("influx_network_error", "alternative offline", failureKind = InfluxFailureKind.TRANSPORT),
+            InfluxActionResult.ok()
+        )
+        val coordinator = coordinator(
+            store,
+            client,
+            influxConfig = config(alternativeHost = "influx-alt.local", alternativePort = 8087)
+        )
+
+        assertTrue(coordinator.runOneCycle(force = true).ok)
+        store.addRow(row(id = 2, fieldKey = "soc"))
+        assertTrue(coordinator.runOneCycle(force = true).ok)
+        store.addRow(row(id = 3, fieldKey = "soc"))
+        assertFalse(coordinator.runOneCycle(force = true).ok)
+        store.addRow(row(id = 4, fieldKey = "soc"))
+        assertTrue(coordinator.runOneCycle(force = true).ok)
+
+        assertEquals(
+            listOf("influx.local", "influx-alt.local", "influx-alt.local", "influx.local", "influx.local", "influx-alt.local", "influx.local"),
+            client.configs.map { it.host }
+        )
+        assertEquals(HaEndpointProfile.PRIMARY, coordinator.activeRoute)
+    }
+
+    @Test
+    fun authenticationAndRateLimitFailuresStayOnCurrentEndpoint() {
+        val store = FakeInfluxStore(rows = listOf(row(id = 1, fieldKey = "soc")))
+        val client = ScriptedInfluxClient(
+            InfluxActionResult.fail("influx_http_error", "unauthorized", httpStatus = 401, failureKind = InfluxFailureKind.AUTHENTICATION),
+            InfluxActionResult.fail("influx_http_error", "too many requests", httpStatus = 429)
+        )
+        val coordinator = coordinator(
+            store,
+            client,
+            influxConfig = config(alternativeHost = "influx-alt.local", alternativePort = 8087)
+        )
+
+        assertFalse(coordinator.runOneCycle(force = true).ok)
+        assertEquals(listOf("influx.local"), client.configs.map { it.host })
+        store.addRow(row(id = 2, fieldKey = "soc"))
+        assertFalse(coordinator.runOneCycle(force = true).ok)
+        assertEquals(listOf("influx.local", "influx.local"), client.configs.map { it.host })
+    }
+
+    @Test
+    fun unsuccessfulAlternativeDoesNotBecomeStickyAfterPrimaryTransportFailure() {
+        val failures = listOf(
+            InfluxActionResult.fail("influx_http_error", "unauthorized", httpStatus = 401, failureKind = InfluxFailureKind.AUTHENTICATION),
+            InfluxActionResult.fail("influx_http_error", "invalid data", httpStatus = 422, failureKind = InfluxFailureKind.DATA),
+            InfluxActionResult.fail("influx_protocol_error", "TLS failure", failureKind = InfluxFailureKind.PROTOCOL),
+            InfluxActionResult.fail("influx_http_error", "too many requests", httpStatus = 429)
+        )
+        failures.forEach { failure ->
+            val store = FakeInfluxStore(rows = listOf(row(id = 1, fieldKey = "soc")))
+            val client = ScriptedInfluxClient(
+                InfluxActionResult.fail("influx_network_error", "primary offline", failureKind = InfluxFailureKind.TRANSPORT),
+                failure,
+                InfluxActionResult.ok()
+            )
+            val coordinator = coordinator(
+                store,
+                client,
+                influxConfig = config(alternativeHost = "influx-alt.local", alternativePort = 8087)
+            )
+
+            assertFalse(coordinator.runOneCycle(force = true).ok)
+            assertEquals(null, coordinator.activeRoute, failure.message)
+            assertEquals(0L, store.cursor("soc").lastExportedHistoryId)
+            assertEquals(listOf("influx.local", "influx-alt.local"), client.configs.map { it.host })
+            assertTrue(coordinator.runOneCycle(force = true).ok)
+            assertEquals(listOf("influx.local", "influx-alt.local", "influx.local"), client.configs.map { it.host })
+            assertTrue(client.writtenLines.all { it == client.writtenLines.first() })
+            assertEquals(HaEndpointProfile.PRIMARY, coordinator.activeRoute)
+            assertEquals(1L, store.cursor("soc").lastExportedHistoryId)
+        }
+    }
+
+    @Test
+    fun successfulPinnedSplitEstablishesAlternativeAsStickyRoute() {
+        val store = FakeInfluxStore(rows = listOf(row(id = 1, fieldKey = "soc"), row(id = 2, fieldKey = "soc")))
+        val client = ScriptedInfluxClient(
+            InfluxActionResult.fail("influx_network_error", "primary offline", failureKind = InfluxFailureKind.TRANSPORT),
+            InfluxActionResult.fail("influx_http_error", "partial write: field type conflict", httpStatus = 400),
+            InfluxActionResult.ok(),
+            InfluxActionResult.ok(),
+            InfluxActionResult.ok()
+        )
+        val coordinator = coordinator(
+            store,
+            client,
+            influxConfig = config(alternativeHost = "influx-alt.local", alternativePort = 8087)
+        )
+
+        assertTrue(coordinator.runOneCycle(force = true).ok)
+        assertEquals(HaEndpointProfile.ALTERNATIVE, coordinator.activeRoute)
+        store.addRow(row(id = 3, fieldKey = "soc"))
+        assertTrue(coordinator.runOneCycle(force = true).ok)
+        assertEquals(listOf("influx.local", "influx-alt.local", "influx-alt.local", "influx-alt.local", "influx-alt.local"), client.configs.map { it.host })
+        assertEquals(3L, store.cursor("soc").lastExportedHistoryId)
+    }
+
+    @Test
+    fun poison400SplittingStaysPinnedToAlternativeEndpoint() {
+        val store = FakeInfluxStore(rows = listOf(row(id = 1, fieldKey = "soc")))
+        val client = ScriptedInfluxClient(
+            InfluxActionResult.fail("influx_network_error", "primary offline", failureKind = InfluxFailureKind.TRANSPORT),
+            InfluxActionResult.ok(),
+            InfluxActionResult.fail("influx_http_error", "partial write: field type conflict", httpStatus = 400),
+            InfluxActionResult.fail("influx_http_error", "partial write: field type conflict", httpStatus = 400),
+            InfluxActionResult.fail("influx_http_error", "partial write: field type conflict", httpStatus = 400)
+        )
+        val coordinator = coordinator(
+            store,
+            client,
+            influxConfig = config(alternativeHost = "influx-alt.local", alternativePort = 8087)
+        )
+
+        assertTrue(coordinator.runOneCycle(force = true).ok)
+        store.addRow(row(id = 2, fieldKey = "soc"))
+        store.addRow(row(id = 3, fieldKey = "soc"))
+        assertTrue(coordinator.runOneCycle(force = true).ok)
+
+        assertEquals(listOf("influx.local", "influx-alt.local", "influx-alt.local", "influx-alt.local", "influx-alt.local"), client.configs.map { it.host })
+        assertEquals(3L, store.cursor("soc").lastExportedHistoryId)
+    }
+
+    @Test
+    fun ownedResumeUsesFrozenEndpointWhenLiveDraftBecomesInvalid() {
+        val store = FakeInfluxStore(rows = emptyList())
+        var live = config(alternativeHost = "influx-alt.local", alternativePort = 8087)
+        val coordinator = InfluxExportCoordinator(
+            store = store,
+            client = FakeInfluxClient(),
+            configProvider = { live },
+            clock = FakeClock()
+        )
+
+        assertTrue(coordinator.resumeExport().ok)
+        live = live.copy(alternativeHost = "influx alt", alternativePort = 8087)
+
+        assertTrue(coordinator.resumeExport().ok)
+    }
+
     private fun coordinator(
         store: FakeInfluxStore,
         client: InfluxClient,
-        clock: Clock = FakeClock()
+        clock: Clock = FakeClock(),
+        influxConfig: InfluxConfig = config()
     ): InfluxExportCoordinator {
         return InfluxExportCoordinator(
             store = store,
             client = client,
-            configProvider = { config() },
+            configProvider = { influxConfig },
             clock = clock
         )
     }
 
-    private fun config(): InfluxConfig = InfluxConfig(
+    private fun config(
+        alternativeHost: String? = null,
+        alternativePort: Int? = null
+    ): InfluxConfig = InfluxConfig(
         enabled = true,
         host = "influx.local",
         port = 8086,
@@ -437,7 +617,9 @@ class InfluxExportCoordinatorTest {
         username = null,
         password = null,
         measurement = "byd_state",
-        enabledCategories = setOf("battery")
+        enabledCategories = setOf("battery"),
+        alternativeHost = alternativeHost,
+        alternativePort = alternativePort
     )
 
     private fun row(id: Long, fieldKey: String): InfluxPendingHistoryRow = InfluxPendingHistoryRow(
@@ -482,12 +664,16 @@ class InfluxExportCoordinatorTest {
         private val results = ArrayDeque(results.toList())
         var writeCalls = 0
         val writtenLineSizes = mutableListOf<Int>()
+        val configs = mutableListOf<InfluxConfig>()
+        val writtenLines = mutableListOf<List<String>>()
 
         override fun test(config: InfluxConfig): InfluxActionResult = InfluxActionResult.ok()
 
         override fun write(config: InfluxConfig, lines: List<String>): InfluxActionResult {
             writeCalls += 1
             writtenLineSizes += lines.size
+            configs += config
+            writtenLines += lines
             return results.removeFirst()
         }
     }

@@ -41,9 +41,10 @@ class RuntimeDemandTest {
             RuntimeLiveness(influxQueued = true),
             RuntimeLiveness(influxInFlight = true),
             RuntimeLiveness(influxRetryScheduled = true),
+            RuntimeLiveness(influxOwned = true),
             RuntimeLiveness()
         ).map(RuntimeLiveness::active)
 
-        assertEquals(listOf(true, true, true, false), lifecycle)
+        assertEquals(listOf(true, true, true, true, false), lifecycle)
     }
 }

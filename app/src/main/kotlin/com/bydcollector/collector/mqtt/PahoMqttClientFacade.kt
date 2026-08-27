@@ -2,8 +2,17 @@ package com.bydcollector.collector.mqtt
 
 import org.eclipse.paho.client.mqttv3.MqttClient
 import org.eclipse.paho.client.mqttv3.MqttConnectOptions
+import org.eclipse.paho.client.mqttv3.MqttException
+import org.eclipse.paho.client.mqttv3.MqttSecurityException
 import org.eclipse.paho.client.mqttv3.MqttMessage
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
+import java.io.IOException
+import java.io.InterruptedIOException
+import java.net.ConnectException
+import java.net.NoRouteToHostException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
+import javax.net.ssl.SSLException
 
 interface PahoMqttClientHandle {
     val serverUri: String
@@ -22,23 +31,42 @@ class PahoMqttClientFacade(
         PahoMqttClientHandleAdapter(MqttClient(serverUri, clientId, MemoryPersistence()))
     }
 ) : MqttClientFacade {
-    private var client: PahoMqttClientHandle? = null
+    @Volatile private var client: PahoMqttClientHandle? = null
     private var clientIdentity: ClientIdentity? = null
+
+    override val isConnected: Boolean
+        get() = client?.isConnected == true
 
     private data class ClientIdentity(
         val serverUri: String,
         val clientId: String,
-        val willTopic: String
+        val willTopic: String?,
+        val purpose: MqttConnectionPurpose
     )
 
-    @Synchronized
     override fun connect(config: HaMqttConfig, willMessage: HaMqttMessage?): MqttActionResult {
+        return connect(config, willMessage, MqttConnectionPurpose.RUNTIME)
+    }
+
+    @Synchronized
+    override fun connect(
+        config: HaMqttConfig,
+        willMessage: HaMqttMessage?,
+        purpose: MqttConnectionPurpose
+    ): MqttActionResult {
         if (Thread.currentThread().isInterrupted) {
-            return MqttActionResult.fail("mqtt_cancelled", "MQTT worker was interrupted")
+            return MqttActionResult.fail(
+                "mqtt_cancelled",
+                "MQTT worker was interrupted",
+                MqttFailureKind.CANCELLED
+            )
         }
         return runMqttAction {
-            val will = willMessage ?: defaultWill(config)
-            val identity = ClientIdentity(config.serverUri, config.clientId, will.topic)
+            val will = when (purpose) {
+                MqttConnectionPurpose.RUNTIME -> willMessage ?: defaultWill(config)
+                MqttConnectionPurpose.TEST_NO_WILL -> willMessage
+            }
+            val identity = ClientIdentity(config.serverUri, config.clientId, will?.topic, purpose)
             val mqttClient = client?.takeIf { clientIdentity == identity }
                 ?: replaceClient(config, identity)
             if (!mqttClient.isConnected) {
@@ -53,7 +81,7 @@ class PahoMqttClientFacade(
                     throw error
                 }
             }
-            MqttActionResult.ok()
+            MqttActionResult.ok("connected")
         }
     }
 
@@ -80,12 +108,24 @@ class PahoMqttClientFacade(
     @Synchronized
     override fun publish(message: HaMqttMessage): MqttActionResult {
         if (Thread.currentThread().isInterrupted) {
-            return MqttActionResult.fail("mqtt_cancelled", "MQTT worker was interrupted")
+            return MqttActionResult.fail(
+                "mqtt_cancelled",
+                "MQTT worker was interrupted",
+                MqttFailureKind.CANCELLED
+            )
         }
         return runMqttAction {
-            val mqttClient = client ?: return@runMqttAction MqttActionResult.fail("mqtt_error", "MQTT client is not connected")
+            val mqttClient = client ?: return@runMqttAction MqttActionResult.fail(
+                "mqtt_error",
+                "MQTT client is not connected",
+                MqttFailureKind.TRANSPORT
+            )
             if (!mqttClient.isConnected) {
-                return@runMqttAction MqttActionResult.fail("mqtt_error", "MQTT client is not connected")
+                return@runMqttAction MqttActionResult.fail(
+                    "mqtt_error",
+                    "MQTT client is not connected",
+                    MqttFailureKind.TRANSPORT
+                )
             }
             mqttClient.publish(message.topic, mqttMessage(message))
             MqttActionResult.ok()
@@ -114,7 +154,8 @@ class PahoMqttClientFacade(
         } else {
             MqttActionResult.fail(
                 "mqtt_error",
-                "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                "${error::class.java.simpleName}: ${error.message ?: "no message"}",
+                classifyFailure(error)
             )
         }
     }
@@ -128,15 +169,17 @@ class PahoMqttClientFacade(
         )
     }
 
-    private fun connectOptions(config: HaMqttConfig, will: HaMqttMessage): MqttConnectOptions {
+    private fun connectOptions(config: HaMqttConfig, will: HaMqttMessage?): MqttConnectOptions {
         return MqttConnectOptions().apply {
             isCleanSession = true
             connectionTimeout = 5
             keepAliveInterval = 30
             config.username?.takeIf { it.isNotBlank() }?.let { userName = it }
             config.password?.takeIf { it.isNotBlank() }?.let { password = it.toCharArray() }
-            //sets retained offline lwt so ha marks entities unavailable if the collector process dies
-            setWill(will.topic, will.payload.toByteArray(Charsets.UTF_8), will.qos, will.retained)
+            //sets retained offline lwt for runtime connections; explicit tests use no Will
+            will?.let { message ->
+                setWill(message.topic, message.payload.toByteArray(Charsets.UTF_8), message.qos, message.retained)
+            }
         }
     }
 
@@ -153,9 +196,51 @@ class PahoMqttClientFacade(
         } catch (error: Exception) {
             MqttActionResult.fail(
                 "mqtt_error",
-                "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                "${error::class.java.simpleName}: ${error.message ?: "no message"}",
+                classifyFailure(error)
             )
         }
+    }
+
+    private fun classifyFailure(error: Throwable): MqttFailureKind {
+        if (error is InterruptedException || Thread.currentThread().isInterrupted) {
+            return MqttFailureKind.CANCELLED
+        }
+        var transportCause = false
+        var current: Throwable? = error
+        while (current != null) {
+            if (current is MqttSecurityException || current is SSLException) {
+                return MqttFailureKind.AUTHENTICATION
+            }
+            if (
+                current is SocketTimeoutException ||
+                current is InterruptedIOException ||
+                current is ConnectException ||
+                current is NoRouteToHostException ||
+                current is UnknownHostException ||
+                current is IOException
+            ) {
+                transportCause = true
+            }
+            if (current is MqttException) {
+                when (current.reasonCode.toShort()) {
+                    MqttException.REASON_CODE_FAILED_AUTHENTICATION,
+                    MqttException.REASON_CODE_NOT_AUTHORIZED,
+                    MqttException.REASON_CODE_SSL_CONFIG_ERROR -> return MqttFailureKind.AUTHENTICATION
+                    MqttException.REASON_CODE_INVALID_MESSAGE -> return MqttFailureKind.DATA
+                    MqttException.REASON_CODE_INVALID_PROTOCOL_VERSION,
+                    MqttException.REASON_CODE_INVALID_CLIENT_ID -> return MqttFailureKind.PROTOCOL
+                    MqttException.REASON_CODE_BROKER_UNAVAILABLE,
+                    MqttException.REASON_CODE_CLIENT_TIMEOUT,
+                    MqttException.REASON_CODE_WRITE_TIMEOUT,
+                    MqttException.REASON_CODE_SERVER_CONNECT_ERROR,
+                    MqttException.REASON_CODE_CLIENT_NOT_CONNECTED,
+                    MqttException.REASON_CODE_CONNECTION_LOST -> transportCause = true
+                }
+            }
+            current = current.cause
+        }
+        return if (transportCause) MqttFailureKind.TRANSPORT else MqttFailureKind.OTHER
     }
 
     private companion object {

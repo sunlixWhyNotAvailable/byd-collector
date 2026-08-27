@@ -45,9 +45,10 @@ data class RuntimeLiveness(
     val influxInFlight: Boolean = false,
     val influxRetryScheduled: Boolean = false,
     val maintenance: Boolean = false,
-    val archiveStorage: Boolean = false
+    val archiveStorage: Boolean = false,
+    val influxOwned: Boolean = false
 ) {
     val active: Boolean
         get() = main || debug || keepAlive || mqtt || telegram ||
-            influxQueued || influxInFlight || influxRetryScheduled || maintenance || archiveStorage
+            influxQueued || influxInFlight || influxRetryScheduled || maintenance || archiveStorage || influxOwned
 }

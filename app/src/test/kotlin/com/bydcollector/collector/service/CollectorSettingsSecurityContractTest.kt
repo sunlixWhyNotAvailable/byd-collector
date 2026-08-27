@@ -79,7 +79,7 @@ class CollectorSettingsSecurityContractTest {
     }
 
     @Test
-    fun tripSummaryMigrationRunsBeforeBuiltInDefaultClassification() {
+    fun tripSummaryMigrationPreservesCustomTextWhenLegacyMarkerIsUnset() {
         val tripKey = "${CollectorSettings.KEY_TELEGRAM_TEMPLATE_PREFIX}trip-summary"
         val otherKey = "${CollectorSettings.KEY_TELEGRAM_TEMPLATE_PREFIX}charging-started"
 
@@ -88,7 +88,8 @@ class CollectorSettingsSecurityContractTest {
 
             CollectorSettings.migrateTelegramBuiltInTemplates(prefs)
 
-            assertFalse(prefs.contains(tripKey))
+            assertTrue(prefs.contains(tripKey))
+            assertEquals(savedTrip, prefs.getString(tripKey, null))
             assertTrue(prefs.getBoolean(CollectorSettings.KEY_TELEGRAM_TRIP_SUMMARY_MIGRATION_DONE, false))
             assertTrue(prefs.getBoolean(CollectorSettings.KEY_TELEGRAM_BUILTIN_DEFAULTS_MIGRATION_DONE, false))
             assertEquals("keep me", prefs.getString(otherKey, null))
@@ -116,7 +117,7 @@ class CollectorSettingsSecurityContractTest {
     }
 
     @Test
-    fun forcedTripMigrationRendersTheLocalizedExpandedDefault() {
+    fun recognizedLegacyTripTemplateMigratesToTheLocalizedExpandedDefault() {
         val tripKey = "${CollectorSettings.KEY_TELEGRAM_TEMPLATE_PREFIX}trip-summary"
         val values = mapOf(
             "trip_distance_km" to "12.3",
@@ -131,19 +132,73 @@ class CollectorSettingsSecurityContractTest {
             "total_energy_kwh" to "98.7"
         )
         val expected = mapOf(
-            TelegramTemplateLanguage.UK to "Поїздку завершено\nПоточна поїздка: 12.3 км / 00:24:18\nВитрата: 3.4 кВт·год, SOC: 81% -> 76%\nЗагалом: 456.7 км / 12:34:56\nВитрата: 98.7 кВт·год, SOC: 84% -> 75%",
-            TelegramTemplateLanguage.EN to "Trip complete\nCurrent trip: 12.3 km / 00:24:18\nEnergy used: 3.4 kWh, SOC: 81% -> 76%\nTotal: 456.7 km / 12:34:56\nEnergy used: 98.7 kWh, SOC: 84% -> 75%"
+            TelegramTemplateLanguage.UK to "Поїздку завершено\nПоточна поїздка: 12.3 км / 00:24:18\nПоточна витрата: 3.4 кВт·год, SOC: 81% -> 76%\nЗагалом: 456.7 км / 12:34:56\nЗагальна витрата: 98.7 кВт·год, SOC: 84% -> 75%",
+            TelegramTemplateLanguage.EN to "Trip complete\nCurrent trip: 12.3 km / 00:24:18\nCurrent energy used: 3.4 kWh, SOC: 81% -> 76%\nTotal: 456.7 km / 12:34:56\nTotal energy used: 98.7 kWh, SOC: 84% -> 75%"
         )
 
         expected.forEach { (language, renderedExpected) ->
-            val prefs = InMemorySharedPreferences(mapOf(tripKey to "arbitrary old value"))
+            val prefs = InMemorySharedPreferences(
+                mapOf(
+                    tripKey to "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\nВитрата: {trip_energy_kwh} кВт·год, SOC: {soc_start}% -> {soc_end}%\nЗагалом: {total_distance_km} км / {total_duration}\nВитрата: {total_energy_kwh} кВт·год, SOC: {total_soc_start}% -> {total_soc_end}%"
+                )
+            )
             CollectorSettings.migrateTelegramBuiltInTemplates(prefs)
             val template = prefs.getString(tripKey, null)
                 ?: TelegramTemplateCatalog.defaultTemplate(TelegramEventType.TRIP_SUMMARY, language)
-            assertEquals(
-                renderedExpected,
-                TelegramTemplateRenderer.render(TelegramEventType.TRIP_SUMMARY, template, values).text
+            assertEquals(renderedExpected, TelegramTemplateRenderer.render(TelegramEventType.TRIP_SUMMARY, template, values).text)
+        }
+    }
+
+    @Test
+    fun priorStockDefaultsAreMigratedInBothLanguagesButCustomTextAndMarkersArePreserved() {
+        val stockByLanguage = listOf(
+            mapOf(
+                "charging-started" to "Заряджання розпочато\nSOC: {soc}%\nПотужність: {battery_power_kw} кВт",
+                "charging-progress" to "Заряд: {soc}%\nЗа крок: +{charge_step_added_percent}% / +{charge_step_added_kwh} кВт·год\nЧас кроку: {charge_step_duration}\nЗа сесію: +{charge_added_percent}% / +{charge_added_kwh} кВт·год\nЧас сесії: {charge_duration}",
+                "charging-stopped" to "Заряджання зупинено\nSOC: {soc}%\nТривалість: {charge_duration}",
+                "low-12v" to "Низька напруга 12V\nНапруга: {battery_12v} В\nЧас: {time}",
+                "trip-summary" to "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\nВитрата: {trip_energy_kwh} кВт·год, SOC: {soc_start}% -> {soc_end}%\nЗагалом: {total_distance_km} км / {total_duration}\nВитрата: {total_energy_kwh} кВт·год, SOC: {total_soc_start}% -> {total_soc_end}%"
+            ),
+            mapOf(
+                "charging-started" to "Charging started\nSOC: {soc}%\nPower: {battery_power_kw} kW",
+                "charging-progress" to "Charge: {soc}%\nThis step: +{charge_step_added_percent}% / +{charge_step_added_kwh} kWh\nStep time: {charge_step_duration}\nSession total: +{charge_added_percent}% / +{charge_added_kwh} kWh\nSession time: {charge_duration}",
+                "charging-stopped" to "Charging stopped\nSOC: {soc}%\nDuration: {charge_duration}",
+                "low-12v" to "Low 12V voltage\nVoltage: {battery_12v} V\nTime: {time}",
+                "trip-summary" to "Trip complete\nCurrent trip: {trip_distance_km} km / {trip_duration}\nEnergy used: {trip_energy_kwh} kWh, SOC: {soc_start}% -> {soc_end}%\nTotal: {total_distance_km} km / {total_duration}\nEnergy used: {total_energy_kwh} kWh, SOC: {total_soc_start}% -> {total_soc_end}%"
             )
+        )
+
+        stockByLanguage.forEach { stock ->
+            listOf(false, true).forEach { alreadyMigrated ->
+                val customKey = "${CollectorSettings.KEY_TELEGRAM_TEMPLATE_PREFIX}telemetry-unavailable"
+                val custom = "My custom\r\ntext  "
+                val prefs = InMemorySharedPreferences(
+                    stock.mapKeys { "${CollectorSettings.KEY_TELEGRAM_TEMPLATE_PREFIX}${it.key}" } + mapOf(
+                        customKey to custom,
+                        CollectorSettings.KEY_TELEGRAM_TRIP_SUMMARY_MIGRATION_DONE to alreadyMigrated,
+                        CollectorSettings.KEY_TELEGRAM_CHARGED_TO_100_MIGRATION_DONE to alreadyMigrated,
+                        CollectorSettings.KEY_TELEGRAM_BUILTIN_DEFAULTS_MIGRATION_DONE to alreadyMigrated,
+                        CollectorSettings.KEY_TELEGRAM_LOW_VOLTAGE to 12.9f
+                    )
+                )
+                CollectorSettings.migrateTelegramBuiltInTemplates(prefs)
+                stock.forEach { (eventKey, saved) ->
+                    val value = prefs.getString("${CollectorSettings.KEY_TELEGRAM_TEMPLATE_PREFIX}$eventKey", null)
+                    if (alreadyMigrated) {
+                        assertEquals(saved, value)
+                        // The normal settings getter resolves recognized text to the current UI-language default.
+                        assertTrue(TelegramBuiltInTemplates.isKnownBuiltIn(eventKey, saved))
+                    } else {
+                        assertEquals(null, value)
+                    }
+                }
+                assertEquals(custom, prefs.getString(customKey, null))
+                assertEquals(12.9f, prefs.getFloat(CollectorSettings.KEY_TELEGRAM_LOW_VOLTAGE, 0f))
+                assertEquals(12.5f, CollectorSettings.DEFAULT_TELEGRAM_LOW_VOLTAGE)
+                assertTrue(prefs.getBoolean(CollectorSettings.KEY_TELEGRAM_TRIP_SUMMARY_MIGRATION_DONE, false))
+                assertTrue(prefs.getBoolean(CollectorSettings.KEY_TELEGRAM_CHARGED_TO_100_MIGRATION_DONE, false))
+                assertTrue(prefs.getBoolean(CollectorSettings.KEY_TELEGRAM_BUILTIN_DEFAULTS_MIGRATION_DONE, false))
+            }
         }
     }
 

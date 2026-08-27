@@ -2,6 +2,10 @@ package com.bydcollector.collector.influx
 
 import java.io.File
 import java.io.ByteArrayInputStream
+import java.io.IOException
+import java.net.ConnectException
+import java.net.ProtocolException
+import javax.net.ssl.SSLException
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -48,6 +52,15 @@ class InfluxClientContractTest {
         assertFalse(sanitized.contains("secret"))
         assertFalse(sanitized.contains("YW50b246c2VjcmV0"))
         assertFalse(sanitized.contains('\n'))
+    }
+
+    @Test
+    fun failureClassifierPrioritizesTlsAndProtocolOverWrappedTransport() {
+        val wrappedTls = IOException("socket").apply { initCause(SSLException("tls")) }
+
+        assertEquals(InfluxFailureKind.AUTHENTICATION, classifyInfluxNetworkFailure(wrappedTls))
+        assertEquals(InfluxFailureKind.PROTOCOL, classifyInfluxNetworkFailure(ProtocolException("bad protocol")))
+        assertEquals(InfluxFailureKind.TRANSPORT, classifyInfluxNetworkFailure(ConnectException("offline")))
     }
 
     private fun sourceFile(path: String): File {

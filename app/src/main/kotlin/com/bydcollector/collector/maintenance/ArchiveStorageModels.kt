@@ -28,10 +28,11 @@ data class ArchiveStorageSnapshot(
     val debugDatabaseSizeBytes: Long,
     val archiveBytes: Long,
     val archiveLimitBytes: Long,
-    val entries: List<ArchiveStorageEntry>
+    val entries: List<ArchiveStorageEntry>,
+    val tripsDatabaseSizeBytes: Long = 0L
 ) {
     val activeDatabaseSizeBytes: Long
-        get() = mainDatabaseSizeBytes + debugDatabaseSizeBytes
+        get() = mainDatabaseSizeBytes + debugDatabaseSizeBytes + tripsDatabaseSizeBytes
 }
 
 data class ArchiveStorageJobStatus(

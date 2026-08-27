@@ -16,12 +16,20 @@ class HaMqttMessageFactory(
     private val clock: Clock = SystemClockAdapter()
 ) {
     fun discoveryMessages(): MqttMessageBuildResult {
-        val config = configProvider()
+        return discoveryMessages(configProvider())
+    }
+
+    fun discoveryMessages(configOverride: HaMqttConfig): MqttMessageBuildResult {
+        val config = configOverride
         return MqttMessageBuildResult.Success(HaDiscoveryBuilder.discoveryMessages(config))
     }
 
     fun fullResyncMessages(): MqttMessageBuildResult {
-        val config = configProvider()
+        return fullResyncMessages(configProvider())
+    }
+
+    fun fullResyncMessages(configOverride: HaMqttConfig): MqttMessageBuildResult {
+        val config = configOverride
         return runCatching {
             //filters at publish time so changing categories does not require rewriting normalized storage
             val rows = HaMqttFieldFilter.publishableRows(normalizedProvider.currentState(config.enabledCategories), config)
@@ -36,11 +44,19 @@ class HaMqttMessageFactory(
     }
 
     fun statusMessage(status: HaMqttStatus): MqttMessageBuildResult {
-        return MqttMessageBuildResult.Success(listOf(statusMessage(configProvider(), status)))
+        return statusMessage(configProvider(), status)
+    }
+
+    fun statusMessage(configOverride: HaMqttConfig, status: HaMqttStatus): MqttMessageBuildResult {
+        return MqttMessageBuildResult.Success(listOf(buildStatusMessage(configOverride, status)))
     }
 
     fun changedCategoryMessages(categories: Set<String>): MqttMessageBuildResult {
-        val config = configProvider()
+        return changedCategoryMessages(configProvider(), categories)
+    }
+
+    fun changedCategoryMessages(configOverride: HaMqttConfig, categories: Set<String>): MqttMessageBuildResult {
+        val config = configOverride
         val enabledChanged = categories.intersect(config.enabledCategories)
         //skips disabled categories even if their normalized values changed in sqlite
         if (enabledChanged.isEmpty()) return MqttMessageBuildResult.Success(emptyList())
@@ -54,7 +70,9 @@ class HaMqttMessageFactory(
         )
     }
 
-    fun offlineMessage(): HaMqttMessage = offlineStatusMessage(configProvider())
+    fun offlineMessage(): HaMqttMessage = offlineMessage(configProvider())
+
+    fun offlineMessage(configOverride: HaMqttConfig): HaMqttMessage = offlineStatusMessage(configOverride)
 
     private fun categoryStateMessages(
         config: HaMqttConfig,
@@ -82,7 +100,7 @@ class HaMqttMessageFactory(
             .mapValues { (_, categoryRows) ->
                 if (categoryRows.any { it.quality != "OK" }) "degraded" else "ok"
             }
-        return statusMessage(
+        return buildStatusMessage(
             config,
             HaMqttStatus(
                 availability = "online",
@@ -97,7 +115,7 @@ class HaMqttMessageFactory(
         )
     }
 
-    private fun statusMessage(config: HaMqttConfig, status: HaMqttStatus): HaMqttMessage {
+    private fun buildStatusMessage(config: HaMqttConfig, status: HaMqttStatus): HaMqttMessage {
         return HaMqttMessage(
             topic = "${config.normalizedTopicPrefix()}/status",
             payload = HaMqttPayloadBuilder.status(status),

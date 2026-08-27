@@ -8,6 +8,70 @@ import kotlin.test.assertTrue
 
 class BydCollectorUiContractTest {
     @Test
+    fun endpointDraftRejectsInvalidHostsBeforeStartWhilePreservingSavedHostTrimming() {
+        listOf("mqtt\\local", "influx\\local", "http://influx.local", "mqtt local", "").forEach { host ->
+            assertFalse(validEndpointDraft(host, "1883"), host)
+            assertFalse(validEndpointDraft(host, "8086", optional = true), host)
+        }
+        assertTrue(validEndpointDraft(" mqtt.local ", "1883"))
+        assertTrue(validEndpointDraft(" influx.local ", "8086"))
+        assertTrue(validEndpointDraft("", "", optional = true))
+        assertFalse(validEndpointDraft("mqtt.local", ""))
+        assertFalse(validEndpointDraft("mqtt.local", "65536"))
+        assertFalse(validEndpointDraft("", "1883", optional = true))
+    }
+
+    @Test
+    fun tripsCompressionUsesRealBackgroundProgressAndPreservesHistoryContract() {
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val service = sourceFile("com/bydcollector/collector/service/TripCompressionService.kt").readText()
+        val dialog = app.substringAfter("private fun TripsCompressionDialog(").substringBefore("private fun DatabaseMaintenanceDialog(")
+        assertTrue(app.contains("TripCompressionService.state.collectAsStateWithLifecycle()"))
+        assertTrue(activity.contains("TripCompressionService.start(applicationContext)"))
+        assertTrue(activity.contains("sqliteFootprintBytes(trips.databaseFile)"))
+        assertTrue(dialog.contains("ModalInputBlocker()"))
+        assertTrue(dialog.contains("background(p.background.copy(alpha = 0.82f))"))
+        assertTrue(dialog.contains("if (!state.running)"))
+        assertFalse(dialog.contains("strings.cancel"))
+        assertFalse(service.contains("DatabaseMaintenanceService"))
+        val finish = service.substringAfter("private fun finishRun(").substringBefore("private fun clearInstanceIfOwned(")
+        assertTrue(finish.contains("mainHandler.post"))
+        assertInOrder(finish, "stopForeground(STOP_FOREGROUND_REMOVE)", "activeToken = null")
+        UiLanguage.entries.forEach { language ->
+            assertEquals(6, strings(language).tripsCompressionSteps.size)
+            assertTrue(strings(language).tripsCompressionWarning.isNotBlank())
+        }
+    }
+
+    @Test
+    fun mqttConnectionEditingUsesRealOwnershipAndGuardsLateDraftCallbacks() {
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        assertTrue(app.contains("CollectorService.mqttConnection.state.collectAsStateWithLifecycle()"))
+        assertTrue(app.contains("connection.activeRoute, !connection.owned && !actionUiState.mqttTest"))
+        assertTrue(app.contains("if (connection.owned) Text(strings.stopChannelToEdit"))
+        assertTrue(activity.contains("if (CollectorService.mqttConnection.owned || actionUiState.mqttTest) return"))
+        assertTrue(activity.contains("if (CollectorService.mqttConnection.owned) return true"))
+        assertTrue(activity.contains("HaMqttActions.testConnection(actionStore, settings, profile = selected)"))
+        assertTrue(app.contains("CollectorService.influxConnection.state.collectAsStateWithLifecycle()"))
+        assertTrue(app.contains("connection.activeRoute, !connection.owned && !actionUiState.influxTest"))
+        assertTrue(activity.contains("if (CollectorService.influxConnection.owned || actionUiState.influxTest) return"))
+        assertTrue(activity.contains("if (CollectorService.influxConnection.owned) return true"))
+        assertTrue(activity.contains("InfluxActions.testConnection(actionStore, settings, profile = selected)"))
+    }
+
+    @Test
+    fun haQueuesShareTheAutostartRowWithoutManualReExport() {
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val actions = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorActions.kt").readText()
+        assertEquals(3, Regex("ChannelQueueRow\\(").findAll(app).count())
+        assertTrue(app.contains("ReadOnlyPathField(\"\${strings.queued}:   \$pendingText\", Modifier.weight(1f).padding(horizontal = 24.dp))"))
+        assertFalse(app.contains("ChannelPrelude"))
+        assertFalse(actions.contains("ReExport"))
+    }
+
+    @Test
     fun nativeLaunchThemeMatchesCollectorDarkSurface() {
         val styles = listOf(
             File("src/main/res/values/styles.xml"),
@@ -182,6 +246,7 @@ class BydCollectorUiContractTest {
         assertTrue(activeDatabaseSection.contains("strings.activeDatabaseSizeTemplate"))
         assertTrue(activeDatabaseSection.contains("snapshot?.mainDatabaseSizeBytes"))
         assertTrue(activeDatabaseSection.contains("snapshot?.debugDatabaseSizeBytes"))
+        assertTrue(activeDatabaseSection.contains("snapshot?.tripsDatabaseSizeBytes"))
         assertTrue(activeDatabaseSection.contains("state?.mainStorageCutoverDeferredReason"))
         assertTrue(activeDatabaseSection.contains("strings.mainStorageCutoverDeferred"))
         assertTrue(activeDatabaseSection.contains("state?.mainStorageCutoverError"))
@@ -237,7 +302,7 @@ class BydCollectorUiContractTest {
         assertEquals(7, Regex("TabScrollColumn \\{").findAll(app).count())
         assertFalse(app.contains("LazyColumn("))
         assertFalse(app.contains("LazyListScope"))
-        assertEquals(3, Regex("\\.verticalScroll\\(").findAll(app).count())
+        assertEquals(5, Regex("\\.verticalScroll\\(").findAll(app).count())
         assertTrue(app.contains(".verticalScroll(releaseNotesScroll)"))
         assertTrue(app.contains(".verticalScroll(rememberScrollState()),"))
     }
@@ -307,8 +372,8 @@ class BydCollectorUiContractTest {
         assertTrue(app.contains(".background(Color.Gray)"))
         assertTrue(strings.contains("tripNoData = \"Відсутні дані\""))
         assertTrue(strings.contains("tripNoData = \"No data\""))
-        val locationRow = app.substringAfter("if (definition.type == TelegramMessageType.TRIP_SUMMARY)")
-            .substringBefore("Row(\n            modifier = Modifier.fillMaxWidth(),")
+        val locationRow = app.substringAfter("val setting = telegramNumberSetting(")
+            .substringBefore("TextValueInput(")
         assertTrue(locationRow.contains("Modifier.fillMaxWidth().height(42.dp)"))
         assertTrue(locationRow.contains("horizontalArrangement = Arrangement.spacedBy(10.dp)"))
         assertTrue(locationRow.contains("modifier = Modifier.weight(1f)"))
@@ -317,6 +382,15 @@ class BydCollectorUiContractTest {
         assertTrue(locationRow.contains("emphasized = true"))
         assertTrue(locationRow.contains("textAlign = TextAlign.Center"))
         assertFalse(locationRow.contains("Spacer(Modifier.weight(1f))"))
+        assertTrue(locationRow.contains("Spacer(Modifier.height(42.dp))"))
+        assertInOrder(locationRow, "NumericInput(", "text = \"{}\"")
+        assertTrue(components.contains("minLines = if (multiline) 7 else 1"))
+        assertTrue(components.contains("maxLines = if (multiline) 7 else 1"))
+        assertFalse(components.contains("if (multiline) 104.dp"))
+        val variableDialog = app.substringAfter("private fun TelegramVariableDialog(")
+            .substringBefore("private fun telegramTestStatusText(")
+        assertInOrder(variableDialog, "strings.telegram.insertVariable", "Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())")
+        assertInOrder(variableDialog, "variables.forEachIndexed", "ActionButton(strings.close")
         assertTrue(strings.contains("charge_start_time\" to \"Час початку заряджання, HH:mm\""))
         assertTrue(strings.contains("charge_end_time\" to \"Час завершення заряджання, HH:mm\""))
         assertTrue(strings.contains("charge_duration_hhmm\" to \"Тривалість заряджання, загальні години HH:mm\""))
@@ -619,8 +693,7 @@ class BydCollectorUiContractTest {
             "archiveShare",
             "archiveDeleteDispatch",
             "mqttTest",
-            "influxTest",
-            "influxReExport"
+            "influxTest"
         ).forEach { flag -> assertTrue(actions.contains("val $flag: Boolean = false"), "Missing scoped flag: $flag") }
         assertTrue(app.contains("state.routeLoadingId == trip.id"))
         assertTrue(app.contains("testStatus != TelegramTestStatus.TESTING"))

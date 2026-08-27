@@ -46,6 +46,7 @@ import com.bydcollector.collector.influx.HttpInfluxClient
 import com.bydcollector.collector.influx.InfluxActionResult
 import com.bydcollector.collector.influx.InfluxExportCoordinator
 import com.bydcollector.collector.ha.HaEndpoint
+import com.bydcollector.collector.ha.HaConnectionOwnership
 import com.bydcollector.collector.ha.SocketHaEndpointProbe
 import com.bydcollector.collector.ha.TailscaleActivator
 import com.bydcollector.collector.ha.TailscaleActivationGate
@@ -427,6 +428,8 @@ class CollectorService : Service() {
         mqttRuntimeStatusRef.set(mqttRuntimeStatus)
         influxRuntimeStatusRef.set(influxRuntimeStatus)
         publishDashboardRuntimeFlags()
+        mqttConnection.release()
+        influxConnection.release()
         clearDashboardVehicleKpis()
         if (::dashboardStateProvider.isInitialized) dashboardStateProvider.close()
         if (::debugStore.isInitialized) {
@@ -654,6 +657,7 @@ class CollectorService : Service() {
 
     private fun reconcileMqttAutoStart() {
         if (!settings.isMqttAutoStartEnabled() || settings.isMqttManuallyStopped()) {
+            if (!mqttRuntimeActive.get() && !mqttConnection.stopping) mqttConnection.release()
             stopIfNoActiveRuntime()
             return
         }
@@ -663,6 +667,7 @@ class CollectorService : Service() {
 
     private fun reconcileInfluxAutoStart() {
         if (!settings.isInfluxAutoStartEnabled() || settings.isInfluxManuallyStopped()) {
+            if (influxWorkInFlight.get() == 0 && !settings.isInfluxEnabled() && !influxConnection.stopping) influxConnection.release()
             stopIfNoActiveRuntime()
             return
         }
@@ -1448,6 +1453,8 @@ class CollectorService : Service() {
 
     private fun publishDashboardRuntimeFlags() {
         if (!::dashboardUiStateStore.isInitialized || !::settings.isInitialized) return
+        if (::mqttCoordinator.isInitialized) mqttConnection.publishRoute(mqttCoordinator.activeRoute)
+        if (::influxCoordinator.isInitialized) influxConnection.publishRoute(influxCoordinator.activeRoute)
         val access = AdbAuthorizationManager.currentSnapshot()
         dashboardUiStateStore.publishRuntimeFlags(
             DashboardRuntimeFlags(
@@ -1564,8 +1571,9 @@ class CollectorService : Service() {
                 try {
                     val mainBytes = sqliteFootprintBytes(applicationContext.getDatabasePath(com.bydcollector.collector.data.local.TelemetryDatabaseHelper.DATABASE_NAME))
                     val debugBytes = sqliteFootprintBytes(applicationContext.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME))
+                    val tripsBytes = sqliteFootprintBytes(applicationContext.getDatabasePath(com.bydcollector.collector.data.trips.TripDatabaseHelper.DATABASE_NAME))
                     if (generation == dashboardMetricsGeneration.get()) {
-                        dashboardUiStateStore.publishDatabaseFootprints(mainBytes, debugBytes)
+                        dashboardUiStateStore.publishDatabaseFootprints(mainBytes, debugBytes, tripsBytes)
                         lastDatabaseFootprintAtMs = SystemClock.elapsedRealtime()
                     }
                 } finally {
@@ -1885,8 +1893,13 @@ class CollectorService : Service() {
     }
 
     private fun startMqttExport(clearManualStop: Boolean = true) {
-        if (maintenanceBlocksRuntimeStart()) return
-        if (clearManualStop && (!settings.isMqttEnabled() || settings.isMqttManuallyStopped())) return
+        if (mqttConnection.stopping || mqttOfflineQueued.get()) return
+        if (maintenanceBlocksRuntimeStart() ||
+            (clearManualStop && (!settings.isMqttEnabled() || settings.isMqttManuallyStopped()))) {
+            if (!mqttRuntimeActive.get()) mqttConnection.release()
+            return
+        }
+        mqttConnection.reserve()
         mqttWorkGeneration.incrementAndGet()
         if (clearManualStop) settings.setMqttManuallyStopped(false)
         settings.setMqttEnabled(true)
@@ -1901,6 +1914,7 @@ class CollectorService : Service() {
 
     private fun stopMqttExport(manualStop: Boolean = true) {
         if (manualStop && settings.isMqttEnabled() && !settings.isMqttManuallyStopped()) return
+        mqttConnection.beginStop()
         mqttWorkGeneration.incrementAndGet()
         setMqttRuntime(RuntimeActionStatus.STOPPING)
         if (manualStop) settings.setMqttManuallyStopped(true)
@@ -1912,6 +1926,7 @@ class CollectorService : Service() {
         mqttRuntimeActive.set(false)
         if (!mqttOfflineQueued.get()) {
             if (mqttRuntimeStatus == RuntimeActionStatus.STOPPING) {
+                mqttConnection.release()
                 setMqttRuntime(RuntimeActionStatus.STOPPED)
             }
             stopIfNoActiveRuntime()
@@ -1919,8 +1934,13 @@ class CollectorService : Service() {
     }
 
     private fun startInfluxExport(clearManualStop: Boolean = true) {
-        if (maintenanceBlocksRuntimeStart()) return
-        if (clearManualStop && (!settings.isInfluxEnabled() || settings.isInfluxManuallyStopped())) return
+        if (influxConnection.stopping) return
+        if (maintenanceBlocksRuntimeStart() ||
+            (clearManualStop && (!settings.isInfluxEnabled() || settings.isInfluxManuallyStopped()))) {
+            if (influxWorkInFlight.get() == 0) influxConnection.release()
+            return
+        }
+        influxConnection.reserve()
         advanceInfluxGeneration()
         if (clearManualStop) settings.setInfluxManuallyStopped(false)
         settings.setInfluxEnabled(true)
@@ -1995,6 +2015,7 @@ class CollectorService : Service() {
 
     private fun stopInfluxExport(manualStop: Boolean = true) {
         if (manualStop && settings.isInfluxEnabled() && !settings.isInfluxManuallyStopped()) return
+        influxConnection.beginStop()
         advanceInfluxGeneration()
         setInfluxRuntime(RuntimeActionStatus.STOPPING)
         if (manualStop) settings.setInfluxManuallyStopped(true)
@@ -2006,17 +2027,26 @@ class CollectorService : Service() {
 
     private fun queueInfluxStop(stopServiceWhenIdle: Boolean = false) {
         cancelInfluxRetry()
-        executeInflux(
+        val accepted = executeInflux(
             errorCategory = "influx_stop_error",
             activateTailscaleOnFailure = false,
+            isStop = true,
             afterComplete = {
                 if (stopServiceWhenIdle) mainHandler.post {
                     stopIfNoActiveRuntime()
                 }
             }
         ) {
-            influxCoordinator.stopExport()
+            try {
+                influxCoordinator.stopExport()
+            } finally {
+                mainHandler.post {
+                    if (!settings.isInfluxEnabled()) influxConnection.release()
+                    publishDashboardRuntimeFlags()
+                }
+            }
         }
+        if (!accepted) influxConnection.stopSubmissionFailed()
     }
 
     private fun reconcileTelegramRuntime(unblockBlocked: Boolean = false) {
@@ -2114,11 +2144,12 @@ class CollectorService : Service() {
             main = poller.isRunning(),
             debug = isDebugPollerRunning(),
             keepAlive = settings.keepAliveConfig().anyEnabled,
-            mqtt = mqttRuntimeActive.get(),
+            mqtt = mqttRuntimeActive.get() || mqttConnection.owned,
             telegram = settings.isTelegramEnabled(),
             influxQueued = influxRequestQueued.get(),
             influxInFlight = influxWorkInFlight.get() > 0,
             influxRetryScheduled = influxRetryScheduled,
+            influxOwned = influxConnection.owned,
             maintenance = maintenanceActive.get(),
             archiveStorage = archiveStorageActiveInProcess.get()
         )
@@ -2229,7 +2260,7 @@ class CollectorService : Service() {
     }
 
     private fun disconnectOfflineAsync() {
-        if (!mqttRuntimeActive.get() && !settings.isMqttEnabled()) return
+        if (!mqttRuntimeActive.get() && !settings.isMqttEnabled() && !mqttConnection.owned) return
         if (!mqttOfflineQueued.compareAndSet(false, true)) return
         try {
             resetMqttExecutorForOffline { previous ->
@@ -2237,6 +2268,7 @@ class CollectorService : Service() {
             }
         } catch (error: RejectedExecutionException) {
             mqttOfflineQueued.set(false)
+            mqttConnection.stopSubmissionFailed()
             store.recordEvent(
                 "mqtt_offline_publish_error",
                 "MQTT offline publish rejected",
@@ -2278,6 +2310,7 @@ class CollectorService : Service() {
         } finally {
             mqttOfflineQueued.set(false)
             mainHandler.post {
+                if (!settings.isMqttEnabled()) mqttConnection.release()
                 if (!settings.isMqttEnabled() && mqttRuntimeStatus == RuntimeActionStatus.STOPPING) {
                     setMqttRuntime(if (completedOk) RuntimeActionStatus.STOPPED else RuntimeActionStatus.ERROR)
                     stopIfNoActiveRuntime()
@@ -2291,30 +2324,36 @@ class CollectorService : Service() {
         errorCategory: String,
         activateTailscaleOnFailure: Boolean = true,
         action: () -> MqttActionResult
-    ) = executeChannel(
-        channelName = "MQTT",
-        errorCategory = errorCategory,
-        executorLock = mqttExecutorLock,
-        executor = { mqttExecutor },
-        generation = mqttWorkGeneration,
-        action = action,
-        onSuccess = { result, submittedGeneration ->
-            if (submittedGeneration == mqttWorkGeneration.get()) {
-                if (result.ok && settings.isMqttEnabled()) {
-                    setMqttRuntime(RuntimeActionStatus.RUNNING)
-                } else if (!result.ok && settings.isMqttEnabled()) {
+    ): Boolean {
+        if (settings.isMqttEnabled() && !maintenanceBlocksRuntimeStart()) mqttConnection.reserve()
+        return executeChannel(
+            channelName = "MQTT",
+            errorCategory = errorCategory,
+            executorLock = mqttExecutorLock,
+            executor = { mqttExecutor },
+            generation = mqttWorkGeneration,
+            canExecute = { settings.isMqttEnabled() && !mqttConnection.stopping && !maintenanceBlocksRuntimeStart() },
+            action = action,
+            onSuccess = { result, submittedGeneration ->
+                if (submittedGeneration == mqttWorkGeneration.get()) {
+                    if (result.ok && settings.isMqttEnabled()) {
+                        setMqttRuntime(RuntimeActionStatus.RUNNING)
+                    } else if (!result.ok && settings.isMqttEnabled()) {
+                        setMqttRuntime(RuntimeActionStatus.ERROR)
+                    }
+                }
+                postMqttRetrySchedule(submittedGeneration)
+            },
+            onComplete = ::scheduleIntegrationDashboardRefresh,
+            onFailedAction = {
+                if (settings.isMqttEnabled() && !mqttConnection.stopping) {
                     setMqttRuntime(RuntimeActionStatus.ERROR)
+                    if (activateTailscaleOnFailure) maybeActivateTailscaleAfterHaFailure("mqtt")
                 }
             }
-            postMqttRetrySchedule(submittedGeneration)
-        },
-        onComplete = ::scheduleIntegrationDashboardRefresh,
-        onFailedAction = {
-            if (settings.isMqttEnabled()) setMqttRuntime(RuntimeActionStatus.ERROR)
-            if (activateTailscaleOnFailure) maybeActivateTailscaleAfterHaFailure("mqtt")
+        ) { result ->
+            ChannelActionStatus(result.ok, result.category, result.message)
         }
-    ) { result ->
-        ChannelActionStatus(result.ok, result.category, result.message)
     }
 
     private fun resetMqttExecutorForOffline(action: (ExecutorService) -> Unit) {
@@ -2385,9 +2424,11 @@ class CollectorService : Service() {
     private fun executeInflux(
         errorCategory: String,
         activateTailscaleOnFailure: Boolean = true,
+        isStop: Boolean = false,
         afterComplete: (() -> Unit)? = null,
         action: () -> InfluxActionResult
     ): Boolean {
+        if (!isStop && settings.isInfluxEnabled() && !maintenanceBlocksRuntimeStart()) influxConnection.reserve()
         influxWorkInFlight.incrementAndGet()
         return executeChannel(
             channelName = "Influx",
@@ -2396,7 +2437,10 @@ class CollectorService : Service() {
             executor = { influxExecutor },
             generation = influxWorkGeneration,
             lowPriority = true,
-            canExecute = { !maintenanceBlocksRuntimeStart() },
+            canExecute = {
+                !maintenanceBlocksRuntimeStart() &&
+                    (if (isStop) !settings.isInfluxEnabled() else settings.isInfluxEnabled() && !influxConnection.stopping)
+            },
             action = action,
             onSuccess = { result, submittedGeneration ->
                 if (submittedGeneration == influxWorkGeneration.get()) {
@@ -2415,8 +2459,10 @@ class CollectorService : Service() {
             },
             onSettled = ::settleInfluxWork,
             onFailedAction = {
-                setInfluxRuntime(RuntimeActionStatus.ERROR)
-                if (activateTailscaleOnFailure) maybeActivateTailscaleAfterHaFailure("influx")
+                if (isStop || (settings.isInfluxEnabled() && !influxConnection.stopping)) {
+                    setInfluxRuntime(RuntimeActionStatus.ERROR)
+                    if (activateTailscaleOnFailure) maybeActivateTailscaleAfterHaFailure("influx")
+                }
             }
         ) { result ->
             ChannelActionStatus(result.ok, result.category, result.message)
@@ -2426,6 +2472,11 @@ class CollectorService : Service() {
     private fun settleInfluxWork() {
         influxWorkInFlight.updateAndGet { count -> (count - 1).coerceAtLeast(0) }
         mainHandler.post {
+            if (influxWorkInFlight.get() == 0 && influxConnection.stopping && !settings.isInfluxEnabled()) {
+                // A queued Stop may have been superseded by maintenance; retain ownership but allow retry.
+                influxConnection.stopSubmissionFailed()
+                setInfluxRuntime(RuntimeActionStatus.ERROR)
+            }
             if (running.get()) stopIfNoActiveRuntime()
         }
     }
@@ -2853,6 +2904,7 @@ class CollectorService : Service() {
             archiveRoot = File(applicationContext.filesDir, "db_archive"),
             mainDatabaseFile = store.databaseFile(),
             debugDatabaseFile = applicationContext.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME),
+            tripsDatabaseFile = applicationContext.getDatabasePath(com.bydcollector.collector.data.trips.TripDatabaseHelper.DATABASE_NAME),
             isRetentionProtected = archiveShareLeaseRegistry::isActive
         )
     }
@@ -3062,7 +3114,9 @@ class CollectorService : Service() {
         private val mainRuntimeStatusRef = AtomicReference(RuntimeActionStatus.STOPPED)
         private val debugRuntimeStatusRef = AtomicReference(DebugRuntimeStatus.STOPPED)
         private val mqttRuntimeStatusRef = AtomicReference(RuntimeActionStatus.STOPPED)
+        internal val mqttConnection = HaConnectionOwnership()
         private val influxRuntimeStatusRef = AtomicReference(RuntimeActionStatus.STOPPED)
+        internal val influxConnection = HaConnectionOwnership()
         private val maintenanceRunningInProcess = AtomicBoolean(false)
         private val archiveStorageActiveInProcess = AtomicBoolean(false)
         private val processMqttClientFacade = PahoMqttClientFacade()

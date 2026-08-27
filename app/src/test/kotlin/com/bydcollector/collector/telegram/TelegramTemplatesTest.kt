@@ -17,9 +17,12 @@ class TelegramTemplatesTest {
 
     @Test
     fun approvedDefaultsAndVariablesMatchProductionContract() {
+        val started = TelegramTemplateCatalog.spec(TelegramEventType.CHARGING_STARTED)
         val progress = TelegramTemplateCatalog.spec(TelegramEventType.CHARGING_PROGRESS)
         val trip = TelegramTemplateCatalog.spec(TelegramEventType.TRIP_SUMMARY)
 
+        assertTrue("battery_power_kw" in started.allowedVariables)
+        assertTrue("time" in progress.allowedVariables)
         assertEquals(TelegramBuiltInTemplates.CHARGING_PROGRESS_EN, progress.defaultTemplate)
         assertEquals(TelegramBuiltInTemplates.TRIP_SUMMARY_EN, trip.defaultTemplate)
         assertTrue("charge_step_added_percent" in progress.allowedVariables)
@@ -126,8 +129,8 @@ class TelegramTemplatesTest {
         )
         assertEquals(
             "Поїздку завершено\nПоточна поїздка: 12.3 км / 00:24:18\n" +
-                "Витрата: 3.4 кВт·год, SOC: 81% -> 76%\n" +
-                "Загалом: 456.7 км / 12:34:56\nВитрата: 98.7 кВт·год, SOC: 84% -> 75%",
+                "Поточна витрата: 3.4 кВт·год, SOC: 81% -> 76%\n" +
+                "Загалом: 456.7 км / 12:34:56\nЗагальна витрата: 98.7 кВт·год, SOC: 84% -> 75%",
             TelegramTemplateRenderer.render(
                 TelegramEventType.TRIP_SUMMARY,
                 TelegramBuiltInTemplates.TRIP_SUMMARY_UK,
@@ -136,8 +139,8 @@ class TelegramTemplatesTest {
         )
         assertEquals(
             "Trip complete\nCurrent trip: 12.3 km / 00:24:18\n" +
-                "Energy used: 3.4 kWh, SOC: 81% -> 76%\n" +
-                "Total: 456.7 km / 12:34:56\nEnergy used: 98.7 kWh, SOC: 84% -> 75%",
+                "Current energy used: 3.4 kWh, SOC: 81% -> 76%\n" +
+                "Total: 456.7 km / 12:34:56\nTotal energy used: 98.7 kWh, SOC: 84% -> 75%",
             TelegramTemplateRenderer.render(
                 TelegramEventType.TRIP_SUMMARY,
                 TelegramBuiltInTemplates.TRIP_SUMMARY_EN,
@@ -162,7 +165,7 @@ class TelegramTemplatesTest {
         )
         assertEquals(
             "Поїздку завершено\nПоточна поїздка: 12.3 км / 00:24:18\n" +
-                "Витрата: 3.4 кВт·год, SOC: 81% -> 76%",
+                "Поточна витрата: 3.4 кВт·год, SOC: 81% -> 76%",
             TelegramTemplateRenderer.render(
                 TelegramEventType.TRIP_SUMMARY,
                 TelegramBuiltInTemplates.tripSummaryTemplate(TelegramTemplateLanguage.UK, includeOverall = false),
@@ -171,7 +174,7 @@ class TelegramTemplatesTest {
         )
         assertEquals(
             "Trip complete\nCurrent trip: 12.3 km / 00:24:18\n" +
-                "Energy used: 3.4 kWh, SOC: 81% -> 76%",
+                "Current energy used: 3.4 kWh, SOC: 81% -> 76%",
             TelegramTemplateRenderer.render(
                 TelegramEventType.TRIP_SUMMARY,
                 TelegramBuiltInTemplates.tripSummaryTemplate(TelegramTemplateLanguage.EN, includeOverall = false),
@@ -225,6 +228,21 @@ class TelegramTemplatesTest {
             TelegramBuiltInTemplates.TRIP_SUMMARY_EN,
             TelegramBuiltInTemplates.migrateKnownSaved(TelegramEventType.TRIP_SUMMARY.key, previousEn)
         )
+    }
+
+    @Test
+    fun approvedChargingDefaultsRetainOptionalPowerAndSupportProgressTime() {
+        TelegramTemplateLanguage.entries.forEach { language ->
+            val started = TelegramTemplateCatalog.defaultTemplate(TelegramEventType.CHARGING_STARTED, language)
+            assertTrue(started.contains("{time}"))
+            assertFalse(started.contains("{battery_power_kw}"))
+            val progress = TelegramTemplateCatalog.defaultTemplate(TelegramEventType.CHARGING_PROGRESS, language)
+            assertEquals(7, progress.lines().size)
+            assertTrue(progress.lines()[1].contains("{battery_power_kw}"))
+            assertTrue(TelegramTemplateRenderer.validate(TelegramEventType.CHARGING_PROGRESS, progress).isEmpty())
+            assertTrue(TelegramTemplateCatalog.defaultTemplate(TelegramEventType.CHARGING_STOPPED, language).contains("{time}"))
+        }
+        assertTrue("battery_power_kw" in TelegramTemplateCatalog.spec(TelegramEventType.CHARGING_STARTED).allowedVariables)
     }
 
     @Test

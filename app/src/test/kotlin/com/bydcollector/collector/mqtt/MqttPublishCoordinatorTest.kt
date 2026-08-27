@@ -2,6 +2,7 @@ package com.bydcollector.collector.mqtt
 
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.normalized.StoredNormalizedState
+import com.bydcollector.collector.ha.HaEndpointProfile
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -9,16 +10,169 @@ import kotlin.test.assertTrue
 
 class MqttPublishCoordinatorTest {
     @Test
-    fun failedOfflineConnectStillReleasesTheFacade() {
+    fun stoppedStatusReadDoesNotFreezeDraftAndOwnedSessionFreezesDestinationsUntilStop() {
+        var live = config(enabled = false).copy(host = "before.local")
+        val client = FakeMqttClient()
+        val coordinator = coordinator(client = client, configProvider = { live })
+        assertEquals(null, coordinator.retryDelayMs())
+        live = live.copy(enabled = true, host = "start.local", topicPrefix = "start", discoveryPrefix = "ha-start")
+        assertTrue(coordinator.startLiveExport().ok)
+        assertEquals("start.local", client.connectConfigs.last().host)
+        live = live.copy(host = "later.local", topicPrefix = "later", discoveryPrefix = "ha-later")
+        client.published.clear()
+        assertTrue(coordinator.queueFullResyncAndFlush().ok)
+        assertTrue(client.published.all { it.topic.startsWith("start/") })
+        assertTrue(coordinator.disconnectOffline().ok)
+        assertTrue(coordinator.startLiveExport().ok)
+        assertEquals("later.local", client.connectConfigs.last().host)
+    }
+
+    @Test
+    fun offlineDisconnectClosesWorkingFacadeWithoutReconnecting() {
         val client = FakeMqttClient(connectResult = MqttActionResult.fail("mqtt_error", "broker down"))
         val coordinator = coordinator(client = client)
 
         val result = coordinator.disconnectOffline()
 
-        assertFalse(result.ok)
-        assertEquals(1, client.connectCount)
+        assertTrue(result.ok)
+        assertEquals(0, client.connectCount)
         assertEquals(1, client.disconnectCount)
         assertEquals(listOf<HaMqttMessage?>(null), client.disconnectMessages)
+    }
+
+    @Test
+    fun transportConnectFailureFallsBackToAlternativeAndKeepsActualRoute() {
+        val client = FakeMqttClient(
+            connectResults = mutableListOf(
+                MqttActionResult.fail("mqtt_error", "primary down", MqttFailureKind.TRANSPORT),
+                MqttActionResult.ok()
+            )
+        )
+        val outbox = FakeOutboxStore().also {
+            it.upsertPending(message("bydcollector/state/battery", "payload"), "state", 50)
+        }
+        val coordinator = coordinator(
+            client = client,
+            outbox = outbox,
+            config = config(alternativeHost = "mqtt-alt.local", alternativePort = 1884)
+        )
+
+        val result = coordinator.flushPending(force = true)
+
+        assertTrue(result.ok)
+        assertEquals(listOf("mqtt.local", "mqtt-alt.local"), client.connectConfigs.map { it.host })
+        assertEquals(HaEndpointProfile.ALTERNATIVE, coordinator.activeRoute)
+        assertEquals(emptyList<PendingRow>(), outbox.pendingRows())
+    }
+
+    @Test
+    fun transportPublishFailureRetriesSameRowOnOtherEndpoint() {
+        val client = FakeMqttClient(
+            connectResults = mutableListOf(MqttActionResult.ok(), MqttActionResult.ok()),
+            publishResults = mutableListOf(
+                MqttActionResult.fail("mqtt_error", "primary publish down", MqttFailureKind.TRANSPORT),
+                MqttActionResult.ok()
+            )
+        )
+        val outbox = FakeOutboxStore().also {
+            it.upsertPending(message("bydcollector/state/battery", "payload"), "state", 50)
+        }
+        val coordinator = coordinator(
+            client = client,
+            outbox = outbox,
+            config = config(alternativeHost = "mqtt-alt.local", alternativePort = 1884)
+        )
+
+        val result = coordinator.flushPending(force = true)
+
+        assertTrue(result.ok)
+        assertEquals(listOf("mqtt.local", "mqtt-alt.local"), client.connectConfigs.map { it.host })
+        assertEquals(2, client.published.size)
+        assertEquals(HaEndpointProfile.ALTERNATIVE, coordinator.activeRoute)
+        assertEquals(emptyList<PendingRow>(), outbox.pendingRows())
+    }
+
+    @Test
+    fun authenticationFailureDoesNotTryAlternativeEndpoint() {
+        val client = FakeMqttClient(
+            connectResults = mutableListOf(
+                MqttActionResult.fail("mqtt_auth", "not authorized", MqttFailureKind.AUTHENTICATION)
+            )
+        )
+        val outbox = FakeOutboxStore().also {
+            it.upsertPending(message("bydcollector/state/battery", "payload"), "state", 50)
+        }
+        val coordinator = coordinator(
+            client = client,
+            outbox = outbox,
+            config = config(alternativeHost = "mqtt-alt.local", alternativePort = 1884)
+        )
+
+        val result = coordinator.flushPending(force = true)
+
+        assertFalse(result.ok)
+        assertEquals(1, client.connectCount)
+        assertEquals(listOf("mqtt.local"), client.connectConfigs.map { it.host })
+        assertEquals(null, coordinator.activeRoute)
+    }
+
+    @Test
+    fun connectedAlternativeIsStickyUntilFacadeReportsDisconnect() {
+        val client = FakeMqttClient(
+            connectResults = mutableListOf(
+                MqttActionResult.fail("mqtt_error", "primary down", MqttFailureKind.TRANSPORT),
+                MqttActionResult.ok(),
+                MqttActionResult.ok()
+            )
+        )
+        val outbox = FakeOutboxStore().also {
+            it.upsertPending(message("bydcollector/state/battery", "first"), "state", 50)
+        }
+        val coordinator = coordinator(
+            client = client,
+            outbox = outbox,
+            config = config(alternativeHost = "mqtt-alt.local", alternativePort = 1884)
+        )
+
+        assertTrue(coordinator.flushPending(force = true).ok)
+        assertEquals(2, client.connectCount)
+
+        outbox.upsertPending(message("bydcollector/state/battery", "second"), "state", 50)
+        assertTrue(coordinator.flushPending(force = true).ok)
+        assertEquals(2, client.connectCount)
+
+        client.connectedState = false
+        outbox.upsertPending(message("bydcollector/state/battery", "third"), "state", 50)
+        assertTrue(coordinator.flushPending(force = true).ok)
+        assertEquals(listOf("mqtt.local", "mqtt-alt.local", "mqtt.local"), client.connectConfigs.map { it.host })
+    }
+
+    @Test
+    fun secondTransportPublishFailureClosesRouteWithoutTryingPrimaryAgain() {
+        val client = FakeMqttClient(
+            connectResults = mutableListOf(MqttActionResult.ok(), MqttActionResult.ok()),
+            publishResults = mutableListOf(
+                MqttActionResult.fail("mqtt_error", "primary publish down", MqttFailureKind.TRANSPORT),
+                MqttActionResult.fail("mqtt_error", "alternative publish down", MqttFailureKind.TRANSPORT)
+            )
+        )
+        val outbox = FakeOutboxStore().also {
+            it.upsertPending(message("bydcollector/state/battery", "payload"), "state", 50)
+        }
+        val coordinator = coordinator(
+            client = client,
+            outbox = outbox,
+            config = config(alternativeHost = "mqtt-alt.local", alternativePort = 1884)
+        )
+
+        val result = coordinator.flushPending(force = true)
+
+        assertFalse(result.ok)
+        assertEquals(listOf("mqtt.local", "mqtt-alt.local"), client.connectConfigs.map { it.host })
+        assertEquals(2, client.published.size)
+        assertEquals(null, coordinator.activeRoute)
+        assertEquals(2, client.disconnectCount)
+        assertEquals(1, outbox.pendingRows().size)
     }
 
     @Test
@@ -49,6 +203,26 @@ class MqttPublishCoordinatorTest {
         assertEquals(existingRetry, retry.state)
         assertEquals(emptyList(), retry.failures)
         assertEquals(emptyList(), retry.successes)
+    }
+
+    @Test
+    fun testConnectionOverrideUsesOnlySelectedAlternativeAndLeavesRuntimeRouteUntouched() {
+        val client = FakeMqttClient()
+        val outbox = FakeOutboxStore()
+        val coordinator = coordinator(
+            client = client,
+            outbox = outbox,
+            config = config(alternativeHost = "mqtt-alt.local", alternativePort = 1884)
+        )
+
+        val selected = config(alternativeHost = "mqtt-alt.local", alternativePort = 1884)
+            .forProfile(HaEndpointProfile.ALTERNATIVE)
+        val result = coordinator.testConnectionOnly(selected)
+
+        assertTrue(result.ok)
+        assertEquals(listOf("mqtt-alt.local"), client.connectConfigs.map { it.host })
+        assertEquals(null, coordinator.activeRoute)
+        assertEquals(emptyList<PendingRow>(), outbox.pendingRows())
     }
 
     @Test
@@ -381,7 +555,8 @@ class MqttPublishCoordinatorTest {
         provider: MutableNormalizedProvider = MutableNormalizedProvider(
             listOf(storedState("soc", "battery", valueNumber = 73.0))
         ),
-        config: HaMqttConfig = config()
+        config: HaMqttConfig = config(),
+        configProvider: () -> HaMqttConfig = { config }
     ): MqttPublishCoordinator {
         return MqttPublishCoordinator(
             client = client,
@@ -389,10 +564,10 @@ class MqttPublishCoordinatorTest {
             retryStateStore = retry,
             messageFactory = HaMqttMessageFactory(
                 normalizedProvider = provider,
-                configProvider = { config },
+                configProvider = configProvider,
                 clock = FakeClock()
             ),
-            configProvider = { config },
+            configProvider = configProvider,
             retryPolicy = MqttRetryPolicy(),
             clock = FakeClock()
         )
@@ -400,18 +575,35 @@ class MqttPublishCoordinatorTest {
 
     private class FakeMqttClient(
         private val connectResult: MqttActionResult = MqttActionResult.ok(),
+        private val connectResults: MutableList<MqttActionResult> = mutableListOf(),
         private val publishResults: MutableList<MqttActionResult> = mutableListOf()
     ) : MqttClientFacade {
         val published = mutableListOf<HaMqttMessage>()
         val willMessages = mutableListOf<HaMqttMessage?>()
         val disconnectMessages = mutableListOf<HaMqttMessage?>()
+        val connectConfigs = mutableListOf<HaMqttConfig>()
+        var connectedState = false
         var connectCount = 0
         var disconnectCount = 0
 
+        override val isConnected: Boolean
+            get() = connectedState
+
         override fun connect(config: HaMqttConfig, willMessage: HaMqttMessage?): MqttActionResult {
+            return connect(config, willMessage, MqttConnectionPurpose.RUNTIME)
+        }
+
+        override fun connect(
+            config: HaMqttConfig,
+            willMessage: HaMqttMessage?,
+            purpose: MqttConnectionPurpose
+        ): MqttActionResult {
             connectCount += 1
+            connectConfigs += config
             willMessages += willMessage
-            return connectResult
+            return (if (connectResults.isEmpty()) connectResult else connectResults.removeAt(0)).also {
+                connectedState = it.ok
+            }
         }
 
         override fun publish(message: HaMqttMessage): MqttActionResult {
@@ -423,6 +615,7 @@ class MqttPublishCoordinatorTest {
             disconnectCount += 1
             disconnectMessages += gracefulMessage
             gracefulMessage?.let { published += it }
+            connectedState = false
             return MqttActionResult.ok()
         }
     }
@@ -561,7 +754,9 @@ class MqttPublishCoordinatorTest {
     private fun config(
         enabled: Boolean = true,
         discoveryEnabled: Boolean = true,
-        enabledCategories: Set<String> = HaMqttConfig.DEFAULT_CATEGORIES
+        enabledCategories: Set<String> = HaMqttConfig.DEFAULT_CATEGORIES,
+        alternativeHost: String? = null,
+        alternativePort: Int? = null
     ): HaMqttConfig {
         return HaMqttConfig(
             enabled = enabled,
@@ -573,7 +768,9 @@ class MqttPublishCoordinatorTest {
             clientId = HaMqttConfig.DEFAULT_CLIENT_ID,
             topicPrefix = HaMqttConfig.DEFAULT_TOPIC_PREFIX,
             discoveryPrefix = HaMqttConfig.DEFAULT_DISCOVERY_PREFIX,
-            enabledCategories = enabledCategories
+            enabledCategories = enabledCategories,
+            alternativeHost = alternativeHost,
+            alternativePort = alternativePort
         )
     }
 
