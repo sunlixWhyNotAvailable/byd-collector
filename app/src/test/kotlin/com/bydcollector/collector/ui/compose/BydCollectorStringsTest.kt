@@ -196,6 +196,8 @@ class BydCollectorStringsTest {
         assertEquals("Total trip duration", en.variableDescriptions["total_duration"])
         assertEquals("SOC на початку загального підсумку, %", uk.variableDescriptions["total_soc_start"])
         assertEquals("SOC at overall-summary end, %", en.variableDescriptions["total_soc_end"])
+        assertEquals("Середня витрата поїздки, кВт·год/100 км", uk.variableDescriptions["trip_avg_kwh_per_100km"])
+        assertEquals("Average total consumption, kWh/100 km", en.variableDescriptions["total_avg_kwh_per_100km"])
         assertEquals("Перевищено обмеження шаблону 4 096 символів", uk.templateLimitWarning)
         assertEquals("Перевищено обмеження шаблону 4 096 символів із локацією", uk.templateLimitWithLocation)
         assertEquals("Template exceeds the 4,096-character limit", en.templateLimitWarning)

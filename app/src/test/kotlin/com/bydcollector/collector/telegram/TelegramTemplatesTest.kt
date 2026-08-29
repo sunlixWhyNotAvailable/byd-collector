@@ -29,6 +29,8 @@ class TelegramTemplatesTest {
         assertTrue("charge_step_added_kwh" in progress.allowedVariables)
         assertTrue("total_distance_km" in trip.allowedVariables)
         assertTrue("total_energy_kwh" in trip.allowedVariables)
+        assertTrue("trip_avg_kwh_per_100km" in trip.allowedVariables)
+        assertTrue("total_avg_kwh_per_100km" in trip.allowedVariables)
         assertTrue("total_duration" in trip.allowedVariables)
         assertTrue("charge_step_duration" in progress.allowedVariables)
         assertEquals(
@@ -119,18 +121,20 @@ class TelegramTemplatesTest {
             "trip_distance_km" to "12.3",
             "trip_duration" to "00:24:18",
             "trip_energy_kwh" to "3.4",
+            "trip_avg_kwh_per_100km" to "27.64",
             "soc_start" to "81",
             "soc_end" to "76",
             "total_soc_start" to "84",
             "total_soc_end" to "75",
             "total_distance_km" to "456.7",
             "total_duration" to "12:34:56",
-            "total_energy_kwh" to "98.7"
+            "total_energy_kwh" to "98.7",
+            "total_avg_kwh_per_100km" to "21.62"
         )
         assertEquals(
             "Поїздку завершено\nПоточна поїздка: 12.3 км / 00:24:18\n" +
-                "Поточна витрата: 3.4 кВт·год, SOC: 81% -> 76%\n" +
-                "Загалом: 456.7 км / 12:34:56\nЗагальна витрата: 98.7 кВт·год, SOC: 84% -> 75%",
+                "Поточна витрата: 3.4 кВт·год (27.64 кВт·год/100 км), SOC: 81% -> 76%\n" +
+                "Загалом: 456.7 км / 12:34:56\nЗагальна витрата: 98.7 кВт·год (21.62 кВт·год/100 км), SOC: 84% -> 75%",
             TelegramTemplateRenderer.render(
                 TelegramEventType.TRIP_SUMMARY,
                 TelegramBuiltInTemplates.TRIP_SUMMARY_UK,
@@ -139,8 +143,8 @@ class TelegramTemplatesTest {
         )
         assertEquals(
             "Trip complete\nCurrent trip: 12.3 km / 00:24:18\n" +
-                "Current energy used: 3.4 kWh, SOC: 81% -> 76%\n" +
-                "Total: 456.7 km / 12:34:56\nTotal energy used: 98.7 kWh, SOC: 84% -> 75%",
+                "Current energy used: 3.4 kWh (27.64 kWh/100 km), SOC: 81% -> 76%\n" +
+                "Total: 456.7 km / 12:34:56\nTotal energy used: 98.7 kWh (21.62 kWh/100 km), SOC: 84% -> 75%",
             TelegramTemplateRenderer.render(
                 TelegramEventType.TRIP_SUMMARY,
                 TelegramBuiltInTemplates.TRIP_SUMMARY_EN,
@@ -155,17 +159,19 @@ class TelegramTemplatesTest {
             "trip_distance_km" to "12.3",
             "trip_duration" to "00:24:18",
             "trip_energy_kwh" to "3.4",
+            "trip_avg_kwh_per_100km" to "27.64",
             "soc_start" to "81",
             "soc_end" to "76",
             "total_soc_start" to "81",
             "total_soc_end" to "76",
             "total_distance_km" to "12.3",
             "total_duration" to "00:24:18",
-            "total_energy_kwh" to "3.4"
+            "total_energy_kwh" to "3.4",
+            "total_avg_kwh_per_100km" to "27.64"
         )
         assertEquals(
             "Поїздку завершено\nПоточна поїздка: 12.3 км / 00:24:18\n" +
-                "Поточна витрата: 3.4 кВт·год, SOC: 81% -> 76%",
+                "Поточна витрата: 3.4 кВт·год (27.64 кВт·год/100 км), SOC: 81% -> 76%",
             TelegramTemplateRenderer.render(
                 TelegramEventType.TRIP_SUMMARY,
                 TelegramBuiltInTemplates.tripSummaryTemplate(TelegramTemplateLanguage.UK, includeOverall = false),
@@ -174,7 +180,7 @@ class TelegramTemplatesTest {
         )
         assertEquals(
             "Trip complete\nCurrent trip: 12.3 km / 00:24:18\n" +
-                "Current energy used: 3.4 kWh, SOC: 81% -> 76%",
+                "Current energy used: 3.4 kWh (27.64 kWh/100 km), SOC: 81% -> 76%",
             TelegramTemplateRenderer.render(
                 TelegramEventType.TRIP_SUMMARY,
                 TelegramBuiltInTemplates.tripSummaryTemplate(TelegramTemplateLanguage.EN, includeOverall = false),

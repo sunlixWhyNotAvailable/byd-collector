@@ -27,7 +27,9 @@ class TripRuntimeEnergyContractTest {
         assertInOrder(runtime, "ensureInitialized()", "powerTracker.observe(decodedPower)")
         assertTrue(runtime.contains("VehiclePowerState.OFF -> handlePowerOff(timestamp, snapshot)"))
         assertTrue(runtime.contains("transition?.let(powerTracker::rollback)"))
-        assertInOrder(runtime, "private fun handlePowerOff", "onConfirmedPowerOff(ConfirmedPowerOff")
+        assertInOrder(runtime, "private fun handlePowerOff", "prepareConfirmedPowerOff(")
+        assertInOrder(runtime, "prepareConfirmedPowerOff(", "state = TripSession.STATE_CLOSED")
+        assertInOrder(runtime, "state = TripSession.STATE_CLOSED", "deliverAfterClose()")
     }
 
     private fun sourceFile(path: String): File = listOf(

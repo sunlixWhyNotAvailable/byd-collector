@@ -462,8 +462,10 @@ class TelegramEventEngineTest {
         assertEquals(TelegramEventType.TRIP_SUMMARY, summary.type)
         assertEquals("1", summary.variables["trip_distance_km"])
         assertEquals("1.5", summary.variables["trip_energy_kwh"])
+        assertEquals("150", summary.variables["trip_avg_kwh_per_100km"])
         assertEquals("1", summary.variables["total_distance_km"])
         assertEquals("1.5", summary.variables["total_energy_kwh"])
+        assertEquals("150", summary.variables["total_avg_kwh_per_100km"])
         assertNull(completed.nextWakeAtMs)
         assertNull(completed.state.tripId)
     }
@@ -486,7 +488,9 @@ class TelegramEventEngineTest {
         val summary = result.events.single()
         assertEquals(TelegramEventType.TRIP_SUMMARY, summary.type)
         assertEquals("1.5", summary.variables["trip_energy_kwh"])
+        assertEquals("150", summary.variables["trip_avg_kwh_per_100km"])
         assertEquals("1.5", summary.variables["total_energy_kwh"])
+        assertEquals("150", summary.variables["total_avg_kwh_per_100km"])
         assertEquals("\nGoogle: google\nWaze: waze\nApple: apple\nOSM: osm", summary.textSuffix)
         assertNull(result.state.tripId)
         assertEquals(0.0, result.state.bootTotalEnergyKwh)
@@ -739,8 +743,10 @@ class TelegramEventEngineTest {
         assertNull(firstNewBootPoll.state.tripId)
         assertEquals("1", summary.variables["trip_distance_km"])
         assertEquals("1.5", summary.variables["trip_energy_kwh"])
+        assertEquals("150", summary.variables["trip_avg_kwh_per_100km"])
         assertEquals("5", summary.variables["total_distance_km"])
         assertEquals("1.5", summary.variables["total_energy_kwh"])
+        assertEquals("30", summary.variables["total_avg_kwh_per_100km"])
         assertTrue(driving.events.isEmpty())
         assertNotNull(driving.state.tripId)
         assertTrue(driving.state.tripId != previousTripId)
@@ -778,8 +784,10 @@ class TelegramEventEngineTest {
 
         assertEquals("1", first.variables["trip_distance_km"])
         assertEquals("0.5", first.variables["trip_energy_kwh"])
+        assertEquals("50", first.variables["trip_avg_kwh_per_100km"])
         assertEquals("1", first.variables["total_distance_km"])
         assertEquals("0.5", first.variables["total_energy_kwh"])
+        assertEquals("50", first.variables["total_avg_kwh_per_100km"])
         assertEquals("0:01", first.variables["trip_duration"])
         assertEquals("0:01", first.variables["total_duration"])
         assertEquals("56", first.variables["soc_start"])
@@ -800,8 +808,10 @@ class TelegramEventEngineTest {
 
         assertEquals("2", second.variables["trip_distance_km"])
         assertEquals("0.7", second.variables["trip_energy_kwh"])
+        assertEquals("35", second.variables["trip_avg_kwh_per_100km"])
         assertEquals("3", second.variables["total_distance_km"])
         assertEquals("1.2", second.variables["total_energy_kwh"])
+        assertEquals("40", second.variables["total_avg_kwh_per_100km"])
         assertEquals("0:03", second.variables["total_duration"])
         assertEquals("53", second.variables["soc_start"])
         assertEquals("52", second.variables["soc_end"])
@@ -925,7 +935,9 @@ class TelegramEventEngineTest {
         assertEquals(tripId, resumed.state.tripId)
         assertEquals("2", summary.variables["trip_distance_km"])
         assertEquals("1.2", summary.variables["trip_energy_kwh"])
+        assertEquals("60", summary.variables["trip_avg_kwh_per_100km"])
         assertEquals("1.2", summary.variables["total_energy_kwh"])
+        assertEquals("60", summary.variables["total_avg_kwh_per_100km"])
     }
 
     @Test
@@ -946,6 +958,7 @@ class TelegramEventEngineTest {
         val qualified = engine.onTick(config, false, null, 24_500L).events.single()
         assertEquals("0", qualified.variables["trip_distance_km"])
         assertEquals("0", qualified.variables["trip_energy_kwh"])
+        assertEquals("n/a", qualified.variables["trip_avg_kwh_per_100km"])
         assertEquals("49.5", qualified.variables["soc_start"])
         assertEquals("48.5", qualified.variables["soc_end"])
     }

@@ -37,7 +37,7 @@ class TripRuntimeCoordinator(
     private val historyEnabled: () -> Boolean,
     private val locationCaptureEnabled: () -> Boolean,
     private val persistLocation: (List<NormalizedObservation>) -> Unit,
-    private val onConfirmedPowerOff: (ConfirmedPowerOff) -> Unit,
+    private val prepareConfirmedPowerOff: (ConfirmedPowerOff) -> (() -> Unit),
     private val recordEvent: (String, String, String?) -> Unit,
     private val elapsedRealtimeMs: () -> Long = SystemClock::elapsedRealtime,
     private val bootIdProvider: () -> String = ::readBootId
@@ -55,6 +55,7 @@ class TripRuntimeCoordinator(
     private var gpsStarted = false
     private val gpsStartRetry = GpsStartRetryGate()
     private var lastLocation: GpsLocationSample? = null
+    private var lastLocationTripId: String? = null
     private var latestBatteryPowerKw: Double? = null
     private var latestBatteryPowerAtMs = Long.MIN_VALUE
     private val vehicleSpeedReference = VehicleSpeedReference(nowElapsedMs = elapsedRealtimeMs)
@@ -170,7 +171,10 @@ class TripRuntimeCoordinator(
     }
 
     private fun handlePowerOn(timestamp: String, snapshot: TelemetrySnapshot) {
-        if (session == null) lastLocation = null
+        if (session == null) {
+            lastLocation = null
+            lastLocationTripId = null
+        }
         if (historyEnabled()) {
             if (session == null) {
                 val startEnergy = snapshot.tripEnergyKwh?.takeIf { it.isFinite() && it >= 0.0 }
@@ -245,7 +249,18 @@ class TripRuntimeCoordinator(
     private fun handlePowerOff(timestamp: String, snapshot: TelemetrySnapshot) {
         stopGps(markFinal = true)
         updateOpenSession(timestamp, snapshot)
-        val closed = session?.let { current ->
+        val current = session
+        val trustedLocation = when {
+            current == null -> lastLocation
+            lastLocationTripId == current.tripId -> lastLocation
+            else -> tripStore.queryRoutePoints(current.tripId)
+                .lastOrNull { it.kind == RoutePoint.KIND_VALID }
+                ?.toGpsSample()
+        }
+        val deliverAfterClose = prepareConfirmedPowerOff(
+            ConfirmedPowerOff(timestamp, current, trustedLocation)
+        )
+        val closed = current?.let { current ->
             markLastRoutePointFinal(current.tripId)
             current.copy(
                 state = TripSession.STATE_CLOSED,
@@ -261,7 +276,7 @@ class TripRuntimeCoordinator(
         }
         session = null
         nextRouteSequence = 0L
-        onConfirmedPowerOff(ConfirmedPowerOff(timestamp, closed, lastLocation))
+        deliverAfterClose()
     }
 
     private fun ensureGpsRunning() {
@@ -288,6 +303,7 @@ class TripRuntimeCoordinator(
         lastLocation = sample
         persistLocation(LocationNormalizer.observations(sample, sample.receiveWallTimeMs))
         val current = session ?: return
+        lastLocationTripId = current.tripId
         val powerAgeMs = sample.receiveElapsedRealtimeNanos / 1_000_000L - latestBatteryPowerAtMs
         val power = latestBatteryPowerKw.takeIf {
             powerAgeMs in 0L..TELEMETRY_FRESH_MS
@@ -341,6 +357,7 @@ class TripRuntimeCoordinator(
         lastLocation = session?.let { current ->
             tripStore.queryRoutePoints(current.tripId).lastOrNull { it.kind == RoutePoint.KIND_VALID }?.toGpsSample()
         }
+        lastLocationTripId = session?.tripId?.takeIf { lastLocation != null }
         initialized = true
     }
 

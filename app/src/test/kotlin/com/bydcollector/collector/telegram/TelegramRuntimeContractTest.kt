@@ -165,33 +165,57 @@ class TelegramRuntimeContractTest {
     fun startupAndPowerOffPrioritizeTripSummariesAfterDurableCommit() {
         val coordinator = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
         val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val tripRuntime = sourceFile("com/bydcollector/collector/service/TripRuntimeCoordinator.kt").readText()
         val tick = coordinator.substringAfter("fun tick(").substringBefore("fun onPowerOffConfirmed")
         val engineTick = tick.substringAfter("val result = engine.onTick")
         val startup = coordinator.substringAfter("private fun ensureStartupRecovery")
-            .substringBefore("private fun nextWakeAt")
-        val powerOff = coordinator.substringAfter("fun onPowerOffConfirmed")
-            .substringBefore("fun testConnection")
-        val servicePowerOff = service.substringAfter("private fun handleConfirmedPowerOff")
+            .substringBefore("private fun recoverStartupLocally")
+        val recovery = coordinator.substringAfter("private fun recoverStartupLocally")
+            .substringBefore("private fun activateEnabledRuntime")
+        val prepare = coordinator.substringAfter("internal fun preparePowerOffConfirmed")
+            .substringBefore("/** Performs network work")
+        val delivery = coordinator.substringAfter("internal fun deliverPreparedPowerOff")
+            .substringBefore("/** Compatibility hook")
+        val servicePowerOff = service.substringAfter("private fun prepareConfirmedPowerOff")
             .substringBefore("private fun telegramLocationSnapshot")
+        val tripPowerOff = tripRuntime.substringAfter("private fun handlePowerOff")
+            .substringBefore("private fun ensureGpsRunning")
 
-        assertInOrder(startup, "engine.recoverPendingTrip", "handle(recovered)")
-        assertInOrder(startup, "handle(recovered)", "attempt(it, force = true)")
+        assertInOrder(recovery, "engine.recoverPendingTrip", "handle(recovered)")
+        assertFalse(recovery.contains("attempt("))
+        assertInOrder(startup, "recoverStartupLocally()", "attempt(it, force = true)")
         assertInOrder(
-            powerOff,
-            "engine.state.pendingPowerOffLocationTripId",
-            "flushPending(\"${'$'}it:summary\", force = true)",
+            prepare,
+            "recoverStartupLocally()",
             "engine.onPowerOffConfirmed",
-            "handle(result)",
-            "flushPending(it, force = true)"
+            "handle(result)"
         )
-        assertTrue(powerOff.contains("!engine.state.pendingPowerOffLocationSummaryDelivered"))
+        assertFalse(prepare.contains("flushPending("))
+        assertFalse(prepare.contains("client.sendMessage"))
+        assertInOrder(delivery, "preparation.priorityKeys.forEach", "flushPending(key, force = true)")
+        assertInOrder(delivery, "flushPending(key, force = true)", "flushPending()")
+        assertFalse(prepare.contains("oldestUnblockedTelegramMessage()"))
+        assertTrue(prepare.contains("check(handle(result))"))
+        assertTrue(recovery.contains("check(handle(recovered))"))
+        assertTrue(prepare.contains("!engine.state.pendingPowerOffLocationSummaryDelivered"))
         assertTrue(coordinator.contains("val runtimeStartedAtMs = activateEnabledRuntime() ?: return null"))
         assertInOrder(engineTick, "tickAtMs,", "runtimeStartedAtMs")
         assertTrue(coordinator.contains("private var enabledRuntimeStartedAtMs: Long? = null"))
         assertTrue(coordinator.contains("enabledRuntimeStartedAtMs = null"))
         assertTrue(coordinator.contains("if (!settings.isTelegramEnabled()) return null"))
-        assertTrue(powerOff.contains("activateEnabledRuntime() ?: return null"))
-        assertTrue(servicePowerOff.contains("coordinator.onPowerOffConfirmed("))
+        assertTrue(prepare.contains("activateEnabledRuntime() ?: return null"))
+        assertInOrder(
+            servicePowerOff,
+            "runOnTelegramExecutorBlocking",
+            "coordinator.preparePowerOffConfirmed(",
+            "coordinator.deliverPreparedPowerOff(preparation)"
+        )
+        assertInOrder(
+            tripPowerOff,
+            "prepareConfirmedPowerOff(",
+            "state = TripSession.STATE_CLOSED",
+            "deliverAfterClose()"
+        )
         assertFalse(servicePowerOff.contains("coordinator.flushPending()"))
         assertTrue(coordinator.contains("telegram_location_eligibility"))
         assertTrue(coordinator.contains("trigger=power_off reason="))

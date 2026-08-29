@@ -393,6 +393,7 @@ private val telegramUk = TelegramStrings(
         "error" to "Короткий опис помилки",
         "trip_distance_km" to "Відстань поїздки, км",
         "trip_energy_kwh" to "Енергія поїздки, кВт·год",
+        "trip_avg_kwh_per_100km" to "Середня витрата поїздки, кВт·год/100 км",
         "trip_duration" to "Тривалість поїздки",
         "soc_start" to "SOC на початку поїздки, %",
         "soc_end" to "SOC наприкінці поїздки, %",
@@ -400,6 +401,7 @@ private val telegramUk = TelegramStrings(
         "total_soc_end" to "SOC наприкінці загального підсумку, %",
         "total_distance_km" to "Загальна відстань, км",
         "total_energy_kwh" to "Загальна витрата енергії, кВт·год",
+        "total_avg_kwh_per_100km" to "Середня загальна витрата, кВт·год/100 км",
         "total_duration" to "Загальна тривалість поїздок"
     )
 )
@@ -494,6 +496,7 @@ private val telegramEn = TelegramStrings(
         "error" to "Short error description",
         "trip_distance_km" to "Trip distance, km",
         "trip_energy_kwh" to "Trip energy, kWh",
+        "trip_avg_kwh_per_100km" to "Average trip consumption, kWh/100 km",
         "trip_duration" to "Trip duration",
         "soc_start" to "SOC at trip start, %",
         "soc_end" to "SOC at trip end, %",
@@ -501,6 +504,7 @@ private val telegramEn = TelegramStrings(
         "total_soc_end" to "SOC at overall-summary end, %",
         "total_distance_km" to "Total distance, km",
         "total_energy_kwh" to "Total energy used, kWh",
+        "total_avg_kwh_per_100km" to "Average total consumption, kWh/100 km",
         "total_duration" to "Total trip duration"
     )
 )

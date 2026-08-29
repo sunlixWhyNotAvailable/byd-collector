@@ -516,18 +516,18 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
                 config,
                 TelegramEventType.TRIP_SUMMARY,
                 "$tripId:summary",
-                mapOf(
-                    "trip_distance_km" to formatNumber(distance),
-                    "trip_energy_kwh" to formatNumber(energy),
-                    "trip_duration" to formatDuration(durationMs),
-                    "soc_start" to formatNumber(state.tripStartSoc),
-                    "soc_end" to formatNumber(state.tripEndSoc),
-                    "total_soc_start" to formatNumber(state.bootStartSoc),
-                    "total_soc_end" to formatNumber(state.bootEndSoc),
-                    "total_distance_km" to formatNumber(totalDistance),
-                    "total_energy_kwh" to formatNumber(totalEnergy),
-                    "total_duration" to formatDuration(totalDurationMs),
-                    "time" to formatTime(nowMs)
+                tripSummaryVariables(
+                    distance = distance,
+                    energy = energy,
+                    durationMs = durationMs,
+                    totalDistance = totalDistance,
+                    totalEnergy = totalEnergy,
+                    totalDurationMs = totalDurationMs,
+                    tripStartSoc = state.tripStartSoc,
+                    tripEndSoc = state.tripEndSoc,
+                    totalStartSoc = state.bootStartSoc,
+                    totalEndSoc = state.bootEndSoc,
+                    nowMs = nowMs
                 ),
                 textSuffix = location
                     ?.takeIf(::isActualLocation)
@@ -903,18 +903,18 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         ) {
             addIfEnabled(
                 events, config, TelegramEventType.TRIP_SUMMARY, "$tripId:summary",
-                mapOf(
-                    "trip_distance_km" to formatNumber(distance),
-                    "trip_energy_kwh" to formatNumber(energy),
-                    "trip_duration" to formatDuration(durationMs),
-                    "soc_start" to formatNumber(state.tripStartSoc),
-                    "soc_end" to formatNumber(state.tripEndSoc),
-                    "total_soc_start" to formatNumber(state.bootStartSoc),
-                    "total_soc_end" to formatNumber(state.bootEndSoc),
-                    "total_distance_km" to formatNumber(totalDistance),
-                    "total_energy_kwh" to formatNumber(totalEnergy),
-                    "total_duration" to formatDuration(totalDurationMs),
-                    "time" to formatTime(parkedSince)
+                tripSummaryVariables(
+                    distance = distance,
+                    energy = energy,
+                    durationMs = durationMs,
+                    totalDistance = totalDistance,
+                    totalEnergy = totalEnergy,
+                    totalDurationMs = totalDurationMs,
+                    tripStartSoc = state.tripStartSoc,
+                    tripEndSoc = state.tripEndSoc,
+                    totalStartSoc = state.bootStartSoc,
+                    totalEndSoc = state.bootEndSoc,
+                    nowMs = parkedSince
                 ),
                 omitOverall = displayedTripTotalsMatch(
                     distance = distance,
@@ -1300,6 +1300,36 @@ private fun formatLocalTime(timeMs: Long?): String {
 private fun formatTime(timeMs: Long): String {
     return java.text.SimpleDateFormat("dd.MM.yyyy HH:mm", java.util.Locale.getDefault()).format(java.util.Date(timeMs))
 }
+
+private fun tripSummaryVariables(
+    distance: Double?,
+    energy: Double?,
+    durationMs: Long,
+    totalDistance: Double,
+    totalEnergy: Double,
+    totalDurationMs: Long,
+    tripStartSoc: Double?,
+    tripEndSoc: Double?,
+    totalStartSoc: Double?,
+    totalEndSoc: Double?,
+    nowMs: Long
+): Map<String, String> = mapOf(
+    "trip_distance_km" to formatNumber(distance),
+    "trip_energy_kwh" to formatNumber(energy),
+    "trip_avg_kwh_per_100km" to formatNumber(TripMetrics.averageConsumptionKwhPer100Km(energy, distance)),
+    "trip_duration" to formatDuration(durationMs),
+    "soc_start" to formatNumber(tripStartSoc),
+    "soc_end" to formatNumber(tripEndSoc),
+    "total_soc_start" to formatNumber(totalStartSoc),
+    "total_soc_end" to formatNumber(totalEndSoc),
+    "total_distance_km" to formatNumber(totalDistance),
+    "total_energy_kwh" to formatNumber(totalEnergy),
+    "total_avg_kwh_per_100km" to formatNumber(
+        TripMetrics.averageConsumptionKwhPer100Km(totalEnergy, totalDistance)
+    ),
+    "total_duration" to formatDuration(totalDurationMs),
+    "time" to formatTime(nowMs)
+)
 
 private fun displayedTripTotalsMatch(
     distance: Double?,

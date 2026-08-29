@@ -37,6 +37,27 @@ class CollectorServiceLocationGateContractTest {
     }
 
     @Test
+    fun powerOffLocationIsScopedToTheCurrentTripOrPowerSession() {
+        val runtime = sourceFile("com/bydcollector/collector/service/TripRuntimeCoordinator.kt").readText()
+        val powerOn = runtime.substringAfter("private fun handlePowerOn")
+            .substringBefore("private fun updateOpenSession")
+        val powerOff = runtime.substringAfter("private fun handlePowerOff")
+            .substringBefore("private fun ensureGpsRunning")
+        val trusted = runtime.substringAfter("private fun handleLocation")
+            .substringBefore("private fun handleUntrusted")
+        val untrusted = runtime.substringAfter("private fun handleUntrusted")
+            .substringBefore("private fun handleGap")
+
+        assertInOrder(powerOn, "lastLocation = null", "lastLocationTripId = null")
+        assertInOrder(trusted, "lastLocation = sample", "lastLocationTripId = current.tripId")
+        assertFalse(untrusted.contains("lastLocation = sample"))
+        assertTrue(powerOff.contains("current == null -> lastLocation"))
+        assertTrue(powerOff.contains("lastLocationTripId == current.tripId -> lastLocation"))
+        assertTrue(powerOff.contains("tripStore.queryRoutePoints(current.tripId)"))
+        assertTrue(powerOff.contains("it.kind == RoutePoint.KIND_VALID"))
+    }
+
+    @Test
     fun gpsProviderReceiverResetsFailedStartWithoutPollSpam() {
         val gpsSource = sourceFile("com/bydcollector/collector/location/AndroidGpsLocationSource.kt").readText()
         val runtime = sourceFile("com/bydcollector/collector/service/TripRuntimeCoordinator.kt").readText()
@@ -72,5 +93,12 @@ class CollectorServiceLocationGateContractTest {
             File("src/main/kotlin/$path"),
             File("app/src/main/kotlin/$path")
         ).firstOrNull { it.isFile } ?: error("Missing source file: $path")
+    }
+
+    private fun assertInOrder(source: String, first: String, second: String) {
+        val firstIndex = source.indexOf(first)
+        val secondIndex = source.indexOf(second)
+        assertTrue(firstIndex >= 0, "Missing token: $first")
+        assertTrue(secondIndex > firstIndex, "Expected $first before $second")
     }
 }

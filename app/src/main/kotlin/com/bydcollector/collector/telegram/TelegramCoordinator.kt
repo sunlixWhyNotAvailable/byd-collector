@@ -14,6 +14,11 @@ import com.bydcollector.collector.service.TelegramEventState
 import com.bydcollector.collector.service.TelegramLocationSnapshot
 import com.bydcollector.collector.service.TelegramPowerOffSnapshot
 
+internal data class TelegramPowerOffPreparation(
+    val priorityKeys: List<String>,
+    val eventDeadlineAtMs: Long?
+)
+
 class TelegramCoordinator(
     private val eventStore: TelemetryStore,
     private val telegramStore: TelegramStore,
@@ -68,15 +73,18 @@ class TelegramCoordinator(
         return nextWakeAt(result.nextWakeAtMs, nextWakeAt(startupDeadline, flushPending()))
     }
 
-    /** Root/service integration hook for confirmed vehicle power-off. */
-    fun onPowerOffConfirmed(snapshot: TelegramPowerOffSnapshot = TelegramPowerOffSnapshot(), location: TelegramLocationSnapshot? = null): Long? {
+    /** Commits the power-off obligation locally before the Trips database is closed. */
+    internal fun preparePowerOffConfirmed(
+        snapshot: TelegramPowerOffSnapshot = TelegramPowerOffSnapshot(),
+        location: TelegramLocationSnapshot? = null
+    ): TelegramPowerOffPreparation? {
         activateEnabledRuntime() ?: return null
-        val startupDeadline = ensureStartupRecovery()
-        engine.state.pendingPowerOffLocationTripId
+        val recovered = recoverStartupLocally()
+        val pendingSummaryKey = engine.state.pendingPowerOffLocationTripId
             ?.takeIf { !engine.state.pendingPowerOffLocationSummaryDelivered }
-            ?.let { flushPending("$it:summary", force = true) }
+            ?.let { "$it:summary" }
         val result = engine.onPowerOffConfirmed(eventConfig(), snapshot, location, nowMs())
-        handle(result)
+        check(handle(result)) { "Telegram power-off batch could not be rendered atomically" }
         result.locationEligibilityReason?.let { reason ->
             eventStore.recordEvent(
                 "telegram_location_eligibility",
@@ -84,11 +92,39 @@ class TelegramCoordinator(
                 "trigger=power_off reason=$reason"
             )
         }
-        val priorityKey = result.events.firstOrNull {
-            it.type == TelegramEventType.TRIP_SUMMARY && !it.locationOnly
-        }?.dedupeKey ?: result.events.firstOrNull { it.locationOnly }?.dedupeKey
-        val deliveryDeadline = priorityKey?.let { flushPending(it, force = true) } ?: flushPending()
-        return nextWakeAt(result.nextWakeAtMs, nextWakeAt(startupDeadline, deliveryDeadline))
+        val priorityKeys = buildList {
+            recovered?.events
+                ?.filter { it.type == TelegramEventType.TRIP_SUMMARY && !it.locationOnly }
+                ?.forEach { add(it.dedupeKey) }
+            pendingSummaryKey?.let(::add)
+            result.events
+                .filter { it.type == TelegramEventType.TRIP_SUMMARY && !it.locationOnly }
+                .forEach { add(it.dedupeKey) }
+            result.events.filter { it.locationOnly }.forEach { add(it.dedupeKey) }
+        }.distinct()
+        return TelegramPowerOffPreparation(
+            priorityKeys = priorityKeys,
+            eventDeadlineAtMs = nextWakeAt(recovered?.nextWakeAtMs, result.nextWakeAtMs)
+        )
+    }
+
+    /** Performs network work only after the Trips close succeeds. */
+    internal fun deliverPreparedPowerOff(preparation: TelegramPowerOffPreparation): Long? {
+        var deadline = preparation.eventDeadlineAtMs
+        preparation.priorityKeys.forEach { key ->
+            deadline = nextWakeAt(deadline, flushPending(key, force = true))
+        }
+        deadline = nextWakeAt(deadline, flushPending())
+        return nextWakeAt(deadline, pendingQueueDeadline())
+    }
+
+    /** Compatibility hook for direct callers; service uses the ordered two-phase API. */
+    fun onPowerOffConfirmed(
+        snapshot: TelegramPowerOffSnapshot = TelegramPowerOffSnapshot(),
+        location: TelegramLocationSnapshot? = null
+    ): Long? {
+        val preparation = preparePowerOffConfirmed(snapshot, location) ?: return null
+        return deliverPreparedPowerOff(preparation)
     }
 
     fun testConnection(): TelegramSendResult {
@@ -197,16 +233,21 @@ class TelegramCoordinator(
     }
 
     private fun ensureStartupRecovery(): Long? {
-        if (!startupRecoveryPending) return null
-        val recovered = engine.recoverPendingTrip(eventConfig(), nowMs())
-        handle(recovered)
-        startupRecoveryPending = false
+        val recovered = recoverStartupLocally() ?: return null
         val recoveredKey = recovered.events
             .firstOrNull { it.type == TelegramEventType.TRIP_SUMMARY }
             ?.dedupeKey
         val pending = recoveredKey?.let(telegramStore::telegramMessageByDedupeKey)?.takeUnless { it.blocked }
             ?: telegramStore.oldestUnblockedTelegramMessage(TelegramEventType.TRIP_SUMMARY.key)
-        return pending?.let { attempt(it, force = true) }
+        return nextWakeAt(recovered.nextWakeAtMs, pending?.let { attempt(it, force = true) })
+    }
+
+    private fun recoverStartupLocally(): TelegramEventResult? {
+        if (!startupRecoveryPending) return null
+        val recovered = engine.recoverPendingTrip(eventConfig(), nowMs())
+        check(handle(recovered)) { "Telegram recovery batch could not be rendered atomically" }
+        startupRecoveryPending = false
+        return recovered
     }
 
     private fun activateEnabledRuntime(): Long? {
@@ -218,11 +259,11 @@ class TelegramCoordinator(
         return listOfNotNull(eventDeadlineAtMs, queueDeadlineAtMs).minOrNull()
     }
 
-    private fun handle(result: TelegramEventResult) {
+    private fun handle(result: TelegramEventResult): Boolean {
         val messages = renderTelegramBatch(result.events, ::render)
         if (messages == null) {
             engine = TelegramEventEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
-            return
+            return false
         }
         val committedAt = nowMs()
         val outcomes = try {
@@ -251,6 +292,7 @@ class TelegramCoordinator(
                 )
             }
         }
+        return true
     }
 
     private fun render(event: TelegramDetectedEvent): TelegramOutboxMessage? {

@@ -520,12 +520,6 @@ class CollectorService : Service() {
                     )
                 )
                 scheduleDatabaseFootprintRefresh(force = false)
-                tripRuntime.onSuccessfulPoll(
-                    timestamp,
-                    readings,
-                    observations,
-                    liveTelemetry = origin == PollOrigin.LIVE
-                )
                 telegramCoordinator?.let { coordinator ->
                     executeTelegram(
                         "telegram_event_error",
@@ -534,6 +528,12 @@ class CollectorService : Service() {
                         coordinator.onSuccessfulPoll(observations)
                     }
                 }
+                tripRuntime.onSuccessfulPoll(
+                    timestamp,
+                    readings,
+                    observations,
+                    liveTelemetry = origin == PollOrigin.LIVE
+                )
                 if (summary.changedCategories.isNotEmpty()) {
                     normalizedStateChangedCallback?.invoke(summary.changedCategories)
                 }
@@ -554,7 +554,7 @@ class CollectorService : Service() {
                     settings.effectiveInfluxCategories().contains("location")
             },
             persistLocation = ::persistLocationObservations,
-            onConfirmedPowerOff = ::handleConfirmedPowerOff,
+            prepareConfirmedPowerOff = ::prepareConfirmedPowerOff,
             recordEvent = store::recordEvent
         )
     }
@@ -572,30 +572,46 @@ class CollectorService : Service() {
         exportInfluxAfterNormalizedWrite(summary)
     }
 
-    private fun handleConfirmedPowerOff(event: ConfirmedPowerOff) {
+    private fun prepareConfirmedPowerOff(event: ConfirmedPowerOff): () -> Unit {
+        if (!settings.isTelegramEnabled()) return {}
         val coordinator = telegramCoordinator ?: run {
-            if (settings.isTelegramEnabled()) {
-                store.recordEvent(
-                    "telegram_event_skipped_storage_unavailable",
-                    "Telegram power-off event skipped because storage is unavailable",
-                    BydCollectorApplication.TELEGRAM_STORAGE_ERROR
+            store.recordEvent(
+                "telegram_power_off_error",
+                "Telegram power-off event could not be persisted",
+                BydCollectorApplication.TELEGRAM_STORAGE_ERROR
+            )
+            error(BydCollectorApplication.TELEGRAM_STORAGE_ERROR)
+        }
+        val current = event.session
+        val preparation = try {
+            runOnTelegramExecutorBlocking {
+                coordinator.preparePowerOffConfirmed(
+                    snapshot = TelegramPowerOffSnapshot(
+                        odometerKm = current?.lastOdometerKm,
+                        soc = current?.endSoc,
+                        tripEnergyKwh = current?.lastTripEnergyKwh
+                    ),
+                    location = event.lastLocation?.let(::telegramLocationSnapshot)
                 )
             }
-            return
-        }
-        executeTelegram(
-            "telegram_power_off_error",
-            onSuccess = ::postTelegramTickSchedule
-        ) {
-            val current = event.session
-            coordinator.onPowerOffConfirmed(
-                snapshot = TelegramPowerOffSnapshot(
-                    odometerKm = current?.lastOdometerKm,
-                    soc = current?.endSoc,
-                    tripEnergyKwh = current?.lastTripEnergyKwh
-                ),
-                location = event.lastLocation?.let(::telegramLocationSnapshot)
-            )
+        } catch (error: Throwable) {
+            runCatching {
+                store.recordEvent(
+                    "telegram_power_off_error",
+                    "Telegram power-off event could not be persisted",
+                    "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                )
+            }
+            handleTelegramExecutionFailure(error)
+            throw error
+        } ?: return {}
+        return {
+            executeTelegram(
+                "telegram_power_off_error",
+                onSuccess = ::postTelegramTickSchedule
+            ) {
+                coordinator.deliverPreparedPowerOff(preparation)
+            }
         }
     }
 
@@ -2956,6 +2972,38 @@ class CollectorService : Service() {
         }
     }
 
+    private fun <T> runOnTelegramExecutorBlocking(action: () -> T): T {
+        if (Thread.currentThread().name == "byd-telegram") return action()
+        check(!maintenanceBlocksRuntimeStart()) { "Telegram storage maintenance is active" }
+        val submittedGeneration = telegramWorkGeneration.get()
+        val selectedExecutor = synchronized(telegramExecutorLock) { telegramExecutor }
+        val task = FutureTask<T> {
+            check(submittedGeneration == telegramWorkGeneration.get() && !maintenanceBlocksRuntimeStart()) {
+                "Telegram worker changed before power-off persistence"
+            }
+            action()
+        }
+        try {
+            selectedExecutor.execute(task)
+        } catch (error: RejectedExecutionException) {
+            throw IllegalStateException("Telegram worker rejected power-off persistence", error)
+        }
+        return try {
+            task.get(TELEGRAM_POWER_OFF_PREPARE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        } catch (error: InterruptedException) {
+            task.cancel(false)
+            Thread.currentThread().interrupt()
+            throw IllegalStateException("Interrupted while persisting Telegram power-off event", error)
+        } catch (error: TimeoutException) {
+            task.cancel(false)
+            throw IllegalStateException("Timed out persisting Telegram power-off event", error)
+        } catch (error: ExecutionException) {
+            val cause = error.cause ?: error
+            if (cause is RuntimeException) throw cause
+            throw IllegalStateException("Telegram power-off persistence failed", cause)
+        }
+    }
+
     private fun recoverInterruptedMaintenanceIfNeeded(action: String) {
         if (action == ACTION_ARCHIVE_DATABASE || action == ACTION_ARCHIVE_DEBUG_DATABASE) return
         if (maintenanceActive.get()) return
@@ -3103,6 +3151,7 @@ class CollectorService : Service() {
         private const val MQTT_MAINTENANCE_STOP_TIMEOUT_MS = 16_000L
         private const val INFLUX_MAINTENANCE_STOP_TIMEOUT_MS = 16_000L
         private const val TELEGRAM_MAINTENANCE_STOP_TIMEOUT_MS = 16_000L
+        private const val TELEGRAM_POWER_OFF_PREPARE_TIMEOUT_MS = 5_000L
         private const val RUNTIME_OWNER_HANDOFF_TIMEOUT_MS = 30_000L
         private const val USER_SHUTDOWN_STOP_TIMEOUT_MS = 16_000L
         private const val TAG = "BYDCollectorService"

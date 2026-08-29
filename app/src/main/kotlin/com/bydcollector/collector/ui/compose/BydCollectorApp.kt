@@ -491,6 +491,7 @@ private val TelegramMessageDefinitions = listOf(
         listOf(
             "trip_distance_km",
             "trip_energy_kwh",
+            "trip_avg_kwh_per_100km",
             "trip_duration",
             "soc_start",
             "soc_end",
@@ -498,6 +499,7 @@ private val TelegramMessageDefinitions = listOf(
             "total_soc_end",
             "total_distance_km",
             "total_energy_kwh",
+            "total_avg_kwh_per_100km",
             "total_duration",
             "time"
         )
