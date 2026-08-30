@@ -191,6 +191,35 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable {
     @Synchronized
     internal fun session(tripId: String): TripSession? = querySessions("trip_id = ?", arrayOf(tripId)).firstOrNull()
 
+    /** Returns the newest closed session without materializing trip history. */
+    @Synchronized
+    internal fun diagnosticLatestClosedSession(): TripSession? = querySessions(
+        where = "state = ?",
+        args = arrayOf(TripSession.STATE_CLOSED),
+        orderBy = "started_at DESC, trip_id DESC",
+        limit = 1
+    ).firstOrNull()
+
+    /** Streams a route under the store monitor and reports only redacted proof fields. */
+    @Synchronized
+    internal fun diagnosticRouteEvidence(tripId: String): TripRouteDiagnosticEvidence {
+        val db = readableDb
+        val chunks = chunkCount(db, tripId) != 0L
+        val raw = db.rawQuery(
+            "SELECT COUNT(*) FROM route_points WHERE trip_id = ?",
+            arrayOf(tripId)
+        ).use { cursor -> if (cursor.moveToFirst()) cursor.getLong(0) else 0L }
+        val storage = when {
+            chunks && raw != 0L -> "mixed"
+            chunks -> "chunks"
+            raw != 0L -> "raw"
+            else -> "none"
+        }
+        val accumulator = TripRouteDiagnosticAccumulator(tripId)
+        forEachRoutePoint(tripId, accumulator::accept)
+        return accumulator.finish(storage)
+    }
+
     /** Replaces a route with raw rows atomically; used when a candidate must fall back to raw. */
     @Synchronized
     internal fun replaceRouteRaw(tripId: String, points: List<RoutePoint>) {
@@ -482,9 +511,19 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable {
         "SELECT trip_id, started_at, ended_at, duration_ms, distance_km, start_soc, end_soc, energy_kwh, average_consumption_kwh_per_100km, quality, movement_observed FROM trip_sessions $where ORDER BY started_at DESC", args
     ).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.toTripSummary()) } }
 
-    private fun querySessions(where: String, args: Array<String>): List<TripSession> = readableDb.rawQuery(
-        "SELECT trip_id, state, started_at, ended_at, start_elapsed_ms, end_elapsed_ms, start_boot_id, end_boot_id, start_segment_id, end_segment_id, movement_observed, start_soc, end_soc, start_odometer_km, last_odometer_km, start_trip_energy_kwh, last_trip_energy_kwh, duration_ms, distance_km, energy_kwh, average_consumption_kwh_per_100km, termination, quality, telegram_eligible, telegram_enqueued FROM trip_sessions WHERE $where ORDER BY started_at", args
-    ).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.toTripSession()) } }
+    private fun querySessions(
+        where: String,
+        args: Array<String>,
+        orderBy: String = "started_at",
+        limit: Int? = null
+    ): List<TripSession> {
+        require(limit == null || limit > 0) { "Session query limit must be positive" }
+        val limitClause = limit?.let { " LIMIT $it" }.orEmpty()
+        return readableDb.rawQuery(
+            "SELECT trip_id, state, started_at, ended_at, start_elapsed_ms, end_elapsed_ms, start_boot_id, end_boot_id, start_segment_id, end_segment_id, movement_observed, start_soc, end_soc, start_odometer_km, last_odometer_km, start_trip_energy_kwh, last_trip_energy_kwh, duration_ms, distance_km, energy_kwh, average_consumption_kwh_per_100km, termination, quality, telegram_eligible, telegram_enqueued FROM trip_sessions WHERE $where ORDER BY $orderBy$limitClause",
+            args
+        ).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.toTripSession()) } }
+    }
 
     private fun TripSession.toContentValues() = ContentValues().apply {
         put("trip_id", tripId); put("state", state); put("started_at", startedAt); put("ended_at", endedAt)

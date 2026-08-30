@@ -125,6 +125,7 @@ class NormalizedStateStore(
     }
 
     private fun upsertCatalogField(db: SQLiteDatabase, field: NormalizedFieldDefinition) {
+        deleteIncompatibleCurrentRow(db, field)
         val now = clock.nowIso()
         //keeps discovery/export metadata in sqlite next to the current values that use it
         val values = ContentValues().apply {
@@ -232,6 +233,21 @@ class NormalizedStateStore(
         }
     }
 
+    private fun deleteIncompatibleCurrentRow(db: SQLiteDatabase, field: NormalizedFieldDefinition) {
+        db.rawQuery(
+            "SELECT value_type, unit FROM vehicle_state_current WHERE field_key = ? LIMIT 1",
+            arrayOf(field.fieldKey)
+        ).use { cursor ->
+            if (!cursor.moveToFirst()) return
+            val storedType = cursor.getString(0)
+            val storedUnit = cursor.getStringOrNull(1)
+            if (storedType != field.valueType.name || storedUnit != field.unit) {
+                //drops only the incompatible live row; immutable history and catalog metadata stay intact
+                db.delete("vehicle_state_current", "field_key = ?", arrayOf(field.fieldKey))
+            }
+        }
+    }
+
     private fun StoredNormalizedState.compactHistoryFieldId(db: SQLiteDatabase): Long {
         val unitValue = unit.orEmpty()
         val catalogIdentity = db.rawQuery(
@@ -332,7 +348,7 @@ internal fun normalizedEpochMillis(value: String): Long =
 internal fun normalizedIsoTime(value: Long): String = Instant.ofEpochMilli(value).toString()
 
 internal fun retiredNormalizedFieldKeysToDelete(activeFieldKeys: Set<String>): Set<String> {
-    return setOf("hv_battery_current_a").filterNot { it in activeFieldKeys }.toSet()
+    return setOf("hv_battery_current_a", "charging_state").filterNot { it in activeFieldKeys }.toSet()
 }
 
 data class NormalizedWriteSummary(

@@ -42,11 +42,15 @@ class DashboardStateProviderMaintenanceContractTest {
     @Test
     fun providerScansArchiveDetailsOnlyForStorageAndKeepsMaintenanceOrder() {
         val source = sourceFile("com/bydcollector/collector/ui/DashboardStateProvider.kt").readText()
+        val application = sourceFile("com/bydcollector/collector/BydCollectorApplication.kt").readText()
         val load = source.substringAfter("profile: DashboardLoadProfile").substringBefore("private fun loadHealthSnapshot")
 
-        assertTrue(source.contains("ArchiveStorageSnapshotCache("))
+        assertTrue(application.contains("internal val archiveStorageSnapshotCache by archiveStorageSnapshotCacheDelegate"))
+        assertTrue(application.contains("archiveStorageSnapshotCache.close()"))
+        assertTrue(source.contains(".archiveStorageSnapshotCache"))
+        assertFalse(source.contains("ArchiveStorageSnapshotCache("))
         assertTrue(source.contains("fun invalidateArchiveStorageSnapshot()"))
-        assertTrue(source.contains("fun close()"))
+        assertFalse(source.contains("fun close()"))
         assertTrue(load.contains("archiveStorageJobStatus.running || CollectorService.isArchiveStorageActive()"))
         assertTrue(load.contains("archiveStorageCache.invalidate()"))
         assertTrue(load.contains("val archiveDetailsLoaded = profile.readsArchiveDetails && !archiveJobActiveNow"))
@@ -54,6 +58,10 @@ class DashboardStateProviderMaintenanceContractTest {
         assertTrue(load.contains("settings.archiveStorageLimitGb()"))
         assertTrue(load.contains("settings.archiveStorageJobStatus()"))
         assertTrue(load.contains("archiveStorageResult.snapshot"))
+        val completion = source.substringAfter("fun completeArchiveStorageDeletion()")
+            .substringBefore("fun retireArchiveStorageEntries")
+        assertTrue(completion.contains("completeRetiredAfterNextScan()"))
+        assertTrue(completion.contains("includeDetails = true"))
         assertInOrder(load, "val maintenanceStatus = settings.dbMaintenanceStatus()", "application.withTelemetryStoreRead")
         assertInOrder(load, "store: TelemetryStore?", "val archiveStorageResult = archiveStorageCache.snapshot(")
     }

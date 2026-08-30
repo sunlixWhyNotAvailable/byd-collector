@@ -117,14 +117,66 @@ class HaDiscoveryBuilderTest {
     }
 
     @Test
+    fun sunroofDiscoveryTombstonesLegacyBinaryAndPublishesUnitlessSensor() {
+        val messages = HaDiscoveryBuilder.discoveryMessages(
+            config = config(enabledCategories = setOf("body")),
+            fields = listOf(NormalizedFieldCatalog.sunroofPosition)
+        )
+
+        assertEquals(2, messages.size)
+        assertEquals(
+            "homeassistant/binary_sensor/byd_sealion_07/bodywork_sunroof_windoblind_position/config",
+            messages[0].topic
+        )
+        assertEquals("", messages[0].payload)
+        assertTrue(messages[0].retained)
+        assertEquals(1, messages[0].qos)
+
+        val sensor = messages[1]
+        assertEquals(
+            "homeassistant/sensor/byd_sealion_07/bodywork_sunroof_windoblind_position/config",
+            sensor.topic
+        )
+        val json = JSONObject(sensor.payload)
+        assertEquals("byd_sealion_07_bodywork_sunroof_windoblind_position", json.getString("unique_id"))
+        assertEquals("bydcollector/state/body", json.getString("state_topic"))
+        assertEquals(
+            "{{ value_json.fields.bodywork_sunroof_windoblind_position }}",
+            json.getString("value_template")
+        )
+        assertFalse(json.has("unit_of_measurement"))
+        assertFalse(json.has("device_class"))
+        assertFalse(json.has("state_class"))
+        assertFalse(json.has("payload_on"))
+        assertFalse(json.has("payload_off"))
+    }
+
+    @Test
+    fun rawDischargeDiscoveryOmitsPowerSemantics() {
+        val message = HaDiscoveryBuilder.discoveryMessages(
+            config = config(enabledCategories = setOf("battery")),
+            fields = listOf(NormalizedFieldCatalog.maxDischargePowerAllow)
+        ).single()
+
+        assertEquals(
+            "homeassistant/sensor/byd_sealion_07/max_discharge_power_allow_raw/config",
+            message.topic
+        )
+        val json = JSONObject(message.payload)
+        assertFalse(json.has("unit_of_measurement"))
+        assertFalse(json.has("device_class"))
+        assertFalse(json.has("state_class"))
+        assertEquals("{{ value_json.fields.max_discharge_power_allow_raw }}", json.getString("value_template"))
+    }
+
+    @Test
     fun discoverySkipsNonDefaultRawFieldsWithinEnabledDefaultCategory() {
         val tireStateRaw = NormalizedFieldCatalog.fields.single { it.fieldKey == "tyre_state_lf" }
         val radarDistance = NormalizedFieldCatalog.fields.single { it.fieldKey == "radar_1025_neg_1728053151_5" }
-        val chargingState = NormalizedFieldCatalog.fields.single { it.fieldKey == "charging_state" }
 
         val messages = HaDiscoveryBuilder.discoveryMessages(
             config = config(enabledCategories = setOf("safety", "battery")),
-            fields = listOf(tireStateRaw, radarDistance, chargingState)
+            fields = listOf(tireStateRaw, radarDistance)
         )
 
         assertEquals(emptyList(), messages)

@@ -118,20 +118,13 @@ class TelegramEventEngineTest {
     }
 
     @Test
-    fun semanticStateIsFallbackOnlyWhenPrimaryEvidenceIsIncomplete() {
+    fun missingPrimaryEvidenceDoesNotUseRetiredSemanticStateFallback() {
         val engine = TelegramEventEngine()
-        engine.onSuccessfulPoll(snapshot(charging = "ready", chargeGun = false, chargePower = 0.0), config, 0L)
-        engine.onSuccessfulPoll(snapshot(charging = "ready", chargeGun = false, chargePower = 0.0), config, 500L)
-
-        engine.onSuccessfulPoll(snapshot(charging = "charging", chargeGun = null, chargePower = null), config, 1_000L)
-        val fallbackStart = engine.onSuccessfulPoll(snapshot(charging = "charging", chargeGun = null, chargePower = null), config, 1_500L)
-        assertTrue(fallbackStart.events.any { it.type == TelegramEventType.CHARGING_STARTED })
-        assertEquals("semantic_fallback", fallbackStart.state.chargingEvidenceSource)
-
-        engine.onSuccessfulPoll(snapshot(charging = "charging", chargeGun = false, chargePower = 9.0), config, 2_000L)
-        val primaryStop = engine.onSuccessfulPoll(snapshot(charging = "charging", chargeGun = false, chargePower = 9.0), config, 2_500L)
-        assertTrue(primaryStop.events.any { it.type == TelegramEventType.CHARGING_STOPPED })
-        assertEquals("primary_disconnected", primaryStop.state.chargingEvidenceSource)
+        engine.onSuccessfulPoll(snapshot(chargeGun = null, chargePower = null), config, 0L)
+        val unknown = engine.onSuccessfulPoll(snapshot(chargeGun = null, chargePower = null), config, 500L)
+        assertTrue(unknown.events.none { it.type == TelegramEventType.CHARGING_STARTED })
+        assertEquals(null, unknown.state.chargingActive)
+        assertEquals(null, unknown.state.chargingEvidenceSource)
     }
 
     @Test
@@ -154,12 +147,12 @@ class TelegramEventEngineTest {
         val engine = startedChargingEngine()
         engine.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 0.0), config, 2_000L)
         val unknownProgress = engine.onSuccessfulPoll(
-            snapshot(charging = null, chargeGun = null, chargePower = null, soc = 55.0),
+            snapshot(chargeGun = null, chargePower = null, soc = 55.0),
             config,
             30_000L
         )
         val unknownFull = engine.onSuccessfulPoll(
-            snapshot(charging = null, chargeGun = null, chargePower = null, soc = 99.6),
+            snapshot(chargeGun = null, chargePower = null, soc = 99.6),
             config,
             30_500L
         )
@@ -183,7 +176,7 @@ class TelegramEventEngineTest {
             2_000L
         )
         val unknown = engine.onSuccessfulPoll(
-            snapshot(charging = null, chargeGun = null, chargePower = null, soc = 99.6),
+            snapshot(chargeGun = null, chargePower = null, soc = 99.6),
             config,
             2_500L
         )
@@ -429,7 +422,7 @@ class TelegramEventEngineTest {
             val result = engine.onSuccessfulPoll(normalizedSnapshot(gunRaw, current), config, 1_500L)
             val started = result.events.single { it.type == TelegramEventType.CHARGING_STARTED }
 
-            assertEquals("ready", result.state.charging)
+            assertNull(result.state.charging)
             assertTrue(started.variables.getValue("battery_power_kw").toDouble() > 0.0)
         }
     }
@@ -1084,7 +1077,6 @@ class TelegramEventEngineTest {
     }
 
     private fun snapshot(
-        charging: String? = "ready",
         soc: Double? = 50.0,
         auxVoltage: Double? = 12.5,
         gear: String? = "P",
@@ -1094,7 +1086,6 @@ class TelegramEventEngineTest {
         chargePower: Double? = 0.0,
         chargeGun: Boolean? = false
     ): List<NormalizedObservation> = buildList {
-        charging?.let { add(text(NormalizedFieldCatalog.chargingState, it)) }
         soc?.let { add(number(NormalizedFieldCatalog.soc, it)) }
         remainingEnergy?.let { add(number(NormalizedFieldCatalog.batteryRemainingEnergy, it)) }
         chargePower?.let { add(number(NormalizedFieldCatalog.batteryChargePower, it)) }

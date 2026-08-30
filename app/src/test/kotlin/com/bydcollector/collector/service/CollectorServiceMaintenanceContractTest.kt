@@ -2,6 +2,7 @@ package com.bydcollector.collector.service
 
 import java.io.File
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -327,6 +328,48 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(settings.contains("fun archiveStorageJobStatus(): ArchiveStorageJobStatus"))
         assertFalse(service.contains("ACTION_COMPACT_DATABASE"))
         assertFalse(controller.contains("fun compactDatabase"))
+    }
+
+    @Test
+    fun archiveDeletePersistsInitialProgressBeforeSubmittingWorker() {
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val delete = service.substringAfter("private fun enqueueArchiveDelete")
+            .substringBefore("private fun enqueueArchiveStorageWork")
+        val enqueue = service.substringAfter("private fun enqueueArchiveStorageWork")
+            .substringBefore("private fun publishArchiveStorageTerminalError")
+
+        assertTrue(delete.contains("initialStatus = ArchiveStorageJobStatus("))
+        assertTrue(delete.contains("stepIndex = 0"))
+        assertTrue(delete.contains("stepCount = safeIds.size"))
+        assertTrue(delete.contains("diagnosticSafeText(status.itemId, 96)"))
+        assertTrue(delete.contains("diagnosticSafeText(status.error, 256)"))
+        assertFalse(delete.contains("item=${'$'}{status.itemId}"))
+        assertFalse(delete.contains("reason=${'$'}{status.error}"))
+        assertTrue(delete.contains("onFinished ="))
+        assertTrue(delete.contains("restoreRetiredArchiveStorageEntries(safeIds - successfulIds)"))
+        assertTrue(delete.contains("onRejected ="))
+        assertTrue(delete.contains("restoreRetiredArchiveStorageEntries(safeIds)"))
+        assertInOrder(enqueue, "initialStatus?.let", "archiveStorageExecutor.execute")
+        val worker = enqueue.substringAfter("archiveStorageExecutor.execute")
+        val finishIndex = worker.indexOf("onFinished()")
+        assertTrue(finishIndex > worker.lastIndexOf("settings.setArchiveStorageJobStatus("))
+        assertEquals(2, Regex("onRejected\\(\\)").findAll(enqueue).count())
+        assertTrue(service.substringAfter("private fun summarizeArchiveDeleteFailures").contains("take(8)"))
+    }
+
+    @Test
+    fun interruptedPersistedArchiveDeleteBecomesTerminalOnServiceStart() {
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val start = service.substringAfter("override fun onStartCommand")
+            .substringBefore("if (\n            maintenanceActive.get()")
+        val recovery = service.substringAfter("private fun recoverInterruptedArchiveDeleteIfNeeded")
+            .substringBefore("private fun createMqttCoordinator")
+
+        assertInOrder(start, "recoverInterruptedMaintenanceIfNeeded(action)", "recoverInterruptedArchiveDeleteIfNeeded(action)")
+        assertTrue(recovery.contains("status.mode != ArchiveStorageJobMode.DELETE || !status.running"))
+        assertTrue(recovery.contains("archive_delete_interrupted"))
+        assertTrue(recovery.contains("running = false"))
+        assertTrue(recovery.contains("scheduleIntegrationDashboardRefresh()"))
     }
 
     @Test

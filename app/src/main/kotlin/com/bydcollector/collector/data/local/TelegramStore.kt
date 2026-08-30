@@ -203,6 +203,102 @@ class TelegramStore(
         emptyArray()
     ).use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
 
+    /** Reads only bounded, redacted delivery metadata; payloads and errors never leave this store. */
+    @Synchronized
+    internal fun diagnosticSnapshot(limit: Int = 64): TelegramDiagnosticSnapshot {
+        require(limit in 1..64) { "Diagnostic Telegram row limit must be 1..64" }
+        val db = helper.readableDatabase
+        var runtimePresent = false
+        var runtimeUpdatedAtMs: Long? = null
+        var pendingTripId: String? = null
+        var summaryDelivered = false
+        var runtimeValid = true
+        db.rawQuery(
+            "SELECT state_json, updated_at_ms FROM telegram_runtime_state WHERE id = 1",
+            emptyArray()
+        ).use { cursor ->
+            if (cursor.moveToFirst()) {
+                runtimePresent = true
+                runtimeUpdatedAtMs = cursor.getLong(1)
+                val stateJson = cursor.getString(0)
+                val state = TelegramEventState.fromJsonOrNull(stateJson)
+                runtimeValid = state != null
+                pendingTripId = state?.pendingPowerOffLocationTripId
+                summaryDelivered = state?.pendingPowerOffLocationSummaryDelivered == true
+            }
+        }
+        val relevantWhere = "(event_type = ? OR waits_for_summary_key IS NOT NULL)"
+        val relevantArgs = arrayOf("trip_summary")
+        val outboxTotal = db.rawQuery("SELECT COUNT(*) FROM telegram_outbox", emptyArray()).use { cursor ->
+            if (cursor.moveToFirst()) cursor.getLong(0) else 0L
+        }
+        val relevantTotal = db.rawQuery(
+            "SELECT COUNT(*) FROM telegram_outbox WHERE $relevantWhere",
+            relevantArgs
+        ).use { cursor -> if (cursor.moveToFirst()) cursor.getLong(0) else 0L }
+        val rows = queryDiagnosticRows(
+            db,
+            "WHERE $relevantWhere ORDER BY id DESC LIMIT ?",
+            arrayOf("trip_summary", limit.toString())
+        ).toMutableList()
+        val pendingKeys = pendingTripId?.takeIf(String::isNotBlank)?.let {
+            listOf("$it:summary", "$it:location")
+        }.orEmpty()
+        if (pendingKeys.isNotEmpty()) {
+            val placeholders = pendingKeys.joinToString(",") { "?" }
+            val targeted = queryDiagnosticRows(
+                db,
+                "WHERE dedupe_key IN ($placeholders) ORDER BY id DESC",
+                pendingKeys.toTypedArray()
+            )
+            targeted.forEach { row ->
+                if (rows.none { it.id == row.id }) {
+                    if (rows.size >= limit) rows.removeAt(rows.lastIndex)
+                    rows += row
+                }
+            }
+            rows.sortByDescending { it.id }
+        }
+        return TelegramDiagnosticSnapshot(
+            status = "ok",
+            runtimeStatePresent = runtimePresent,
+            runtimeStateValid = runtimeValid,
+            runtimeStateUpdatedAtMs = runtimeUpdatedAtMs,
+            pendingPowerOffLocationTripId = pendingTripId,
+            pendingPowerOffLocationSummaryDelivered = summaryDelivered,
+            outboxTotal = outboxTotal,
+            relevantRowsTotal = relevantTotal,
+            rows = rows,
+            rowsTruncated = relevantTotal > rows.size
+        )
+    }
+
+    private fun queryDiagnosticRows(
+        db: SQLiteDatabase,
+        suffix: String,
+        args: Array<String>
+    ): List<TelegramDiagnosticRow> = db.rawQuery(
+        "SELECT id, dedupe_key, event_type, created_at_ms, next_attempt_at_ms, attempt_count, blocked, waits_for_summary_key FROM telegram_outbox $suffix",
+        args
+    ).use { cursor ->
+        buildList {
+            while (cursor.moveToNext()) {
+                add(
+                    TelegramDiagnosticRow(
+                        id = cursor.getLong(0),
+                        dedupeKey = cursor.getString(1),
+                        eventType = cursor.getString(2),
+                        createdAtMs = cursor.getLong(3),
+                        nextAttemptAtMs = cursor.getLong(4),
+                        attemptCount = cursor.getInt(5),
+                        blocked = cursor.getInt(6) != 0,
+                        waitsForSummaryKey = if (cursor.isNull(7)) null else cursor.getString(7)
+                    )
+                )
+            }
+        }
+    }
+
     fun verifyRuntimeState(): Boolean = helper.readableDatabase.rawQuery(
         "SELECT state_json, updated_at_ms FROM telegram_runtime_state WHERE id = 1",
         emptyArray()

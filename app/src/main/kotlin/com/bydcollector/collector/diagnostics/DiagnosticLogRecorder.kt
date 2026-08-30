@@ -6,11 +6,17 @@ import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.BuildConfig
 import com.bydcollector.collector.adb.AdbLocalClient
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
+import com.bydcollector.collector.data.local.TelegramDiagnosticRow
+import com.bydcollector.collector.data.local.TelegramDiagnosticSnapshot
+import com.bydcollector.collector.data.trips.TripRouteDiagnosticEvidence
+import com.bydcollector.collector.data.trips.TripSession
 import com.bydcollector.collector.maintenance.ArchiveShareLeaseRegistry
 import java.io.File
+import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.concurrent.withLock
 
 //captures a small support bundle without making dashboard refresh perform zip work
 object DiagnosticLogRecorder {
@@ -18,6 +24,9 @@ object DiagnosticLogRecorder {
     private const val DIAGNOSTIC_SHARES_DIR = "diagnostic_shares"
     private const val LATEST_ZIP_NAME = "bydcollector_diagnostics_latest.zip"
     private const val EVENTS_SNAPSHOT_NAME = "collector_events_snapshot.txt"
+    private const val TRIPS_TELEGRAM_EVIDENCE_NAME = "trips_telegram_evidence.txt"
+    internal const val TRIPS_TELEGRAM_EVIDENCE_MAX_BYTES = 64 * 1024
+    private const val TELEGRAM_EVIDENCE_ROW_LIMIT = 64
     private const val KEEP_ALIVE_LOG_PATH = "/data/local/tmp/bydcollector_keepalive.log"
     private const val KEEP_ALIVE_LOG_SNAPSHOT_NAME = "bydcollector_keepalive.log"
     private const val KEEP_ALIVE_LOG_STATUS_NAME = "bydcollector_keepalive_status.txt"
@@ -141,6 +150,7 @@ object DiagnosticLogRecorder {
                 val journalStatus = writeOperationalJournalSnapshot(appContext, snapshotDir)
                 val databaseStatus = writeCollectorEventsSnapshot(appContext, snapshotDir)
                 val helperStatus = writeKeepAliveLogSnapshot(appContext, snapshotDir)
+                val tripsTelegramStatus = writeTripsTelegramEvidence(appContext, snapshotDir)
                 File(snapshotDir, "diagnostic_info.txt").writeText(
                     buildString {
                         appendLine("captured_at=${timestampIso()}")
@@ -151,6 +161,7 @@ object DiagnosticLogRecorder {
                         appendLine("operational_journal=$journalStatus")
                         appendLine("collector_events=$databaseStatus")
                         appendLine("keep_alive_log=$helperStatus")
+                        appendLine("trips_telegram_evidence=$tripsTelegramStatus")
                     },
                     Charsets.UTF_8
                 )
@@ -402,6 +413,177 @@ object DiagnosticLogRecorder {
         }
     }
 
+    private fun writeTripsTelegramEvidence(context: Context, runDir: File): String {
+        val output = File(runDir, TRIPS_TELEGRAM_EVIDENCE_NAME)
+        val lines = mutableListOf<String>(
+            "schema_version=1",
+            "captured_at=${timestampIso()}",
+            "redaction=trip_telegram_metadata_only"
+        )
+        val app = context.applicationContext as BydCollectorApplication
+        var telegram: TelegramDiagnosticSnapshot? = null
+        var telegramStatus = "not_initialized"
+        var telegramError: Throwable? = null
+        runCatching {
+            val store = app.telegramStoreOrNull()
+            if (store == null) {
+                telegramStatus = if (app.telegramStorageError() == null) "not_initialized" else "error"
+            } else {
+                telegram = store.diagnosticSnapshot(TELEGRAM_EVIDENCE_ROW_LIMIT)
+                telegramStatus = telegram?.status ?: "error"
+            }
+        }.onFailure {
+            telegramStatus = "error"
+            telegramError = it
+        }
+
+        var selectedSession: TripSession? = null
+        var route: TripRouteDiagnosticEvidence? = null
+        var tripSelection = "none"
+        var tripError: Throwable? = null
+        val pendingTripId = telegram?.pendingPowerOffLocationTripId
+            ?.takeIf(String::isNotBlank)
+        val trips = app.tripsStoreOrNull()
+        if (trips == null) {
+            tripSelection = "not_initialized"
+        } else if (!trips.databaseFile.isFile || trips.databaseFile.length() == 0L) {
+            tripSelection = "missing"
+        } else runCatching {
+            app.tripsFileOperationLock.withLock {
+                trips.withLease {
+                    selectedSession = if (pendingTripId != null) {
+                        trips.session(pendingTripId).also {
+                            tripSelection = if (it == null) "pending_missing" else "pending"
+                        }
+                    } else {
+                        trips.diagnosticLatestClosedSession().also {
+                            tripSelection = if (it == null) "none" else "newest_closed"
+                        }
+                    }
+                    selectedSession?.let { session ->
+                        route = trips.diagnosticRouteEvidence(session.tripId)
+                    }
+                }
+            }
+        }.onFailure {
+            tripSelection = "error"
+            tripError = it
+        }
+
+        lines += "trips_status=${when (tripSelection) {
+            "not_initialized" -> "not_initialized"
+            "missing" -> "missing"
+            "error" -> "error"
+            else -> "ok"
+        }}"
+        lines += "trip_selection=$tripSelection"
+        tripError?.let { lines += "trips_error=${it::class.java.simpleName}" }
+        selectedSession?.let { session ->
+            lines += "trip_ref=${diagnosticSha256(session.tripId)}"
+            lines += "trip_state=${diagnosticSafeText(session.state, 32)}"
+            lines += "trip_started_at=${diagnosticSafeText(session.startedAt, 64)}"
+            lines += "trip_ended_at=${diagnosticSafeText(session.endedAt, 64).ifBlank { "none" }}"
+            lines += "trip_termination=${diagnosticSafeText(session.termination, 64).ifBlank { "none" }}"
+            lines += "trip_quality=${diagnosticSafeText(session.quality, 128)}"
+            lines += "trip_telegram_eligible=${session.telegramEligible}"
+            lines += "trip_telegram_enqueued=${session.telegramEnqueued}"
+        }
+        route?.let { evidence ->
+            lines += "route_storage=${evidence.storage}"
+            lines += "route_point_count=${evidence.pointCount}"
+            lines += "route_valid_count=${evidence.validCount}"
+            lines += "route_gap_count=${evidence.gapCount}"
+            lines += "route_untrusted_count=${evidence.untrustedCount}"
+            lines += "route_final_marker_count=${evidence.finalMarkerCount}"
+            lines += "route_sequence_contiguous=${evidence.sequenceContiguous}"
+            lines += "route_final_is_latest_valid=${evidence.finalIsLatestValid}"
+            evidence.finalPoint?.let { point ->
+                lines += "route_final_sequence=${point.sequence}"
+                lines += "route_final_observed_at=${diagnosticSafeText(point.observedAt, 64)}"
+                lines += "route_final_quality=${diagnosticSafeText(point.quality, 128)}"
+                lines += "route_final_has_coordinate=${point.hasCoordinate}"
+            } ?: lines.add("route_final=none")
+            evidence.latestValidPoint?.let { point ->
+                lines += "route_latest_valid_sequence=${point.sequence}"
+                lines += "route_latest_valid_observed_at=${diagnosticSafeText(point.observedAt, 64)}"
+                lines += "route_latest_valid_quality=${diagnosticSafeText(point.quality, 128)}"
+                lines += "route_latest_valid_has_coordinate=${point.hasCoordinate}"
+            } ?: lines.add("route_latest_valid=none")
+        }
+
+        lines += "telegram_status=$telegramStatus"
+        telegramError?.let { lines += "telegram_error=${it::class.java.simpleName}" }
+        telegram?.let { snapshot ->
+            lines += "telegram_runtime_state=${when {
+                !snapshot.runtimeStatePresent -> "missing"
+                snapshot.runtimeStateValid -> "valid"
+                else -> "invalid"
+            }}"
+            lines += "telegram_runtime_updated_at_ms=${snapshot.runtimeStateUpdatedAtMs ?: "none"}"
+            lines += "telegram_pending_trip_ref=${snapshot.pendingPowerOffLocationTripId?.let(::diagnosticSha256) ?: "none"}"
+            lines += "telegram_pending_summary_delivered=${snapshot.pendingPowerOffLocationSummaryDelivered}"
+            lines += "telegram_outbox_total=${snapshot.outboxTotal}"
+            lines += "telegram_relevant_rows_total=${snapshot.relevantRowsTotal}"
+            lines += "telegram_rows_returned=${snapshot.rows.size}"
+            lines += "telegram_rows_truncated=${snapshot.rowsTruncated}"
+            lines += "telegram_location_obligation=${telegramLocationObligation(snapshot)}"
+            snapshot.rows.forEach { row -> appendTelegramDiagnosticRow(lines, row) }
+        }
+
+        val encoded = boundedDiagnosticUtf8(lines, TRIPS_TELEGRAM_EVIDENCE_MAX_BYTES)
+        return runCatching {
+            output.writeBytes(encoded)
+            "ok bytes=${output.length()}"
+        }.getOrElse { error ->
+            runCatching {
+                output.writeText(
+                    "schema_version=1\nstatus=error\nerror=${error::class.java.simpleName}\n",
+                    Charsets.UTF_8
+                )
+            }
+            "error"
+        }
+    }
+
+    private fun appendTelegramDiagnosticRow(lines: MutableList<String>, row: TelegramDiagnosticRow) {
+        val tripId = telegramTripIdForDiagnostic(row.dedupeKey)
+        lines += "telegram_event=${diagnosticSafeText(row.eventType, 64)}"
+        lines += "telegram_delivery_kind=${when {
+            row.dedupeKey.endsWith(":location") -> "location_follow_up"
+            row.dedupeKey.endsWith(":summary") -> "summary"
+            else -> "other"
+        }}"
+        if (row.dedupeKey.endsWith(":location")) lines += "telegram_location=only"
+        lines += "telegram_trip_ref=${tripId?.let(::diagnosticSha256) ?: "none"}"
+        lines += "telegram_dedupe_ref=${diagnosticSha256(row.dedupeKey)}"
+        lines += "telegram_dependency_ref=${row.waitsForSummaryKey?.let(::diagnosticSha256) ?: "none"}"
+        lines += "telegram_created_at_ms=${row.createdAtMs}"
+        lines += "telegram_next_attempt_at_ms=${row.nextAttemptAtMs}"
+        lines += "telegram_attempt_count=${row.attemptCount}"
+        lines += "telegram_blocked=${row.blocked}"
+    }
+
+    private fun telegramLocationObligation(snapshot: TelegramDiagnosticSnapshot): String {
+        val pending = snapshot.pendingPowerOffLocationTripId
+            ?.takeIf(String::isNotBlank)
+        val locationRows = snapshot.rows.filter { it.dedupeKey.endsWith(":location") }
+        val pendingLocation = pending?.let { id -> locationRows.firstOrNull { it.dedupeKey == "$id:location" } }
+        return when {
+            pendingLocation?.blocked == true -> "blocked"
+            pendingLocation != null -> "queued"
+            pending != null && !snapshot.pendingPowerOffLocationSummaryDelivered -> "waiting_summary"
+            pending != null -> "pending_follow_up"
+            locationRows.isNotEmpty() -> "queued"
+            else -> "none_or_delivered"
+        }
+    }
+
+    private fun telegramTripIdForDiagnostic(dedupeKey: String): String? = when {
+        dedupeKey.endsWith(":summary") -> dedupeKey.removeSuffix(":summary")
+        dedupeKey.endsWith(":location") -> dedupeKey.removeSuffix(":location")
+        else -> null
+    }
+
     private fun writeLatestZip(context: Context, runDir: File) {
         writeLatestZip(latestZip(context), runDir)
     }
@@ -428,6 +610,34 @@ data class DiagnosticClearResult(
     val removed: Int,
     val warnings: List<String>
 )
+
+internal fun boundedDiagnosticUtf8(lines: List<String>, maxBytes: Int): ByteArray {
+    require(maxBytes > 0) { "Diagnostic evidence limit must be positive" }
+    val notTruncated = "truncated=0\n".toByteArray(StandardCharsets.UTF_8)
+    val truncated = "truncated=1\n".toByteArray(StandardCharsets.UTF_8)
+    require(truncated.size < maxBytes) { "Diagnostic evidence limit is too small" }
+    val output = StringBuilder()
+    var bytes = 0
+    var wasTruncated = false
+    lines.forEach { line ->
+        if (wasTruncated) return@forEach
+        val encoded = (line.replace('\r', ' ').replace('\n', ' ') + "\n")
+            .toByteArray(StandardCharsets.UTF_8)
+        val markerBytes = if (bytes + encoded.size + notTruncated.size <= maxBytes) notTruncated else truncated
+        if (bytes + encoded.size + markerBytes.size > maxBytes) {
+            wasTruncated = true
+        } else {
+            output.append(String(encoded, StandardCharsets.UTF_8))
+            bytes += encoded.size
+        }
+    }
+    val marker = if (wasTruncated) truncated else notTruncated
+    if (bytes + marker.size > maxBytes) {
+        return output.toString().toByteArray(StandardCharsets.UTF_8)
+            .copyOf(maxBytes - marker.size) + marker
+    }
+    return output.toString().toByteArray(StandardCharsets.UTF_8) + marker
+}
 
 internal fun createDiagnosticRunDirectory(root: File, timestamp: String): File {
     return createUniqueDiagnosticDirectory(root, "logcat", timestamp)

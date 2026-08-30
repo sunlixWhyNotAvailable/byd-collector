@@ -519,6 +519,38 @@ class MqttPublishCoordinatorTest {
         assertTrue(outbox.pendingRows().all { it.targetType == "discovery" })
         assertTrue(outbox.pendingRows().all { it.message.retained })
         assertTrue(outbox.pendingRows().all { it.message.topic.endsWith("/config") })
+        assertTrue(outbox.pendingRows().any {
+            it.message.topic == "homeassistant/binary_sensor/byd_sealion_07/bodywork_sunroof_windoblind_position/config" &&
+                it.message.payload.isEmpty()
+        })
+        assertTrue(outbox.pendingRows().any {
+            it.message.topic == "homeassistant/sensor/byd_sealion_07/bodywork_sunroof_windoblind_position/config"
+        })
+        val tombstonePriority = outbox.pendingRows().single {
+            it.message.topic == "homeassistant/binary_sensor/byd_sealion_07/bodywork_sunroof_windoblind_position/config"
+        }.priority
+        val sensorPriority = outbox.pendingRows().single {
+            it.message.topic == "homeassistant/sensor/byd_sealion_07/bodywork_sunroof_windoblind_position/config"
+        }.priority
+        assertTrue(tombstonePriority < sensorPriority)
+    }
+
+    @Test
+    fun sunroofTombstonePublishesBeforeReplacementSensorConfig() {
+        val client = FakeMqttClient()
+        val coordinator = coordinator(client = client)
+
+        assertTrue(coordinator.queueDiscoveryAndFlush(force = true).ok)
+
+        val tombstoneTopic =
+            "homeassistant/binary_sensor/byd_sealion_07/bodywork_sunroof_windoblind_position/config"
+        val sensorTopic =
+            "homeassistant/sensor/byd_sealion_07/bodywork_sunroof_windoblind_position/config"
+        val tombstoneIndex = client.published.indexOfFirst { it.topic == tombstoneTopic }
+        val sensorIndex = client.published.indexOfFirst { it.topic == sensorTopic }
+        assertTrue(tombstoneIndex >= 0)
+        assertTrue(sensorIndex >= 0)
+        assertTrue(tombstoneIndex < sensorIndex)
     }
 
     @Test

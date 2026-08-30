@@ -39,6 +39,10 @@ class ArchiveStorageSnapshotCache(
     private var generation = 0L
     private var lastError: Throwable? = null
     private var retryAfterMs = 0L
+    private var pendingForcedScan = false
+    private var pendingScanLimitBytes: Long? = null
+    private var releaseRetiredAfterScan = false
+    private val retiredIds = mutableSetOf<String>()
 
     fun snapshot(limitBytes: Long, includeDetails: Boolean): ArchiveStorageSnapshotResult {
         val nowMs = clock()
@@ -55,21 +59,26 @@ class ArchiveStorageSnapshotCache(
             when {
                 !includeDetails -> ArchiveStorageSnapshotResult(
                     snapshot = current?.snapshot?.withCurrentActiveDatabases(requestedLimitBytes)
+                        ?.visible()
                         ?: lightweightSnapshot(requestedLimitBytes),
                     pending = false
                 )
                 fresh -> ArchiveStorageSnapshotResult(
-                    snapshot = current.snapshot.withCurrentActiveDatabases(requestedLimitBytes),
+                    snapshot = current.snapshot.withCurrentActiveDatabases(requestedLimitBytes).visible(),
                     pending = false,
                     error = lastError
                 )
                 retryCoolingDown -> ArchiveStorageSnapshotResult(
                     snapshot = current?.snapshot?.withCurrentActiveDatabases(requestedLimitBytes)
+                        ?.visible()
                         ?: lightweightSnapshot(requestedLimitBytes),
                     pending = false,
                     error = lastError
                 )
                 else -> {
+                    if (running && pendingForcedScan) {
+                        pendingScanLimitBytes = requestedLimitBytes
+                    }
                     if (!running) {
                         running = true
                         shouldStartScan = true
@@ -77,6 +86,7 @@ class ArchiveStorageSnapshotCache(
                     }
                     ArchiveStorageSnapshotResult(
                         snapshot = current?.snapshot?.withCurrentActiveDatabases(requestedLimitBytes)
+                            ?.visible()
                             ?: lightweightSnapshot(requestedLimitBytes),
                         pending = true,
                         error = lastError
@@ -85,45 +95,37 @@ class ArchiveStorageSnapshotCache(
             }
         }
 
-        if (shouldStartScan) {
-            val scan = Runnable {
-                val loaded = runCatching { loader(requestedLimitBytes) }
-                synchronized(lock) {
-                    if (scanGeneration == generation) {
-                        loaded.onSuccess { snapshot ->
-                            cached = CachedSnapshot(
-                                snapshot = snapshot.copy(archiveLimitBytes = requestedLimitBytes),
-                                loadedAtMs = clock(),
-                                generation = generation
-                            )
-                            lastError = null
-                            retryAfterMs = 0L
-                        }.onFailure { error ->
-                            //Keep the last good snapshot visible while a later request retries.
-                            lastError = error
-                            retryAfterMs = clock() + ttlMs
-                        }
-                    }
-                    running = false
-                }
-            }
-            runCatching { executor.execute(scan) }
-                .onFailure { error ->
-                    synchronized(lock) {
-                        if (scanGeneration == generation) lastError = error
-                        if (scanGeneration == generation) retryAfterMs = clock() + ttlMs
-                        running = false
-                    }
-                }
-        }
+        if (shouldStartScan) launchScan(requestedLimitBytes, scanGeneration)
 
         return result
+    }
+
+    fun retire(ids: Collection<String>) {
+        synchronized(lock) {
+            retiredIds += ids
+        }
+    }
+
+    fun restoreRetired(ids: Collection<String>? = null) {
+        synchronized(lock) {
+            if (ids == null) retiredIds.clear() else retiredIds.removeAll(ids.toSet())
+        }
     }
 
     fun invalidate() {
         synchronized(lock) {
             generation += 1L
             retryAfterMs = 0L
+            if (running) pendingForcedScan = true
+        }
+    }
+
+    fun completeRetiredAfterNextScan() {
+        synchronized(lock) {
+            releaseRetiredAfterScan = true
+            generation += 1L
+            retryAfterMs = 0L
+            if (running) pendingForcedScan = true
         }
     }
 
@@ -152,7 +154,64 @@ class ArchiveStorageSnapshotCache(
         )
     }
 
+    private fun ArchiveStorageSnapshot.visible(): ArchiveStorageSnapshot {
+        if (retiredIds.isEmpty()) return this
+        return copy(entries = entries.filterNot { it.id in retiredIds })
+    }
+
     private fun databaseSize(file: File): Long = sqliteFootprintBytes(file)
+
+    private fun launchScan(requestedLimitBytes: Long, scanGeneration: Long) {
+        val scan = Runnable {
+            val loaded = runCatching { loader(requestedLimitBytes) }
+            var rerun: Pair<Long, Long>? = null
+            synchronized(lock) {
+                if (scanGeneration == generation) {
+                    loaded.onSuccess { snapshot ->
+                        cached = CachedSnapshot(
+                            snapshot = snapshot.copy(archiveLimitBytes = requestedLimitBytes),
+                            loadedAtMs = clock(),
+                            generation = generation
+                        )
+                        lastError = null
+                        retryAfterMs = 0L
+                        if (releaseRetiredAfterScan) {
+                            retiredIds.clear()
+                            releaseRetiredAfterScan = false
+                        }
+                    }.onFailure { error ->
+                        //Keep the last good snapshot visible while a later request retries.
+                        lastError = error
+                        retryAfterMs = clock() + ttlMs
+                    }
+                }
+                if (pendingForcedScan) {
+                    pendingForcedScan = false
+                    val nextLimit = pendingScanLimitBytes ?: requestedLimitBytes
+                    pendingScanLimitBytes = null
+                    running = true
+                    rerun = nextLimit to generation
+                } else {
+                    running = false
+                }
+            }
+            rerun?.let { launchScan(it.first, it.second) }
+        }
+        runCatching { executor.execute(scan) }
+            .onFailure { error ->
+                synchronized(lock) {
+                    if (scanGeneration == generation) {
+                        lastError = error
+                        retryAfterMs = clock() + ttlMs
+                    }
+                    if (pendingForcedScan) {
+                        pendingForcedScan = false
+                        pendingScanLimitBytes = null
+                    }
+                    running = false
+                }
+            }
+    }
 
     private data class CachedSnapshot(
         val snapshot: ArchiveStorageSnapshot,

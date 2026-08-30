@@ -4,6 +4,7 @@ import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.local.TelegramStore
 import com.bydcollector.collector.data.local.TelegramOutboxEntry
 import com.bydcollector.collector.data.local.TelegramOutboxMessage
+import com.bydcollector.collector.diagnostics.diagnosticSha256
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.service.TelegramDetectedEvent
@@ -13,6 +14,7 @@ import com.bydcollector.collector.service.TelegramEventResult
 import com.bydcollector.collector.service.TelegramEventState
 import com.bydcollector.collector.service.TelegramLocationSnapshot
 import com.bydcollector.collector.service.TelegramPowerOffSnapshot
+import java.util.LinkedHashMap
 
 internal data class TelegramPowerOffPreparation(
     val priorityKeys: List<String>,
@@ -30,6 +32,8 @@ class TelegramCoordinator(
     private var engine = TelegramEventEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
     private var enabledRuntimeStartedAtMs: Long? = null
     private var startupRecoveryPending = true
+    private val locationKindsByDedupeKey = LinkedHashMap<String, String>(16, 0.75f, true)
+    private val locationKindCacheLock = Any()
 
     fun onSuccessfulPoll(observations: List<NormalizedObservation>): Long? {
         activateEnabledRuntime() ?: return null
@@ -83,13 +87,18 @@ class TelegramCoordinator(
         val pendingSummaryKey = engine.state.pendingPowerOffLocationTripId
             ?.takeIf { !engine.state.pendingPowerOffLocationSummaryDelivered }
             ?.let { "$it:summary" }
+        val pendingLocationTripId = engine.state.pendingPowerOffLocationTripId
         val result = engine.onPowerOffConfirmed(eventConfig(), snapshot, location, nowMs())
         check(handle(result)) { "Telegram power-off batch could not be rendered atomically" }
         result.locationEligibilityReason?.let { reason ->
             eventStore.recordEvent(
                 "telegram_location_eligibility",
                 "Telegram power-off location eligibility evaluated",
-                "trigger=power_off reason=$reason"
+                buildTelegramDiagnosticDetail(
+                    dedupeKey = pendingLocationTripId?.let { "$it:location" },
+                    eventType = TelegramEventType.TRIP_SUMMARY.key,
+                    extra = "trigger=power_off reason=$reason"
+                )
             )
         }
         val priorityKeys = buildList {
@@ -201,7 +210,12 @@ class TelegramCoordinator(
                 eventStore.recordEvent(
                     "telegram_message_delivered",
                     "Telegram message delivered",
-                    "event=${entry.eventType}"
+                    buildTelegramDiagnosticDetail(
+                        dedupeKey = entry.dedupeKey,
+                        eventType = entry.eventType,
+                        waitsForSummaryKey = entry.waitsForSummaryKey,
+                        location = knownLocationKind(entry.dedupeKey)
+                    )
                 )
                 pendingQueueDeadline()
             }
@@ -219,7 +233,13 @@ class TelegramCoordinator(
                 eventStore.recordEvent(
                     "telegram_message_failed",
                     "Telegram message delivery failed",
-                    "event=${entry.eventType} ${failureDetail(result)}"
+                    buildTelegramDiagnosticDetail(
+                        dedupeKey = entry.dedupeKey,
+                        eventType = entry.eventType,
+                        waitsForSummaryKey = entry.waitsForSummaryKey,
+                        location = knownLocationKind(entry.dedupeKey),
+                        extra = failureDetail(result)
+                    )
                 )
                 nextAttemptAtMs
             }
@@ -276,12 +296,20 @@ class TelegramCoordinator(
             engine = TelegramEventEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
             throw error
         }
+        val eventsByDedupeKey = result.events.associateBy { it.dedupeKey }
         messages.zip(outcomes).forEach { (message, queued) ->
             if (queued.inserted) {
+                val locationKind = telegramLocationKind(eventsByDedupeKey[message.dedupeKey], message.dedupeKey)
+                rememberLocationKind(message.dedupeKey, locationKind)
                 eventStore.recordEvent(
                     "telegram_event_queued",
                     "Telegram event queued",
-                    "event=${message.eventType}"
+                    buildTelegramDiagnosticDetail(
+                        dedupeKey = message.dedupeKey,
+                        eventType = message.eventType,
+                        waitsForSummaryKey = message.waitsForSummaryKey,
+                        location = locationKind
+                    )
                 )
             }
             if (queued.expiredCount > 0 || queued.overflowCount > 0) {
@@ -293,6 +321,53 @@ class TelegramCoordinator(
             }
         }
         return true
+    }
+
+    private fun buildTelegramDiagnosticDetail(
+        dedupeKey: String?,
+        eventType: String,
+        waitsForSummaryKey: String? = null,
+        location: String? = null,
+        extra: String? = null
+    ): String = buildString {
+        append("event=").append(eventType)
+        dedupeKey?.let { key ->
+            append(" dedupe_ref=").append(diagnosticSha256(key))
+            telegramTripId(key)?.let { append(" trip_ref=").append(diagnosticSha256(it)) }
+        }
+        waitsForSummaryKey?.let { append(" dependency_ref=").append(diagnosticSha256(it)) }
+        location?.let { append(" location=").append(it) }
+        extra?.takeIf(String::isNotBlank)?.let { append(' ').append(it) }
+    }
+
+    private fun rememberLocationKind(dedupeKey: String, location: String) {
+        synchronized(locationKindCacheLock) {
+            locationKindsByDedupeKey[dedupeKey] = location
+            while (locationKindsByDedupeKey.size > 128) {
+                locationKindsByDedupeKey.entries.iterator().apply {
+                    if (hasNext()) {
+                        next()
+                        remove()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun knownLocationKind(dedupeKey: String): String? = synchronized(locationKindCacheLock) {
+        locationKindsByDedupeKey[dedupeKey]
+    }
+
+    private fun telegramTripId(dedupeKey: String): String? = when {
+        dedupeKey.endsWith(":summary") -> dedupeKey.removeSuffix(":summary")
+        dedupeKey.endsWith(":location") -> dedupeKey.removeSuffix(":location")
+        else -> null
+    }
+
+    private fun telegramLocationKind(event: TelegramDetectedEvent?, dedupeKey: String): String = when {
+        event?.locationOnly == true || dedupeKey.endsWith(":location") -> "only"
+        event?.textSuffix?.isNotBlank() == true -> "attached"
+        else -> "none"
     }
 
     private fun render(event: TelegramDetectedEvent): TelegramOutboxMessage? {

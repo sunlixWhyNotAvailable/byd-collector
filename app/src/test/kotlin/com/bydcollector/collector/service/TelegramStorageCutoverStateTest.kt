@@ -1,6 +1,7 @@
 package com.bydcollector.collector.service
 
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -10,6 +11,21 @@ class TelegramStorageCutoverStateTest {
     fun malformedStateFailsStrictParsing() {
         assertNull(TelegramEventState.fromJsonOrNull("{not-json"))
         assertFalse(TelegramEventState.fromJson("{not-json").hasDeferredStorageWork())
+    }
+
+    @Test
+    fun legacySemanticChargingStateIsIgnoredAndSerializedClean() {
+        val state = TelegramEventState.fromJson(
+            """{"charging":"charging","chargingCandidate":"charging","chargingCandidateCount":2}"""
+        )
+
+        assertNull(state.charging)
+        assertNull(state.chargingCandidate)
+        assertEquals(0, state.chargingCandidateCount)
+        assertFalse(state.hasDeferredStorageWork())
+        assertTrue(state.toJson().contains("\"charging\":null"))
+        assertTrue(state.toJson().contains("\"chargingCandidate\":null"))
+        assertTrue(state.toJson().contains("\"chargingCandidateCount\":0"))
     }
 
     @Test

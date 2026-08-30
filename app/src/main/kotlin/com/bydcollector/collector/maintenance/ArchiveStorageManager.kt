@@ -122,17 +122,75 @@ class ArchiveStorageManager(
     ): Int {
         var deleted = 0
         val safeIds = ids.distinct()
+        onStatus(
+            status(
+                mode = ArchiveStorageJobMode.DELETE,
+                stepIndex = 0,
+                stepCount = safeIds.size,
+                messageUk = "Готуємо видалення",
+                messageEn = "Preparing archive deletion",
+                itemId = null,
+                running = true
+            )
+        )
         safeIds.forEachIndexed { index, id ->
-            onStatus(status(ArchiveStorageJobMode.DELETE, index + 1, safeIds.size, "Видаляємо архів", "Deleting archive", id))
-            if (deleteArchiveFile(id)) deleted += 1
+            onStatus(
+                status(
+                    ArchiveStorageJobMode.DELETE,
+                    index,
+                    safeIds.size,
+                    "Видаляємо архів",
+                    "Deleting archive",
+                    id,
+                    running = true
+                )
+            )
+            val outcome = deleteArchiveFileOutcome(id)
+            if (outcome.success) {
+                deleted += 1
+                onStatus(
+                    status(
+                        ArchiveStorageJobMode.DELETE,
+                        index + 1,
+                        safeIds.size,
+                        "Архів видалено",
+                        "Archive deleted",
+                        id,
+                        running = true
+                    )
+                )
+            } else {
+                onStatus(
+                    status(
+                        ArchiveStorageJobMode.DELETE,
+                        index + 1,
+                        safeIds.size,
+                        "Не вдалося видалити архів",
+                        "Archive deletion failed",
+                        id,
+                        error = outcome.error,
+                        running = true
+                    )
+                )
+            }
         }
         return deleted
     }
 
     private fun deleteArchiveFile(id: String): Boolean {
-        val target = archiveChild(id) ?: return false
-        if (!target.exists() || !isDeletableArchive(target)) return false
-        return if (target.isDirectory) target.deleteRecursively() else target.delete()
+        return deleteArchiveFileOutcome(id).success
+    }
+
+    private fun deleteArchiveFileOutcome(id: String): DeleteOutcome {
+        val target = archiveChild(id) ?: return DeleteOutcome(false, "archive_id_rejected")
+        if (!target.exists()) return DeleteOutcome(false, "archive_missing")
+        if (!isDeletableArchive(target)) return DeleteOutcome(false, "archive_not_deletable")
+        val deleted = if (target.isDirectory) target.deleteRecursively() else target.delete()
+        return if (deleted && !target.exists()) {
+            DeleteOutcome(true, null)
+        } else {
+            DeleteOutcome(false, "archive_delete_verify_failed")
+        }
     }
 
     private fun entryFor(file: File): ArchiveStorageEntry? {
@@ -227,11 +285,12 @@ class ArchiveStorageManager(
         messageUk: String,
         messageEn: String,
         itemId: String?,
-        error: String? = null
+        error: String? = null,
+        running: Boolean = error == null
     ): ArchiveStorageJobStatus {
         return ArchiveStorageJobStatus(
             mode = mode,
-            running = error == null,
+            running = running,
             stepIndex = stepIndex,
             stepCount = stepCount,
             messageUk = messageUk,
@@ -241,6 +300,11 @@ class ArchiveStorageManager(
             updatedAtMs = clock()
         )
     }
+
+    private data class DeleteOutcome(
+        val success: Boolean,
+        val error: String?
+    )
 
     companion object {
         const val MAIN_ARCHIVE_PREFIX = "bydcollector_telemetry_"

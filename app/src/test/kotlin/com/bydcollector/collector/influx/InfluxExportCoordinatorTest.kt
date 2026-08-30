@@ -83,6 +83,39 @@ class InfluxExportCoordinatorTest {
     }
 
     @Test
+    fun semanticCutoverFiltersRetiredChargingAndExportsUnitlessRawSensors() {
+        val store = FakeInfluxStore(
+            rows = listOf(
+                row(id = 1, fieldKey = "charging_state"),
+                row(id = 2, fieldKey = "max_discharge_power_allow_raw").copy(
+                    valueNumber = 123.0,
+                    unit = null
+                ),
+                row(id = 3, fieldKey = "bodywork_sunroof_windoblind_position").copy(
+                    category = "body",
+                    valueNumber = 4.0,
+                    unit = null
+                )
+            )
+        )
+        val client = FakeInfluxClient()
+        val coordinator = coordinator(
+            store,
+            client,
+            influxConfig = config().copy(enabledCategories = setOf("battery", "body"))
+        )
+
+        val result = coordinator.runOneCycle(force = true)
+
+        assertTrue(result.ok)
+        val lines = client.writtenLines.single()
+        assertEquals(2, lines.size)
+        assertTrue(lines.none { it.contains("field_key=charging_state") })
+        assertTrue(lines.any { it.contains("field_key=max_discharge_power_allow_raw") && it.contains("unit=none") })
+        assertTrue(lines.any { it.contains("field_key=bodywork_sunroof_windoblind_position") && it.contains("unit=none") })
+    }
+
+    @Test
     fun successfulBatchKeepsRemainingPendingRowsVisibleForDashboard() {
         val rows = (1L..301L).map { id -> row(id = id, fieldKey = "soc") }
         val store = FakeInfluxStore(rows = rows)

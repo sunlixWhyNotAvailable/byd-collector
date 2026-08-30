@@ -86,6 +86,33 @@ class ArchiveStorageManagerTest {
     }
 
     @Test
+    fun deleteReportsPerItemProgressAndContinuesAfterMissingArchive() {
+        val root = createTempDirectory().toFile()
+        val active = File(root, "bydcollector_telemetry.db").apply { writeText("active") }
+        val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+        val valid = File(archiveRoot, "bydcollector_telemetry_20260707_120000.zip").apply { writeText("zip") }
+        val statuses = mutableListOf<ArchiveStorageJobStatus>()
+        val manager = manager(archiveRoot, active)
+
+        assertEquals(
+            1,
+            manager.deleteArchiveIds(
+                listOf(valid.name, "bydcollector_telemetry_20260707_130000.zip"),
+                statuses::add
+            )
+        )
+
+        assertFalse(valid.exists())
+        assertEquals(5, statuses.size) // 0/N, before/after for each item
+        assertEquals(0, statuses.first().stepIndex)
+        assertTrue(statuses.first().running)
+        assertEquals("Archive deleted", statuses[2].messageEn)
+        assertTrue(statuses[3].running)
+        assertEquals("Archive deletion failed", statuses[4].messageEn)
+        assertEquals("archive_missing", statuses[4].error)
+    }
+
+    @Test
     fun snapshotAndCompressionIncludeDebugArchivesAndAllActiveDatabaseFootprints() {
         val root = createTempDirectory().toFile()
         val main = File(root, "bydcollector_telemetry.db").apply { writeText("main") }

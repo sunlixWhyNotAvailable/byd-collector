@@ -97,3 +97,80 @@ data class TripDayGroup(
 ) {
     val tripCount: Int get() = trips.size
 }
+
+/** Hash-free internal route proof; diagnostics serializes only the safe fields. */
+internal data class TripRouteDiagnosticPoint(
+    val sequence: Long,
+    val observedAt: String,
+    val quality: String,
+    val hasCoordinate: Boolean
+)
+
+internal data class TripRouteDiagnosticEvidence(
+    val tripId: String,
+    val storage: String,
+    val pointCount: Long,
+    val validCount: Long,
+    val gapCount: Long,
+    val untrustedCount: Long,
+    val finalMarkerCount: Long,
+    val finalPoint: TripRouteDiagnosticPoint?,
+    val latestValidPoint: TripRouteDiagnosticPoint?,
+    val sequenceContiguous: Boolean
+) {
+    val finalIsLatestValid: Boolean
+        get() = finalPoint != null && finalPoint.sequence == latestValidPoint?.sequence
+}
+
+/** Streaming route proof; it never retains coordinates or the route itself. */
+internal class TripRouteDiagnosticAccumulator(private val tripId: String) {
+    private var pointCount = 0L
+    private var validCount = 0L
+    private var gapCount = 0L
+    private var untrustedCount = 0L
+    private var finalMarkerCount = 0L
+    private var previousSequence: Long? = null
+    private var sequenceContiguous = true
+    private var finalPoint: TripRouteDiagnosticPoint? = null
+    private var latestValidPoint: TripRouteDiagnosticPoint? = null
+
+    fun accept(point: RoutePoint) {
+        pointCount++
+        if (pointCount == 1L) sequenceContiguous = point.sequence == 0L
+        previousSequence?.let {
+            sequenceContiguous = sequenceContiguous && it != Long.MAX_VALUE && point.sequence == it + 1L
+        }
+        previousSequence = point.sequence
+        val summary = TripRouteDiagnosticPoint(
+            sequence = point.sequence,
+            observedAt = point.observedAt,
+            quality = point.quality,
+            hasCoordinate = point.latitude?.isFinite() == true && point.longitude?.isFinite() == true
+        )
+        when (point.kind) {
+            RoutePoint.KIND_VALID -> {
+                validCount++
+                latestValidPoint = summary
+            }
+            RoutePoint.KIND_GAP -> gapCount++
+            RoutePoint.KIND_UNTRUSTED -> untrustedCount++
+        }
+        if (point.isFinal) {
+            finalMarkerCount++
+            finalPoint = summary
+        }
+    }
+
+    fun finish(storage: String): TripRouteDiagnosticEvidence = TripRouteDiagnosticEvidence(
+        tripId = tripId,
+        storage = storage,
+        pointCount = pointCount,
+        validCount = validCount,
+        gapCount = gapCount,
+        untrustedCount = untrustedCount,
+        finalMarkerCount = finalMarkerCount,
+        finalPoint = finalPoint,
+        latestValidPoint = latestValidPoint,
+        sequenceContiguous = sequenceContiguous
+    )
+}

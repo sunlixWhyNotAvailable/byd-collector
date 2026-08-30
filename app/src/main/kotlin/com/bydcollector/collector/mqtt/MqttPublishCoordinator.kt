@@ -312,12 +312,19 @@ class MqttPublishCoordinator(
     }
 
     private fun priorityFor(message: HaMqttMessage, fallbackPriority: Int): Int {
+        if (isLegacySunroofTombstone(message)) return LEGACY_SUNROOF_TOMBSTONE_PRIORITY
         return when (targetType(message)) {
             "discovery" -> DISCOVERY_PRIORITY
             "status" -> STATUS_PRIORITY
             "state" -> STATE_PRIORITY
             else -> fallbackPriority
         }
+    }
+
+    private fun isLegacySunroofTombstone(message: HaMqttMessage): Boolean {
+        return message.retained && message.payload.isEmpty() && message.topic.endsWith(
+            "/binary_sensor/${HaDiscoveryBuilder.DEVICE_ID}/bodywork_sunroof_windoblind_position/config"
+        )
     }
 
     private fun targetType(message: HaMqttMessage): String {
@@ -331,6 +338,8 @@ class MqttPublishCoordinator(
     }
 
     private companion object {
+        //ensures the retained legacy entity is cleared before the replacement sensor config is delivered
+        const val LEGACY_SUNROOF_TOMBSTONE_PRIORITY = 9
         const val DISCOVERY_PRIORITY = 10
         const val STATUS_PRIORITY = 20
         const val STATE_PRIORITY = 50

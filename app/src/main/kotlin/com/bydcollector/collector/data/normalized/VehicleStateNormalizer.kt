@@ -105,6 +105,7 @@ class VehicleStateNormalizer(
             "raw_number_deci_non_negative" -> normalizeNumber(field, rawOnly(reading), scale = 0.1) { it >= 0.0 }
             "raw_number_milli_non_negative" -> normalizeNumber(field, rawOnly(reading), scale = 0.001) { it >= 0.0 }
             "raw_number_kpa_non_negative" -> normalizeNumber(field, rawOnly(reading)) { it in 0.0..1000.0 }
+            "raw_integer_enum_0_1_2_4" -> normalizeRawIntegerEnum(rawOnly(reading), SUNROOF_POSITION_CODES)
             "raw_temperature_c" -> normalizeNumber(field, rawOnly(reading)) { it in -50.0..100.0 }
             "raw_temp_c_offset_40" -> normalizeNumber(field, rawOnly(reading), offset = -40.0) { it in -50.0..100.0 }
             "zero_closed_nonzero_open",
@@ -114,7 +115,6 @@ class VehicleStateNormalizer(
             "charging_gun_connected_openapi" -> normalizeMappedBoolean(rawOnly(reading), CHARGING_GUN_CONNECTED)
             "charger_connected_openapi" -> normalizeMappedBoolean(rawOnly(reading), CHARGER_CONNECTED)
             "gearbox_auto_mode_openapi" -> normalizeEnumText(rawOnly(reading), GEARBOX_AUTO_MODE)
-            "charging_battery_state_openapi" -> normalizeEnumText(rawOnly(reading), CHARGING_BATTERY_STATE)
             "tyre_pressure_state_openapi" -> normalizeEnumText(rawOnly(reading), TYRE_PRESSURE_STATE)
             "decoded_bool_nonzero_true",
             "decoded_zero_false_nonzero_true" -> normalizeBoolean(field, decodedPreferred(reading))
@@ -209,6 +209,21 @@ class VehicleStateNormalizer(
         return NormalizedQuality.OK to NormalizedValue(
             type = NormalizedValueType.TEXT,
             text = value
+        )
+    }
+
+    private fun normalizeRawIntegerEnum(
+        rawValue: String?,
+        accepted: Set<Int>
+    ): Pair<NormalizedQuality, NormalizedValue> {
+        if (rawValue == null) {
+            return NormalizedQuality.MISSING to emptyValue(NormalizedValueType.NUMBER)
+        }
+        val value = parseInteger(rawValue)?.takeIf(accepted::contains)
+            ?: return NormalizedQuality.INVALID to emptyValue(NormalizedValueType.NUMBER)
+        return NormalizedQuality.OK to NormalizedValue(
+            type = NormalizedValueType.NUMBER,
+            number = value.toDouble()
         )
     }
 
@@ -350,21 +365,7 @@ class VehicleStateNormalizer(
             5 to "M",
             6 to "S"
         )
-        val CHARGING_BATTERY_STATE = mapOf(
-            0 to "ready",
-            1 to "charging",
-            2 to "charge_finished",
-            3 to "discharging",
-            4 to "charge_terminated",
-            5 to "fault_c10",
-            6 to "fault_charging_gun",
-            7 to "fault_charger",
-            8 to "fault_ac",
-            9 to "scheduled",
-            10 to "discharging_cbu",
-            11 to "timeout",
-            12 to "discharge_finished"
-        )
+        val SUNROOF_POSITION_CODES = setOf(0, 1, 2, 4)
         val TYRE_PRESSURE_STATE = mapOf(
             0 to "normal",
             1 to "overpressure",

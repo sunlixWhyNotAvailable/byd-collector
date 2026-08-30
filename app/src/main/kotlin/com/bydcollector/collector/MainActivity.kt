@@ -372,12 +372,15 @@ class MainActivity : ComponentActivity() {
             if (ids.isEmpty()) return
             archiveDeleteDispatchStartedAtMs = System.currentTimeMillis()
             actionUiState = actionUiState.copy(archiveDeleteDispatch = true)
+            stateProvider.retireArchiveStorageEntries(ids)
             stateProvider.invalidateArchiveStorageSnapshot()
             runCatching {
                 CollectorServiceController.deleteArchives(this@MainActivity, ids)
             }.onFailure {
                 archiveDeleteDispatchStartedAtMs = null
                 actionUiState = actionUiState.copy(archiveDeleteDispatch = false)
+                stateProvider.restoreRetiredArchiveStorageEntries(ids)
+                stateProvider.invalidateArchiveStorageSnapshot()
             }
             refresh()
         }
@@ -736,9 +739,6 @@ class MainActivity : ComponentActivity() {
         dashboardCountExecutor.shutdownNow()
         diagnosticsExecutor.shutdownNow()
         updateExecutor.shutdownNow()
-        if (::stateProvider.isInitialized) {
-            stateProvider.close()
-        }
         if (::settingsPreferences.isInitialized) {
             settingsPreferences.unregisterOnSharedPreferenceChangeListener(settingsChangeListener)
         }
@@ -1092,7 +1092,7 @@ class MainActivity : ComponentActivity() {
             tab = tab,
             storageRefreshPending = tabSnapshot?.state?.let { state ->
                 state.archiveStorageJobStatus.running || state.archiveStorageScanPending
-            } == true
+            } == true || actionUiState.archiveDeleteDispatch
         )
         val tabDue = profile != null && (
             force || dashboardSnapshotDue(tabSnapshot?.loadedAtElapsedMs, tabIntervalMs, nowMs)
@@ -1193,10 +1193,12 @@ class MainActivity : ComponentActivity() {
             actionUiState.archiveDeleteDispatch &&
             dispatchedAtMs != null &&
             archiveJob.mode == ArchiveStorageJobMode.DELETE &&
+            !archiveJob.running &&
             archiveJob.updatedAtMs >= dispatchedAtMs
         ) {
             archiveDeleteDispatchStartedAtMs = null
             actionUiState = actionUiState.copy(archiveDeleteDispatch = false)
+            refresh()
         }
     }
 

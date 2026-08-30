@@ -2,7 +2,7 @@ package com.bydcollector.collector.data.normalized
 
 //semantic catalog that maps curated raw keys to stable fields exposed to dashboard, mqtt, and influx
 object NormalizedFieldCatalog {
-    const val CATALOG_VERSION = "normalized-direct-v11-20260820-location"
+    const val CATALOG_VERSION = "normalized-direct-v12-20260830-semantic-fixes"
 
     val soc = number(
         fieldKey = "soc",
@@ -48,7 +48,6 @@ object NormalizedFieldCatalog {
     val remainingRangeKm = number("remaining_range_km", NormalizedCategory.BATTERY, "km", "EV range", "distance", "measurement", listOf("statistic_elec_driving_range_yun"), "decoded_number_non_negative")
     val odometerKm = number("odometer_km", NormalizedCategory.MOTION, "km", "Odometer", "distance", "total_increasing", listOf("statistic_1014_1246765072_5"), "raw_number_deci_non_negative")
     val speedKmh = number("speed_kmh", NormalizedCategory.MOTION, "km/h", "Speed", "speed", "measurement", listOf("speed_1013_-1807745016_7"), "decoded_speed_kmh")
-    val chargingState = textEnum("charging_state", NormalizedCategory.BATTERY, "Charging state", "charging_1009_1231032336_5", "charging_battery_state_openapi")
     val chargeGunConnected = bool("charge_gun_connected_raw", NormalizedCategory.BATTERY, "Charging gun connected", "plug", listOf("charging_1009_876609586_5"), "charging_gun_connected_openapi")
     val acPower = bool("ac_power", NormalizedCategory.CLIMATE, "Climate", null, listOf("ac_1000_1077936144_5"), "zero_false_nonzero_true")
     val driverTempSetpoint = number("driver_temp_setpoint_raw", NormalizedCategory.CLIMATE, "°C", "Driver temperature setting", "temperature", "measurement", listOf("ac_1000_1077936168_5"), "raw_temperature_c", mqttDefaultEnabled = false)
@@ -65,7 +64,16 @@ object NormalizedFieldCatalog {
     val rightFrontWindow = bool("rf_window_open_raw", NormalizedCategory.BODY, "Passenger window", "window", listOf("bodywork_1001_1267728396_5"), "zero_false_nonzero_true")
     val leftRearWindow = number("lr_window_percent", NormalizedCategory.BODY, "%", "Rear left window", null, "measurement", listOf("bodywork_1001_947912736_5"), "decoded_percent_0_100")
     val rightRearWindow = number("rr_window_percent", NormalizedCategory.BODY, "%", "Rear right window", null, "measurement", listOf("bodywork_1001_947912752_5"), "decoded_percent_0_100")
-    val sunroofPosition = bool("bodywork_sunroof_windoblind_position", NormalizedCategory.BODY, "Sunroof position", "opening", listOf("bodywork_sunroof_windoblind_position"), "zero_false_nonzero_true")
+    val sunroofPosition = number(
+        "bodywork_sunroof_windoblind_position",
+        NormalizedCategory.BODY,
+        null,
+        "Sunroof/windblind position raw",
+        null,
+        null,
+        listOf("bodywork_sunroof_windoblind_position"),
+        "raw_integer_enum_0_1_2_4"
+    )
     val panoramaSunshade = number("bodywork_sunshade_panel_percent", NormalizedCategory.BODY, "%", "Panorama sunshade status", null, "measurement", listOf("bodywork_sunshade_panel_percent"), "decoded_percent_0_100")
     val tirePressureLf = number("tire_pressure_lf_raw", NormalizedCategory.SAFETY, "kPa", "Driver tire pressure", "pressure", "measurement", listOf("tyre_1016_-1728052956_5"), "raw_number_kpa_non_negative")
     val tirePressureRf = number("tire_pressure_rf_raw", NormalizedCategory.SAFETY, "kPa", "Passenger tire pressure", "pressure", "measurement", listOf("tyre_1016_-1728052952_5"), "raw_number_kpa_non_negative")
@@ -104,7 +112,7 @@ object NormalizedFieldCatalog {
     val radarRight = number("radar_1025_neg_1728053144_5", NormalizedCategory.SAFETY, "cm", "Radar right", "distance", "measurement", listOf("radar_1025_-1728053144_5"), "decoded_number_non_negative", mqttDefaultEnabled = false)
     val batteryAverageTemp = number("battery_average_temp_raw", NormalizedCategory.BATTERY, "°C", "Battery average temperature", "temperature", "measurement", listOf("statistic_average_battery_temp"), "raw_temp_c_offset_40")
     val chargerConnected = bool("charger_connected_raw", NormalizedCategory.BATTERY, "Charger connected", "plug", listOf("charging_1009_89128973_5"), "charger_connected_openapi")
-    val maxDischargePowerAllow = number("max_discharge_power_allow_raw", NormalizedCategory.BATTERY, "kW", "Max discharge power allow raw", "power", "measurement", listOf("statistic_1014_877658120_5"), "decoded_number_non_negative")
+    val maxDischargePowerAllow = number("max_discharge_power_allow_raw", NormalizedCategory.BATTERY, null, "Max discharge power allow raw", null, null, listOf("statistic_1014_877658120_5"), "number_raw")
 
     val locationLatitude = number("location_latitude", NormalizedCategory.LOCATION, "°", "GPS latitude", null, "measurement", listOf("android_gps"), "android_gps")
     val locationLongitude = number("location_longitude", NormalizedCategory.LOCATION, "°", "GPS longitude", null, "measurement", listOf("android_gps"), "android_gps")
@@ -141,7 +149,6 @@ object NormalizedFieldCatalog {
         remainingRangeKm,
         odometerKm,
         speedKmh,
-        chargingState,
         chargeGunConnected,
         acPower,
         driverTempSetpoint,

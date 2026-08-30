@@ -275,6 +275,11 @@ class BydCollectorUiContractTest {
         assertTrue(app.contains("modifier = Modifier.width(180.dp)"))
         assertTrue(app.contains("actionUiState.archiveDeleteDispatch"))
         assertTrue(app.contains("strings.deleteSelected"))
+        val inlineStatus = app.substringAfter("private fun ArchiveStorageInlineStatus(")
+            .substringBefore("private fun ArchiveEntryRow(")
+        assertTrue(inlineStatus.contains("status.stepCount.takeIf { it > 0 }"))
+        assertTrue(inlineStatus.contains("\"${'$'}{status.stepIndex} / ${'$'}it · \""))
+        assertTrue(inlineStatus.contains("text = progress +"))
         val archiveEntryRow = app.substringAfter("private fun ArchiveEntryRow(").substringBefore("private fun archiveUsageText")
         assertTrue(archiveEntryRow.contains(".height(48.dp)"))
         assertTrue(archiveEntryRow.contains(".size(32.dp)"))
@@ -679,6 +684,41 @@ class BydCollectorUiContractTest {
         assertTrue(app.contains("pressScaleModifier(interactionSource, forcePressed = press.visualPressed"))
         assertTrue(app.contains("clickableNoRipple(interactionSource, press.visualPressed"))
         assertTrue(app.contains("ShutdownIconButton(onClick = actions::onShutdownApp)"))
+    }
+
+    @Test
+    fun editableFieldsCommitOnImeDoneOrDismissWithoutChangingPersistenceContracts() {
+        val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+
+        assertTrue(components.contains("internal fun rememberKeyboardCommit"))
+        assertTrue(components.contains("WindowInsets.ime.getBottom"))
+        assertTrue(components.contains("if (!focused)"))
+        assertTrue(components.contains("keyboardController?.hide()"))
+        assertTrue(components.contains("focusManager.clearFocus()"))
+        assertFalse(components.substringAfter("internal fun rememberKeyboardCommit").substringBefore("data class ForcedPressClick").contains("onValueChange"))
+
+        val textInput = components.substringAfter("fun TextInput(").substringBefore("fun TextValueInput(")
+        assertTrue(textInput.contains("imeAction = ImeAction.Done"))
+        assertTrue(textInput.contains("KeyboardActions(onDone = { keyboardCommit.onDone() })"))
+        assertTrue(textInput.contains("modifier = keyboardCommit.modifier.weight(1f)"))
+
+        val textValueInput = components.substringAfter("fun TextValueInput(").substringBefore("private fun PasswordVisibilityButton(")
+        assertTrue(textValueInput.contains("singleLine = !multiline"))
+        assertTrue(textValueInput.contains("imeAction = if (multiline) ImeAction.Default else ImeAction.Done"))
+        assertTrue(textValueInput.contains("if (multiline) null"))
+        assertTrue(textValueInput.contains("rememberKeyboardCommit()"))
+        assertFalse(textValueInput.contains("onValueChange(value.copy"))
+
+        val threshold = app.substringAfter("private fun TripThresholdField(").substringBefore("private fun TripRouteDialog(")
+        assertTrue(threshold.contains("rememberKeyboardCommit()"))
+        assertTrue(threshold.contains("ImeAction.Done"))
+        assertTrue(threshold.contains("KeyboardActions(onDone = { keyboardCommit.onDone() })"))
+
+        val storage = app.substringAfter("SectionCard(strings.archiveStorageLimit")
+            .substringBefore("SectionCard(")
+        assertTrue(storage.contains("ActionButton(strings.ok"))
+        assertFalse(storage.contains("TextInput("))
     }
 
     @Test

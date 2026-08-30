@@ -14,7 +14,6 @@ import com.bydcollector.collector.data.local.HealthSnapshot
 import com.bydcollector.collector.data.local.HealthSnapshotDetail
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
-import com.bydcollector.collector.data.trips.TripDatabaseHelper
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
 import com.bydcollector.collector.influx.InfluxExportStateSnapshot
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
@@ -22,7 +21,6 @@ import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.util.TimedCache
 import com.bydcollector.collector.util.sqliteFootprintBytes
-import java.io.File
 
 //assembles one immutable dashboard snapshot from settings, service flags, sqlite health, and diagnostics
 class DashboardStateProvider(
@@ -46,12 +44,8 @@ class DashboardStateProvider(
         )
     }
     private val debugStatusCache = TimedCache<DirectDebugStatus>(ttlMs = 5_000L)
-    private val archiveStorageCache = ArchiveStorageSnapshotCache(
-        archiveRoot = File(context.filesDir, "db_archive"),
-        mainDatabaseFile = context.getDatabasePath(TelemetryDatabaseHelper.DATABASE_NAME),
-        debugDatabaseFile = context.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME),
-        tripsDatabaseFile = context.getDatabasePath(TripDatabaseHelper.DATABASE_NAME)
-    )
+    private val archiveStorageCache =
+        (context.applicationContext as BydCollectorApplication).archiveStorageSnapshotCache
     private val healthCacheRunning = mutableMapOf<HealthSnapshotDetail, Boolean>()
     private var recentEventsSource: List<CollectorEvent>? = null
     private var formattedRecentEvents: List<CollectorEvent> = emptyList()
@@ -329,13 +323,25 @@ class DashboardStateProvider(
         archiveStorageCache.invalidate()
     }
 
+    fun completeArchiveStorageDeletion() {
+        archiveStorageCache.completeRetiredAfterNextScan()
+        archiveStorageCache.snapshot(
+            limitBytes = settings.archiveStorageLimitGb() * 1024L * 1024L * 1024L,
+            includeDetails = true
+        )
+    }
+
+    fun retireArchiveStorageEntries(ids: Collection<String>) {
+        archiveStorageCache.retire(ids)
+    }
+
+    fun restoreRetiredArchiveStorageEntries(ids: Collection<String>? = null) {
+        archiveStorageCache.restoreRetired(ids)
+    }
+
     fun invalidateIntegrationRuntime() {
         healthCaches.getValue(HealthSnapshotDetail.INTEGRATIONS).clear()
         healthCaches.getValue(HealthSnapshotDetail.FULL).clear()
-    }
-
-    fun close() {
-        archiveStorageCache.close()
     }
 
     private fun loadHealthSnapshot(

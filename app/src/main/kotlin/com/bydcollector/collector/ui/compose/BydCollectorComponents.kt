@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -23,8 +24,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -37,16 +40,21 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.VisualTransformation
@@ -61,6 +69,43 @@ private val CardShape = RoundedCornerShape(8.dp)
 private val ControlShape = RoundedCornerShape(7.dp)
 private val PillShape = RoundedCornerShape(50)
 private const val PRESS_FEEDBACK_MS = 100L
+
+internal data class KeyboardCommitHandle(
+    val modifier: Modifier,
+    val onDone: () -> Unit
+)
+
+@Composable
+internal fun rememberKeyboardCommit(): KeyboardCommitHandle {
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val density = LocalDensity.current
+    var focused by remember { mutableStateOf(false) }
+    var imeWasVisible by remember { mutableStateOf(false) }
+    val imeVisible = WindowInsets.ime.getBottom(density) > 0
+
+    fun commit() {
+        if (!focused) return
+        keyboardController?.hide()
+        focusManager.clearFocus()
+        imeWasVisible = false
+    }
+
+    LaunchedEffect(focused, imeVisible) {
+        if (!focused) {
+            imeWasVisible = false
+        } else if (imeVisible) {
+            imeWasVisible = true
+        } else if (focused && imeWasVisible) {
+            commit()
+        }
+    }
+
+    return KeyboardCommitHandle(
+        modifier = Modifier.onFocusChanged { focused = it.isFocused },
+        onDone = ::commit
+    )
+}
 
 data class ForcedPressClick(
     val visualPressed: Boolean,
@@ -521,6 +566,7 @@ fun TextInput(
 ) {
     val p = LocalBydPalette.current
     var passwordVisible by remember { mutableStateOf(false) }
+    val keyboardCommit = rememberKeyboardCommit()
     val hasVisibilityToggle = password &&
         showPasswordContentDescription != null &&
         hidePasswordContentDescription != null
@@ -561,8 +607,9 @@ fun TextInput(
                 } else {
                     VisualTransformation.None
                 },
-                keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
-                modifier = Modifier.weight(1f),
+                keyboardOptions = KeyboardOptions(keyboardType = keyboardType, imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { keyboardCommit.onDone() }),
+                modifier = keyboardCommit.modifier.weight(1f),
                 decorationBox = { innerTextField ->
                     Box {
                         if (value.isEmpty() && placeholder.isNotEmpty()) {
@@ -602,6 +649,7 @@ fun TextValueInput(
     keyboardType: KeyboardType = KeyboardType.Text
 ) {
     val p = LocalBydPalette.current
+    val keyboardCommit = rememberKeyboardCommit()
     Column(modifier = modifier) {
         if (label.isNotEmpty()) {
             Text(
@@ -627,8 +675,15 @@ fun TextValueInput(
                 lineHeight = 19.sp
             ),
             cursorBrush = SolidColor(p.accent),
-            keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
+            keyboardOptions = KeyboardOptions(
+                keyboardType = keyboardType,
+                imeAction = if (multiline) ImeAction.Default else ImeAction.Done
+            ),
+            keyboardActions = KeyboardActions(
+                onDone = if (multiline) null else ({ keyboardCommit.onDone() })
+            ),
             modifier = Modifier
+                .then(keyboardCommit.modifier)
                 .fillMaxWidth()
                 .then(if (multiline) Modifier else Modifier.height(38.dp))
                 .clip(ControlShape)

@@ -40,6 +40,7 @@ import com.bydcollector.collector.data.local.PollReading
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.data.remote.DirectTelemetryClient
 import com.bydcollector.collector.data.remote.DirectBridgeManager
+import com.bydcollector.collector.diagnostics.diagnosticSafeText
 import com.bydcollector.collector.keepalive.KeepAliveConfig
 import com.bydcollector.collector.keepalive.KeepAliveSupervisor
 import com.bydcollector.collector.influx.HttpInfluxClient
@@ -327,6 +328,7 @@ class CollectorService : Service() {
             return START_NOT_STICKY
         }
         recoverInterruptedMaintenanceIfNeeded(action)
+        recoverInterruptedArchiveDeleteIfNeeded(action)
         if (
             maintenanceActive.get() &&
             activeMaintenanceOperation == DbMaintenanceOperation.ARCHIVE &&
@@ -431,7 +433,6 @@ class CollectorService : Service() {
         mqttConnection.release()
         influxConnection.release()
         clearDashboardVehicleKpis()
-        if (::dashboardStateProvider.isInitialized) dashboardStateProvider.close()
         if (::debugStore.isInitialized) {
             debugStore.close()
         }
@@ -1804,7 +1805,6 @@ class CollectorService : Service() {
         requireRuntimeOwner()
         dashboardMetricsGeneration.incrementAndGet()
         dashboardUiStateStore.invalidateRowCounts()
-        dashboardStateProvider.close()
         store = newStore
         settings = CollectorSettings(applicationContext, store)
         dashboardStateProvider = DashboardStateProvider(applicationContext, { store }, settings)
@@ -2827,30 +2827,94 @@ class CollectorService : Service() {
     }
 
     private fun enqueueArchiveDelete(ids: List<String>) {
-        enqueueArchiveStorageWork("archive_storage_delete_rejected", ArchiveStorageJobMode.DELETE) {
+        val safeIds = ids.distinct()
+        val successfulIds = linkedSetOf<String>()
+        enqueueArchiveStorageWork(
+            errorCategory = "archive_storage_delete_rejected",
+            requestedMode = ArchiveStorageJobMode.DELETE,
+            initialStatus = ArchiveStorageJobStatus(
+                mode = ArchiveStorageJobMode.DELETE,
+                running = true,
+                stepIndex = 0,
+                stepCount = safeIds.size,
+                messageUk = "Готуємо видалення",
+                messageEn = "Preparing archive deletion",
+                updatedAtMs = System.currentTimeMillis()
+            ),
+            onRejected = {
+                dashboardStateProvider.restoreRetiredArchiveStorageEntries(safeIds)
+                dashboardStateProvider.completeArchiveStorageDeletion()
+            },
+            onFinished = {
+                dashboardStateProvider.restoreRetiredArchiveStorageEntries(safeIds - successfulIds)
+                dashboardStateProvider.completeArchiveStorageDeletion()
+            }
+        ) {
             val manager = archiveStorageManager()
-            val limitBytes = settings.archiveStorageLimitGb() * 1024L * 1024L * 1024L
+            val failedIds = linkedSetOf<String>()
+            store.recordEvent(
+                "archive_delete_started",
+                "Archive deletion started",
+                "count=${safeIds.size}"
+            )
             archiveShareLeaseRegistry.forceRelease(ids)
-            manager.deleteArchiveIds(ids, ::publishArchiveStorageStatus)
-            manager.enforceRetention(limitBytes, ::publishArchiveStorageStatus)
+            manager.deleteArchiveIds(ids) { status ->
+                publishArchiveStorageStatus(status)
+                if (status.error != null && status.itemId != null) {
+                    failedIds += status.itemId
+                    store.recordEvent(
+                        "archive_delete_item",
+                        "Archive deletion failed",
+                        "item=${diagnosticSafeText(status.itemId, 96)} step=${status.stepIndex}/${status.stepCount} " +
+                            "reason=${diagnosticSafeText(status.error, 256)}"
+                    )
+                } else if (status.messageEn == "Archive deleted" && status.itemId != null) {
+                    successfulIds += status.itemId
+                    store.recordEvent(
+                        "archive_delete_item",
+                        "Archive deleted",
+                        "item=${diagnosticSafeText(status.itemId, 96)} step=${status.stepIndex}/${status.stepCount}"
+                    )
+                }
+            }
+            if (failedIds.isNotEmpty()) {
+                settings.setArchiveStorageJobStatus(
+                    ArchiveStorageJobStatus(
+                        mode = ArchiveStorageJobMode.DELETE,
+                        running = false,
+                        stepIndex = safeIds.size,
+                        stepCount = safeIds.size,
+                        messageUk = "Видалення завершено з помилками",
+                        messageEn = "Archive deletion completed with failures",
+                        error = summarizeArchiveDeleteFailures(failedIds),
+                        updatedAtMs = System.currentTimeMillis()
+                    ),
+                    synchronous = true
+                )
+            }
         }
     }
 
     private fun enqueueArchiveStorageWork(
         errorCategory: String,
         requestedMode: ArchiveStorageJobMode,
+        initialStatus: ArchiveStorageJobStatus? = null,
+        onRejected: () -> Unit = {},
+        onFinished: () -> Unit = {},
         work: () -> Unit
     ) {
         if (!archiveStorageActiveInProcess.compareAndSet(false, true)) {
             publishArchiveStorageTerminalError(requestedMode, "Archive storage is already active")
+            onRejected()
             store.recordEvent(errorCategory, "Archive storage action rejected", "archive_storage_active")
             scheduleIntegrationDashboardRefresh()
             return
         }
+        initialStatus?.let { settings.setArchiveStorageJobStatus(it, synchronous = true) }
         try {
             archiveStorageExecutor.execute {
                 try {
-                    runCatching { work() }
+                    val result = runCatching { work() }
                         .onFailure { error ->
                             settings.setArchiveStorageJobStatus(
                                 ArchiveStorageJobStatus(
@@ -2865,6 +2929,11 @@ class CollectorService : Service() {
                                 "archive_storage_error",
                                 "Archive storage action failed",
                                 "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                            )
+                            store.recordEvent(
+                                "archive_storage_terminal",
+                                "Archive storage action completed",
+                                "mode=${requestedMode.name.lowercase()} ok=false error=${error.message?.take(160) ?: error::class.java.simpleName}"
                             )
                         }
                     if (settings.archiveStorageJobStatus().error == null) {
@@ -2883,6 +2952,18 @@ class CollectorService : Service() {
                             settings.clearArchiveStorageJobStatus()
                         }
                     }
+                    try {
+                        result.onSuccess {
+                            val terminal = settings.archiveStorageJobStatus()
+                            store.recordEvent(
+                                "archive_storage_terminal",
+                                "Archive storage action completed",
+                                "mode=${requestedMode.name.lowercase()} ok=${terminal.error == null} error=${terminal.error?.take(160) ?: "none"}"
+                            )
+                        }
+                    } finally {
+                        onFinished()
+                    }
                 } finally {
                     archiveStorageActiveInProcess.set(false)
                     mainHandler.post { stopIfNoActiveRuntime() }
@@ -2894,6 +2975,7 @@ class CollectorService : Service() {
                 requestedMode,
                 "${error::class.java.simpleName}: ${error.message ?: "no message"}"
             )
+            onRejected()
             store.recordEvent(
                 errorCategory,
                 "Archive storage action rejected",
@@ -2913,6 +2995,14 @@ class CollectorService : Service() {
             ),
             synchronous = true
         )
+    }
+
+    private fun summarizeArchiveDeleteFailures(failedIds: Collection<String>): String {
+        val cappedIds = failedIds
+            .take(8)
+            .joinToString(",") { it.take(96) }
+        val suffix = if (failedIds.size > 8) ",..." else ""
+        return "failed_count=${failedIds.size} failed_ids=$cappedIds$suffix"
     }
 
     private fun archiveStorageManager(): ArchiveStorageManager {
@@ -3008,6 +3098,32 @@ class CollectorService : Service() {
         if (action == ACTION_ARCHIVE_DATABASE || action == ACTION_ARCHIVE_DEBUG_DATABASE) return
         if (maintenanceActive.get()) return
         settings.recoverInterruptedDbMaintenanceIfNeeded("service_start:$action")
+    }
+
+    private fun recoverInterruptedArchiveDeleteIfNeeded(action: String) {
+        val status = settings.archiveStorageJobStatus()
+        if (status.mode != ArchiveStorageJobMode.DELETE || !status.running) return
+        if (archiveStorageActiveInProcess.get()) return
+        val detail = "archive_delete_interrupted: process_restart action=$action"
+        settings.setArchiveStorageJobStatus(
+            status.copy(
+                running = false,
+                messageUk = "Видалення перервано після перезапуску",
+                messageEn = "Archive deletion interrupted by process restart",
+                error = detail,
+                updatedAtMs = System.currentTimeMillis()
+            ),
+            synchronous = true
+        )
+        runCatching {
+            store.recordEvent(
+                "archive_delete_interrupted",
+                "Archive deletion interrupted by process restart",
+                "action=$action step=${status.stepIndex}/${status.stepCount}"
+            )
+        }
+        dashboardStateProvider.invalidateArchiveStorageSnapshot()
+        scheduleIntegrationDashboardRefresh()
     }
 
     private fun createMqttCoordinator(client: MqttClientFacade): MqttPublishCoordinator {

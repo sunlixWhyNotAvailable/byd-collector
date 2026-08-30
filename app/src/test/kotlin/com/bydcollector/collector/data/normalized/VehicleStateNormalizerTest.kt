@@ -234,7 +234,6 @@ class VehicleStateNormalizerTest {
         val output = VehicleStateNormalizer(
             catalog = listOf(
                 fieldsByKey.getValue("gear_auto_mode_raw"),
-                fieldsByKey.getValue("charging_state"),
                 fieldsByKey.getValue("tyre_state_lf")
             )
         ).normalize(
@@ -242,13 +241,11 @@ class VehicleStateNormalizerTest {
             observedAt = "2026-07-10T12:00:00+03:00",
             readings = listOf(
                 PollReading("gearbox_1011_555745336_5", "4"),
-                PollReading("charging_1009_1231032336_5", "3"),
                 PollReading("tyre_1016_-1728052957_5", "2")
             )
         )
 
         assertEquals("D", output.single { it.field.fieldKey == "gear_auto_mode_raw" }.value.text)
-        assertEquals("discharging", output.single { it.field.fieldKey == "charging_state" }.value.text)
         assertEquals("underpressure", output.single { it.field.fieldKey == "tyre_state_lf" }.value.text)
         output.forEach {
             assertEquals(NormalizedValueType.TEXT, it.value.type)
@@ -380,8 +377,9 @@ class VehicleStateNormalizerTest {
     fun catalogVersionAndExpansionWaveExposeRepresentativeFields() {
         val fieldsByKey = NormalizedFieldCatalog.fields.associateBy { it.fieldKey }
 
-        assertEquals("normalized-direct-v11-20260820-location", NormalizedFieldCatalog.CATALOG_VERSION)
-        assertEquals(90, NormalizedFieldCatalog.fields.size)
+        assertEquals("normalized-direct-v12-20260830-semantic-fixes", NormalizedFieldCatalog.CATALOG_VERSION)
+        assertEquals(89, NormalizedFieldCatalog.fields.size)
+        assertFalse(fieldsByKey.containsKey("charging_state"))
         assertEquals(emptyList(), NormalizedFieldCatalog.fields.filter { field ->
             field.sourceKeys.any {
                 it.startsWith("adas_") ||
@@ -461,8 +459,55 @@ class VehicleStateNormalizerTest {
             assertFalse(fieldsByKey.getValue(fieldKey).mqttDefaultEnabled, fieldKey)
         }
         assertEquals(NormalizedValueType.TEXT, fieldsByKey.getValue("gear_auto_mode_raw").valueType)
-        assertEquals(NormalizedValueType.TEXT, fieldsByKey.getValue("charging_state").valueType)
         assertEquals(NormalizedValueType.TEXT, fieldsByKey.getValue("tyre_state_lf").valueType)
+    }
+
+    @Test
+    fun rawSemanticCorrectionsExposeUnitlessNumericFieldsWithoutDescriptionScaling() {
+        val fieldsByKey = NormalizedFieldCatalog.fields.associateBy { it.fieldKey }
+        val maxDischarge = fieldsByKey.getValue("max_discharge_power_allow_raw")
+        val sunroof = fieldsByKey.getValue("bodywork_sunroof_windoblind_position")
+
+        assertEquals(NormalizedValueType.NUMBER, maxDischarge.valueType)
+        assertEquals(null, maxDischarge.unit)
+        assertEquals(null, maxDischarge.deviceClass)
+        assertEquals(null, maxDischarge.stateClass)
+        assertEquals("number_raw", maxDischarge.normalizerId)
+        assertTrue(maxDischarge.mqttDefaultEnabled)
+        assertEquals(NormalizedValueType.NUMBER, sunroof.valueType)
+        assertEquals(null, sunroof.unit)
+        assertEquals(null, sunroof.deviceClass)
+        assertEquals(null, sunroof.stateClass)
+        assertEquals("sensor", sunroof.entityPlatform)
+        assertEquals("raw_integer_enum_0_1_2_4", sunroof.normalizerId)
+        assertTrue(sunroof.mqttDefaultEnabled)
+
+        val output = VehicleStateNormalizer(catalog = listOf(maxDischarge, sunroof)).normalize(
+            pollId = 74L,
+            observedAt = "2026-08-30T12:00:00+03:00",
+            readings = listOf(
+                PollReading("statistic_1014_877658120_5", "123", "1.23"),
+                PollReading("bodywork_sunroof_windoblind_position", "4", "open")
+            )
+        )
+
+        assertEquals(123.0, output.single { it.field == maxDischarge }.value.number)
+        assertEquals(4.0, output.single { it.field == sunroof }.value.number)
+        output.forEach { assertEquals(NormalizedQuality.OK, it.quality) }
+    }
+
+    @Test
+    fun sunroofRejectsUnknownOrNonIntegerCodesWithoutInventingLabels() {
+        val field = NormalizedFieldCatalog.sunroofPosition
+        listOf("3", "open", "1.5").forEachIndexed { index, raw ->
+            val output = VehicleStateNormalizer(catalog = listOf(field)).normalize(
+                pollId = 75L + index,
+                observedAt = "2026-08-30T12:00:0${index + 1}+03:00",
+                readings = listOf(PollReading(field.sourceKeys.single(), raw, "open"))
+            ).single()
+            assertEquals(NormalizedQuality.INVALID, output.quality)
+            assertEquals(null, output.value.number)
+        }
     }
 
     @Test

@@ -116,7 +116,6 @@ data class TelegramEventState(
             chargingSessionId != null ||
             chargingActive == true ||
             chargingLowPowerSinceMs != null ||
-            (chargingCandidate != null && chargingCandidateCount > 0) ||
             (chargingActiveCandidate != null && chargingActiveCandidateCount > 0) ||
             (chargeGunCandidate != null && chargeGunCandidateCount > 0) ||
             (gearCandidate != null && gearCandidateCount > 0) ||
@@ -195,9 +194,10 @@ data class TelegramEventState(
                 val json = JSONObject(value)
                 TelegramEventState(
                     initialized = json.optBoolean("initialized", false),
-                    charging = json.optStringOrNull("charging"),
-                    chargingCandidate = json.optStringOrNull("chargingCandidate"),
-                    chargingCandidateCount = json.optInt("chargingCandidateCount"),
+                    //legacy semantic charging fields are accepted but intentionally discarded
+                    charging = null,
+                    chargingCandidate = null,
+                    chargingCandidateCount = 0,
                     chargingActive = json.optBooleanOrNull("chargingActive"),
                     chargingActiveCandidate = json.optBooleanOrNull("chargingActiveCandidate"),
                     chargingActiveCandidateCount = json.optInt("chargingActiveCandidateCount"),
@@ -267,6 +267,9 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
                 initialState.bootTotalDurationMs == 0L
         }
     var state: TelegramEventState = initialState.copy(
+        charging = null,
+        chargingCandidate = null,
+        chargingCandidateCount = 0,
         chargingActive = initialState.chargingActive.takeIf { resumePendingChargingTransition },
         chargingActiveCandidate = initialState.chargingActiveCandidate.takeIf { resumePendingChargingTransition },
         chargingActiveCandidateCount = initialState.chargingActiveCandidateCount.takeIf { resumePendingChargingTransition } ?: 0,
@@ -321,7 +324,6 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         val odometer = values.number("odometer_km")
         val tripEnergy = values.number("trip_energy_kwh")
         val range = values.number("remaining_range_km")
-        val rawCharging = values.text("charging_state")
         val rawGun = values.bool("charge_gun_connected_raw")
         val rawGear = values.text("gear_auto_mode_raw")
         val events = mutableListOf<TelegramDetectedEvent>()
@@ -334,7 +336,6 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         if (firstPoll) {
             state = state.copy(
                 initialized = true,
-                charging = rawCharging,
                 chargeGunConnected = rawGun,
                 gear = rawGear,
                 lastSuccessfulPollAtMs = nowMs,
@@ -348,13 +349,12 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
                 telemetryExpectedSinceMs = state.telemetryExpectedSinceMs ?: nowMs,
                 telemetryOutageSent = false
             )
-            trackChargingSemantic(rawCharging)
             confirmChargeGun(rawGun, nowMs, soc, config, events)
             confirmGear(rawGear, nowMs, odometer, soc, tripEnergy, config)
         }
         updatePowerSessionSoc(soc)
 
-        val evidence = chargingEvidence(rawGun, batteryChargePower, rawCharging)
+        val evidence = chargingEvidence(rawGun, batteryChargePower)
         val stopCharging = confirmChargingEvidence(
             evidence = evidence,
             nowMs = nowMs,
@@ -551,18 +551,6 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         clearTrip()
         clearPowerSessionTotals()
         return persistedResult(events, nowMs, force = true, config = config)
-    }
-
-    private fun trackChargingSemantic(raw: String?) {
-        if (raw == null || raw == state.charging) {
-            state = state.copy(chargingCandidate = null, chargingCandidateCount = 0)
-            return
-        }
-        val count = if (state.chargingCandidate == raw) state.chargingCandidateCount + 1 else 1
-        state = state.copy(chargingCandidate = raw, chargingCandidateCount = count)
-        if (count >= CONFIRMATION_SAMPLES) {
-            state = state.copy(charging = raw, chargingCandidate = null, chargingCandidateCount = 0)
-        }
     }
 
     private fun confirmChargingEvidence(
@@ -816,8 +804,7 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
 
     private fun chargingEvidence(
         chargeGunConnected: Boolean?,
-        batteryChargePower: Double?,
-        semanticState: String?
+        batteryChargePower: Double?
     ): ChargingEvidence {
         if (chargeGunConnected == false) {
             return ChargingEvidence(false, ChargingEvidenceSource.PRIMARY_DISCONNECTED)
@@ -828,12 +815,6 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
             } else {
                 ChargingEvidence(false, ChargingEvidenceSource.PRIMARY_LOW_POWER)
             }
-        }
-        if (semanticState == CHARGING) {
-            return ChargingEvidence(true, ChargingEvidenceSource.SEMANTIC_FALLBACK)
-        }
-        if (semanticState != null) {
-            return ChargingEvidence(false, ChargingEvidenceSource.SEMANTIC_FALLBACK)
         }
         return ChargingEvidence(null, ChargingEvidenceSource.UNKNOWN)
     }
@@ -1190,7 +1171,6 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
     private fun Map<String, NormalizedObservation>.bool(key: String): Boolean? = get(key)?.value?.bool
 
     companion object {
-        private const val CHARGING = "charging"
         private const val PARK = "P"
         private const val CONFIRMATION_SAMPLES = 2
         private const val FULL_SOC_THRESHOLD = 99.5
@@ -1215,7 +1195,6 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         PRIMARY_POWER("primary_power"),
         PRIMARY_LOW_POWER("primary_low_power"),
         PRIMARY_DISCONNECTED("primary_disconnected"),
-        SEMANTIC_FALLBACK("semantic_fallback"),
         UNKNOWN("unknown")
     }
 }

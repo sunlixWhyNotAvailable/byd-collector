@@ -36,11 +36,11 @@ class NormalizedStateStoreTest {
     @Test
     fun retiredCurrentKeyIsDeletedOnlyWhenNotActive() {
         assertEquals(
-            setOf("hv_battery_current_a"),
+            setOf("hv_battery_current_a", "charging_state"),
             retiredNormalizedFieldKeysToDelete(activeFieldKeys = setOf("charge_current_a", "battery_power_kw"))
         )
         assertEquals(
-            emptySet(),
+            setOf("charging_state"),
             retiredNormalizedFieldKeysToDelete(activeFieldKeys = setOf("hv_battery_current_a"))
         )
     }
@@ -50,6 +50,8 @@ class NormalizedStateStoreTest {
         val source = normalizedStateStoreSource()
 
         assertTrue(source.contains("db.delete(\"vehicle_state_current\""))
+        assertTrue(source.contains("deleteIncompatibleCurrentRow(db, field)"))
+        assertTrue(source.contains("storedType != field.valueType.name || storedUnit != field.unit"))
         assertFalse(
             source.contains("db.delete(\"normalized_field_catalog\""),
             "retired cleanup must preserve catalog metadata"

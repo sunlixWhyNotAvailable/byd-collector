@@ -60,6 +60,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
@@ -246,10 +247,7 @@ fun BydCollectorApp(
                         }
                     )
                 }
-                val archiveJob = chromeState?.archiveStorageJobStatus
-                if (archiveJob?.running == true && archiveJob.mode == ArchiveStorageJobMode.DELETE) {
-                    ArchiveStorageProgressDialog(strings = s, status = archiveJob)
-                }
+                //Archive deletion reports inline in Storage; keep the rest of the UI interactive.
                 if (showClearLogsDialog) {
                     ClearLogsDialog(
                         strings = s,
@@ -1063,13 +1061,18 @@ private fun TripRuleSymbol(symbol: String) {
 @Composable
 private fun TripThresholdField(value: String, onValueChange: (String) -> Unit) {
     val p = LocalBydPalette.current
+    val keyboardCommit = rememberKeyboardCommit()
     BasicTextField(
         value = value,
         onValueChange = { onValueChange(it.filter(Char::isDigit).take(3)) },
         singleLine = true,
-        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = KeyboardType.Number),
+        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+            keyboardType = KeyboardType.Number,
+            imeAction = ImeAction.Done
+        ),
+        keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = { keyboardCommit.onDone() }),
         textStyle = TextStyle(color = p.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center),
-        modifier = Modifier.width(62.dp).height(38.dp).clip(Rounded8).background(p.pathField).border(1.dp, p.borderStrong, Rounded8).padding(horizontal = 8.dp, vertical = 9.dp)
+        modifier = keyboardCommit.modifier.width(62.dp).height(38.dp).clip(Rounded8).background(p.pathField).border(1.dp, p.borderStrong, Rounded8).padding(horizontal = 8.dp, vertical = 9.dp)
     )
 }
 
@@ -2292,6 +2295,7 @@ private fun ArchiveShareIconButton(
     enabled: Boolean,
     loading: Boolean = false,
     contentDescription: String,
+    label: String,
     onClick: () -> Unit
 ) {
     val p = LocalBydPalette.current
@@ -2306,7 +2310,9 @@ private fun ArchiveShareIconButton(
     }
     Box(
         modifier = Modifier
-            .size(42.dp)
+            .height(42.dp)
+            .widthIn(min = 112.dp)
+            .padding(horizontal = 10.dp)
             .pressScaleModifier(interactionSource, forcePressed = press.visualPressed)
             .background(background, Rounded8)
             .border(1.dp, if (enabled) p.accent.copy(alpha = 0.85f) else p.borderStrong, Rounded8)
@@ -2320,15 +2326,23 @@ private fun ArchiveShareIconButton(
         if (loading) {
             CircularProgressIndicator(modifier = Modifier.size(18.dp), color = p.accent, strokeWidth = 2.dp)
         } else {
-            ShareIcon(
-                contentDescription = contentDescription,
-                color = when {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                ShareIcon(
+                    contentDescription = contentDescription,
+                    color = when {
+                        !enabled -> p.muted.copy(alpha = 0.62f)
+                        visualPressed -> p.accentText
+                        else -> p.accent
+                    },
+                    modifier = Modifier.size(22.dp)
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(label, color = when {
                     !enabled -> p.muted.copy(alpha = 0.62f)
                     visualPressed -> p.accentText
                     else -> p.accent
-                },
-                modifier = Modifier.size(24.dp)
-            )
+                }, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            }
         }
     }
 }
@@ -2860,6 +2874,7 @@ private fun StorageTab(
                         enabled = shareEnabled && !actionUiState.archiveShare,
                         loading = actionUiState.archiveShare,
                         contentDescription = strings.shareSelectedArchives,
+                        label = strings.shareArchives,
                         onClick = { actions.onShareArchives(selectedArchiveIds) }
                     )
                     val sortLabel = if (newestFirst) strings.archiveSortNewestFirst else strings.archiveSortOldestFirst
@@ -2913,6 +2928,9 @@ private fun StorageTab(
 @Composable
 private fun ArchiveStorageInlineStatus(strings: UiStrings, status: ArchiveStorageJobStatus) {
     val p = LocalBydPalette.current
+    val progress = status.stepCount.takeIf { it > 0 }
+        ?.let { "${status.stepIndex} / $it · " }
+        .orEmpty()
     Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         if (status.running) {
             CircularProgressIndicator(modifier = Modifier.size(24.dp), color = p.accent, strokeWidth = 3.dp)
@@ -2920,8 +2938,8 @@ private fun ArchiveStorageInlineStatus(strings: UiStrings, status: ArchiveStorag
             StatusPill(strings.error, StatusKind.ERROR, compact = true)
         }
         Text(
-            text = status.error?.let { "${localizedArchiveStorageMessage(strings, status)}: $it" }
-                ?: localizedArchiveStorageMessage(strings, status),
+            text = progress + (status.error?.let { "${localizedArchiveStorageMessage(strings, status)}: $it" }
+                ?: localizedArchiveStorageMessage(strings, status)),
             color = if (status.error != null) p.red else p.muted,
             fontSize = 14.sp,
             fontWeight = FontWeight.SemiBold,

@@ -7,6 +7,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
+import kotlin.test.assertContentEquals
 
 class DiagnosticLogRecorderContractTest {
     @Test
@@ -226,6 +227,44 @@ class DiagnosticLogRecorderContractTest {
 
         assertTrue(snapshot.contains("context.applicationContext as BydCollectorApplication"))
         assertTrue(snapshot.indexOf("withDatabaseRead") < snapshot.indexOf("SQLiteDatabase.openDatabase"))
+    }
+
+    @Test
+    fun tripsTelegramEvidenceIsExplicitShareOnlyAndRedacted() {
+        val source = projectFile(
+            "app/src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt",
+            "src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt"
+        ).readText()
+        val share = source.substringAfter("fun prepareShareBundle(context: Context)")
+            .substringBefore("fun clearCompleted(context: Context)")
+        assertTrue(share.contains("writeTripsTelegramEvidence"))
+        assertTrue(source.contains("TRIPS_TELEGRAM_EVIDENCE_MAX_BYTES = 64 * 1024"))
+        assertTrue(source.contains("pending_missing"))
+        assertTrue(source.contains("tripsStoreOrNull"))
+        assertFalse(source.contains("BydCollectorApplication.trips(app)"))
+        assertTrue(source.contains("\"not_initialized\" -> \"not_initialized\""))
+        assertTrue(source.contains("tripsFileOperationLock.withLock"))
+        assertTrue(source.contains("trips.withLease"))
+        assertFalse(source.contains("latitude"))
+        assertFalse(source.contains("longitude"))
+        assertFalse(source.contains("payload"))
+        assertFalse(source.contains("botToken"))
+        assertFalse(source.contains("chatId"))
+        assertFalse(source.contains("run-as"))
+        assertFalse(source.contains("TripsDatabase"))
+    }
+
+    @Test
+    fun boundedEvidenceUsesUtf8ByteCapAndExplicitTruncationMarker() {
+        val lines = listOf("schema_version=1") + List(100) { "дані=" + "x".repeat(20) }
+        val capped = boundedDiagnosticUtf8(lines, 128)
+        assertTrue(capped.size <= 128)
+        assertTrue(String(capped, Charsets.UTF_8).endsWith("truncated=1\n"))
+
+        val complete = boundedDiagnosticUtf8(listOf("ok=так"), 128)
+        assertTrue(complete.size <= 128)
+        assertTrue(String(complete, Charsets.UTF_8).endsWith("truncated=0\n"))
+        assertContentEquals(complete, boundedDiagnosticUtf8(listOf("ok=так"), 128))
     }
 
     private fun projectFile(vararg paths: String): File =

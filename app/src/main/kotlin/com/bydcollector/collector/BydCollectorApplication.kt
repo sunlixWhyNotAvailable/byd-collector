@@ -2,6 +2,7 @@ package com.bydcollector.collector
 
 import android.app.Application
 import android.content.Context
+import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.local.TelegramStore
@@ -14,8 +15,10 @@ import com.bydcollector.collector.maintenance.DatabaseMaintenanceGate
 import com.bydcollector.collector.maintenance.StorageFormatCutoverCoordinator
 import com.bydcollector.collector.maintenance.StorageFormat
 import com.bydcollector.collector.service.CollectorSettings
+import com.bydcollector.collector.ui.ArchiveStorageSnapshotCache
 import com.bydcollector.collector.ui.DashboardUiStateStore
 import com.bydcollector.collector.update.UpdateAutoCheckRuntime
+import java.io.File
 
 //starts process-scoped app bookkeeping before either CollectorService or MainActivity is created
 class BydCollectorApplication : Application() {
@@ -31,6 +34,15 @@ class BydCollectorApplication : Application() {
     internal val tripsFileOperationLock = ReentrantLock(true)
     internal val operationalEventJournal by lazy { OperationalEventJournal(applicationContext) }
     val dashboardUiStateStore by lazy { DashboardUiStateStore() }
+    private val archiveStorageSnapshotCacheDelegate = lazy {
+        ArchiveStorageSnapshotCache(
+            archiveRoot = File(filesDir, "db_archive"),
+            mainDatabaseFile = getDatabasePath(TelemetryDatabaseHelper.DATABASE_NAME),
+            debugDatabaseFile = getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME),
+            tripsDatabaseFile = getDatabasePath(TripDatabaseHelper.DATABASE_NAME)
+        )
+    }
+    internal val archiveStorageSnapshotCache by archiveStorageSnapshotCacheDelegate
 
     override fun onCreate() {
         super.onCreate()
@@ -42,6 +54,9 @@ class BydCollectorApplication : Application() {
         tripsStore?.close()
         telemetryStore?.close()
         telegramStore?.close()
+        if (archiveStorageSnapshotCacheDelegate.isInitialized()) {
+            archiveStorageSnapshotCache.close()
+        }
         super.onTerminate()
     }
 
@@ -72,6 +87,10 @@ class BydCollectorApplication : Application() {
 
     @Synchronized
     fun telegramStorageError(): String? = telegramStorageError
+
+    /** Returns the already-open Trips store without opening or recovering its files. */
+    @Synchronized
+    internal fun tripsStoreOrNull(): TripStore? = tripsStore
 
     @Synchronized
     fun markTelegramStorageUnavailable(mainStore: TelemetryStore, error: Throwable) {

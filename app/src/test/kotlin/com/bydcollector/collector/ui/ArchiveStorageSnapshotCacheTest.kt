@@ -220,4 +220,56 @@ class ArchiveStorageSnapshotCacheTest {
         assertTrue(retry.pending)
         assertEquals(1, commands.size)
     }
+
+    @Test
+    fun retiredEntriesDisappearImmediatelyAndForcedScanRunsAfterInFlightScan() {
+        val root = Files.createTempDirectory("byd-archive-cache-delete").toFile()
+        val active = root.resolve("bydcollector_telemetry.db").apply { writeText("active") }
+        val debug = root.resolve("bydcollector_debug_round_robin.db").apply { writeText("debug") }
+        val archiveRoot = root.resolve("db_archive").apply { mkdirs() }
+        val archive = archiveRoot.resolve("bydcollector_telemetry_20260830_120000.zip").apply { writeText("zip") }
+        val commands = mutableListOf<Runnable>()
+        var scans = 0
+        var now = 1_000L
+        val requestedLimits = mutableListOf<Long>()
+        val cache = ArchiveStorageSnapshotCache(
+            archiveRoot = archiveRoot,
+            mainDatabaseFile = active,
+            debugDatabaseFile = debug,
+            clock = { now },
+            executor = { command -> commands += command }
+        ) { limit ->
+            scans += 1
+            requestedLimits += limit
+            com.bydcollector.collector.maintenance.ArchiveStorageManager(archiveRoot, active, debug).snapshot(limit)
+        }
+
+        cache.snapshot(1024L, includeDetails = true)
+        assertEquals(1, commands.size)
+        commands.removeAt(0).run()
+        assertEquals(1, scans)
+        assertEquals(1, cache.snapshot(1024L, includeDetails = true).snapshot.entries.size)
+
+        now += 31_000L
+        cache.snapshot(1024L, includeDetails = true)
+        assertEquals(1, commands.size)
+        cache.retire(listOf(archive.name))
+        cache.invalidate()
+        cache.snapshot(2048L, includeDetails = true)
+        assertTrue(cache.snapshot(2048L, includeDetails = true).snapshot.entries.isEmpty())
+        assertEquals(1, commands.size)
+
+        //The first forced scan is queued while the scan is in flight; it must run once after completion.
+        commands.removeAt(0).run()
+        assertEquals(2, scans)
+        assertEquals(1, commands.size)
+        assertTrue(cache.snapshot(2048L, includeDetails = true).snapshot.entries.isEmpty())
+        cache.completeRetiredAfterNextScan()
+        archive.delete()
+        commands.removeAt(0).run()
+        assertEquals(3, scans)
+        assertEquals(listOf(1024L, 1024L, 2048L), requestedLimits)
+        assertTrue(cache.snapshot(2048L, includeDetails = true).snapshot.entries.isEmpty())
+        cache.close()
+    }
 }

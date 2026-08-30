@@ -19,8 +19,8 @@ object HaDiscoveryBuilder {
         val availabilityTopic = "$topicPrefix/status"
 
         //publishes only fields that are enabled and safe for ha entity semantics
-        return fields
-            .filter { HaMqttFieldFilter.isPublishable(it, config) }
+        val publishableFields = fields.filter { HaMqttFieldFilter.isPublishable(it, config) }
+        val publishable = publishableFields
             .map { field ->
                 val stateTopic = "$topicPrefix/state/${field.category.mqttKey}"
                 val discoveryTopic = "$discoveryPrefix/${field.entityPlatform}/$DEVICE_ID/${field.fieldKey}/config"
@@ -31,6 +31,18 @@ object HaDiscoveryBuilder {
                     qos = 1
                 )
             }
+        val legacySunroof = publishableFields.any {
+            it.fieldKey == "bodywork_sunroof_windoblind_position" && it.entityPlatform == "sensor"
+        }
+        if (!legacySunroof) return publishable
+
+        val tombstone = HaMqttMessage(
+            topic = "$discoveryPrefix/binary_sensor/$DEVICE_ID/bodywork_sunroof_windoblind_position/config",
+            payload = "",
+            retained = true,
+            qos = 1
+        )
+        return listOf(tombstone) + publishable
     }
 
     private fun discoveryPayload(

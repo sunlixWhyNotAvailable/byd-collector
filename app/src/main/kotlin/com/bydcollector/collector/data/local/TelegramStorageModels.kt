@@ -83,3 +83,27 @@ data class TelegramMigrationResult(
     val verified: Boolean
         get() = sidecarVerified
 }
+
+internal data class TelegramDiagnosticRow(
+    val id: Long,
+    val dedupeKey: String,
+    val eventType: String,
+    val createdAtMs: Long,
+    val nextAttemptAtMs: Long,
+    val attemptCount: Int,
+    val blocked: Boolean,
+    val waitsForSummaryKey: String?
+)
+
+internal data class TelegramDiagnosticSnapshot(
+    val status: String,
+    val runtimeStatePresent: Boolean,
+    val runtimeStateValid: Boolean,
+    val runtimeStateUpdatedAtMs: Long?,
+    val pendingPowerOffLocationTripId: String?,
+    val pendingPowerOffLocationSummaryDelivered: Boolean,
+    val outboxTotal: Long,
+    val relevantRowsTotal: Long,
+    val rows: List<TelegramDiagnosticRow>,
+    val rowsTruncated: Boolean
+)
