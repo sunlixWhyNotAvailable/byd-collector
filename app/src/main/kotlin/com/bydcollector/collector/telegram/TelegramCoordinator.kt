@@ -15,6 +15,7 @@ import com.bydcollector.collector.service.TelegramEventState
 import com.bydcollector.collector.service.TelegramLocationSnapshot
 import com.bydcollector.collector.service.TelegramPowerOffSnapshot
 import java.util.LinkedHashMap
+import java.util.concurrent.CompletableFuture
 
 internal data class TelegramPowerOffPreparation(
     val priorityKeys: List<String>,
@@ -35,12 +36,25 @@ class TelegramCoordinator(
     private val locationKindsByDedupeKey = LinkedHashMap<String, String>(16, 0.75f, true)
     private val locationKindCacheLock = Any()
 
-    fun onSuccessfulPoll(observations: List<NormalizedObservation>): Long? {
+    fun onSuccessfulPoll(
+        observations: List<NormalizedObservation>,
+        onDiagnosticLegStarted: ((String) -> Unit)? = null
+    ): Long? {
         activateEnabledRuntime() ?: return null
         val startupDeadline = ensureStartupRecovery()
         val previousChargingActive = engine.state.chargingActive
+        val previousTripId = engine.state.tripId
         val result = engine.onSuccessfulPoll(observations, eventConfig(), nowMs())
-        handle(result)
+        val committed = handle(result)
+        // Only a leg created by this poll has a proven relation to this poll's Trips session.
+        // Restored active/pending legs without metadata remain explicitly unlinked.
+        if (committed) {
+            result.state.tripId?.takeIf {
+                it != previousTripId && result.state.tripPowerSessionId == null
+            }?.let { legId ->
+                runCatching { onDiagnosticLegStarted?.invoke(legId) }
+            }
+        }
         if (result.state.chargingActive != previousChargingActive) {
             eventStore.recordEvent(
                 "telegram_charging_transition",
@@ -49,6 +63,23 @@ class TelegramCoordinator(
             )
         }
         return nextWakeAt(result.nextWakeAtMs, nextWakeAt(startupDeadline, pendingQueueDeadline()))
+    }
+
+    /** Diagnostic writes never reset or disable the sender on failure. */
+    internal fun bindTripDiagnosticParent(legId: String, powerSessionId: String) {
+        runCatching {
+            engine.bindTripPowerSession(legId, powerSessionId) { state ->
+                telegramStore.saveTelegramRuntimeState(state.toJson(), nowMs())
+            }
+        }.onFailure { error ->
+            runCatching {
+                eventStore.recordEvent(
+                    "telegram_diagnostic_correlation_error",
+                    "Telegram trip diagnostic correlation could not be persisted",
+                    "error=${error::class.java.simpleName}"
+                )
+            }
+        }
     }
 
     fun tick(
@@ -441,6 +472,24 @@ class TelegramCoordinator(
         return "kind=${result.kind.name.lowercase()} " +
             "status=${result.httpStatus ?: "none"} " +
             "exception=${result.exceptionClass ?: "none"}"
+    }
+}
+
+/** Joins one poll's results without waiting or changing either owner's execution order. */
+internal fun correlateTripDiagnostic(
+    legId: String,
+    powerSession: CompletableFuture<String?>,
+    isCurrent: () -> Boolean,
+    enqueue: (() -> Unit) -> Unit,
+    bind: (String, String) -> Unit
+) {
+    if (legId.isBlank()) return
+    powerSession.thenAccept { resolved ->
+        val parentId = resolved?.trim()?.takeIf(String::isNotEmpty) ?: return@thenAccept
+        if (!isCurrent()) return@thenAccept
+        enqueue {
+            if (isCurrent()) bind(legId, parentId)
+        }
     }
 }
 

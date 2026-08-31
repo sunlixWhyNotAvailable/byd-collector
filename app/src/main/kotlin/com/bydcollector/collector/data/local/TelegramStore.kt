@@ -211,6 +211,7 @@ class TelegramStore(
         var runtimePresent = false
         var runtimeUpdatedAtMs: Long? = null
         var pendingTripId: String? = null
+        var pendingPowerSessionId: String? = null
         var summaryDelivered = false
         var runtimeValid = true
         db.rawQuery(
@@ -224,6 +225,7 @@ class TelegramStore(
                 val state = TelegramEventState.fromJsonOrNull(stateJson)
                 runtimeValid = state != null
                 pendingTripId = state?.pendingPowerOffLocationTripId
+                pendingPowerSessionId = state?.pendingPowerOffLocationPowerSessionId
                 summaryDelivered = state?.pendingPowerOffLocationSummaryDelivered == true
             }
         }
@@ -265,6 +267,7 @@ class TelegramStore(
             runtimeStateValid = runtimeValid,
             runtimeStateUpdatedAtMs = runtimeUpdatedAtMs,
             pendingPowerOffLocationTripId = pendingTripId,
+            pendingPowerOffLocationPowerSessionId = pendingPowerSessionId,
             pendingPowerOffLocationSummaryDelivered = summaryDelivered,
             outboxTotal = outboxTotal,
             relevantRowsTotal = relevantTotal,

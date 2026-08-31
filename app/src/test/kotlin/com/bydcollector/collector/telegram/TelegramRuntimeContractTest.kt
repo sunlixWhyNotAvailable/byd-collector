@@ -22,6 +22,38 @@ class TelegramRuntimeContractTest {
     }
 
     @Test
+    fun diagnosticCorrelationPreservesOwnerOrderingAndDoesNotResetTheSender() {
+        val coordinator = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val runtime = sourceFile("com/bydcollector/collector/service/TripRuntimeCoordinator.kt").readText()
+        val poll = coordinator.substringAfter("fun onSuccessfulPoll(")
+            .substringBefore("internal fun bindTripDiagnosticParent")
+        assertInOrder(poll, "ensureStartupRecovery()", "val previousTripId", "engine.onSuccessfulPoll", "handle(result)", "if (committed)")
+        assertTrue(poll.contains("it != previousTripId && result.state.tripPowerSessionId == null"))
+        assertTrue(poll.contains("runCatching { onDiagnosticLegStarted?.invoke(legId) }"))
+        val bind = coordinator.substringAfter("internal fun bindTripDiagnosticParent")
+            .substringBefore("fun tick(")
+        assertInOrder(bind, "runCatching", "engine.bindTripPowerSession", "saveTelegramRuntimeState", ".onFailure")
+        assertFalse(bind.contains("engine ="))
+        assertFalse(bind.contains("flushPending"))
+        assertFalse(bind.contains("settings."))
+        val observer = service.substringAfter("private fun createSuccessfulPollObserver")
+            .substringBefore("private fun createTripRuntimeCoordinator")
+        assertInOrder(observer, "CompletableFuture<String?>()", "executeTelegram(", "tripRuntime.onSuccessfulPoll(")
+        assertTrue(observer.contains("telegramCoordinator === coordinator"))
+        assertTrue(observer.contains("telegramWorkGeneration.get() == generation"))
+        assertTrue(observer.contains("bind = coordinator::bindTripDiagnosticParent"))
+        assertFalse(observer.contains("parent.get("))
+        assertFalse(observer.contains("parent.join("))
+        val powerOff = runtime.substringAfter("private fun handlePowerOff(")
+            .substringBefore("private fun ensureGpsRunning")
+        assertInOrder(powerOff, "updateOpenSession", "diagnosticPowerSession?.complete(current?.tripId)", "prepareConfirmedPowerOff(")
+        val tripsPoll = runtime.substringAfter("fun onSuccessfulPoll(").substringBefore("fun resume()")
+        assertTrue(tripsPoll.contains("onDropped = { diagnosticPowerSession?.complete(null) }"))
+        assertTrue(tripsPoll.substringAfterLast("finally {").contains("diagnosticPowerSession?.complete(null)"))
+    }
+
+    @Test
     fun pendingTripDeadlineReschedulesTheExistingTelegramTick() {
         val engine = sourceFile("com/bydcollector/collector/service/TelegramEventEngine.kt").readText()
         val coordinator = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
@@ -40,7 +72,8 @@ class TelegramRuntimeContractTest {
         assertInOrder(engine, "finalizePendingTrip(config, nowMs, events)", "if (!mainCollectionExpected)")
         assertTrue(engine.contains("nextWakeAtMs: Long?"))
         assertTrue(engine.contains("pendingTripDeadline(config)"))
-        assertTrue(coordinator.contains("fun onSuccessfulPoll(observations: List<NormalizedObservation>): Long?"))
+        assertTrue(coordinator.contains("observations: List<NormalizedObservation>"))
+        assertTrue(coordinator.contains("onDiagnosticLegStarted: ((String) -> Unit)? = null"))
         assertTrue(coordinator.contains("pendingQueueDeadline()"))
         assertTrue(coordinator.contains("flushPending()"))
         assertTrue(coordinator.contains("listOfNotNull(eventDeadlineAtMs, queueDeadlineAtMs).minOrNull()"))

@@ -14,6 +14,7 @@ class TelegramDiagnosticContractTest {
         assertTrue(snapshot.contains("limit in 1..64"))
         assertTrue(snapshot.contains("LIMIT ?"))
         assertTrue(snapshot.contains("pendingPowerOffLocationTripId"))
+        assertTrue(snapshot.contains("pendingPowerOffLocationPowerSessionId"))
         assertTrue(snapshot.contains("rowsTruncated"))
         assertTrue(snapshot.contains("dedupe_key"))
         assertTrue(snapshot.contains("pendingKeys"))

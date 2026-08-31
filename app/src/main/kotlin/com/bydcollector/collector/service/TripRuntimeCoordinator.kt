@@ -20,6 +20,7 @@ import com.bydcollector.collector.location.VehicleSpeedReference
 import com.bydcollector.collector.util.namedSingleThreadExecutor
 import java.io.File
 import java.time.Instant
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -91,35 +92,41 @@ class TripRuntimeCoordinator(
         timestamp: String,
         readings: List<PollReading>,
         observations: List<NormalizedObservation>,
-        liveTelemetry: Boolean
+        liveTelemetry: Boolean,
+        diagnosticPowerSession: CompletableFuture<String?>? = null
     ) {
         val receivedElapsedMs = elapsedRealtimeMs()
         val snapshot = computeTelemetrySnapshot(observations, receivedElapsedMs)
         if (liveTelemetry) vehicleSpeedReference.observe(snapshot.speedKmh, receivedElapsedMs)
-        dispatch {
-            ensureInitialized()
-            latestBatteryPowerKw = snapshot.batteryPowerKw
-            latestBatteryPowerAtMs = snapshot.receivedElapsedMs
-
-            val decodedPower = readings.firstOrNull { it.rawKey == POWER_FIELD_KEY }
-                ?.descValue
-                ?.trim()
-                ?.toIntOrNull()
-            val transition = powerTracker.observe(decodedPower)
+        dispatch(onDropped = { diagnosticPowerSession?.complete(null) }) {
             try {
-                when (transition?.current) {
-                    VehiclePowerState.ON -> handlePowerOn(timestamp, snapshot)
-                    VehiclePowerState.OFF -> handlePowerOff(timestamp, snapshot)
-                    else -> Unit
+                ensureInitialized()
+                latestBatteryPowerKw = snapshot.batteryPowerKw
+                latestBatteryPowerAtMs = snapshot.receivedElapsedMs
+
+                val decodedPower = readings.firstOrNull { it.rawKey == POWER_FIELD_KEY }
+                    ?.descValue
+                    ?.trim()
+                    ?.toIntOrNull()
+                val transition = powerTracker.observe(decodedPower)
+                try {
+                    when (transition?.current) {
+                        VehiclePowerState.ON -> handlePowerOn(timestamp, snapshot)
+                        VehiclePowerState.OFF -> handlePowerOff(timestamp, snapshot, diagnosticPowerSession)
+                        else -> Unit
+                    }
+                } catch (error: Throwable) {
+                    transition?.let(powerTracker::rollback)
+                    throw error
                 }
-            } catch (error: Throwable) {
-                transition?.let(powerTracker::rollback)
-                throw error
-            }
-            if (powerTracker.current() == VehiclePowerState.ON) {
-                updateOpenSession(timestamp, snapshot)
-                if (!locationCaptureEnabled()) stopGps()
-                else if (liveTelemetry) ensureGpsRunning()
+                if (powerTracker.current() == VehiclePowerState.ON) {
+                    updateOpenSession(timestamp, snapshot)
+                    if (!locationCaptureEnabled()) stopGps()
+                    else if (liveTelemetry) ensureGpsRunning()
+                    diagnosticPowerSession?.complete(session?.tripId)
+                }
+            } finally {
+                diagnosticPowerSession?.complete(null)
             }
         }
     }
@@ -246,7 +253,11 @@ class TripRuntimeCoordinator(
         ).also(tripStore::upsertSession)
     }
 
-    private fun handlePowerOff(timestamp: String, snapshot: TelemetrySnapshot) {
+    private fun handlePowerOff(
+        timestamp: String,
+        snapshot: TelemetrySnapshot,
+        diagnosticPowerSession: CompletableFuture<String?>?
+    ) {
         stopGps(markFinal = true)
         updateOpenSession(timestamp, snapshot)
         val current = session
@@ -257,6 +268,8 @@ class TripRuntimeCoordinator(
                 .lastOrNull { it.kind == RoutePoint.KIND_VALID }
                 ?.toGpsSample()
         }
+        // Resolve before the existing Telegram-owner handoff; diagnostics must never wait for it.
+        diagnosticPowerSession?.complete(current?.tripId)
         val deliverAfterClose = prepareConfirmedPowerOff(
             ConfirmedPowerOff(timestamp, current, trustedLocation)
         )
@@ -361,13 +374,19 @@ class TripRuntimeCoordinator(
         initialized = true
     }
 
-    private fun dispatch(block: () -> Unit) {
-        if (!running.get()) return
+    private fun dispatch(onDropped: () -> Unit = {}, block: () -> Unit) {
+        if (!running.get()) {
+            onDropped()
+            return
+        }
         if (Thread.currentThread() === ownerThread) {
             block()
             return
         }
-        if (paused.get()) return
+        if (paused.get()) {
+            onDropped()
+            return
+        }
         runCatching {
             executor.execute {
                 ownerThread = Thread.currentThread()
@@ -375,7 +394,7 @@ class TripRuntimeCoordinator(
                     recordEvent("trip_runtime_error", "Trip runtime operation failed", "${error::class.java.simpleName}: ${error.message.orEmpty()}")
                 }
             }
-        }
+        }.onFailure { onDropped() }
     }
 
     private fun Map<String, NormalizedObservation>.number(key: String): Double? {

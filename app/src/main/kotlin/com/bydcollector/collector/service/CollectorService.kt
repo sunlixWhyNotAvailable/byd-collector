@@ -66,6 +66,7 @@ import com.bydcollector.collector.mqtt.MqttPublishCoordinator
 import com.bydcollector.collector.mqtt.PahoMqttClientFacade
 import com.bydcollector.collector.system.CollectorAutoStart
 import com.bydcollector.collector.telegram.TelegramCoordinator
+import com.bydcollector.collector.telegram.correlateTripDiagnostic
 import java.time.Instant
 import com.bydcollector.collector.ui.DashboardDebugPollState
 import com.bydcollector.collector.ui.DashboardMainPollState
@@ -83,6 +84,7 @@ import com.bydcollector.collector.ui.compose.AppTab
 import com.bydcollector.collector.util.namedSingleThreadExecutor
 import com.bydcollector.collector.util.sqliteFootprintBytes
 import java.io.File
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.FutureTask
@@ -521,19 +523,36 @@ class CollectorService : Service() {
                     )
                 )
                 scheduleDatabaseFootprintRefresh(force = false)
-                telegramCoordinator?.let { coordinator ->
+                val diagnosticPowerSession = telegramCoordinator?.let { coordinator ->
+                    val parent = CompletableFuture<String?>()
+                    val generation = telegramWorkGeneration.get()
                     executeTelegram(
                         "telegram_event_error",
                         onSuccess = ::postTelegramTickSchedule
                     ) {
-                        coordinator.onSuccessfulPoll(observations)
+                        coordinator.onSuccessfulPoll(observations) { legId ->
+                            correlateTripDiagnostic(
+                                legId = legId,
+                                powerSession = parent,
+                                isCurrent = {
+                                    running.get() && telegramCoordinator === coordinator &&
+                                        telegramWorkGeneration.get() == generation
+                                },
+                                enqueue = { action ->
+                                    executeTelegram("telegram_diagnostic_correlation_error") { action() }
+                                },
+                                bind = coordinator::bindTripDiagnosticParent
+                            )
+                        }
                     }
+                    parent
                 }
                 tripRuntime.onSuccessfulPoll(
                     timestamp,
                     readings,
                     observations,
-                    liveTelemetry = origin == PollOrigin.LIVE
+                    liveTelemetry = origin == PollOrigin.LIVE,
+                    diagnosticPowerSession = diagnosticPowerSession
                 )
                 if (summary.changedCategories.isNotEmpty()) {
                     normalizedStateChangedCallback?.invoke(summary.changedCategories)

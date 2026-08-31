@@ -25,7 +25,7 @@ class TripRuntimeEnergyContractTest {
         assertFalse(tracker.contains("offConfirmationCount"))
         assertFalse(tracker.contains("consecutiveZeroes"))
         assertInOrder(runtime, "ensureInitialized()", "powerTracker.observe(decodedPower)")
-        assertTrue(runtime.contains("VehiclePowerState.OFF -> handlePowerOff(timestamp, snapshot)"))
+        assertTrue(runtime.contains("VehiclePowerState.OFF -> handlePowerOff(timestamp, snapshot, diagnosticPowerSession)"))
         assertTrue(runtime.contains("transition?.let(powerTracker::rollback)"))
         assertInOrder(runtime, "private fun handlePowerOff", "prepareConfirmedPowerOff(")
         assertInOrder(runtime, "prepareConfirmedPowerOff(", "state = TripSession.STATE_CLOSED")

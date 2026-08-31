@@ -101,6 +101,7 @@ internal data class TelegramDiagnosticSnapshot(
     val runtimeStateValid: Boolean,
     val runtimeStateUpdatedAtMs: Long?,
     val pendingPowerOffLocationTripId: String?,
+    val pendingPowerOffLocationPowerSessionId: String?,
     val pendingPowerOffLocationSummaryDelivered: Boolean,
     val outboxTotal: Long,
     val relevantRowsTotal: Long,

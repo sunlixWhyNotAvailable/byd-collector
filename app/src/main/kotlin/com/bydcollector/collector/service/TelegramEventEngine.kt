@@ -90,6 +90,7 @@ data class TelegramEventState(
     val telemetryExpectedSinceMs: Long? = null,
     val telemetryOutageSent: Boolean = false,
     val tripId: String? = null,
+    val tripPowerSessionId: String? = null,
     val tripStartedAtMs: Long? = null,
     val tripStartOdometerKm: Double? = null,
     val tripStartSoc: Double? = null,
@@ -100,6 +101,7 @@ data class TelegramEventState(
     val tripEndEnergyKwh: Double? = null,
     val tripAccumulatedEnergyKwh: Double? = null,
     val pendingPowerOffLocationTripId: String? = null,
+    val pendingPowerOffLocationPowerSessionId: String? = null,
     val pendingPowerOffLocationSummaryDelivered: Boolean = false,
     val bootStartSoc: Double? = null,
     val bootEndSoc: Double? = null,
@@ -163,6 +165,7 @@ data class TelegramEventState(
         putNullable("telemetryExpectedSinceMs", telemetryExpectedSinceMs)
         put("telemetryOutageSent", telemetryOutageSent)
         putNullable("tripId", tripId)
+        putNullable("tripPowerSessionId", tripPowerSessionId)
         putNullable("tripStartedAtMs", tripStartedAtMs)
         putNullable("tripStartOdometerKm", tripStartOdometerKm)
         putNullable("tripStartSoc", tripStartSoc)
@@ -173,6 +176,7 @@ data class TelegramEventState(
         putNullable("tripEndEnergyKwh", tripEndEnergyKwh)
         putNullable("tripAccumulatedEnergyKwh", tripAccumulatedEnergyKwh)
         putNullable("pendingPowerOffLocationTripId", pendingPowerOffLocationTripId)
+        putNullable("pendingPowerOffLocationPowerSessionId", pendingPowerOffLocationPowerSessionId)
         put("pendingPowerOffLocationSummaryDelivered", pendingPowerOffLocationSummaryDelivered)
         putNullable("bootStartSoc", bootStartSoc)
         putNullable("bootEndSoc", bootEndSoc)
@@ -227,6 +231,7 @@ data class TelegramEventState(
                     telemetryExpectedSinceMs = json.optLongOrNull("telemetryExpectedSinceMs"),
                     telemetryOutageSent = json.optBoolean("telemetryOutageSent"),
                     tripId = json.optStringOrNull("tripId"),
+                    tripPowerSessionId = json.optStringOrNull("tripPowerSessionId"),
                     tripStartedAtMs = json.optLongOrNull("tripStartedAtMs"),
                     tripStartOdometerKm = json.optDoubleOrNull("tripStartOdometerKm"),
                     tripStartSoc = json.optDoubleOrNull("tripStartSoc"),
@@ -238,6 +243,8 @@ data class TelegramEventState(
                     tripAccumulatedEnergyKwh = json.optDoubleOrNull("tripAccumulatedEnergyKwh")
                         ?.takeIf { it.isFinite() && it >= 0.0 },
                     pendingPowerOffLocationTripId = json.optStringOrNull("pendingPowerOffLocationTripId"),
+                    pendingPowerOffLocationPowerSessionId =
+                        json.optStringOrNull("pendingPowerOffLocationPowerSessionId"),
                     pendingPowerOffLocationSummaryDelivered =
                         json.optBoolean("pendingPowerOffLocationSummaryDelivered", false),
                     bootStartSoc = json.optDoubleOrNull("bootStartSoc"),
@@ -286,6 +293,32 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
     fun reset(): TelegramEventState {
         state = TelegramEventState()
         return state
+    }
+
+    /** Binds a Trips power-session parent; persistence runs before assignment and may abort the bind. */
+    fun bindTripPowerSession(
+        legId: String,
+        powerSessionId: String,
+        persist: (TelegramEventState) -> Unit = {}
+    ): TelegramEventState? {
+        val normalizedLegId = legId.trim()
+        val normalizedPowerSessionId = powerSessionId.trim()
+        if (normalizedLegId.isEmpty() || normalizedPowerSessionId.isEmpty()) return null
+
+        val next = when {
+            state.tripId == normalizedLegId -> {
+                if (!state.tripPowerSessionId.isNullOrBlank()) return null
+                state.copy(tripPowerSessionId = normalizedPowerSessionId)
+            }
+            state.pendingPowerOffLocationTripId == normalizedLegId -> {
+                if (!state.pendingPowerOffLocationPowerSessionId.isNullOrBlank()) return null
+                state.copy(pendingPowerOffLocationPowerSessionId = normalizedPowerSessionId)
+            }
+            else -> return null
+        }
+        persist(next)
+        state = next
+        return next
     }
 
     /** Persists proof only after the matching delayed-P summary leaves the durable outbox. */
@@ -476,6 +509,7 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
                 }
                 state = state.copy(
                     pendingPowerOffLocationTripId = null,
+                    pendingPowerOffLocationPowerSessionId = null,
                     pendingPowerOffLocationSummaryDelivered = false
                 )
             }
@@ -913,6 +947,7 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
             if (TelegramEventType.TRIP_SUMMARY in config.enabledEvents) {
                 state = state.copy(
                     pendingPowerOffLocationTripId = tripId,
+                    pendingPowerOffLocationPowerSessionId = state.tripPowerSessionId,
                     pendingPowerOffLocationSummaryDelivered = false
                 )
             }
@@ -959,6 +994,7 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
     private fun clearTrip() {
         state = state.copy(
             tripId = null,
+            tripPowerSessionId = null,
             tripStartedAtMs = null,
             tripStartOdometerKm = null,
             tripStartSoc = null,
@@ -1015,6 +1051,7 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
             state.bootTotalEnergyKwh == 0.0 && state.bootTotalDurationMs == 0L
         state = state.copy(
             tripId = UUID.randomUUID().toString(),
+            tripPowerSessionId = null,
             tripStartedAtMs = nowMs,
             tripStartOdometerKm = odometer,
             tripStartSoc = startSoc,
@@ -1024,6 +1061,7 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
             tripEndSoc = null,
             tripEndEnergyKwh = null,
             pendingPowerOffLocationTripId = null,
+            pendingPowerOffLocationPowerSessionId = null,
             pendingPowerOffLocationSummaryDelivered = false,
             bootStartSoc = state.bootStartSoc ?: startSoc?.takeIf { canAnchorPowerSession },
             bootEndSoc = startSoc ?: state.bootEndSoc,

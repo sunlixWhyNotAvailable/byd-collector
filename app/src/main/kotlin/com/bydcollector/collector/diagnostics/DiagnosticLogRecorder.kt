@@ -18,6 +18,28 @@ import java.util.Date
 import java.util.Locale
 import kotlin.concurrent.withLock
 
+internal data class DiagnosticTripSelection(
+    val selection: String,
+    val session: TripSession?
+)
+
+internal fun selectDiagnosticTrip(
+    pendingTripId: String?,
+    pendingPowerSessionId: String?,
+    findByPowerSessionId: (String) -> TripSession?,
+    findNewestClosed: () -> TripSession?
+): DiagnosticTripSelection {
+    val pending = pendingTripId?.takeIf(String::isNotBlank)
+    if (pending != null) {
+        val parent = pendingPowerSessionId?.takeIf(String::isNotBlank)
+            ?: return DiagnosticTripSelection("pending_unlinked", null)
+        return findByPowerSessionId(parent)?.let { DiagnosticTripSelection("pending", it) }
+            ?: DiagnosticTripSelection("pending_missing", null)
+    }
+    return findNewestClosed()?.let { DiagnosticTripSelection("newest_closed", it) }
+        ?: DiagnosticTripSelection("none", null)
+}
+
 //captures a small support bundle without making dashboard refresh perform zip work
 object DiagnosticLogRecorder {
     private const val DIAGNOSTICS_DIR = "diagnostics"
@@ -440,43 +462,60 @@ object DiagnosticLogRecorder {
         var selectedSession: TripSession? = null
         var route: TripRouteDiagnosticEvidence? = null
         var tripSelection = "none"
+        var tripCorrelation = "not_requested"
         var tripError: Throwable? = null
         val pendingTripId = telegram?.pendingPowerOffLocationTripId
             ?.takeIf(String::isNotBlank)
-        val trips = app.tripsStoreOrNull()
-        if (trips == null) {
-            tripSelection = "not_initialized"
-        } else if (!trips.databaseFile.isFile || trips.databaseFile.length() == 0L) {
-            tripSelection = "missing"
-        } else runCatching {
-            app.tripsFileOperationLock.withLock {
-                trips.withLease {
-                    selectedSession = if (pendingTripId != null) {
-                        trips.session(pendingTripId).also {
-                            tripSelection = if (it == null) "pending_missing" else "pending"
+        val pendingPowerSessionId = telegram?.pendingPowerOffLocationPowerSessionId
+            ?.takeIf(String::isNotBlank)
+        if (pendingTripId != null && pendingPowerSessionId == null) {
+            tripSelection = "pending_unlinked"
+            tripCorrelation = "unavailable"
+        } else {
+            val trips = app.tripsStoreOrNull()
+            if (trips == null) {
+                tripSelection = "not_initialized"
+                if (pendingTripId != null) tripCorrelation = "unavailable"
+            } else if (!trips.databaseFile.isFile || trips.databaseFile.length() == 0L) {
+                tripSelection = "missing"
+                if (pendingTripId != null) tripCorrelation = "unavailable"
+            } else runCatching {
+                app.tripsFileOperationLock.withLock {
+                    trips.withLease {
+                        val selection = selectDiagnosticTrip(
+                            pendingTripId = pendingTripId,
+                            pendingPowerSessionId = pendingPowerSessionId,
+                            findByPowerSessionId = trips::session,
+                            findNewestClosed = trips::diagnosticLatestClosedSession
+                        )
+                        tripSelection = selection.selection
+                        selectedSession = selection.session
+                        tripCorrelation = when (tripSelection) {
+                            "pending" -> "linked"
+                            "pending_missing" -> "missing"
+                            else -> "not_requested"
                         }
-                    } else {
-                        trips.diagnosticLatestClosedSession().also {
-                            tripSelection = if (it == null) "none" else "newest_closed"
+                        selectedSession?.let { session ->
+                            route = trips.diagnosticRouteEvidence(session.tripId)
                         }
-                    }
-                    selectedSession?.let { session ->
-                        route = trips.diagnosticRouteEvidence(session.tripId)
                     }
                 }
+            }.onFailure {
+                tripSelection = "error"
+                if (pendingTripId != null) tripCorrelation = "error"
+                tripError = it
             }
-        }.onFailure {
-            tripSelection = "error"
-            tripError = it
         }
 
         lines += "trips_status=${when (tripSelection) {
             "not_initialized" -> "not_initialized"
             "missing" -> "missing"
+            "pending_unlinked" -> "not_queried"
             "error" -> "error"
             else -> "ok"
         }}"
         lines += "trip_selection=$tripSelection"
+        lines += "trip_correlation=$tripCorrelation"
         tripError?.let { lines += "trips_error=${it::class.java.simpleName}" }
         selectedSession?.let { session ->
             lines += "trip_ref=${diagnosticSha256(session.tripId)}"
@@ -520,7 +559,11 @@ object DiagnosticLogRecorder {
                 else -> "invalid"
             }}"
             lines += "telegram_runtime_updated_at_ms=${snapshot.runtimeStateUpdatedAtMs ?: "none"}"
-            lines += "telegram_pending_trip_ref=${snapshot.pendingPowerOffLocationTripId?.let(::diagnosticSha256) ?: "none"}"
+            lines += "telegram_pending_trip_ref=${snapshot.pendingPowerOffLocationTripId
+                ?.takeIf(String::isNotBlank)?.let(::diagnosticSha256) ?: "none"}"
+            lines += "telegram_pending_power_session_ref=${snapshot.pendingPowerOffLocationPowerSessionId
+                ?.takeIf { snapshot.pendingPowerOffLocationTripId?.isNotBlank() == true }
+                ?.takeIf(String::isNotBlank)?.let(::diagnosticSha256) ?: "none"}"
             lines += "telegram_pending_summary_delivered=${snapshot.pendingPowerOffLocationSummaryDelivered}"
             lines += "telegram_outbox_total=${snapshot.outboxTotal}"
             lines += "telegram_relevant_rows_total=${snapshot.relevantRowsTotal}"
