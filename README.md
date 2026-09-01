@@ -7,7 +7,7 @@
 BYD Collector is a read-only telemetry collector for Chinese-market BYD vehicles using DiLink 5.0. It reads vehicle values through the local Android ADB bridge and an APK-owned `app_process` helper, keeps the raw readings in SQLite, derives a normalized vehicle state, and optionally exports that state to MQTT/Home Assistant, InfluxDB, and Telegram.
 
 - **Vehicle focus:** Chinese-market BYD Sea Lion 07 EV
-- **Current source version:** `v2.7.5`; latest published release: `v2.7.3`
+- **Current source version:** `v2.7.6`; latest published release: `v2.7.3`
 - **Package:** `com.bydcollector.collector`
 - **Download:** [latest GitHub release](https://github.com/sunlixWhyNotAvailable/byd-collector/releases/latest)
 - **Help:** read [Troubleshooting](#troubleshooting), then [Report a problem](#report-a-problem)

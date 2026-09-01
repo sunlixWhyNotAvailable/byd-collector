@@ -19,11 +19,11 @@
 
     <application
         android:allowBackup="false"
-        android:icon="@drawable/collector_apk_icon"
+        android:icon="@drawable/collector_launcher_icon"
         android:label="${collectorLabel}"
         android:name="com.bydcollector.collector.BydCollectorApplication"
         android:networkSecurityConfig="@xml/network_security_config"
-        android:roundIcon="@drawable/collector_apk_icon"
+        android:roundIcon="@drawable/collector_launcher_icon"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
 
