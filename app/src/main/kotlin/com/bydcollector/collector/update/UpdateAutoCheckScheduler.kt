@@ -8,52 +8,105 @@ sealed interface UpdateAutoCheckAction {
     data class Schedule(val delayMs: Long) : UpdateAutoCheckAction
 }
 
-//tracks the one startup auto-check delay separately from foreground visibility
+//Tracks the process startup delay independently of foreground visibility.
 class UpdateAutoCheckScheduler(
     private val delayMs: Long,
-    private val nowMs: () -> Long
+    private val nowMs: () -> Long,
+    private val suppressionMs: Long = 60 * 60 * 1000L
 ) {
-    private var runtimeStartedAtMs: Long? = null
-    private var pendingAfterBackgroundExpiry = false
-    private var consumed = false
+    private var initialized = false
+    private var deadlineMs: Long? = null
+    private var suppressedUntilMs: Long? = null
 
     fun onRuntimeStarted(enabled: Boolean): UpdateAutoCheckAction {
-        if (!enabled || consumed) return UpdateAutoCheckAction.None
-        if (runtimeStartedAtMs == null) {
-            runtimeStartedAtMs = nowMs()
-            consumed = false
-            pendingAfterBackgroundExpiry = false
+        if (!enabled) return UpdateAutoCheckAction.None
+        if (!initialized) {
+            val startedAt = nowMs()
+            initialized = true
+            deadlineMs = startedAt + delayMs
         }
-        val elapsedMs = nowMs() - (runtimeStartedAtMs ?: nowMs())
-        return UpdateAutoCheckAction.Schedule((delayMs - elapsedMs).coerceAtLeast(0L))
+        if (isSuppressed()) return UpdateAutoCheckAction.None
+        val deadline = deadlineMs ?: return UpdateAutoCheckAction.None
+        return UpdateAutoCheckAction.Schedule((deadline - nowMs()).coerceAtLeast(0L))
     }
 
     fun onForeground(enabled: Boolean): UpdateAutoCheckAction {
-        if (!enabled || consumed) return UpdateAutoCheckAction.None
-        val startedAt = runtimeStartedAtMs ?: return UpdateAutoCheckAction.None
-        if (pendingAfterBackgroundExpiry || nowMs() - startedAt >= delayMs) {
-            pendingAfterBackgroundExpiry = false
-            consumed = true
-            return UpdateAutoCheckAction.Run
+        if (!enabled || isSuppressed()) return UpdateAutoCheckAction.None
+        val deadline = deadlineMs ?: return UpdateAutoCheckAction.None
+        val remaining = deadline - nowMs()
+        return if (remaining > 0L) {
+            UpdateAutoCheckAction.Schedule(remaining)
+        } else {
+            UpdateAutoCheckAction.Run
         }
-        return UpdateAutoCheckAction.None
     }
 
     fun onTimerElapsed(enabled: Boolean, foreground: Boolean): UpdateAutoCheckAction {
-        if (!enabled || consumed || runtimeStartedAtMs == null) return UpdateAutoCheckAction.None
-        if (foreground) {
-            consumed = true
-            return UpdateAutoCheckAction.Run
+        if (!enabled || isSuppressed()) return UpdateAutoCheckAction.None
+        val deadline = deadlineMs ?: return UpdateAutoCheckAction.None
+        val remaining = deadline - nowMs()
+        if (remaining > 0L) {
+            return UpdateAutoCheckAction.Schedule(remaining)
         }
-        pendingAfterBackgroundExpiry = true
-        return UpdateAutoCheckAction.None
+        return if (foreground) UpdateAutoCheckAction.Run else UpdateAutoCheckAction.None
     }
 
     fun onAutoCheckEnabledChanged(enabled: Boolean): UpdateAutoCheckAction {
-        runtimeStartedAtMs = null
-        pendingAfterBackgroundExpiry = false
-        consumed = false
-        return onRuntimeStarted(enabled)
+        if (!enabled) {
+            // Turning the switch off cancels this runtime's pending timer, but
+            // intentionally leaves a Close suppression window intact.
+            initialized = false
+            deadlineMs = null
+            return UpdateAutoCheckAction.None
+        }
+        return onRuntimeStarted(enabled = true)
+    }
+
+    /** Arms the existing deadline after a foreground timer is torn down. */
+    fun onBackground(enabled: Boolean): UpdateAutoCheckAction {
+        if (!enabled || isSuppressed()) return UpdateAutoCheckAction.None
+        val now = nowMs()
+        if (deadlineMs == null) {
+            // The previous accepted request consumed its deadline. A later
+            // stop/return is a new automatic-check cycle.
+            initialized = true
+            deadlineMs = now + delayMs
+        }
+        val deadline = deadlineMs ?: return UpdateAutoCheckAction.None
+        return UpdateAutoCheckAction.Schedule((deadline - now).coerceAtLeast(0L))
+    }
+
+    /** Marks an accepted request; its deadline is consumed only after acceptance. */
+    fun onCheckStarted() {
+        // A manual request during Close suppression must not erase the latent
+        // post-TTL eligibility established by onDismissed().
+        if (!isSuppressed()) deadlineMs = null
+    }
+
+    /** Starts the process-local close suppression window. */
+    fun onDismissed() {
+        val now = nowMs()
+        suppressedUntilMs = now + suppressionMs
+        initialized = true
+        deadlineMs = now
+    }
+
+    /** Clears all process state for shutdown or a new runtime session. */
+    fun reset() {
+        initialized = false
+        deadlineMs = null
+        suppressedUntilMs = null
+    }
+
+    fun diagnosticState(): String =
+        "initialized=$initialized deadline_elapsed_ms=${deadlineMs ?: "null"} " +
+            "suppressed_until_elapsed_ms=${suppressedUntilMs ?: "null"}"
+
+    private fun isSuppressed(): Boolean {
+        val until = suppressedUntilMs ?: return false
+        if (nowMs() < until) return true
+        suppressedUntilMs = null
+        return false
     }
 }
 
@@ -83,5 +136,30 @@ object UpdateAutoCheckRuntime {
     @Synchronized
     fun onAutoCheckEnabledChanged(enabled: Boolean): UpdateAutoCheckAction {
         return scheduler.onAutoCheckEnabledChanged(enabled)
+    }
+
+    @Synchronized
+    fun onBackground(enabled: Boolean): UpdateAutoCheckAction {
+        return scheduler.onBackground(enabled)
+    }
+
+    @Synchronized
+    fun onCheckStarted() {
+        scheduler.onCheckStarted()
+    }
+
+    @Synchronized
+    fun onDismissed() {
+        scheduler.onDismissed()
+    }
+
+    @Synchronized
+    fun reset() {
+        scheduler.reset()
+    }
+
+    @Synchronized
+    fun diagnosticState(): String {
+        return scheduler.diagnosticState()
     }
 }

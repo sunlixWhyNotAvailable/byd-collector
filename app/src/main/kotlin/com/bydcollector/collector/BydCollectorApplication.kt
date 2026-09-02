@@ -2,6 +2,7 @@ package com.bydcollector.collector
 
 import android.app.Application
 import android.content.Context
+import android.os.SystemClock
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
@@ -19,7 +20,14 @@ import com.bydcollector.collector.ui.ArchiveStorageSnapshotCache
 import com.bydcollector.collector.ui.DashboardUiStateStore
 import com.bydcollector.collector.ui.UiSessionState
 import com.bydcollector.collector.update.UpdateAutoCheckRuntime
+import com.bydcollector.collector.update.UpdateChecker
+import com.bydcollector.collector.update.UpdateCheckResult
+import com.bydcollector.collector.update.UpdateCheckSession
+import com.bydcollector.collector.util.dispatchOperationalEvent
+import com.bydcollector.collector.util.namedSingleThreadExecutor
+import com.bydcollector.collector.util.sharedOperationalEventExecutor
 import java.io.File
+import java.time.Instant
 
 //starts process-scoped app bookkeeping before either CollectorService or MainActivity is created
 class BydCollectorApplication : Application() {
@@ -36,6 +44,21 @@ class BydCollectorApplication : Application() {
     internal val operationalEventJournal by lazy { OperationalEventJournal(applicationContext) }
     val dashboardUiStateStore by lazy { DashboardUiStateStore() }
     val navigationSession by lazy { UiSessionState() }
+    private val updateCheckExecutorDelegate = lazy { namedSingleThreadExecutor("byd-update-check") }
+    internal val updateChecks by lazy {
+        UpdateCheckSession(updateCheckExecutorDelegate.value) {
+            val startedAt = SystemClock.elapsedRealtime()
+            recordUpdateEvent("check_started", "installed=${BuildConfig.VERSION_NAME}")
+            UpdateChecker().check().also { result ->
+                val detail = when (result) {
+                    is UpdateCheckResult.Available -> "available=${result.info.version}"
+                    UpdateCheckResult.UpToDate -> "up_to_date"
+                    is UpdateCheckResult.Error -> "error=${result.message.replace('\n', ' ').take(256)}"
+                }
+                recordUpdateEvent("check_result", "$detail duration_ms=${SystemClock.elapsedRealtime() - startedAt}")
+            }
+        }
+    }
     private val archiveStorageSnapshotCacheDelegate = lazy {
         ArchiveStorageSnapshotCache(
             archiveRoot = File(filesDir, "db_archive"),
@@ -50,9 +73,11 @@ class BydCollectorApplication : Application() {
         super.onCreate()
         val settings = CollectorSettings(this)
         UpdateAutoCheckRuntime.onRuntimeStarted(settings.isUpdateAutoCheckEnabled())
+        recordUpdateEvent("runtime_started", "auto_enabled=${settings.isUpdateAutoCheckEnabled()} ${UpdateAutoCheckRuntime.diagnosticState()}")
     }
 
     override fun onTerminate() {
+        if (updateCheckExecutorDelegate.isInitialized()) updateCheckExecutorDelegate.value.shutdownNow()
         tripsStore?.close()
         telemetryStore?.close()
         telegramStore?.close()
@@ -60,6 +85,14 @@ class BydCollectorApplication : Application() {
             archiveStorageSnapshotCache.close()
         }
         super.onTerminate()
+    }
+
+    internal fun recordUpdateEvent(message: String, detail: String? = null) {
+        val timestamp = Instant.now().toString()
+        val elapsedMs = SystemClock.elapsedRealtime()
+        dispatchOperationalEvent(sharedOperationalEventExecutor) {
+            operationalEventJournal.append(timestamp, elapsedMs, "update", message, detail)
+        }
     }
 
     @Synchronized

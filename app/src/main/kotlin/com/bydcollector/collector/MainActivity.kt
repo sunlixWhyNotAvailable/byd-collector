@@ -76,8 +76,7 @@ import com.bydcollector.collector.ui.compose.strings
 import com.bydcollector.collector.update.UpdateAutoCheckAction
 import com.bydcollector.collector.update.UpdateAutoCheckRuntime
 import com.bydcollector.collector.update.UpdateApkVerifier
-import com.bydcollector.collector.update.UpdateChecker
-import com.bydcollector.collector.update.UpdateCheckResult
+import com.bydcollector.collector.update.UpdateCheckSession
 import com.bydcollector.collector.update.UpdateDownloader
 import com.bydcollector.collector.update.UpdateInfo
 import com.bydcollector.collector.update.UpdateUiState
@@ -100,7 +99,8 @@ class MainActivity : ComponentActivity() {
     private val dashboardCountExecutor = namedSingleThreadExecutor("byd-ui-counts")
     private val diagnosticsExecutor = namedSingleThreadExecutor("byd-diagnostics")
     private val updateExecutor = namedSingleThreadExecutor("byd-update")
-    private val updateChecker by lazy { UpdateChecker(settings) }
+    private val updateChecks: UpdateCheckSession
+        get() = (applicationContext as BydCollectorApplication).updateChecks
     private val updateDownloader by lazy { UpdateDownloader(applicationContext) }
     private val updateApkVerifier by lazy { UpdateApkVerifier(applicationContext) }
     private var startupBackgroundLaunchPosted = false
@@ -110,7 +110,6 @@ class MainActivity : ComponentActivity() {
     private var mainWindowHasFocus = false
     private var runtimePermissionRequestInFlight = false
     @Volatile private var refreshInFlight = false
-    @Volatile private var updateCheckInFlight = false
     @Volatile private var foreground = false
     @Volatile private var destroyed = false
     private val archiveShareInFlight = AtomicBoolean(false)
@@ -128,6 +127,7 @@ class MainActivity : ComponentActivity() {
     private var tripsUiState by mutableStateOf(TripsUiState())
     private var updateUiState by mutableStateOf<UpdateUiState>(UpdateUiState.Hidden)
     private var updateUiGeneration = 0L
+    private var updatePresentationRevision = -1L
     private var pendingMaintenanceOperation by mutableStateOf<DbMaintenanceOperation?>(null)
     private var pendingMainArchivePreflight by mutableStateOf<MainArchivePreflight?>(null)
     private var maintenanceLaunchOperation by mutableStateOf<DbMaintenanceOperation?>(null)
@@ -182,6 +182,8 @@ class MainActivity : ComponentActivity() {
     }
     private val startupAdbSelfCheckTask = Runnable { runStartupAdbSelfCheckIfReady() }
     private val updateAutoCheckTimerTask = Runnable { onUpdateAutoCheckTimerElapsed() }
+    private val updateCheckUiTask = Runnable { syncUpdateCheckUi() }
+    private val updateCheckListener: () -> Unit = { handler.post(updateCheckUiTask); Unit }
     private val telegramReconcileTask = Runnable {
         if (!destroyed && ::settings.isInitialized) {
             CollectorServiceController.reconcileTelegram(this@MainActivity)
@@ -563,6 +565,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onToggleUpdateAutoCheck(enabled: Boolean) {
             settings.setUpdateAutoCheckEnabled(enabled)
+            handler.removeCallbacks(updateAutoCheckTimerTask)
             handleUpdateAutoCheckAction(UpdateAutoCheckRuntime.onAutoCheckEnabledChanged(enabled))
             refresh()
         }
@@ -572,6 +575,14 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onDismissUpdateDialog() {
+            val dismissedOffer = updateUiState is UpdateUiState.Available
+            updateChecks.dismiss()
+            updatePresentationRevision = updateChecks.snapshot().revision
+            if (dismissedOffer) {
+                UpdateAutoCheckRuntime.onDismissed()
+                handler.removeCallbacks(updateAutoCheckTimerTask)
+                recordUpdateEvent("offer_dismissed", "auto_suppression_ms=3600000")
+            }
             updateUiGeneration += 1L
             updateUiState = UpdateUiState.Hidden
         }
@@ -586,6 +597,11 @@ class MainActivity : ComponentActivity() {
             settings.setUserShutdownRequested(true)
             CollectorAutoStart.cancelScheduled(applicationContext)
             navigationSession.clear()
+            updateChecks.reset()
+            UpdateAutoCheckRuntime.reset()
+            handler.removeCallbacks(updateAutoCheckTimerTask)
+            updateUiGeneration += 1L
+            updateUiState = UpdateUiState.Hidden
             CollectorServiceController.shutdown(this@MainActivity)
             finishAndRemoveTask()
         }
@@ -621,7 +637,10 @@ class MainActivity : ComponentActivity() {
         val clearedUserShutdown = settings.clearUserShutdownRequestIfSet()
         if (clearedUserShutdown) {
             settings.clearRuntimeManualStops()
+            updateChecks.reset()
+            UpdateAutoCheckRuntime.reset()
         }
+        updateChecks.addListener(updateCheckListener)
         stateProvider = DashboardStateProvider(applicationContext, { BydCollectorApplication.store(applicationContext) }, settings)
         dashboardUiStateStore = BydCollectorApplication.dashboardUiStateStore(applicationContext)
         dashboardUiStateStore.selectVehicleKpiLanguage(uiLanguage.vehicleKpiLanguage())
@@ -691,6 +710,7 @@ class MainActivity : ComponentActivity() {
             )
         }
         loadCredentialsAfterFirstFrame()
+        startRuntimeUpdateAutoCheck()
         dashboardExecutor.execute {
             val runtimeStore = currentStore()
             runOnUiThread {
@@ -705,7 +725,6 @@ class MainActivity : ComponentActivity() {
                     CollectorAutoStart.recoverFromForeground(applicationContext, settings, runtimeStore)
                 }
                 reconcileCutoverArchiveStorageIfNeeded()
-                startRuntimeUpdateAutoCheck()
                 hydrateDashboardTabsOnce()
             }
         }
@@ -720,6 +739,7 @@ class MainActivity : ComponentActivity() {
         if (activeTab == AppTab.TRIPS) loadTripsUi()
         refresh()
         maybeContinueStartupAccessFlow()
+        syncUpdateCheckUi()
         runPendingStartupUpdateCheckIfReady()
         handler.removeCallbacks(refreshTask)
         handler.postDelayed(refreshTask, DASHBOARD_REFRESH_HEARTBEAT_MS)
@@ -728,7 +748,10 @@ class MainActivity : ComponentActivity() {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         mainWindowHasFocus = hasFocus
-        if (hasFocus && ::settings.isInitialized) maybeContinueStartupAccessFlow()
+        if (hasFocus && ::settings.isInitialized) {
+            maybeContinueStartupAccessFlow()
+            syncUpdateCheckUi()
+        }
     }
 
     override fun onPause() {
@@ -738,8 +761,19 @@ class MainActivity : ComponentActivity() {
         super.onPause()
     }
 
+    override fun onStop() {
+        handler.removeCallbacks(updateAutoCheckTimerTask)
+        if (!isChangingConfigurations && !settings.isUserShutdownRequested()) {
+            // Only age the deadline in background; HTTP and presentation stay foreground-only.
+            UpdateAutoCheckRuntime.onBackground(settings.isUpdateAutoCheckEnabled())
+            recordUpdateEvent("background_deadline", UpdateAutoCheckRuntime.diagnosticState())
+        }
+        super.onStop()
+    }
+
     override fun onDestroy() {
         destroyed = true
+        updateChecks.removeListener(updateCheckListener)
         archiveDeleteDispatchStartedAtMs = null
         actionUiState = BydCollectorActionUiState()
         diagnosticsBusy = false
@@ -759,6 +793,7 @@ class MainActivity : ComponentActivity() {
             settingsPreferences.unregisterOnSharedPreferenceChangeListener(settingsChangeListener)
         }
         handler.removeCallbacks(updateAutoCheckTimerTask)
+        handler.removeCallbacks(updateCheckUiTask)
         handler.removeCallbacks(startupAdbSelfCheckTask)
         handler.removeCallbacks(telegramReconcileTask)
         super.onDestroy()
@@ -1517,7 +1552,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun runPendingStartupUpdateCheckIfReady() {
-        //runs a deferred startup check as soon as the user brings the already-running app forward
+        // Reuse the process deadline after cold background start or an ordinary stop/return.
         handleUpdateAutoCheckAction(
             UpdateAutoCheckRuntime.onForeground(settings.isUpdateAutoCheckEnabled())
         )
@@ -1534,6 +1569,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleUpdateAutoCheckAction(action: UpdateAutoCheckAction) {
+        recordUpdateEvent(
+            "auto_check_gate",
+            "action=$action enabled=${settings.isUpdateAutoCheckEnabled()} foreground=$foreground ${UpdateAutoCheckRuntime.diagnosticState()}"
+        )
         when (action) {
             UpdateAutoCheckAction.None -> Unit
             UpdateAutoCheckAction.Run -> runAutomaticUpdateCheck()
@@ -1550,36 +1589,35 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun runUpdateCheck(force: Boolean) {
-        //guard duplicate update checks while github request is running
-        if (updateCheckInFlight || destroyed) return
-        updateCheckInFlight = true
-        val uiGeneration = ++updateUiGeneration
-        if (force) {
-            updateUiState = UpdateUiState.Checking
+        if (destroyed || !foreground || updateUiState is UpdateUiState.Downloading) return
+        val accepted = updateChecks.request(manual = force)
+        if (accepted) {
+            UpdateAutoCheckRuntime.onCheckStarted()
+            handler.removeCallbacks(updateAutoCheckTimerTask)
+            updateUiGeneration += 1L
         }
-        runCatching {
-            updateExecutor.execute {
-            val result = runCatching { updateChecker.check(force) }
-                .getOrElse { UpdateCheckResult.Error(it.message ?: it::class.java.simpleName) }
-            runOnUiThread {
-                updateCheckInFlight = false
-                if (destroyed || !foreground || uiGeneration != updateUiGeneration) return@runOnUiThread
-                updateUiState = when (result) {
-                    is UpdateCheckResult.Available -> UpdateUiState.Available(result.info)
-                    UpdateCheckResult.UpToDate -> if (force) UpdateUiState.UpToDate else UpdateUiState.Hidden
-                    is UpdateCheckResult.Error -> if (force) UpdateUiState.Error(result.message) else UpdateUiState.Hidden
-                }
-            }
-            }
-        }.onFailure { error ->
-            updateCheckInFlight = false
-            if (!destroyed && uiGeneration == updateUiGeneration && force) {
-                updateUiState = UpdateUiState.Error(error.message ?: error::class.java.simpleName)
-            }
+        recordUpdateEvent("check_requested", "manual=$force accepted=$accepted")
+        syncUpdateCheckUi()
+    }
+
+    private fun syncUpdateCheckUi() {
+        if (destroyed || !foreground || !mainWindowHasFocus) return
+        val snapshot = updateChecks.snapshot()
+        if (snapshot.revision == updatePresentationRevision) return
+        updatePresentationRevision = snapshot.revision
+        updateUiState = snapshot.uiState
+        if (snapshot.uiState is UpdateUiState.Available) {
+            recordUpdateEvent("offer_shown", "version=${snapshot.uiState.info.version}")
         }
     }
 
+    private fun recordUpdateEvent(message: String, detail: String? = null) {
+        (applicationContext as BydCollectorApplication).recordUpdateEvent(message, detail)
+    }
+
     private fun startUpdateDownload(info: UpdateInfo) {
+        updateChecks.clearPresentation()
+        updatePresentationRevision = updateChecks.snapshot().revision
         val uiGeneration = ++updateUiGeneration
         updateUiState = UpdateUiState.Downloading(info, 0)
         runCatching {

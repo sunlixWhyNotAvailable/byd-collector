@@ -853,12 +853,6 @@ class CollectorSettings(
         }
     }
 
-    fun lastUpdateCheckAtMs(): Long = prefs.getLong(KEY_UPDATE_LAST_CHECK_AT_MS, 0L)
-
-    fun setLastUpdateCheckAtMs(value: Long) {
-        prefs.edit().putLong(KEY_UPDATE_LAST_CHECK_AT_MS, value).apply()
-    }
-
     fun influxHost(): String = prefs.getString(KEY_INFLUX_HOST, "") ?: ""
 
     fun setInfluxHost(host: String) {
@@ -1206,7 +1200,6 @@ class CollectorSettings(
         private val TELEGRAM_TRIP_TEMPLATE_LIMIT_LOCK = Any()
         const val SECRET_TELEGRAM_BOT_TOKEN = "telegram.bot_token"
         const val KEY_UPDATE_AUTO_CHECK = "updateAutoCheck"
-        const val KEY_UPDATE_LAST_CHECK_AT_MS = "updateLastCheckAtMs"
         const val KEY_TAILSCALE_ACTIVATION = "tailscaleActivation"
         const val KEY_TAILSCALE_ACTIVATION_LAST_ATTEMPT_AT_MS = "tailscaleActivationLastAttemptAtMs"
         const val KEY_ARCHIVE_STORAGE_LIMIT_GB = "archiveStorageLimitGb"

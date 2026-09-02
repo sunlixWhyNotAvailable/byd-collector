@@ -182,6 +182,15 @@ The `Options` tab contains operational controls rather than vehicle-control comm
 
 The app's keep-alive path is recovery-oriented and idempotent. It does not write vehicle values or invoke vehicle-control APIs.
 
+Automatic update checking starts a 30-second countdown with the app process,
+including background startup. Requests start and update prompts appear only
+when the app is in the foreground. Returning after a normal background stop uses the
+remaining delay, or checks immediately if it has elapsed. An available update
+survives window recreation. Closing its offer pauses automatic checks for one
+hour; a new app session can reset that pause earlier. There is no hourly
+background polling, and the manual check remains available. Each check asks for
+the latest published release; a failed check does not impose an extra cooldown.
+
 <p align="center"><img src="docs/screenshots/en/options.png" alt="BYD Collector options and runtime settings" width="100%"></p>
 
 ## Diagnostics and privacy
