@@ -63,6 +63,22 @@ class InfluxClientContractTest {
         assertEquals(InfluxFailureKind.TRANSPORT, classifyInfluxNetworkFailure(ConnectException("offline")))
     }
 
+    @Test
+    fun diagnosticEndpointHostStripsEmbeddedUserInfoOnly() {
+        assertEquals("influx.local", safeInfluxDiagnosticHost("anton:secret@influx.local"))
+        assertEquals("10.0.0.5", safeInfluxDiagnosticHost("10.0.0.5"))
+    }
+
+    @Test
+    fun httpDiagnosticsExposeStagesWithoutBodyFields() {
+        val source = sourceFile("com/bydcollector/collector/influx/InfluxClient.kt").readText()
+        assertTrue(source.contains("open_connection"))
+        assertTrue(source.contains("write_body"))
+        assertTrue(source.contains("read_error_body"))
+        assertTrue(source.contains("duration_ms"))
+        assertFalse(source.contains("details[\"body\"]"))
+    }
+
     private fun sourceFile(path: String): File {
         return listOf(
             File("src/main/kotlin/$path"),

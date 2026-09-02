@@ -88,7 +88,7 @@ class CollectorServiceMaintenanceContractTest {
             "influxExecutor = namedSingleThreadExecutor(\"byd-influx\")",
             "setInfluxRuntime(RuntimeActionStatus.STOPPED)"
         )
-        assertTrue(prepare.contains("cancelInfluxRetry()"))
+        assertTrue(prepare.contains("cancelInfluxRetry(\"maintenance\")"))
         assertFalse(prepare.contains("setInfluxRuntime(RuntimeActionStatus.STOPPING)"))
         assertInOrder(finish, "maintenanceActive.set(false)", "restoreRuntimeAfterMaintenance(operation, snapshot)")
         assertInOrder(
@@ -132,7 +132,7 @@ class CollectorServiceMaintenanceContractTest {
         assertInOrder(stop, "runOnRuntimeOwnerBlocking", "stopAndJoin(2_000L)", "shutdownAndAwait(debugStopReason, 2_000L)")
         assertTrue(prepare.contains("requireRuntimeOwner()"))
         assertTrue(prepare.contains("sessionId = null"))
-        assertTrue(prepare.contains("cancelInfluxRetry()"))
+        assertTrue(prepare.contains("cancelInfluxRetry(\"maintenance\")"))
         assertTrue(prepare.contains("cancelTelegramTick()"))
         assertFalse(prepare.contains("stopAndJoin(2_000L)"))
         assertTrue(restore.contains("requireRuntimeOwner()"))
@@ -382,7 +382,7 @@ class CollectorServiceMaintenanceContractTest {
         val prepare = service.substringAfter("private fun prepareRuntimeStopForMaintenance")
             .substringBefore("private fun restoreRuntimeAfterMaintenance")
         val debugBranch = prepare.substringAfter("if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE)")
-            .substringBefore("cancelInfluxRetry()")
+            .substringBefore("cancelInfluxRetry(\"maintenance\")")
 
         assertTrue(service.contains("ACTION_ARCHIVE_DEBUG_DATABASE"))
         assertTrue(stop.contains("\"debug_database_maintenance\""))

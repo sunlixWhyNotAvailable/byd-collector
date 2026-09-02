@@ -1,5 +1,7 @@
 package com.bydcollector.collector.influx
 
+import com.bydcollector.collector.ha.HaEndpointProfile
+
 enum class InfluxFailureKind {
     TRANSPORT,
     AUTHENTICATION,
@@ -7,6 +9,21 @@ enum class InfluxFailureKind {
     PROTOCOL,
     OTHER
 }
+
+/** Metadata-only causal evidence; never include payloads, credentials, or response bodies. */
+data class InfluxDiagnosticEvent(
+    val type: String,
+    val details: Map<String, String> = emptyMap()
+)
+
+typealias InfluxDiagnosticSink = (InfluxDiagnosticEvent) -> Unit
+
+data class InfluxRequestContext(
+    val requestId: String,
+    val mode: String,
+    val profile: HaEndpointProfile? = null,
+    val source: String
+)
 
 data class InfluxActionResult(
     val ok: Boolean,

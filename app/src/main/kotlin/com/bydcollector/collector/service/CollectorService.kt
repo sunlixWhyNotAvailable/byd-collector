@@ -46,6 +46,8 @@ import com.bydcollector.collector.keepalive.KeepAliveSupervisor
 import com.bydcollector.collector.influx.HttpInfluxClient
 import com.bydcollector.collector.influx.InfluxActionResult
 import com.bydcollector.collector.influx.InfluxExportCoordinator
+import com.bydcollector.collector.influx.InfluxRuntimeDiagnosticsProcess
+import com.bydcollector.collector.influx.safeInfluxDiagnosticHost
 import com.bydcollector.collector.ha.HaEndpoint
 import com.bydcollector.collector.ha.HaConnectionOwnership
 import com.bydcollector.collector.ha.SocketHaEndpointProbe
@@ -140,6 +142,9 @@ class CollectorService : Service() {
     private val influxWorkInFlight = AtomicInteger(0)
     private var influxRetryScheduled = false
     private var influxRetryAtElapsedMs: Long? = null
+    @Volatile private var influxWorkQueuedAtElapsedMs: Long? = null
+    private val influxRuntimeDiagnostics = InfluxRuntimeDiagnosticsProcess.instance
+    private val influxDiagnosticRuntimeId = java.util.UUID.randomUUID().toString()
     private val telegramExecutorLock = Any()
     private var telegramExecutor: ExecutorService = namedSingleThreadExecutor("byd-telegram")
     private val mqttWorkGeneration = AtomicLong(0L)
@@ -186,9 +191,38 @@ class CollectorService : Service() {
     }
     private val influxRetryTask = object : Runnable {
         override fun run() {
+            val scheduledAt = influxRetryAtElapsedMs
+            recordInfluxDiagnostic(
+                com.bydcollector.collector.influx.InfluxDiagnosticEvent(
+                    "influx_retry_fired",
+                    mapOf(
+                        "retry_deadline_elapsed_ms" to (scheduledAt ?: -1L).toString(),
+                        "generation" to influxWorkGeneration.get().toString(),
+                        "reason" to "scheduled"
+                    )
+                )
+            )
             influxRetryScheduled = false
             influxRetryAtElapsedMs = null
-            if (!running.get() || !settings.isInfluxEnabled() || maintenanceBlocksRuntimeStart()) return
+            recordInfluxDiagnostic(
+                com.bydcollector.collector.influx.InfluxDiagnosticEvent(
+                    "influx_runtime_state",
+                    influxDiagnosticStateDetails(influxWorkGeneration.get(), queued = influxRequestQueued.get()) +
+                        mapOf("retry_deadline_elapsed_ms" to "none", "retry_deadline" to "none")
+                )
+            )
+            if (!running.get()) {
+                recordInfluxGate("stopped")
+                return
+            }
+            if (!settings.isInfluxEnabled()) {
+                recordInfluxGate("disabled")
+                return
+            }
+            if (maintenanceBlocksRuntimeStart()) {
+                recordInfluxGate("maintenance")
+                return
+            }
             requestInfluxCycle()
         }
     }
@@ -240,6 +274,7 @@ class CollectorService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        influxRuntimeDiagnostics.attachJournal(applicationContext)
         running.set(true)
         mainRuntimeStatus = RuntimeActionStatus.STOPPED
         debugRuntimeStatus = DebugRuntimeStatus.STOPPED
@@ -250,6 +285,21 @@ class CollectorService : Service() {
         debugRuntimeStatusRef.set(debugRuntimeStatus)
         mqttRuntimeStatusRef.set(mqttRuntimeStatus)
         influxRuntimeStatusRef.set(influxRuntimeStatus)
+        recordInfluxDiagnostic(
+            com.bydcollector.collector.influx.InfluxDiagnosticEvent(
+                "influx_runtime_state",
+                mapOf(
+                    "running" to "true",
+                    "generation" to influxWorkGeneration.get().toString(),
+                    "queued" to "false",
+                    "inflight" to "0",
+                    "frozen" to "false",
+                    "actual_route" to "none",
+                    "endpoints" to "none",
+                    "reason" to "service_started"
+                )
+            )
+        )
         store = BydCollectorApplication.store(applicationContext)
         settings = CollectorSettings(applicationContext, store)
         debugStorageReady = BydCollectorApplication.isDebugStorageReady(applicationContext)
@@ -402,7 +452,7 @@ class CollectorService : Service() {
         mainHandler.removeCallbacks(kpiPublishTask)
         mainHandler.removeCallbacks(kpiStaleTask)
         cancelMqttRetry()
-        cancelInfluxRetry()
+        cancelInfluxRetry("service_destroyed")
         cancelTelegramTick()
         accessSelfCheckScheduled = false
         stopCollection("service_destroyed")
@@ -431,6 +481,21 @@ class CollectorService : Service() {
         debugRuntimeStatusRef.set(debugRuntimeStatus)
         mqttRuntimeStatusRef.set(mqttRuntimeStatus)
         influxRuntimeStatusRef.set(influxRuntimeStatus)
+        recordInfluxDiagnostic(
+            com.bydcollector.collector.influx.InfluxDiagnosticEvent(
+                "influx_runtime_state",
+                mapOf(
+                    "running" to "false",
+                    "generation" to influxWorkGeneration.get().toString(),
+                    "queued" to "false",
+                    "inflight" to influxWorkInFlight.get().toString(),
+                    "frozen" to "false",
+                    "actual_route" to "none",
+                    "endpoints" to "none",
+                    "reason" to "service_destroyed"
+                )
+            )
+        )
         publishDashboardRuntimeFlags()
         mqttConnection.release()
         influxConnection.release()
@@ -1197,7 +1262,7 @@ class CollectorService : Service() {
         settings.setMqttEnabled(false)
         settings.setInfluxEnabled(false)
         cancelMqttRetry()
-        cancelInfluxRetry()
+        cancelInfluxRetry("maintenance")
         cancelTelegramTick()
         store.recordEvent(
             "user_shutdown_deferred_for_maintenance",
@@ -1217,7 +1282,7 @@ class CollectorService : Service() {
         stopDebug("user_shutdown")
         cancelMqttRetry()
         disconnectOfflineAsync()
-        cancelInfluxRetry()
+        cancelInfluxRetry("user_shutdown")
         cancelTelegramTick()
     }
 
@@ -1358,33 +1423,124 @@ class CollectorService : Service() {
     }
 
     private fun requestInfluxCycle() {
-        if (!settings.isInfluxEnabled() || maintenanceBlocksRuntimeStart()) return
+        if (!settings.isInfluxEnabled()) {
+            recordInfluxGate("disabled")
+            return
+        }
+        if (maintenanceBlocksRuntimeStart()) {
+            recordInfluxGate("maintenance")
+            return
+        }
+        if (!::influxCoordinator.isInitialized) {
+            recordInfluxGate("missing_coordinator")
+            return
+        }
         val submittedGeneration = synchronized(influxQueueLock) {
-            if (!influxRequestQueued.compareAndSet(false, true)) return
+            if (!influxRequestQueued.compareAndSet(false, true)) {
+                recordInfluxGate(
+                    "singleflight_occupied",
+                    influxDiagnosticStateDetails(influxWorkGeneration.get(), queued = true)
+                )
+                return
+            }
+            influxWorkQueuedAtElapsedMs = SystemClock.elapsedRealtime()
             influxWorkGeneration.get()
         }
+        recordInfluxDiagnostic(
+            com.bydcollector.collector.influx.InfluxDiagnosticEvent(
+                "influx_work_queued",
+                influxDiagnosticStateDetails(submittedGeneration, queued = true)
+            )
+        )
         val accepted = executeInflux("influx_cycle_error") {
             try {
                 influxCoordinator.runOneCycle(force = false)
             } finally {
-                synchronized(influxQueueLock) {
-                    if (submittedGeneration == influxWorkGeneration.get()) {
+                val isCurrentGeneration = synchronized(influxQueueLock) {
+                    val current = submittedGeneration == influxWorkGeneration.get()
+                    if (current) {
                         influxRequestQueued.set(false)
+                        influxWorkQueuedAtElapsedMs = null
                     }
+                    current
                 }
+                recordInfluxDiagnostic(
+                    com.bydcollector.collector.influx.InfluxDiagnosticEvent(
+                        "influx_work_settled",
+                        influxDiagnosticStateDetails(
+                            workGeneration = if (isCurrentGeneration && !influxRequestQueued.get()) {
+                                null
+                            } else {
+                                submittedGeneration
+                            },
+                            queued = if (isCurrentGeneration) false else influxRequestQueued.get()
+                        )
+                    )
+                )
                 postInfluxRetrySchedule(submittedGeneration)
             }
         }
-        if (!accepted) synchronized(influxQueueLock) {
-            if (submittedGeneration == influxWorkGeneration.get()) influxRequestQueued.set(false)
+        val rejectedForCurrentGeneration = if (!accepted) synchronized(influxQueueLock) {
+            val current = submittedGeneration == influxWorkGeneration.get()
+            if (current) {
+                influxRequestQueued.set(false)
+                influxWorkQueuedAtElapsedMs = null
+            }
+            current
+        } else {
+            false
+        }
+        if (!accepted) {
+            recordInfluxGate(
+                "queue_rejected",
+                influxDiagnosticStateDetails(
+                    workGeneration = if (rejectedForCurrentGeneration) null else submittedGeneration,
+                    queued = influxRequestQueued.get()
+                )
+            )
         }
     }
 
+    private fun influxDiagnosticStateDetails(workGeneration: Long?, queued: Boolean): Map<String, String> {
+        val coordinator = if (::influxCoordinator.isInitialized) influxCoordinator else null
+        return buildMap {
+            put("running", running.get().toString())
+            put("generation", influxWorkGeneration.get().toString())
+            put("queued", queued.toString())
+            put("inflight", influxWorkInFlight.get().toString())
+            put("queued_at_elapsed_ms", influxWorkQueuedAtElapsedMs?.toString() ?: "none")
+            put("work_generation", workGeneration?.toString() ?: "none")
+            put("frozen", (coordinator?.sessionFrozen ?: false).toString())
+            put("actual_route", coordinator?.activeRoute?.name ?: "none")
+            put("endpoints", coordinator?.frozenEndpoints ?: "none")
+        }
+    }
+
+    private fun recordInfluxDiagnostic(event: com.bydcollector.collector.influx.InfluxDiagnosticEvent) {
+        influxRuntimeDiagnostics.record(event.copy(details = event.details + ("runtime_id" to influxDiagnosticRuntimeId)))
+    }
+
+    private fun recordInfluxGate(reason: String, details: Map<String, String> = emptyMap()) {
+        influxRuntimeDiagnostics.gate(reason, details + ("runtime_id" to influxDiagnosticRuntimeId))
+    }
+
     private fun postInfluxRetrySchedule(submittedGeneration: Long) {
-        if (submittedGeneration != influxWorkGeneration.get()) return
+        if (submittedGeneration != influxWorkGeneration.get()) {
+            recordInfluxGate(
+                "stale_generation",
+                influxDiagnosticStateDetails(submittedGeneration, queued = influxRequestQueued.get())
+            )
+            return
+        }
         val delayMs = runCatching { influxCoordinator.retryDelayMs() }.getOrNull()
         mainHandler.post {
-            if (submittedGeneration != influxWorkGeneration.get()) return@post
+            if (submittedGeneration != influxWorkGeneration.get()) {
+                recordInfluxGate(
+                    "stale_generation",
+                    influxDiagnosticStateDetails(submittedGeneration, queued = influxRequestQueued.get())
+                )
+                return@post
+            }
             scheduleInfluxRetry(delayMs)
             stopIfNoActiveRuntime()
         }
@@ -1392,7 +1548,7 @@ class CollectorService : Service() {
 
     private fun scheduleInfluxRetry(delayMs: Long?) {
         if (delayMs == null || !running.get() || !settings.isInfluxEnabled() || maintenanceBlocksRuntimeStart()) {
-            cancelInfluxRetry()
+            cancelInfluxRetry("no_deadline_or_gate")
             return
         }
         val targetElapsedMs = SystemClock.elapsedRealtime() + delayMs
@@ -1400,13 +1556,38 @@ class CollectorService : Service() {
         if (influxRetryScheduled) mainHandler.removeCallbacks(influxRetryTask)
         influxRetryScheduled = true
         influxRetryAtElapsedMs = targetElapsedMs
+        recordInfluxDiagnostic(
+            com.bydcollector.collector.influx.InfluxDiagnosticEvent(
+                "influx_retry_scheduled",
+                mapOf(
+                    "retry_deadline_elapsed_ms" to targetElapsedMs.toString(),
+                    "delay_ms" to delayMs.toString(),
+                    "generation" to influxWorkGeneration.get().toString(),
+                    "reason" to "pending_or_backoff"
+                )
+            )
+        )
         mainHandler.postDelayed(influxRetryTask, delayMs)
     }
 
-    private fun cancelInfluxRetry() {
+    private fun cancelInfluxRetry(reason: String = "cancelled") {
+        val wasScheduled = influxRetryScheduled
         mainHandler.removeCallbacks(influxRetryTask)
         influxRetryScheduled = false
         influxRetryAtElapsedMs = null
+        if (wasScheduled) {
+            recordInfluxDiagnostic(
+                com.bydcollector.collector.influx.InfluxDiagnosticEvent(
+                    "influx_retry_cancelled",
+                    mapOf(
+                        "generation" to influxWorkGeneration.get().toString(),
+                        "reason" to reason,
+                        "retry_deadline_elapsed_ms" to "none",
+                        "retry_deadline" to "none"
+                    )
+                )
+            )
+        }
     }
 
     private fun stopDebug(reason: String) {
@@ -1754,7 +1935,7 @@ class CollectorService : Service() {
         }
 
         cancelMqttRetry()
-        cancelInfluxRetry()
+        cancelInfluxRetry("maintenance")
         cancelTelegramTick()
         if (mainRuntimeStatus != RuntimeActionStatus.STOPPED) setMainRuntime(RuntimeActionStatus.STOPPING)
         poller.stop()
@@ -2050,6 +2231,7 @@ class CollectorService : Service() {
 
     private fun stopInfluxExport(manualStop: Boolean = true) {
         if (manualStop && settings.isInfluxEnabled() && !settings.isInfluxManuallyStopped()) return
+        recordInfluxGate("stopped")
         influxConnection.beginStop()
         advanceInfluxGeneration()
         setInfluxRuntime(RuntimeActionStatus.STOPPING)
@@ -2505,7 +2687,18 @@ class CollectorService : Service() {
     }
 
     private fun settleInfluxWork() {
-        influxWorkInFlight.updateAndGet { count -> (count - 1).coerceAtLeast(0) }
+        val remaining = influxWorkInFlight.updateAndGet { count -> (count - 1).coerceAtLeast(0) }
+        val queued = influxRequestQueued.get()
+        if (remaining == 0 && !queued) influxWorkQueuedAtElapsedMs = null
+        recordInfluxDiagnostic(
+            com.bydcollector.collector.influx.InfluxDiagnosticEvent(
+                "influx_work_settled",
+                influxDiagnosticStateDetails(
+                    workGeneration = influxWorkGeneration.get().takeUnless { remaining == 0 && !queued },
+                    queued = queued
+                )
+            )
+        )
         mainHandler.post {
             if (influxWorkInFlight.get() == 0 && influxConnection.stopping && !settings.isInfluxEnabled()) {
                 // A queued Stop may have been superseded by maintenance; retain ownership but allow retry.
@@ -2519,6 +2712,7 @@ class CollectorService : Service() {
     private fun advanceInfluxGeneration(): Long {
         return synchronized(influxQueueLock) {
             influxRequestQueued.set(false)
+            influxWorkQueuedAtElapsedMs = null
             influxWorkGeneration.incrementAndGet()
         }
     }
@@ -2560,6 +2754,15 @@ class CollectorService : Service() {
         status: (T) -> ChannelActionStatus
     ): Boolean {
         if (!canExecute()) {
+            if (channelName == "Influx") {
+                val reason = when {
+                    maintenanceBlocksRuntimeStart() -> "maintenance"
+                    !settings.isInfluxEnabled() -> "disabled"
+                    influxConnection.stopping -> "stopped"
+                    else -> "runtime_gate"
+                }
+                recordInfluxGate(reason)
+            }
             onFailedAction?.invoke()
             onComplete?.invoke()
             onSettled?.invoke()
@@ -2572,7 +2775,31 @@ class CollectorService : Service() {
                 try {
                     if (lowPriority) Thread.currentThread().priority = Thread.MIN_PRIORITY
                     //drops stale work submitted before a channel executor reset
-                    if (submittedGeneration != generation.get() || !canExecute()) return@execute
+                    if (submittedGeneration != generation.get() || !canExecute()) {
+                        if (channelName == "Influx") {
+                            recordInfluxGate(
+                                "stale_generation",
+                                influxDiagnosticStateDetails(
+                                    submittedGeneration,
+                                    queued = influxRequestQueued.get()
+                                )
+                            )
+                        }
+                        return@execute
+                    }
+                    if (channelName == "Influx") {
+                        recordInfluxDiagnostic(
+                            com.bydcollector.collector.influx.InfluxDiagnosticEvent(
+                                "influx_work_started",
+                                influxDiagnosticStateDetails(submittedGeneration, queued = false) +
+                                    mapOf(
+                                        "age_ms" to (influxWorkQueuedAtElapsedMs?.let {
+                                            (SystemClock.elapsedRealtime() - it).coerceAtLeast(0L)
+                                        } ?: 0L).toString()
+                                    )
+                            )
+                        )
+                    }
                     try {
                         runCatching { action() }
                             .onSuccess { result ->
@@ -2611,6 +2838,15 @@ class CollectorService : Service() {
             }
             return true
         } catch (error: RejectedExecutionException) {
+            if (channelName == "Influx") {
+                recordInfluxGate(
+                    "queue_rejected",
+                    influxDiagnosticStateDetails(
+                        submittedGeneration,
+                        queued = influxRequestQueued.get()
+                    ) + mapOf("error_class" to error::class.java.simpleName)
+                )
+            }
             if (submittedGeneration == generation.get() && canExecute()) {
                 store.recordEvent(
                     errorCategory,
@@ -3161,8 +3397,9 @@ class CollectorService : Service() {
     private fun createInfluxCoordinator(): InfluxExportCoordinator {
         return InfluxExportCoordinator(
             store = store,
-            client = HttpInfluxClient(),
-            configProvider = { settings.influxConfig() }
+            client = HttpInfluxClient(::recordInfluxDiagnostic),
+            configProvider = { settings.influxConfig() },
+            diagnostics = ::recordInfluxDiagnostic
         )
     }
 
@@ -3301,6 +3538,7 @@ class CollectorService : Service() {
         internal val mqttConnection = HaConnectionOwnership()
         private val influxRuntimeStatusRef = AtomicReference(RuntimeActionStatus.STOPPED)
         internal val influxConnection = HaConnectionOwnership()
+        internal val influxRuntimeDiagnostics = InfluxRuntimeDiagnosticsProcess.instance
         private val maintenanceRunningInProcess = AtomicBoolean(false)
         private val archiveStorageActiveInProcess = AtomicBoolean(false)
         private val processMqttClientFacade = PahoMqttClientFacade()

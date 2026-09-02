@@ -192,6 +192,8 @@ class DiagnosticLogRecorderContractTest {
         assertTrue(share.contains("writeLogcatSnapshot"))
         assertTrue(share.contains("writeOperationalJournalSnapshot"))
         assertTrue(share.contains("writeKeepAliveLogSnapshot"))
+        assertTrue(share.contains("sanitizeDiagnosticSnapshot(snapshotDir)"))
+        assertTrue(share.indexOf("sanitizeDiagnosticSnapshot(snapshotDir)") < share.indexOf("writeLatestZip(it, snapshotDir)"))
         assertTrue(source.contains("private const val KEEP_ALIVE_LOG_TAIL_BYTES = 512 * 1024"))
         assertTrue(source.contains("tail -c \$KEEP_ALIVE_LOG_TAIL_BYTES"))
         assertTrue(source.contains("logcat_provenance.txt"))
@@ -217,7 +219,7 @@ class DiagnosticLogRecorderContractTest {
     }
 
     @Test
-    fun collectorEventSnapshotUsesTheApplicationDatabaseReadGate() {
+    fun collectorEventSnapshotUsesTheNonblockingApplicationDatabaseReadGate() {
         val source = projectFile(
             "app/src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt",
             "src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt"
@@ -226,7 +228,9 @@ class DiagnosticLogRecorderContractTest {
             .substringBefore("private fun writeLatestZip(")
 
         assertTrue(snapshot.contains("context.applicationContext as BydCollectorApplication"))
-        assertTrue(snapshot.indexOf("withDatabaseRead") < snapshot.indexOf("SQLiteDatabase.openDatabase"))
+        assertTrue(snapshot.contains("tryDatabaseRead"))
+        assertTrue(snapshot.indexOf("tryDatabaseRead") < snapshot.indexOf("SQLiteDatabase.openDatabase"))
+        assertTrue(snapshot.contains("collector_events_status=maintenance_busy"))
     }
 
     @Test
@@ -247,7 +251,12 @@ class DiagnosticLogRecorderContractTest {
         assertTrue(source.contains("tripsStoreOrNull"))
         assertFalse(source.contains("BydCollectorApplication.trips(app)"))
         assertTrue(source.contains("\"not_initialized\" -> \"not_initialized\""))
-        assertTrue(source.contains("tripsFileOperationLock.withLock"))
+        val tripWrapper = source.substringAfter("private fun writeTripsTelegramEvidence(")
+            .substringBefore("private fun writeTripsEvidenceUnavailable")
+        assertTrue(tripWrapper.contains("tryDatabaseRead"))
+        assertTrue(tripWrapper.contains("maintenance_busy"))
+        assertTrue(source.contains("tripsFileOperationLock.tryLock()"))
+        assertTrue(source.contains("tripsFileOperationLock.unlock()"))
         assertTrue(source.contains("trips.withLease"))
         assertFalse(source.contains("latitude"))
         assertFalse(source.contains("longitude"))
@@ -269,6 +278,41 @@ class DiagnosticLogRecorderContractTest {
         assertTrue(complete.size <= 128)
         assertTrue(String(complete, Charsets.UTF_8).endsWith("truncated=0\n"))
         assertContentEquals(complete, boundedDiagnosticUtf8(listOf("ok=так"), 128))
+    }
+
+    @Test
+    fun influxEvidenceReadsOnlyExistingTablesUnderNonblockingMaintenanceAccess() {
+        val source = projectFile(
+            "app/src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt",
+            "src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt"
+        ).readText()
+        val share = source.substringAfter("fun prepareShareBundle(context: Context)")
+            .substringBefore("fun clearCompleted(context: Context)")
+        val evidence = source.substringAfter("private fun writeInfluxEvidence(")
+            .substringBefore("private fun writeTripsTelegramEvidence(")
+
+        assertTrue(share.contains("writeInfluxEvidence"))
+        assertEquals(128 * 1024, DiagnosticLogRecorder.INFLUX_EVIDENCE_MAX_BYTES)
+        assertTrue(evidence.contains("getSharedPreferences(CollectorSettings.PREFS_NAME, Context.MODE_PRIVATE)"))
+        assertTrue(evidence.contains("CollectorSettings.KEY_INFLUX_ALTERNATIVE_HOST"))
+        assertFalse(evidence.contains("CollectorSettings(context)"))
+        assertFalse(evidence.contains("prefs.edit("))
+        assertFalse(evidence.contains("KEY_INFLUX_PASSWORD"))
+        assertFalse(evidence.contains("KEY_INFLUX_USERNAME"))
+        assertTrue(evidence.contains("InfluxRuntimeDiagnostics.snapshotLines()"))
+        assertTrue(evidence.contains("tryDatabaseRead"))
+        assertTrue(evidence.contains("SQLiteDatabase.OPEN_READONLY"))
+        assertTrue(evidence.contains("\"influx_export_state\""))
+        assertTrue(evidence.contains("\"influx_export_cursor\""))
+        assertTrue(evidence.contains("\"influx_export_events\""))
+        assertTrue(evidence.contains("\"id DESC\", 200"))
+        assertTrue(evidence.contains("maintenance_busy"))
+        assertTrue(evidence.contains("boundedDiagnosticUtf8(lines, INFLUX_EVIDENCE_MAX_BYTES)"))
+        assertFalse(evidence.contains("ensureInfluxCursors("))
+        assertFalse(evidence.contains("pendingInfluxSummary("))
+        assertFalse(evidence.contains("withTelemetryStoreRead("))
+        assertFalse(evidence.contains("writableDatabase"))
+        assertFalse(evidence.contains("registerNetworkCallback"))
     }
 
     private fun projectFile(vararg paths: String): File =

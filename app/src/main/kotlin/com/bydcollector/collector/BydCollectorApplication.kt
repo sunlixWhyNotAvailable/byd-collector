@@ -17,6 +17,7 @@ import com.bydcollector.collector.maintenance.StorageFormat
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.ui.ArchiveStorageSnapshotCache
 import com.bydcollector.collector.ui.DashboardUiStateStore
+import com.bydcollector.collector.ui.UiSessionState
 import com.bydcollector.collector.update.UpdateAutoCheckRuntime
 import java.io.File
 
@@ -34,6 +35,7 @@ class BydCollectorApplication : Application() {
     internal val tripsFileOperationLock = ReentrantLock(true)
     internal val operationalEventJournal by lazy { OperationalEventJournal(applicationContext) }
     val dashboardUiStateStore by lazy { DashboardUiStateStore() }
+    val navigationSession by lazy { UiSessionState() }
     private val archiveStorageSnapshotCacheDelegate = lazy {
         ArchiveStorageSnapshotCache(
             archiveRoot = File(filesDir, "db_archive"),
@@ -68,6 +70,8 @@ class BydCollectorApplication : Application() {
     }
 
     fun <T> withDatabaseRead(action: () -> T): T = databaseMaintenanceGate.withRead(action)
+
+    internal fun <T : Any> tryDatabaseRead(action: () -> T): T? = databaseMaintenanceGate.tryRead(action)
 
     fun <T> withTelemetryStoreRead(action: (TelemetryStore) -> T): T {
         while (true) {
@@ -142,6 +146,10 @@ class BydCollectorApplication : Application() {
 
         fun dashboardUiStateStore(context: Context): DashboardUiStateStore {
             return (context.applicationContext as BydCollectorApplication).dashboardUiStateStore
+        }
+
+        fun navigationSession(context: Context): UiSessionState {
+            return (context.applicationContext as BydCollectorApplication).navigationSession
         }
 
         fun trips(context: Context): TripStore {

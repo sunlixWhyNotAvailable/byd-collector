@@ -52,6 +52,21 @@ class CollectorServiceInfluxRetryContractTest {
         assertTrue(service.contains("onSettled = ::settleInfluxWork"))
         assertFalse(service.contains("AlarmManager"))
         assertFalse(service.contains("JobScheduler"))
+        assertTrue(influxPath.contains("\"singleflight_occupied\","))
+        assertTrue(service.contains("influxRuntimeDiagnostics.gate(reason, details + (\"runtime_id\" to influxDiagnosticRuntimeId))"))
+        assertTrue(service.contains("influx_retry_scheduled"))
+        assertTrue(service.contains("influx_retry_fired"))
+        assertTrue(service.contains("influx_retry_cancelled"))
+        assertTrue(service.contains("influxRuntimeDiagnostics.attachJournal(applicationContext)"))
+        assertTrue(service.contains("InfluxRuntimeDiagnosticsProcess.instance"))
+        val stateDetails = service.substringAfter("private fun influxDiagnosticStateDetails")
+            .substringBefore("private fun postInfluxRetrySchedule")
+        assertFalse(stateDetails.contains("settings.influxConfig()"))
+        assertTrue(stateDetails.contains("if (::influxCoordinator.isInitialized) influxCoordinator else null"))
+        assertTrue(stateDetails.contains("coordinator?.activeRoute?.name ?: \"none\""))
+        assertTrue(stateDetails.contains("coordinator?.frozenEndpoints ?: \"none\""))
+        assertTrue(influxPath.contains("influxDiagnosticStateDetails(influxWorkGeneration.get(), queued = true)"))
+        assertTrue(influxPath.contains("workGeneration = if (isCurrentGeneration && !influxRequestQueued.get())"))
     }
 
     private fun sourceFile(path: String): File {

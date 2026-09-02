@@ -8,8 +8,9 @@ object InfluxActions {
     fun testConnection(
         store: TelemetryStore,
         settings: CollectorSettings,
-        client: InfluxClient = HttpInfluxClient(),
-        profile: HaEndpointProfile = HaEndpointProfile.PRIMARY
+        client: InfluxClient? = null,
+        profile: HaEndpointProfile = HaEndpointProfile.PRIMARY,
+        diagnostics: InfluxDiagnosticSink = InfluxRuntimeDiagnosticsProcess.instance::record
     ): InfluxActionResult {
         val base = settings.influxConfig()
         base.validateProfile(profile)?.let {
@@ -22,18 +23,21 @@ object InfluxActions {
                 failureKind = InfluxFailureKind.PROTOCOL
             )
         }
-        return coordinator(store, settings, client).testConnection(selected)
+        return coordinator(store, settings, client ?: HttpInfluxClient(diagnostics), diagnostics)
+            .testConnection(selected, profile)
     }
 
     private fun coordinator(
         store: TelemetryStore,
         settings: CollectorSettings,
-        client: InfluxClient
+        client: InfluxClient,
+        diagnostics: InfluxDiagnosticSink = {}
     ): InfluxExportCoordinator {
         return InfluxExportCoordinator(
             store = store,
             client = client,
-            configProvider = { settings.influxConfig() }
+            configProvider = { settings.influxConfig() },
+            diagnostics = diagnostics
         )
     }
 }

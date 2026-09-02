@@ -7,6 +7,7 @@ import android.view.ViewGroup
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -41,11 +42,15 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.platform.LocalFocusManager
@@ -97,6 +102,7 @@ import com.bydcollector.collector.ui.DashboardState
 import com.bydcollector.collector.ui.DebugRuntimeStatus
 import com.bydcollector.collector.ui.RuntimeActionStatus
 import com.bydcollector.collector.ui.VehicleKpis
+import com.bydcollector.collector.ui.UiSessionState
 import com.bydcollector.collector.update.ReleaseNotesSelector
 import com.bydcollector.collector.update.UpdateInfo
 import com.bydcollector.collector.update.UpdateUiState
@@ -108,12 +114,16 @@ import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polyline
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.launch
 
 @Composable
 fun BydCollectorApp(
     state: DashboardState?,
     chromeState: DashboardState? = state,
     activeTab: AppTab,
+    navigationSession: UiSessionState,
+    tabContentReady: Boolean,
     language: UiLanguage,
     darkTheme: Boolean,
     mqttDraft: MqttDraft,
@@ -138,8 +148,8 @@ fun BydCollectorApp(
     BydCollectorTheme(darkTheme) {
         val p = LocalBydPalette.current
         var pendingArchiveDeleteIds by remember { mutableStateOf<List<String>>(emptyList()) }
-        var showClearLogsDialog by rememberSaveable { mutableStateOf(false) }
-        var showTripsCompressionConfirm by rememberSaveable { mutableStateOf(false) }
+        var showClearLogsDialog by remember { mutableStateOf(false) }
+        var showTripsCompressionConfirm by remember { mutableStateOf(false) }
         val tripsCompression by TripCompressionService.state.collectAsStateWithLifecycle()
         Box(
             modifier = Modifier
@@ -170,15 +180,17 @@ fun BydCollectorApp(
                                 .fillMaxWidth()
                                 .weight(1f)
                         ) {
-                            //keeps tabs mounted from one state snapshot so service/runtime facts stay consistent
+                            //mount only the active tab; navigation state lives in the process-owned session
                             when (activeTab) {
-                                AppTab.MAIN -> MainTab(state, s, actions, actionUiState)
-                                AppTab.ALL_PARAMETERS -> AllParametersTab(state, s, language, actions)
+                                AppTab.MAIN -> MainTab(state, s, actions, actionUiState, navigationSession, tabContentReady)
+                                AppTab.ALL_PARAMETERS -> AllParametersTab(state, s, language, actions, navigationSession, tabContentReady)
                                 AppTab.TRIPS -> TripsTab(
                                     tripsUiState,
                                     tripsUiActions.copy(onCompressDatabase = { showTripsCompressionConfirm = true }),
                                     s,
-                                    language
+                                    language,
+                                    navigationSession,
+                                    tripsUiState.databasePath.isNotBlank() || tripsUiState.years.isNotEmpty()
                                 )
                                  AppTab.HA -> HaTab(
                                      state,
@@ -186,12 +198,20 @@ fun BydCollectorApp(
                                      mqttDraft,
                                      influxDraft,
                                      actions,
-                                     actionUiState
+                                     actionUiState,
+                                     navigationSession,
+                                     tabContentReady
                                  )
-                                AppTab.TELEGRAM -> TelegramTab(s, telegramUiState, telegramActions)
-                                 AppTab.STORAGE -> StorageTab(state, s, actions, actionUiState) { ids ->
-                                    pendingArchiveDeleteIds = ids
-                                }
+                                AppTab.TELEGRAM -> TelegramTab(s, telegramUiState, telegramActions, navigationSession)
+                                 AppTab.STORAGE -> StorageTab(
+                                    state = state,
+                                    strings = s,
+                                    actions = actions,
+                                    actionUiState = actionUiState,
+                                    onRequestDelete = { ids -> pendingArchiveDeleteIds = ids },
+                                    session = navigationSession,
+                                    contentReady = tabContentReady
+                                )
                                 AppTab.EXTRA -> ExtraTab(
                                     state = state,
                                     strings = s,
@@ -199,6 +219,8 @@ fun BydCollectorApp(
                                     diagnosticsBusy = diagnosticsBusy,
                                     actions = actions,
                                     onRequestClearLogs = { showClearLogsDialog = true },
+                                    session = navigationSession,
+                                    contentReady = tabContentReady,
                                 )
                             }
                         }
@@ -515,9 +537,39 @@ private data class TelegramNumberSetting(
 )
 
 @Composable
-private fun TabScrollColumn(content: @Composable ColumnScope.() -> Unit) {
+private fun TabScrollColumn(
+    tab: AppTab,
+    session: UiSessionState,
+    contentReady: Boolean,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    val scrollState = remember(tab, session) { ScrollState(0) }
+    var laidOut by remember(tab, session) { mutableStateOf(false) }
+    val sessionGeneration = remember(tab, session) { session.captureGeneration() }
+    val currentContentReady by rememberUpdatedState(contentReady)
+    LaunchedEffect(tab, session) {
+        var captureEnabled = false
+        launch {
+            snapshotFlow { scrollState.value to currentContentReady }.collect { (offset, ready) ->
+                if (captureEnabled && ready) session.updateScrollOffset(tab, offset, sessionGeneration)
+            }
+        }
+        snapshotFlow { laidOut && currentContentReady }.collect { ready ->
+            if (!ready) {
+                captureEnabled = false
+                return@collect
+            }
+            withFrameNanos { }
+            scrollState.scrollTo(session.scrollOffset(tab).coerceAtMost(scrollState.maxValue))
+            session.updateScrollOffset(tab, scrollState.value, sessionGeneration)
+            captureEnabled = true
+        }
+    }
     Column(
-        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
+        modifier = Modifier
+            .fillMaxSize()
+            .onGloballyPositioned { if (!laidOut) laidOut = true }
+            .verticalScroll(scrollState),
         verticalArrangement = Arrangement.spacedBy(10.dp),
         content = content
     )
@@ -528,9 +580,11 @@ private fun MainTab(
     state: DashboardState?,
     strings: UiStrings,
     actions: BydCollectorActions,
-    actionUiState: BydCollectorActionUiState
+    actionUiState: BydCollectorActionUiState,
+    session: UiSessionState,
+    contentReady: Boolean
 ) {
-    TabScrollColumn {
+    TabScrollColumn(AppTab.MAIN, session, contentReady) {
         ScreenTitle(strings.mainTab, strings.mainSubtitle)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             MainCollectionCard(
@@ -653,9 +707,11 @@ private fun AllParametersTab(
     state: DashboardState?,
     strings: UiStrings,
     language: UiLanguage,
-    actions: BydCollectorActions
+    actions: BydCollectorActions,
+    session: UiSessionState,
+    contentReady: Boolean
 ) {
-    TabScrollColumn {
+    TabScrollColumn(AppTab.ALL_PARAMETERS, session, contentReady) {
         ScreenTitle(strings.allTab, strings.allSubtitle)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             SectionCard(
@@ -761,31 +817,35 @@ private fun TripsTab(
     state: TripsUiState,
     actions: TripsUiActions,
     strings: UiStrings,
-    language: UiLanguage
+    language: UiLanguage,
+    session: UiSessionState,
+    contentReady: Boolean
 ) {
     var selectedTripId by remember { mutableStateOf<String?>(null) }
-    var expandedYears by rememberSaveable { mutableStateOf<List<String>>(emptyList()) }
-    var expandedMonths by rememberSaveable { mutableStateOf<List<String>>(emptyList()) }
-    var expandedDays by rememberSaveable { mutableStateOf<List<String>>(emptyList()) }
-    var expansionInitialized by rememberSaveable { mutableStateOf(false) }
+    val sessionGeneration = remember(session) { session.captureGeneration() }
     val yearIds = state.years.map { it.id }
-    LaunchedEffect(yearIds) {
-        if (!expansionInitialized && state.years.isNotEmpty()) {
+    val monthIds = state.years.flatMap { it.months }.map { it.id }.toSet()
+    val dayIds = state.years.flatMap { year -> year.months.flatMap { it.days } }.map { it.id }.toSet()
+    LaunchedEffect(contentReady, yearIds, monthIds, dayIds) {
+        if (!contentReady) return@LaunchedEffect
+        if (!session.tripsExpansionInitialized && state.years.isNotEmpty()) {
             val year = state.years.first()
             val month = year.months.firstOrNull()
             val day = month?.days?.firstOrNull()
-            expandedYears = listOf(year.id)
-            expandedMonths = month?.let { listOf(it.id) }.orEmpty()
-            expandedDays = day?.let { listOf(it.id) }.orEmpty()
-            expansionInitialized = true
+            session.initializeTripsExpansion(year.id, month?.id, day?.id, sessionGeneration)
         }
+        session.reconcileTripsExpansion(yearIds.toSet(), monthIds, dayIds, sessionGeneration)
     }
     val selectedTrip = state.years.asSequence()
         .flatMap { it.months.asSequence() }
         .flatMap { it.days.asSequence() }
         .flatMap { it.trips.asSequence() }
         .firstOrNull { it.id == selectedTripId }
-    TabScrollColumn {
+    TabScrollColumn(
+        AppTab.TRIPS,
+        session,
+        contentReady && (state.years.isEmpty() || session.tripsExpansionInitialized)
+    ) {
         ScreenTitle(strings.tripsTab, strings.tripsSubtitle)
         SectionCard(title = strings.database, modifier = Modifier.fillMaxWidth()) {
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -841,28 +901,28 @@ private fun TripsTab(
                 Text(strings.noTrips, color = LocalBydPalette.current.muted, fontSize = 13.sp, modifier = Modifier.fillMaxWidth().padding(18.dp), textAlign = TextAlign.Center)
             } else {
                 state.years.forEach { year ->
-                    val yearExpanded = year.id in expandedYears
+                    val yearExpanded = year.id in session.expandedTripYears
                     TripGroupRow(
                         strings, language, year.title, year.distanceKm, year.energyKwh,
                         year.averageConsumptionKwhPer100Km, year.months.sumOf { it.days.sumOf { day -> day.trips.size } },
                         level = 0, expanded = yearExpanded,
-                        onClick = { expandedYears = toggleExpanded(expandedYears, year.id) }
+                        onClick = { session.setTripYearExpanded(year.id, !yearExpanded, sessionGeneration) }
                     )
                     if (yearExpanded) year.months.forEach { month ->
-                        val monthExpanded = month.id in expandedMonths
+                        val monthExpanded = month.id in session.expandedTripMonths
                         TripGroupRow(
                             strings, language, month.title, month.distanceKm, month.energyKwh,
                             month.averageConsumptionKwhPer100Km, month.days.sumOf { it.trips.size },
                             level = 1, expanded = monthExpanded,
-                            onClick = { expandedMonths = toggleExpanded(expandedMonths, month.id) }
+                            onClick = { session.setTripMonthExpanded(month.id, !monthExpanded, sessionGeneration) }
                         )
                         if (monthExpanded) month.days.forEach { day ->
-                            val dayExpanded = day.id in expandedDays
+                            val dayExpanded = day.id in session.expandedTripDays
                             TripGroupRow(
                                 strings, language, day.title, day.distanceKm, day.energyKwh,
                                 day.averageConsumptionKwhPer100Km, day.trips.size,
                                 level = 2, expanded = dayExpanded,
-                                onClick = { expandedDays = toggleExpanded(expandedDays, day.id) }
+                                onClick = { session.setTripDayExpanded(day.id, !dayExpanded, sessionGeneration) }
                             )
                             if (dayExpanded) {
                                 TripTableHeader(strings)
@@ -889,9 +949,6 @@ private fun TripsTab(
         )
     }
 }
-
-private fun toggleExpanded(ids: List<String>, id: String): List<String> =
-    if (id in ids) ids - id else ids + id
 
 @Composable
 private fun TripThresholdRow(
@@ -1302,9 +1359,11 @@ private fun HaTab(
     mqttDraft: MqttDraft,
     influxDraft: InfluxDraft,
     actions: BydCollectorActions,
-    actionUiState: BydCollectorActionUiState
+    actionUiState: BydCollectorActionUiState,
+    session: UiSessionState,
+    contentReady: Boolean
 ) {
-    TabScrollColumn {
+    TabScrollColumn(AppTab.HA, session, contentReady) {
         Row(Modifier.fillMaxWidth().height(36.dp), verticalAlignment = Alignment.CenterVertically) {
             ScreenTitle(strings.haTab, strings.haSubtitle, modifier = Modifier.weight(1f))
             Text(strings.sharedCategories, color = LocalBydPalette.current.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
@@ -1599,7 +1658,8 @@ private fun CredentialGridInflux(
 private fun TelegramTab(
     strings: UiStrings,
     uiState: TelegramUiState,
-    actions: TelegramUiActions
+    actions: TelegramUiActions,
+    session: UiSessionState
 ) {
     var config by remember(uiState.config) { mutableStateOf(uiState.config) }
     val updateConfig: (TelegramConfig) -> Unit = { next ->
@@ -1607,7 +1667,7 @@ private fun TelegramTab(
         actions.onConfigChanged(next)
     }
 
-    TabScrollColumn {
+    TabScrollColumn(AppTab.TELEGRAM, session, contentReady = true) {
         ScreenTitle(strings.telegram.tab, strings.telegram.subtitle)
         TelegramConnectionCard(
             strings = strings,
@@ -2092,9 +2152,11 @@ private fun ExtraTab(
     diagnosticsBusy: Boolean,
     actions: BydCollectorActions,
     onRequestClearLogs: () -> Unit,
+    session: UiSessionState,
+    contentReady: Boolean,
 ) {
     val optionsCardHeight = 312.dp
-    TabScrollColumn {
+    TabScrollColumn(AppTab.EXTRA, session, contentReady) {
         ScreenTitle(strings.extraTab, strings.extraSubtitle)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             SectionCard(strings.keepAlive, Modifier.weight(1f).height(optionsCardHeight)) {
@@ -2296,7 +2358,8 @@ private fun ArchiveShareIconButton(
     loading: Boolean = false,
     contentDescription: String,
     label: String,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
     val p = LocalBydPalette.current
     val interactionSource = remember { MutableInteractionSource() }
@@ -2309,7 +2372,7 @@ private fun ArchiveShareIconButton(
         else -> p.accent.copy(alpha = 0.12f)
     }
     Box(
-        modifier = Modifier
+        modifier = modifier
             .height(42.dp)
             .widthIn(min = 112.dp)
             .padding(horizontal = 10.dp)
@@ -2750,7 +2813,9 @@ private fun StorageTab(
     strings: UiStrings,
     actions: BydCollectorActions,
     actionUiState: BydCollectorActionUiState,
-    onRequestDelete: (List<String>) -> Unit
+    onRequestDelete: (List<String>) -> Unit,
+    session: UiSessionState,
+    contentReady: Boolean
 ) {
     val snapshot = state?.archiveStorageSnapshot
     val entries = snapshot?.entries.orEmpty()
@@ -2776,7 +2841,7 @@ private fun StorageTab(
         !CollectorService.isArchiveStorageActive()
     val topCardHeight = 156.dp
 
-    TabScrollColumn {
+    TabScrollColumn(AppTab.STORAGE, session, contentReady) {
         ScreenTitle(strings.storageTab, strings.storageSubtitle)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 SectionCard(strings.activeDatabase, modifier = Modifier.weight(0.6f).height(topCardHeight)) {
@@ -2869,13 +2934,14 @@ private fun StorageTab(
                 }
             ) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    ReadOnlyPathField(snapshot?.archiveRootPath ?: "-", modifier = Modifier.weight(1f))
+                    ReadOnlyPathField(snapshot?.archiveRootPath ?: "-", modifier = Modifier.weight(0.6f))
                     ArchiveShareIconButton(
                         enabled = shareEnabled && !actionUiState.archiveShare,
                         loading = actionUiState.archiveShare,
                         contentDescription = strings.shareSelectedArchives,
                         label = strings.shareArchives,
-                        onClick = { actions.onShareArchives(selectedArchiveIds) }
+                        onClick = { actions.onShareArchives(selectedArchiveIds) },
+                        modifier = Modifier.weight(0.4f)
                     )
                     val sortLabel = if (newestFirst) strings.archiveSortNewestFirst else strings.archiveSortOldestFirst
                     ActionButton(sortLabel, { newestFirst = !newestFirst }, modifier = Modifier.width(180.dp))

@@ -54,6 +54,7 @@ import com.bydcollector.collector.ui.DashboardLoadProfile
 import com.bydcollector.collector.ui.DashboardRowCounts
 import com.bydcollector.collector.ui.DashboardStateProvider
 import com.bydcollector.collector.ui.DashboardUiStateStore
+import com.bydcollector.collector.ui.UiSessionState
 import com.bydcollector.collector.ui.VehicleKpiLanguage
 import com.bydcollector.collector.ui.compose.AppTab
 import com.bydcollector.collector.ui.compose.BydCollectorActions
@@ -114,7 +115,11 @@ class MainActivity : ComponentActivity() {
     @Volatile private var destroyed = false
     private val archiveShareInFlight = AtomicBoolean(false)
 
-    private var activeTab by mutableStateOf(AppTab.MAIN)
+    private val navigationSession: UiSessionState
+        get() = BydCollectorApplication.navigationSession(applicationContext)
+    private var navigationSessionGeneration = 0L
+    private val activeTab: AppTab
+        get() = navigationSession.selectedTab
     private var uiLanguage by mutableStateOf(UiLanguage.UK)
     private var darkTheme by mutableStateOf(true)
     private var mqttDraft by mutableStateOf(MqttDraft())
@@ -192,7 +197,8 @@ class MainActivity : ComponentActivity() {
     //maps every ui command to persisted settings plus service intents so process restarts keep the same intent
     private val uiActions = object : BydCollectorActions {
         override fun onTabSelected(tab: AppTab) {
-            activeTab = tab
+            if (!navigationSession.isGenerationCurrent(navigationSessionGeneration)) return
+            navigationSession.selectTab(tab)
             if (tab == AppTab.TELEGRAM) syncTelegramUiRuntimeState()
             if (tab == AppTab.TRIPS) loadTripsUi()
             refresh()
@@ -579,6 +585,7 @@ class MainActivity : ComponentActivity() {
             refreshStoreBackedState()
             settings.setUserShutdownRequested(true)
             CollectorAutoStart.cancelScheduled(applicationContext)
+            navigationSession.clear()
             CollectorServiceController.shutdown(this@MainActivity)
             finishAndRemoveTask()
         }
@@ -602,6 +609,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        CollectorService.influxRuntimeDiagnostics.attachJournal(applicationContext)
+        navigationSessionGeneration = navigationSession.captureGeneration()
         settings = CollectorSettings(applicationContext)
         uiLanguage = UiLanguage.fromCode(settings.uiLanguageCode())
         settingsPreferences = getSharedPreferences(CollectorSettings.PREFS_NAME, MODE_PRIVATE)
@@ -651,10 +660,16 @@ class MainActivity : ComponentActivity() {
             val tabSnapshot by dashboardUiStateStore.tabState(activeTab).collectAsStateWithLifecycle()
             val renderedChrome = chromeSnapshot?.state
             val renderedTab = tabSnapshot?.state ?: renderedChrome
+            // Cached content stays real during refresh; only an empty pending archive scan is a placeholder.
+            val tabContentReady = renderedTab != null &&
+                (activeTab != AppTab.STORAGE || !renderedTab.archiveStorageScanPending ||
+                    renderedTab.archiveStorageSnapshot.entries.isNotEmpty())
             BydCollectorApp(
                 state = renderedTab,
                 chromeState = renderedChrome,
                 activeTab = activeTab,
+                navigationSession = navigationSession,
+                tabContentReady = tabContentReady,
                 language = uiLanguage,
                 darkTheme = darkTheme,
                 mqttDraft = mqttDraft,
@@ -702,6 +717,7 @@ class MainActivity : ComponentActivity() {
         scheduleDashboardCountBootstrap(force = false)
         reconcileCutoverArchiveStorageIfNeeded()
         syncTelegramUiRuntimeState()
+        if (activeTab == AppTab.TRIPS) loadTripsUi()
         refresh()
         maybeContinueStartupAccessFlow()
         runPendingStartupUpdateCheckIfReady()
@@ -1041,9 +1057,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun loadTripsUi(routeTripId: String? = null) {
-        if (destroyed) return
+        if (destroyed || !navigationSession.isGenerationCurrent(navigationSessionGeneration)) return
         val requestedLanguage = uiLanguage
         val requestGeneration = ++tripsRequestGeneration
+        val sessionGeneration = navigationSession.captureGeneration()
         tripsUiState = tripsUiState.copy(routeLoadingId = routeTripId)
         runCatching { dashboardExecutor.execute {
             val result = runCatching {
@@ -1063,7 +1080,11 @@ class MainActivity : ComponentActivity() {
                 )
             }
             runOnUiThread {
-                if (destroyed || uiLanguage != requestedLanguage || requestGeneration != tripsRequestGeneration) return@runOnUiThread
+                if (destroyed ||
+                    uiLanguage != requestedLanguage ||
+                    requestGeneration != tripsRequestGeneration ||
+                    !navigationSession.isGenerationCurrent(sessionGeneration)
+                ) return@runOnUiThread
                 result.onSuccess { (years, path, size) ->
                     tripsUiState = tripsUiState.copy(
                         years = years, routeLoadingId = null,
@@ -1075,7 +1096,10 @@ class MainActivity : ComponentActivity() {
                 }
             }
         } }.onFailure { error ->
-            if (!destroyed && requestGeneration == tripsRequestGeneration) {
+            if (!destroyed &&
+                requestGeneration == tripsRequestGeneration &&
+                navigationSession.isGenerationCurrent(sessionGeneration)
+            ) {
                 tripsUiState = tripsUiState.copy(routeLoadingId = null)
                 recordDashboardRefreshFailure("trips", error)
             }

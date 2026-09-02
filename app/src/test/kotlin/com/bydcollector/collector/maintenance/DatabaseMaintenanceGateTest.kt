@@ -9,8 +9,38 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlin.test.assertNull
+import kotlin.test.assertFailsWith
 
 class DatabaseMaintenanceGateTest {
+    @Test
+    fun diagnosticReadSkipsBusyMaintenanceAndDoesNotHoldALeaseAfterFailure() {
+        val gate = DatabaseMaintenanceGate()
+        val executor = Executors.newSingleThreadExecutor()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        try {
+            val maintenance = executor.submit {
+                gate.withExclusive {
+                    entered.countDown()
+                    check(release.await(2, TimeUnit.SECONDS))
+                }
+            }
+            assertTrue(entered.await(1, TimeUnit.SECONDS))
+            assertNull(gate.tryRead { error("Busy diagnostics must not open the database") })
+            release.countDown()
+            maintenance.get(1, TimeUnit.SECONDS)
+            assertEquals("ready", gate.tryRead { "ready" })
+            assertFailsWith<IllegalStateException> { gate.tryRead { error("read failed") } }
+            assertEquals("maintenance", executor.submit<String> {
+                gate.withExclusive { "maintenance" }
+            }.get(1, TimeUnit.SECONDS))
+        } finally {
+            release.countDown()
+            executor.shutdownNow()
+        }
+    }
+
     @Test
     fun queuedMainAndDebugReadersOpenOnlyAfterExclusiveMaintenanceCompletes() {
         val gate = DatabaseMaintenanceGate()

@@ -83,6 +83,59 @@ class InfluxExportCoordinatorTest {
     }
 
     @Test
+    fun cursorPersistenceBreadcrumbsAreBatchScopedAcrossFields() {
+        val store = FakeInfluxStore(
+            rows = listOf(
+                row(id = 10, fieldKey = "soc"),
+                row(id = 11, fieldKey = "remaining_range_km")
+            )
+        )
+        val events = mutableListOf<InfluxDiagnosticEvent>()
+        val coordinator = InfluxExportCoordinator(
+            store = store,
+            client = FakeInfluxClient(),
+            configProvider = { config() },
+            clock = FakeClock(),
+            diagnostics = { events += it }
+        )
+
+        assertTrue(coordinator.runOneCycle(force = true).ok)
+        assertEquals(1, events.count { it.type == "influx_cursor_persistence_start" })
+        assertEquals(1, events.count { it.type == "influx_cursor_persistence_end" })
+        assertEquals("2", events.single { it.type == "influx_cursor_persistence_start" }.details["cursor_fields"])
+        assertEquals("2", events.single { it.type == "influx_cursor_persistence_end" }.details["completed_fields"])
+    }
+
+    @Test
+    fun cursorPersistenceFailureRecordsFailedFieldWithoutBatchSuccess() {
+        val store = FakeInfluxStore(
+            rows = listOf(
+                row(id = 10, fieldKey = "soc"),
+                row(id = 11, fieldKey = "remaining_range_km")
+            ),
+            cursorFailureField = "remaining_range_km"
+        )
+        val events = mutableListOf<InfluxDiagnosticEvent>()
+        val coordinator = InfluxExportCoordinator(
+            store = store,
+            client = FakeInfluxClient(),
+            configProvider = { config() },
+            clock = FakeClock(),
+            diagnostics = { events += it }
+        )
+
+        assertFalse(coordinator.runOneCycle(force = true).ok)
+        assertEquals(1, events.count { it.type == "influx_server_ack" })
+        assertEquals(1, events.count { it.type == "influx_cursor_persistence_start" })
+        assertEquals(0, events.count { it.type == "influx_cursor_persistence_end" })
+        val failure = events.single { it.type == "influx_cursor_persistence_failure" }
+        assertEquals("remaining_range_km", failure.details["failed_field"])
+        assertEquals("1", failure.details["completed_fields"])
+        assertEquals(10, store.cursor("soc").lastExportedHistoryId)
+        assertEquals(0, store.cursor("remaining_range_km").lastExportedHistoryId)
+    }
+
+    @Test
     fun semanticCutoverFiltersRetiredChargingAndExportsUnitlessRawSensors() {
         val store = FakeInfluxStore(
             rows = listOf(
@@ -625,6 +678,25 @@ class InfluxExportCoordinatorTest {
         assertTrue(coordinator.resumeExport().ok)
     }
 
+    @Test
+    fun serverAckIsRecordedBeforeDurableCursorPersistence() {
+        val store = FakeInfluxStore(rows = listOf(row(id = 10, fieldKey = "soc")))
+        val events = mutableListOf<InfluxDiagnosticEvent>()
+        val coordinator = InfluxExportCoordinator(
+            store = store,
+            client = FakeInfluxClient(),
+            configProvider = { config() },
+            clock = FakeClock(),
+            diagnostics = { events += it }
+        )
+
+        assertTrue(coordinator.runOneCycle(force = true).ok)
+        val ack = events.indexOfFirst { it.type == "influx_server_ack" }
+        val cursorStart = events.indexOfFirst { it.type == "influx_cursor_persistence_start" }
+        assertTrue(ack >= 0)
+        assertTrue(cursorStart > ack)
+    }
+
     private fun coordinator(
         store: FakeInfluxStore,
         client: InfluxClient,
@@ -712,7 +784,8 @@ class InfluxExportCoordinatorTest {
     }
 
     private class FakeInfluxStore(
-        rows: List<InfluxPendingHistoryRow>
+        rows: List<InfluxPendingHistoryRow>,
+        private val cursorFailureField: String? = null
     ) : InfluxExportStore {
         private val rows = rows.toMutableList()
         val cursors = linkedMapOf<String, InfluxCursor>()
@@ -757,6 +830,7 @@ class InfluxExportCoordinatorTest {
         }
 
         override fun updateInfluxCursorSuccess(fieldKey: String, historyId: Long, exportedAt: String) {
+            if (fieldKey == cursorFailureField) throw IllegalStateException("cursor persistence failed")
             cursors[fieldKey] = InfluxCursor(fieldKey, historyId)
         }
 

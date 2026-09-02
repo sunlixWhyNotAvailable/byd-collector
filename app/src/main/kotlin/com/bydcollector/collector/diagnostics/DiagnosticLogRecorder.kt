@@ -2,6 +2,8 @@ package com.bydcollector.collector.diagnostics
 
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.BuildConfig
 import com.bydcollector.collector.adb.AdbLocalClient
@@ -11,12 +13,17 @@ import com.bydcollector.collector.data.local.TelegramDiagnosticSnapshot
 import com.bydcollector.collector.data.trips.TripRouteDiagnosticEvidence
 import com.bydcollector.collector.data.trips.TripSession
 import com.bydcollector.collector.maintenance.ArchiveShareLeaseRegistry
+import com.bydcollector.collector.ha.HaIntegrationCategories
+import com.bydcollector.collector.influx.InfluxConfig
+import com.bydcollector.collector.influx.InfluxRuntimeDiagnostics
+import com.bydcollector.collector.influx.safeInfluxDiagnosticHost
+import com.bydcollector.collector.service.CollectorSettings
+import org.json.JSONObject
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import kotlin.concurrent.withLock
 
 internal data class DiagnosticTripSelection(
     val selection: String,
@@ -46,6 +53,8 @@ object DiagnosticLogRecorder {
     private const val DIAGNOSTIC_SHARES_DIR = "diagnostic_shares"
     private const val LATEST_ZIP_NAME = "bydcollector_diagnostics_latest.zip"
     private const val EVENTS_SNAPSHOT_NAME = "collector_events_snapshot.txt"
+    internal const val INFLUX_EVIDENCE_NAME = "influx_evidence.txt"
+    internal const val INFLUX_EVIDENCE_MAX_BYTES = 128 * 1024
     private const val TRIPS_TELEGRAM_EVIDENCE_NAME = "trips_telegram_evidence.txt"
     internal const val TRIPS_TELEGRAM_EVIDENCE_MAX_BYTES = 64 * 1024
     private const val TELEGRAM_EVIDENCE_ROW_LIMIT = 64
@@ -173,6 +182,7 @@ object DiagnosticLogRecorder {
                 val databaseStatus = writeCollectorEventsSnapshot(appContext, snapshotDir)
                 val helperStatus = writeKeepAliveLogSnapshot(appContext, snapshotDir)
                 val tripsTelegramStatus = writeTripsTelegramEvidence(appContext, snapshotDir)
+                val influxStatus = writeInfluxEvidence(appContext, snapshotDir)
                 File(snapshotDir, "diagnostic_info.txt").writeText(
                     buildString {
                         appendLine("captured_at=${timestampIso()}")
@@ -184,9 +194,11 @@ object DiagnosticLogRecorder {
                         appendLine("collector_events=$databaseStatus")
                         appendLine("keep_alive_log=$helperStatus")
                         appendLine("trips_telegram_evidence=$tripsTelegramStatus")
+                        appendLine("influx_evidence=$influxStatus")
                     },
                     Charsets.UTF_8
                 )
+                sanitizeDiagnosticSnapshot(snapshotDir)
                 val latestZip = latestZip(appContext).also { writeLatestZip(it, snapshotDir) }
                 val handedOff = createDiagnosticShareCopy(latestZip, shareRoot, captureStamp)
                 pruneExpiredDiagnosticShareFiles(
@@ -386,11 +398,11 @@ object DiagnosticLogRecorder {
     private fun writeCollectorEventsSnapshot(context: Context, runDir: File): String {
         val output = File(runDir, EVENTS_SNAPSHOT_NAME)
         return runCatching {
-            (context.applicationContext as BydCollectorApplication).withDatabaseRead {
+            (context.applicationContext as BydCollectorApplication).tryDatabaseRead {
                 val dbFile = context.getDatabasePath(TelemetryDatabaseHelper.DATABASE_NAME)
                 if (!dbFile.exists()) {
                     output.writeText("collector_events_snapshot: database missing at ${dbFile.absolutePath}\n", Charsets.UTF_8)
-                    return@withDatabaseRead "missing"
+                    return@tryDatabaseRead "missing"
                 }
                 //opens sqlite read-only so diagnostics cannot mutate live telemetry while copying recent events
                 SQLiteDatabase.openDatabase(
@@ -425,6 +437,8 @@ object DiagnosticLogRecorder {
                         "ok"
                     }
                 }
+            } ?: "maintenance_busy".also {
+                output.writeText("collector_events_status=maintenance_busy\n", Charsets.UTF_8)
             }
         }.getOrElse { error ->
             output.writeText(
@@ -435,7 +449,146 @@ object DiagnosticLogRecorder {
         }
     }
 
+    private fun writeInfluxEvidence(context: Context, runDir: File): String {
+        val lines = mutableListOf(
+            "schema_version=1", "captured_at=${timestampIso()}",
+            "limit_bytes=$INFLUX_EVIDENCE_MAX_BYTES export_event_limit=200 cursor_limit=512"
+        )
+        var partial = false
+        runCatching {
+            // Read only the named nonsecret preferences; constructing settings can run migrations.
+            val prefs = context.getSharedPreferences(CollectorSettings.PREFS_NAME, Context.MODE_PRIVATE)
+            listOf(
+                "configured_enabled" to CollectorSettings.KEY_INFLUX_ENABLED,
+                "configured_autostart" to CollectorSettings.KEY_INFLUX_AUTO_START,
+                "configured_manual_stop" to CollectorSettings.KEY_INFLUX_MANUAL_STOP,
+                "user_shutdown" to CollectorSettings.KEY_USER_SHUTDOWN
+            ).forEach { (label, key) -> lines += "$label=${prefs.getBoolean(key, false)}" }
+            val primaryHost = prefs.getString(CollectorSettings.KEY_INFLUX_HOST, "").orEmpty()
+            val alternativeHost = prefs.getString(CollectorSettings.KEY_INFLUX_ALTERNATIVE_HOST, "").orEmpty()
+            lines += "configured_primary_host=${safeInfluxDiagnosticHost(primaryHost)}"
+            lines += "configured_primary_port=${prefs.getInt(CollectorSettings.KEY_INFLUX_PORT, InfluxConfig.DEFAULT_PORT)}"
+            lines += "configured_alternative_host=${safeInfluxDiagnosticHost(alternativeHost)}"
+            val alternativePort = if (prefs.contains(CollectorSettings.KEY_INFLUX_ALTERNATIVE_PORT)) {
+                prefs.getInt(CollectorSettings.KEY_INFLUX_ALTERNATIVE_PORT, 0).toString()
+            } else "none"
+            lines += "configured_alternative_port=$alternativePort"
+            val sharedCategories = prefs.getBoolean(CollectorSettings.KEY_HA_SHARED_CATEGORIES, true)
+            val categoryKey = if (sharedCategories) CollectorSettings.KEY_MQTT_CATEGORIES else CollectorSettings.KEY_INFLUX_CATEGORIES
+            val categories = prefs.getStringSet(categoryKey, HaIntegrationCategories.defaults) ?: HaIntegrationCategories.defaults
+            lines += "configured_shared_categories=$sharedCategories"
+            lines += "configured_categories=${categories.sorted().joinToString(",")}"
+        }.onFailure {
+            partial = true
+            lines += "configured_status=unavailable error=${it::class.java.simpleName}"
+        }
+        runCatching { lines += InfluxRuntimeDiagnostics.snapshotLines() }
+        .onFailure {
+            partial = true
+            lines += "runtime_status=unavailable error=${it::class.java.simpleName}"
+        }
+        runCatching {
+            val manager = context.getSystemService(ConnectivityManager::class.java)
+            val network = manager?.activeNetwork
+            val caps = network?.let { manager?.getNetworkCapabilities(it) }
+            lines += "network_active=${network != null}"
+            lines += "network_capabilities_available=${caps != null}"
+            if (caps != null) {
+                lines += "network_validated=${caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)}"
+                lines += "network_internet=${caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)}"
+                lines += "network_vpn=${caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)}"
+                lines += "network_wifi=${caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)}"
+                lines += "network_cellular=${caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)}"
+                lines += "network_ethernet=${caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)}"
+            }
+        }.onFailure {
+            partial = true
+            lines += "network_status=unavailable error=${it::class.java.simpleName}"
+        }
+        val databaseStatus = runCatching {
+            (context.applicationContext as BydCollectorApplication).tryDatabaseRead {
+                val file = context.getDatabasePath(TelemetryDatabaseHelper.DATABASE_NAME)
+                if (!file.isFile) return@tryDatabaseRead "missing"
+                SQLiteDatabase.openDatabase(file.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { db ->
+                    val results = listOf(
+                        appendInfluxTable(db, lines, "influx_export_state",
+                            "id, status, mode, pending_rows, oldest_pending_at, next_retry_at, last_success_at, last_error_at, last_error, exported_rows_total, updated_at", "id", 1),
+                        appendInfluxTable(db, lines, "influx_export_cursor",
+                            "field_key, last_exported_history_id, last_success_at, last_error_at, last_error", "field_key", 512),
+                        appendInfluxTable(db, lines, "influx_export_events",
+                            "id, ts, event_type, message, batch_count, from_history_id, to_history_id", "id DESC", 200)
+                    )
+                    if (results.all { it }) "ok" else "partial"
+                }
+            } ?: "maintenance_busy"
+        }.getOrElse {
+            lines += "database_error=${it::class.java.simpleName}"
+            "unavailable"
+        }
+        partial = partial || databaseStatus != "ok"
+        // Keep availability ahead of possibly truncated rows.
+        lines.add(2, "database_status=$databaseStatus")
+        lines.add(3, "snapshot_status=${if (partial) "partial" else "ok"}")
+        val output = File(runDir, INFLUX_EVIDENCE_NAME)
+        return runCatching {
+            output.writeBytes(boundedDiagnosticUtf8(lines, INFLUX_EVIDENCE_MAX_BYTES))
+            "${if (partial) "partial" else "ok"} bytes=${output.length()}"
+        }.getOrElse { "unavailable error=${it::class.java.simpleName}" }
+    }
+
+    private fun appendInfluxTable(
+        db: SQLiteDatabase,
+        lines: MutableList<String>,
+        table: String,
+        columns: String,
+        order: String,
+        limit: Int
+    ): Boolean = runCatching {
+        // All names/order/limits above are fixed; no telemetry rows or cursor-creation helpers are read.
+        db.rawQuery("SELECT $columns FROM $table ORDER BY $order LIMIT ${limit + 1}", emptyArray()).use { cursor ->
+            var count = 0
+            var rowsTruncated = false
+            while (cursor.moveToNext()) {
+                if (count == limit) {
+                    rowsTruncated = true
+                    break
+                }
+                val row = JSONObject()
+                var textTruncated = false
+                cursor.columnNames.forEachIndexed { index, name ->
+                    val value = if (cursor.isNull(index)) null else cursor.getString(index)
+                    if (value != null && value.length > 4_096) textTruncated = true
+                    row.put(name, value?.take(4_096) ?: JSONObject.NULL)
+                }
+                if (textTruncated) row.put("diagnostic_text_truncated", true)
+                lines += "$table=$row"
+                count += 1
+            }
+            lines += "${table}_rows=$count rows_truncated=$rowsTruncated"
+        }
+        true
+    }.getOrElse {
+        lines += "${table}_status=unavailable error=${it::class.java.simpleName}"
+        false
+    }
+
     private fun writeTripsTelegramEvidence(context: Context, runDir: File): String {
+        return runCatching {
+            (context.applicationContext as BydCollectorApplication).tryDatabaseRead {
+                writeTripsTelegramEvidenceUnderReadGate(context, runDir)
+            } ?: writeTripsEvidenceUnavailable(runDir, "maintenance_busy")
+        }.getOrElse { writeTripsEvidenceUnavailable(runDir, "read_unavailable") }
+    }
+
+    private fun writeTripsEvidenceUnavailable(runDir: File, reason: String): String {
+        File(runDir, TRIPS_TELEGRAM_EVIDENCE_NAME).writeText(
+            "schema_version=1\ntrips_status=$reason\ntelegram_status=$reason\ntruncated=0\n",
+            Charsets.UTF_8
+        )
+        return "partial $reason"
+    }
+
+    private fun writeTripsTelegramEvidenceUnderReadGate(context: Context, runDir: File): String {
         val output = File(runDir, TRIPS_TELEGRAM_EVIDENCE_NAME)
         val lines = mutableListOf<String>(
             "schema_version=1",
@@ -480,7 +633,10 @@ object DiagnosticLogRecorder {
                 tripSelection = "missing"
                 if (pendingTripId != null) tripCorrelation = "unavailable"
             } else runCatching {
-                app.tripsFileOperationLock.withLock {
+                if (!app.tripsFileOperationLock.tryLock()) {
+                    tripSelection = "maintenance_busy"
+                    if (pendingTripId != null) tripCorrelation = "unavailable"
+                } else try {
                     trips.withLease {
                         val selection = selectDiagnosticTrip(
                             pendingTripId = pendingTripId,
@@ -499,7 +655,7 @@ object DiagnosticLogRecorder {
                             route = trips.diagnosticRouteEvidence(session.tripId)
                         }
                     }
-                }
+                } finally { app.tripsFileOperationLock.unlock() }
             }.onFailure {
                 tripSelection = "error"
                 if (pendingTripId != null) tripCorrelation = "error"
@@ -510,6 +666,7 @@ object DiagnosticLogRecorder {
         lines += "trips_status=${when (tripSelection) {
             "not_initialized" -> "not_initialized"
             "missing" -> "missing"
+            "maintenance_busy" -> "maintenance_busy"
             "pending_unlinked" -> "not_queried"
             "error" -> "error"
             else -> "ok"

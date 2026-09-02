@@ -41,6 +41,20 @@ class MainActivityInitialDashboardStateContractTest {
         assertFalse(bootstrap.contains("BydCollectorApplication.ensureDebugStorageReady(applicationContext)"))
     }
 
+    @Test
+    fun restoredTripsTabReloadsItsActivityLocalDataOnResume() {
+        val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val resume = activity.substringAfter("override fun onResume()")
+            .substringBefore("override fun onWindowFocusChanged")
+
+        assertTrue(resume.contains("if (activeTab == AppTab.TRIPS) loadTripsUi()"))
+        val readiness = activity.substringAfter("val tabContentReady =")
+            .substringBefore("BydCollectorApp(")
+        assertFalse(readiness.contains("inFlight"))
+        assertTrue(readiness.contains("archiveStorageScanPending"))
+        assertTrue(readiness.contains("archiveStorageSnapshot.entries.isNotEmpty()"))
+    }
+
     private fun sourceFile(path: String): File {
         return listOf(
             File("src/main/kotlin/$path"),
