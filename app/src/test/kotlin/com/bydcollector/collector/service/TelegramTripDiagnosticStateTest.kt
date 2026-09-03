@@ -210,9 +210,13 @@ class TelegramTripDiagnosticStateTest {
         restarted.onSuccessfulPoll(snapshot("D", 102.0, 49.0, 0.0), tripConfig, 22_500L)
         val newLegId = restarted.state.tripId
         assertTrue(newLegId != null && newLegId != oldLegId)
-        assertNull(restarted.state.pendingPowerOffLocationTripId)
-        assertNull(restarted.state.pendingPowerOffLocationPowerSessionId)
+        assertEquals(oldLegId, restarted.state.pendingPowerOffLocationTripId)
+        assertEquals("power", restarted.state.pendingPowerOffLocationPowerSessionId)
         assertNull(restarted.bindTripPowerSession(oldLegId, "late-parent"))
+
+        val powerOff = restarted.onPowerOffConfirmed(tripConfig, nowMs = 23_000L)
+        assertNull(powerOff.state.pendingPowerOffLocationTripId)
+        assertNull(powerOff.state.pendingPowerOffLocationPowerSessionId)
 
         restarted.reset()
         assertNull(restarted.bindTripPowerSession(newLegId!!, "late-parent"))

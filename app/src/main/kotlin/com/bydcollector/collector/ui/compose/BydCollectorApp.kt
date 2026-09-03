@@ -42,15 +42,12 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.platform.LocalFocusManager
@@ -115,7 +112,6 @@ import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polyline
 import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.launch
 
 @Composable
 fun BydCollectorApp(
@@ -543,32 +539,20 @@ private fun TabScrollColumn(
     contentReady: Boolean,
     content: @Composable ColumnScope.() -> Unit
 ) {
-    val scrollState = remember(tab, session) { ScrollState(0) }
-    var laidOut by remember(tab, session) { mutableStateOf(false) }
-    val sessionGeneration = remember(tab, session) { session.captureGeneration() }
-    val currentContentReady by rememberUpdatedState(contentReady)
-    LaunchedEffect(tab, session) {
-        var captureEnabled = false
-        launch {
-            snapshotFlow { scrollState.value to currentContentReady }.collect { (offset, ready) ->
-                if (captureEnabled && ready) session.updateScrollOffset(tab, offset, sessionGeneration)
-            }
-        }
-        snapshotFlow { laidOut && currentContentReady }.collect { ready ->
-            if (!ready) {
-                captureEnabled = false
-                return@collect
-            }
-            withFrameNanos { }
-            scrollState.scrollTo(session.scrollOffset(tab).coerceAtMost(scrollState.maxValue))
-            session.updateScrollOffset(tab, scrollState.value, sessionGeneration)
-            captureEnabled = true
+    val sessionGeneration = session.captureGeneration()
+    // A loading placeholder must not clamp away the retained ready-content offset.
+    val scrollState = remember(tab, session, sessionGeneration, contentReady) {
+        ScrollState(session.scrollOffset(tab))
+    }
+    LaunchedEffect(scrollState, contentReady) {
+        if (!contentReady) return@LaunchedEffect
+        snapshotFlow { scrollState.value }.collect { offset ->
+            session.updateScrollOffset(tab, offset, sessionGeneration)
         }
     }
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .onGloballyPositioned { if (!laidOut) laidOut = true }
             .verticalScroll(scrollState),
         verticalArrangement = Arrangement.spacedBy(10.dp),
         content = content

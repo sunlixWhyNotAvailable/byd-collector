@@ -26,10 +26,12 @@ class BydCollectorStringsTest {
         assertEquals("Всі дані", uk.allTab)
         assertEquals("Сховище", uk.storageTab)
         assertEquals("Опції", uk.extraTab)
+        assertEquals("Окремі налаштування", uk.extraSubtitle)
         assertEquals("Всі дані", uk.allParameters)
         assertEquals("All data", en.allTab)
         assertEquals("Storage", en.storageTab)
         assertEquals("Options", en.extraTab)
+        assertEquals("Separate settings", en.extraSubtitle)
         assertEquals("All data", en.allParameters)
     }
 
