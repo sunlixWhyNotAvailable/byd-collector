@@ -6,6 +6,7 @@ import java.nio.file.Files
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class KeepAliveShellPlannerTest {
@@ -153,6 +154,91 @@ class KeepAliveShellPlannerTest {
         assertEquals(1, Regex("""run\(\"svc bluetooth enable\"""").findAll(method).count())
         assertTrue(source.contains("BLUETOOTH_VERIFY_ATTEMPTS = 5"))
         assertTrue(source.contains("BLUETOOTH_VERIFY_DELAY_MS = 1_000L"))
+    }
+
+    @Test
+    fun vehiclePowerParserAcceptsOnlyKnownParcelPowerValues() {
+        assertEquals(
+            true,
+            KeepAliveDaemon.parseVehiclePoweredOff("Result: Parcel(00000000 00000000 '........')")
+        )
+        assertEquals(
+            false,
+            KeepAliveDaemon.parseVehiclePoweredOff("Result: Parcel(00000000 00000001 '........')")
+        )
+        assertEquals(
+            false,
+            KeepAliveDaemon.parseVehiclePoweredOff("Result: Parcel(00000000 00000002 '........')")
+        )
+        assertEquals(
+            true,
+            KeepAliveDaemon.parseVehiclePoweredOff(
+                "  \nResult: Parcel(\n 0x00000000: 00000000 00000000 '........'\n)  \n"
+            )
+        )
+
+        listOf("FFFFD8E3", "FFFFD8E5", "FFFFFFFF").forEach { raw ->
+            assertNull(KeepAliveDaemon.parseVehiclePoweredOff("Result: Parcel(00000000 $raw '........')"))
+        }
+        assertNull(KeepAliveDaemon.parseVehiclePoweredOff("Result: Parcel(00000001 00000000 '........')"))
+    }
+
+    @Test
+    fun vehiclePowerParserRejectsMalformedOrDiagnosticOutput() {
+        listOf(
+            null,
+            "",
+            "NULL",
+            "Result: Parcel(00000000 00000000)",
+            "Result: Parcel(00000000 0000000 '........')",
+            "Result: Parcel(00000000 000000000 '........')",
+            "Result: Parcel(00000000 00000000 NULL)",
+            "Result: Parcel(00000000 00000000 '........') warning",
+            "warning Result: Parcel(00000000 00000000 '........')",
+            "Result: Parcel(00000000 00000000 '........') Result: Parcel(00000000 00000000 '........')",
+            "0x00000000: Result: Parcel(00000000 00000000 '........')"
+        ).forEach { output ->
+            assertNull(KeepAliveDaemon.parseVehiclePoweredOff(output))
+        }
+    }
+
+    @Test
+    fun bluetoothRecoveryGatesSvcEnableOnFreshVehiclePowerRead() {
+        val source = sourceFile("com/bydcollector/collector/keepalive/KeepAliveDaemon.java").readText()
+        val expectedCommand = "service call autoservice 5 i32 1001 i32 315621418"
+        val command = Regex(
+            """private static final String VEHICLE_POWER_COMMAND =\s*"([^"]+)";"""
+        ).find(source) ?: error("Missing vehicle power command")
+        assertEquals(expectedCommand, command.groupValues[1])
+
+        val allowedStart = source.indexOf("private static final String[] ALLOWED_COMMANDS")
+        val allowedEnd = source.indexOf("};", allowedStart)
+        assertTrue(allowedStart >= 0 && allowedEnd > allowedStart)
+        assertTrue(source.substring(allowedStart, allowedEnd).contains("VEHICLE_POWER_COMMAND"))
+
+        val method = source.substringAfter("private static void keepBluetoothAlive() {")
+            .substringBefore("    private static Boolean readBluetoothEnabled()")
+        val profileRestore = method.indexOf("settings put global bluetooth_disabled_profiles 0")
+        val managerRead = method.indexOf("readBluetoothEnabled()")
+        val vehicleRead = method.indexOf("run(VEHICLE_POWER_COMMAND, 5_000L)")
+        val svcEnable = method.indexOf("run(\"svc bluetooth enable\"")
+        assertTrue(profileRestore >= 0)
+        assertTrue(managerRead in 0..<vehicleRead)
+        assertTrue(profileRestore < vehicleRead)
+        assertTrue(vehicleRead in 0..<svcEnable)
+        assertTrue(method.contains("bluetooth_sleep_keepalive_requested"))
+        assertTrue(method.contains("settings put global bluetooth_disabled_profiles 202803"))
+        assertTrue(method.contains("bluetooth_profiles_restored_awake"))
+        val powerGate = method.substring(vehicleRead, svcEnable)
+        assertTrue(
+            Regex(
+                """Boolean\s+vehiclePoweredOff\s*=\s*vehiclePower\.ok\s*\?\s*parseVehiclePoweredOff\(vehiclePower\.output\)\s*:\s*null\s*;"""
+            ).containsMatchIn(method)
+        )
+        assertTrue(Regex("""if\s*\(\s*!Boolean\.TRUE\.equals\(vehiclePoweredOff\)\s*\)""").containsMatchIn(method))
+        assertTrue(method.contains("bluetooth_vehicle_power_state_unavailable"))
+        assertFalse(powerGate.contains("dumpsys power | grep mWakefulness"))
+        assertFalse(powerGate.contains("Asleep"))
     }
 
     @Test

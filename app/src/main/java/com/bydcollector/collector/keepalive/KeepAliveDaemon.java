@@ -11,6 +11,8 @@ import java.util.Locale;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 //keeps selected dilink radios/service recovery alive from shell while the app process may be backgrounded
 public final class KeepAliveDaemon {
@@ -23,6 +25,10 @@ public final class KeepAliveDaemon {
     private static final int BLUETOOTH_VERIFY_ATTEMPTS = 5;
     private static final String USER_SHUTDOWN_COMMAND = "settings get global bydcollector_user_shutdown";
     private static final String BLUETOOTH_STATE_COMMAND = "dumpsys bluetooth_manager | grep -E 'enabled:|state:'";
+    private static final String VEHICLE_POWER_COMMAND = "service call autoservice 5 i32 1001 i32 315621418";
+    private static final Pattern VEHICLE_POWER_REPLY = Pattern.compile(
+            "Result:\\s*Parcel\\(\\s*(?:0x00000000:\\s*)?00000000\\s+([0-9a-fA-F]{8})\\s+'[^'\\r\\n]*'\\s*\\)"
+    );
     private static final String RECOVER_COLLECTOR_COMMAND =
             "am broadcast --include-stopped-packages -a com.bydcollector.collector.action.KEEP_ALIVE_RECOVERY " +
                     "-n com.bydcollector.collector/com.bydcollector.collector.system.KeepAliveRecoveryReceiver";
@@ -39,6 +45,7 @@ public final class KeepAliveDaemon {
             "settings put global bluetooth_disabled_profiles 202803",
             "settings put global bluetooth_disabled_profiles 0",
             BLUETOOTH_STATE_COMMAND,
+            VEHICLE_POWER_COMMAND,
             "dumpsys power | grep mWakefulness",
             "pidof com.bydcollector.collector",
             "dumpsys activity services com.bydcollector.collector/.service.CollectorService",
@@ -131,6 +138,19 @@ public final class KeepAliveDaemon {
             return;
         }
 
+        //reads vehicle power immediately before enabling, independently of app lifetime or screen state
+        ShellResult vehiclePower = run(VEHICLE_POWER_COMMAND, 5_000L);
+        Boolean vehiclePoweredOff = vehiclePower.ok ? parseVehiclePoweredOff(vehiclePower.output) : null;
+        if (!Boolean.TRUE.equals(vehiclePoweredOff)) {
+            log(Boolean.FALSE.equals(vehiclePoweredOff)
+                    ? "bluetooth_enable_skipped_vehicle_on"
+                    : "bluetooth_vehicle_power_state_unavailable ok=" + vehiclePower.ok
+                            + " elapsed_ms=" + vehiclePower.elapsedMs
+                            + " output=" + sanitize(vehiclePower.output)
+                            + " error=" + sanitize(vehiclePower.error));
+            return;
+        }
+
         ShellResult request = run("svc bluetooth enable", 10_000L);
         log("bluetooth_enable_requested ok=" + request.ok
                 + " elapsed_ms=" + request.elapsedMs
@@ -155,6 +175,13 @@ public final class KeepAliveDaemon {
     private static Boolean readBluetoothEnabled() {
         ShellResult state = run(BLUETOOTH_STATE_COMMAND, 5_000L);
         return state.ok ? parseBluetoothEnabled(state.output) : null;
+    }
+
+    static Boolean parseVehiclePoweredOff(String output) {
+        Matcher reply = VEHICLE_POWER_REPLY.matcher(output == null ? "" : output.trim());
+        if (!reply.matches()) return null;
+        int raw = (int) Long.parseLong(reply.group(1), 16);
+        return raw < 0 ? null : raw == 0;
     }
 
     static Boolean parseBluetoothEnabled(String output) {

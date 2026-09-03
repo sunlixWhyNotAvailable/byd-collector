@@ -7,7 +7,7 @@
 BYD Collector is a read-only telemetry collector for Chinese-market BYD vehicles using DiLink 5.0. It reads vehicle values through the local Android ADB bridge and an APK-owned `app_process` helper, keeps the raw readings in SQLite, derives a normalized vehicle state, and optionally exports that state to MQTT/Home Assistant, InfluxDB, and Telegram.
 
 - **Vehicle focus:** Chinese-market BYD Sea Lion 07 EV
-- **Current source/local APK:** `v2.7.9`; latest published release: `v2.7.8` (verified on 2026-09-03)
+- **Current source:** `v2.7.10` (not built); latest local APK: `v2.7.9`
 - **Package:** `com.bydcollector.collector`
 - **Download:** [latest GitHub release](https://github.com/sunlixWhyNotAvailable/byd-collector/releases/latest)
 - **Help:** read [Troubleshooting](#troubleshooting), then [Report a problem](#report-a-problem)
@@ -172,7 +172,7 @@ The `Options` tab contains operational controls rather than vehicle-control comm
 - switch English/Ukrainian and dark/light themes;
 - grant or re-check ADB access and open the DiLink background-app settings;
 - enable automatic start for main collection, All data, MQTT, and InfluxDB where shown;
-- restore Wi-Fi and cellular together, or Bluetooth independently, while the runtime is active;
+- restore Wi-Fi and cellular together while the runtime is active, or Bluetooth independently while the vehicle is powered off;
 - restore the collector service after supported process/boot events;
 - start or stop the single full-system logcat recorder, then create a fresh diagnostic ZIP or clear local logs at the bottom of `Keep alive`;
 - grant and verify the notification-listener lifecycle anchor through the app's local-ADB repair flow; the service reads no notification payloads;
@@ -181,6 +181,12 @@ The `Options` tab contains operational controls rather than vehicle-control comm
 - check for a verified update, or use `Shutdown` to stop runtime until the app is opened again.
 
 The app's keep-alive path is recovery-oriented and idempotent. It does not write vehicle values or invoke vehicle-control APIs.
+
+Bluetooth enable requests require the recovery switch, a confirmed OFF adapter,
+and a fresh read-only vehicle-power value of zero. Powered-on or unavailable
+vehicle power skips the request; screen sleep alone is not enough. Recovery can
+still run after a kernel reboot while the vehicle remains off. Normal profile
+restoration on wake and verification of the actual adapter state are unchanged.
 
 Automatic update checking starts a 30-second countdown with the app process,
 including background startup. Requests start and update prompts appear only
