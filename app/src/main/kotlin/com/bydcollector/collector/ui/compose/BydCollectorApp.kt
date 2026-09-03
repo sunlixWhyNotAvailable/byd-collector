@@ -846,27 +846,20 @@ private fun TripsTab(
             title = strings.routeColors,
             modifier = Modifier.fillMaxWidth(),
             bodyPadding = 0.dp,
+            headerHeight = 50.dp,
             trailing = {
                 Row(horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            strings.speed,
-                            color = if (state.colorMetric == TripMapMetric.SPEED) LocalBydPalette.current.text else LocalBydPalette.current.muted,
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        BydSwitch(
-                            checked = state.colorMetric == TripMapMetric.CONSUMPTION,
-                            onCheckedChange = { actions.onColorMetricChanged(if (it) TripMapMetric.CONSUMPTION else TripMapMetric.SPEED) },
-                            binary = true
-                        )
-                        Text(
-                            strings.consumption,
-                            color = if (state.colorMetric == TripMapMetric.CONSUMPTION) LocalBydPalette.current.text else LocalBydPalette.current.muted,
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
+                    SegmentedControl(
+                        left = strings.speed,
+                        right = strings.consumption,
+                        leftSelected = state.colorMetric == TripMapMetric.SPEED,
+                        onLeft = { actions.onColorMetricChanged(TripMapMetric.SPEED) },
+                        onRight = { actions.onColorMetricChanged(TripMapMetric.CONSUMPTION) },
+                        leftWidth = 150.dp,
+                        rightWidth = 210.dp,
+                        fontSize = 13.sp,
+                        animateSelection = true
+                    )
                     TripThresholdRow(
                         strings = strings,
                         metric = state.colorMetric,
@@ -1038,9 +1031,10 @@ private fun TripTableRow(
             ActionButton(
                 if (loading) strings.loading else strings.route,
                 onRoute,
-                primary = true,
                 enabled = !loading,
-                modifier = Modifier.width(108.dp)
+                modifier = Modifier.width(108.dp),
+                listAction = true,
+                fontSize = 12.sp
             )
         }
     }
@@ -1148,18 +1142,24 @@ private fun TripRouteDialog(
                     modifier = Modifier.weight(1f).fillMaxWidth()
                 )
                 Row(Modifier.fillMaxWidth().padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(strings.colorBySpeed, color = if (metric == TripMapMetric.SPEED) p.text else p.muted, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                    Spacer(Modifier.width(10.dp))
-                    BydSwitch(metric == TripMapMetric.CONSUMPTION, { metric = if (it) TripMapMetric.CONSUMPTION else TripMapMetric.SPEED }, binary = true)
-                    Spacer(Modifier.width(10.dp))
-                    Text(strings.colorByConsumption, color = if (metric == TripMapMetric.CONSUMPTION) p.text else p.muted, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                    Spacer(Modifier.weight(1f))
+                    SegmentedControl(
+                        left = strings.colorBySpeed,
+                        right = strings.colorByConsumption,
+                        leftSelected = metric == TripMapMetric.SPEED,
+                        onLeft = { metric = TripMapMetric.SPEED },
+                        onRight = { metric = TripMapMetric.CONSUMPTION },
+                        leftWidth = 170.dp,
+                        rightWidth = 190.dp,
+                        fontSize = 13.sp,
+                        animateSelection = true
+                    )
+                    Spacer(Modifier.width(18.dp))
                     TripEndpointLegend(R.drawable.ic_trip_start_marker, strings.tripStart)
                     Spacer(Modifier.width(12.dp))
                     TripEndpointLegend(R.drawable.ic_trip_finish_marker, strings.tripFinish)
                     Spacer(Modifier.width(12.dp))
                     TripNoDataLegend(strings.tripNoData)
-                    Spacer(Modifier.width(18.dp))
+                    Spacer(Modifier.weight(1f))
                     ActionButton(strings.close, onDismiss, modifier = Modifier.width(140.dp))
                 }
             }

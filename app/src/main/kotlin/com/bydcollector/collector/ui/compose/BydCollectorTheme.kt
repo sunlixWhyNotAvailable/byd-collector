@@ -6,6 +6,7 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
 
 data class BydPalette(
+    val dark: Boolean,
     val background: Color,
     val surface: Color,
     val panel: Color,
@@ -35,6 +36,7 @@ data class BydPalette(
 )
 
 private val DarkPalette = BydPalette(
+    dark = true,
     background = Color(0xFF080D12),
     surface = Color(0xFF0E151D),
     panel = Color(0xFF131B25),
@@ -64,6 +66,7 @@ private val DarkPalette = BydPalette(
 )
 
 private val LightPalette = BydPalette(
+    dark = false,
     background = Color(0xFFEAF1F8),
     surface = Color(0xFFFFFFFF),
     panel = Color(0xFFFFFFFF),

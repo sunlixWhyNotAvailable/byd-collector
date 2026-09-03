@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -61,6 +62,7 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
@@ -244,6 +246,7 @@ fun SectionCard(
     headerWarning: String? = null,
     trailing: (@Composable () -> Unit)? = null,
     bodyPadding: Dp = 14.dp,
+    headerHeight: Dp = 42.dp,
     content: @Composable () -> Unit
 ) {
     val p = LocalBydPalette.current
@@ -256,7 +259,7 @@ fun SectionCard(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(42.dp)
+                .height(headerHeight)
                 .background(p.panelAlt)
                 .padding(horizontal = 14.dp),
             verticalAlignment = Alignment.CenterVertically
@@ -297,7 +300,9 @@ fun ActionButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     primary: Boolean = false,
-    enabled: Boolean = true
+    enabled: Boolean = true,
+    listAction: Boolean = false,
+    fontSize: TextUnit = 14.sp
 ) {
     val p = LocalBydPalette.current
     val interactionSource = remember { MutableInteractionSource() }
@@ -306,12 +311,19 @@ fun ActionButton(
     val visualPressed = pressed || press.visualPressed
     val bg = when {
         !enabled -> p.disabled.copy(alpha = 0.55f)
+        listAction && visualPressed -> p.accent.copy(alpha = if (p.dark) 0.24f else 0.14f)
+        listAction -> p.accent.copy(alpha = if (p.dark) 0.20f else 0.04f)
         primary && visualPressed -> p.active
         primary -> p.accent
         visualPressed -> p.activeSoft
         else -> p.surface
     }
-    val border = if (primary && enabled) p.accent else p.borderStrong
+    val border = when {
+        !enabled && listAction -> p.borderStrong.copy(alpha = 0.68f)
+        !enabled -> p.borderStrong
+        listAction || primary -> p.accent
+        else -> p.borderStrong
+    }
     val fg = when {
         !enabled -> p.muted.copy(alpha = 0.65f)
         primary -> p.accentText
@@ -333,7 +345,7 @@ fun ActionButton(
         Text(
             text = text,
             color = fg,
-            fontSize = 14.sp,
+            fontSize = fontSize,
             fontWeight = FontWeight.SemiBold,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
@@ -823,9 +835,53 @@ fun SegmentedControl(
     leftSelected: Boolean,
     onLeft: () -> Unit,
     onRight: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    leftWidth: Dp? = null,
+    rightWidth: Dp? = null,
+    fontSize: TextUnit = 14.sp,
+    animateSelection: Boolean = false
 ) {
     val p = LocalBydPalette.current
+    if (leftWidth != null && rightWidth != null) {
+        val contentPadding = 3.dp
+        val itemSpacing = 3.dp
+        val itemHeight = 36.dp
+        val animationDuration = if (animateSelection) 180 else 0
+        val selectionWidth by animateDpAsState(
+            targetValue = if (leftSelected) leftWidth else rightWidth,
+            animationSpec = tween(durationMillis = animationDuration)
+        )
+        val selectionOffset by animateDpAsState(
+            targetValue = contentPadding + if (leftSelected) 0.dp else leftWidth + itemSpacing,
+            animationSpec = tween(durationMillis = animationDuration)
+        )
+        Box(
+            modifier = modifier
+                .height(42.dp)
+                .width(leftWidth + rightWidth + itemSpacing + contentPadding * 2)
+                .clip(PillShape)
+                .background(p.panel)
+                .border(1.dp, p.borderStrong, PillShape)
+        ) {
+            Box(
+                Modifier
+                    .offset(x = selectionOffset, y = contentPadding)
+                    .width(selectionWidth)
+                    .height(itemHeight)
+                    .clip(PillShape)
+                    .background(p.accent)
+            )
+            Row(
+                modifier = Modifier.padding(contentPadding),
+                horizontalArrangement = Arrangement.spacedBy(itemSpacing),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                SegmentButton(left, leftSelected, onLeft, Modifier.width(leftWidth), fontSize, drawSelection = false, directClick = true)
+                SegmentButton(right, !leftSelected, onRight, Modifier.width(rightWidth), fontSize, drawSelection = false, directClick = true)
+            }
+        }
+        return
+    }
     Row(
         modifier = modifier
             .height(42.dp)
@@ -835,39 +891,48 @@ fun SegmentedControl(
             .padding(3.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        SegmentButton(left, selected = leftSelected, onClick = onLeft, Modifier.weight(1f))
-        SegmentButton(right, selected = !leftSelected, onClick = onRight, Modifier.weight(1f))
+        SegmentButton(left, selected = leftSelected, onClick = onLeft, Modifier.weight(1f), fontSize)
+        SegmentButton(right, selected = !leftSelected, onClick = onRight, Modifier.weight(1f), fontSize)
     }
 }
 
 @Composable
-private fun SegmentButton(text: String, selected: Boolean, onClick: () -> Unit, modifier: Modifier) {
+private fun SegmentButton(
+    text: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier,
+    fontSize: TextUnit,
+    drawSelection: Boolean = true,
+    directClick: Boolean = false
+) {
     val p = LocalBydPalette.current
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
-    val press = rememberForcedPressClick(enabled = true, onClick = onClick)
-    val visualPressed = pressed || press.visualPressed
+    val press = if (directClick) null else rememberForcedPressClick(enabled = true, onClick = onClick)
+    val visualPressed = pressed || press?.visualPressed == true
     Box(
         modifier = modifier
             .fillMaxHeight()
-            .pressScaleModifier(interactionSource, forcePressed = press.visualPressed)
+            .pressScaleModifier(interactionSource, forcePressed = press?.visualPressed == true)
             .clip(PillShape)
             .background(
                 when {
-                    selected -> p.accent
+                    selected && drawSelection -> p.accent
+                    selected && visualPressed -> p.accent.copy(alpha = if (p.dark) 0.76f else 0.82f)
                     visualPressed -> p.activeSoft
                     else -> Color.Transparent
                 }
             )
-            .clickable(enabled = !press.locked, interactionSource = interactionSource, indication = null) {
-                press.onClick()
+            .clickable(enabled = press?.locked != true, interactionSource = interactionSource, indication = null) {
+                if (press == null) onClick() else press.onClick()
             },
         contentAlignment = Alignment.Center
     ) {
         Text(
             text = text,
             color = if (selected) p.accentText else p.muted,
-            fontSize = 14.sp,
+            fontSize = fontSize,
             fontWeight = FontWeight.SemiBold
         )
     }
