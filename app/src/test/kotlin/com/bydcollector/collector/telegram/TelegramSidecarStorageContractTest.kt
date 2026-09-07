@@ -23,7 +23,7 @@ class TelegramSidecarStorageContractTest {
         val storeSource = store.readText()
 
         assertTrue(source.contains("bydcollector_telegram.db"))
-        assertTrue(source.contains("DATABASE_VERSION = 2"))
+        assertTrue(source.contains("DATABASE_VERSION = 3"))
         assertTrue(source.contains("setWriteAheadLoggingEnabled(true)"))
         assertTrue(source.contains("CREATE TABLE IF NOT EXISTS telegram_outbox"))
         assertTrue(source.contains("waits_for_summary_key TEXT"))

@@ -7,6 +7,10 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.database.sqlite.SQLiteException
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -68,6 +72,7 @@ import com.bydcollector.collector.mqtt.MqttPublishCoordinator
 import com.bydcollector.collector.mqtt.PahoMqttClientFacade
 import com.bydcollector.collector.system.CollectorAutoStart
 import com.bydcollector.collector.telegram.TelegramCoordinator
+import com.bydcollector.collector.telegram.TelegramSendResult
 import com.bydcollector.collector.telegram.correlateTripDiagnostic
 import java.time.Instant
 import com.bydcollector.collector.ui.DashboardDebugPollState
@@ -147,6 +152,12 @@ class CollectorService : Service() {
     private val influxDiagnosticRuntimeId = java.util.UUID.randomUUID().toString()
     private val telegramExecutorLock = Any()
     private var telegramExecutor: ExecutorService = namedSingleThreadExecutor("byd-telegram")
+    private val telegramRecoveryCoalescer = TelegramRecoveryCoalescer()
+    private val telegramNetworkRecoveryEdge = TelegramNetworkRecoveryEdge()
+    private val telegramNetworkRecoveryRevision = AtomicLong(0L)
+    private var telegramNetworkManager: ConnectivityManager? = null
+    private var telegramNetworkCallback: ConnectivityManager.NetworkCallback? = null
+    private var telegramNetworkCallbackRegistered = false
     private val mqttWorkGeneration = AtomicLong(0L)
     private val influxWorkGeneration = AtomicLong(0L)
     private val telegramWorkGeneration = AtomicLong(0L)
@@ -352,6 +363,7 @@ class CollectorService : Service() {
         scheduleIntegrationDashboardRefresh()
         scheduleDatabaseFootprintRefresh(force = true)
         mainHandler.postDelayed(dashboardHeartbeatTask, DASHBOARD_RUNTIME_HEARTBEAT_MS)
+        registerTelegramNetworkCallback()
         if (settings.isAutoStartEnabled() && settings.hasActiveAccessWork()) {
             requestAccessSelfCheck("runtime_supervisor_start")
         }
@@ -447,6 +459,9 @@ class CollectorService : Service() {
     override fun onDestroy() {
         requireRuntimeOwner()
         maintenanceRuntimeRestoreAllowed.set(false)
+        telegramWorkGeneration.incrementAndGet()
+        telegramRecoveryCoalescer.invalidate()
+        unregisterTelegramNetworkCallback()
         mainHandler.removeCallbacks(accessSelfCheckTask)
         mainHandler.removeCallbacks(dashboardHeartbeatTask)
         mainHandler.removeCallbacks(kpiPublishTask)
@@ -640,7 +655,8 @@ class CollectorService : Service() {
             },
             persistLocation = ::persistLocationObservations,
             prepareConfirmedPowerOff = ::prepareConfirmedPowerOff,
-            recordEvent = store::recordEvent
+            recordEvent = store::recordEvent,
+            onConfirmedPowerOn = { requestTelegramRecovery(RECOVERY_VEHICLE_ON) }
         )
     }
 
@@ -1284,6 +1300,7 @@ class CollectorService : Service() {
         disconnectOfflineAsync()
         cancelInfluxRetry("user_shutdown")
         cancelTelegramTick()
+        telegramRecoveryCoalescer.invalidate()
     }
 
     private fun finishUserShutdown() {
@@ -2270,6 +2287,7 @@ class CollectorService : Service() {
         if (maintenanceBlocksRuntimeStart()) return
         if (!settings.isTelegramEnabled()) {
             cancelTelegramTick()
+            telegramRecoveryCoalescer.invalidate()
             telegramCoordinator?.let { coordinator ->
                 executeTelegram("telegram_reset_error") {
                     coordinator.integrationDisabled()
@@ -2289,16 +2307,9 @@ class CollectorService : Service() {
             return
         }
         ensureForegroundForChannel("Telegram notifications enabled")
-        executeTelegram(
-            "telegram_start_error",
-            onSuccess = ::postTelegramTickSchedule
-        ) {
-            if (unblockBlocked) coordinator.credentialsChanged()
-            coordinator.tick(
-                mainCollectionExpected = settings.isPollingEnabled() && !settings.isMainManuallyStopped(),
-                lastError = lastTelegramPollError
-            )
-        }
+        requestTelegramRecovery(
+            if (unblockBlocked) RECOVERY_STARTUP_CREDENTIALS else RECOVERY_STARTUP
+        )
         scheduleTelegramTick()
         CollectorAutoStart.scheduleWatchdog(applicationContext, settings, store)
     }
@@ -2319,11 +2330,191 @@ class CollectorService : Service() {
             onFailedAction = {
                 settings.setTelegramConnectionStatus("failed", "telegram_test_error")
                 mainHandler.post { stopIfNoActiveRuntime() }
+            },
+            onSuccess = { result, submittedGeneration ->
+                if (result == TelegramSendResult.Success && settings.isTelegramEnabled()) {
+                    requestTelegramRecovery(RECOVERY_MANUAL_TEST_SUCCESS, submittedGeneration)
+                }
             }
         ) {
-            coordinator.testConnection()
+            val result = coordinator.testConnection()
             mainHandler.post { stopIfNoActiveRuntime() }
+            result
         }
+    }
+
+    /** Posts a nonblocking hint; all lifecycle/setting checks happen on the runtime owner. */
+    private fun requestTelegramRecovery(
+        trigger: String,
+        expectedGeneration: Long? = null,
+        key: String = trigger,
+        replacePendingKey: String? = null
+    ) {
+        val generation = expectedGeneration ?: telegramWorkGeneration.get()
+        if (!running.get() || generation != telegramWorkGeneration.get()) return
+        mainHandler.post { enqueueTelegramRecovery(trigger, generation, key, replacePendingKey) }
+    }
+
+    private fun enqueueTelegramRecovery(
+        trigger: String,
+        generation: Long,
+        key: String = trigger,
+        replacePendingKey: String? = null
+    ) {
+        if (!telegramRecoveryRuntimeAvailable(generation)) return
+        val request = telegramRecoveryCoalescer.request(trigger, key, replacePendingKey) ?: return
+        submitTelegramRecovery(request, generation)
+    }
+
+    private fun telegramRecoveryRuntimeAvailable(expectedGeneration: Long): Boolean {
+        if (
+            !running.get() ||
+            expectedGeneration != telegramWorkGeneration.get() ||
+            !::settings.isInitialized ||
+            !settings.isTelegramEnabled() ||
+            settings.isUserShutdownRequested() ||
+            maintenanceActive.get()
+        ) return false
+        return !maintenanceBlocksRuntimeStart()
+    }
+
+    private fun submitTelegramRecovery(request: TelegramRecoveryRequest, generation: Long) {
+        val coordinator = telegramCoordinator
+        if (coordinator == null) {
+            telegramRecoveryCoalescer.invalidate()
+            return
+        }
+        try {
+            executeTelegram(
+                errorCategory = "telegram_recovery_error",
+                onSuccess = ::postTelegramTickSchedule,
+                onSettled = { completeTelegramRecovery(request.token, generation) }
+            ) {
+                if (
+                    !running.get() ||
+                    generation != telegramWorkGeneration.get() ||
+                    telegramCoordinator !== coordinator ||
+                    !telegramRecoveryCoalescer.isCurrent(request.token) ||
+                    !settings.isTelegramEnabled() ||
+                    settings.isUserShutdownRequested() ||
+                    maintenanceBlocksRuntimeStart()
+                ) return@executeTelegram null
+                if (RECOVERY_STARTUP_CREDENTIALS in request.reasons) coordinator.credentialsChanged()
+                if (!telegramRecoveryCoalescer.isCurrent(request.token)) return@executeTelegram null
+                coordinator.recoverPending(request.trigger)
+            }
+        } catch (_: RuntimeException) {
+            telegramRecoveryCoalescer.invalidate(request.token)
+        }
+    }
+
+    private fun completeTelegramRecovery(requestToken: Long, submittedGeneration: Long) {
+        if (submittedGeneration != telegramWorkGeneration.get()) {
+            telegramRecoveryCoalescer.invalidate(requestToken)
+            return
+        }
+        val next = telegramRecoveryCoalescer.complete(requestToken) ?: return
+        val generation = submittedGeneration
+        mainHandler.post {
+            if (!telegramRecoveryRuntimeAvailable(generation)) {
+                telegramRecoveryCoalescer.invalidate(next.token)
+                return@post
+            }
+            submitTelegramRecovery(next, generation)
+        }
+    }
+
+    private fun registerTelegramNetworkCallback() {
+        if (telegramNetworkCallbackRegistered) return
+        val manager = applicationContext.getSystemService(ConnectivityManager::class.java) ?: return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                val generation = telegramWorkGeneration.get()
+                if (!running.get()) return
+                if (telegramNetworkRecoveryEdge.onAvailable(network.toString())) {
+                    postTelegramNetworkRecoveryHint(generation, telegramNetworkRecoveryRevision.incrementAndGet())
+                }
+            }
+
+            override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+                val generation = telegramWorkGeneration.get()
+                if (!running.get()) return
+                if (telegramNetworkRecoveryEdge.onCapabilitiesChanged(network.toString(), telegramNetworkCapabilities(capabilities))) {
+                    postTelegramNetworkRecoveryHint(generation, telegramNetworkRecoveryRevision.incrementAndGet())
+                }
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                val generation = telegramWorkGeneration.get()
+                if (!running.get()) return
+                if (telegramNetworkRecoveryEdge.onLinkPropertiesChanged(network.toString(), telegramNetworkLinks(linkProperties))) {
+                    postTelegramNetworkRecoveryHint(generation, telegramNetworkRecoveryRevision.incrementAndGet())
+                }
+            }
+
+            override fun onLost(network: Network) {
+                telegramNetworkRecoveryEdge.onLost(network.toString())
+            }
+        }
+        try {
+            manager.registerDefaultNetworkCallback(callback)
+            telegramNetworkManager = manager
+            telegramNetworkCallback = callback
+            telegramNetworkCallbackRegistered = true
+        } catch (error: RuntimeException) {
+            Log.w(TAG, "Telegram network callback registration failed", error)
+        }
+    }
+
+    private fun unregisterTelegramNetworkCallback() {
+        val manager = telegramNetworkManager
+        val callback = telegramNetworkCallback
+        telegramNetworkCallbackRegistered = false
+        telegramNetworkManager = null
+        telegramNetworkCallback = null
+        telegramNetworkRecoveryEdge.reset()
+        if (manager != null && callback != null) {
+            runCatching { manager.unregisterNetworkCallback(callback) }
+                .onFailure { error -> Log.w(TAG, "Telegram network callback unregister failed", error) }
+        }
+    }
+
+    private fun postTelegramNetworkRecoveryHint(generation: Long, revision: Long) {
+        // Check before posting as well as inside the owner callback: teardown and
+        // maintenance may advance the generation between those two points.
+        if (!running.get() || generation != telegramWorkGeneration.get()) return
+        mainHandler.post {
+            if (!running.get() || generation != telegramWorkGeneration.get()) return@post
+            enqueueTelegramRecovery(
+                trigger = RECOVERY_NETWORK,
+                generation = generation,
+                key = "$RECOVERY_NETWORK:$revision",
+                replacePendingKey = RECOVERY_NETWORK
+            )
+        }
+    }
+
+    private fun telegramNetworkCapabilities(capabilities: NetworkCapabilities): TelegramNetworkCapabilitiesFingerprint {
+        return TelegramNetworkCapabilitiesFingerprint(
+            hasInternet = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET),
+            validated = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED),
+            notRestricted = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED),
+            vpn = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN),
+            wifi = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI),
+            cellular = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR),
+            ethernet = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+        )
+    }
+
+    private fun telegramNetworkLinks(linkProperties: LinkProperties): TelegramNetworkLinkFingerprint {
+        return TelegramNetworkLinkFingerprint(
+            dnsServers = linkProperties.dnsServers.map { it.hostAddress.orEmpty() }.sorted().toList(),
+            routes = linkProperties.routes.map { it.toString() }.sorted().toList(),
+            linkAddresses = linkProperties.linkAddresses.map { it.toString() }.sorted().toList(),
+            interfaceName = linkProperties.interfaceName,
+            domains = linkProperties.domains,
+            mtu = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) linkProperties.mtu else 0
+        )
     }
 
     private fun scheduleTelegramTick(deadlineAtMs: Long? = null) {
@@ -2721,6 +2912,7 @@ class CollectorService : Service() {
         errorCategory: String,
         onSuccess: ((T, Long) -> Unit)? = null,
         onFailedAction: (() -> Unit)? = null,
+        onSettled: (() -> Unit)? = null,
         action: () -> T
     ) = executeChannel(
         channelName = "Telegram",
@@ -2732,7 +2924,8 @@ class CollectorService : Service() {
         action = action,
         onFailedAction = onFailedAction,
         onException = ::handleTelegramExecutionFailure,
-        onSuccess = onSuccess
+        onSuccess = onSuccess,
+        onSettled = onSettled
     ) {
         ChannelActionStatus(true, "ok", "ok")
     }
@@ -2872,6 +3065,7 @@ class CollectorService : Service() {
         (applicationContext as BydCollectorApplication).markTelegramStorageUnavailable(store, error)
         telegramCoordinator = null
         telegramWorkGeneration.incrementAndGet()
+        telegramRecoveryCoalescer.invalidate()
         mainHandler.post {
             cancelTelegramTick()
             scheduleIntegrationDashboardRefresh()
@@ -2929,6 +3123,7 @@ class CollectorService : Service() {
     private fun startDatabaseMaintenance(operation: DbMaintenanceOperation) {
         requireRuntimeOwner()
         if (!maintenanceActive.compareAndSet(false, true)) return
+        telegramRecoveryCoalescer.invalidate()
         activeMaintenanceOperation = operation
         maintenanceRuntimeRestoreAllowed.set(true)
         maintenanceRunningInProcess.set(true)
@@ -3037,6 +3232,7 @@ class CollectorService : Service() {
     }
 
     private fun shutdownTelegramExecutor() {
+        telegramWorkGeneration.incrementAndGet()
         synchronized(telegramExecutorLock) {
             telegramExecutor.shutdown()
         }
@@ -3520,6 +3716,11 @@ class CollectorService : Service() {
         private const val KPI_STALE_AFTER_MS = 3_000L
         private const val ACCESS_SELF_CHECK_INTERVAL_MS = 5 * 60_000L
         private const val TELEGRAM_TICK_INTERVAL_MS = 15_000L
+        private const val RECOVERY_STARTUP = "startup"
+        private const val RECOVERY_STARTUP_CREDENTIALS = "startup_credentials"
+        private const val RECOVERY_VEHICLE_ON = "vehicle_on"
+        private const val RECOVERY_NETWORK = "network"
+        private const val RECOVERY_MANUAL_TEST_SUCCESS = "manual_test_success"
         private const val MQTT_MAINTENANCE_STOP_TIMEOUT_MS = 16_000L
         private const val INFLUX_MAINTENANCE_STOP_TIMEOUT_MS = 16_000L
         private const val TELEGRAM_MAINTENANCE_STOP_TIMEOUT_MS = 16_000L

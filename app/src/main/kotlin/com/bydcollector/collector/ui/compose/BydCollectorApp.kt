@@ -417,7 +417,8 @@ private fun TopHeader(
                     leftSelected = language == UiLanguage.UK,
                     onLeft = { actions.onLanguageSelected(UiLanguage.UK) },
                     onRight = { actions.onLanguageSelected(UiLanguage.EN) },
-                    modifier = Modifier.width(138.dp)
+                    modifier = Modifier.width(138.dp),
+                    animateSelection = true
                 )
                 SegmentedControl(
                     left = strings.dark,
@@ -425,7 +426,8 @@ private fun TopHeader(
                     leftSelected = darkTheme,
                     onLeft = { actions.onDarkThemeSelected(true) },
                     onRight = { actions.onDarkThemeSelected(false) },
-                    modifier = Modifier.width(154.dp)
+                    modifier = Modifier.width(154.dp),
+                    animateSelection = true
                 )
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {

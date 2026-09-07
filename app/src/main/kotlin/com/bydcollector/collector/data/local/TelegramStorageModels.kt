@@ -8,8 +8,35 @@ data class TelegramOutboxEntry(
     val attemptCount: Int,
     val nextAttemptAtMs: Long,
     val blocked: Boolean,
-    val waitsForSummaryKey: String? = null
+    val waitsForSummaryKey: String? = null,
+    val createdAtMs: Long = 0L,
+    val failureCount: Int = attemptCount,
+    val lastError: String? = null
 )
+
+/** Narrow durable delivery contract shared by the independent Telegram sender. */
+public interface TelegramDeliveryStore {
+    fun oldestDueTelegramMessage(nowMs: Long, eventType: String? = null): TelegramOutboxEntry?
+
+    fun nextTelegramAttemptAtMs(eventType: String? = null): Long?
+
+    fun telegramMessageByDedupeKey(dedupeKey: String): TelegramOutboxEntry?
+
+    fun markTelegramRetry(
+        id: Long,
+        error: String,
+        attemptedAtMs: Long,
+        nextAttemptAtMs: Long
+    )
+
+    fun markTelegramBlocked(id: Long, error: String, attemptedAtMs: Long)
+
+    fun telegramServerNotBefore(botScope: String): Long
+
+    fun extendTelegramServerNotBefore(botScope: String, notBeforeMs: Long)
+
+    fun expediteNetworkRetries(nowMs: Long, excludeIds: Set<Long> = emptySet()): Int
+}
 
 data class TelegramEnqueueResult(
     val inserted: Boolean,

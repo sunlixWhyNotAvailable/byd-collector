@@ -35,6 +35,15 @@ class TelegramCoordinator(
     private var startupRecoveryPending = true
     private val locationKindsByDedupeKey = LinkedHashMap<String, String>(16, 0.75f, true)
     private val locationKindCacheLock = Any()
+    private val delivery = TelegramDeliveryQueue(
+        store = telegramStore,
+        credentials = { TelegramDeliveryCredentials(settings.isTelegramEnabled(), settings.telegramBotToken(), settings.telegramChatId()) },
+        send = client::sendMessage,
+        commitDelivery = ::commitDelivery,
+        record = ::recordDelivery,
+        nowMs = nowMs,
+        retryPolicy = retryPolicy
+    )
 
     fun onSuccessfulPoll(
         observations: List<NormalizedObservation>,
@@ -169,7 +178,7 @@ class TelegramCoordinator(
 
     fun testConnection(): TelegramSendResult {
         settings.setTelegramConnectionStatus("testing", null)
-        val result = client.sendMessage(
+        val result = delivery.testConnection(
             TelegramSendMessage(
                 botToken = settings.telegramBotToken(),
                 chatId = settings.telegramChatId(),
@@ -195,102 +204,63 @@ class TelegramCoordinator(
     }
 
     fun credentialsChanged() {
+        delivery.resetSession()
         telegramStore.unblockTelegramMessages(nowMs())
     }
 
     fun integrationDisabled() {
+        delivery.resetSession()
         telegramStore.saveTelegramRuntimeState(engine.reset().toJson(), nowMs())
         enabledRuntimeStartedAtMs = null
         startupRecoveryPending = true
     }
 
     fun flushPending(): Long? {
-        val entry = telegramStore.oldestUnblockedTelegramMessage() ?: return null
-        return attempt(entry, force = false)
+        return delivery.flush("tick")
     }
 
     private fun flushPending(dedupeKey: String, force: Boolean): Long? {
-        val entry = telegramStore.telegramMessageByDedupeKey(dedupeKey) ?: return null
-        return attempt(entry, force)
+        return delivery.flush("power_off", dedupeKey, expediteLocal = force)
     }
 
-    private fun attempt(entry: TelegramOutboxEntry, force: Boolean): Long? {
-        if (!settings.isTelegramEnabled()) return null
-        val token = settings.telegramBotToken()
-        val chatId = settings.telegramChatId()
-        if (token.isBlank() || chatId.isBlank()) return null
-        if (entry.blocked) return null
-        entry.waitsForSummaryKey?.let { dependencyKey ->
-            val summary = telegramStore.telegramMessageByDedupeKey(dependencyKey)
-            return summary?.takeIf { !it.blocked }?.nextAttemptAtMs
-        }
-        val now = nowMs()
-        if (!force && entry.nextAttemptAtMs > now) return entry.nextAttemptAtMs
-        if (Thread.currentThread().isInterrupted) return entry.nextAttemptAtMs
-        val attemptedAt = nowMs()
-        return when (val result = client.sendMessage(TelegramSendMessage(token, chatId, entry.payload))) {
-            TelegramSendResult.Success -> {
-                val deliveredAtMs = nowMs()
-                val deliveredState = engine.markTripSummaryDelivered(entry.dedupeKey, deliveredAtMs)
-                try {
-                    telegramStore.markTelegramDelivered(entry.id, deliveredState?.toJson(), deliveredAtMs)
-                } catch (error: RuntimeException) {
-                    engine = TelegramEventEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
-                    throw error
-                }
-                eventStore.recordEvent(
-                    "telegram_message_delivered",
-                    "Telegram message delivered",
-                    buildTelegramDiagnosticDetail(
-                        dedupeKey = entry.dedupeKey,
-                        eventType = entry.eventType,
-                        waitsForSummaryKey = entry.waitsForSummaryKey,
-                        location = knownLocationKind(entry.dedupeKey)
-                    )
-                )
-                pendingQueueDeadline()
-            }
-            is TelegramSendResult.Failure -> {
-                val error = failureCode(result)
-                val nextAttemptAtMs = if (result.kind.retryable) {
-                    val delay = retryPolicy.delayForFailure(entry.attemptCount + 1, result.retryAfterSeconds)
-                    (attemptedAt + delay).also {
-                        telegramStore.markTelegramRetry(entry.id, error, attemptedAt, it)
-                    }
-                } else {
-                    telegramStore.markTelegramBlocked(entry.id, error, attemptedAt)
-                    pendingQueueDeadline()
-                }
-                eventStore.recordEvent(
-                    "telegram_message_failed",
-                    "Telegram message delivery failed",
-                    buildTelegramDiagnosticDetail(
-                        dedupeKey = entry.dedupeKey,
-                        eventType = entry.eventType,
-                        waitsForSummaryKey = entry.waitsForSummaryKey,
-                        location = knownLocationKind(entry.dedupeKey),
-                        extra = failureDetail(result)
-                    )
-                )
-                nextAttemptAtMs
-            }
-        }
+    /** Called only on the existing serialized Telegram worker after lifecycle guards. */
+    fun recoverPending(trigger: String): Long? {
+        activateEnabledRuntime() ?: return null
+        val recovered = recoverStartupLocally()
+        return nextWakeAt(recovered?.nextWakeAtMs, delivery.recover(trigger))
     }
 
     private fun pendingQueueDeadline(): Long? {
-        if (!settings.isTelegramEnabled()) return null
-        if (settings.telegramBotToken().isBlank() || settings.telegramChatId().isBlank()) return null
-        return telegramStore.oldestUnblockedTelegramMessage()?.nextAttemptAtMs
+        return delivery.pendingDeadline()
+    }
+
+    private fun commitDelivery(entry: TelegramOutboxEntry, deliveredAtMs: Long) {
+        val deliveredState = engine.markTripSummaryDelivered(entry.dedupeKey, deliveredAtMs)
+        try {
+            telegramStore.markTelegramDelivered(entry.id, deliveredState?.toJson(), deliveredAtMs)
+        } catch (error: RuntimeException) {
+            engine = TelegramEventEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
+            throw error
+        }
+    }
+
+    private fun recordDelivery(kind: String, entry: TelegramOutboxEntry?, detail: String) {
+        eventStore.recordEvent(
+            "telegram_message_$kind",
+            "Telegram delivery $kind",
+            buildTelegramDiagnosticDetail(
+                dedupeKey = entry?.dedupeKey,
+                eventType = entry?.eventType ?: "queue",
+                waitsForSummaryKey = entry?.waitsForSummaryKey,
+                location = entry?.let { knownLocationKind(it.dedupeKey) },
+                extra = detail
+            )
+        )
     }
 
     private fun ensureStartupRecovery(): Long? {
         val recovered = recoverStartupLocally() ?: return null
-        val recoveredKey = recovered.events
-            .firstOrNull { it.type == TelegramEventType.TRIP_SUMMARY }
-            ?.dedupeKey
-        val pending = recoveredKey?.let(telegramStore::telegramMessageByDedupeKey)?.takeUnless { it.blocked }
-            ?: telegramStore.oldestUnblockedTelegramMessage(TelegramEventType.TRIP_SUMMARY.key)
-        return nextWakeAt(recovered.nextWakeAtMs, pending?.let { attempt(it, force = true) })
+        return nextWakeAt(recovered.nextWakeAtMs, delivery.recover("startup"))
     }
 
     private fun recoverStartupLocally(): TelegramEventResult? {
@@ -460,18 +430,8 @@ class TelegramCoordinator(
         )
     }
 
-    private fun failureCode(result: TelegramSendResult.Failure): String {
-        return listOfNotNull(
-            result.kind.name.lowercase(),
-            result.httpStatus?.toString(),
-            result.exceptionClass
-        ).joinToString(":")
-    }
-
     private fun failureDetail(result: TelegramSendResult.Failure): String {
-        return "kind=${result.kind.name.lowercase()} " +
-            "status=${result.httpStatus ?: "none"} " +
-            "exception=${result.exceptionClass ?: "none"}"
+        return telegramFailureDetail(result)
     }
 }
 

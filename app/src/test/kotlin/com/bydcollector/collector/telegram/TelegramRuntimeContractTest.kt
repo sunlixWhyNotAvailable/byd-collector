@@ -117,7 +117,8 @@ class TelegramRuntimeContractTest {
         val store = sourceFile("com/bydcollector/collector/data/local/TelegramStore.kt").readText()
         val helper = sourceFile("com/bydcollector/collector/data/local/TelegramDatabaseHelper.kt").readText()
         val flush = coordinator.substringAfter("fun flushPending").substringBefore("private fun pendingQueueDeadline")
-        val attempt = coordinator.substringAfter("private fun attempt").substringBefore("private fun pendingQueueDeadline")
+        val sender = sourceFile("com/bydcollector/collector/telegram/TelegramDeliveryQueue.kt").readText()
+        val attempt = sender.substringAfter("fun flush(").substringBefore("fun pendingDeadline")
         val oldest = store.substringAfter("fun oldestUnblockedTelegramMessage")
             .substringBefore("fun telegramMessageByDedupeKey")
         val connectionTest = coordinator.substringAfter("fun testConnection")
@@ -128,21 +129,22 @@ class TelegramRuntimeContractTest {
         assertTrue(oldest.contains("ORDER BY id"))
         assertTrue(oldest.contains("LIMIT 1"))
         assertTrue(oldest.contains("WHERE blocked = 0"))
-        assertTrue(flush.contains("oldestUnblockedTelegramMessage()"))
-        assertInOrder(attempt, "if (entry.blocked) return null", "entry.nextAttemptAtMs > now")
+        assertTrue(flush.contains("delivery.flush"))
+        assertTrue(attempt.contains("oldestDueTelegramMessage(now)"))
+        assertInOrder(attempt, "entry.blocked || entry.waitsForSummaryKey", "entry.nextAttemptAtMs > now")
         assertInOrder(attempt, "entry.nextAttemptAtMs > now", "Thread.currentThread().isInterrupted")
-        assertInOrder(attempt, "Thread.currentThread().isInterrupted", "client.sendMessage")
+        assertInOrder(attempt, "Thread.currentThread().isInterrupted", "send(TelegramSendMessage")
         assertFalse(flush.contains("for ("))
-        assertTrue(attempt.contains("entry.attemptCount + 1, result.retryAfterSeconds"))
+        assertTrue(attempt.contains("entry.failureCount + 1"))
         assertTrue(attempt.contains("markTelegramBlocked"))
         assertTrue(attempt.contains("entry.waitsForSummaryKey"))
-        assertTrue(attempt.contains("telegramMessageByDedupeKey(dependencyKey)"))
-        assertInOrder(attempt, "entry.waitsForSummaryKey", "client.sendMessage")
+        assertInOrder(attempt, "entry.waitsForSummaryKey", "send(TelegramSendMessage")
+        assertInOrder(attempt, "telegramServerNotBefore", "send(TelegramSendMessage")
         assertFalse(coordinator.contains("BACKLOG_SUCCESS_DELAY_MS"))
         assertFalse(store.contains("delayOldestTelegramMessageUntil"))
         assertTrue(helper.contains("MAX_PENDING = 1_000L"))
         assertTrue(helper.contains("RETENTION_MS = 30L * 24L * 60L * 60L * 1_000L"))
-        assertInOrder(connectionTest, "client.sendMessage", "unblockTelegramMessages(nowMs())")
+        assertInOrder(connectionTest, "delivery.testConnection", "unblockTelegramMessages(nowMs())")
         assertTrue(credentialsChanged.contains("unblockTelegramMessages(nowMs())"))
     }
 
@@ -163,20 +165,19 @@ class TelegramRuntimeContractTest {
     fun successfulAndBlockedAttemptsScheduleTheNextUnblockedMessageImmediately() {
         val coordinator = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
         val store = sourceFile("com/bydcollector/collector/data/local/TelegramStore.kt").readText()
-        val attempt = coordinator.substringAfter("private fun attempt").substringBefore("private fun pendingQueueDeadline")
-        val success = attempt.substringAfter("TelegramSendResult.Success").substringBefore("is TelegramSendResult.Failure")
-        val permanentFailure = attempt.substringAfter("} else {").substringBefore("recordEvent(")
+        val sender = sourceFile("com/bydcollector/collector/telegram/TelegramDeliveryQueue.kt").readText()
+        val attempt = sender.substringAfter("fun flush(").substringBefore("fun pendingDeadline")
+        val success = coordinator.substringAfter("private fun commitDelivery").substringBefore("private fun recordDelivery")
         val unblock = store.substringAfter("fun unblockTelegramMessages")
-            .substringBefore("fun telegramRuntimeState")
+            .substringBefore("override fun telegramServerNotBefore")
 
         assertInOrder(
             success,
             "engine.markTripSummaryDelivered(entry.dedupeKey, deliveredAtMs)",
-            "markTelegramDelivered(entry.id, deliveredState?.toJson(), deliveredAtMs)",
-            "pendingQueueDeadline()"
+            "markTelegramDelivered(entry.id, deliveredState?.toJson(), deliveredAtMs)"
         )
         val deliveryCommit = store.substringAfter("fun markTelegramDelivered")
-            .substringBefore("fun markTelegramRetry")
+            .substringBefore("override fun markTelegramRetry")
         assertInOrder(
             deliveryCommit,
             "db.beginTransactionNonExclusive()",
@@ -187,15 +188,16 @@ class TelegramRuntimeContractTest {
             "db.setTransactionSuccessful()",
             "db.endTransaction()"
         )
-        assertInOrder(permanentFailure, "markTelegramBlocked", "pendingQueueDeadline()")
+        assertInOrder(attempt, "commitDelivery(entry, deliveredAt)", "expediteNetworkFailures(\"delivery_success\")", "return finishDrain(pendingDeadline())")
+        assertInOrder(attempt, "markTelegramBlocked", "return finishDrain(pendingDeadline())")
         val blockedCommit = store.substringAfter("fun markTelegramBlocked").substringBefore("fun unblockTelegramMessages")
-        assertTrue(blockedCommit.contains("put(\"last_attempt_at_ms\", attemptedAtMs)"))
+        assertTrue(blockedCommit.contains("last_attempt_at_ms = ?"))
         assertTrue(unblock.contains("next_attempt_at_ms = MAX(next_attempt_at_ms, ?)"))
         assertFalse(unblock.contains("put(\"next_attempt_at_ms\", nowMs)"))
     }
 
     @Test
-    fun startupAndPowerOffPrioritizeTripSummariesAfterDurableCommit() {
+    fun startupRecoversDueWorkAndPowerOffPrioritizesTripSummariesAfterDurableCommit() {
         val coordinator = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
         val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
         val tripRuntime = sourceFile("com/bydcollector/collector/service/TripRuntimeCoordinator.kt").readText()
@@ -216,7 +218,7 @@ class TelegramRuntimeContractTest {
 
         assertInOrder(recovery, "engine.recoverPendingTrip", "handle(recovered)")
         assertFalse(recovery.contains("attempt("))
-        assertInOrder(startup, "recoverStartupLocally()", "attempt(it, force = true)")
+        assertInOrder(startup, "recoverStartupLocally()", "delivery.recover(\"startup\")")
         assertInOrder(
             prepare,
             "recoverStartupLocally()",

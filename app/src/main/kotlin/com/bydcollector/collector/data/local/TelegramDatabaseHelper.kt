@@ -1,5 +1,6 @@
 package com.bydcollector.collector.data.local
 
+import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
@@ -33,7 +34,8 @@ class TelegramDatabaseHelper(
                 last_attempt_at_ms INTEGER,
                 last_error TEXT,
                 blocked INTEGER NOT NULL DEFAULT 0 CHECK (blocked IN (0, 1)),
-                waits_for_summary_key TEXT
+                waits_for_summary_key TEXT,
+                failure_count INTEGER NOT NULL DEFAULT 0
             )
             """.trimIndent()
         )
@@ -67,6 +69,14 @@ class TelegramDatabaseHelper(
         )
         db.execSQL(
             """
+            CREATE TABLE IF NOT EXISTS telegram_sender_gate (
+                bot_scope TEXT PRIMARY KEY NOT NULL,
+                not_before_ms INTEGER NOT NULL
+            )
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
             INSERT OR IGNORE INTO telegram_migration_state(id, main_import_complete)
             VALUES (1, 0)
             """.trimIndent()
@@ -77,7 +87,12 @@ class TelegramDatabaseHelper(
         if (oldVersion < 2) {
             db.execSQL("ALTER TABLE telegram_outbox ADD COLUMN waits_for_summary_key TEXT")
         }
+        if (oldVersion < 3) {
+            db.execSQL("ALTER TABLE telegram_outbox ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("UPDATE telegram_outbox SET failure_count = attempt_count")
+        }
         onCreate(db)
+        if (oldVersion < 3) seedLegacyRateLimitCooldown(db)
     }
 
     override fun onDowngrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -88,8 +103,41 @@ class TelegramDatabaseHelper(
 
     companion object {
         const val DATABASE_NAME = "bydcollector_telegram.db"
-        const val DATABASE_VERSION = 2
+        const val DATABASE_VERSION = 3
         const val MAX_PENDING = 1_000L
         const val RETENTION_MS = 30L * 24L * 60L * 60L * 1_000L
+        const val LEGACY_UNCLAIMED_BOT_SCOPE = "__legacy_unclaimed__"
+        const val MAX_SERVER_GATE_HISTORY = 32
+
+        private fun seedLegacyRateLimitCooldown(db: SQLiteDatabase) {
+            db.rawQuery(
+                """
+                SELECT MAX(next_attempt_at_ms)
+                FROM telegram_outbox
+                WHERE last_error = 'rate_limited' OR last_error LIKE 'rate_limited:%'
+                """.trimIndent(),
+                emptyArray()
+            ).use { cursor ->
+                if (!cursor.moveToFirst() || cursor.isNull(0)) return
+                val deadline = cursor.getLong(0)
+                val updated = db.update(
+                    "telegram_sender_gate",
+                    ContentValues().apply { put("not_before_ms", deadline) },
+                    "bot_scope = ? AND not_before_ms < ?",
+                    arrayOf(LEGACY_UNCLAIMED_BOT_SCOPE, deadline.toString())
+                )
+                if (updated == 0) {
+                    db.insertWithOnConflict(
+                        "telegram_sender_gate",
+                        null,
+                        ContentValues().apply {
+                            put("bot_scope", LEGACY_UNCLAIMED_BOT_SCOPE)
+                            put("not_before_ms", deadline)
+                        },
+                        SQLiteDatabase.CONFLICT_IGNORE
+                    )
+                }
+            }
+        }
     }
 }

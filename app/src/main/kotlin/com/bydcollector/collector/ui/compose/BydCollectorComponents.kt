@@ -12,6 +12,7 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
@@ -882,17 +883,40 @@ fun SegmentedControl(
         }
         return
     }
-    Row(
+    BoxWithConstraints(
         modifier = modifier
             .height(42.dp)
             .clip(PillShape)
             .background(p.panel)
             .border(1.dp, p.borderStrong, PillShape)
-            .padding(3.dp),
-        verticalAlignment = Alignment.CenterVertically
+            .padding(3.dp)
     ) {
-        SegmentButton(left, selected = leftSelected, onClick = onLeft, Modifier.weight(1f), fontSize)
-        SegmentButton(right, selected = !leftSelected, onClick = onRight, Modifier.weight(1f), fontSize)
+        // Match the existing weighted Row's pixel rounding, including odd widths.
+        // Padding stays on the container, so header geometry is unchanged.
+        val density = LocalDensity.current
+        val leftPixels = constraints.maxWidth / 2
+        val leftSize = with(density) { leftPixels.toDp() }
+        val rightSize = with(density) { (constraints.maxWidth - leftPixels).toDp() }
+        val animationDuration = if (animateSelection) 180 else 0
+        val selectionWidth by animateDpAsState(
+            targetValue = if (leftSelected) leftSize else rightSize,
+            animationSpec = tween(durationMillis = animationDuration)
+        )
+        val selectionOffset by animateDpAsState(
+            targetValue = if (leftSelected) 0.dp else leftSize,
+            animationSpec = tween(durationMillis = animationDuration)
+        )
+        Box(
+            Modifier.offset(x = selectionOffset)
+                .width(selectionWidth)
+                .fillMaxHeight()
+                .clip(PillShape)
+                .background(p.accent)
+        )
+        Row(Modifier.fillMaxSize(), verticalAlignment = Alignment.CenterVertically) {
+            SegmentButton(left, leftSelected, onLeft, Modifier.weight(1f), fontSize, drawSelection = false, directClick = true)
+            SegmentButton(right, !leftSelected, onRight, Modifier.weight(1f), fontSize, drawSelection = false, directClick = true)
+        }
     }
 }
 

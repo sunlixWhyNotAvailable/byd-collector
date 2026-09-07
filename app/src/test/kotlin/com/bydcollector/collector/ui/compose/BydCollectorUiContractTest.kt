@@ -344,7 +344,7 @@ class BydCollectorUiContractTest {
     }
 
     @Test
-    fun tripsUseSlidingMetricSelectorsAndListRouteActionWithoutChangingHeaderControls() {
+    fun tripsKeepSlidingMetricSelectorsAndHeaderUsesEqualWidthSlidingWithoutGeometryChanges() {
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
         val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
         val tripsTab = app.substringAfter("private fun TripsTab(").substringBefore("private fun TripThresholdRow(")
@@ -370,7 +370,16 @@ class BydCollectorUiContractTest {
         assertTrue(tripRow.contains("fontSize = 12.sp"))
         assertFalse(tripRow.contains("primary = true"))
         assertEquals(2, Regex("SegmentedControl\\(").findAll(topHeader).count())
-        assertFalse(topHeader.contains("animateSelection = true"))
+        assertEquals(2, Regex("animateSelection = true").findAll(topHeader).count())
+        assertTrue(topHeader.contains("Modifier.width(138.dp)"))
+        assertTrue(topHeader.contains("Modifier.width(154.dp)"))
+        assertTrue(topHeader.contains(".height(96.dp)"))
+        val equalSegments = components.substringAfter("// Match the existing weighted Row")
+            .substringBefore("private fun SegmentButton(")
+        assertTrue(equalSegments.contains("constraints.maxWidth / 2"))
+        assertTrue(equalSegments.contains("targetValue = if (leftSelected) 0.dp else leftSize"))
+        assertEquals(2, Regex("drawSelection = false, directClick = true").findAll(equalSegments).count())
+        assertFalse(equalSegments.contains("rememberForcedPressClick"))
         assertTrue(components.contains("headerHeight: Dp = 42.dp"))
         assertTrue(components.contains(".height(headerHeight)"))
         assertTrue(components.contains("val animationDuration = if (animateSelection) 180 else 0"))

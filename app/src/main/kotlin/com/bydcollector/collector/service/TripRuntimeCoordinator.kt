@@ -40,6 +40,7 @@ class TripRuntimeCoordinator(
     private val persistLocation: (List<NormalizedObservation>) -> Unit,
     private val prepareConfirmedPowerOff: (ConfirmedPowerOff) -> (() -> Unit),
     private val recordEvent: (String, String, String?) -> Unit,
+    private val onConfirmedPowerOn: () -> Unit = {},
     private val elapsedRealtimeMs: () -> Long = SystemClock::elapsedRealtime,
     private val bootIdProvider: () -> String = ::readBootId
 ) : AutoCloseable {
@@ -111,7 +112,12 @@ class TripRuntimeCoordinator(
                 val transition = powerTracker.observe(decodedPower)
                 try {
                     when (transition?.current) {
-                        VehiclePowerState.ON -> handlePowerOn(timestamp, snapshot)
+                        VehiclePowerState.ON -> {
+                            handlePowerOn(timestamp, snapshot)
+                            // Recovery is only a scheduling hint. It must not roll back a
+                            // confirmed boundary if the service is already tearing down.
+                            runCatching { onConfirmedPowerOn() }
+                        }
                         VehiclePowerState.OFF -> handlePowerOff(timestamp, snapshot, diagnosticPowerSession)
                         else -> Unit
                     }

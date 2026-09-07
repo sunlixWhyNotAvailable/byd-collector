@@ -11,7 +11,7 @@ class TelegramStore(
     context: Context,
     private val helper: TelegramDatabaseHelper = TelegramDatabaseHelper(context),
     private val clockMs: () -> Long = System::currentTimeMillis
-) : Closeable {
+) : Closeable, TelegramDeliveryStore {
 
     override fun close() = helper.close()
 
@@ -83,7 +83,7 @@ class TelegramStore(
         return queryTelegramMessage(
             """
             SELECT id, dedupe_key, event_type, payload, attempt_count, next_attempt_at_ms, blocked,
-                   waits_for_summary_key
+                   waits_for_summary_key, created_at_ms, failure_count, last_error
             FROM telegram_outbox
             WHERE blocked = 0 AND waits_for_summary_key IS NULL$filter
             ORDER BY id
@@ -93,10 +93,46 @@ class TelegramStore(
         )
     }
 
-    fun telegramMessageByDedupeKey(dedupeKey: String): TelegramOutboxEntry? = queryTelegramMessage(
+    override fun oldestDueTelegramMessage(nowMs: Long, eventType: String?): TelegramOutboxEntry? {
+        val filter = if (eventType == null) "" else " AND event_type = ?"
+        val args = if (eventType == null) {
+            arrayOf(nowMs.toString())
+        } else {
+            arrayOf(nowMs.toString(), eventType)
+        }
+        return queryTelegramMessage(
+            """
+            SELECT id, dedupe_key, event_type, payload, attempt_count, next_attempt_at_ms, blocked,
+                   waits_for_summary_key, created_at_ms, failure_count, last_error
+            FROM telegram_outbox
+            WHERE blocked = 0 AND waits_for_summary_key IS NULL
+              AND next_attempt_at_ms <= ?$filter
+            ORDER BY id
+            LIMIT 1
+            """.trimIndent(),
+            args
+        )
+    }
+
+    override fun nextTelegramAttemptAtMs(eventType: String?): Long? {
+        val filter = if (eventType == null) "" else " AND event_type = ?"
+        val args = if (eventType == null) emptyArray() else arrayOf(eventType)
+        return helper.readableDatabase.rawQuery(
+            """
+            SELECT MIN(next_attempt_at_ms)
+            FROM telegram_outbox
+            WHERE blocked = 0 AND waits_for_summary_key IS NULL$filter
+            """.trimIndent(),
+            args
+        ).use { cursor ->
+            if (!cursor.moveToFirst() || cursor.isNull(0)) null else cursor.getLong(0)
+        }
+    }
+
+    override fun telegramMessageByDedupeKey(dedupeKey: String): TelegramOutboxEntry? = queryTelegramMessage(
         """
             SELECT id, dedupe_key, event_type, payload, attempt_count, next_attempt_at_ms, blocked,
-                   waits_for_summary_key
+                   waits_for_summary_key, created_at_ms, failure_count, last_error
             FROM telegram_outbox
             WHERE dedupe_key = ?
             LIMIT 1
@@ -115,7 +151,10 @@ class TelegramStore(
                 attemptCount = cursor.getInt(4),
                 nextAttemptAtMs = cursor.getLong(5),
                 blocked = cursor.getInt(6) != 0,
-                waitsForSummaryKey = if (cursor.isNull(7)) null else cursor.getString(7)
+                waitsForSummaryKey = if (cursor.isNull(7)) null else cursor.getString(7),
+                createdAtMs = cursor.getLong(8),
+                failureCount = cursor.getInt(9),
+                lastError = if (cursor.isNull(10)) null else cursor.getString(10)
             )
         }
 
@@ -152,37 +191,48 @@ class TelegramStore(
         }
     }
 
-    fun markTelegramRetry(
+    override fun markTelegramRetry(
         id: Long,
         error: String,
         attemptedAtMs: Long,
         nextAttemptAtMs: Long
     ) {
-        helper.writableDatabase.update(
-            "telegram_outbox",
-            ContentValues().apply {
-                put("attempt_count", telegramAttemptCount(id) + 1)
-                put("last_attempt_at_ms", attemptedAtMs)
-                put("next_attempt_at_ms", nextAttemptAtMs)
-                put("last_error", error.truncateForStorage(MAX_ERROR_TEXT_LENGTH))
-                put("blocked", 0)
-            },
-            "id = ?",
-            arrayOf(id.toString())
+        helper.writableDatabase.execSQL(
+            """
+            UPDATE telegram_outbox
+            SET attempt_count = attempt_count + 1,
+                failure_count = failure_count + 1,
+                last_attempt_at_ms = ?,
+                next_attempt_at_ms = ?,
+                last_error = ?,
+                blocked = 0
+            WHERE id = ?
+            """.trimIndent(),
+            arrayOf(
+                attemptedAtMs,
+                nextAttemptAtMs,
+                error.truncateForStorage(MAX_ERROR_TEXT_LENGTH),
+                id
+            )
         )
     }
 
-    fun markTelegramBlocked(id: Long, error: String, attemptedAtMs: Long) {
-        helper.writableDatabase.update(
-            "telegram_outbox",
-            ContentValues().apply {
-                put("attempt_count", telegramAttemptCount(id) + 1)
-                put("last_attempt_at_ms", attemptedAtMs)
-                put("last_error", error.truncateForStorage(MAX_ERROR_TEXT_LENGTH))
-                put("blocked", 1)
-            },
-            "id = ?",
-            arrayOf(id.toString())
+    override fun markTelegramBlocked(id: Long, error: String, attemptedAtMs: Long) {
+        helper.writableDatabase.execSQL(
+            """
+            UPDATE telegram_outbox
+            SET attempt_count = attempt_count + 1,
+                failure_count = failure_count + 1,
+                last_attempt_at_ms = ?,
+                last_error = ?,
+                blocked = 1
+            WHERE id = ?
+            """.trimIndent(),
+            arrayOf(
+                attemptedAtMs,
+                error.truncateForStorage(MAX_ERROR_TEXT_LENGTH),
+                id
+            )
         )
     }
 
@@ -195,6 +245,146 @@ class TelegramStore(
             WHERE blocked = 1
             """.trimIndent(),
             arrayOf(nowMs)
+        )
+    }
+
+    /** Returns the durable server cooldown for one bot scope, binding legacy state once. */
+    override fun telegramServerNotBefore(botScope: String): Long {
+        val scope = botScope.trim().takeIf(String::isNotEmpty) ?: return 0L
+        // The common steady state has no unclaimed migration row.  Keep that
+        // read path read-only; only the one-time legacy bind needs a write lock.
+        val readable = helper.readableDatabase
+        if (senderGateDeadline(readable, TelegramDatabaseHelper.LEGACY_UNCLAIMED_BOT_SCOPE) == null) {
+            return senderGateDeadline(readable, scope) ?: 0L
+        }
+        val db = helper.writableDatabase
+        db.beginTransactionNonExclusive()
+        try {
+            bindLegacyCooldown(db, scope)
+            val deadline = senderGateDeadline(db, scope) ?: 0L
+            db.setTransactionSuccessful()
+            return deadline
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    /** Extends a bot's server cooldown monotonically and keeps expired bot history bounded. */
+    override fun extendTelegramServerNotBefore(botScope: String, notBeforeMs: Long) {
+        val scope = botScope.trim().takeIf(String::isNotEmpty) ?: return
+        if (scope == TelegramDatabaseHelper.LEGACY_UNCLAIMED_BOT_SCOPE) return
+        val requested = notBeforeMs.coerceAtLeast(0L)
+        val db = helper.writableDatabase
+        db.beginTransactionNonExclusive()
+        try {
+            bindLegacyCooldown(db, scope)
+            val current = senderGateDeadline(db, scope)
+            if (current == null) {
+                db.insertWithOnConflict(
+                    "telegram_sender_gate",
+                    null,
+                    ContentValues().apply {
+                        put("bot_scope", scope)
+                        put("not_before_ms", requested)
+                    },
+                    SQLiteDatabase.CONFLICT_IGNORE
+                )
+            } else if (requested > current) {
+                db.update(
+                    "telegram_sender_gate",
+                    ContentValues().apply { put("not_before_ms", requested) },
+                    "bot_scope = ?",
+                    arrayOf(scope)
+                )
+            }
+            pruneExpiredSenderGates(db, clockMs(), scope)
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    /**
+     * Makes only transport-failed, unblocked rows immediately eligible after network recovery.
+     * Historical attempt_count is intentionally untouched; failure_count is the retry streak.
+     */
+    override fun expediteNetworkRetries(nowMs: Long, excludeIds: Set<Long>): Int {
+        val selection = StringBuilder(
+            "blocked = 0 AND (next_attempt_at_ms > ? OR failure_count > 0) AND (last_error = ? OR last_error GLOB ?)"
+        )
+        // GLOB keeps the prefix case-sensitive; SQLite LIKE is ASCII
+        // case-insensitive unless a connection-wide PRAGMA changes it.
+        val args = mutableListOf(nowMs.toString(), "network_error", "network_error:*")
+        if (excludeIds.isNotEmpty()) {
+            selection.append(" AND id NOT IN (")
+            // IDs originate from SQLite rows and are numeric by type.  Using
+            // numeric literals keeps this safe for a recovery set at or above
+            // SQLite's 999 bind-parameter limit.
+            selection.append(excludeIds.joinToString(",") { it.toString() })
+            selection.append(')')
+        }
+        return helper.writableDatabase.update(
+            "telegram_outbox",
+            ContentValues().apply {
+                put("failure_count", 0)
+                put("next_attempt_at_ms", nowMs)
+            },
+            selection.toString(),
+            args.toTypedArray()
+        )
+    }
+
+    private fun senderGateDeadline(db: SQLiteDatabase, botScope: String): Long? = db.rawQuery(
+        "SELECT not_before_ms FROM telegram_sender_gate WHERE bot_scope = ? LIMIT 1",
+        arrayOf(botScope)
+    ).use { cursor -> if (cursor.moveToFirst()) cursor.getLong(0) else null }
+
+    /** Must be called inside the same write transaction as the first bot-scope lookup. */
+    private fun bindLegacyCooldown(db: SQLiteDatabase, botScope: String) {
+        if (botScope == TelegramDatabaseHelper.LEGACY_UNCLAIMED_BOT_SCOPE) return
+        val legacy = senderGateDeadline(db, TelegramDatabaseHelper.LEGACY_UNCLAIMED_BOT_SCOPE) ?: return
+        val current = senderGateDeadline(db, botScope)
+        if (current == null) {
+            db.insertWithOnConflict(
+                "telegram_sender_gate",
+                null,
+                ContentValues().apply {
+                    put("bot_scope", botScope)
+                    put("not_before_ms", legacy)
+                },
+                SQLiteDatabase.CONFLICT_IGNORE
+            )
+        } else if (legacy > current) {
+            db.update(
+                "telegram_sender_gate",
+                ContentValues().apply { put("not_before_ms", legacy) },
+                "bot_scope = ?",
+                arrayOf(botScope)
+            )
+        }
+        // The deadline has been transferred to the first real bot scope.  No
+        // row deadline is discarded: the larger value is retained above.
+        db.delete(
+            "telegram_sender_gate",
+            "bot_scope = ?",
+            arrayOf(TelegramDatabaseHelper.LEGACY_UNCLAIMED_BOT_SCOPE)
+        )
+    }
+
+    private fun pruneExpiredSenderGates(db: SQLiteDatabase, nowMs: Long, protectedScope: String) {
+        val count = db.rawQuery(
+            "SELECT COUNT(*) FROM telegram_sender_gate WHERE bot_scope <> ?",
+            arrayOf(TelegramDatabaseHelper.LEGACY_UNCLAIMED_BOT_SCOPE)
+        ).use { cursor -> if (cursor.moveToFirst()) cursor.getInt(0) else 0 }
+        if (count <= TelegramDatabaseHelper.MAX_SERVER_GATE_HISTORY) return
+        db.delete(
+            "telegram_sender_gate",
+            "bot_scope <> ? AND bot_scope <> ? AND not_before_ms <= ?",
+            arrayOf(
+                TelegramDatabaseHelper.LEGACY_UNCLAIMED_BOT_SCOPE,
+                protectedScope,
+                nowMs.toString()
+            )
         )
     }
 
@@ -400,6 +590,9 @@ class TelegramStore(
                         SQLiteDatabase.CONFLICT_IGNORE
                     )
                 }
+                legacyRateLimitedDeadline(snapshot)?.let { deadline ->
+                    seedLegacyCooldown(db, deadline)
+                }
                 snapshot.runtimeStateJson?.let { state ->
                     db.insertWithOnConflict(
                         "telegram_runtime_state",
@@ -472,11 +665,6 @@ class TelegramStore(
         "SELECT COUNT(*) FROM telegram_outbox", emptyArray()
     ).use { cursor -> if (cursor.moveToFirst()) cursor.getInt(0) else 0 }
 
-    private fun telegramAttemptCount(id: Long): Int = helper.readableDatabase.rawQuery(
-        "SELECT attempt_count FROM telegram_outbox WHERE id = ?",
-        arrayOf(id.toString())
-    ).use { cursor -> if (cursor.moveToFirst()) cursor.getInt(0) else 0 }
-
     private fun telegramMessageExists(db: SQLiteDatabase, dedupeKey: String): Boolean = db.rawQuery(
         "SELECT 1 FROM telegram_outbox WHERE dedupe_key = ? LIMIT 1",
         arrayOf(dedupeKey)
@@ -547,6 +735,40 @@ class TelegramStore(
         if (lastAttemptAtMs == null) putNull("last_attempt_at_ms") else put("last_attempt_at_ms", lastAttemptAtMs)
         if (lastError == null) putNull("last_error") else put("last_error", lastError)
         put("blocked", if (blocked) 1 else 0)
+        // Main has no separate retry-streak column; preserve its historical
+        // attempt count as the initial failure streak during the cutover.
+        put("failure_count", attemptCount)
+    }
+
+    private fun legacyRateLimitedDeadline(snapshot: TelegramLegacySnapshot): Long? = snapshot.outbox
+        .asSequence()
+        .filter { row ->
+            row.lastError == "rate_limited" ||
+                row.lastError?.startsWith("rate_limited:") == true
+        }
+        .map { it.nextAttemptAtMs }
+        .maxOrNull()
+
+    private fun seedLegacyCooldown(db: SQLiteDatabase, deadline: Long) {
+        val current = senderGateDeadline(db, TelegramDatabaseHelper.LEGACY_UNCLAIMED_BOT_SCOPE)
+        if (current == null) {
+            db.insertWithOnConflict(
+                "telegram_sender_gate",
+                null,
+                ContentValues().apply {
+                    put("bot_scope", TelegramDatabaseHelper.LEGACY_UNCLAIMED_BOT_SCOPE)
+                    put("not_before_ms", deadline)
+                },
+                SQLiteDatabase.CONFLICT_IGNORE
+            )
+        } else if (deadline > current) {
+            db.update(
+                "telegram_sender_gate",
+                ContentValues().apply { put("not_before_ms", deadline) },
+                "bot_scope = ?",
+                arrayOf(TelegramDatabaseHelper.LEGACY_UNCLAIMED_BOT_SCOPE)
+            )
+        }
     }
 
     private fun String.truncateForStorage(maxLength: Int): String {
