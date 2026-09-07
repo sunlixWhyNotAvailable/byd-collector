@@ -4,10 +4,9 @@
 
 <img align="right" src="app/src/main/res/drawable-nodpi/collector_apk_icon.png" alt="BYD Collector icon" width="112">
 
-BYD Collector is a read-only telemetry collector for Chinese-market BYD vehicles using DiLink 5.0. It reads vehicle values through the local Android ADB bridge and an APK-owned `app_process` helper, keeps the raw readings in SQLite, derives a normalized vehicle state, and optionally exports that state to MQTT/Home Assistant, InfluxDB, and Telegram.
+BYD Collector is a read-only telemetry collector for Chinese-market BYD vehicles using DiLink 5.0. It reads vehicle data locally through ADB, stores raw readings in SQLite, and displays vehicle status and trip history. Optional integrations send data to MQTT/Home Assistant, InfluxDB, and Telegram.
 
 - **Vehicle focus:** Chinese-market BYD Sea Lion 07 EV
-- **Current source and local APK:** `v2.7.11`
 - **Package:** `com.bydcollector.collector`
 - **Download:** [latest GitHub release](https://github.com/sunlixWhyNotAvailable/byd-collector/releases/latest)
 - **Help:** read [Troubleshooting](#troubleshooting), then [Report a problem](#report-a-problem)
@@ -18,149 +17,153 @@ The collector is an engineering and research tool, not an OEM diagnostic or safe
 
 ## How collection works
 
-The production path is deliberately local and read-only:
+The app reads vehicle parameters without changing them. It keeps raw values, available Chinese names and descriptions, timestamps, and data-quality information in a local SQLite database. These readings also provide the vehicle status shown in the app and shared with enabled integrations. Unavailable or unknown values remain identifiable rather than being presented as valid readings.
 
-1. The Android app checks the local ADB bridge and starts the packaged helper with the app's class path.
-2. The helper uses only the approved getter transactions (`5` and `7`) and a fixed read whitelist.
-3. Each poll preserves the raw value, field name, Chinese name/description when available, quality, elapsed time, stale/failure state, and partial-success metadata in SQLite.
-4. Normalized fields are derived from the raw record for the UI and integrations. Unknown fields and values remain queryable; enum meanings are field-specific rather than globally assumed.
+The app remembers your selected tab, scroll positions, and expanded trip groups during the current session, including when you switch tabs or return from another app. Closing the app with `Shutdown` or restarting its process resets navigation.
 
-The UI keeps the latest dashboard snapshot in a process-wide cache. Opening or resuming the app and switching tabs therefore renders the last known state immediately, while scoped background refreshes replace only data that can actually change. KPI values and row-count deltas are fed directly from successful collection/storage work; SQLite full counts are used only to establish or rebuild a baseline after startup or database maintenance.
-
-The selected tab, each tab's scroll position, and expanded Trips groups belong to the live app session. They survive tab changes, backgrounding, and Android recreating the window while the process remains alive. Ready content opens at its retained position from the first layout, without a delayed scroll jump. Loading placeholders do not reset retained positions. Shutdown or a new process starts from the initial navigation state; ordinary collector/export Stop does not reset it. Navigation is not saved to disk.
-
-Interactive controls do not add an artificial callback delay: accepted button, switch, selector, category-chip, icon-button, and bottom-tab actions run immediately. The shared 100 ms pressed animation is visual feedback and repeat protection only. Asynchronous work disables only the affected operation; Main, All data, MQTT, and InfluxDB expose stopped, starting, running, stopping, or error states, and an older completion cannot overwrite a newer Start/Stop intent.
-
-A switch can also be toggled by tapping its label or unused row area. Telegram message switches work from the section header, not the editable body. Each tap changes the value once; disabled switches stay disabled and embedded action buttons remain independent. In the current source, these rows and headers highlight and gently scale on press, retaining the visual effect for 90 ms after release without delaying or locking repeated toggles; this refinement is not yet in the local APK. Single-line text and numeric fields finish editing on keyboard Done or dismissal, clearing field focus. Multiline Telegram templates keep Enter/newlines and finish editing when the keyboard is hidden. Existing live validation and saving remain unchanged; finishing an edit does not save the value a second time.
+You can toggle a switch by tapping its label or row; Telegram message switches also respond to their section headers. Finish editing a single-line field with the keyboard's `Done` button or by hiding the keyboard. Telegram templates keep Enter for new lines and finish editing when the keyboard is hidden.
 
 ## Features
 
 | Area | What it provides |
 | --- | --- |
-| Read-only transport | Local ADB plus an APK-owned read-only `app_process` helper with a fixed read whitelist |
-| Main tab | Start/stop the curated 82-field read-only poll, automatic start, current status, database health, and quick diagnostics |
-| All data tab | Round-robin research polling of the full 23,096-signature catalog, with raw values and change/transition evidence |
-| Normalized state | SOC, SOH, range, odometer, battery energy, charging, power, temperatures, doors, tires, climate, speed, radar, and related vehicle fields |
-| MQTT / Home Assistant | Home Assistant MQTT Discovery and live current-state topics for selected categories, with primary/optional alternative endpoints and sticky transport failover |
-| InfluxDB | Independent `InfluxDB v1` historical export with durable cursors, sticky primary/alternative routing, and retry state |
-| Telegram | Optional outbound event messages with editable templates and a dedicated archive-safe SQLite FIFO outbox |
-| Trips | Separate local trip history, GPS routes, lossless compression for completed routes, configurable speed/consumption colours, and an online OpenStreetMap view |
-| SQLite and archives | Compact SQLite stores for raw, normalized, and Trips data, crash-safe database cutover, ZIP archives, sharing, and a shared archive limit |
-| Runtime | Background recovery, optional Tailscale activation, combined Wi-Fi/cellular recovery, Bluetooth recovery, and explicit shutdown |
-| Diagnostics | An always-on bounded operational journal, optional full-system logcat under `Options -> Keep alive`, fresh native ZIP sharing, and safe log cleanup |
+| Main tab | Collection of 82 selected vehicle fields, automatic start, current status, and database information |
+| All data tab | Research collection from a catalog of 23,096 read-only signatures, with raw values and recorded changes |
+| Vehicle status | SOC, SOH, range, odometer, battery energy, charging, power, temperatures, doors, tires, climate, speed, and related readings |
+| MQTT / Home Assistant | Home Assistant MQTT Discovery and live state for selected categories, with primary and alternative connections |
+| InfluxDB | Historical export to `InfluxDB v1`, with automatic retries and progress saved between sessions |
+| Telegram | Optional event notifications with editable templates and saved messages awaiting delivery |
+| Trips | Local trip history, GPS routes, lossless route compression, and OpenStreetMap views coloured by speed or consumption |
+| Storage | SQLite databases, ZIP archives, archive sharing/deletion, and a shared archive-size limit |
+| Background operation | Service and connection recovery, optional Tailscale activation, and explicit shutdown |
+| Diagnostics | Local event logs, optional full-system logcat recording, ZIP sharing, and log cleanup |
 
-The app UI is available in English and Ukrainian and supports dark and light themes.
-
-The header language/theme selectors use a 180 ms sliding indicator. Selection changes immediately, rapid reversals retarget the animation without a repeat lock, and the existing header/status-pill sizes stay unchanged.
+The app is available in English and Ukrainian, with dark and light themes.
 
 <p align="center"><img src="docs/screenshots/en/main.png" alt="BYD Collector Main tab" width="100%"></p>
 
 ## Main tab
 
-`Main` controls the production poll. Start it after ADB is authorized, or enable its automatic-start switch for supported boot and runtime events.
+`Main` controls regular telemetry collection. Start it after ADB is authorized, or enable automatic start.
 
-- The curated main catalog contains 82 direct fields, including the read-only power-boundary candidate.
-- The app owns the normal 500 ms Main poll and authoritative SQLite writer. A detached helper starts fallback reads only after the app lease has been absent for two seconds, writes crash-safe records without opening Android SQLite, and leaves the app to validate and idempotently import them before its next live read. Intentional Main Stop/Shutdown or full database maintenance stops the helper; ordinary app-process loss leaves it collecting until app recovery or kernel reboot.
-- Integer and float values use grouped native reads where possible, with ordered results and an in-helper scalar fallback.
-- The status card shows polling, MQTT, and InfluxDB states, last success, last error, and session errors.
-- The normalized vehicle-state cards show current SOC, SOH, odometer, cabin and battery temperatures, charging/discharging, range, cell-voltage delta, and category summaries.
-- Main raw polls remain authoritative. Normalized history is lossless and currently has no automatic retention period or downsampling.
+- Collects 82 selected read-only vehicle fields.
+- Shows collection, MQTT, and InfluxDB status, last success, last error, and session errors.
+- Displays SOC, SOH, odometer, cabin and battery temperatures, charging/discharging, range, cell-voltage difference, and category summaries.
+- Stores raw readings and normalized history locally. History is not automatically deleted or reduced.
 
-Raw `CHARGING_STATE` remains queryable in Main data, but its constant/untrusted normalized field is retired from active exports and Telegram semantics; charging evidence uses the connected charge gun and positive battery charge power only. `max_discharge_power_allow_raw` remains visible as the exact unitless raw number with no inferred kW scale. `bodywork_sunroof_windoblind_position` preserves observed integer codes `0`, `1`, `2`, and `4` instead of collapsing them to a boolean; Home Assistant migrates from the old binary-sensor discovery to the unitless sensor.
+Some fields have known interpretation limits: raw `CHARGING_STATE` is unreliable and is not used to identify charging for exports or Telegram. Charging is determined from the connected charge gun and positive charging power. `max_discharge_power_allow_raw` has no verified unit or kW scale, and sunroof/windblind position codes must not be interpreted as a simple open/closed value.
 
-Use `Stop` before maintenance or when the car should no longer be polled. A failed or incomplete poll is recorded as such; the UI does not silently turn an unknown value into a valid one.
+Use `Stop` when collection is no longer needed. Background collection and its vehicle-specific limits are described under [Known limitations](#known-limitations).
 
 ## All data tab
 
-`All data` is the research/debug lane. It can be started independently after the main runtime is available.
+`All data` is intended for research and diagnostics. It can run independently once the main collection service is available.
 
-- The full catalog currently contains 23,096 read-only signatures.
-- A round-robin cycle sends the catalog as one helper request on the existing 500 ms cadence; it is not split into arbitrary 10,000-entry runtime steps.
-- Raw values, descriptions, quality, and transition/change evidence are stored in the separate round-robin database.
-- This lane is useful for discovering changing fields. A changing value is not, by itself, a confirmed field meaning; promote fields only with field-specific evidence.
+- Reads the full catalog of 23,096 read-only signatures.
+- Saves raw values, descriptions, data quality, and changes in a separate database.
+- Helps identify changing fields, but a changing value alone does not prove what the field means.
 
-Round-robin storage is cut over and checked before a debug session starts. Stopping the lane does not change the main poll.
+This collection can use substantial storage. Stop it after your research session and archive its database when needed. Stopping `All data` does not stop Main collection.
 
 <p align="center"><img src="docs/screenshots/en/parameters.png" alt="BYD Collector All data tab" width="100%"></p>
 
 ## Trips and routes
 
-The `Trips` tab stores power-on to confirmed-power-off sessions in a separate app-private `bydcollector_trips.db`. It keeps only trip summaries and GPS route points/gaps; it does not duplicate the full Main telemetry catalogue. Zero-motion sessions remain stored but are hidden from the ordinary list.
+The `Trips` tab keeps sessions from vehicle power-on to power-off in a separate local database. It stores trip summaries and GPS routes rather than duplicating all telemetry. Sessions without movement are hidden from the ordinary list.
 
-Route recording uses Android's GPS provider after the user grants location access. During serialized first-run setup, the app requests fine/coarse location once before the ADB authorization step; after a denial, access must be granted later in Android settings. Mock, stale, clock-skewed, physically impossible, or otherwise untrusted fixes with finite coordinates remain in `route_points` as diagnostics but are excluded from the trusted route; numerically invalid coordinates are stored as gaps. When a live vehicle-speed sample from the last two seconds is available, a GPS fix is also rejected if its reported or adjacent-fix implied speed exceeds vehicle speed by more than `40 km/h`; replayed fallback telemetry cannot supply that reference. Missing or stale vehicle speed leaves the existing GPS checks unchanged. After a rejection, callback outage, or location-source restart, three mutually consistent fresh fixes are required before location is trusted again. The map uses online OpenStreetMap tiles, fits the trusted route, and can colour segments by speed or instantaneous consumption. Trusted route runs use a black outline for contrast; every rejected fix interrupts the rendered line instead of being bridged. Gray consumption sections mean that an instantaneous-consumption value is unavailable, not that consumption is average or zero. A compact blue dot marks Start; a neutral circle with a white flag marks Finish, with matching localized Start, Finish, and No data legends in the lower control row. Defaults are speed colouring with `90/30 km/h` thresholds and consumption thresholds of `15/20 kWh/100 km`. The page and route modal use immediate two-part speed/consumption selectors with a sliding indicator; `Route` is visually distinct from primary actions.
+Route recording requires Android location access. If you decline the first-run request, grant access later in Android settings. Untrusted GPS readings—including implausible jumps or speeds—are excluded from the displayed route. Loss of reception or rejected readings can leave gaps; the app does not draw a connecting line across rejected points.
 
-Completed Trips routes can be compressed losslessly from the Trips tab. The operation keeps every trip, point, value, order, gap, and map; the open trip stays writable and is not split. Its initial closed/checkpointed snapshot briefly pauses Trips persistence while receipt-timestamped callbacks queue; GPS collection is not paused. It verifies a replacement before publication and keeps the original if preparation or verification fails. Committed data is not rolled back; cleanup can leave temporary files, but it does not remove the written history. It is not an archive, JSON export, retention rotation, or `VACUUM` operation; no automatic deletion or rotation is enabled.
+The map uses online OpenStreetMap tiles and colours the route by speed or instantaneous consumption. A black outline helps distinguish it from map objects. Start and Finish markers have a matching legend. Gray consumption sections mean that consumption data is unavailable, not zero. Colour thresholds are configurable; defaults are `90/30 km/h` for speed and `15/20 kWh/100 km` for consumption.
+
+Use route compression on the Trips tab to reduce storage without losing trips, route points, or maps. The current trip continues recording. Compression is not archiving or deletion; there is no automatic deletion of trip history.
 
 <p align="center"><img src="docs/screenshots/en/trips.png" alt="BYD Collector trip history" width="100%"></p>
 
 ## MQTT, Home Assistant, and InfluxDB
 
-The `HA integration` tab configures the two off-car export channels. They are independent: a problem with one channel does not make a successful main poll fail. For either channel, profile selection, both endpoint drafts, and shared connection fields lock from accepted Start/resume through completed Stop, including retry and failover; Stop remains available. `Test connection` checks only the selected profile and never changes the running route.
+The `HA integration` tab configures two independent export channels. A connection problem does not stop local collection.
+
+Each channel supports a primary host/port and an optional alternative host/port for reaching the same server, for example through a home network or VPN. Labels show both the profile being edited and the connection currently in use. Connection fields and profile selection remain locked while the channel is started, including while it waits to retry; stop the channel before editing them. `Test connection` checks the selected profile only and does not switch the active connection.
 
 ### MQTT and Home Assistant
 
-- Publishes Home Assistant MQTT Discovery configuration and live normalized vehicle state.
-- Select battery, motion, body, climate, safety, and location from the ordinary category grid.
-- The location category remains off by default. When enabled, it publishes the latest trusted normalized GPS state; local trip/location recording remains independent of export selection.
-- Configure a Primary host/port and an optional Alternative host/port for the same broker, plus shared username/password, client ID, topic prefix, and discovery prefix.
-- MQTT is for current state. A disconnected Home Assistant broker can mean that a live state is missed; SQLite remains the local source of truth.
-- A failed publish becomes eligible again after 30 seconds. The runtime schedules one persisted single-flight retry at that deadline without waiting for a new state update or status heartbeat.
-- Labels distinguish the edited profile from the route currently in use.
-- A new connection cycle tries Primary first. Connect or publish transport failures close the failed client and try the other profile once; a working route is reused until the next connection cycle. Authentication, TLS, and data failures are reported without rerouting.
+- Publishes Home Assistant MQTT Discovery configuration and current vehicle state.
+- Supports battery, motion, body, climate, safety, and location categories.
+- Location export is off by default and is independent of local route recording.
+- Configure the broker host/port, optional alternative host/port, shared credentials, client ID, topic prefix, and discovery prefix.
+- Tries the primary connection first and switches to the alternative for connection failures. It reuses a working connection; authentication, TLS, and data errors require attention rather than switching profiles.
+- Retries failed publications automatically. MQTT carries current state, so updates can be missed while the broker is unreachable; local SQLite history remains available.
 
 ### InfluxDB
 
-- Exports normalized history to `InfluxDB v1` for long-term charts and Grafana.
-- Configure a Primary host/port and an optional Alternative host/port for the same database, plus shared database, measurement, credentials, and categories independently of MQTT.
-- The location category remains off by default. When enabled, timestamped trusted GPS history uses the same durable per-field cursor contract as the other categories.
-- A persisted cursor is kept for each selected field. Export is independent of main polling while the service is alive: globally ordered batches contain up to 300 rows below 5,000 pending rows and up to 2,000 rows from that threshold. Transient failures step a large batch down through 1,000, 500, and 300 rows before later successes ramp it back up. A proven single malformed/type-conflicting row is isolated without deleting its raw history or blocking unrelated fields; generic authentication/configuration failures are not treated as bad data. Successful batches continue once per second while backlog remains, and a real write failure uses a 30-second retry delay. The successful endpoint remains sticky across requests and batches; after Stop/start or both endpoints fail, the next cycle begins at Primary. Fallback is limited to network/timeout and HTTP 502/503/504; 429, authentication, TLS, protocol, and data errors keep the current route. HTTP 400 line-format isolation stays pinned to the endpoint that rejected that batch.
+- Exports vehicle history to `InfluxDB v1` for charts and Grafana.
+- Configure the server host/port, optional alternative host/port, database, measurement, credentials, and categories separately from MQTT.
+- Location export is off by default. When enabled, trusted coordinates are exported with their original timestamps.
+- Saves export progress and resumes remaining history after interruptions. Large queues use larger batches, adjusted after temporary failures.
+- Reuses a working connection and tries the alternative for network failures and certain temporary server errors. Authentication, TLS, rate-limit, and data errors do not trigger that switch.
+- Isolates a confirmed malformed record without deleting its local raw history or blocking unrelated fields.
 
-Transport security and TLS deployment are separate integration decisions. Protect the endpoint and credentials on the network where the collector is used.
+Protect the server and credentials on the network where the collector is used.
 
 <p align="center"><img src="docs/screenshots/en/home-assistant.png" alt="BYD Collector Home Assistant and InfluxDB settings" width="100%"></p>
 
 ## Telegram notifications
 
-Telegram is optional and disabled by default. It sends plain text through the Telegram Bot API only; the collector does not accept commands, register webhooks, poll updates, or send media.
+Telegram is optional and disabled by default. The app sends text notifications through your bot; it does not accept remote commands or upload route images.
 
-Configure the bot token, chat ID, event switches, delay values, and message templates in the `Telegram` tab. Secrets are stored with the Android Keystore, shown masked by default, and can be cleared explicitly.
+Configure the bot token, chat ID, event switches, delays, and templates on the `Telegram` tab, then use `Test connection`. Credentials are protected using Android Keystore and masked in the UI.
 
-New or unset low-12 V thresholds default to `12.5 V` in `0.1 V` steps; existing saved thresholds and custom template text are preserved. Charging start/progress/stop defaults include the local event time (`dd.MM.yyyy HH:mm`); progress shows Power directly below Charge and retains step/session energy and duration.
-
-The Trip summary header warns immediately when the source template exceeds Telegram's 4,096-character limit; expansion and location-link overflow states update from the actual runtime render. If the template itself fits but selected location links cause the overflow, the header uses the complete dedicated `Template exceeds the 4,096-character limit with location` warning rather than an appended suffix.
-
-Supported event templates include:
+Supported notifications include:
 
 - charging started, charging progress, charged to 100%, and charging stopped;
 - charge-gun connected and disconnected;
-- low 12 V voltage;
+- low 12 V battery voltage;
 - telemetry unavailable; and
 - trip summary.
 
-Charging-progress templates can report energy/SOC and localized duration for both the current step and the whole charging session. The built-in charged-to-100% report also shows added SOC/energy and the observed charging start, end, and duration. Charging baselines persist across process or kernel recovery; a cold attachment starts from the first observed active-charging sample. The editor presents nine equal-height cards; each editor scrolls internally after seven lines, and the variable picker scrolls independently. Charging templates distinguish `Current energy used` from `Total energy used`. Recognized current and historic built-ins follow the persisted app language, while custom templates retain their exact text. The one-time trip-summary migration updates only a recognized persisted built-in; custom text and saved settings remain exact. Trip summaries separate the current `P -> non-P -> P` trip from totals observed during the current vehicle power session. The built-in current and overall energy rows calculate their own average consumption from the matching energy and distance totals; custom templates can use the separate `{trip_avg_kwh_per_100km}` and `{total_avg_kwh_per_100km}` variables. Current-trip SOC is frozen at the confirmed end of that drive; Overall SOC starts with the first drive and continues through the latest observed session SOC, including parked consumption between drives. That baseline survives delayed-`P` finalization and process recovery and clears with the power-session totals at confirmed power-off. Recognized previous built-ins migrate to the corrected variables, while custom templates remain exact. When the built-in summary's Overall distance, energy, duration, and SOC are display-identical to its only completed trip, that duplicate block is omitted; a parked SOC change or distinct multi-stop total remains visible. A summary is eligible for an SOC change of at least 1%; otherwise the trip must exceed 0.1 km or 0.1 kWh. A short `P` below the configured delay remains part of the same trip; once that deadline expires, the old trip is finalized before a new drive can replace it. After process recovery, the original parked deadline remains in force; recovery finalizes the trip before fresh telemetry only when that deadline has expired. If the first observed gear is missing, tracking starts from the subsequently confirmed driving gear without inventing earlier distance or energy. The first valid power-off sample bypasses the parked delay and durably queues and immediately attempts the summary while the network may still be available.
+Built-in templates follow the app language. Your custom text and saved settings are preserved. The template editor offers variables for the available readings and warns about Telegram's 4,096-character limit, including overflow caused by location links.
 
-Trip-summary location is off by default. The separate `Send location` action has a centered `No` / `Yes, N links` status and opens a blocking modal with independent Google, Waze, Apple, and OSM selections; choosing zero links is allowed. At real power-off, the summary receives only the selected navigation links in that order, without separate coordinate, capture-time, or age rows. The latest trusted valid point from the same trip/power session remains eligible when the current fix is absent or invalid; no extra age cutoff or earlier-trip fallback is applied. A trip finalized by the configured long-`P` delay is sent without links. If no qualifying final summary replaces it at power-off, that earlier trip records its Telegram obligation durably before the trip is closed, even if its summary is still undelivered; after the matching summary is durably acknowledged, exactly one links-only follow-up is sent. Before power-off, starting a later short drive in the same power session preserves the earlier pending location. At power-off, a qualifying new final summary carries the selected links once and settles that earlier obligation without a second links-only message. If the final drive is too short for a summary, the earlier follow-up is retained. Queued follow-ups survive process restarts; a missing/pruned row or another trip never proves delivery. Disabled location, no selected navigator, or no trusted point recorded during that trip clears the follow-up without blocking the summary. The collector does not upload a route image or other media.
+Charging reports can include SOC, energy, power, local event time (`dd.MM.yyyy HH:mm`), and step/session duration. The 100% report includes the observed charging start, end, and added charge. If collection starts partway through charging, the report covers only the observed portion. The default low-12 V threshold is `12.5 V`, adjustable in `0.1 V` steps.
 
-The outbox keeps FIFO order among messages that are ready to send. An older message waiting for its retry deadline does not hold newer ready messages; a links-only follow-up still waits for its own summary's durable delivery receipt. A summary finalized by the first valid power-off sample retains immediate priority after its durable commit. Runtime startup, confirmed vehicle ON, useful active-network changes, and successful Telegram delivery or a connection test make network-failed messages eligible again without waiting out the old local backoff. Repeated signals are coalesced; a message that fails again is not repeatedly reset by later successes in the same drain. Continued failures back off from 30 seconds to at most 30 minutes. Telegram's explicit server wait remains durable and applies to every send path, including manual tests. Permanently blocked rows remain for diagnosis and do not hold later messages. Successful delivery schedules the next eligible row immediately without a fixed pacing delay. Original queued content and trip ownership are preserved. Telemetry-unavailable timing is rebased when the Telegram runtime is enabled, so a kernel/process restart or later enable does not immediately replay an outage from stale timestamps. Trip-summary delay is configurable from 5 to 300 seconds (10 seconds by default).
+**Trip summaries**
 
-The outbox and its single runtime-state row live in the separate app-private `bydcollector_telegram.db`, so Main or Debug/test archive maintenance cannot replace queued messages or in-progress event state. A one-time validated transaction imports legacy Main Telegram rows before the Telegram runtime starts; a failed import disables only Telegram, reports a storage error, and leaves manual Main recovery available. A persistent fail-closed marker prevents a fresh Main database from being mistaken for a successful migration after an interrupted or failed archive; unresolved legacy Telegram rows remain in the preserved Main archive until explicitly recovered. Malformed live sidecar state or a runtime sidecar SQLite failure also closes and gates only Telegram with the red storage status; Bot API/network errors remain ordinary transport failures. The sidecar keeps at most 1,000 pending rows, prunes only previously attempted rows after 30 days, deletes delivered rows, and relies on normal SQLite page reuse without vehicle-side `VACUUM`. It is not included in Main/Debug archives, diagnostic ZIPs, or `Clear logs`.
+- A driving segment ends after the vehicle stays in `P` for the configured delay: 5–300 seconds, 10 seconds by default. A shorter stop remains part of the same segment.
+- The first valid vehicle power-off reading triggers an immediate send attempt without waiting for the parking delay. Delivery still depends on connectivity.
+- The current-trip section shows that drive's distance, duration, energy, average consumption, and start/end SOC. Overall totals cover the vehicle's current power-on session; Overall SOC runs from the first drive to the latest reading, including parked consumption.
+- The Overall block is omitted when it duplicates the only trip. Different totals or parked SOC changes keep it visible.
+- A summary requires at least a 1% SOC change, more than 0.1 km, or more than 0.1 kWh.
+
+**Location links**
+
+Location sharing is off by default. Open `Send location` to choose Google, Waze, Apple, and/or OSM. Links are sent at vehicle power-off, not for an ordinary parking-delay summary.
+
+If GPS is unavailable at shutdown, the app uses the last trusted point from that trip/session. It may be where reception was last available, not the final parking spot. Without a trusted point, no location link is sent; the trip summary can still be delivered.
+
+If a parking summary was already sent, location follows in a separate message after power-off. If a later drive produces a new final summary, the links accompany that summary instead. A short final move that does not qualify for a new summary does not cancel the earlier location follow-up.
+
+**Delivery and storage**
+
+Undelivered messages survive restarts and Main/All data database archiving. Network failures are retried automatically; vehicle startup, useful network changes, and a successful connection test can prompt another attempt. During continued outages, retry waits grow from 30 seconds to 30 minutes. Telegram's own server-imposed waits still apply.
+
+A waiting or failed message does not block unrelated ready messages, but location-only follow-ups wait for their matching summary. Telemetry-unavailable notifications start a fresh waiting period when Telegram starts, rather than reporting an old outage immediately after a restart.
+
+The queue is limited to 1,000 pending messages. Previously attempted messages older than 30 days can expire. A Telegram storage error pauses Telegram without stopping local collection. The message queue is separate from database archives and diagnostic ZIPs; `Clear logs` does not remove it.
 
 <p align="center"><img src="docs/screenshots/en/telegram.png" alt="BYD Collector Telegram notification settings" width="100%"></p>
 
 ## Storage and archives
 
-SQLite is the authoritative long-term store. JSON is used for export/transport, not as the primary database.
+Telemetry and trips are stored locally in SQLite. Main and All data databases can be archived to ZIP so a fresh database can be used.
 
-- Fresh installations use compact Main, Debug/test, and Trips SQLite schemas.
-- Raw readings are retained before normalization; normalized current state and history use compact identifiers and quality codes while preserving queryability.
-- Existing Main and Debug/test databases are archived before format cutover; they are not migrated in place or deleted as part of that transition. Trips schema upgrades are additive and preserve its history.
-- Main cutover is automatic only when MQTT and all InfluxDB cursors have no queued work. During the one-time upgrade, any not-yet-migrated legacy Telegram queue or unfinished legacy event state also defers cutover until it is safely copied into the dedicated sidecar.
-- Automatic startup cutover remains fail-closed on format, checkpoint, integrity, or recovery uncertainty. Explicit Main and Debug/test archive actions are recovery overrides: inspection failures are preserved as warnings instead of disabling the user's only in-app reset path. Both lanes still use exact SQLite sidecar sets, crash journals, and rollback boundaries; a manual archive stops if the source set cannot be preserved without overwrite/data loss or if a fresh writable database cannot be created and verified.
-- The `Storage` tab shows active Main + Debug/test + Trips totals and a `+` breakdown, archive size/count, sort order, and the configured shared archive limit. Totals include each database's SQLite `-wal`, `-shm`, and `-journal` companion files. The archive-root path stays in the shortened monospace field; the existing Share icon is shown with the localized `Поділитись` / `Share` label. It can share selected ZIP archives or delete selected archives after confirmation.
-- Confirmed deletion publishes `0 / N` immediately, retires selected rows from the visible list before worker completion, verifies each target, continues through partial failures, and reconciles the final snapshot. Manual deletion affects only the selected archives; automatic retention remains a separate oldest-first process with newest-per-family protection.
-- The limit applies to completed Main/Debug archives; Trips has no archive family. Main and Trips histories remain unbounded. Completed Trips routes can be compressed losslessly from the Trips tab; no automatic deletion or rotation is enabled.
+- `Storage` shows the combined size of Main, All data, and Trips, including supporting database files, plus archive size/count and the shared archive limit.
+- Select existing archives to share them or delete them after confirmation. Deletion shows progress and reports files that could not be removed.
+- The archive limit applies to completed Main/All data archives, not active databases or Trips. Automatic cleanup removes older archives while protecting the newest archive of each type.
+- Trips uses lossless compression instead of archiving. Main and Trips history are not automatically deleted.
+- When a Main/All data storage-format update is required, the existing database is archived before replacement. Trips updates preserve its history.
 
-Archive maintenance can temporarily stop collection and integrations. Read the confirmation dialog: it shows queued Main-owned MQTT/InfluxDB work, reports a Telegram migration warning separately when applicable, and warns when an operation cannot be stopped safely after it begins. The live Telegram sidecar itself is not at risk from Main archive replacement.
+Manual archiving also provides a recovery path when a database can no longer be used normally. Failed preliminary checks are shown as warnings; the operation still stops if it cannot preserve the source database or create a usable replacement.
+
+Archiving can temporarily stop collection and integrations. Read the confirmation carefully, especially warnings about queued MQTT/InfluxDB data or an older Telegram queue awaiting transfer. Do not interrupt an archive operation. Archiving Main or All data does not remove the current Telegram message queue.
 
 <p align="center"><img src="docs/screenshots/en/storage.png" alt="BYD Collector storage and database archives" width="100%"></p>
 
@@ -171,53 +174,34 @@ Archive maintenance can temporarily stop collection and integrations. Read the c
 
 ## Options and runtime
 
-The `Options` tab contains operational controls rather than vehicle-control commands:
+`Options` provides ADB and background-service controls, connection recovery, Tailscale activation, update checks, and log tools. Automatic-start switches on the collection and integration tabs control their respective functions.
 
-- switch English/Ukrainian and dark/light themes;
-- grant or re-check ADB access and open the DiLink background-app settings;
-- enable automatic start for main collection, All data, MQTT, and InfluxDB where shown;
-- restore Wi-Fi and cellular together while the runtime is active, or Bluetooth independently while the vehicle is powered off;
-- restore the collector service after supported process/boot events;
-- start or stop the single full-system logcat recorder, then create a fresh diagnostic ZIP or clear local logs at the bottom of `Keep alive`;
-- grant and verify the notification-listener lifecycle anchor through the app's local-ADB repair flow; the service reads no notification payloads;
-- keep Wi-Fi and cellular enabled from the separate detached keep-alive helper every 30 seconds when their combined switch is enabled;
-- optionally detect and activate Tailscale when a configured endpoint is unreachable, with a delayed launch and foreground-task restoration; and
-- check for a verified update, or use `Shutdown` to stop runtime until the app is opened again.
+- Use the background-app settings and ADB checks to allow collection to run.
+- Enable `Restore Wi-Fi and cellular` to recover both connections together, or enable Bluetooth recovery separately.
+- Bluetooth recovery only requests activation when Bluetooth is off and the vehicle is confirmed powered off. It does not issue that request while the vehicle is on or its power state is unknown.
+- Service recovery helps the app return after supported process or boot events. Its notification-listener permission is used for background recovery, not to read notification contents.
+- Optional Tailscale activation can help reach a configured server through your VPN.
+- Use `Shutdown` to stop operation until you open the app again.
 
-The app's keep-alive path is recovery-oriented and idempotent. It does not write vehicle values or invoke vehicle-control APIs.
+These controls restore Android services and connections; they do not send vehicle-control commands.
 
-Bluetooth enable requests require the recovery switch, a confirmed OFF adapter,
-and a fresh read-only vehicle-power value of zero. Powered-on or unavailable
-vehicle power skips the request; screen sleep alone is not enough. Recovery can
-still run after a kernel reboot while the vehicle remains off. Normal profile
-restoration on wake and verification of the actual adapter state are unchanged.
-
-Automatic update checking starts a 30-second countdown with the app process,
-including background startup. Requests start and update prompts appear only
-when the app is in the foreground. Returning after a normal background stop uses the
-remaining delay, or checks immediately if it has elapsed. An available update
-survives window recreation. Closing its offer pauses automatic checks for one
-hour; a new app session can reset that pause earlier. There is no hourly
-background polling, and the manual check remains available. Each check asks for
-the latest published release; a failed check does not impose an extra cooldown.
+Automatic update checking starts after a short startup delay and runs only while the app is visible. Closing an update offer pauses automatic checks for an hour, or until a new app session. Manual checking remains available and always checks the latest published release.
 
 <p align="center"><img src="docs/screenshots/en/options.png" alt="BYD Collector options and runtime settings" width="100%"></p>
 
 ## Diagnostics and privacy
 
-There is no separate `Logs` tab or user-controlled Journal mode. The app continuously writes existing operational events—not telemetry samples—to an app-private JSONL journal with one active file plus three 2 MiB rotations (8 MiB maximum). Start and stop the optional full-system logcat recorder at the bottom of `Options -> Keep alive` when investigating a reproducible issue. Start waits for the completed ADB authorization check and uses the exact command `logcat -b all -v threadtime`; it does not silently fall back to a PID-filtered app-only file. Full-system capture is capped at eight 16 MiB segments (128 MiB total).
+The app keeps a local operational event log, separate from telemetry databases. For a reproducible problem, use `Start logcat` under `Options -> Keep alive`, reproduce the issue, then stop recording. Full-system recording requires ADB authorization and is limited to 128 MiB; the regular event log is limited to 8 MiB.
 
-Each `Share logs` action creates a new coherent snapshot rather than modifying an old logcat run. The ZIP contains capture metadata, the bounded JSONL journal, up to 200 recent SQLite `collector_events`, provenance plus a best-effort copy of the active or latest logcat run, up to the last 512 KiB of `/data/local/tmp/bydcollector_keepalive.log`, and a bounded 64 KiB redacted `trips_telegram_evidence.txt` sidecar. The sidecar contains hashed trip/dedupe/dependency references, route continuity/final-point quality, and bounded Telegram outbox/runtime metadata; it contains no coordinates, message payloads, credentials, URLs, or database copies. Missing logcat/helper data is recorded as a controlled status entry and does not block the ZIP. Main, Debug, Trips, and Telegram databases are not included. Before snapshot/copy/ZIP work, Share requires free space for four times the retained source plus 16 MiB; insufficient space or ZIP failure preserves the source capture and the last valid bundle. Android receives only the ZIP attachment—no prefilled subject or message—and opens the native chooser with an immutable cache copy.
+`Share logs` prepares a fresh ZIP and opens Android's share chooser with just the file. It includes app/device information, recent operational events, available system and background-service logs, and diagnostic summaries for InfluxDB, trips, and Telegram. Missing sources are reported without blocking the rest of the archive. Telemetry and Telegram databases are not included. ZIP preparation needs additional free space; a failure preserves existing logs and the previous valid bundle.
 
-`Clear logs` first opens a localized blocking confirmation over the still-visible Options screen. Confirmation removes completed captures and generated bundles, resets the JSONL journal, and attempts to truncate the helper log in place without interrupting an active logcat capture. A helper/ADB failure is reported as partial cleanup instead of blocking local cleanup. A fresh handoff copy remains protected for 10 minutes so the receiving app can finish reading it; expired copies are pruned by the next Share/Clear action and can otherwise remain until Android clears app cache. Recorder, snapshot, ZIP, share preparation, and cleanup work runs away from the UI thread.
+`Clear logs` asks for confirmation, removes completed captures and generated bundles, and resets the event log without stopping an active logcat recording. Unavailable background-service logs may result in partial cleanup. A recently shared copy can remain temporarily so the receiving app can finish reading it. Database archives, trip history, and pending Telegram messages are not cleared.
 
-Influx diagnostics record why an export cycle is skipped, retry and worker state, the profile/host/port used by Test and export, request stages/results, and server acknowledgement separately from cursor persistence. They do not log telemetry payloads or change retry timing. Share also includes `influx_evidence.txt`: at most 128 KiB of configured/runtime state, cursor metadata and the latest 200 export events, with explicit truncation/availability status. Database evidence is read-only; maintenance contention produces a partial snapshot rather than waiting for maintenance or initializing a database.
+Before sharing, recognized credentials, explicit coordinates, and private vehicle/chat/account identifiers are masked in the diagnostic copies. App/firmware versions, vehicle names, hosts/IP addresses, and ports remain readable for troubleshooting. Original logs and database archives are not changed. **This filtering does not guarantee that full-system logs are anonymous.**
 
-Before ZIP creation, only the temporary Share copies are filtered for recognized credential/header values, URL credentials, explicit coordinates and private VIN/chat/account fields. The same private identifier receives the same alias within that bundle. App and firmware versions, vehicle names, hosts/IP addresses, ports and technical IDs remain readable. Malformed or oversized records are omitted with a `privacy_status.txt` entry, while other complete JSONL records survive. Original recordings, database archives and integration payloads are unchanged; this is not a guarantee that arbitrary full-system logcat is anonymous.
+Review the ZIP before sharing: system logs and background-service output may still contain private information or data from other apps. Database archives are shared separately through `Storage` and may contain raw telemetry, trips, and location data.
 
-Diagnostics stay local unless you explicitly share the ZIP through the Android chooser. Operational details, full-system logcat, and helper output can still contain private addresses, identifiers, coordinates, or unrelated process data. Review the archive before sharing it and do not publish credentials or sensitive location data. Database archives are a separate Storage feature and can contain raw telemetry and trip history.
-
-The collector does not automatically upload telemetry, screenshots, crash reports, or logcat to the project. MQTT, InfluxDB, and Telegram are opt-in destinations configured by the user. Read the complete data-handling policy in [PRIVACY.md](PRIVACY.md).
+Diagnostics stay on the device unless you choose to share them. The app does not automatically send telemetry, screenshots, crash reports, or logs to the project. MQTT, InfluxDB, and Telegram are opt-in destinations you configure. See [PRIVACY.md](PRIVACY.md) for the full data-handling policy.
 
 ## Installation and ADB
 
@@ -233,14 +217,14 @@ The collector does not automatically upload telemetry, screenshots, crash report
 1. Download the current APK from [GitHub Releases](https://github.com/sunlixWhyNotAvailable/byd-collector/releases/latest) and verify the release checksum when one is published.
 2. Install and open **BYD Collector** on the vehicle tablet.
 3. Follow the first-run background-app prompt and set `Disable background Apps -> BYD Collector` to `OFF`.
-4. Accept the one-time Android fine/coarse location request if route recording is wanted. After a denial, grant it later in Android settings; the app does not repeatedly prompt.
+4. Allow Android location access if route recording is wanted. After a denial, grant it later in Android settings; the app does not repeatedly prompt.
 5. When Android shows the ADB RSA prompt, confirm it. In the app, use `Grant ADB` to re-check the bridge.
 6. Start `Main` and confirm that the status changes from waiting to successful polling.
 7. Enable the default-off `location` category only for MQTT/Influx channels that need precise-location export.
 8. Enable only the integrations and Telegram events you need, then test each connection from its tab.
 9. Start `All data` only for research sessions; it writes a separate, much larger database.
 
-ADB is required for direct vehicle reads and for the helper startup. Without an authorized bridge the app can still open and show stored data, settings, and archives, but it cannot collect fresh vehicle telemetry. Re-authorize after a tablet reset, Android security prompt, or changed host key.
+ADB authorization is required to collect fresh vehicle telemetry. Without it, you can still view stored data, settings, and archives. Re-authorize after a tablet reset or when Android requests it again.
 
 ## Troubleshooting
 
@@ -254,7 +238,7 @@ ADB is required for direct vehicle reads and for the helper startup. Without an 
 
 ### Main is successful but a value is blank, stale, or unknown
 
-This can be a vehicle-side unavailable field, an incomplete helper response, or a field without a confirmed mapping. The raw value and quality metadata remain queryable. Do not infer a global enum meaning from one field or one driving session.
+The vehicle may not supply the field, a read may be incomplete, or the field's meaning may not yet be confirmed. Raw values and quality information remain available for analysis. A numeric code in one field does not necessarily mean the same thing in another.
 
 ### All data is slow or storage grows quickly
 
@@ -262,19 +246,19 @@ All data intentionally polls the research catalog and stores raw evidence. Stop 
 
 ### Home Assistant or MQTT is offline
 
-Check the selected profile's broker host/port, shared credentials, topic/discovery prefixes, and categories. `Test connection` checks only that profile. During a runtime cycle, transport failures try the other configured profile once; authentication, TLS, and data failures do not switch routes. MQTT publishes current state only; historical gaps are expected while the broker is unreachable. Main collection and SQLite continue independently.
+Check the selected profile's host/port, credentials, topic/discovery prefixes, and categories. `Test connection` checks that profile only. An alternative connection can help with network failures, but not incorrect credentials or data. MQTT sends current state, so updates can be missed while offline. Local collection continues independently.
 
 ### InfluxDB is behind or shows retries
 
-Check the selected profile's endpoint, shared credentials, database/measurement, and category selection. The successful endpoint stays sticky across requests and batches; a fresh cycle starts at Primary. Fallback is limited to network/timeout and HTTP 502/503/504, while 429, authentication, TLS, protocol, and data failures stay on the current route. The exporter retains cursors, uses 300-row batches below 5,000 pending rows and up to 2,000 rows from that threshold, adapts large batches downward after transient failures, keeps successful batches one second apart, and waits 30 seconds only after a real write failure. A deterministic bad row is isolated only after the server proves a line-format/type conflict, pinned to the endpoint that rejected it. A successful poll does not imply that every queued history row has already reached InfluxDB.
+Check the selected profile, credentials, database/measurement, categories, and VPN if required. Use `Test connection` and compare the active connection with the profile you tested. A successful test or collection cycle does not mean the backlog has already been exported. Export progress is saved and retries are automatic; if the queue stays unchanged, share diagnostic logs with the approximate time of the problem.
 
 ### Telegram messages are delayed or missing
 
-Verify the bot token and chat ID with `Test connection`, enable the specific event, and inspect pending outbox rows. A successful test wakes network-failed backlog when Telegram is enabled; an explicit Telegram server wait cannot be bypassed. Permanently blocked rows are skipped until a successful connection test or credential change unblocks them. Shared diagnostic logs record attempt/recovery/wait reasons and retry deadlines without message contents or credentials.
+Verify the bot token and chat ID with `Test connection` and enable the specific event. A successful test can restart network-failed delivery attempts while Telegram is enabled, but cannot override Telegram's server-imposed wait. If no location arrives, check the selected navigators and whether the trip had any trusted GPS point. For persistent failures, share diagnostic logs and the approximate event time.
 
 ### Archive is deferred or maintenance cannot start
 
-Finish or explicitly review queued Main-owned MQTT/InfluxDB work. During the one-time upgrade, Main cutover also waits for any legacy Telegram queue or unfinished state to be copied into the dedicated sidecar. Use the confirmation dialog and do not interrupt a running archive operation.
+Read the confirmation's warnings about queued export data or older Telegram messages awaiting transfer. Let pending exports finish when possible. If ordinary collection is blocked by a database problem, use its manual archive action to preserve the old data and start fresh. Do not interrupt a running archive operation.
 
 ## Report a problem
 
@@ -298,17 +282,15 @@ Archives can expose vehicle identifiers, raw Chinese descriptions, timestamps, t
 
 ## Known limitations
 
-- The project is tested primarily on the Chinese `BYD Sea Lion 07 EV 2025` with `DiLink 5.0`; other models, regions, firmware, and tablet builds may expose different fields or behavior.
-- Production reads are read-only. Vehicle-control/write paths are intentionally unsupported.
-- ADB authorization and BYD background-app policy can be lost after resets or firmware changes.
-- The full All data catalog is research evidence, not a guaranteed normalized schema. Unknown fields and field-specific enums require new evidence.
-- Main normalized history is currently lossless and unbounded. No retention period, downsampling, `VACUUM`, or size-triggered rotation is enabled.
-- Trips history and routes remain unbounded, but completed routes can be compressed losslessly from the Trips tab without an archive or automatic deletion/rotation; online maps require OpenStreetMap tile connectivity.
-- Off-state fallback has been observed on the target vehicle across `BODYWORK_POWER_LEVEL=0` and ordinary app-process loss. A kernel reboot still terminates the shell helper; collection resumes only after Android recreates the app/service and it reconciles the helper, so unattended recovery remains firmware-dependent.
-- MQTT is a live-state channel and can miss updates while the broker is offline. InfluxDB v1 export is cursor/retry based and intentionally paced.
-- Telegram delivery depends on external Bot API reachability; retryable failures remain subject to their persisted backoff.
-- Optional Tailscale activation depends on the vehicle's network and process policy; it is not required for local collection.
-- No physical-vehicle installation or live-car timing claim is implied by a source build or unit-test result; validate changes on the intended tablet before relying on them.
+- Primarily tested on the Chinese-market `BYD Sea Lion 07 EV 2025` with `DiLink 5.0`; other vehicles and firmware may expose different data or behaviour.
+- Telemetry access is read-only; vehicle-control commands are unsupported.
+- ADB authorization and background permissions may need restoring after resets or firmware changes.
+- All data is a research catalog, not a guarantee that every field is available or understood.
+- Active Main and Trips history can continue growing. Monitor storage, archive Main when needed, and compress completed routes.
+- GPS interference or poor reception can create route gaps; online maps need an internet connection.
+- Collection while the vehicle is off has been observed on the tested car, including after the app process stopped. A tablet/kernel reboot interrupts collection; recovery depends on Android and the vehicle firmware.
+- MQTT can miss live updates while offline. InfluxDB exports history progressively, and Telegram delivery depends on network and server availability.
+- Tailscale is optional and is not needed for local collection; its operation depends on the vehicle's network restrictions.
 
 ## Tested device
 
@@ -316,7 +298,7 @@ Archives can expose vehicle identifiers, raw Chinese descriptions, timestamps, t
 | --- | --- | --- | --- |
 | BYD Sea Lion 07 EV 2025 | China | 5.0 | Tested by the maintainer |
 
-The collector may work on other Chinese-market BYD vehicles, but their parameter catalogs and enum values must be verified independently.
+The collector may work on other Chinese-market BYD vehicles, but their available parameters and meanings must be verified independently.
 
 ## License and disclaimer
 
