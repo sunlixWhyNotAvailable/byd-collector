@@ -10,6 +10,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.PressInteraction
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -72,6 +73,8 @@ import androidx.compose.ui.unit.sp
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 
 private val CardShape = RoundedCornerShape(8.dp)
 private val ControlShape = RoundedCornerShape(7.dp)
@@ -290,6 +293,7 @@ fun SectionCard(
                 .fillMaxWidth()
                 .height(headerHeight)
                 .background(p.panelAlt)
+                .switchRowPressFeedback(headerInteraction, headerToggle?.enabled == true)
                 .switchTarget(headerToggle, headerInteraction)
                 .padding(horizontal = 14.dp),
             verticalAlignment = Alignment.CenterVertically
@@ -386,6 +390,54 @@ fun ActionButton(
     }
 }
 
+private val SwitchRowPressColor = Color(0xFF2F86F6)
+
+@Composable
+private fun Modifier.switchRowPressFeedback(
+    interactionSource: MutableInteractionSource,
+    enabled: Boolean
+): Modifier {
+    if (!enabled) return this
+    val p = LocalBydPalette.current
+    var visualPressed by remember(interactionSource) { mutableStateOf(false) }
+    LaunchedEffect(interactionSource) {
+        val activePresses = mutableSetOf<PressInteraction.Press>()
+        var releaseJob: Job? = null
+        fun release(press: PressInteraction.Press) {
+            activePresses -= press
+            if (activePresses.isEmpty()) {
+                releaseJob?.cancel()
+                releaseJob = launch {
+                    delay(90L)
+                    visualPressed = false
+                }
+            }
+        }
+        interactionSource.interactions.collect { interaction ->
+            when (interaction) {
+                is PressInteraction.Press -> {
+                    releaseJob?.cancel()
+                    activePresses += interaction
+                    visualPressed = true
+                }
+                is PressInteraction.Release -> release(interaction.press)
+                is PressInteraction.Cancel -> release(interaction.press)
+            }
+        }
+    }
+    val scale by animateFloatAsState(
+        targetValue = if (visualPressed) 0.97f else 1f,
+        label = "switchRowPressScale"
+    )
+    // Extend's visual hold is independent of the row's immediate toggle callback.
+    return this
+        .background(if (visualPressed) SwitchRowPressColor.copy(alpha = if (p.dark) 0.24f else 0.14f) else Color.Transparent)
+        .graphicsLayer {
+            scaleX = scale
+            scaleY = scale
+        }
+}
+
 @Composable
 fun SwitchControlRow(
     toggle: SwitchToggle,
@@ -395,7 +447,9 @@ fun SwitchControlRow(
 ) {
     val interactionSource = remember { MutableInteractionSource() }
     Row(
-        modifier = modifier.switchTarget(toggle, interactionSource),
+        modifier = modifier
+            .switchRowPressFeedback(interactionSource, toggle.enabled)
+            .switchTarget(toggle, interactionSource),
         horizontalArrangement = horizontalArrangement,
         verticalAlignment = Alignment.CenterVertically
     ) {

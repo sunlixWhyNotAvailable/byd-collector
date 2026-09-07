@@ -709,7 +709,7 @@ class BydCollectorUiContractTest {
         val target = components.substringAfter("private fun Modifier.switchTarget(").substringBefore("fun BydSwitch(")
         val thumb = components.substringAfter("fun BydSwitch(").substringBefore("fun InfoRow(")
 
-        assertTrue(row.contains("modifier.switchTarget(toggle, interactionSource)"))
+        assertInOrder(row, ".switchRowPressFeedback(interactionSource, toggle.enabled)", ".switchTarget(toggle, interactionSource)")
         assertTrue(row.contains("BydSwitch(toggle.checked, null, enabled = toggle.enabled, interactionSource = interactionSource)"))
         assertTrue(target.contains("if (toggle == null) this else toggleable("))
         listOf("value = toggle.checked", "enabled = toggle.enabled", "role = Role.Switch", "onValueChange = toggle.onChange")
@@ -721,6 +721,35 @@ class BydCollectorUiContractTest {
         assertTrue(thumb.contains("interactionSource.collectIsPressedAsState()"))
         assertTrue(thumb.contains(".size(width = 56.dp, height = 32.dp)"))
         assertTrue(thumb.contains("tween(durationMillis = 120)"))
+        assertFalse(thumb.contains("switchRowPressFeedback"))
+    }
+
+    @Test
+    fun switchRowPressFeedbackMatchesExtendWithoutDelayingOrLockingActions() {
+        val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
+        val feedback = components.substringAfter("private fun Modifier.switchRowPressFeedback(")
+            .substringBefore("fun SwitchControlRow(")
+
+        assertTrue(components.contains("private val SwitchRowPressColor = Color(0xFF2F86F6)"))
+        assertTrue(feedback.contains("if (!enabled) return this"))
+        assertTrue(feedback.contains("remember(interactionSource)"))
+        assertTrue(feedback.contains("LaunchedEffect(interactionSource)"))
+        assertTrue(feedback.contains("mutableSetOf<PressInteraction.Press>()"))
+        assertTrue(feedback.contains("if (activePresses.isEmpty())"))
+        assertInOrder(feedback, "releaseJob = launch", "delay(90L)")
+        assertInOrder(feedback, "delay(90L)", "visualPressed = false")
+        assertInOrder(feedback.substringAfter("is PressInteraction.Press ->"),
+            "releaseJob?.cancel()", "activePresses += interaction")
+        assertInOrder(feedback, "activePresses += interaction", "visualPressed = true")
+        assertTrue(feedback.contains("is PressInteraction.Release -> release(interaction.press)"))
+        assertTrue(feedback.contains("is PressInteraction.Cancel -> release(interaction.press)"))
+        assertTrue(feedback.contains("targetValue = if (visualPressed) 0.97f else 1f"))
+        assertTrue(feedback.contains("SwitchRowPressColor.copy(alpha = if (p.dark) 0.24f else 0.14f)"))
+        assertInOrder(feedback, ".background(", ".graphicsLayer")
+        assertTrue(feedback.contains("scaleX = scale"))
+        assertTrue(feedback.contains("scaleY = scale"))
+        listOf("animationSpec", "rememberForcedPressClick", "pressScaleModifier", "locked", "onValueChange", "toggleable", "clickable")
+            .forEach { assertFalse(feedback.contains(it), it) }
     }
 
     @Test
@@ -753,8 +782,13 @@ class BydCollectorUiContractTest {
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
         val section = components.substringAfter("fun SectionCard(").substringBefore("fun ActionButton(")
         assertInOrder(section, ".height(headerHeight)", ".switchTarget(headerToggle, headerInteraction)")
+        assertInOrder(section, ".background(p.panelAlt)",
+            ".switchRowPressFeedback(headerInteraction, headerToggle?.enabled == true)")
+        assertInOrder(section, ".switchRowPressFeedback(headerInteraction, headerToggle?.enabled == true)",
+            ".switchTarget(headerToggle, headerInteraction)")
         assertTrue(section.contains("BydSwitch(it.checked, null, enabled = it.enabled, interactionSource = headerInteraction)"))
         assertFalse(section.substringAfter(".padding(bodyPadding)").contains("switchTarget"))
+        assertFalse(section.substringAfter(".padding(bodyPadding)").contains("switchRowPressFeedback"))
         assertTrue(app.contains("headerToggle = SwitchToggle(messageConfig.enabled, { updateMessage(messageConfig.copy(enabled = it)) })"))
     }
 
