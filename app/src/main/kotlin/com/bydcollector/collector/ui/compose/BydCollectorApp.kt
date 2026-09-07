@@ -629,9 +629,11 @@ private fun MainCollectionCard(
             Spacer(Modifier.width(10.dp))
             ActionButton(strings.backgroundWork, actions::onOpenBackgroundApps, modifier = Modifier.weight(0.9f))
         }
-        Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
+        SwitchControlRow(
+            SwitchToggle(state?.autoStartEnabled == true, actions::onToggleMainAutoStart),
+            Modifier.fillMaxWidth().height(42.dp)
+        ) {
             Text(strings.autoStart, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            BydSwitch(state?.autoStartEnabled == true, actions::onToggleMainAutoStart)
         }
     }
 }
@@ -731,9 +733,11 @@ private fun AllParametersTab(
                             modifier = Modifier.weight(1f)
                         )
                     }
-                    Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
+                    SwitchControlRow(
+                        SwitchToggle(state?.debugAutoStartEnabled == true, actions::onToggleDebugAutoStart, enabled = state?.autoStartEnabled == true),
+                        Modifier.fillMaxWidth().height(42.dp)
+                    ) {
                         Text(strings.autoStart, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                        BydSwitch(state?.debugAutoStartEnabled == true, actions::onToggleDebugAutoStart, enabled = state?.autoStartEnabled == true)
                     }
                     Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
                         Text(strings.parametersPerCycle, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
@@ -1352,9 +1356,13 @@ private fun HaTab(
     TabScrollColumn(AppTab.HA, session, contentReady) {
         Row(Modifier.fillMaxWidth().height(36.dp), verticalAlignment = Alignment.CenterVertically) {
             ScreenTitle(strings.haTab, strings.haSubtitle, modifier = Modifier.weight(1f))
-            Text(strings.sharedCategories, color = LocalBydPalette.current.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.width(10.dp))
-            BydSwitch(state?.haSharedCategoriesEnabled == true, actions::onToggleSharedCategories, enabled = state?.influxEnabled != true)
+            SwitchControlRow(
+                SwitchToggle(state?.haSharedCategoriesEnabled == true, actions::onToggleSharedCategories, enabled = state?.influxEnabled != true),
+                Modifier.height(36.dp)
+            ) {
+                Text(strings.sharedCategories, color = LocalBydPalette.current.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.width(10.dp))
+            }
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             MqttCard(state, strings, mqttDraft, actions, actionUiState, Modifier.weight(1f))
@@ -1452,10 +1460,9 @@ private fun ChannelQueueRow(
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+        SwitchControlRow(SwitchToggle(autoStart, onAutoStartChanged), Modifier.weight(1f).height(42.dp)) {
             Text(strings.autoStart, color = LocalBydPalette.current.text, fontSize = 14.sp,
                 fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            BydSwitch(autoStart, onAutoStartChanged)
         }
         ReadOnlyPathField("${strings.queued}:   $pendingText", Modifier.weight(1f).padding(horizontal = 24.dp))
     }
@@ -1695,9 +1702,9 @@ private fun TelegramConnectionCard(
     onTestConnection: () -> Unit
 ) {
     SectionCard(title = strings.telegram.connection, modifier = Modifier.fillMaxWidth()) {
-        Row(
-            modifier = Modifier.fillMaxWidth().height(42.dp),
-            verticalAlignment = Alignment.CenterVertically
+        SwitchControlRow(
+            SwitchToggle(config.enabled, { onConfigChanged(config.copy(enabled = it)) }),
+            modifier = Modifier.fillMaxWidth().height(42.dp)
         ) {
             Text(
                 strings.telegram.enable,
@@ -1706,7 +1713,6 @@ private fun TelegramConnectionCard(
                 fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.weight(1f)
             )
-            BydSwitch(config.enabled, { onConfigChanged(config.copy(enabled = it)) })
         }
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1811,9 +1817,7 @@ private fun TelegramMessageCard(
     SectionCard(
         title = localized.title,
         headerWarning = templateLimitWarning,
-        trailing = {
-            BydSwitch(messageConfig.enabled, { updateMessage(messageConfig.copy(enabled = it)) })
-        },
+        headerToggle = SwitchToggle(messageConfig.enabled, { updateMessage(messageConfig.copy(enabled = it)) }),
         modifier = modifier
     ) {
         val setting = telegramNumberSetting(definition.type, config, strings.telegram, onConfigChanged)
@@ -1965,9 +1969,8 @@ private fun TelegramLocationDialog(
             ) {
                 Text(strings.locationSettings, color = p.text, fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(8.dp))
-                Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
+                SwitchControlRow(SwitchToggle(selectedEnabled, { selectedEnabled = it }), Modifier.fillMaxWidth().height(42.dp)) {
                     Text(strings.locationMaster, color = p.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                    BydSwitch(selectedEnabled, { selectedEnabled = it })
                 }
                 listOf(
                     TelegramNavigatorMask.GOOGLE to strings.googleNavigator,
@@ -1975,11 +1978,13 @@ private fun TelegramLocationDialog(
                     TelegramNavigatorMask.APPLE to strings.appleNavigator,
                     TelegramNavigatorMask.OSM to strings.osmNavigator
                 ).forEach { (bit, label) ->
-                    Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text(label, color = p.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                        BydSwitch((selectedMask and bit) != 0, { checked ->
+                    SwitchControlRow(
+                        SwitchToggle((selectedMask and bit) != 0, { checked ->
                             selectedMask = if (checked) selectedMask or bit else selectedMask and bit.inv()
-                        })
+                        }),
+                        Modifier.fillMaxWidth().height(42.dp)
+                    ) {
+                        Text(label, color = p.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
                     }
                 }
                 Spacer(Modifier.height(14.dp))
@@ -2211,9 +2216,9 @@ private fun ExtraTab(
 private fun TailscaleRuntimeRow(strings: UiStrings, enabled: Boolean, onChange: (Boolean) -> Unit) {
     val p = LocalBydPalette.current
     Column(Modifier.fillMaxWidth()) {
-        Row(
+        SwitchControlRow(
+            SwitchToggle(enabled, onChange),
             modifier = Modifier.fillMaxWidth().heightIn(min = 72.dp),
-            verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -2234,7 +2239,6 @@ private fun TailscaleRuntimeRow(strings: UiStrings, enabled: Boolean, onChange: 
                     overflow = TextOverflow.Ellipsis
                 )
             }
-            BydSwitch(enabled, onChange)
         }
         Box(Modifier.fillMaxWidth().height(1.dp).background(p.border))
     }
@@ -2246,9 +2250,9 @@ private fun UpdateSettingsRow(
     updateAutoCheckEnabled: Boolean,
     actions: BydCollectorActions
 ) {
-    Row(
+    SwitchControlRow(
+        SwitchToggle(updateAutoCheckEnabled, actions::onToggleUpdateAutoCheck),
         modifier = Modifier.fillMaxWidth().heightIn(min = 72.dp),
-        verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -2270,7 +2274,6 @@ private fun UpdateSettingsRow(
             )
         }
         ActionButton(strings.checkUpdates, actions::onCheckForUpdates, modifier = Modifier.width(210.dp))
-        BydSwitch(updateAutoCheckEnabled, actions::onToggleUpdateAutoCheck)
     }
 }
 
@@ -2405,9 +2408,8 @@ private fun SwitchRow(
 ) {
     val p = LocalBydPalette.current
     Column(Modifier.fillMaxWidth()) {
-        Row(Modifier.fillMaxWidth().height(42.dp), verticalAlignment = Alignment.CenterVertically) {
+        SwitchControlRow(SwitchToggle(checked, onChange), Modifier.fillMaxWidth().height(42.dp)) {
             Text(label, color = p.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            BydSwitch(checked, onChange)
         }
         if (divider) {
             Box(Modifier.fillMaxWidth().height(1.dp).background(p.border))

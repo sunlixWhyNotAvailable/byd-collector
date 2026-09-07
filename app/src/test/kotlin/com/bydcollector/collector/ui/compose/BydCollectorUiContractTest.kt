@@ -120,7 +120,7 @@ class BydCollectorUiContractTest {
         assertTrue(components.contains(".size(width = 56.dp, height = 32.dp)"))
         assertTrue(components.contains(".size(thumbSize)"))
         assertTrue(components.contains(".background(if (binary || checked) p.switchThumbOn else p.switchThumbOff)"))
-        assertTrue(components.contains("onCheckedChange(!checked)"))
+        assertTrue(components.contains("onValueChange = toggle.onChange"))
         assertTrue(app.contains(".pressScaleModifier(interactionSource, forcePressed = press.visualPressed)"))
         assertTrue(app.contains(".background(if (selected) p.active else p.surface, Rounded8)"))
     }
@@ -695,11 +695,67 @@ class BydCollectorUiContractTest {
         assertFalse(components.contains("SwitchPendingState"))
         assertFalse(components.contains("visuallyPending"))
         assertFalse(components.contains("onCheckedChange(current.target)"))
-        assertTrue(components.contains("onCheckedChange(!checked)"))
+        assertTrue(components.contains("onValueChange = toggle.onChange"))
         assertFalse(activity.contains("dashboardRefreshVersion"))
         assertTrue(activity.contains("private var forcedRefreshPending = false"))
         assertFalse(app.contains("switchConfirmationVersion"))
         assertFalse(activity.contains("switchConfirmationVersion"))
+    }
+
+    @Test
+    fun switchRowsHaveOneSemanticOwnerAndShareTheOriginalPressedFeedback() {
+        val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
+        val row = components.substringAfter("fun SwitchControlRow(").substringBefore("data class SwitchToggle(")
+        val target = components.substringAfter("private fun Modifier.switchTarget(").substringBefore("fun BydSwitch(")
+        val thumb = components.substringAfter("fun BydSwitch(").substringBefore("fun InfoRow(")
+
+        assertTrue(row.contains("modifier.switchTarget(toggle, interactionSource)"))
+        assertTrue(row.contains("BydSwitch(toggle.checked, null, enabled = toggle.enabled, interactionSource = interactionSource)"))
+        assertTrue(target.contains("if (toggle == null) this else toggleable("))
+        listOf("value = toggle.checked", "enabled = toggle.enabled", "role = Role.Switch", "onValueChange = toggle.onChange")
+            .forEach { assertTrue(target.contains(it), it) }
+        assertFalse(target.contains("delay("))
+        assertFalse(target.contains("remember"))
+        assertTrue(thumb.contains("onCheckedChange?.let { SwitchToggle(checked, it, enabled) }"))
+        assertFalse(thumb.contains(".clickable("))
+        assertTrue(thumb.contains("interactionSource.collectIsPressedAsState()"))
+        assertTrue(thumb.contains(".size(width = 56.dp, height = 32.dp)"))
+        assertTrue(thumb.contains("tween(durationMillis = 120)"))
+    }
+
+    @Test
+    fun wholeRowTogglesPreserveRuntimeCallbacksGatesAndIndependentControls() {
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        assertFalse(app.contains("BydSwitch("), "Screen thumbs must belong to the semantic row/header")
+        listOf(
+            "SwitchToggle(state?.autoStartEnabled == true, actions::onToggleMainAutoStart)",
+            "SwitchToggle(state?.debugAutoStartEnabled == true, actions::onToggleDebugAutoStart, enabled = state?.autoStartEnabled == true)",
+            "SwitchToggle(state?.haSharedCategoriesEnabled == true, actions::onToggleSharedCategories, enabled = state?.influxEnabled != true)",
+            "SwitchToggle(autoStart, onAutoStartChanged)",
+            "SwitchToggle(config.enabled, { onConfigChanged(config.copy(enabled = it)) })",
+            "SwitchToggle(selectedEnabled, { selectedEnabled = it })",
+            "SwitchToggle((selectedMask and bit) != 0",
+            "SwitchToggle(enabled, onChange)",
+            "SwitchToggle(updateAutoCheckEnabled, actions::onToggleUpdateAutoCheck)",
+            "SwitchToggle(checked, onChange)"
+        ).forEach { assertTrue(app.contains(it), it) }
+        val update = app.substringAfter("private fun UpdateSettingsRow(").substringBefore("private fun ShutdownSettingsRow(")
+        assertTrue(update.contains("ActionButton(strings.checkUpdates, actions::onCheckForUpdates, modifier = Modifier.width(210.dp))"))
+        assertFalse(update.contains("onCheckForUpdates()"))
+        val queue = app.substringAfter("private fun ChannelQueueRow(").substringBefore("private fun ChannelButtons(")
+        assertInOrder(queue, "SwitchControlRow(", "ReadOnlyPathField(")
+        assertFalse(queue.substringAfter("ReadOnlyPathField(").contains("SwitchToggle("))
+    }
+
+    @Test
+    fun messageToggleOwnsOnlyTheSectionHeaderNotItsBody() {
+        val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val section = components.substringAfter("fun SectionCard(").substringBefore("fun ActionButton(")
+        assertInOrder(section, ".height(headerHeight)", ".switchTarget(headerToggle, headerInteraction)")
+        assertTrue(section.contains("BydSwitch(it.checked, null, enabled = it.enabled, interactionSource = headerInteraction)"))
+        assertFalse(section.substringAfter(".padding(bodyPadding)").contains("switchTarget"))
+        assertTrue(app.contains("headerToggle = SwitchToggle(messageConfig.enabled, { updateMessage(messageConfig.copy(enabled = it)) })"))
     }
 
     @Test
@@ -738,7 +794,7 @@ class BydCollectorUiContractTest {
         val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
 
         assertTrue(components.contains("internal fun rememberKeyboardCommit"))
-        assertTrue(components.contains("WindowInsets.ime.getBottom"))
+        assertFalse(components.contains("WindowInsets.ime.getBottom"))
         assertTrue(components.contains("if (!focused)"))
         assertTrue(components.contains("keyboardController?.hide()"))
         assertTrue(components.contains("focusManager.clearFocus()"))
@@ -765,6 +821,22 @@ class BydCollectorUiContractTest {
             .substringBefore("SectionCard(")
         assertTrue(storage.contains("ActionButton(strings.ok"))
         assertFalse(storage.contains("TextInput("))
+    }
+
+    @Test
+    fun keyboardDismissalUsesFocusedRootInsetsWithoutPollingOrAnotherSavePath() {
+        val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
+        val helper = components.substringAfter("internal fun rememberKeyboardCommit")
+            .substringBefore("data class ForcedPressClick").replace("\r\n", "\n")
+        assertTrue(helper.contains("DisposableEffect(view, focused)"))
+        assertTrue(helper.contains("ViewCompat.getRootWindowInsets(view)?.isVisible(WindowInsetsCompat.Type.ime())"))
+        assertTrue(helper.contains("if (focused) {\n            listener.onGlobalLayout()\n            observer.addOnGlobalLayoutListener(listener)"))
+        assertTrue(helper.contains("if (observer.isAlive) observer.removeOnGlobalLayoutListener(listener)"))
+        assertTrue(helper.contains("else if (focused && imeWasVisible)"))
+        assertTrue(helper.contains("imeWasVisible = false"))
+        assertTrue(helper.contains("imeVisible = false"))
+        listOf("delay(", "while (", "onValueChange", "setSoftInputMode", "setDecorFitsSystemWindows")
+            .forEach { assertFalse(helper.contains(it), it) }
     }
 
     @Test

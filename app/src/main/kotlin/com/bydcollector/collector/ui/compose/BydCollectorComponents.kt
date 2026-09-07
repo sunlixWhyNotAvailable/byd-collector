@@ -1,5 +1,6 @@
 package com.bydcollector.collector.ui.compose
 
+import android.view.ViewTreeObserver
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
@@ -17,7 +18,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -26,13 +26,14 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -52,6 +53,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -66,6 +69,8 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import kotlinx.coroutines.delay
 
 private val CardShape = RoundedCornerShape(8.dp)
@@ -82,16 +87,31 @@ internal data class KeyboardCommitHandle(
 internal fun rememberKeyboardCommit(): KeyboardCommitHandle {
     val focusManager = LocalFocusManager.current
     val keyboardController = LocalSoftwareKeyboardController.current
-    val density = LocalDensity.current
+    val view = LocalView.current
     var focused by remember { mutableStateOf(false) }
     var imeWasVisible by remember { mutableStateOf(false) }
-    val imeVisible = WindowInsets.ime.getBottom(density) > 0
+    var imeVisible by remember { mutableStateOf(false) }
+
+    DisposableEffect(view, focused) {
+        //the non-edge-to-edge window consumes Compose IME insets; observe the root only while editing
+        val observer = view.viewTreeObserver
+        val listener = ViewTreeObserver.OnGlobalLayoutListener {
+            imeVisible = ViewCompat.getRootWindowInsets(view)?.isVisible(WindowInsetsCompat.Type.ime()) == true
+        }
+        if (focused) {
+            listener.onGlobalLayout()
+            observer.addOnGlobalLayoutListener(listener)
+        }
+        onDispose {
+            if (observer.isAlive) observer.removeOnGlobalLayoutListener(listener)
+        }
+    }
 
     fun commit() {
         if (!focused) return
+        imeWasVisible = false
         keyboardController?.hide()
         focusManager.clearFocus()
-        imeWasVisible = false
     }
 
     LaunchedEffect(focused, imeVisible) {
@@ -105,7 +125,13 @@ internal fun rememberKeyboardCommit(): KeyboardCommitHandle {
     }
 
     return KeyboardCommitHandle(
-        modifier = Modifier.onFocusChanged { focused = it.isFocused },
+        modifier = Modifier.onFocusChanged {
+            focused = it.isFocused
+            if (!focused) {
+                imeWasVisible = false
+                imeVisible = false
+            }
+        },
         onDone = ::commit
     )
 }
@@ -248,9 +274,11 @@ fun SectionCard(
     trailing: (@Composable () -> Unit)? = null,
     bodyPadding: Dp = 14.dp,
     headerHeight: Dp = 42.dp,
+    headerToggle: SwitchToggle? = null,
     content: @Composable () -> Unit
 ) {
     val p = LocalBydPalette.current
+    val headerInteraction = remember { MutableInteractionSource() }
     Column(
         modifier = modifier
             .clip(CardShape)
@@ -262,6 +290,7 @@ fun SectionCard(
                 .fillMaxWidth()
                 .height(headerHeight)
                 .background(p.panelAlt)
+                .switchTarget(headerToggle, headerInteraction)
                 .padding(horizontal = 14.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -283,6 +312,9 @@ fun SectionCard(
                 }
             }
             if (trailing != null) trailing()
+            headerToggle?.let {
+                BydSwitch(it.checked, null, enabled = it.enabled, interactionSource = headerInteraction)
+            }
         }
         Column(
             modifier = Modifier
@@ -355,15 +387,49 @@ fun ActionButton(
 }
 
 @Composable
+fun SwitchControlRow(
+    toggle: SwitchToggle,
+    modifier: Modifier = Modifier,
+    horizontalArrangement: Arrangement.Horizontal = Arrangement.Start,
+    content: @Composable RowScope.() -> Unit
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    Row(
+        modifier = modifier.switchTarget(toggle, interactionSource),
+        horizontalArrangement = horizontalArrangement,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        content()
+        BydSwitch(toggle.checked, null, enabled = toggle.enabled, interactionSource = interactionSource)
+    }
+}
+
+data class SwitchToggle(
+    val checked: Boolean,
+    val onChange: (Boolean) -> Unit,
+    val enabled: Boolean = true
+)
+
+private fun Modifier.switchTarget(toggle: SwitchToggle?, interactionSource: MutableInteractionSource): Modifier =
+    if (toggle == null) this else toggleable(
+        value = toggle.checked,
+        enabled = toggle.enabled,
+        role = Role.Switch,
+        interactionSource = interactionSource,
+        indication = null,
+        onValueChange = toggle.onChange
+    )
+
+@Composable
 fun BydSwitch(
     checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit,
+    onCheckedChange: ((Boolean) -> Unit)?,
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
-    binary: Boolean = false
+    binary: Boolean = false,
+    interactionSource: MutableInteractionSource = remember { MutableInteractionSource() }
 ) {
     val p = LocalBydPalette.current
-    val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
 
     val track = when {
@@ -396,9 +462,7 @@ fun BydSwitch(
             .clip(PillShape)
             .background(track)
             .border(1.dp, if (binary || checked) p.accent else p.border, PillShape)
-            .clickable(enabled = enabled, interactionSource = interactionSource, indication = null) {
-                onCheckedChange(!checked)
-            }
+            .switchTarget(onCheckedChange?.let { SwitchToggle(checked, it, enabled) }, interactionSource)
             .padding(3.dp),
         contentAlignment = Alignment.CenterStart
     ) {
