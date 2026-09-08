@@ -122,11 +122,11 @@ class DirectDebugRoundRobinPollerTest {
         val shards = assets.map { DirectDebugParameterAsset.parse(it.readText(Charsets.UTF_8)) }
         val rows = shards.flatten()
 
-        assertEquals("fid-catalog-20260804-6e29ad30-main81-roundrobin23096-both-read-tx-v1", DirectDebugParameterAsset.SOURCE_VERSION)
-        assertEquals(listOf(7_699, 7_699, 7_698), shards.map { it.size })
-        assertEquals(23_096, rows.size)
-        assertEquals(7_699, DirectDebugParameterAsset.MAX_SHARD_SIZE)
-        assertEquals(rows.size, com.bydcollector.collector.direct.CollectorHelperProtocol.MAX_BATCH_SIZE)
+        assertEquals("fid-catalog-20260908-main95-roundrobin23083-both-read-tx-v1", DirectDebugParameterAsset.SOURCE_VERSION)
+        assertEquals(listOf(7_692, 7_693, 7_698), shards.map { it.size })
+        assertEquals(23_083, rows.size)
+        assertEquals(7_698, DirectDebugParameterAsset.MAX_SHARD_SIZE)
+        assertTrue(rows.size <= com.bydcollector.collector.direct.CollectorHelperProtocol.MAX_BATCH_SIZE)
         assets.forEach { asset ->
             assertEquals(DirectDebugParameterAsset.EXPECTED_HEADER, asset.useLines(Charsets.UTF_8) { it.first().split(",") })
         }
@@ -144,8 +144,8 @@ class DirectDebugRoundRobinPollerTest {
 
         assertEquals(
             listOf(
-                "7A448F762B52976501FBFFEEBEA8EAEADC443A5C5E3B476B84E8F61C37BD149A",
-                "0A95E822EA78502EBC98B20361502E8D43E596B3E683A0E0F8AC266AC2B06CB1",
+                "C50FF5A6BCEAEBC374EC16E6797D06BBB6F07DDC841BC743F98076C6CCA07452",
+                "89E07B554DD8E305CEF1A6778032CFFCF1E2C1E2A13DC62C4449E1F425F569F0",
                 "265A61C5098528D504BF2C08389E0D10CFB62BAED7B6CDE6E8ECFD27430DC132"
             ),
             assets.map(::sha256)
@@ -161,6 +161,16 @@ class DirectDebugRoundRobinPollerTest {
         val prodSignatures = com.bydcollector.collector.data.direct.DirectFidRegistry.entries
             .map { Triple(it.dev, it.fid, it.tx) }
         assertEquals(prodSignatures.size, prodSignatures.distinct().size)
+        val promoted = prodSignatures.drop(82)
+        assertEquals(13, promoted.size)
+        promoted.forEach { signature ->
+            assertTrue(signature !in debugSignatures)
+            val otherReadTx = if (signature.third == 5) 7 else 5
+            assertTrue(Triple(signature.first, signature.second, otherReadTx) in debugSignatures)
+        }
+        assertTrue(Triple(1014, 877658152, 5) in debugSignatures)
+        assertTrue(Triple(1009, 666894360, 7) in debugSignatures)
+        assertTrue(Triple(1023, 1267728400, 5) in debugSignatures)
 
         assertEquals(
             setOf(Triple(1001, 315621418, 5)),
@@ -180,7 +190,7 @@ class DirectDebugRoundRobinPollerTest {
         val cursor = DirectDebugRoundRobinCursor(rows)
         val batch = cursor.nextBatch(DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT)
 
-        assertEquals(23_096, batch.size)
+        assertEquals(23_083, batch.size)
         assertEquals(rows.map { it.key }, batch.map { it.key })
         assertEquals(rows.size, batch.map { Triple(it.dev, it.fid, it.tx) }.distinct().size)
         assertEquals(batch.map { it.key }, cursor.nextBatch(DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT).map { it.key })

@@ -29,6 +29,17 @@ class VehicleStateNormalizer(
         pollId: Long,
         observedAt: String
     ): NormalizedObservation {
+        if (field.normalizerId == "charging_time_remaining_hh_mm_ss") {
+            val result = normalizeChargingTimeRemaining(field, byKey)
+            return observation(
+                field = field,
+                pollId = pollId,
+                observedAt = observedAt,
+                sourceKey = field.sourceKeys.joinToString("+"),
+                quality = result.quality,
+                value = result.value
+            )
+        }
         if (field.normalizerId in DERIVED_HV_POWER_NORMALIZERS) {
             //derives hv power from voltage/current because the charge-power source does not represent discharge
             val result = when (field.normalizerId) {
@@ -113,6 +124,10 @@ class VehicleStateNormalizer(
             "nonzero_true" -> normalizeBoolean(field, rawOnly(reading))
             "door_lock_state_locked" -> normalizeDoorLockState(rawOnly(reading))
             "charging_gun_connected_openapi" -> normalizeMappedBoolean(rawOnly(reading), CHARGING_GUN_CONNECTED)
+            "charging_gun_type_openapi" -> normalizeEnumText(rawOnly(reading), CHARGING_GUN_TYPE)
+            "charging_type_openapi" -> normalizeEnumText(rawOnly(reading), CHARGING_TYPE)
+            "charging_battery_device_state_openapi" -> normalizeEnumText(rawOnly(reading), CHARGING_BATTERY_DEVICE_STATE)
+            "strict_binary_flag" -> normalizeMappedBoolean(rawOnly(reading), STRICT_BINARY_FLAG)
             "charger_connected_openapi" -> normalizeMappedBoolean(rawOnly(reading), CHARGER_CONNECTED)
             "gearbox_auto_mode_openapi" -> normalizeEnumText(rawOnly(reading), GEARBOX_AUTO_MODE)
             "tyre_pressure_state_openapi" -> normalizeEnumText(rawOnly(reading), TYRE_PRESSURE_STATE)
@@ -180,6 +195,29 @@ class VehicleStateNormalizer(
             0 -> NormalizedQuality.MISSING to emptyValue(NormalizedValueType.BOOLEAN)
             else -> NormalizedQuality.INVALID to emptyValue(NormalizedValueType.BOOLEAN)
         }
+    }
+
+    private fun normalizeChargingTimeRemaining(
+        field: NormalizedFieldDefinition,
+        byKey: Map<String, PollReading>
+    ): NormalizedResult {
+        val hourReading = byKey[field.sourceKeys[0]]
+        val minuteReading = byKey[field.sourceKeys[1]]
+        if (hourReading?.rawValue == null || minuteReading?.rawValue == null) {
+            return NormalizedResult(NormalizedQuality.MISSING, emptyValue(field.valueType))
+        }
+        val hours = parseInteger(hourReading.rawValue)?.takeIf { it in 0..254 }
+        val minutes = parseInteger(minuteReading.rawValue)?.takeIf { it in 0..59 }
+        if (hours == null || minutes == null) {
+            return NormalizedResult(NormalizedQuality.INVALID, emptyValue(field.valueType))
+        }
+        return NormalizedResult(
+            NormalizedQuality.OK,
+            NormalizedValue(
+                type = NormalizedValueType.TEXT,
+                text = String.format(Locale.US, "%02d:%02d:00", hours, minutes)
+            )
+        )
     }
 
     private fun normalizeMappedBoolean(
@@ -378,6 +416,37 @@ class VehicleStateNormalizer(
             4 to true,
             5 to true
         )
+        val CHARGING_GUN_TYPE = mapOf(
+            1 to "none",
+            2 to "ac",
+            3 to "dc",
+            4 to "ac_dc",
+            5 to "vtol"
+        )
+        val CHARGING_TYPE = mapOf(
+            1 to "default",
+            2 to "ac",
+            3 to "vtog",
+            4 to "gb_dc",
+            5 to "gb_non_dc"
+        )
+        val CHARGING_BATTERY_DEVICE_STATE = mapOf(
+            0 to "ready",
+            1 to "charging",
+            2 to "finished",
+            3 to "discharg",
+            4 to "charg_terminate",
+            5 to "breakdown_c10",
+            6 to "breakdown_charging_gun",
+            7 to "breakdown_charger",
+            8 to "breakdown_ac",
+            9 to "schedule",
+            10 to "discharg_cbu",
+            11 to "timeout",
+            12 to "discharg_finish",
+            13 to "charging_pause"
+        )
+        val STRICT_BINARY_FLAG = mapOf(0 to false, 1 to true)
         val CHARGER_CONNECTED = mapOf(0 to false, 1 to true)
     }
 }

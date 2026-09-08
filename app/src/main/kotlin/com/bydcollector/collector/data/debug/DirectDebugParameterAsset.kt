@@ -44,11 +44,11 @@ object DirectDebugParameterAsset {
         "direct_debug_round_robin_parameters_2.csv",
         "direct_debug_round_robin_parameters_3.csv"
     )
-    val EXPECTED_SHARD_SIZES = listOf(7_699, 7_699, 7_698)
+    val EXPECTED_SHARD_SIZES = listOf(7_692, 7_693, 7_698)
     const val SHARD_COUNT = 3
-    const val MAX_SHARD_SIZE = 7_699
-    const val TOTAL_PARAMETER_COUNT = 23_096
-    const val SOURCE_VERSION = "fid-catalog-20260804-6e29ad30-main81-roundrobin23096-both-read-tx-v1"
+    const val MAX_SHARD_SIZE = 7_698
+    const val TOTAL_PARAMETER_COUNT = 23_083
+    const val SOURCE_VERSION = "fid-catalog-20260908-main95-roundrobin23083-both-read-tx-v1"
     val EXPECTED_HEADER = listOf(
         "key",
         "feature_group",

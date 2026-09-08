@@ -374,11 +374,206 @@ class VehicleStateNormalizerTest {
     }
 
     @Test
+    fun chargingEnumsExposeExactStableTextAndRejectUnknownCodes() {
+        val cases = listOf(
+            Triple(NormalizedFieldCatalog.chargingGunType, "charging_1009_876609586_5", mapOf(1 to "none", 2 to "ac", 3 to "dc", 4 to "ac_dc", 5 to "vtol")),
+            Triple(NormalizedFieldCatalog.chargingType, "charging_1009_876609592_5", mapOf(1 to "default", 2 to "ac", 3 to "vtog", 4 to "gb_dc", 5 to "gb_non_dc")),
+            Triple(
+                NormalizedFieldCatalog.chargingBatteryDeviceState,
+                "charging_1009_876609560_5",
+                mapOf(
+                    0 to "ready",
+                    1 to "charging",
+                    2 to "finished",
+                    3 to "discharg",
+                    4 to "charg_terminate",
+                    5 to "breakdown_c10",
+                    6 to "breakdown_charging_gun",
+                    7 to "breakdown_charger",
+                    8 to "breakdown_ac",
+                    9 to "schedule",
+                    10 to "discharg_cbu",
+                    11 to "timeout",
+                    12 to "discharg_finish",
+                    13 to "charging_pause"
+                )
+            )
+        )
+
+        cases.forEach { (field, sourceKey, mapping) ->
+            mapping.forEach { (raw, expected) ->
+                val observation = VehicleStateNormalizer(catalog = listOf(field)).normalize(
+                    pollId = 80L,
+                    observedAt = "2026-09-08T12:00:00+03:00",
+                    readings = listOf(PollReading(sourceKey, raw.toString()))
+                ).single()
+                assertEquals(NormalizedQuality.OK, observation.quality, "${field.fieldKey}:$raw")
+                assertEquals(expected, observation.value.text, "${field.fieldKey}:$raw")
+                assertEquals("2026-09-08T12:00:00+03:00", observation.observedAt)
+            }
+            listOf(14, 15, 255).filterNot(mapping::containsKey).forEach { raw ->
+                val observation = VehicleStateNormalizer(catalog = listOf(field)).normalize(
+                    pollId = 81L,
+                    observedAt = "2026-09-08T12:00:01+03:00",
+                    readings = listOf(PollReading(sourceKey, raw.toString()))
+                ).single()
+                assertEquals(NormalizedQuality.INVALID, observation.quality, "${field.fieldKey}:$raw")
+                assertEquals(null, observation.value.text)
+            }
+        }
+    }
+
+    @Test
+    fun chargingEtaUsesSamePollPairWithoutDayWrapAndRecoversAfterInvalidInput() {
+        val field = NormalizedFieldCatalog.chargingTimeRemaining
+        val normalizer = VehicleStateNormalizer(catalog = listOf(field))
+        val hourKey = field.sourceKeys[0]
+        val minuteKey = field.sourceKeys[1]
+        val validCases = listOf(
+            0 to (0 to "00:00:00"),
+            9 to (17 to "09:17:00"),
+            36 to (50 to "36:50:00"),
+            100 to (5 to "100:05:00")
+        )
+
+        validCases.forEachIndexed { index, (hours, minuteAndExpected) ->
+            val (minutes, expected) = minuteAndExpected
+            val observation = normalizer.normalize(
+                pollId = 90L + index,
+                observedAt = "2026-09-08T12:00:0$index+03:00",
+                readings = listOf(PollReading(hourKey, hours.toString()), PollReading(minuteKey, minutes.toString()))
+            ).single()
+            assertEquals(NormalizedQuality.OK, observation.quality)
+            assertEquals(expected, observation.value.text)
+            assertEquals("$hourKey+$minuteKey", observation.sourceKey)
+        }
+
+        val invalidCases = listOf(
+            listOf(PollReading(hourKey, "255"), PollReading(minuteKey, "17")) to NormalizedQuality.INVALID,
+            listOf(PollReading(hourKey, "9"), PollReading(minuteKey, "60")) to NormalizedQuality.INVALID,
+            listOf(PollReading(hourKey, "bad"), PollReading(minuteKey, "17")) to NormalizedQuality.INVALID,
+            listOf(PollReading(hourKey, "9")) to NormalizedQuality.MISSING,
+            listOf(PollReading(hourKey, "9"), PollReading(minuteKey, null)) to NormalizedQuality.MISSING
+        )
+        invalidCases.forEachIndexed { index, (readings, quality) ->
+            val observation = normalizer.normalize(
+                pollId = 100L + index,
+                observedAt = "2026-09-08T12:01:0$index+03:00",
+                readings = readings
+            ).single()
+            assertEquals(quality, observation.quality)
+            assertEquals(null, observation.value.text)
+        }
+
+        val recovered = normalizer.normalize(
+            pollId = 110L,
+            observedAt = "2026-09-08T12:02:00+03:00",
+            readings = listOf(PollReading(hourKey, "9"), PollReading(minuteKey, "17"))
+        ).single()
+        assertEquals(NormalizedQuality.OK, recovered.quality)
+        assertEquals("09:17:00", recovered.value.text)
+    }
+
+    @Test
+    fun step3PercentagesAndInstallationFlagsUseStrictFieldSpecificValidation() {
+        val fields = listOf(
+            NormalizedFieldCatalog.rightFrontWindowPercent,
+            NormalizedFieldCatalog.perfume1RemainingPercent,
+            NormalizedFieldCatalog.perfume2RemainingPercent,
+            NormalizedFieldCatalog.perfume3RemainingPercent,
+            NormalizedFieldCatalog.perfume1Installed,
+            NormalizedFieldCatalog.perfume2Installed,
+            NormalizedFieldCatalog.perfume3Installed
+        )
+        val observedAt = "2026-09-08T13:00:00+03:00"
+        val output = VehicleStateNormalizer(catalog = fields).normalize(
+            pollId = 120L,
+            observedAt = observedAt,
+            readings = listOf(
+                PollReading("bodywork_1001_1267728400_5", "42", "42"),
+                PollReading("ac_1000_1242562584_5", "79", "79"),
+                PollReading("ac_1000_1242562592_5", "81", "81"),
+                PollReading("ac_1000_1242562600_5", "83", "83"),
+                PollReading("ac_1000_1242562612_5", "0"),
+                PollReading("ac_1000_1242562614_5", "1"),
+                PollReading("ac_1000_1242562616_5", "0")
+            )
+        ).associateBy { it.field.fieldKey }
+
+        assertEquals(42.0, output.getValue("rf_window_percent").value.number)
+        assertEquals(79.0, output.getValue("perfume_1_remaining_percent").value.number)
+        assertEquals(81.0, output.getValue("perfume_2_remaining_percent").value.number)
+        assertEquals(83.0, output.getValue("perfume_3_remaining_percent").value.number)
+        assertEquals(false, output.getValue("perfume_1_installed").value.bool)
+        assertEquals(true, output.getValue("perfume_2_installed").value.bool)
+        assertEquals(false, output.getValue("perfume_3_installed").value.bool)
+        output.values.forEach {
+            assertEquals(NormalizedQuality.OK, it.quality)
+            assertEquals(observedAt, it.observedAt)
+        }
+
+        val invalid = VehicleStateNormalizer(
+            catalog = listOf(
+                NormalizedFieldCatalog.rightFrontWindowPercent,
+                NormalizedFieldCatalog.perfume1RemainingPercent,
+                NormalizedFieldCatalog.perfume1Installed
+            )
+        ).normalize(
+            pollId = 121L,
+            observedAt = observedAt,
+            readings = listOf(
+                PollReading("bodywork_1001_1267728400_5", "101"),
+                PollReading("ac_1000_1242562584_5", "255"),
+                PollReading("ac_1000_1242562612_5", "2")
+            )
+        )
+        invalid.forEach { observation ->
+            assertEquals(NormalizedQuality.INVALID, observation.quality)
+            assertEquals(null, observation.value.number)
+            assertEquals(null, observation.value.bool)
+        }
+    }
+
+    @Test
+    fun step3MotorRawValuesPreserveSignedNumbersWithoutUnitsOrScaling() {
+        val fields = listOf(
+            NormalizedFieldCatalog.frontMotorCurrentRaw,
+            NormalizedFieldCatalog.rearMotorCurrentRaw
+        )
+        val observedAt = "2026-09-08T13:01:00+03:00"
+        val output = VehicleStateNormalizer(catalog = fields).normalize(
+            pollId = 122L,
+            observedAt = observedAt,
+            readings = listOf(
+                PollReading("charging_1009_1186988040_7", java.lang.Float.floatToRawIntBits(-1.0f).toString(), "-1"),
+                PollReading("charging_1009_1186988056_7", java.lang.Float.floatToRawIntBits(-226.7f).toString(), "-226.7")
+            )
+        ).associateBy { it.field.fieldKey }
+
+        assertEquals(-1.0, output.getValue("front_motor_current_raw").value.number)
+        assertEquals(-226.7, output.getValue("rear_motor_current_raw").value.number)
+        output.values.forEach {
+            assertEquals(NormalizedQuality.OK, it.quality)
+            assertEquals(observedAt, it.observedAt)
+        }
+
+        val rawBitsOnly = VehicleStateNormalizer(catalog = listOf(fields.first())).normalize(
+            pollId = 123L,
+            observedAt = observedAt,
+            readings = listOf(
+                PollReading("charging_1009_1186988040_7", java.lang.Float.floatToRawIntBits(126.9f).toString())
+            )
+        ).single()
+        assertEquals(NormalizedQuality.INVALID, rawBitsOnly.quality)
+        assertEquals(null, rawBitsOnly.value.number)
+    }
+
+    @Test
     fun catalogVersionAndExpansionWaveExposeRepresentativeFields() {
         val fieldsByKey = NormalizedFieldCatalog.fields.associateBy { it.fieldKey }
 
-        assertEquals("normalized-direct-v12-20260830-semantic-fixes", NormalizedFieldCatalog.CATALOG_VERSION)
-        assertEquals(89, NormalizedFieldCatalog.fields.size)
+        assertEquals("normalized-direct-v14-20260908-telemetry", NormalizedFieldCatalog.CATALOG_VERSION)
+        assertEquals(102, NormalizedFieldCatalog.fields.size)
         assertFalse(fieldsByKey.containsKey("charging_state"))
         assertEquals(emptyList(), NormalizedFieldCatalog.fields.filter { field ->
             field.sourceKeys.any {
@@ -412,6 +607,37 @@ class VehicleStateNormalizerTest {
         assertFalse(fieldsByKey.containsKey("remaining_battery_power_raw"))
         assertFalse(fieldsByKey.containsKey("max_charge_current_allow_raw"))
         assertFalse(fieldsByKey.getValue("radar_1025_neg_1728053151_5").mqttDefaultEnabled)
+        listOf("charging_gun_type", "charging_type", "charging_battery_device_state", "charging_time_remaining").forEach { key ->
+            val field = fieldsByKey.getValue(key)
+            assertEquals(NormalizedCategory.BATTERY, field.category)
+            assertEquals(NormalizedValueType.TEXT, field.valueType)
+            assertTrue(field.mqttDefaultEnabled)
+        }
+        assertEquals(NormalizedValueType.BOOLEAN, fieldsByKey.getValue("charge_gun_connected_raw").valueType)
+        assertEquals(NormalizedValueType.BOOLEAN, fieldsByKey.getValue("rf_window_open_raw").valueType)
+        assertEquals(listOf("bodywork_1001_1267728400_5"), fieldsByKey.getValue("rf_window_percent").sourceKeys)
+        listOf("rf_window_percent", "perfume_1_remaining_percent", "perfume_2_remaining_percent", "perfume_3_remaining_percent").forEach { key ->
+            val field = fieldsByKey.getValue(key)
+            assertEquals(NormalizedValueType.NUMBER, field.valueType)
+            assertEquals("%", field.unit)
+            assertTrue(field.mqttDefaultEnabled)
+        }
+        listOf("perfume_1_installed", "perfume_2_installed", "perfume_3_installed").forEach { key ->
+            val field = fieldsByKey.getValue(key)
+            assertEquals(NormalizedCategory.CLIMATE, field.category)
+            assertEquals(NormalizedValueType.BOOLEAN, field.valueType)
+            assertEquals("strict_binary_flag", field.normalizerId)
+            assertTrue(field.mqttDefaultEnabled)
+        }
+        listOf("front_motor_current_raw", "rear_motor_current_raw").forEach { key ->
+            val field = fieldsByKey.getValue(key)
+            assertEquals(NormalizedCategory.MOTION, field.category)
+            assertEquals(NormalizedValueType.NUMBER, field.valueType)
+            assertEquals(null, field.unit)
+            assertEquals(null, field.deviceClass)
+            assertEquals(null, field.stateClass)
+            assertTrue(field.mqttDefaultEnabled)
+        }
 
         val socInternal = fieldsByKey.getValue("soc_internal")
         assertEquals(NormalizedCategory.BATTERY, socInternal.category)

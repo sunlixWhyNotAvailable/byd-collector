@@ -41,7 +41,8 @@ class TelemetryWorkerReplayCoordinator(
     private val pendingSamples: (Int) -> PendingTelemetryWorkerSamples,
     private val acknowledgeSample: (TelemetryWorkerSampleIdentity, Long) -> TelemetryWorkerAckResult,
     private val successfulPollObserver: SuccessfulPollObserver? = null,
-    private val entries: List<DirectFidEntry> = DirectFidRegistry.entries,
+    private val replayEntriesForCatalog: (String) -> List<DirectFidEntry>? =
+        DirectFidRegistry::workerReplayEntriesForCatalog,
     private val acknowledgedAtMs: () -> Long = { System.currentTimeMillis() }
 ) {
     private var lastFailureKey: String? = null
@@ -68,10 +69,17 @@ class TelemetryWorkerReplayCoordinator(
                 lastFailureKey = null
                 return WorkerReplayBatchResult(needsReplay = false, cycleResult = null)
             }
-            val parameters = store.getActiveCatalogParameters()
+            val parametersByKey = store.getActiveCatalogParameters().associateBy { it.key }
             for (sample in pending.samples) {
                 if (Thread.currentThread().isInterrupted) throw InterruptedException()
-                val input = persistedInput(sample)
+                val entries = requireNotNull(replayEntriesForCatalog(sample.catalogVersion)) {
+                    "unsupported worker catalog: ${sample.catalogVersion}"
+                }
+                val input = persistedInput(sample, entries)
+                // Count the fields this helper actually requested, not newly added APP fields.
+                val parameters = entries.map { entry ->
+                    requireNotNull(parametersByKey[entry.key]) { "missing replay parameter: ${entry.key}" }
+                }
                 val imported = store.insertWorkerPoll(sessionId, sample.identity, input, parameters)
                 if (imported.inserted) insertedPolls += 1L
                 lastPollId = imported.pollId
@@ -137,10 +145,7 @@ class TelemetryWorkerReplayCoordinator(
         }
     }
 
-    private fun persistedInput(sample: TelemetryWorkerSample): PersistedPollInput {
-        require(sample.catalogVersion == DirectFidRegistry.CATALOG_VERSION) {
-            "worker catalog mismatch: expected=${DirectFidRegistry.CATALOG_VERSION} actual=${sample.catalogVersion}"
-        }
+    private fun persistedInput(sample: TelemetryWorkerSample, entries: List<DirectFidEntry>): PersistedPollInput {
         require(sample.values.size == entries.size) {
             "worker field count mismatch: expected=${entries.size} actual=${sample.values.size}"
         }

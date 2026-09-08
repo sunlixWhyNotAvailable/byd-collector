@@ -29,6 +29,7 @@ enum class DirectValueDecoder {
     INT_KPA,
     INT_SCALED,
     FLOAT_RAW,
+    FLOAT_SIGNED_RAW,
     FLOAT_PERCENT,
     FLOAT_KWH,
     FLOAT_VOLT
@@ -36,11 +37,12 @@ enum class DirectValueDecoder {
 
 //curated read-only autoservice scope for the main db; exploratory values belong in round-robin
 object DirectFidRegistry {
-    const val CATALOG_VERSION = "autoservice-fid-direct-20260820-curated-82-power-v1"
+    const val LEGACY_WORKER_CATALOG_VERSION = "autoservice-fid-direct-20260820-curated-82-power-v1"
+    const val CATALOG_VERSION = "autoservice-fid-direct-20260908-curated-95-telemetry-v1"
     const val TX_GET_INT = 5
     const val TX_GET_FLOAT = 7
 
-    val entries: List<DirectFidEntry> = listOf(
+    private val legacyWorkerEntries: List<DirectFidEntry> = listOf(
         DirectFidEntry("statistic_1014_1145045040_5", 1014, 1145045040, TX_GET_INT, DirectValueDecoder.INT_PERCENT, groupName = "direct_statistic", featureNames = "STATISTIC_SOC_BATTERY_PERCENTAGE;Statistic.STATISTIC_SOC_BATTERY_PERCENTAGE", classification = "curated_debug_promotion", prodCategory = "curated_main", source = "wide-poll-session-20260605_161751"),
         DirectFidEntry("statistic_1014_1134559272_5", 1014, 1134559272, TX_GET_INT, DirectValueDecoder.INT_PERCENT, groupName = "direct_statistic", featureNames = "STATISTIC_ESTIMATE_SOC_V1;Statistic.STATISTIC_ESTIMATE_SOC_V1", classification = "round_robin_changing_candidate", prodCategory = "charging_energy", source = "wide-poll-session-20260605_161751"),
         DirectFidEntry("statistic_remaining_battery_power", 1014, 1148190760, TX_GET_INT, DirectValueDecoder.INT_SCALED, scale = 0.1, groupName = "direct_statistic", featureNames = "STATISTIC_REMAINING_BATTERY_POWER;Statistic.STATISTIC_REMAINING_BATTERY_POWER", classification = "round_robin_promoted_20260719_energy_soc", prodCategory = "charging_energy", source = "wide-poll-session-20260605_161751"),
@@ -124,6 +126,35 @@ object DirectFidRegistry {
         DirectFidEntry("statistic_1014_877658120_5", 1014, 877658120, TX_GET_INT, DirectValueDecoder.INT_RAW, groupName = "direct_statistic", featureNames = "STATISTIC_MAX_DISCHARGE_POWER_ALLOW;Statistic.STATISTIC_MAX_DISCHARGE_POWER_ALLOW", classification = "round_robin_promoted_20260613", prodCategory = "charging_energy", source = "wide-poll-session-20260605_161751"),
         DirectFidEntry("bodywork_power_level", 1001, 315621418, TX_GET_INT, DirectValueDecoder.INT_RAW, groupName = "direct_bodywork", featureNames = "BODYWORK_POWER_LEVEL;Bodywork.BODYWORK_POWER_LEVEL", classification = "curated_power_boundary_20260820", prodCategory = "curated_main", source = "archived_power-transition-evidence-20260817"),
     )
+
+    val entries: List<DirectFidEntry> = legacyWorkerEntries + listOf(
+        DirectFidEntry("charging_1009_876609592_5", 1009, 876609592, TX_GET_INT, DirectValueDecoder.INT_ENUM, groupName = "direct_charging", featureNames = "CHARGING_TYPE;Charging.CHARGING_TYPE", classification = "curated_debug_promotion_20260908", prodCategory = "charging_energy", source = "debug-main-promotion-20260908"),
+        DirectFidEntry("charging_1009_876609560_5", 1009, 876609560, TX_GET_INT, DirectValueDecoder.INT_ENUM, groupName = "direct_charging", featureNames = "CHARGING_BATTERRY_DEVICE_STATE;Charging.CHARGING_BATTERRY_DEVICE_STATE", classification = "curated_debug_promotion_20260908", prodCategory = "charging_energy", source = "debug-main-promotion-20260908"),
+        DirectFidEntry("charging_1009_1146095640_5", 1009, 1146095640, TX_GET_INT, DirectValueDecoder.INT_RAW, groupName = "direct_charging", featureNames = "CHARGING_FULL_REST_HOUR;Charging.CHARGING_FULL_REST_HOUR", classification = "curated_debug_promotion_20260908", prodCategory = "charging_energy", source = "debug-main-promotion-20260908"),
+        DirectFidEntry("charging_1009_1146095648_5", 1009, 1146095648, TX_GET_INT, DirectValueDecoder.INT_RAW, groupName = "direct_charging", featureNames = "CHARGING_FULL_REST_MINUTE;Charging.CHARGING_FULL_REST_MINUTE", classification = "curated_debug_promotion_20260908", prodCategory = "charging_energy", source = "debug-main-promotion-20260908"),
+        DirectFidEntry("bodywork_1001_1267728400_5", 1001, 1267728400, TX_GET_INT, DirectValueDecoder.INT_PERCENT, groupName = "direct_bodywork", featureNames = "BODYWORK_WINDOW_RIGHT_FRONT_PERCENT;Bodywork.BODYWORK_WINDOW_RIGHT_FRONT_PERCENT", classification = "curated_debug_promotion_20260908", prodCategory = "body_visibility", source = "debug-main-promotion-20260908"),
+        DirectFidEntry("ac_1000_1242562584_5", 1000, 1242562584, TX_GET_INT, DirectValueDecoder.INT_PERCENT, groupName = "direct_ac", featureNames = "AC_THE_FIRST_PERFUME_SURPLUS;Ac.AC_THE_FIRST_PERFUME_SURPLUS", classification = "curated_debug_promotion_20260908", prodCategory = "climate_environment", source = "debug-main-promotion-20260908"),
+        DirectFidEntry("ac_1000_1242562592_5", 1000, 1242562592, TX_GET_INT, DirectValueDecoder.INT_PERCENT, groupName = "direct_ac", featureNames = "AC_THE_SECOND_PERFUME_SURPLUS;Ac.AC_THE_SECOND_PERFUME_SURPLUS", classification = "curated_debug_promotion_20260908", prodCategory = "climate_environment", source = "debug-main-promotion-20260908"),
+        DirectFidEntry("ac_1000_1242562600_5", 1000, 1242562600, TX_GET_INT, DirectValueDecoder.INT_PERCENT, groupName = "direct_ac", featureNames = "AC_THE_THIRD_PERFUME_SURPLUS;Ac.AC_THE_THIRD_PERFUME_SURPLUS", classification = "curated_debug_promotion_20260908", prodCategory = "climate_environment", source = "debug-main-promotion-20260908"),
+        DirectFidEntry("ac_1000_1242562612_5", 1000, 1242562612, TX_GET_INT, DirectValueDecoder.INT_ENUM, groupName = "direct_ac", featureNames = "AC_FIRST_PERFUME_INSTALLATION_STATUS;Ac.AC_FIRST_PERFUME_INSTALLATION_STATUS", classification = "curated_debug_promotion_20260908", prodCategory = "climate_environment", source = "debug-main-promotion-20260908"),
+        DirectFidEntry("ac_1000_1242562614_5", 1000, 1242562614, TX_GET_INT, DirectValueDecoder.INT_ENUM, groupName = "direct_ac", featureNames = "AC_SECOND_PERFUME_INSTALLATION_STATUS;Ac.AC_SECOND_PERFUME_INSTALLATION_STATUS", classification = "curated_debug_promotion_20260908", prodCategory = "climate_environment", source = "debug-main-promotion-20260908"),
+        DirectFidEntry("ac_1000_1242562616_5", 1000, 1242562616, TX_GET_INT, DirectValueDecoder.INT_ENUM, groupName = "direct_ac", featureNames = "AC_THIRD_PERFUME_INSTALLATION_STATUS;Ac.AC_THIRD_PERFUME_INSTALLATION_STATUS", classification = "curated_debug_promotion_20260908", prodCategory = "climate_environment", source = "debug-main-promotion-20260908"),
+        DirectFidEntry("charging_1009_1186988040_7", 1009, 1186988040, TX_GET_FLOAT, DirectValueDecoder.FLOAT_SIGNED_RAW, groupName = "direct_charging", featureNames = "CHARGING_DRIVER_MOTOR_CURRENT;Charging.CHARGING_DRIVER_MOTOR_CURRENT", classification = "curated_debug_promotion_20260908", prodCategory = "motion_powertrain", source = "debug-main-promotion-20260908"),
+        DirectFidEntry("charging_1009_1186988056_7", 1009, 1186988056, TX_GET_FLOAT, DirectValueDecoder.FLOAT_SIGNED_RAW, groupName = "direct_charging", featureNames = "CHARGING_REAR_DRIVER_MOTOR_CURRENT;Charging.CHARGING_REAR_DRIVER_MOTOR_CURRENT", classification = "curated_debug_promotion_20260908", prodCategory = "motion_powertrain", source = "debug-main-promotion-20260908")
+    )
+
+    fun workerReplayEntriesForCatalog(catalogVersion: String): List<DirectFidEntry>? =
+        workerReplayEntriesForCatalog(catalogVersion, CATALOG_VERSION, entries)
+
+    internal fun workerReplayEntriesForCatalog(
+        catalogVersion: String,
+        currentCatalogVersion: String,
+        currentEntries: List<DirectFidEntry>
+    ): List<DirectFidEntry>? = when {
+        catalogVersion == currentCatalogVersion -> currentEntries
+        catalogVersion == LEGACY_WORKER_CATALOG_VERSION -> legacyWorkerEntries
+        else -> null
+    }
 }
 
 object DirectValueDecoders {
@@ -139,6 +170,7 @@ object DirectValueDecoders {
             DirectValueDecoder.INT_TEMP_C_OFS40 -> decodeInt(raw)?.minus(40)?.takeIf { it in -50..80 }?.toString()
             DirectValueDecoder.INT_SCALED -> decodeInt(raw)?.let { formatDecimal(it * entry.scale) }
             DirectValueDecoder.FLOAT_RAW -> decodeFloat(Float.fromBits(raw))?.let { formatDecimal(it.toDouble()) }
+            DirectValueDecoder.FLOAT_SIGNED_RAW -> decodeSignedFloat(Float.fromBits(raw))?.let { formatDecimal(it.toDouble()) }
             DirectValueDecoder.FLOAT_PERCENT -> decodeFloat(Float.fromBits(raw))
                 ?.takeIf { it in 0.0f..100.0f }
                 ?.let { formatDecimal(it.toDouble()) }
@@ -162,6 +194,10 @@ object DirectValueDecoders {
 
     private fun decodeFloat(raw: Float): Float? {
         return raw.takeUnless { it.isNaN() || it.isInfinite() || it == -1.0f }
+    }
+
+    private fun decodeSignedFloat(raw: Float): Float? {
+        return raw.takeUnless { it.isNaN() || it.isInfinite() || it == 65535.0f }
     }
 
     private fun formatDecimal(value: Double): String {

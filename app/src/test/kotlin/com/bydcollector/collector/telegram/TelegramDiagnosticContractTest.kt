@@ -45,6 +45,19 @@ class TelegramDiagnosticContractTest {
             .contains("payload"))
     }
 
+    @Test
+    fun bmsFinishPowerConflictDiagnosticIsBoundedLatchedAndPostCommit() {
+        val source = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
+        val poll = source.substringAfter("fun onSuccessfulPoll(")
+            .substringBefore("internal fun bindTripDiagnosticParent")
+
+        assertTrue(poll.contains("committed && !previousBmsConflict"))
+        assertTrue(poll.contains("result.state.bmsFinishHighPowerConflictActive"))
+        assertTrue(poll.contains("telegram_bms_finish_power_conflict"))
+        assertTrue(poll.contains("bms_state=finished power_relation=gte_0_5_kw action=power_fallback"))
+        assertTrue(poll.indexOf("val committed = handle(result)") < poll.indexOf("telegram_bms_finish_power_conflict"))
+    }
+
     private fun sourceFile(path: String): File = listOf(
         File("src/main/kotlin/$path"),
         File("app/src/main/kotlin/$path")

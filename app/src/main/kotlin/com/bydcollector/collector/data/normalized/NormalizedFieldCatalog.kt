@@ -2,7 +2,7 @@ package com.bydcollector.collector.data.normalized
 
 //semantic catalog that maps curated raw keys to stable fields exposed to dashboard, mqtt, and influx
 object NormalizedFieldCatalog {
-    const val CATALOG_VERSION = "normalized-direct-v12-20260830-semantic-fixes"
+    const val CATALOG_VERSION = "normalized-direct-v14-20260908-telemetry"
 
     val soc = number(
         fieldKey = "soc",
@@ -49,9 +49,31 @@ object NormalizedFieldCatalog {
     val odometerKm = number("odometer_km", NormalizedCategory.MOTION, "km", "Odometer", "distance", "total_increasing", listOf("statistic_1014_1246765072_5"), "raw_number_deci_non_negative")
     val speedKmh = number("speed_kmh", NormalizedCategory.MOTION, "km/h", "Speed", "speed", "measurement", listOf("speed_1013_-1807745016_7"), "decoded_speed_kmh")
     val chargeGunConnected = bool("charge_gun_connected_raw", NormalizedCategory.BATTERY, "Charging gun connected", "plug", listOf("charging_1009_876609586_5"), "charging_gun_connected_openapi")
+    val chargingGunType = textEnum("charging_gun_type", NormalizedCategory.BATTERY, "Charging gun type", "charging_1009_876609586_5", "charging_gun_type_openapi", mqttDefaultEnabled = true)
+    val chargingType = textEnum("charging_type", NormalizedCategory.BATTERY, "Charging type", "charging_1009_876609592_5", "charging_type_openapi", mqttDefaultEnabled = true)
+    val chargingBatteryDeviceState = textEnum("charging_battery_device_state", NormalizedCategory.BATTERY, "Charging battery device state", "charging_1009_876609560_5", "charging_battery_device_state_openapi", mqttDefaultEnabled = true)
+    val chargingTimeRemaining = NormalizedFieldDefinition(
+        fieldKey = "charging_time_remaining",
+        category = NormalizedCategory.BATTERY,
+        valueType = NormalizedValueType.TEXT,
+        unit = null,
+        displayName = "Charging time remaining",
+        deviceClass = null,
+        stateClass = null,
+        entityPlatform = "sensor",
+        sourceKeys = listOf("charging_1009_1146095640_5", "charging_1009_1146095648_5"),
+        normalizerId = "charging_time_remaining_hh_mm_ss",
+        mqttDefaultEnabled = true
+    )
     val acPower = bool("ac_power", NormalizedCategory.CLIMATE, "Climate", null, listOf("ac_1000_1077936144_5"), "zero_false_nonzero_true")
     val driverTempSetpoint = number("driver_temp_setpoint_raw", NormalizedCategory.CLIMATE, "°C", "Driver temperature setting", "temperature", "measurement", listOf("ac_1000_1077936168_5"), "raw_temperature_c", mqttDefaultEnabled = false)
     val acWindLevel = number("ac_wind_level_raw", NormalizedCategory.CLIMATE, "level", "Fan speed", null, "measurement", listOf("ac_wind_level"), "ac_wind_level_0_7", mqttDefaultEnabled = false)
+    val perfume1RemainingPercent = number("perfume_1_remaining_percent", NormalizedCategory.CLIMATE, "%", "Perfume slot 1 estimated remaining", null, "measurement", listOf("ac_1000_1242562584_5"), "decoded_percent_0_100")
+    val perfume2RemainingPercent = number("perfume_2_remaining_percent", NormalizedCategory.CLIMATE, "%", "Perfume slot 2 estimated remaining", null, "measurement", listOf("ac_1000_1242562592_5"), "decoded_percent_0_100")
+    val perfume3RemainingPercent = number("perfume_3_remaining_percent", NormalizedCategory.CLIMATE, "%", "Perfume slot 3 estimated remaining", null, "measurement", listOf("ac_1000_1242562600_5"), "decoded_percent_0_100")
+    val perfume1Installed = bool("perfume_1_installed", NormalizedCategory.CLIMATE, "Perfume slot 1 installed", null, listOf("ac_1000_1242562612_5"), "strict_binary_flag")
+    val perfume2Installed = bool("perfume_2_installed", NormalizedCategory.CLIMATE, "Perfume slot 2 installed", null, listOf("ac_1000_1242562614_5"), "strict_binary_flag")
+    val perfume3Installed = bool("perfume_3_installed", NormalizedCategory.CLIMATE, "Perfume slot 3 installed", null, listOf("ac_1000_1242562616_5"), "strict_binary_flag")
     val driverDoorLock = bool("ota_lf_door_lock", NormalizedCategory.BODY, "Driver door lock", null, listOf("ota_lf_door_lock"), "door_lock_state_locked", mqttDefaultEnabled = false)
     val passengerDoorLock = bool("rf_door_lock_raw", NormalizedCategory.BODY, "Passenger door lock", null, listOf("bodywork_rf_door_lock_status"), "door_lock_state_locked", mqttDefaultEnabled = false)
     val driverDoor = bool("driver_door_open", NormalizedCategory.BODY, "Driver door", "door", listOf("bodywork_left_hand_front_door"), "zero_closed_nonzero_open")
@@ -62,6 +84,7 @@ object NormalizedFieldCatalog {
     val trunkDoor = bool("trunk_open", NormalizedCategory.BODY, "Trunk", "door", listOf("bodywork_luggage_door"), "zero_closed_nonzero_open")
     val leftFrontWindow = number("lf_window_percent", NormalizedCategory.BODY, "%", "Driver window", null, "measurement", listOf("bodywork_1001_947912728_5"), "decoded_percent_0_100")
     val rightFrontWindow = bool("rf_window_open_raw", NormalizedCategory.BODY, "Passenger window", "window", listOf("bodywork_1001_1267728396_5"), "zero_false_nonzero_true")
+    val rightFrontWindowPercent = number("rf_window_percent", NormalizedCategory.BODY, "%", "Passenger window", null, "measurement", listOf("bodywork_1001_1267728400_5"), "decoded_percent_0_100")
     val leftRearWindow = number("lr_window_percent", NormalizedCategory.BODY, "%", "Rear left window", null, "measurement", listOf("bodywork_1001_947912736_5"), "decoded_percent_0_100")
     val rightRearWindow = number("rr_window_percent", NormalizedCategory.BODY, "%", "Rear right window", null, "measurement", listOf("bodywork_1001_947912752_5"), "decoded_percent_0_100")
     val sunroofPosition = number(
@@ -95,6 +118,8 @@ object NormalizedFieldCatalog {
     val rearMotorSpeed = number("rear_motor_speed_raw", NormalizedCategory.MOTION, "RPM", "Rear motor speed raw", null, "measurement", listOf("engine_rear_motor_speed"), "decoded_number_raw")
     val frontMotorTorque = number("front_motor_torque", NormalizedCategory.MOTION, "Nm", "Front motor torque", null, "measurement", listOf("engine_1012_1141899288_7"), "decoded_number_raw")
     val rearMotorTorque = number("rear_motor_torque", NormalizedCategory.MOTION, "Nm", "Rear motor torque", null, "measurement", listOf("engine_1012_1169162280_7"), "decoded_number_raw")
+    val frontMotorCurrentRaw = number("front_motor_current_raw", NormalizedCategory.MOTION, null, "Front motor current raw", null, null, listOf("charging_1009_1186988040_7"), "decoded_number_raw")
+    val rearMotorCurrentRaw = number("rear_motor_current_raw", NormalizedCategory.MOTION, null, "Rear motor current raw", null, null, listOf("charging_1009_1186988056_7"), "decoded_number_raw")
     val frontMotorIpmTemp = number("front_motor_ipm_temp_raw", NormalizedCategory.MOTION, "°C", "Front motor IPM temperature raw", "temperature", "measurement", listOf("gb_front_motor_ipm_temp"), "decoded_number_raw")
     val rearMotorIpmTemp = number("rear_motor_ipm_temp_raw", NormalizedCategory.MOTION, "°C", "Rear motor IPM temperature raw", "temperature", "measurement", listOf("gb_rear_motor_ipm_temp"), "decoded_number_raw")
     val frontMotorBusVoltage = number("front_motor_bus_voltage_raw", NormalizedCategory.MOTION, "V", "Front motor bus voltage raw", "voltage", "measurement", listOf("gb_1039_1169162248_5"), "decoded_voltage_v")
@@ -150,9 +175,19 @@ object NormalizedFieldCatalog {
         odometerKm,
         speedKmh,
         chargeGunConnected,
+        chargingGunType,
+        chargingType,
+        chargingBatteryDeviceState,
+        chargingTimeRemaining,
         acPower,
         driverTempSetpoint,
         acWindLevel,
+        perfume1RemainingPercent,
+        perfume2RemainingPercent,
+        perfume3RemainingPercent,
+        perfume1Installed,
+        perfume2Installed,
+        perfume3Installed,
         driverDoorLock,
         passengerDoorLock,
         driverDoor,
@@ -163,6 +198,7 @@ object NormalizedFieldCatalog {
         trunkDoor,
         leftFrontWindow,
         rightFrontWindow,
+        rightFrontWindowPercent,
         leftRearWindow,
         rightRearWindow,
         sunroofPosition,
@@ -187,6 +223,8 @@ object NormalizedFieldCatalog {
         rearMotorSpeed,
         frontMotorTorque,
         rearMotorTorque,
+        frontMotorCurrentRaw,
+        rearMotorCurrentRaw,
         frontMotorIpmTemp,
         rearMotorIpmTemp,
         frontMotorBusVoltage,

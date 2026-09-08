@@ -27,8 +27,8 @@ You can toggle a switch by tapping its label or row; Telegram message switches a
 
 | Area | What it provides |
 | --- | --- |
-| Main tab | Collection of 82 selected vehicle fields, automatic start, current status, and database information |
-| All data tab | Research collection from a catalog of 23,096 read-only signatures, with raw values and recorded changes |
+| Main tab | Collection of 95 selected vehicle fields, automatic start, current status, and database information |
+| All data tab | Research collection from a catalog of 23,083 read-only signatures, with raw values and recorded changes |
 | Vehicle status | SOC, SOH, range, odometer, battery energy, charging, power, temperatures, doors, tires, climate, speed, and related readings |
 | MQTT / Home Assistant | Home Assistant MQTT Discovery and live state for selected categories, with primary and alternative connections |
 | InfluxDB | Historical export to `InfluxDB v1`, with automatic retries and progress saved between sessions |
@@ -46,12 +46,14 @@ The app is available in English and Ukrainian, with dark and light themes.
 
 `Main` controls regular telemetry collection. Start it after ADB is authorized, or enable automatic start.
 
-- Collects 82 selected read-only vehicle fields.
+- Collects 95 selected read-only vehicle fields.
 - Shows collection, MQTT, and InfluxDB status, last success, last error, and session errors.
 - Displays SOC, SOH, odometer, cabin and battery temperatures, charging/discharging, range, cell-voltage difference, and category summaries.
 - Stores raw readings and normalized history locally. History is not automatically deleted or reduced.
 
-Some fields have known interpretation limits: raw `CHARGING_STATE` is unreliable and is not used to identify charging for exports or Telegram. Charging is determined from the connected charge gun and positive charging power. `max_discharge_power_allow_raw` has no verified unit or kW scale, and sunroof/windblind position codes must not be interpreted as a simple open/closed value.
+The collected data includes charging mode and battery charging status, the charging connector type, opening percentages for all four windows, and estimated remaining perfume and installation state for three slots. The vehicle's estimated charging time remaining is exported as one `hh:mm:ss` value; unavailable readings are not shown as zero. Front and rear motor-current readings remain unitless raw values because their physical units are not yet verified. These fields are available to MQTT and InfluxDB through their selected categories.
+
+Some fields have known interpretation limits: raw `CHARGING_STATE` is unreliable and is not used to identify charging for exports or Telegram. Charging notifications use confirmed battery charging states together with connector and power readings, falling back to connector and power when the battery state is unavailable. A confirmed full charge takes priority over a stopped notification. `max_discharge_power_allow_raw` has no verified unit or kW scale, and sunroof/windblind position codes must not be interpreted as a simple open/closed value.
 
 Use `Stop` when collection is no longer needed. Background collection and its vehicle-specific limits are described under [Known limitations](#known-limitations).
 
@@ -59,7 +61,7 @@ Use `Stop` when collection is no longer needed. Background collection and its ve
 
 `All data` is intended for research and diagnostics. It can run independently once the main collection service is available.
 
-- Reads the full catalog of 23,096 read-only signatures.
+- Reads a research catalog of 23,083 read-only signatures.
 - Saves raw values, descriptions, data quality, and changes in a separate database.
 - Helps identify changing fields, but a changing value alone does not prove what the field means.
 

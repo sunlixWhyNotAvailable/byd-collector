@@ -63,15 +63,10 @@ class TelegramEventEngineTest {
         assertEquals("4", first.variables["charge_added_kwh"])
 
         val restarted = TelegramEventEngine(TelegramEventState.fromJson(engine.state.toJson()))
-        restarted.onSuccessfulPoll(
-            snapshot(chargeGun = true, chargePower = 8.0, soc = 76.0, remainingEnergy = 35.0),
-            config,
-            2_500L
-        )
         val second = restarted.onSuccessfulPoll(
             snapshot(chargeGun = true, chargePower = 8.0, soc = 76.0, remainingEnergy = 35.0),
             config,
-            3_000L
+            2_500L
         ).events.single { it.type == TelegramEventType.CHARGING_PROGRESS }
 
         assertEquals("4", second.variables["charge_step_added_percent"])
@@ -89,15 +84,10 @@ class TelegramEventEngineTest {
         )
         val restarted = TelegramEventEngine(TelegramEventState.fromJson(legacyState.toJson()))
 
-        restarted.onSuccessfulPoll(
-            snapshot(chargeGun = true, chargePower = 6.0, soc = 56.0, remainingEnergy = 39.0),
-            config,
-            2_000L
-        )
         val progress = restarted.onSuccessfulPoll(
             snapshot(chargeGun = true, chargePower = 6.0, soc = 56.0, remainingEnergy = 39.0),
             config,
-            2_500L
+            2_000L
         ).events.single { it.type == TelegramEventType.CHARGING_PROGRESS }
 
         assertEquals("n/a", progress.variables["charge_step_added_percent"])
@@ -115,6 +105,250 @@ class TelegramEventEngineTest {
         assertTrue(confirmed.events.isEmpty())
         assertEquals(true, confirmed.state.chargingActive)
         assertNotNull(confirmed.state.chargingSessionId)
+    }
+
+    @Test
+    fun bmsChargingStartsFromKnownInactiveAtLowPowerAndKeepsFirstSampleBaseline() {
+        val engine = knownInactiveChargingEngine()
+
+        val candidate = engine.onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = null, bmsState = "charging", soc = 60.0, remainingEnergy = 30.0),
+            config,
+            1_000L
+        )
+        val restored = TelegramEventEngine(TelegramEventState.fromJson(candidate.state.toJson()))
+        val started = restored.onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = 0.0, bmsState = "charging", soc = 61.0, remainingEnergy = 31.0),
+            config,
+            1_500L
+        )
+
+        assertTrue(candidate.events.none { it.type == TelegramEventType.CHARGING_STOPPED })
+        assertEquals("bms_charging", candidate.state.chargingActiveCandidateSource)
+        assertEquals(
+            TelegramEventType.CHARGING_STARTED,
+            started.events.single { it.type == TelegramEventType.CHARGING_STARTED }.type
+        )
+        assertEquals(true, started.state.chargingActive)
+        assertEquals("bms_charging", started.state.chargingEvidenceSource)
+        assertEquals(1_000L, started.state.chargingStartedAtMs)
+        assertEquals(60.0, started.state.chargingStartSoc)
+        assertEquals(30.0, started.state.chargingStartEnergyKwh)
+    }
+
+    @Test
+    fun bmsChargingColdAttachIsSilentAndExplicitDisconnectWins() {
+        val engine = TelegramEventEngine()
+        engine.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 0.0, bmsState = "charging"), config, 0L)
+        val attached = engine.onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = 0.0, bmsState = "charging"),
+            config,
+            500L
+        )
+
+        assertTrue(attached.events.isEmpty())
+        assertNotNull(attached.state.chargingSessionId)
+        engine.onSuccessfulPoll(snapshot(chargeGun = false, chargePower = 8.0, bmsState = "charging"), config, 1_000L)
+        val stopped = engine.onSuccessfulPoll(
+            snapshot(chargeGun = false, chargePower = 8.0, bmsState = "charging"),
+            config,
+            1_500L
+        )
+
+        assertEquals(
+            TelegramEventType.CHARGING_STOPPED,
+            stopped.events.single { it.type == TelegramEventType.CHARGING_STOPPED }.type
+        )
+        assertEquals("primary_disconnected", stopped.state.chargingEvidenceSource)
+    }
+
+    @Test
+    fun bmsChargingKeepsAnActiveSessionThroughLowPowerLongerThanFallbackTimeout() {
+        val engine = startedBmsChargingEngine()
+
+        val stillCharging = engine.onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = 0.0, bmsState = "charging"),
+            config,
+            120_000L
+        )
+
+        assertTrue(stillCharging.events.none { it.type == TelegramEventType.CHARGING_STOPPED })
+        assertEquals(true, stillCharging.state.chargingActive)
+        assertNull(stillCharging.state.chargingLowPowerSinceMs)
+    }
+
+    @Test
+    fun bmsFinishedLowPowerStopsAfterTwoPollsWithoutWaitingForFallbackTimeout() {
+        val engine = startedBmsChargingEngine()
+        val sessionId = engine.state.chargingSessionId
+
+        val candidate = engine.onSuccessfulPoll(
+            snapshot(chargeGun = null, chargePower = 0.49, bmsState = "finished", soc = 70.0),
+            config,
+            2_000L
+        )
+        val stopped = engine.onSuccessfulPoll(
+            snapshot(chargeGun = null, chargePower = 0.49, bmsState = "finished", soc = 70.0),
+            config,
+            2_500L
+        )
+
+        assertTrue(candidate.events.none { it.type == TelegramEventType.CHARGING_STOPPED })
+        assertEquals("bms_finished", candidate.state.chargingActiveCandidateSource)
+        assertEquals(
+            "$sessionId:stopped",
+            stopped.events.single { it.type == TelegramEventType.CHARGING_STOPPED }.dedupeKey
+        )
+        assertNull(stopped.state.chargingSessionId)
+        assertEquals(false, stopped.state.chargingActive)
+    }
+
+    @Test
+    fun bmsFinishedAtThresholdUsesPowerFallbackAndLatchesOneConflictEpisode() {
+        val engine = startedBmsChargingEngine()
+
+        val conflict = engine.onSuccessfulPoll(
+            snapshot(chargeGun = null, chargePower = 0.5, bmsState = "finished"),
+            config,
+            2_000L
+        )
+        val persisted = TelegramEventState.fromJson(conflict.state.toJson())
+        val restarted = TelegramEventEngine(persisted)
+        val repeated = restarted.onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = 6.0, bmsState = "finished"),
+            config,
+            2_500L
+        )
+        val fallback = restarted.onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = 6.0, bmsState = "finished"),
+            config,
+            2_750L
+        )
+        val reset = TelegramEventEngine(TelegramEventState.fromJson(fallback.state.toJson())).onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = 6.0, bmsState = "charging"),
+            config,
+            3_000L
+        )
+
+        assertTrue(conflict.events.none { it.type == TelegramEventType.CHARGING_STOPPED })
+        assertEquals(true, conflict.state.chargingActive)
+        assertTrue(persisted.bmsFinishHighPowerConflictActive)
+        assertTrue(repeated.state.bmsFinishHighPowerConflictActive)
+        assertEquals("primary_power", fallback.state.chargingEvidenceSource)
+        assertTrue(fallback.events.none { it.type == TelegramEventType.CHARGING_STOPPED })
+        assertFalse(reset.state.bmsFinishHighPowerConflictActive)
+    }
+
+    @Test
+    fun explicitDisconnectDoesNotLatchBmsFinishPowerConflict() {
+        val engine = startedBmsChargingEngine()
+
+        val candidate = engine.onSuccessfulPoll(
+            snapshot(chargeGun = false, chargePower = 6.0, bmsState = "finished"),
+            config,
+            2_000L
+        )
+        val stopped = engine.onSuccessfulPoll(
+            snapshot(chargeGun = false, chargePower = 6.0, bmsState = "finished"),
+            config,
+            2_500L
+        )
+
+        assertFalse(candidate.state.bmsFinishHighPowerConflictActive)
+        assertEquals("primary_disconnected", candidate.state.chargingActiveCandidateSource)
+        assertFalse(stopped.state.bmsFinishHighPowerConflictActive)
+        assertEquals(1, stopped.events.count { it.type == TelegramEventType.CHARGING_STOPPED })
+    }
+
+    @Test
+    fun chargingConfirmationCannotMixBmsFallbackDisconnectOrEvidenceGaps() {
+        val engine = knownInactiveChargingEngine()
+
+        engine.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 0.0, bmsState = "charging"), config, 1_000L)
+        val sourceChanged = engine.onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = 6.0, bmsState = "ready"),
+            config,
+            1_500L
+        )
+        val gap = engine.onSuccessfulPoll(snapshot(chargeGun = null, chargePower = null), config, 2_000L)
+        val disconnected = engine.onSuccessfulPoll(
+            snapshot(chargeGun = false, chargePower = 6.0, bmsState = "charging"),
+            config,
+            2_500L
+        )
+        val fresh = engine.onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = 0.0, bmsState = "charging"),
+            config,
+            3_000L
+        )
+
+        assertEquals(1, sourceChanged.state.chargingActiveCandidateCount)
+        assertEquals("primary_power", sourceChanged.state.chargingActiveCandidateSource)
+        assertNull(gap.state.chargingActiveCandidateSource)
+        assertEquals(0, disconnected.state.chargingActiveCandidateCount)
+        assertNull(disconnected.state.chargingActiveCandidateSource)
+        assertEquals(1, fresh.state.chargingActiveCandidateCount)
+        assertTrue(listOf(sourceChanged, gap, disconnected, fresh).all { result ->
+            result.events.none { it.type == TelegramEventType.CHARGING_STARTED }
+        })
+    }
+
+    @Test
+    fun missingNamedAndUntrustedBmsStatesUseExistingGunPowerFallback() {
+        val fallbackStates = listOf<String?>(
+            null,
+            "ready",
+            "discharg",
+            "charg_terminate",
+            "breakdown_c10",
+            "breakdown_charging_gun",
+            "breakdown_charger",
+            "breakdown_ac",
+            "schedule",
+            "discharg_cbu",
+            "timeout",
+            "discharg_finish",
+            "charging_pause"
+        )
+        fallbackStates.forEach { bmsState ->
+            val engine = knownInactiveChargingEngine()
+            engine.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 6.0, bmsState = bmsState), config, 1_000L)
+            val started = engine.onSuccessfulPoll(
+                snapshot(chargeGun = true, chargePower = 6.0, bmsState = bmsState),
+                config,
+                1_500L
+            )
+            assertEquals(
+                TelegramEventType.CHARGING_STARTED,
+                started.events.single { it.type == TelegramEventType.CHARGING_STARTED }.type,
+                bmsState
+            )
+            assertEquals("primary_power", started.state.chargingEvidenceSource, bmsState)
+        }
+
+        val readyLowPower = knownInactiveChargingEngine().also { engine ->
+            engine.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 0.0, bmsState = "ready"), config, 1_000L)
+        }.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 0.0, bmsState = "ready"), config, 1_500L)
+        assertTrue(readyLowPower.events.none { it.type == TelegramEventType.CHARGING_STARTED })
+        assertEquals(false, readyLowPower.state.chargingActive)
+
+        NormalizedQuality.entries.filter { it != NormalizedQuality.OK }.forEach { quality ->
+            val engine = knownInactiveChargingEngine()
+            val untrustedBms = text(NormalizedFieldCatalog.chargingBatteryDeviceState, "charging")
+                .copy(quality = quality)
+            engine.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 6.0) + untrustedBms, config, 1_000L)
+            val started = engine.onSuccessfulPoll(
+                snapshot(chargeGun = true, chargePower = 6.0) + untrustedBms,
+                config,
+                1_500L
+            )
+            assertEquals(
+                TelegramEventType.CHARGING_STARTED,
+                started.events.single { it.type == TelegramEventType.CHARGING_STARTED }.type,
+                quality.name
+            )
+            assertEquals("primary_power", started.state.chargingEvidenceSource, quality.name)
+        }
     }
 
     @Test
@@ -295,6 +529,113 @@ class TelegramEventEngineTest {
     }
 
     @Test
+    fun simultaneousBmsFinishAndFullConfirmationEmitsOnlyFullAndRetainsFullLatch() {
+        val engine = startedBmsChargingEngine(soc = 98.0, remainingEnergy = 30.0)
+        val sessionId = engine.state.chargingSessionId
+
+        engine.onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = 0.49, bmsState = "finished", soc = 99.6, remainingEnergy = 40.0),
+            config,
+            2_000L
+        )
+        val finished = engine.onSuccessfulPoll(
+            snapshot(chargeGun = true, chargePower = 0.49, bmsState = "finished", soc = 99.6, remainingEnergy = 40.0),
+            config,
+            2_500L
+        )
+
+        assertEquals(listOf(TelegramEventType.CHARGED_TO_100), finished.events.map { it.type })
+        assertEquals("$sessionId:full", finished.events.single().dedupeKey)
+        assertTrue(finished.state.fullSent)
+        assertNull(finished.state.chargingSessionId)
+        assertNull(finished.state.chargingStartSoc)
+        assertNull(finished.state.chargingProgressBaselineSoc)
+    }
+
+    @Test
+    fun restoredSessionCountsBothSimultaneousBmsFinishAndFullSamplesBeforeStopping() {
+        val running = startedBmsChargingEngine(soc = 98.0, remainingEnergy = 30.0)
+        val sessionId = running.state.chargingSessionId
+        val restored = TelegramEventEngine(TelegramEventState.fromJson(running.state.toJson()))
+
+        val first = restored.onSuccessfulPoll(
+            snapshot(chargeGun = null, chargePower = 0.49, bmsState = "finished", soc = 99.6, remainingEnergy = 40.0),
+            config,
+            10_000L
+        )
+        val finished = restored.onSuccessfulPoll(
+            snapshot(chargeGun = null, chargePower = 0.49, bmsState = "finished", soc = 99.6, remainingEnergy = 40.0),
+            config,
+            10_500L
+        )
+
+        assertTrue(first.events.none { it.type == TelegramEventType.CHARGING_STOPPED })
+        assertEquals(1, first.state.fullCandidateCount)
+        assertEquals(listOf(TelegramEventType.CHARGED_TO_100), finished.events.map { it.type })
+        val full = finished.events.single()
+        assertEquals("$sessionId:full", full.dedupeKey)
+        assertEquals("1.6", full.variables["charge_added_percent"])
+        assertEquals("10", full.variables["charge_added_kwh"])
+        assertTrue(finished.state.fullSent)
+        assertNull(finished.state.chargingSessionId)
+    }
+
+    @Test
+    fun bmsFinishWithLowOrMissingSocStopsWithoutFullAndPreservesStopVariables() {
+        listOf<Double?>(70.0, null).forEach { soc ->
+            val engine = startedBmsChargingEngine(soc = 60.0, remainingEnergy = 30.0)
+            engine.onSuccessfulPoll(
+                snapshot(chargeGun = true, chargePower = 0.49, bmsState = "finished", soc = soc),
+                config,
+                2_000L
+            )
+            val stopped = engine.onSuccessfulPoll(
+                snapshot(chargeGun = true, chargePower = 0.49, bmsState = "finished", soc = soc),
+                config,
+                2_500L
+            )
+
+            assertEquals(
+                1,
+                stopped.events.count { it.type == TelegramEventType.CHARGING_STOPPED },
+                soc.toString()
+            )
+            assertEquals(
+                if (soc == null) "n/a" else "10",
+                stopped.events.single { it.type == TelegramEventType.CHARGING_STOPPED }.variables["charge_added_percent"],
+                soc.toString()
+            )
+            assertFalse(stopped.state.fullSent, soc.toString())
+        }
+    }
+
+    @Test
+    fun restoredActiveSessionUsesTwoBmsFinishPollsAndOriginalBaselinesForStop() {
+        val running = startedBmsChargingEngine(soc = 60.0, remainingEnergy = 30.0)
+        val sessionId = running.state.chargingSessionId
+        val startedAt = running.state.chargingStartedAtMs
+        val restored = TelegramEventEngine(TelegramEventState.fromJson(running.state.toJson()))
+
+        val candidate = restored.onSuccessfulPoll(
+            snapshot(chargeGun = null, chargePower = 0.49, bmsState = "finished", soc = 70.0, remainingEnergy = 35.0),
+            config,
+            10_000L
+        )
+        val stopped = restored.onSuccessfulPoll(
+            snapshot(chargeGun = null, chargePower = 0.49, bmsState = "finished", soc = 70.0, remainingEnergy = 35.0),
+            config,
+            10_500L
+        )
+
+        assertTrue(candidate.events.none { it.type == TelegramEventType.CHARGING_STOPPED })
+        assertEquals(sessionId, candidate.state.chargingSessionId)
+        assertEquals(startedAt, candidate.state.chargingStartedAtMs)
+        val stoppedEvent = stopped.events.single { it.type == TelegramEventType.CHARGING_STOPPED }
+        assertEquals("10", stoppedEvent.variables["charge_added_percent"])
+        assertEquals("5", stoppedEvent.variables["charge_added_kwh"])
+    }
+
+    @Test
     fun fullChargeUsesPersistedSessionBaselineAndUnwrappedPaddedDuration() {
         val english = config.copy(language = TelegramTemplateLanguage.EN)
         val engine = TelegramEventEngine()
@@ -305,11 +646,10 @@ class TelegramEventEngineTest {
         assertEquals(0L, engine.state.chargingStartedAtMs)
         val restarted = TelegramEventEngine(TelegramEventState.fromJson(engine.state.toJson()))
         restarted.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 4.0, soc = 99.6, remainingEnergy = 30.0), english, day + 1_000L)
-        restarted.onSuccessfulPoll(snapshot(chargeGun = true, chargePower = 4.0, soc = 99.6, remainingEnergy = 30.0), english, day + 7L * 60L * 1_000L + 1_000L)
         val full = restarted.onSuccessfulPoll(
             snapshot(chargeGun = true, chargePower = 4.0, soc = 99.6, remainingEnergy = 30.0),
             english,
-            day + 7L * 60L * 1_000L + 2_000L
+            day + 7L * 60L * 1_000L + 1_000L
         ).events.single()
 
         assertEquals(TelegramEventType.CHARGED_TO_100, full.type)
@@ -318,7 +658,7 @@ class TelegramEventEngineTest {
         assertEquals("24:07", full.variables["charge_duration_hhmm"])
         val localTime = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
         assertEquals(localTime.format(java.util.Date(0L)), full.variables["charge_start_time"])
-        assertEquals(localTime.format(java.util.Date(day + 7L * 60L * 1_000L + 2_000L)), full.variables["charge_end_time"])
+        assertEquals(localTime.format(java.util.Date(day + 7L * 60L * 1_000L + 1_000L)), full.variables["charge_end_time"])
     }
 
     @Test
@@ -1052,6 +1392,43 @@ class TelegramEventEngineTest {
         }
     }
 
+    private fun knownInactiveChargingEngine(): TelegramEventEngine {
+        return TelegramEventEngine().also { engine ->
+            engine.onSuccessfulPoll(snapshot(chargeGun = false, chargePower = 0.0), config, 0L)
+            engine.onSuccessfulPoll(snapshot(chargeGun = false, chargePower = 0.0), config, 500L)
+        }
+    }
+
+    private fun startedBmsChargingEngine(
+        soc: Double = 50.0,
+        remainingEnergy: Double = 40.0
+    ): TelegramEventEngine {
+        return knownInactiveChargingEngine().also { engine ->
+            engine.onSuccessfulPoll(
+                snapshot(
+                    chargeGun = true,
+                    chargePower = 0.0,
+                    bmsState = "charging",
+                    soc = soc,
+                    remainingEnergy = remainingEnergy
+                ),
+                config,
+                1_000L
+            )
+            engine.onSuccessfulPoll(
+                snapshot(
+                    chargeGun = true,
+                    chargePower = 0.0,
+                    bmsState = "charging",
+                    soc = soc,
+                    remainingEnergy = remainingEnergy
+                ),
+                config,
+                1_500L
+            )
+        }
+    }
+
     private fun pendingTripEngine(): TelegramEventEngine {
         return TelegramEventEngine().also { engine ->
             engine.onSuccessfulPoll(snapshot(gear = "P", odometer = 100.0, soc = 50.0, tripEnergy = 1.0), config, 0L)
@@ -1084,7 +1461,8 @@ class TelegramEventEngineTest {
         tripEnergy: Double? = 2.5,
         remainingEnergy: Double? = 40.0,
         chargePower: Double? = 0.0,
-        chargeGun: Boolean? = false
+        chargeGun: Boolean? = false,
+        bmsState: String? = null
     ): List<NormalizedObservation> = buildList {
         soc?.let { add(number(NormalizedFieldCatalog.soc, it)) }
         remainingEnergy?.let { add(number(NormalizedFieldCatalog.batteryRemainingEnergy, it)) }
@@ -1095,6 +1473,7 @@ class TelegramEventEngineTest {
         add(number(NormalizedFieldCatalog.remainingRangeKm, 300.0))
         gear?.let { add(text(NormalizedFieldCatalog.gearAutoMode, it)) }
         chargeGun?.let { add(bool(NormalizedFieldCatalog.chargeGunConnected, it)) }
+        bmsState?.let { add(text(NormalizedFieldCatalog.chargingBatteryDeviceState, it)) }
     }
 
     private fun normalizedSnapshot(gunRaw: String, current: Double): List<NormalizedObservation> {

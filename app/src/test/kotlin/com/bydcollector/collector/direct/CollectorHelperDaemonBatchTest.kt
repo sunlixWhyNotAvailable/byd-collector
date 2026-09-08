@@ -133,11 +133,17 @@ class CollectorHelperDaemonBatchTest {
     }
 
     @Test
-    fun fallbackCatalogIsTheExactOrderedProduction82FieldMain() {
+    fun fallbackCatalogKeepsCurrent95AndExactLegacy82StrictAndOrdered() {
         val rows = CollectorHelperDaemon.loadMainRows()
+        val legacyRows = requireNotNull(
+            CollectorHelperDaemon.loadWorkerReplayRows(DirectFidRegistry.LEGACY_WORKER_CATALOG_VERSION)
+        )
         val expected = DirectFidRegistry.entries
 
-        assertEquals(82, rows.size)
+        assertEquals(95, rows.size)
+        assertEquals(82, legacyRows.size)
+        assertEquals(rows.take(82), legacyRows)
+        assertNull(CollectorHelperDaemon.loadWorkerReplayRows("unknown-catalog"))
         assertEquals(
             expected.map { Triple(it.tx, it.dev, it.fid) },
             rows.map { Triple(it.tx, it.dev, it.fid) }
@@ -166,13 +172,88 @@ class CollectorHelperDaemonBatchTest {
         CollectorHelperDaemon.validateWorkerSampleForReplay(
             sample,
             DirectFidRegistry.CATALOG_VERSION,
-            rows
+            rows,
+            DirectFidRegistry.LEGACY_WORKER_CATALOG_VERSION,
+            legacyRows
+        )
+        val legacyResult = CollectorHelperDaemon.BatchResult(
+            CollectorHelperProtocol.STATUS_OK,
+            CollectorHelperProtocol.MODE_NATIVE,
+            true,
+            1,
+            0,
+            0,
+            0,
+            1,
+            Array(legacyRows.size) { CollectorHelperDaemon.ReadValue.ok(it) },
+            null
+        )
+        val legacySample = CollectorHelperDaemon.workerSample(
+            TelemetryWorkerSampleIdentity("boot-a", "generation-a", 2),
+            DirectFidRegistry.LEGACY_WORKER_CATALOG_VERSION,
+            100,
+            90,
+            legacyRows,
+            legacyResult
+        )
+        CollectorHelperDaemon.validateWorkerSampleForReplay(
+            legacySample,
+            DirectFidRegistry.CATALOG_VERSION,
+            rows,
+            DirectFidRegistry.LEGACY_WORKER_CATALOG_VERSION,
+            legacyRows
         )
         assertFailsWith<IllegalArgumentException> {
             CollectorHelperDaemon.validateWorkerSampleForReplay(
-                sample,
-                "wrong-catalog",
-                rows
+                CollectorHelperDaemon.workerSample(
+                    TelemetryWorkerSampleIdentity("boot-a", "generation-a", 3),
+                    "wrong-catalog",
+                    100,
+                    90,
+                    rows,
+                    result
+                ),
+                DirectFidRegistry.CATALOG_VERSION,
+                rows,
+                DirectFidRegistry.LEGACY_WORKER_CATALOG_VERSION,
+                legacyRows
+            )
+        }
+        val corruptRows = rows.toMutableList().also {
+            val first = it.first()
+            it[0] = address(first.tx, first.dev, first.fid + 1)
+        }
+        val corruptSample = CollectorHelperDaemon.workerSample(
+            TelemetryWorkerSampleIdentity("boot-a", "generation-a", 4),
+            DirectFidRegistry.CATALOG_VERSION,
+            100,
+            90,
+            corruptRows,
+            result
+        )
+        assertFailsWith<IllegalArgumentException> {
+            CollectorHelperDaemon.validateWorkerSampleForReplay(
+                corruptSample,
+                DirectFidRegistry.CATALOG_VERSION,
+                rows,
+                DirectFidRegistry.LEGACY_WORKER_CATALOG_VERSION,
+                legacyRows
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            CollectorHelperDaemon.validateWorkerSampleForReplay(
+                CollectorHelperDaemon.workerSample(
+                    TelemetryWorkerSampleIdentity("boot-a", "generation-a", 5),
+                    DirectFidRegistry.CATALOG_VERSION,
+                    100,
+                    90,
+                    legacyRows,
+                    legacyResult
+                ),
+                DirectFidRegistry.CATALOG_VERSION,
+                rows,
+                DirectFidRegistry.LEGACY_WORKER_CATALOG_VERSION,
+                legacyRows
             )
         }
     }
@@ -197,8 +278,8 @@ class CollectorHelperDaemonBatchTest {
 
             assertEquals(3, assets.size)
             assertEquals(23177, whitelist.size)
-            assertEquals(23096, debugAddresses.size)
-            assertEquals(CollectorHelperProtocol.MAX_BATCH_SIZE, debugAddresses.size)
+            assertEquals(23083, debugAddresses.size)
+            assertTrue(debugAddresses.size <= CollectorHelperProtocol.MAX_BATCH_SIZE)
             assertNull(CollectorHelperDaemon.validateRows(debugAddresses, whitelist))
             assets.forEach { asset ->
                 val shard = DirectDebugParameterAsset.parse(asset.readText(Charsets.UTF_8))
@@ -227,9 +308,9 @@ class CollectorHelperDaemonBatchTest {
         val daemon = sourceFile("com/bydcollector/collector/direct/CollectorHelperDaemon.java").readText()
         val shardSizes = assets.map { DirectDebugParameterAsset.parse(it.readText(Charsets.UTF_8)).size }
 
-        assertEquals(listOf(7699, 7699, 7698), shardSizes)
-        assertEquals(23096, shardSizes.sum())
-        assertEquals(shardSizes.sum(), CollectorHelperProtocol.MAX_BATCH_SIZE)
+        assertEquals(listOf(7692, 7693, 7698), shardSizes)
+        assertEquals(23083, shardSizes.sum())
+        assertTrue(shardSizes.sum() <= CollectorHelperProtocol.MAX_BATCH_SIZE)
         assertEquals(23_096, CollectorHelperProtocol.MAX_BATCH_SIZE)
         assertTrue(client.contains("entries.isEmpty() || entries.size > CollectorHelperProtocol.MAX_BATCH_SIZE"))
         assertTrue(client.contains("return synchronized(lock)"))

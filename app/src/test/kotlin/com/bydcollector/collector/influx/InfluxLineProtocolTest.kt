@@ -57,6 +57,56 @@ class InfluxLineProtocolTest {
     }
 
     @Test
+    fun writesChargingTextWithOriginalObservationTimestamp() {
+        val row = InfluxPendingHistoryRow(
+            id = 4,
+            fieldKey = "charging_time_remaining",
+            category = "battery",
+            valueType = "TEXT",
+            valueText = "100:05:00",
+            valueNumber = null,
+            valueBool = null,
+            quality = "OK",
+            unit = null,
+            sourcePollId = 110,
+            sourceKeys = "charging_1009_1146095640_5+charging_1009_1146095648_5",
+            observedAt = "2026-09-08T09:02:00Z",
+            changedAt = "2026-09-08T09:02:01Z"
+        )
+
+        val line = InfluxLineProtocol.toLine(row, config())
+
+        assertTrue(line.contains("field_key=charging_time_remaining"))
+        assertTrue(line.contains("value_str=\"100:05:00\""))
+        val expectedTimestampNanos = java.time.Instant.parse(row.observedAt).toEpochMilli() * 1_000_000L
+        assertTrue(line.endsWith(expectedTimestampNanos.toString()))
+    }
+
+    @Test
+    fun writesAllStep3ValuesWithOriginalObservationTimestamps() {
+        val rows = listOf(
+            Triple("rf_window_percent", "body", 42.0),
+            Triple("perfume_1_remaining_percent", "climate", 79.0),
+            Triple("perfume_2_remaining_percent", "climate", 81.0),
+            Triple("perfume_3_remaining_percent", "climate", 83.0),
+            Triple("front_motor_current_raw", "motion", -1.0),
+            Triple("rear_motor_current_raw", "motion", -226.7)
+        ).mapIndexed { index, (fieldKey, category, value) ->
+            InfluxPendingHistoryRow(index.toLong(), fieldKey, category, "NUMBER", null, value, null, "OK", if (fieldKey.endsWith("percent")) "%" else null, 120, fieldKey, "2026-09-08T10:00:00Z", "2026-09-08T10:00:01Z")
+        } + listOf("perfume_1_installed", "perfume_2_installed", "perfume_3_installed").mapIndexed { index, fieldKey ->
+            InfluxPendingHistoryRow((index + 6).toLong(), fieldKey, "climate", "BOOLEAN", null, null, index == 1, "OK", null, 120, fieldKey, "2026-09-08T10:00:00Z", "2026-09-08T10:00:01Z")
+        }
+        val timestampNanos = java.time.Instant.parse("2026-09-08T10:00:00Z").toEpochMilli() * 1_000_000L
+
+        rows.forEach { row ->
+            val line = InfluxLineProtocol.toLine(row, config())
+            assertTrue(line.contains("field_key=${row.fieldKey}"))
+            assertTrue(line.contains("category=${row.category}"))
+            assertTrue(line.endsWith(timestampNanos.toString()))
+        }
+    }
+
+    @Test
     fun omitsTimestampWhenObservedAtCannotBeParsed() {
         val row = InfluxPendingHistoryRow(
             id = 3,

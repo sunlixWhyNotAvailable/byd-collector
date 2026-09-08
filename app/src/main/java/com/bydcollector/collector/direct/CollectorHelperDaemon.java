@@ -90,8 +90,19 @@ public final class CollectorHelperDaemon {
         final Object readLock = new Object();
         final Handler mainHandler = new Handler(Looper.myLooper());
         final String mainCatalogVersion = loadMainCatalogVersion();
+        final String legacyWorkerCatalogVersion = loadLegacyWorkerCatalogVersion();
+        final List<Address> legacyWorkerRows = mainCatalogVersion.equals(legacyWorkerCatalogVersion)
+            ? mainRows
+            : loadWorkerReplayRows(legacyWorkerCatalogVersion);
+        if (legacyWorkerRows == null) throw new IllegalStateException("legacy worker catalog is unavailable");
         final TelemetryWorkerSpool.SampleValidator replaySampleValidator = sample ->
-            validateWorkerSampleForReplay(sample, mainCatalogVersion, mainRows);
+            validateWorkerSampleForReplay(
+                sample,
+                mainCatalogVersion,
+                mainRows,
+                legacyWorkerCatalogVersion,
+                legacyWorkerRows
+            );
         final WorkerPollLoop workerPollLoop = spoolMode
             ? new WorkerPollLoop(
                 mainHandler,
@@ -475,6 +486,36 @@ public final class CollectorHelperDaemon {
         return (String) registryClass.getField("CATALOG_VERSION").get(null);
     }
 
+    private static String loadLegacyWorkerCatalogVersion() throws Exception {
+        Class<?> registryClass = Class.forName("com.bydcollector.collector.data.direct.DirectFidRegistry");
+        return (String) registryClass.getField("LEGACY_WORKER_CATALOG_VERSION").get(null);
+    }
+
+    static List<Address> loadWorkerReplayRows(String catalogVersion) {
+        try {
+            Class<?> registryClass = Class.forName("com.bydcollector.collector.data.direct.DirectFidRegistry");
+            Object registry = registryClass.getField("INSTANCE").get(null);
+            List<?> entries = (List<?>) registryClass
+                .getMethod("workerReplayEntriesForCatalog", String.class)
+                .invoke(registry, catalogVersion);
+            if (entries == null) return null;
+            List<Address> rows = new ArrayList<Address>(entries.size());
+            for (Object entry : entries) {
+                Class<?> entryClass = entry.getClass();
+                int tx = (Integer) entryClass.getMethod("getTx").invoke(entry);
+                if (!isAllowedTx(tx)) throw new IllegalArgumentException("unsupported replay catalog tx: " + tx);
+                rows.add(new Address(
+                    tx,
+                    (Integer) entryClass.getMethod("getDev").invoke(entry),
+                    (Integer) entryClass.getMethod("getFid").invoke(entry)
+                ));
+            }
+            return Collections.unmodifiableList(rows);
+        } catch (ReflectiveOperationException error) {
+            throw new IllegalStateException("cannot load telemetry worker replay catalog", error);
+        }
+    }
+
     private static String readBootId() throws Exception {
         return new String(
             Files.readAllBytes(Paths.get("/proc/sys/kernel/random/boot_id")),
@@ -607,6 +648,22 @@ public final class CollectorHelperDaemon {
             result.error,
             values
         );
+    }
+
+    static void validateWorkerSampleForReplay(
+        TelemetryWorkerSpool.Sample sample,
+        String currentCatalogVersion,
+        List<Address> currentRows,
+        String legacyCatalogVersion,
+        List<Address> legacyRows
+    ) {
+        if (currentCatalogVersion.equals(sample.catalogVersion)) {
+            validateWorkerSampleForReplay(sample, currentCatalogVersion, currentRows);
+        } else if (legacyCatalogVersion.equals(sample.catalogVersion)) {
+            validateWorkerSampleForReplay(sample, legacyCatalogVersion, legacyRows);
+        } else {
+            throw new IllegalArgumentException("unsupported worker catalog: " + sample.catalogVersion);
+        }
     }
 
     static void validateWorkerSampleForReplay(

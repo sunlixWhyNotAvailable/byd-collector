@@ -3,6 +3,7 @@ package com.bydcollector.collector.data.direct
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -11,13 +12,15 @@ class DirectFidRegistryTest {
     fun registryContainsAllWidePollDynamicReadFields() {
         val entries = DirectFidRegistry.entries
 
-        assertEquals(82, entries.size)
+        assertEquals(95, entries.size)
         assertEquals(entries.size, entries.map { it.key }.distinct().size)
         assertEquals(
             entries.size,
             entries.map { Triple(it.dev, it.fid, it.tx) }.distinct().size
         )
-        assertEquals("autoservice-fid-direct-20260820-curated-82-power-v1", DirectFidRegistry.CATALOG_VERSION)
+        assertEquals("autoservice-fid-direct-20260908-curated-95-telemetry-v1", DirectFidRegistry.CATALOG_VERSION)
+        assertNotEquals(DirectFidRegistry.CATALOG_VERSION, DirectFidRegistry.LEGACY_WORKER_CATALOG_VERSION)
+        assertEquals(entries, DirectFidRegistry.workerReplayEntriesForCatalog(DirectFidRegistry.CATALOG_VERSION))
         assertNotNull(entries.firstOrNull { it.key == "statistic_1014_1134559272_5" && it.dev == 1014 && it.fid == 1134559272 && it.tx == 5 })
         assertNotNull(entries.firstOrNull { it.key == "statistic_1014_1145045040_5" && it.dev == 1014 && it.fid == 1145045040 && it.tx == 5 })
         assertNotNull(entries.firstOrNull { it.key == "charging_charge_battery_volt" && it.dev == 1009 && it.fid == 1145045000 && it.tx == 5 })
@@ -44,6 +47,63 @@ class DirectFidRegistryTest {
         assertTrue(entries.all { it.tx == DirectFidRegistry.TX_GET_INT || it.tx == DirectFidRegistry.TX_GET_FLOAT })
         assertTrue(entries.all { it.source.isNotBlank() })
         assertTrue(entries.all { it.prodCategory.isNotBlank() })
+        assertEquals(
+            listOf(
+                Triple(876609592, "charging_1009_876609592_5", DirectValueDecoder.INT_ENUM),
+                Triple(876609560, "charging_1009_876609560_5", DirectValueDecoder.INT_ENUM),
+                Triple(1146095640, "charging_1009_1146095640_5", DirectValueDecoder.INT_RAW),
+                Triple(1146095648, "charging_1009_1146095648_5", DirectValueDecoder.INT_RAW),
+                Triple(1267728400, "bodywork_1001_1267728400_5", DirectValueDecoder.INT_PERCENT),
+                Triple(1242562584, "ac_1000_1242562584_5", DirectValueDecoder.INT_PERCENT),
+                Triple(1242562592, "ac_1000_1242562592_5", DirectValueDecoder.INT_PERCENT),
+                Triple(1242562600, "ac_1000_1242562600_5", DirectValueDecoder.INT_PERCENT),
+                Triple(1242562612, "ac_1000_1242562612_5", DirectValueDecoder.INT_ENUM),
+                Triple(1242562614, "ac_1000_1242562614_5", DirectValueDecoder.INT_ENUM),
+                Triple(1242562616, "ac_1000_1242562616_5", DirectValueDecoder.INT_ENUM),
+                Triple(1186988040, "charging_1009_1186988040_7", DirectValueDecoder.FLOAT_SIGNED_RAW),
+                Triple(1186988056, "charging_1009_1186988056_7", DirectValueDecoder.FLOAT_SIGNED_RAW)
+            ),
+            entries.takeLast(13).map { Triple(it.fid, it.key, it.decoder) }
+        )
+        assertTrue(entries.none { it.dev == 1001 && it.fid == 947912744 })
+    }
+
+    @Test
+    fun workerReplayCatalogKeepsTheKnown82FieldsWhenTheCurrentCatalogExpands() {
+        val legacy = requireNotNull(
+            DirectFidRegistry.workerReplayEntriesForCatalog(DirectFidRegistry.LEGACY_WORKER_CATALOG_VERSION)
+        )
+        val added = DirectFidEntry("future_field", 1009, 42, DirectFidRegistry.TX_GET_INT, DirectValueDecoder.INT_RAW)
+        val expanded = legacy + added
+
+        assertEquals(
+            legacy,
+            DirectFidRegistry.workerReplayEntriesForCatalog(
+                DirectFidRegistry.LEGACY_WORKER_CATALOG_VERSION,
+                "future-current-catalog",
+                expanded
+            )
+        )
+        assertEquals(
+            expanded,
+            DirectFidRegistry.workerReplayEntriesForCatalog(
+                "future-current-catalog",
+                "future-current-catalog",
+                expanded
+            )
+        )
+        assertNull(
+            DirectFidRegistry.workerReplayEntriesForCatalog(
+                "unknown-catalog",
+                "future-current-catalog",
+                expanded
+            )
+        )
+        assertEquals(82, legacy.size)
+        assertEquals(
+            DirectFidRegistry.entries.take(82).map { Triple(it.key, Triple(it.tx, it.dev, it.fid), it.decoder) },
+            legacy.map { Triple(it.key, Triple(it.tx, it.dev, it.fid), it.decoder) }
+        )
     }
 
     @Test
@@ -62,6 +122,19 @@ class DirectFidRegistryTest {
 
         assertEquals("82.5", DirectValueDecoders.decode(current, bits))
         assertEquals(null, DirectValueDecoders.decode(current, java.lang.Float.floatToIntBits(Float.NaN)))
+    }
+
+    @Test
+    fun motorDecoderPreservesSignedMinusOneButRejectsFloatSentinels() {
+        val motor = DirectFidRegistry.entries.first { it.key == "charging_1009_1186988040_7" }
+        val ordinaryFloat = DirectFidRegistry.entries.first { it.key == "charging_charge_current" }
+
+        assertEquals("-1", DirectValueDecoders.decode(motor, java.lang.Float.floatToRawIntBits(-1.0f)))
+        assertEquals("-4.1", DirectValueDecoders.decode(motor, java.lang.Float.floatToRawIntBits(-4.1f)))
+        assertEquals(null, DirectValueDecoders.decode(motor, java.lang.Float.floatToRawIntBits(65535.0f)))
+        assertEquals(null, DirectValueDecoders.decode(motor, java.lang.Float.floatToRawIntBits(Float.NaN)))
+        assertEquals(null, DirectValueDecoders.decode(motor, java.lang.Float.floatToRawIntBits(Float.POSITIVE_INFINITY)))
+        assertEquals(null, DirectValueDecoders.decode(ordinaryFloat, java.lang.Float.floatToRawIntBits(-1.0f)))
     }
 
     @Test

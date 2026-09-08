@@ -37,6 +37,14 @@ class HaMqttPayloadBuilderTest {
                     quality = "MISSING",
                     sourcePollId = 43L,
                     sourceKeys = "charging_mode"
+                ),
+                storedState(
+                    fieldKey = "charging_time_remaining",
+                    valueType = "TEXT",
+                    valueText = "36:50:00",
+                    quality = "OK",
+                    sourcePollId = 44L,
+                    sourceKeys = "charging_1009_1146095640_5+charging_1009_1146095648_5"
                 )
             )
         )
@@ -47,12 +55,15 @@ class HaMqttPayloadBuilderTest {
         assertEquals(73.5, json.getJSONObject("fields").getDouble("soc"))
         assertTrue(json.getJSONObject("fields").getBoolean("charging"))
         assertTrue(json.getJSONObject("fields").isNull("charge_mode"))
+        assertEquals("36:50:00", json.getJSONObject("fields").getString("charging_time_remaining"))
         assertEquals("ok", json.getJSONObject("quality").getString("soc"))
         assertEquals("stale", json.getJSONObject("quality").getString("charging"))
         assertEquals("missing", json.getJSONObject("quality").getString("charge_mode"))
+        assertEquals("ok", json.getJSONObject("quality").getString("charging_time_remaining"))
         assertEquals("2026-06-12T12:00:00+03:00", json.getJSONObject("observed_at").getString("soc"))
         assertEquals("2026-06-12T12:00:05+03:00", json.getJSONObject("changed_at").getString("soc"))
         assertEquals(42L, json.getJSONObject("source_poll_id").getLong("soc"))
+        assertEquals("2026-06-12T12:00:00+03:00", json.getJSONObject("observed_at").getString("charging_time_remaining"))
         assertTrue(json.getJSONObject("source_poll_id").isNull("charging"))
         assertEquals(
             "statistic_1014_1145045040_5",
@@ -109,6 +120,37 @@ class HaMqttPayloadBuilderTest {
     }
 
     @Test
+    fun step3CategoryPayloadsPreserveNumbersBooleansQualityAndTimestamps() {
+        val body = JSONObject(HaMqttPayloadBuilder.categoryState(
+            category = "body",
+            timestamp = "2026-09-08T10:00:05Z",
+            rows = listOf(storedState("rf_window_percent", "NUMBER", valueNumber = 42.0, quality = "OK", sourcePollId = 120L, sourceKeys = "bodywork_1001_1267728400_5", category = "body"))
+        ))
+        val climateRows = listOf(
+            storedState("perfume_1_remaining_percent", "NUMBER", valueNumber = 79.0, quality = "OK", sourcePollId = 120L, sourceKeys = "ac_1000_1242562584_5", category = "climate"),
+            storedState("perfume_2_remaining_percent", "NUMBER", valueNumber = 81.0, quality = "OK", sourcePollId = 120L, sourceKeys = "ac_1000_1242562592_5", category = "climate"),
+            storedState("perfume_3_remaining_percent", "NUMBER", valueNumber = 83.0, quality = "OK", sourcePollId = 120L, sourceKeys = "ac_1000_1242562600_5", category = "climate"),
+            storedState("perfume_1_installed", "BOOLEAN", valueBool = false, quality = "OK", sourcePollId = 120L, sourceKeys = "ac_1000_1242562612_5", category = "climate"),
+            storedState("perfume_2_installed", "BOOLEAN", valueBool = true, quality = "OK", sourcePollId = 120L, sourceKeys = "ac_1000_1242562614_5", category = "climate"),
+            storedState("perfume_3_installed", "BOOLEAN", valueBool = false, quality = "OK", sourcePollId = 120L, sourceKeys = "ac_1000_1242562616_5", category = "climate")
+        )
+        val climate = JSONObject(HaMqttPayloadBuilder.categoryState("climate", "2026-09-08T10:00:05Z", climateRows))
+        val motionRows = listOf(
+            storedState("front_motor_current_raw", "NUMBER", valueNumber = -1.0, quality = "OK", sourcePollId = 120L, sourceKeys = "charging_1009_1186988040_7", category = "motion"),
+            storedState("rear_motor_current_raw", "NUMBER", valueNumber = -226.7, quality = "OK", sourcePollId = 120L, sourceKeys = "charging_1009_1186988056_7", category = "motion")
+        )
+        val motion = JSONObject(HaMqttPayloadBuilder.categoryState("motion", "2026-09-08T10:00:05Z", motionRows))
+
+        assertEquals(42.0, body.getJSONObject("fields").getDouble("rf_window_percent"))
+        assertEquals("ok", body.getJSONObject("quality").getString("rf_window_percent"))
+        climateRows.forEach { row -> assertTrue(climate.getJSONObject("fields").has(row.fieldKey)) }
+        assertTrue(climate.getJSONObject("fields").getBoolean("perfume_2_installed"))
+        assertEquals(-1.0, motion.getJSONObject("fields").getDouble("front_motor_current_raw"))
+        assertEquals(-226.7, motion.getJSONObject("fields").getDouble("rear_motor_current_raw"))
+        assertEquals("2026-06-12T12:00:00+03:00", motion.getJSONObject("observed_at").getString("front_motor_current_raw"))
+    }
+
+    @Test
     fun offlineStatusPublishesOfflineAvailabilityAndCollectorStatus() {
         val json = JSONObject(HaMqttPayloadBuilder.offlineStatus())
 
@@ -125,11 +167,12 @@ class HaMqttPayloadBuilderTest {
         valueBool: Boolean? = null,
         quality: String,
         sourcePollId: Long?,
-        sourceKeys: String
+        sourceKeys: String,
+        category: String = "battery"
     ): StoredNormalizedState {
         return StoredNormalizedState(
             fieldKey = fieldKey,
-            category = "battery",
+            category = category,
             valueType = valueType,
             valueText = valueText,
             valueNumber = valueNumber,

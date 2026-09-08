@@ -52,6 +52,7 @@ class TelegramCoordinator(
         activateEnabledRuntime() ?: return null
         val startupDeadline = ensureStartupRecovery()
         val previousChargingActive = engine.state.chargingActive
+        val previousBmsConflict = engine.state.bmsFinishHighPowerConflictActive
         val previousTripId = engine.state.tripId
         val result = engine.onSuccessfulPoll(observations, eventConfig(), nowMs())
         val committed = handle(result)
@@ -64,11 +65,18 @@ class TelegramCoordinator(
                 runCatching { onDiagnosticLegStarted?.invoke(legId) }
             }
         }
-        if (result.state.chargingActive != previousChargingActive) {
+        if (committed && result.state.chargingActive != previousChargingActive) {
             eventStore.recordEvent(
                 "telegram_charging_transition",
                 "Telegram charging evidence changed",
                 "active=${result.state.chargingActive ?: "unknown"} source=${result.state.chargingEvidenceSource ?: "unknown"}"
+            )
+        }
+        if (committed && !previousBmsConflict && result.state.bmsFinishHighPowerConflictActive) {
+            eventStore.recordEvent(
+                "telegram_bms_finish_power_conflict",
+                "Telegram BMS finish conflicts with charging power",
+                "bms_state=finished power_relation=gte_0_5_kw action=power_fallback"
             )
         }
         return nextWakeAt(result.nextWakeAtMs, nextWakeAt(startupDeadline, pendingQueueDeadline()))
