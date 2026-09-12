@@ -3,6 +3,7 @@ package com.bydcollector.collector.ui.compose
 import com.bydcollector.collector.telegram.TelegramNavigatorMask
 import com.bydcollector.collector.telegram.TelegramPayloadLimitState
 import com.bydcollector.collector.ha.HaEndpointProfile
+import com.bydcollector.collector.update.UpdateHintAppearance
 
 internal fun validEndpointDraft(host: String, port: String, optional: Boolean = false): Boolean {
     if (optional && host.isBlank() && port.isBlank()) return true
@@ -215,6 +216,8 @@ interface BydCollectorActions {
     fun onToggleTailscaleActivation(enabled: Boolean)
 
     fun onToggleUpdateAutoCheck(enabled: Boolean)
+    fun onToggleUpdateHint(enabled: Boolean) {}
+    fun onUpdateHintAppearanceChanged(appearance: UpdateHintAppearance) {}
     fun onCheckForUpdates()
     fun onDismissUpdateDialog()
     fun onInstallUpdate()

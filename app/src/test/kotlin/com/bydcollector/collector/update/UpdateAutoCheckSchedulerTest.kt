@@ -22,11 +22,11 @@ class UpdateAutoCheckSchedulerTest {
     }
 
     @Test
-    fun timerExpiryInBackgroundDefersCheckUntilForegroundResume() {
+    fun timerExpiryInBackgroundRunsWithoutActivityGate() {
         scheduler.onRuntimeStarted(enabled = true)
         nowMs = 31_000L
 
-        assertEquals(UpdateAutoCheckAction.None, scheduler.onTimerElapsed(enabled = true, foreground = false))
+        assertEquals(UpdateAutoCheckAction.Run, scheduler.onTimerElapsed(enabled = true, foreground = false))
         assertEquals(UpdateAutoCheckAction.Run, scheduler.onForeground(enabled = true))
     }
 
@@ -69,7 +69,7 @@ class UpdateAutoCheckSchedulerTest {
 
         assertEquals(UpdateAutoCheckAction.Schedule(30_000L), cold.onBackground(enabled = true))
         nowMs = 31_000L
-        assertEquals(UpdateAutoCheckAction.None, cold.onTimerElapsed(enabled = true, foreground = false))
+        assertEquals(UpdateAutoCheckAction.Run, cold.onTimerElapsed(enabled = true, foreground = false))
         assertEquals(UpdateAutoCheckAction.Run, cold.onForeground(enabled = true))
     }
 
@@ -91,7 +91,7 @@ class UpdateAutoCheckSchedulerTest {
         scheduler.onDismissed()
 
         nowMs += 60 * 60 * 1000L - 1L
-        assertEquals(UpdateAutoCheckAction.None, scheduler.onForeground(enabled = true))
+        assertEquals(UpdateAutoCheckAction.Schedule(1L), scheduler.onForeground(enabled = true))
         nowMs += 2L
         assertEquals(UpdateAutoCheckAction.Run, scheduler.onForeground(enabled = true))
 
@@ -105,7 +105,10 @@ class UpdateAutoCheckSchedulerTest {
         scheduler.onCheckStarted()
         scheduler.onDismissed()
         scheduler.onAutoCheckEnabledChanged(enabled = false)
-        assertEquals(UpdateAutoCheckAction.None, scheduler.onAutoCheckEnabledChanged(enabled = true))
+        assertEquals(
+            UpdateAutoCheckAction.Schedule(60 * 60 * 1000L),
+            scheduler.onAutoCheckEnabledChanged(enabled = true)
+        )
     }
 
     @Test
@@ -136,10 +139,24 @@ class UpdateAutoCheckSchedulerTest {
 
         nowMs += 30 * 60 * 1000L
         scheduler.onCheckStarted()
-        assertEquals(UpdateAutoCheckAction.None, scheduler.onForeground(enabled = true))
+        assertEquals(UpdateAutoCheckAction.Schedule(30 * 60 * 1000L), scheduler.onForeground(enabled = true))
 
         nowMs += 30 * 60 * 1000L
         assertEquals(UpdateAutoCheckAction.Run, scheduler.onForeground(enabled = true))
+    }
+
+    @Test
+    fun suppressionTimerResumesAutomaticCheckInBackgroundAtTtl() {
+        scheduler.onRuntimeStarted(enabled = true)
+        scheduler.onCheckStarted()
+        scheduler.onDismissed()
+
+        assertEquals(
+            UpdateAutoCheckAction.Schedule(60 * 60 * 1000L),
+            scheduler.onBackground(enabled = true)
+        )
+        nowMs += 60 * 60 * 1000L
+        assertEquals(UpdateAutoCheckAction.Run, scheduler.onTimerElapsed(enabled = true, foreground = false))
     }
 
     @Test

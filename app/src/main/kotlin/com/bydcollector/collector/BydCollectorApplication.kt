@@ -19,7 +19,8 @@ import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.ui.ArchiveStorageSnapshotCache
 import com.bydcollector.collector.ui.DashboardUiStateStore
 import com.bydcollector.collector.ui.UiSessionState
-import com.bydcollector.collector.update.UpdateAutoCheckRuntime
+import com.bydcollector.collector.update.UpdateRuntime
+import com.bydcollector.collector.update.UpdateHintOverlay
 import com.bydcollector.collector.update.UpdateChecker
 import com.bydcollector.collector.update.UpdateCheckResult
 import com.bydcollector.collector.update.UpdateCheckSession
@@ -59,6 +60,8 @@ class BydCollectorApplication : Application() {
             }
         }
     }
+    internal val updateRuntime by lazy { UpdateRuntime(this) }
+    internal val updateHints by lazy { UpdateHintOverlay(this) }
     private val archiveStorageSnapshotCacheDelegate = lazy {
         ArchiveStorageSnapshotCache(
             archiveRoot = File(filesDir, "db_archive"),
@@ -71,9 +74,8 @@ class BydCollectorApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
-        val settings = CollectorSettings(this)
-        UpdateAutoCheckRuntime.onRuntimeStarted(settings.isUpdateAutoCheckEnabled())
-        recordUpdateEvent("runtime_started", "auto_enabled=${settings.isUpdateAutoCheckEnabled()} ${UpdateAutoCheckRuntime.diagnosticState()}")
+        // A Messenger bind can create only this Application. Normal runtime entry
+        // points start update timing explicitly; IPC must not start checks or collection.
     }
 
     override fun onTerminate() {

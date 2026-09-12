@@ -285,6 +285,7 @@ class CollectorService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        (applicationContext as BydCollectorApplication).updateRuntime.start("collector_service")
         influxRuntimeDiagnostics.attachJournal(applicationContext)
         running.set(true)
         mainRuntimeStatus = RuntimeActionStatus.STOPPED

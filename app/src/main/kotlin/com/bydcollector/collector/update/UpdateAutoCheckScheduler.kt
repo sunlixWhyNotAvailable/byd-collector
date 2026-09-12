@@ -25,13 +25,14 @@ class UpdateAutoCheckScheduler(
             initialized = true
             deadlineMs = startedAt + delayMs
         }
-        if (isSuppressed()) return UpdateAutoCheckAction.None
+        suppressionRemainingMs()?.let { return UpdateAutoCheckAction.Schedule(it) }
         val deadline = deadlineMs ?: return UpdateAutoCheckAction.None
         return UpdateAutoCheckAction.Schedule((deadline - nowMs()).coerceAtLeast(0L))
     }
 
     fun onForeground(enabled: Boolean): UpdateAutoCheckAction {
-        if (!enabled || isSuppressed()) return UpdateAutoCheckAction.None
+        if (!enabled) return UpdateAutoCheckAction.None
+        suppressionRemainingMs()?.let { return UpdateAutoCheckAction.Schedule(it) }
         val deadline = deadlineMs ?: return UpdateAutoCheckAction.None
         val remaining = deadline - nowMs()
         return if (remaining > 0L) {
@@ -41,14 +42,16 @@ class UpdateAutoCheckScheduler(
         }
     }
 
+    @Suppress("UNUSED_PARAMETER") // Kept for source compatibility; checks are process-owned.
     fun onTimerElapsed(enabled: Boolean, foreground: Boolean): UpdateAutoCheckAction {
-        if (!enabled || isSuppressed()) return UpdateAutoCheckAction.None
+        if (!enabled) return UpdateAutoCheckAction.None
+        suppressionRemainingMs()?.let { return UpdateAutoCheckAction.Schedule(it) }
         val deadline = deadlineMs ?: return UpdateAutoCheckAction.None
         val remaining = deadline - nowMs()
         if (remaining > 0L) {
             return UpdateAutoCheckAction.Schedule(remaining)
         }
-        return if (foreground) UpdateAutoCheckAction.Run else UpdateAutoCheckAction.None
+        return UpdateAutoCheckAction.Run
     }
 
     fun onAutoCheckEnabledChanged(enabled: Boolean): UpdateAutoCheckAction {
@@ -64,7 +67,8 @@ class UpdateAutoCheckScheduler(
 
     /** Arms the existing deadline after a foreground timer is torn down. */
     fun onBackground(enabled: Boolean): UpdateAutoCheckAction {
-        if (!enabled || isSuppressed()) return UpdateAutoCheckAction.None
+        if (!enabled) return UpdateAutoCheckAction.None
+        suppressionRemainingMs()?.let { return UpdateAutoCheckAction.Schedule(it) }
         val now = nowMs()
         if (deadlineMs == null) {
             // The previous accepted request consumed its deadline. A later
@@ -80,7 +84,7 @@ class UpdateAutoCheckScheduler(
     fun onCheckStarted() {
         // A manual request during Close suppression must not erase the latent
         // post-TTL eligibility established by onDismissed().
-        if (!isSuppressed()) deadlineMs = null
+        if (suppressionRemainingMs() == null) deadlineMs = null
     }
 
     /** Starts the process-local close suppression window. */
@@ -102,11 +106,12 @@ class UpdateAutoCheckScheduler(
         "initialized=$initialized deadline_elapsed_ms=${deadlineMs ?: "null"} " +
             "suppressed_until_elapsed_ms=${suppressedUntilMs ?: "null"}"
 
-    private fun isSuppressed(): Boolean {
-        val until = suppressedUntilMs ?: return false
-        if (nowMs() < until) return true
+    private fun suppressionRemainingMs(): Long? {
+        val until = suppressedUntilMs ?: return null
+        val remaining = until - nowMs()
+        if (remaining > 0L) return remaining
         suppressedUntilMs = null
-        return false
+        return null
     }
 }
 

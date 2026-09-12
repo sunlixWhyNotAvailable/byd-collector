@@ -19,7 +19,8 @@ class UpdateCheckSession(
     data class Snapshot(
         val uiState: UpdateUiState,
         val inFlight: Boolean,
-        val revision: Long
+        val revision: Long,
+        val availableResultId: Long?
     )
 
     private val lock = Any()
@@ -28,6 +29,7 @@ class UpdateCheckSession(
     private var inFlight = false
     private var inFlightManual = false
     private var presentationInvalidated = false
+    private var availableResultId: Long? = null
     private var revision = 0L
     private var nextToken = 0L
     private var activeToken: Long? = null
@@ -35,7 +37,12 @@ class UpdateCheckSession(
     private var sessionGeneration = 0L
 
     fun snapshot(): Snapshot = synchronized(lock) {
-        Snapshot(uiState = uiState, inFlight = inFlight, revision = revision)
+        Snapshot(
+            uiState = uiState,
+            inFlight = inFlight,
+            revision = revision,
+            availableResultId = availableResultId
+        )
     }
 
     /** Returns false when an existing physical request is still running. */
@@ -56,11 +63,11 @@ class UpdateCheckSession(
                 if (!joined) return false
                 token = checkNotNull(activeToken)
             } else {
-                if (!manual && uiState is UpdateUiState.Available) return false
                 inFlight = true
                 inFlightManual = manual
                 presentationInvalidated = false
                 uiState = if (manual) UpdateUiState.Checking else UpdateUiState.Hidden
+                availableResultId = null
                 token = ++nextToken
                 activeToken = token
                 activeGeneration = sessionGeneration
@@ -88,6 +95,7 @@ class UpdateCheckSession(
             if (inFlight) presentationInvalidated = true
             if (uiState != UpdateUiState.Hidden) {
                 uiState = UpdateUiState.Hidden
+                availableResultId = null
                 changed = true
             }
             notify = inFlight || changed
@@ -111,6 +119,7 @@ class UpdateCheckSession(
             if (inFlight) presentationInvalidated = true
             else inFlightManual = false
             uiState = UpdateUiState.Hidden
+            availableResultId = null
             revision++
         }
         notifyListeners()
@@ -154,8 +163,10 @@ class UpdateCheckSession(
                         UpdateUiState.Hidden
                     }
                 }
+                availableResultId = if (result is UpdateCheckResult.Available) token else null
             } else {
                 uiState = UpdateUiState.Hidden
+                availableResultId = null
             }
             inFlightManual = false
             presentationInvalidated = false

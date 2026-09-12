@@ -4,21 +4,31 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 class UpdateCheckSessionTest {
     private val info = UpdateInfo("2.8.0", "https://example.test/update.apk", "notes")
 
     @Test
-    fun autoAvailableSurvivesObserverLossAndReattach() {
+    fun availableResultIdIsStableForSnapshotAndFreshForNextEligibleCheck() {
         val tasks = ArrayDeque<() -> Unit>()
         val session = UpdateCheckSession(dispatch = { tasks += it }, checker = { UpdateCheckResult.Available(info) })
 
         assertTrue(session.request(manual = false))
         tasks.removeFirst().invoke()
 
-        assertEquals(UpdateUiState.Available(info), session.snapshot().uiState)
-        assertFalse(session.request(manual = false))
+        val first = session.snapshot()
+        assertEquals(UpdateUiState.Available(info), first.uiState)
+        assertNotNull(first.availableResultId)
+        assertEquals(first.availableResultId, session.snapshot().availableResultId)
+        assertTrue(session.request(manual = false))
+        assertEquals(null, session.snapshot().availableResultId)
+        tasks.removeFirst().invoke()
+        val second = session.snapshot()
+        assertEquals(UpdateUiState.Available(info), second.uiState)
+        assertNotNull(second.availableResultId)
+        assertTrue(second.availableResultId != first.availableResultId)
         var notified = 0
         session.addListener { notified++ }
         assertEquals(UpdateUiState.Available(info), session.snapshot().uiState)
@@ -33,14 +43,17 @@ class UpdateCheckSessionTest {
 
         assertTrue(session.request(manual = true))
         assertIs<UpdateUiState.Checking>(session.snapshot().uiState)
+        assertEquals(null, session.snapshot().availableResultId)
         tasks.removeFirst().invoke()
         assertIs<UpdateUiState.UpToDate>(session.snapshot().uiState)
+        assertEquals(null, session.snapshot().availableResultId)
 
         result = UpdateCheckResult.Error("network")
         assertTrue(session.request(manual = false))
         assertEquals(UpdateUiState.Hidden, session.snapshot().uiState)
         tasks.removeFirst().invoke()
         assertEquals(UpdateUiState.Hidden, session.snapshot().uiState)
+        assertEquals(null, session.snapshot().availableResultId)
     }
 
     @Test
@@ -143,12 +156,11 @@ class UpdateCheckSessionTest {
         result = UpdateCheckResult.Available(info)
         tasks.removeFirst().invoke() // UI may have disappeared; the process retains the offer.
         assertEquals(UpdateUiState.Available(info), session.snapshot().uiState)
-        assertFalse(session.request(manual = false))
-        assertEquals(0, tasks.size)
         assertTrue(session.dismiss())
+        assertEquals(null, session.snapshot().availableResultId)
         scheduler.onDismissed()
         elapsedMs += 3_599_999L
-        assertEquals(UpdateAutoCheckAction.None, scheduler.onForeground(enabled = true))
+        assertEquals(UpdateAutoCheckAction.Schedule(1L), scheduler.onForeground(enabled = true))
         elapsedMs++
         assertEquals(UpdateAutoCheckAction.Run, scheduler.onForeground(enabled = true))
     }

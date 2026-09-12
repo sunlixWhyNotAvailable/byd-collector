@@ -2,6 +2,7 @@ package com.bydcollector.collector.service
 
 import android.content.Context
 import android.content.SharedPreferences
+import com.bydcollector.collector.update.UpdateHintAppearance
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.telegram.TelegramBuiltInTemplates
 import com.bydcollector.collector.telegram.TelegramEventType
@@ -361,6 +362,34 @@ class CollectorSettings(
     }
 
     fun isUpdateAutoCheckEnabled(): Boolean = prefs.getBoolean(KEY_UPDATE_AUTO_CHECK, true)
+
+    fun isUpdateHintEnabled(): Boolean = prefs.getBoolean(KEY_UPDATE_HINT_ENABLED, true)
+
+    fun setUpdateHintEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_UPDATE_HINT_ENABLED, enabled).apply()
+    }
+
+    fun updateHintAppearance(): UpdateHintAppearance {
+        val defaults = UpdateHintAppearance()
+        return UpdateHintAppearance(
+            prefs.getInt("updateHintTransparency", defaults.transparencyPercent),
+            prefs.getInt("updateHintCorner", defaults.cornerRadiusDp),
+            prefs.getInt("updateHintBorderWidth", defaults.borderWidthDp),
+            prefs.getInt("updateHintBorderColor", defaults.borderArgb),
+            prefs.getInt("updateHintSize", defaults.sizePercent)
+        ).normalized()
+    }
+
+    fun setUpdateHintAppearance(appearance: UpdateHintAppearance) {
+        val value = appearance.normalized()
+        prefs.edit()
+            .putInt("updateHintTransparency", value.transparencyPercent)
+            .putInt("updateHintCorner", value.cornerRadiusDp)
+            .putInt("updateHintBorderWidth", value.borderWidthDp)
+            .putInt("updateHintBorderColor", value.borderArgb)
+            .putInt("updateHintSize", value.sizePercent)
+            .apply()
+    }
 
     fun setUpdateAutoCheckEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_UPDATE_AUTO_CHECK, enabled).apply()
@@ -1200,6 +1229,7 @@ class CollectorSettings(
         private val TELEGRAM_TRIP_TEMPLATE_LIMIT_LOCK = Any()
         const val SECRET_TELEGRAM_BOT_TOKEN = "telegram.bot_token"
         const val KEY_UPDATE_AUTO_CHECK = "updateAutoCheck"
+        const val KEY_UPDATE_HINT_ENABLED = "updateHintEnabled"
         const val KEY_TAILSCALE_ACTIVATION = "tailscaleActivation"
         const val KEY_TAILSCALE_ACTIVATION_LAST_ATTEMPT_AT_MS = "tailscaleActivationLastAttemptAtMs"
         const val KEY_ARCHIVE_STORAGE_LIMIT_GB = "archiveStorageLimitGb"

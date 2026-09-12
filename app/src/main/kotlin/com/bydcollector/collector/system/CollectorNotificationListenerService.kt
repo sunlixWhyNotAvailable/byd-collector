@@ -10,6 +10,7 @@ import com.bydcollector.collector.util.sharedOperationalEventExecutor
 class CollectorNotificationListenerService : NotificationListenerService() {
     override fun onCreate() {
         super.onCreate()
+        (applicationContext as BydCollectorApplication).updateRuntime.start("notification_listener")
         requestRuntimeRecovery("notification_listener_create")
     }
 

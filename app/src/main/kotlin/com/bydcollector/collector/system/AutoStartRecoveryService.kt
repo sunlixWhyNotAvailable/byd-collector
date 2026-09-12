@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import com.bydcollector.collector.BuildConfig
+import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.util.namedSingleThreadExecutor
 import java.util.concurrent.Executor
@@ -26,6 +27,7 @@ class AutoStartRecoveryService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        (applicationContext as BydCollectorApplication).updateRuntime.start("auto_start_recovery")
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
     }

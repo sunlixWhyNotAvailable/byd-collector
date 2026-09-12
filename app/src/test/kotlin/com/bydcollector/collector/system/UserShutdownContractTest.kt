@@ -26,13 +26,15 @@ class UserShutdownContractTest {
     fun autoStartIsBlockedByUserShutdownUntilMainActivityClearsIt() {
         val autoStart = sourceFile("com/bydcollector/collector/system/CollectorAutoStart.kt").readText()
         val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val updateRuntime = sourceFile("com/bydcollector/collector/update/UpdateRuntime.kt").readText()
 
         assertTrue(autoStart.contains("if (settings.isUserShutdownRequested()) {"))
         assertTrue(activity.contains("val clearedUserShutdown = settings.clearUserShutdownRequestIfSet()"))
         assertTrue(activity.contains("if (clearedUserShutdown)"))
         assertTrue(activity.contains("settings.clearRuntimeManualStops()"))
         assertTrue(activity.contains("CollectorAutoStart.recoverFromForeground(applicationContext, settings, runtimeStore)"))
-        assertTrue(activity.indexOf("settings.clearUserShutdownRequestIfSet()") < activity.indexOf("startRuntimeUpdateAutoCheck()"))
+        assertInOrder(activity, "settings.clearUserShutdownRequestIfSet()", "updateRuntime.start(\"activity\")")
+        assertTrue(updateRuntime.contains("if (started || settings.isUserShutdownRequested()) return"))
     }
 
     @Test

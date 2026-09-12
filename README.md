@@ -187,7 +187,11 @@ Archiving can temporarily stop collection and integrations. Read the confirmatio
 
 These controls restore Android services and connections; they do not send vehicle-control commands.
 
-Automatic update checking starts after a short startup delay and runs only while the app is visible. Closing an update offer pauses automatic checks for an hour, or until a new app session. Manual checking remains available and always checks the latest published release.
+Automatic update checking starts after a short startup delay and can run while the app operates in the background. When Collector is visible, an available update is offered inside the app. Closing an update offer pauses automatic checks for an hour, or until a new app session. Manual checking remains available and always checks the latest published release.
+
+`New version hint widget` is enabled by default. When a background check finds an update, it can show a hint above other apps for 10 seconds. Tap it to open `Options` and the saved update offer, or close it with the X. Returning to Collector removes its hint without repeating the check; minimizing the app does not replay an old hint. The settings button beside the switch adjusts size, transparency, corners, and frame/stripe color; the default accent is green.
+
+The hint requires Android's permission to display over other apps. Without that permission, normal update offers and collection still work. With compatible BYD HUD and BYD Extend versions, update hints arrange themselves in the available screen area and temporarily shrink when needed; each keeps its own display time and saved appearance settings.
 
 <p align="center"><img src="docs/screenshots/en/options.png" alt="BYD Collector options and runtime settings" width="100%"></p>
 

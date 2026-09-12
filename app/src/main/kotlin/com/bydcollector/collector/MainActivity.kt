@@ -73,8 +73,8 @@ import com.bydcollector.collector.ui.compose.TripsUiState
 import com.bydcollector.collector.ui.compose.TripsUiMapper
 import com.bydcollector.collector.ui.compose.UiLanguage
 import com.bydcollector.collector.ui.compose.strings
-import com.bydcollector.collector.update.UpdateAutoCheckAction
-import com.bydcollector.collector.update.UpdateAutoCheckRuntime
+import com.bydcollector.collector.update.UpdateRuntime
+import com.bydcollector.collector.update.UpdateHintAppearance
 import com.bydcollector.collector.update.UpdateApkVerifier
 import com.bydcollector.collector.update.UpdateCheckSession
 import com.bydcollector.collector.update.UpdateDownloader
@@ -101,6 +101,8 @@ class MainActivity : ComponentActivity() {
     private val updateExecutor = namedSingleThreadExecutor("byd-update")
     private val updateChecks: UpdateCheckSession
         get() = (applicationContext as BydCollectorApplication).updateChecks
+    private val updateRuntime: UpdateRuntime
+        get() = (applicationContext as BydCollectorApplication).updateRuntime
     private val updateDownloader by lazy { UpdateDownloader(applicationContext) }
     private val updateApkVerifier by lazy { UpdateApkVerifier(applicationContext) }
     private var startupBackgroundLaunchPosted = false
@@ -121,6 +123,8 @@ class MainActivity : ComponentActivity() {
         get() = navigationSession.selectedTab
     private var uiLanguage by mutableStateOf(UiLanguage.UK)
     private var darkTheme by mutableStateOf(true)
+    private var updateHintEnabled by mutableStateOf(true)
+    private var updateHintAppearance by mutableStateOf(UpdateHintAppearance())
     private var mqttDraft by mutableStateOf(MqttDraft())
     private var influxDraft by mutableStateOf(InfluxDraft())
     private var telegramUiState by mutableStateOf(TelegramUiState())
@@ -181,7 +185,6 @@ class MainActivity : ComponentActivity() {
         }
     }
     private val startupAdbSelfCheckTask = Runnable { runStartupAdbSelfCheckIfReady() }
-    private val updateAutoCheckTimerTask = Runnable { onUpdateAutoCheckTimerElapsed() }
     private val updateCheckUiTask = Runnable { syncUpdateCheckUi() }
     private val updateCheckListener: () -> Unit = { handler.post(updateCheckUiTask); Unit }
     private val telegramReconcileTask = Runnable {
@@ -209,6 +212,7 @@ class MainActivity : ComponentActivity() {
         override fun onLanguageSelected(language: UiLanguage) {
             uiLanguage = language
             settings.setUiLanguageCode(language.code)
+            (applicationContext as BydCollectorApplication).updateHints.refresh(darkTheme)
             dashboardUiStateStore.selectVehicleKpiLanguage(language.vehicleKpiLanguage())
             val previousTelegram = telegramUiState
             if (previousTelegram.config.messages[TelegramMessageType.TRIP_SUMMARY]?.usesDefaultTemplate == true) {
@@ -228,6 +232,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onDarkThemeSelected(dark: Boolean) {
             darkTheme = dark
+            (applicationContext as BydCollectorApplication).updateHints.refresh(dark)
         }
 
         override fun onStartMain() {
@@ -565,8 +570,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onToggleUpdateAutoCheck(enabled: Boolean) {
             settings.setUpdateAutoCheckEnabled(enabled)
-            handler.removeCallbacks(updateAutoCheckTimerTask)
-            handleUpdateAutoCheckAction(UpdateAutoCheckRuntime.onAutoCheckEnabledChanged(enabled))
+            updateRuntime.onAutoCheckEnabledChanged()
             refresh()
         }
 
@@ -574,15 +578,24 @@ class MainActivity : ComponentActivity() {
             runUpdateCheck(force = true)
         }
 
-        override fun onDismissUpdateDialog() {
-            val dismissedOffer = updateUiState is UpdateUiState.Available
-            updateChecks.dismiss()
-            updatePresentationRevision = updateChecks.snapshot().revision
-            if (dismissedOffer) {
-                UpdateAutoCheckRuntime.onDismissed()
-                handler.removeCallbacks(updateAutoCheckTimerTask)
-                recordUpdateEvent("offer_dismissed", "auto_suppression_ms=3600000")
+        override fun onToggleUpdateHint(enabled: Boolean) {
+            settings.setUpdateHintEnabled(enabled)
+            updateHintEnabled = settings.isUpdateHintEnabled()
+            (applicationContext as BydCollectorApplication).updateHints.refresh(darkTheme)
+            if (enabled && !Settings.canDrawOverlays(applicationContext)) {
+                requestAccessCheck("update_hint_enabled", AccessCheckMode.NORMAL)
             }
+        }
+
+        override fun onUpdateHintAppearanceChanged(appearance: UpdateHintAppearance) {
+            settings.setUpdateHintAppearance(appearance)
+            updateHintAppearance = settings.updateHintAppearance()
+            (applicationContext as BydCollectorApplication).updateHints.refresh(darkTheme)
+        }
+
+        override fun onDismissUpdateDialog() {
+            updateRuntime.dismissOffer()
+            updatePresentationRevision = updateChecks.snapshot().revision
             updateUiGeneration += 1L
             updateUiState = UpdateUiState.Hidden
         }
@@ -597,9 +610,7 @@ class MainActivity : ComponentActivity() {
             settings.setUserShutdownRequested(true)
             CollectorAutoStart.cancelScheduled(applicationContext)
             navigationSession.clear()
-            updateChecks.reset()
-            UpdateAutoCheckRuntime.reset()
-            handler.removeCallbacks(updateAutoCheckTimerTask)
+            updateRuntime.shutdown()
             updateUiGeneration += 1L
             updateUiState = UpdateUiState.Hidden
             CollectorServiceController.shutdown(this@MainActivity)
@@ -629,6 +640,8 @@ class MainActivity : ComponentActivity() {
         navigationSessionGeneration = navigationSession.captureGeneration()
         settings = CollectorSettings(applicationContext)
         uiLanguage = UiLanguage.fromCode(settings.uiLanguageCode())
+        updateHintEnabled = settings.isUpdateHintEnabled()
+        updateHintAppearance = settings.updateHintAppearance()
         settingsPreferences = getSharedPreferences(CollectorSettings.PREFS_NAME, MODE_PRIVATE)
         settingsPreferences.registerOnSharedPreferenceChangeListener(settingsChangeListener)
         if (!CollectorService.isMaintenanceRunningInProcess() && !DatabaseMaintenanceService.isRunning()) {
@@ -637,8 +650,7 @@ class MainActivity : ComponentActivity() {
         val clearedUserShutdown = settings.clearUserShutdownRequestIfSet()
         if (clearedUserShutdown) {
             settings.clearRuntimeManualStops()
-            updateChecks.reset()
-            UpdateAutoCheckRuntime.reset()
+            updateRuntime.shutdown()
         }
         updateChecks.addListener(updateCheckListener)
         stateProvider = DashboardStateProvider(applicationContext, { BydCollectorApplication.store(applicationContext) }, settings)
@@ -699,6 +711,8 @@ class MainActivity : ComponentActivity() {
                 telegramActions = telegramActions,
                 appVersionName = BuildConfig.VERSION_NAME,
                 updateAutoCheckEnabled = settings.isUpdateAutoCheckEnabled(),
+                updateHintEnabled = updateHintEnabled,
+                updateHintAppearance = updateHintAppearance,
                 updateUiState = updateUiState,
                 databaseMaintenanceUiState = currentMaintenanceUiState(renderedChrome),
                 diagnosticsBusy = diagnosticsBusy,
@@ -710,7 +724,7 @@ class MainActivity : ComponentActivity() {
             )
         }
         loadCredentialsAfterFirstFrame()
-        startRuntimeUpdateAutoCheck()
+        updateRuntime.start("activity")
         dashboardExecutor.execute {
             val runtimeStore = currentStore()
             runOnUiThread {
@@ -730,9 +744,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        updateRuntime.onUiVisible()
+    }
+
     override fun onResume() {
         super.onResume()
         foreground = true
+        updateRuntime.onUiResumed()
+        consumeUpdateHintOpen()
         scheduleDashboardCountBootstrap(force = false)
         reconcileCutoverArchiveStorageIfNeeded()
         syncTelegramUiRuntimeState()
@@ -740,7 +761,6 @@ class MainActivity : ComponentActivity() {
         refresh()
         maybeContinueStartupAccessFlow()
         syncUpdateCheckUi()
-        runPendingStartupUpdateCheckIfReady()
         handler.removeCallbacks(refreshTask)
         handler.postDelayed(refreshTask, DASHBOARD_REFRESH_HEARTBEAT_MS)
     }
@@ -754,6 +774,20 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        consumeUpdateHintOpen()
+        syncUpdateCheckUi()
+    }
+
+    private fun consumeUpdateHintOpen() {
+        if ((applicationContext as BydCollectorApplication).updateHints.consumeOpenRequest()) {
+            navigationSession.selectTab(AppTab.EXTRA)
+            updatePresentationRevision = -1L
+        }
+    }
+
     override fun onPause() {
         foreground = false
         mainWindowHasFocus = false
@@ -762,11 +796,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
-        handler.removeCallbacks(updateAutoCheckTimerTask)
         if (!isChangingConfigurations && !settings.isUserShutdownRequested()) {
-            // Only age the deadline in background; HTTP and presentation stay foreground-only.
-            UpdateAutoCheckRuntime.onBackground(settings.isUpdateAutoCheckEnabled())
-            recordUpdateEvent("background_deadline", UpdateAutoCheckRuntime.diagnosticState())
+            updateRuntime.onUiHidden()
         }
         super.onStop()
     }
@@ -792,7 +823,6 @@ class MainActivity : ComponentActivity() {
         if (::settingsPreferences.isInitialized) {
             settingsPreferences.unregisterOnSharedPreferenceChangeListener(settingsChangeListener)
         }
-        handler.removeCallbacks(updateAutoCheckTimerTask)
         handler.removeCallbacks(updateCheckUiTask)
         handler.removeCallbacks(startupAdbSelfCheckTask)
         handler.removeCallbacks(telegramReconcileTask)
@@ -1544,64 +1574,17 @@ class MainActivity : ComponentActivity() {
         startupAccessFlowCompleted = true
     }
 
-    private fun startRuntimeUpdateAutoCheck() {
-        //starts the process-aged 30s update clock independently from startup access prompts
-        handleUpdateAutoCheckAction(
-            UpdateAutoCheckRuntime.onRuntimeStarted(settings.isUpdateAutoCheckEnabled())
-        )
-    }
-
-    private fun runPendingStartupUpdateCheckIfReady() {
-        // Reuse the process deadline after cold background start or an ordinary stop/return.
-        handleUpdateAutoCheckAction(
-            UpdateAutoCheckRuntime.onForeground(settings.isUpdateAutoCheckEnabled())
-        )
-    }
-
-    private fun onUpdateAutoCheckTimerElapsed() {
-        //records background expiry as pending while preserving the foreground-only popup rule
-        handleUpdateAutoCheckAction(
-            UpdateAutoCheckRuntime.onTimerElapsed(
-                enabled = settings.isUpdateAutoCheckEnabled(),
-                foreground = foreground
-            )
-        )
-    }
-
-    private fun handleUpdateAutoCheckAction(action: UpdateAutoCheckAction) {
-        recordUpdateEvent(
-            "auto_check_gate",
-            "action=$action enabled=${settings.isUpdateAutoCheckEnabled()} foreground=$foreground ${UpdateAutoCheckRuntime.diagnosticState()}"
-        )
-        when (action) {
-            UpdateAutoCheckAction.None -> Unit
-            UpdateAutoCheckAction.Run -> runAutomaticUpdateCheck()
-            is UpdateAutoCheckAction.Schedule -> {
-                handler.removeCallbacks(updateAutoCheckTimerTask)
-                handler.postDelayed(updateAutoCheckTimerTask, action.delayMs)
-            }
-        }
-    }
-
-    private fun runAutomaticUpdateCheck() {
-        if (!foreground || destroyed || !settings.isUpdateAutoCheckEnabled()) return
-        runUpdateCheck(force = false)
-    }
-
     private fun runUpdateCheck(force: Boolean) {
         if (destroyed || !foreground || updateUiState is UpdateUiState.Downloading) return
-        val accepted = updateChecks.request(manual = force)
+        val accepted = updateRuntime.request(manual = force)
         if (accepted) {
-            UpdateAutoCheckRuntime.onCheckStarted()
-            handler.removeCallbacks(updateAutoCheckTimerTask)
             updateUiGeneration += 1L
         }
-        recordUpdateEvent("check_requested", "manual=$force accepted=$accepted")
         syncUpdateCheckUi()
     }
 
     private fun syncUpdateCheckUi() {
-        if (destroyed || !foreground || !mainWindowHasFocus) return
+        if (destroyed || !updateRuntime.ownUiVisible) return
         val snapshot = updateChecks.snapshot()
         if (snapshot.revision == updatePresentationRevision) return
         updatePresentationRevision = snapshot.revision
@@ -1616,6 +1599,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startUpdateDownload(info: UpdateInfo) {
+        updateRuntime.onInstallStarted()
         updateChecks.clearPresentation()
         updatePresentationRevision = updateChecks.snapshot().revision
         val uiGeneration = ++updateUiGeneration
@@ -1646,11 +1630,15 @@ class MainActivity : ComponentActivity() {
                     )
                 }
                 runOnUiThread {
-                    if (destroyed) return@runOnUiThread
+                    if (destroyed) {
+                        updateRuntime.onInstallFinished()
+                        return@runOnUiThread
+                    }
                     result
                         .onSuccess { verified ->
                             val finalValidation = updateApkVerifier.validate(verified.file)
                             if (!finalValidation.ok || finalValidation.sha256 != verified.sha256) {
+                                updateRuntime.onInstallFinished()
                                 if (uiGeneration == updateUiGeneration) {
                                     updateUiState = UpdateUiState.Error(
                                         if (!finalValidation.ok) finalValidation.message else "APK digest changed before install"
@@ -1659,14 +1647,19 @@ class MainActivity : ComponentActivity() {
                                 return@onSuccess
                             }
                             runCatching { updateDownloader.install(verified.info, verified.file) }
-                                .onSuccess { if (uiGeneration == updateUiGeneration) updateUiState = UpdateUiState.Hidden }
+                                .onSuccess {
+                                    updateRuntime.onInstallerLaunched()
+                                    if (uiGeneration == updateUiGeneration) updateUiState = UpdateUiState.Hidden
+                                }
                                 .onFailure { error ->
+                                    updateRuntime.onInstallFinished()
                                     if (uiGeneration == updateUiGeneration) {
                                         updateUiState = UpdateUiState.Error(error.message ?: error::class.java.simpleName)
                                     }
                                 }
                         }
                         .onFailure { error ->
+                            updateRuntime.onInstallFinished()
                             if (uiGeneration == updateUiGeneration) {
                                 updateUiState = UpdateUiState.Error(error.message ?: error::class.java.simpleName)
                             }
@@ -1674,6 +1667,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }.onFailure { error ->
+            updateRuntime.onInstallFinished()
             if (!destroyed && uiGeneration == updateUiGeneration) {
                 updateUiState = UpdateUiState.Error(error.message ?: error::class.java.simpleName)
             }

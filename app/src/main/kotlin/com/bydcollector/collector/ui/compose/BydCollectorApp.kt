@@ -25,6 +25,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -102,6 +103,7 @@ import com.bydcollector.collector.ui.VehicleKpis
 import com.bydcollector.collector.ui.UiSessionState
 import com.bydcollector.collector.update.ReleaseNotesSelector
 import com.bydcollector.collector.update.UpdateInfo
+import com.bydcollector.collector.update.UpdateHintAppearance
 import com.bydcollector.collector.update.UpdateUiState
 import java.util.Locale
 import org.osmdroid.config.Configuration
@@ -130,6 +132,8 @@ fun BydCollectorApp(
     telegramActions: TelegramUiActions = TelegramUiActions(),
     appVersionName: String = "",
     updateAutoCheckEnabled: Boolean = true,
+    updateHintEnabled: Boolean = true,
+    updateHintAppearance: UpdateHintAppearance = UpdateHintAppearance(),
     updateUiState: UpdateUiState = UpdateUiState.Hidden,
     databaseMaintenanceUiState: DbMaintenanceUiState? = null,
     diagnosticsBusy: Boolean = false,
@@ -145,8 +149,12 @@ fun BydCollectorApp(
         val p = LocalBydPalette.current
         var pendingArchiveDeleteIds by remember { mutableStateOf<List<String>>(emptyList()) }
         var showClearLogsDialog by remember { mutableStateOf(false) }
+        var showUpdateHintSettings by remember { mutableStateOf(false) }
         var showTripsCompressionConfirm by remember { mutableStateOf(false) }
         val tripsCompression by TripCompressionService.state.collectAsStateWithLifecycle()
+        LaunchedEffect(updateUiState) {
+            if (updateUiState != UpdateUiState.Hidden) showUpdateHintSettings = false
+        }
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -212,8 +220,12 @@ fun BydCollectorApp(
                                     state = state,
                                     strings = s,
                                     updateAutoCheckEnabled = updateAutoCheckEnabled,
+                                    updateHintEnabled = updateHintEnabled,
                                     diagnosticsBusy = diagnosticsBusy,
                                     actions = actions,
+                                    language = language,
+                                    darkTheme = darkTheme,
+                                    onUpdateHintSettings = { showUpdateHintSettings = true },
                                     onRequestClearLogs = { showClearLogsDialog = true },
                                     session = navigationSession,
                                     contentReady = tabContentReady,
@@ -229,17 +241,6 @@ fun BydCollectorApp(
                         strings = s,
                         onOpenSettings = onOpenBackgroundSettingsFromPrompt,
                         onDismiss = onDismissBackgroundSetupPrompt
-                    )
-                }
-                if (updateUiState != UpdateUiState.Hidden) {
-                    //uses the same modal layer as background setup so update flow cannot trigger other controls
-                    UpdateCheckDialog(
-                        strings = s,
-                        appVersionName = appVersionName,
-                        language = language,
-                        state = updateUiState,
-                        onDismiss = actions::onDismissUpdateDialog,
-                        onUpdate = actions::onInstallUpdate
                     )
                 }
                 if (databaseMaintenanceUiState != null) {
@@ -289,6 +290,27 @@ fun BydCollectorApp(
                             showTripsCompressionConfirm = false
                             if (TripCompressionService.dismissResult()) tripsUiActions.onRefreshRequested()
                         }
+                    )
+                }
+                if (showUpdateHintSettings) {
+                    UpdateHintSettingsDialog(
+                        language = language,
+                        darkTheme = darkTheme,
+                        version = (updateUiState as? UpdateUiState.Available)?.info?.version ?: appVersionName,
+                        appearance = updateHintAppearance,
+                        onAppearanceChange = actions::onUpdateHintAppearanceChanged,
+                        onClose = { showUpdateHintSettings = false }
+                    )
+                }
+                if (updateUiState != UpdateUiState.Hidden) {
+                    //The known update offer owns the top modal layer without cancelling unrelated work.
+                    UpdateCheckDialog(
+                        strings = s,
+                        appVersionName = appVersionName,
+                        language = language,
+                        state = updateUiState,
+                        onDismiss = actions::onDismissUpdateDialog,
+                        onUpdate = actions::onInstallUpdate
                     )
                 }
             }
@@ -2140,8 +2162,12 @@ private fun ExtraTab(
     state: DashboardState?,
     strings: UiStrings,
     updateAutoCheckEnabled: Boolean,
+    updateHintEnabled: Boolean,
     diagnosticsBusy: Boolean,
     actions: BydCollectorActions,
+    language: UiLanguage,
+    darkTheme: Boolean,
+    onUpdateHintSettings: () -> Unit,
     onRequestClearLogs: () -> Unit,
     session: UiSessionState,
     contentReady: Boolean,
@@ -2149,8 +2175,8 @@ private fun ExtraTab(
     val optionsCardHeight = 312.dp
     TabScrollColumn(AppTab.EXTRA, session, contentReady) {
         ScreenTitle(strings.extraTab, strings.extraSubtitle)
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            SectionCard(strings.keepAlive, Modifier.weight(1f).height(optionsCardHeight)) {
+        Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            SectionCard(strings.keepAlive, Modifier.weight(1f).heightIn(min = optionsCardHeight).fillMaxHeight()) {
                 Column(Modifier.fillMaxWidth()) {
                     SwitchRow(
                         strings.restoreConnectivity,
@@ -2199,12 +2225,21 @@ private fun ExtraTab(
                     }
                 }
             }
-            SectionCard(strings.appRuntime, Modifier.weight(1f).height(optionsCardHeight)) {
+            SectionCard(strings.appRuntime, Modifier.weight(1f).heightIn(min = optionsCardHeight).fillMaxHeight()) {
                 TailscaleRuntimeRow(strings, state?.tailscaleActivationEnabled == true, actions::onToggleTailscaleActivation)
                 UpdateSettingsRow(
                     strings = strings,
                     updateAutoCheckEnabled = updateAutoCheckEnabled,
                     actions = actions
+                )
+                Box(Modifier.fillMaxWidth().height(1.dp).background(LocalBydPalette.current.border))
+                UpdateHintSettingsRow(
+                    strings = strings,
+                    language = language,
+                    darkTheme = darkTheme,
+                    enabled = updateHintEnabled,
+                    onChange = actions::onToggleUpdateHint,
+                    onSettings = onUpdateHintSettings
                 )
                 ShutdownSettingsRow(strings = strings, actions = actions)
             }
@@ -2338,6 +2373,29 @@ private fun ShutdownIconButton(onClick: () -> Unit) {
         contentAlignment = Alignment.Center
     ) {
         ShutdownIcon(color = p.red, modifier = Modifier.size(23.dp))
+    }
+}
+
+@Composable
+private fun UpdateHintSettingsRow(
+    strings: UiStrings,
+    language: UiLanguage,
+    darkTheme: Boolean,
+    enabled: Boolean,
+    onChange: (Boolean) -> Unit,
+    onSettings: () -> Unit
+) {
+    val p = LocalBydPalette.current
+    SwitchControlRow(
+        toggle = SwitchToggle(enabled, onChange),
+        modifier = Modifier.fillMaxWidth().heightIn(min = 72.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(strings.updateHintTitle, color = p.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            Text(strings.updateHintDescription, color = p.muted, fontSize = 12.sp, lineHeight = 16.sp, maxLines = 2)
+        }
+        UpdateHintSettingsButton(language, darkTheme, onSettings)
     }
 }
 
