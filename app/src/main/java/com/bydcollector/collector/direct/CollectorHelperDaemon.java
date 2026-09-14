@@ -58,6 +58,46 @@ public final class CollectorHelperDaemon {
             return;
         }
 
+        final String helperBootId = readBootId();
+        final String helperGeneration = UUID.randomUUID().toString();
+        final HelperDiagnostics helperDiagnostics = HelperDiagnostics.open(
+            helperBootId,
+            Process.myPid(),
+            helperGeneration,
+            TelemetryWorkerSpool.MAX_SPOOL_BYTES,
+            null
+        );
+        HelperBootstrapOutput.install(helperDiagnostics);
+
+        HelperResources resources = new HelperResources(ownerLock, helperDiagnostics);
+        int exitCode;
+        try {
+            exitCode = runMain(appUid, apkPath, spoolMode, helperBootId, helperGeneration, helperDiagnostics, resources);
+        } catch (Exception error) {
+            recordDiagnosticError(helperDiagnostics, "helper startup/runtime failed: " + describe(error));
+            throw error;
+        } catch (Error error) {
+            recordDiagnosticError(helperDiagnostics, "helper startup/runtime failed: " + describe(error));
+            throw error;
+        } finally {
+            try {
+                resources.close();
+            } finally {
+                helperDiagnostics.close();
+            }
+        }
+        System.exit(exitCode);
+    }
+
+    private static int runMain(
+        int appUid,
+        String apkPath,
+        boolean spoolMode,
+        String helperBootId,
+        String helperGeneration,
+        HelperDiagnostics helperDiagnostics,
+        HelperResources resources
+    ) throws Exception {
         prepareMainLooper();
         final List<Address> mainRows = loadMainRows();
         final Set<Address> whitelist = loadWhitelist(apkPath, mainRows);
@@ -66,8 +106,8 @@ public final class CollectorHelperDaemon {
         final IBinder autoservice = (IBinder) getService.invoke(null, "autoservice");
         if (autoservice == null) {
             System.err.println("ERR: autoservice not found");
-            System.exit(3);
-            return;
+            helperDiagnostics.error("autoservice not found");
+            return 3;
         }
         String descriptor = autoservice.getInterfaceDescriptor();
         final String autoserviceDescriptor = descriptor == null ? "" : descriptor;
@@ -78,15 +118,27 @@ public final class CollectorHelperDaemon {
             openedSpool = TelemetryWorkerSpool.open();
         } catch (Throwable error) {
             openedSpoolError = describe(error);
+            helperDiagnostics.onPersistenceFailure("spool_open", error);
         }
         final TelemetryWorkerSpool workerSpool = openedSpool;
+        resources.workerSpool = workerSpool;
         final String workerSpoolError = openedSpoolError;
         if (spoolMode && workerSpool == null) {
             System.err.println("ERR: app-gap spool unavailable: " + workerSpoolError);
-            ownerLock.close();
-            System.exit(4);
-            return;
+            helperDiagnostics.error("app-gap spool unavailable: " + workerSpoolError);
+            return 4;
         }
+        if (workerSpool != null) {
+            try {
+                TelemetryWorkerSpool.Footprint initialFootprint = workerSpool.observe();
+                helperDiagnostics.onObservation(initialFootprint, false);
+            } catch (Throwable error) {
+                //An unavailable initial observation stays unknown; diagnostics never blocks telemetry startup.
+                helperDiagnostics.onPersistenceFailure("initial_spool_observation", error);
+            }
+            workerSpool.setDiagnosticListener(helperDiagnostics);
+        }
+        helperDiagnostics.mode("app");
         final Object readLock = new Object();
         final Handler mainHandler = new Handler(Looper.myLooper());
         final String mainCatalogVersion = loadMainCatalogVersion();
@@ -108,8 +160,8 @@ public final class CollectorHelperDaemon {
                 mainHandler,
                 mainRows,
                 mainCatalogVersion,
-                readBootId(),
-                UUID.randomUUID().toString(),
+                helperBootId,
+                helperGeneration,
                 workerSpool,
                 readLock,
                 address -> scalarRead(autoservice, autoserviceDescriptor, address),
@@ -117,10 +169,19 @@ public final class CollectorHelperDaemon {
                 new HelperWakeLockController(
                     SystemClock::elapsedRealtime,
                     HelperWakeLockPlatform::acquireShellPartialWakeLock,
-                    WorkerPollLoop::log
-                )
+                    message -> {
+                        WorkerPollLoop.log(message);
+                        if (message.startsWith("WARN:") || message.startsWith("ERR:")) {
+                            helperDiagnostics.error("wake_lock: " + message);
+                        } else {
+                            helperDiagnostics.context("wake_lock", message);
+                        }
+                    }
+                ),
+                helperDiagnostics
             )
             : null;
+        resources.workerPollLoop = workerPollLoop;
         Binder helperBinder = new Binder() {
             @Override
             protected boolean onTransact(int code, Parcel data, Parcel reply, int flags) throws RemoteException {
@@ -251,6 +312,7 @@ public final class CollectorHelperDaemon {
                     if (workerPollLoop != null) workerPollLoop.markConsumerHeartbeat();
                     if (reply != null) {
                         if (workerSpool == null) {
+                            recordFailedAck(helperDiagnostics, workerSpoolError);
                             writeWorkerAckReply(
                                 reply,
                                 CollectorHelperProtocol.STATUS_SPOOL_UNAVAILABLE,
@@ -264,16 +326,19 @@ public final class CollectorHelperDaemon {
                                     data.readString(),
                                     data.readLong()
                                 );
-                                int updated = workerSpool.acknowledge(identity, data.readLong());
+                                TelemetryWorkerSpool.AckResult ack = workerSpool.acknowledge(identity, data.readLong());
                                 writeWorkerAckReply(
                                     reply,
-                                    updated == 1
+                                    ack.status == TelemetryWorkerSpool.AckStatus.RELEASED
                                         ? CollectorHelperProtocol.STATUS_OK
-                                        : CollectorHelperProtocol.STATUS_SAMPLE_NOT_FOUND,
-                                    updated,
-                                    updated == 1 ? null : "worker sample not found"
+                                        : ack.status == TelemetryWorkerSpool.AckStatus.NOT_FOUND
+                                            ? CollectorHelperProtocol.STATUS_SAMPLE_NOT_FOUND
+                                            : CollectorHelperProtocol.STATUS_SPOOL_UNAVAILABLE,
+                                    ack.releasedRecords,
+                                    ack.error
                                 );
                             } catch (IllegalArgumentException error) {
+                                recordFailedAck(helperDiagnostics, describe(error));
                                 writeWorkerAckReply(
                                     reply,
                                     CollectorHelperProtocol.STATUS_INVALID_REQUEST,
@@ -281,6 +346,7 @@ public final class CollectorHelperDaemon {
                                     describe(error)
                                 );
                             } catch (Throwable error) {
+                                recordFailedAck(helperDiagnostics, describe(error));
                                 writeWorkerAckReply(
                                     reply,
                                     CollectorHelperProtocol.STATUS_SPOOL_UNAVAILABLE,
@@ -321,34 +387,26 @@ public final class CollectorHelperDaemon {
             }
         };
         helperBinder.attachInterface(null, CollectorHelperProtocol.DESCRIPTOR);
-        try {
-            if (workerPollLoop != null) workerPollLoop.startAutonomousMode();
-            Method addService = serviceManager.getMethod("addService", String.class, IBinder.class);
-            addService.invoke(null, CollectorHelperProtocol.SERVICE_NAME, helperBinder);
-            System.out.println(
-                "READY pid=" + Process.myPid() +
-                    " protocol=" + CollectorHelperProtocol.PROTOCOL_VERSION +
-                    " whitelist=" + whitelist.size() +
-                    " native=" + nativeReader.isAvailable() +
-                    (nativeReader.isAvailable() ? "" : " native_error=" + nativeReader.unavailableReason()) +
-                    " spool=" + (workerSpool != null) +
-                    " spool_mode=" + spoolMode +
-                    (workerSpoolError == null ? "" : " spool_error=" + workerSpoolError)
-            );
-            System.out.flush();
-            if (workerPollLoop != null) workerPollLoop.start();
-            Looper.loop();
-        } finally {
-            try {
-                if (workerPollLoop != null) workerPollLoop.stop();
-                if (workerSpool != null) workerSpool.close();
-            } finally {
-                ownerLock.close();
-            }
-        }
+        if (workerPollLoop != null) workerPollLoop.startAutonomousMode();
+        Method addService = serviceManager.getMethod("addService", String.class, IBinder.class);
+        addService.invoke(null, CollectorHelperProtocol.SERVICE_NAME, helperBinder);
+        System.out.println(
+            "READY pid=" + Process.myPid() +
+                " protocol=" + CollectorHelperProtocol.PROTOCOL_VERSION +
+                " whitelist=" + whitelist.size() +
+                " native=" + nativeReader.isAvailable() +
+                (nativeReader.isAvailable() ? "" : " native_error=" + nativeReader.unavailableReason()) +
+                " spool=" + (workerSpool != null) +
+                " spool_mode=" + spoolMode +
+                (workerSpoolError == null ? "" : " spool_error=" + workerSpoolError)
+        );
+        System.out.flush();
+        helperDiagnostics.context("helper_ready", "spool_mode=" + spoolMode);
+        if (workerPollLoop != null) workerPollLoop.start();
+        Looper.loop();
         // ActivityThread/Binder threads may outlive main; process death is the final
         // fallback that releases a lock whose explicit teardown persistently failed.
-        System.exit(0);
+        return 0;
     }
 
     private static ReadValue scalarRead(
@@ -374,6 +432,22 @@ public final class CollectorHelperDaemon {
         } finally {
             data.recycle();
             reply.recycle();
+        }
+    }
+
+    private static void recordFailedAck(HelperDiagnostics diagnostics, String error) {
+        try {
+            diagnostics.onAcknowledge(TelemetryWorkerSpool.AckResult.failed(error));
+        } catch (Throwable ignored) {
+            //Diagnostic accounting cannot change the ACK reply path.
+        }
+    }
+
+    private static void recordDiagnosticError(HelperDiagnostics diagnostics, String error) {
+        try {
+            diagnostics.error(error);
+        } catch (Throwable ignored) {
+            //Cleanup and original failure propagation remain authoritative.
         }
     }
 
@@ -719,6 +793,7 @@ public final class CollectorHelperDaemon {
         private final NativeReader nativeReader;
         private final ConsumerLease consumerLease;
         private final HelperWakeLockController wakeLockController;
+        private final HelperDiagnostics diagnostics;
         private long sequence;
         private boolean stopped;
         private String lastError;
@@ -733,7 +808,8 @@ public final class CollectorHelperDaemon {
             Object readLock,
             ScalarReader scalarReader,
             NativeReader nativeReader,
-            HelperWakeLockController wakeLockController
+            HelperWakeLockController wakeLockController,
+            HelperDiagnostics diagnostics
         ) {
             this.handler = handler;
             this.rows = rows;
@@ -745,6 +821,7 @@ public final class CollectorHelperDaemon {
             this.scalarReader = scalarReader;
             this.nativeReader = nativeReader;
             this.wakeLockController = wakeLockController;
+            this.diagnostics = diagnostics;
             this.consumerLease = new ConsumerLease(
                 SystemClock.elapsedRealtime(),
                 CONSUMER_LEASE_MS
@@ -757,6 +834,7 @@ public final class CollectorHelperDaemon {
 
         void startAutonomousMode() {
             wakeLockController.enterAutonomousMode();
+            diagnostics.context("helper_owner", "app_gap_spool");
         }
 
         void stop() {
@@ -772,6 +850,7 @@ public final class CollectorHelperDaemon {
                 wakeFallback = !consumerLease.isActive(now);
                 if (consumerLease.renew(now)) {
                     log("INFO: app consumer lease restored");
+                    diagnostics.mode("app");
                     lastError = null;
                 }
             }
@@ -792,8 +871,10 @@ public final class CollectorHelperDaemon {
                     if (!consumerLease.isActive(now)) {
                         if (consumerLease.beginFallback(now)) {
                             log("INFO: app consumer lease expired; fallback spool started");
+                            diagnostics.mode("autonomous");
                         }
                         if (!spool.canAppend()) {
+                            diagnostics.capSkippedPollCycle();
                             recordError("app-gap spool cap reached");
                         } else {
                             long capturedWallMs = System.currentTimeMillis();
@@ -803,7 +884,7 @@ public final class CollectorHelperDaemon {
                             //the read lock also serializes lease renewal, so a restored APP cannot
                             //race this append and leave a sample after the lease becomes active
                             if (!consumerLease.isActive(SystemClock.elapsedRealtime())) {
-                                boolean appended = spool.append(workerSample(
+                                TelemetryWorkerSpool.AppendResult appendResult = spool.append(workerSample(
                                     new TelemetryWorkerSampleIdentity(bootId, helperGeneration, pollSequence),
                                     catalogVersion,
                                     capturedWallMs,
@@ -811,8 +892,12 @@ public final class CollectorHelperDaemon {
                                     rows,
                                     result
                                 ));
-                                if (!appended) {
-                                    recordError("app-gap spool append rejected (cap or duplicate)");
+                                if (appendResult != TelemetryWorkerSpool.AppendResult.SUCCESS) {
+                                    recordError(
+                                        appendResult == TelemetryWorkerSpool.AppendResult.DUPLICATE
+                                            ? "app-gap spool append rejected (duplicate)"
+                                            : "app-gap spool append rejected (cap)"
+                                    );
                                 } else {
                                     lastError = null;
                                 }
@@ -834,6 +919,7 @@ public final class CollectorHelperDaemon {
         }
 
         private void recordError(String message) {
+            diagnostics.error(message);
             if (!message.equals(lastError)) {
                 log("WARN: " + message);
                 lastError = message;
@@ -1205,6 +1291,39 @@ public final class CollectorHelperDaemon {
             try {
                 if (file != null) file.close();
             } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private static final class HelperResources implements AutoCloseable {
+        private final OwnerLock ownerLock;
+        private final HelperDiagnostics diagnostics;
+        private TelemetryWorkerSpool workerSpool;
+        private WorkerPollLoop workerPollLoop;
+        private boolean closed;
+
+        HelperResources(OwnerLock ownerLock, HelperDiagnostics diagnostics) {
+            this.ownerLock = ownerLock;
+            this.diagnostics = diagnostics;
+        }
+
+        @Override public synchronized void close() {
+            if (closed) return;
+            closed = true;
+            try {
+                if (workerPollLoop != null) workerPollLoop.stop();
+            } catch (Throwable error) {
+                recordDiagnosticError(diagnostics, "helper worker teardown failed: " + describe(error));
+            }
+            try {
+                if (workerSpool != null) workerSpool.close();
+            } catch (Throwable error) {
+                recordDiagnosticError(diagnostics, "helper spool teardown failed: " + describe(error));
+            }
+            try {
+                ownerLock.close();
+            } catch (Throwable error) {
+                recordDiagnosticError(diagnostics, "helper owner teardown failed: " + describe(error));
             }
         }
     }

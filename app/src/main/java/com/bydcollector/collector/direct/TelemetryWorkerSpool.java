@@ -29,9 +29,18 @@ final class TelemetryWorkerSpool implements AutoCloseable {
     private static final String TMP_SUFFIX = ".tmp";
     private static final String BAD_SUFFIX = ".bad";
     private static final SampleValidator ACCEPT_ALL = sample -> { };
+    private static final DiagnosticListener NO_DIAGNOSTICS = new DiagnosticListener() {
+        @Override public void onObservation(Footprint footprint, boolean capacityBlocked) { }
+        @Override public void onAppend(AppendResult result, Footprint footprint) { }
+        @Override public void onPersistenceFailure(String operation, Throwable error) { }
+        @Override public void onAcknowledge(AckResult result) { }
+        @Override public void onQuarantine(long recordBytes) { }
+    };
 
     private final File directory;
     private final long maxBytes;
+    private DiagnosticListener diagnostics = NO_DIAGNOSTICS;
+    private Footprint capacityBlockedFootprint;
     private boolean closed;
 
     static TelemetryWorkerSpool open() {
@@ -56,12 +65,27 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         this.maxBytes = maxBytes;
     }
 
-    synchronized boolean append(Sample sample) {
+    synchronized void setDiagnosticListener(DiagnosticListener diagnostics) {
+        ensureOpen();
+        this.diagnostics = diagnostics == null ? NO_DIAGNOSTICS : diagnostics;
+    }
+
+    synchronized Footprint observe() {
+        ensureOpen();
+        Footprint footprint = footprint();
+        notifyObservation(footprint, isCapacityBlockedAt(footprint));
+        return footprint;
+    }
+
+    synchronized AppendResult append(Sample sample) {
         ensureOpen();
         if (sample == null) throw new IllegalArgumentException("sample is required");
         File ready = readyFile(sample.identity);
         File temporary = temporaryFile(sample.identity);
-        if (ready.exists() || temporary.exists()) return false;
+        if (ready.exists() || temporary.exists()) {
+            notifyAppend(AppendResult.DUPLICATE, null);
+            return AppendResult.DUPLICATE;
+        }
 
         byte[] payload;
         try {
@@ -69,22 +93,43 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         } catch (Exception error) {
             throw new IllegalStateException("cannot encode telemetry worker sample", error);
         }
-        long footprint = footprintBytes();
-        if (footprint > maxBytes || payload.length > maxBytes - footprint) return false;
+        Footprint footprint = footprint();
+        if (footprint.bytes > maxBytes || payload.length > maxBytes - footprint.bytes) {
+            capacityBlockedFootprint = footprint;
+            notifyAppend(AppendResult.CAP_REACHED, footprint);
+            return AppendResult.CAP_REACHED;
+        }
         try {
             writeDurably(temporary, payload);
             Files.move(temporary.toPath(), ready.toPath(), StandardCopyOption.ATOMIC_MOVE);
-            return true;
+            capacityBlockedFootprint = null;
+            Footprint appended = footprint.plus(payload.length, 1);
+            notifyAppend(AppendResult.SUCCESS, appended);
+            return AppendResult.SUCCESS;
         } catch (IOException error) {
             //A .tmp is never visible to pending(); remove only this failed write.
             if (temporary.isFile()) temporary.delete();
+            if (temporary.isFile()) notifyObservation(footprint.plus(temporary.length(), 0), false);
+            notifyPersistenceFailure("append", error);
             throw new IllegalStateException("cannot persist telemetry worker sample", error);
         }
     }
 
     synchronized boolean canAppend() {
         ensureOpen();
-        return footprintBytes() < maxBytes;
+        //The disk listing remains authoritative. The remembered footprint only prevents
+        //repeating a payload-size rejection while the real on-disk state is unchanged.
+        Footprint footprint = footprint();
+        if (
+            capacityBlockedFootprint != null &&
+            !sameFootprint(capacityBlockedFootprint, footprint)
+        ) {
+            capacityBlockedFootprint = null;
+        }
+        boolean blocked = footprint.bytes >= maxBytes || isCapacityBlockedAt(footprint);
+        if (blocked) capacityBlockedFootprint = footprint;
+        notifyObservation(footprint, blocked);
+        return !blocked;
     }
 
     synchronized List<Sample> pending(int limit) {
@@ -98,9 +143,14 @@ final class TelemetryWorkerSpool implements AutoCloseable {
             throw new IllegalArgumentException("invalid pending sample limit: " + limit);
         }
         File[] files = directory.listFiles((dir, name) -> name.endsWith(READY_SUFFIX));
-        if (files == null) throw new IllegalStateException("cannot list telemetry worker spool: " + directory);
+        if (files == null) {
+            IllegalStateException error = new IllegalStateException("cannot list telemetry worker spool: " + directory);
+            notifyPersistenceFailure("pending", error);
+            throw error;
+        }
         List<PendingRecord> records = new ArrayList<PendingRecord>();
         for (File file : files) {
+            if (!file.isFile()) continue;
             try {
                 Sample sample = decode(readBytes(file));
                 if (!file.equals(readyFile(sample.identity))) throw new IllegalArgumentException("record filename does not match identity");
@@ -130,19 +180,39 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         return result;
     }
 
-    synchronized int acknowledge(TelemetryWorkerSampleIdentity identity, long acknowledgedAtMs) {
+    synchronized AckResult acknowledge(TelemetryWorkerSampleIdentity identity, long acknowledgedAtMs) {
         ensureOpen();
         if (identity == null) throw new IllegalArgumentException("identity is required");
         if (acknowledgedAtMs < 0) throw new IllegalArgumentException("acknowledgedAtMs must be non-negative");
         File ready = readyFile(identity);
-        if (!ready.isFile()) return 0;
+        if (!ready.isFile()) {
+            AckResult result = AckResult.notFound();
+            notifyAcknowledge(result);
+            return result;
+        }
+        long recordBytes = ready.length();
         try {
             Sample sample = decode(readBytes(ready));
-            if (!identity.equals(sample.identity)) return 0;
+            if (!identity.equals(sample.identity)) {
+                AckResult result = AckResult.failed("record identity mismatch");
+                notifyAcknowledge(result);
+                return result;
+            }
         } catch (Exception error) {
-            return 0;
+            AckResult result = AckResult.failed("cannot validate record: " + error.getMessage());
+            notifyAcknowledge(result);
+            return result;
         }
-        return ready.delete() ? 1 : 0;
+        AckResult result;
+        if (ready.delete()) {
+            capacityBlockedFootprint = null;
+            result = AckResult.released(recordBytes);
+        } else {
+            result = AckResult.failed("record delete failed");
+            notifyPersistenceFailure("acknowledge", new IOException(result.error));
+        }
+        notifyAcknowledge(result);
+        return result;
     }
 
     @Override public synchronized void close() {
@@ -170,17 +240,23 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         return Base64.getUrlEncoder().withoutPadding().encodeToString(value.getBytes(StandardCharsets.UTF_8));
     }
 
-    private long footprintBytes() {
+    private Footprint footprint() {
         File[] files = directory.listFiles();
-        if (files == null) throw new IllegalStateException("cannot list telemetry worker spool: " + directory);
+        if (files == null) {
+            IllegalStateException error = new IllegalStateException("cannot list telemetry worker spool: " + directory);
+            notifyPersistenceFailure("observe", error);
+            throw error;
+        }
         long total = 0L;
+        int pendingReadyRecords = 0;
         for (File file : files) {
             if (!file.isFile()) continue;
             long length = file.length();
-            if (Long.MAX_VALUE - total < length) return Long.MAX_VALUE;
-            total += length;
+            if (Long.MAX_VALUE - total < length) total = Long.MAX_VALUE;
+            else total += length;
+            if (file.getName().endsWith(READY_SUFFIX)) pendingReadyRecords++;
         }
-        return total;
+        return new Footprint(total, pendingReadyRecords);
     }
 
     private static void writeDurably(File file, byte[] payload) throws IOException {
@@ -293,12 +369,44 @@ final class TelemetryWorkerSpool implements AutoCloseable {
     }
 
     private void quarantine(File file) {
+        long recordBytes = file.length();
         File bad = new File(file.getPath() + BAD_SUFFIX);
         int suffix = 1;
         while (bad.exists()) bad = new File(file.getPath() + BAD_SUFFIX + "." + suffix++);
         if (!file.renameTo(bad)) {
             System.err.println("WARN: cannot quarantine malformed telemetry worker record: " + file);
+            notifyPersistenceFailure("quarantine", new IOException("rename failed: " + file));
+        } else {
+            notifyQuarantine(recordBytes);
         }
+    }
+
+    private boolean isCapacityBlockedAt(Footprint footprint) {
+        return capacityBlockedFootprint != null && sameFootprint(capacityBlockedFootprint, footprint);
+    }
+
+    private static boolean sameFootprint(Footprint left, Footprint right) {
+        return left.bytes == right.bytes && left.pendingReadyRecords == right.pendingReadyRecords;
+    }
+
+    private void notifyObservation(Footprint footprint, boolean capacityBlocked) {
+        try { diagnostics.onObservation(footprint, capacityBlocked); } catch (Throwable ignored) { }
+    }
+
+    private void notifyAppend(AppendResult result, Footprint footprint) {
+        try { diagnostics.onAppend(result, footprint); } catch (Throwable ignored) { }
+    }
+
+    private void notifyPersistenceFailure(String operation, Throwable error) {
+        try { diagnostics.onPersistenceFailure(operation, error); } catch (Throwable ignored) { }
+    }
+
+    private void notifyAcknowledge(AckResult result) {
+        try { diagnostics.onAcknowledge(result); } catch (Throwable ignored) { }
+    }
+
+    private void notifyQuarantine(long recordBytes) {
+        try { diagnostics.onQuarantine(recordBytes); } catch (Throwable ignored) { }
     }
 
     private static int compareLong(long left, long right) {
@@ -317,6 +425,67 @@ final class TelemetryWorkerSpool implements AutoCloseable {
 
     interface SampleValidator {
         void validate(Sample sample);
+    }
+
+    interface DiagnosticListener {
+        void onObservation(Footprint footprint, boolean capacityBlocked);
+        void onAppend(AppendResult result, Footprint footprint);
+        void onPersistenceFailure(String operation, Throwable error);
+        void onAcknowledge(AckResult result);
+        void onQuarantine(long recordBytes);
+    }
+
+    enum AppendResult {
+        SUCCESS,
+        DUPLICATE,
+        CAP_REACHED
+    }
+
+    enum AckStatus {
+        RELEASED,
+        NOT_FOUND,
+        FAILED
+    }
+
+    static final class Footprint {
+        final long bytes;
+        final int pendingReadyRecords;
+
+        Footprint(long bytes, int pendingReadyRecords) {
+            this.bytes = bytes;
+            this.pendingReadyRecords = pendingReadyRecords;
+        }
+
+        Footprint plus(long addedBytes, int addedReadyRecords) {
+            long nextBytes = Long.MAX_VALUE - bytes < addedBytes ? Long.MAX_VALUE : bytes + addedBytes;
+            return new Footprint(nextBytes, pendingReadyRecords + addedReadyRecords);
+        }
+    }
+
+    static final class AckResult {
+        final AckStatus status;
+        final int releasedRecords;
+        final long releasedBytes;
+        final String error;
+
+        private AckResult(AckStatus status, int releasedRecords, long releasedBytes, String error) {
+            this.status = status;
+            this.releasedRecords = releasedRecords;
+            this.releasedBytes = releasedBytes;
+            this.error = error;
+        }
+
+        static AckResult released(long releasedBytes) {
+            return new AckResult(AckStatus.RELEASED, 1, releasedBytes, null);
+        }
+
+        static AckResult notFound() {
+            return new AckResult(AckStatus.NOT_FOUND, 0, 0L, "worker sample not found");
+        }
+
+        static AckResult failed(String error) {
+            return new AckResult(AckStatus.FAILED, 0, 0L, error);
+        }
     }
 
     static final class Sample {

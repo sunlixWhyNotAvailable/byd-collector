@@ -20,7 +20,7 @@ class DirectBridgeManagerTest {
         assertContains(command, "rm -f /data/local/tmp/bydcollector_helper.lock")
         assertContains(command, "setsid app_process /system/bin --nice-name=bydcollector_helper")
         assertContains(command, "com.bydcollector.collector.direct.CollectorHelperDaemon 12345 '/data/app/com.bydcollector.collector/base.apk'")
-        assertContains(command, "</dev/null >/data/local/tmp/bydcollector_helper.log 2>&1 &")
+        assertContains(command, "</dev/null >>/data/local/tmp/bydcollector_helper.log 2>&1 &")
         assertContains(command, "service list 2>/dev/null | grep -q bydcollector_helper")
         assert(command.indexOf("kill \"${'$'}pid\"") < command.indexOf("setsid app_process"))
         assert(command.indexOf("HELPER_STOP_TIMEOUT") < command.indexOf("rm -f /data/local/tmp/bydcollector_helper.lock"))
@@ -28,6 +28,26 @@ class DirectBridgeManagerTest {
         assertFalse(command.contains("base.apk' worker"))
         assertFalse(command.contains("DirectVehicleBridgeServer"))
         assertFalse(command.contains("19837"))
+    }
+
+    @Test
+    fun bootstrapHistoryIsBoundedAndPreservedBeforeAppendingTheNewLaunch() {
+        val history = DirectBridgeManager.bootstrapHistoryCommand()
+        val command = DirectBridgeManager.launchCommand("/data/app/collector/base.apk", 12345)
+        val log = "/data/local/tmp/bydcollector_helper.log"
+
+        for (index in 3 downTo 1) {
+            val source = if (index == 1) log else "$log.${index - 1}"
+            assertContains(history, "tail -c 2097152 $source >$log.$index.tmp && mv -f $log.$index.tmp $log.$index")
+        }
+        assertTrue(history.indexOf("$log.3.tmp") < history.indexOf("$log.2.tmp"))
+        assertTrue(history.indexOf("$log.2.tmp") < history.indexOf("$log.1.tmp"))
+        assertContains(history, "if [ \"${'$'}bootstrap_history_ok\" = 1 ]; then : >$log;")
+        assertContains(history, "HELPER_BOOTSTRAP_HISTORY_PARTIAL")
+        assertTrue(command.indexOf("HELPER_STOP_TIMEOUT") < command.indexOf(history))
+        assertTrue(command.indexOf(history) < command.indexOf("setsid app_process"))
+        assertFalse(history.contains("telemetry_spool"))
+        assertFalse(history.contains("rm -r"))
     }
 
     @Test

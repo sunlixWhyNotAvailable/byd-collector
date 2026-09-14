@@ -43,12 +43,24 @@ class TelemetryWorkerReplayCoordinator(
     private val successfulPollObserver: SuccessfulPollObserver? = null,
     private val replayEntriesForCatalog: (String) -> List<DirectFidEntry>? =
         DirectFidRegistry::workerReplayEntriesForCatalog,
-    private val acknowledgedAtMs: () -> Long = { System.currentTimeMillis() }
+    private val acknowledgedAtMs: () -> Long = { System.currentTimeMillis() },
+    private val monotonicNanos: () -> Long = { System.nanoTime() }
 ) {
     private var lastFailureKey: String? = null
+    private var lastFailureLoggedAtNanos = 0L
+    private var repeatedFailureCount = 0L
 
     fun replayNextBatch(sessionId: Long): WorkerReplayBatchResult {
+        var batchCount = 0
+        var importAttempts = 0L
+        var importedPolls = 0L
         var insertedPolls = 0L
+        var duplicatePolls = 0L
+        var ackAttempts = 0L
+        var successfulAcks = 0L
+        var failedAcks = 0L
+        var firstIdentity: TelemetryWorkerSampleIdentity? = null
+        var lastIdentity: TelemetryWorkerSampleIdentity? = null
         var lastPollId: Long? = null
         var lastTimestamp: String? = null
         var lastElapsedMs = 0L
@@ -66,12 +78,15 @@ class TelemetryWorkerReplayCoordinator(
                 )
             }
             if (pending.samples.isEmpty()) {
-                lastFailureKey = null
+                clearFailureAggregation()
                 return WorkerReplayBatchResult(needsReplay = false, cycleResult = null)
             }
+            batchCount = pending.samples.size
+            firstIdentity = pending.samples.first().identity
             val parametersByKey = store.getActiveCatalogParameters().associateBy { it.key }
             for (sample in pending.samples) {
                 if (Thread.currentThread().isInterrupted) throw InterruptedException()
+                lastIdentity = sample.identity
                 val entries = requireNotNull(replayEntriesForCatalog(sample.catalogVersion)) {
                     "unsupported worker catalog: ${sample.catalogVersion}"
                 }
@@ -80,8 +95,10 @@ class TelemetryWorkerReplayCoordinator(
                 val parameters = entries.map { entry ->
                     requireNotNull(parametersByKey[entry.key]) { "missing replay parameter: ${entry.key}" }
                 }
+                importAttempts += 1L
                 val imported = store.insertWorkerPoll(sessionId, sample.identity, input, parameters)
-                if (imported.inserted) insertedPolls += 1L
+                importedPolls += 1L
+                if (imported.inserted) insertedPolls += 1L else duplicatePolls += 1L
                 lastPollId = imported.pollId
                 lastTimestamp = input.timestamp
                 lastElapsedMs = sample.pollElapsedMs
@@ -95,8 +112,15 @@ class TelemetryWorkerReplayCoordinator(
                         PollOrigin.REPLAY
                     )
                 }
-                val ack = acknowledgeSample(sample.identity, acknowledgedAtMs())
+                ackAttempts += 1L
+                val ack = try {
+                    acknowledgeSample(sample.identity, acknowledgedAtMs())
+                } catch (error: RuntimeException) {
+                    failedAcks += 1L
+                    throw error
+                }
                 if (!ack.ok) {
+                    failedAcks += 1L
                     return failure(
                         category = "worker_spool_ack_error",
                         message = "identity=${sample.identity} ${ack.error ?: "status=${ack.status}"}",
@@ -104,21 +128,44 @@ class TelemetryWorkerReplayCoordinator(
                         pollId = lastPollId,
                         timestamp = lastTimestamp,
                         elapsedMs = lastElapsedMs,
-                        insertedPolls = insertedPolls
+                        insertedPolls = insertedPolls,
+                        diagnosticDetail = replayEvidence(
+                            batchCount,
+                            importAttempts,
+                            importedPolls,
+                            insertedPolls,
+                            duplicatePolls,
+                            ackAttempts,
+                            successfulAcks,
+                            failedAcks,
+                            firstIdentity,
+                            lastIdentity
+                        )
                     )
                 }
+                successfulAcks += 1L
             }
 
             runCatching {
                 store.recordEvent(
                     "worker_spool_replayed",
                     "Replayed helper telemetry samples into app storage",
-                    "count=${pending.samples.size} inserted=$insertedPolls " +
-                        "first=${pending.samples.first().identity} last=${pending.samples.last().identity}"
+                    replayEvidence(
+                        batchCount,
+                        importAttempts,
+                        importedPolls,
+                        insertedPolls,
+                        duplicatePolls,
+                        ackAttempts,
+                        successfulAcks,
+                        failedAcks,
+                        firstIdentity,
+                        lastIdentity
+                    )
                 )
             }
 
-            lastFailureKey = null
+            clearFailureAggregation()
             return WorkerReplayBatchResult(
                 needsReplay = pending.samples.size == CollectorHelperProtocol.MAX_PENDING_WORKER_SAMPLES,
                 cycleResult = PollCycleResult(
@@ -140,7 +187,19 @@ class TelemetryWorkerReplayCoordinator(
                 pollId = lastPollId,
                 timestamp = lastTimestamp,
                 elapsedMs = lastElapsedMs,
-                insertedPolls = insertedPolls
+                insertedPolls = insertedPolls,
+                diagnosticDetail = replayEvidence(
+                    batchCount,
+                    importAttempts,
+                    importedPolls,
+                    insertedPolls,
+                    duplicatePolls,
+                    ackAttempts,
+                    successfulAcks,
+                    failedAcks,
+                    firstIdentity,
+                    lastIdentity
+                )
             )
         }
     }
@@ -214,12 +273,25 @@ class TelemetryWorkerReplayCoordinator(
         pollId: Long? = null,
         timestamp: String? = null,
         elapsedMs: Long = 0L,
-        insertedPolls: Long = 0L
+        insertedPolls: Long = 0L,
+        diagnosticDetail: String? = null
     ): WorkerReplayBatchResult {
         val key = "$category:$message"
-        if (key != lastFailureKey) {
-            runCatching { store.recordEvent(category, "Telemetry worker replay failed", message) }
+        val nowNanos = monotonicNanos()
+        val sameFailure = key == lastFailureKey
+        repeatedFailureCount = if (sameFailure) repeatedFailureCount + 1L else 1L
+        val recurrenceDue = sameFailure &&
+            nowNanos - lastFailureLoggedAtNanos >= FAILURE_RECURRENCE_NANOS
+        if (!sameFailure || recurrenceDue) {
+            val detail = listOf(
+                diagnosticDetail ?: replayEvidence(0, 0L, 0L, 0L, 0L, 0L, 0L, 0L, null, null),
+                "repeated_failures=$repeatedFailureCount",
+                "error=${bounded(message)}"
+            ).joinToString(" ")
+            runCatching { store.recordEvent(category, "Telemetry worker replay failed", detail) }
             lastFailureKey = key
+            lastFailureLoggedAtNanos = nowNanos
+            repeatedFailureCount = 0L
         }
         return WorkerReplayBatchResult(
             needsReplay = needsReplay,
@@ -237,11 +309,49 @@ class TelemetryWorkerReplayCoordinator(
         )
     }
 
+    private fun clearFailureAggregation() {
+        lastFailureKey = null
+        lastFailureLoggedAtNanos = 0L
+        repeatedFailureCount = 0L
+    }
+
+    private fun replayEvidence(
+        batchCount: Int,
+        importAttempts: Long,
+        importedPolls: Long,
+        insertedPolls: Long,
+        duplicatePolls: Long,
+        ackAttempts: Long,
+        successfulAcks: Long,
+        failedAcks: Long,
+        firstIdentity: TelemetryWorkerSampleIdentity?,
+        lastIdentity: TelemetryWorkerSampleIdentity?
+    ): String =
+        "batch=$batchCount import_attempted=$importAttempts imported=$importedPolls " +
+            "inserted=$insertedPolls duplicates=$duplicatePolls ack_attempted=$ackAttempts " +
+            "ack_succeeded=$successfulAcks ack_failed=$failedAcks " +
+            "first=${identityDetail(firstIdentity)} last=${identityDetail(lastIdentity)}"
+
+    private fun identityDetail(identity: TelemetryWorkerSampleIdentity?): String = when (identity) {
+        null -> "none"
+        else -> "${bounded(identity.bootId, IDENTITY_COMPONENT_LIMIT)}:" +
+            "${bounded(identity.helperGeneration, IDENTITY_COMPONENT_LIMIT)}:${identity.pollSequence}"
+    }
+
+    private fun bounded(value: String, limit: Int = ERROR_DETAIL_LIMIT): String =
+        if (value.length <= limit) value else value.take(limit) + "..."
+
     private fun modeName(mode: Int): String = when (mode) {
         CollectorHelperProtocol.MODE_NATIVE -> "native"
         CollectorHelperProtocol.MODE_NATIVE_WITH_FALLBACK -> "native_with_fallback"
         CollectorHelperProtocol.MODE_SCALAR_FALLBACK -> "scalar_fallback"
         else -> "rejected"
+    }
+
+    private companion object {
+        const val FAILURE_RECURRENCE_NANOS = 30_000_000_000L
+        const val IDENTITY_COMPONENT_LIMIT = 80
+        const val ERROR_DETAIL_LIMIT = 320
     }
 }
 

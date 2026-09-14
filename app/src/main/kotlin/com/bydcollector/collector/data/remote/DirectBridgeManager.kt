@@ -92,10 +92,28 @@ object DirectBridgeManager {
             "for i in 1 2 3 4 5; do pidof ${CollectorHelperProtocol.PROCESS_NAME} >/dev/null || break; sleep 1; done; " +
             "if pidof ${CollectorHelperProtocol.PROCESS_NAME} >/dev/null; then echo HELPER_STOP_TIMEOUT >&2; exit 73; fi; " +
             "rm -f ${CollectorHelperProtocol.LOCK_PATH}; "
-        return cleanup +
+        return cleanup + bootstrapHistoryCommand() +
             "CLASSPATH=$quotedApk setsid app_process /system/bin --nice-name=${CollectorHelperProtocol.PROCESS_NAME} " +
-            "${CollectorHelperProtocol.HELPER_CLASS} $appUid $quotedApk$modeArgument </dev/null >${CollectorHelperProtocol.LOG_PATH} 2>&1 & " +
+            "${CollectorHelperProtocol.HELPER_CLASS} $appUid $quotedApk$modeArgument </dev/null >>${CollectorHelperProtocol.LOG_PATH} 2>&1 & " +
             "for i in 1 2 3; do service list 2>/dev/null | grep -q ${CollectorHelperProtocol.SERVICE_NAME} && break; sleep 1; done"
+    }
+
+    // This captures failures before the JVM reaches our bounded output adapter.
+    // A stopped previous owner cannot still hold/write the file while it rotates.
+    internal fun bootstrapHistoryCommand(): String = buildString {
+        val log = CollectorHelperProtocol.LOG_PATH
+        append("if [ -f $log ]; then ")
+        append("bootstrap_history_ok=1; ")
+        for (index in 3 downTo 1) {
+            val source = if (index == 1) log else "$log.${index - 1}"
+            val target = "$log.$index"
+            append("if [ -f $source ]; then ")
+            append("if tail -c 2097152 $source >$target.tmp && mv -f $target.tmp $target; ")
+            append("then :; else bootstrap_history_ok=0; fi; fi; ")
+        }
+        // Preserve the original if even one part of history could not be saved.
+        append("if [ \"${'$'}bootstrap_history_ok\" = 1 ]; then : >$log; ")
+        append("else echo HELPER_BOOTSTRAP_HISTORY_PARTIAL >&2; fi; fi; ")
     }
 
     private fun shellQuote(value: String): String {

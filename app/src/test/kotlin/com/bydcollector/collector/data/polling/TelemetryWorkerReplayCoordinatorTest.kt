@@ -14,6 +14,7 @@ import com.bydcollector.collector.data.local.WorkerPollImportResult
 import com.bydcollector.collector.direct.CollectorHelperProtocol
 import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
 import kotlin.test.Test
+import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -55,6 +56,12 @@ class TelemetryWorkerReplayCoordinatorTest {
         assertEquals("1970-01-01T00:00:01Z", storage.input?.timestamp)
         assertEquals(PollReading("test_percent", "72", "72"), storage.input?.readings?.single())
         assertEquals(PollOrigin.REPLAY, observedOrigin)
+        assertContains(
+            storage.events.single().third.orEmpty(),
+            "batch=1 import_attempted=1 imported=1 inserted=1 duplicates=0 " +
+                "ack_attempted=1 ack_succeeded=1 ack_failed=0"
+        )
+        assertContains(storage.events.single().third.orEmpty(), "first=boot-a:generation-a:1 last=boot-a:generation-a:1")
     }
 
     @Test
@@ -156,6 +163,7 @@ class TelemetryWorkerReplayCoordinatorTest {
         val runner = TelemetryWorkerReplayPollCycleRunner(replay)
 
         assertEquals(null, runner.pollOnce(7L))
+        assertTrue(storage.events.isEmpty())
         assertEquals(41L, runner.pollOnce(7L)?.pollId)
         assertEquals(2, pendingCalls)
     }
@@ -257,6 +265,151 @@ class TelemetryWorkerReplayCoordinatorTest {
         assertEquals(0L, second.cycleResult?.pollRowsPersisted)
         assertTrue(actions.indexOf("insert:7") < actions.indexOf("ack-attempt:1"))
         assertTrue(actions.lastIndexOf("insert:7") < actions.indexOf("ack-attempt:2"))
+        assertEquals(listOf("worker_spool_ack_error", "worker_spool_replayed"), storage.events.map { it.first })
+        assertContains(
+            storage.events[0].third.orEmpty(),
+            "inserted=1 duplicates=0 ack_attempted=1 ack_succeeded=0 ack_failed=1"
+        )
+        assertContains(
+            storage.events[1].third.orEmpty(),
+            "inserted=0 duplicates=1 ack_attempted=1 ack_succeeded=1 ack_failed=0"
+        )
+    }
+
+    @Test
+    fun partialBatchFailureRecordsCompletedImportsAndAcksWithLastAttemptedIdentity() {
+        val actions = mutableListOf<String>()
+        val storage = FakeWorkerPollStorage(actions)
+        var observerCalls = 0
+        val coordinator = TelemetryWorkerReplayCoordinator(
+            store = storage,
+            ensureHelper = { null },
+            pendingSamples = {
+                PendingTelemetryWorkerSamples(
+                    CollectorHelperProtocol.STATUS_OK,
+                    listOf(sample(sequence = 1L), sample(sequence = 2L))
+                )
+            },
+            acknowledgeSample = { identity, _ ->
+                actions += "ack:${identity.pollSequence}"
+                TelemetryWorkerAckResult(CollectorHelperProtocol.STATUS_OK, updated = true)
+            },
+            successfulPollObserver = object : SuccessfulPollObserver {
+                override fun onSuccessfulPoll(
+                    sessionId: Long,
+                    pollId: Long,
+                    timestamp: String,
+                    readings: List<PollReading>,
+                    origin: PollOrigin
+                ) {
+                    observerCalls += 1
+                    if (observerCalls == 2) throw IllegalStateException("observer stopped batch")
+                }
+            },
+            replayEntriesForCatalog = ::testCatalogEntries
+        )
+
+        val result = coordinator.replayNextBatch(7L)
+
+        assertTrue(result.needsReplay)
+        assertEquals(2L, result.cycleResult?.pollRowsPersisted)
+        assertEquals(listOf("ack:1"), actions.filter { it.startsWith("ack:") })
+        assertContains(
+            storage.events.single().third.orEmpty(),
+            "batch=2 import_attempted=2 imported=2 inserted=2 duplicates=0 " +
+                "ack_attempted=1 ack_succeeded=1 ack_failed=0"
+        )
+        assertContains(storage.events.single().third.orEmpty(), "first=boot-a:generation-a:1 last=boot-a:generation-a:2")
+    }
+
+    @Test
+    fun partialStorageFailureDoesNotClaimTheUncompletedImportOrAck() {
+        val actions = mutableListOf<String>()
+        val storage = FakeWorkerPollStorage(actions).apply { failInsertAttempt = 2 }
+        val coordinator = TelemetryWorkerReplayCoordinator(
+            store = storage,
+            ensureHelper = { null },
+            pendingSamples = {
+                PendingTelemetryWorkerSamples(
+                    CollectorHelperProtocol.STATUS_OK,
+                    listOf(sample(sequence = 1L), sample(sequence = 2L))
+                )
+            },
+            acknowledgeSample = { identity, _ ->
+                actions += "ack:${identity.pollSequence}"
+                TelemetryWorkerAckResult(CollectorHelperProtocol.STATUS_OK, updated = true)
+            },
+            replayEntriesForCatalog = ::testCatalogEntries
+        )
+
+        val result = coordinator.replayNextBatch(7L)
+
+        assertTrue(result.needsReplay)
+        assertEquals(1L, result.cycleResult?.pollRowsPersisted)
+        assertEquals(listOf("ack:1"), actions.filter { it.startsWith("ack:") })
+        assertContains(
+            storage.events.single().third.orEmpty(),
+            "batch=2 import_attempted=2 imported=1 inserted=1 duplicates=0 " +
+                "ack_attempted=1 ack_succeeded=1 ack_failed=0"
+        )
+        assertContains(storage.events.single().third.orEmpty(), "last=boot-a:generation-a:2")
+    }
+
+    @Test
+    fun diagnosticWriteFailureDoesNotChangeCommittedOrAcknowledgedOutcome() {
+        val actions = mutableListOf<String>()
+        val storage = FakeWorkerPollStorage(actions).apply { failEventWrites = true }
+        val coordinator = TelemetryWorkerReplayCoordinator(
+            store = storage,
+            ensureHelper = { null },
+            pendingSamples = {
+                PendingTelemetryWorkerSamples(CollectorHelperProtocol.STATUS_OK, listOf(sample()))
+            },
+            acknowledgeSample = { _, _ ->
+                actions += "ack"
+                TelemetryWorkerAckResult(CollectorHelperProtocol.STATUS_OK, updated = true)
+            },
+            replayEntriesForCatalog = ::testCatalogEntries
+        )
+
+        val result = coordinator.replayNextBatch(7L)
+
+        assertFalse(result.needsReplay)
+        assertTrue(result.cycleResult?.ok == true)
+        assertEquals(listOf(true), storage.inserted)
+        assertTrue(actions.indexOf("insert:7") < actions.indexOf("ack"))
+        assertTrue(actions.indexOf("ack") < actions.indexOf("event:worker_spool_replayed"))
+    }
+
+    @Test
+    fun repeatedIdenticalFailuresAreSummarizedAtThirtySecondIntervals() {
+        val actions = mutableListOf<String>()
+        val storage = FakeWorkerPollStorage(actions)
+        var nowNanos = 0L
+        val coordinator = TelemetryWorkerReplayCoordinator(
+            store = storage,
+            ensureHelper = { null },
+            pendingSamples = {
+                PendingTelemetryWorkerSamples(
+                    CollectorHelperProtocol.STATUS_READ_ERROR,
+                    emptyList(),
+                    "same read failure"
+                )
+            },
+            acknowledgeSample = { _, _ -> error("ack must not run") },
+            replayEntriesForCatalog = ::testCatalogEntries,
+            monotonicNanos = { nowNanos }
+        )
+
+        coordinator.replayNextBatch(7L)
+        nowNanos = 10_000_000_000L
+        coordinator.replayNextBatch(7L)
+        nowNanos = 31_000_000_000L
+        coordinator.replayNextBatch(7L)
+
+        assertEquals(2, storage.events.size)
+        assertContains(storage.events[0].third.orEmpty(), "repeated_failures=1")
+        assertContains(storage.events[1].third.orEmpty(), "repeated_failures=2")
     }
 
     @Test
@@ -344,8 +497,8 @@ class TelemetryWorkerReplayCoordinatorTest {
         )
     }
 
-    private fun sample(): TelemetryWorkerSample =
-        sample(DirectFidRegistry.CATALOG_VERSION, listOf(TEST_ENTRY), listOf(72))
+    private fun sample(sequence: Long = 1L): TelemetryWorkerSample =
+        sample(DirectFidRegistry.CATALOG_VERSION, listOf(TEST_ENTRY), listOf(72), sequence)
 
     private fun sample(
         catalogVersion: String,
@@ -386,6 +539,10 @@ class TelemetryWorkerReplayCoordinatorTest {
         val inputs = mutableListOf<PersistedPollInput>()
         val requestedParameters = mutableListOf<List<CatalogParameter>>()
         val inserted = mutableListOf<Boolean>()
+        val events = mutableListOf<Triple<String, String, String?>>()
+        var failEventWrites = false
+        var failInsertAttempt: Int? = null
+        private var insertAttempts = 0
         private val identities = mutableSetOf<TelemetryWorkerSampleIdentity>()
 
         override fun getActiveCatalogParameters(): List<CatalogParameter> {
@@ -402,6 +559,8 @@ class TelemetryWorkerReplayCoordinatorTest {
             parameters: List<CatalogParameter>
         ): WorkerPollImportResult {
             actions += "insert:$sessionId"
+            insertAttempts += 1
+            if (failInsertAttempt == insertAttempts) throw IllegalStateException("storage unavailable")
             this.input = input
             inputs += input
             requestedParameters += parameters
@@ -412,6 +571,8 @@ class TelemetryWorkerReplayCoordinatorTest {
 
         override fun recordEvent(category: String, message: String, detail: String?) {
             actions += "event:$category"
+            events += Triple(category, message, detail)
+            if (failEventWrites) throw IllegalStateException("event writer unavailable")
         }
     }
 
