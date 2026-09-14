@@ -8,6 +8,45 @@ import kotlin.test.assertTrue
 
 class BydCollectorUiContractTest {
     @Test
+    fun vehicleKpisUseApprovedSixColumnCompactLayout() {
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val components = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorComponents.kt").readText()
+        val card = app.substringAfter("private fun VehicleKpiCard(").substringBefore("private fun DebugDatabaseCard(")
+        val tile = components.substringAfter("fun KpiTile(").substringBefore("fun RowScope.EqualSpacer(")
+
+        assertTrue(card.contains("val kpiWidth = (maxWidth - 30.dp) / 4 * 0.6f"))
+        assertTrue(card.contains("horizontalArrangement = Arrangement.SpaceBetween"))
+        assertEquals(6, Regex("Column\\(Modifier\\.width\\(kpiWidth\\)").findAll(card).count())
+        assertEquals(6, Regex("Arrangement\\.spacedBy\\(18\\.dp\\)").findAll(card).count())
+        listOf(
+            "strings.kpiSoc",
+            "strings.kpiOdometer",
+            "strings.kpiCabinTemp",
+            "strings.kpiPerfume1",
+            "strings.kpiPerfume2",
+            "strings.kpiPerfume3"
+        ).zipWithNext().forEach { (first, second) -> assertInOrder(card, first, second) }
+        listOf(
+            "chargeLabel",
+            "strings.kpiRange",
+            "strings.kpiBatteryTemp",
+            "strings.kpiCellDelta",
+            "strings.kpiSoh"
+        ).zipWithNext().forEach { (first, second) -> assertInOrder(card, first, second) }
+        assertFalse(card.contains("80%"))
+        assertFalse(card.contains("65%"))
+        assertFalse(card.contains("40%"))
+
+        assertTrue(tile.contains(".height(64.dp)"))
+        assertTrue(tile.contains(".padding(start = 8.dp, end = 10.dp, top = 5.dp, bottom = 7.dp)"))
+        assertTrue(tile.contains("fontSize = 11.sp"))
+        assertTrue(tile.contains("offset(y = (-6).dp)"))
+        assertTrue(tile.contains("fontSize = 18.sp"))
+        assertTrue(tile.contains("fontWeight = FontWeight.SemiBold"))
+        assertTrue(tile.contains("Modifier.align(Alignment.Center)"))
+    }
+
+    @Test
     fun endpointDraftRejectsInvalidHostsBeforeStartWhilePreservingSavedHostTrimming() {
         listOf("mqtt\\local", "influx\\local", "http://influx.local", "mqtt local", "").forEach { host ->
             assertFalse(validEndpointDraft(host, "1883"), host)

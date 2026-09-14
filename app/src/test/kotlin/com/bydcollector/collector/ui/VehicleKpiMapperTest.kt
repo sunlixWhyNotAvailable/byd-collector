@@ -111,7 +111,77 @@ class VehicleKpiMapperTest {
         assertEquals("-", kpis.cabinTempC)
     }
 
-    private fun state(fieldKey: String, valueNumber: Double): StoredNormalizedState {
+    @Test
+    fun mapsAllPerfumeSlotsFromStoredStateIncludingZeroAndBounds() {
+        val kpis = VehicleKpiMapper.from(
+            rows = listOf(
+                state("perfume_1_remaining_percent", 0.0),
+                state("perfume_2_remaining_percent", 49.6),
+                state("perfume_3_remaining_percent", 100.0)
+            ),
+            language = VehicleKpiLanguage.UK
+        )
+
+        assertEquals("0%", kpis.perfume1RemainingPercent)
+        assertEquals("50%", kpis.perfume2RemainingPercent)
+        assertEquals("100%", kpis.perfume3RemainingPercent)
+    }
+
+    @Test
+    fun mapsAllPerfumeSlotsFromCurrentObservations() {
+        val kpis = VehicleKpiMapper.fromObservations(
+            observations = listOf(
+                observation("perfume_1_remaining_percent", 12.4),
+                observation("perfume_2_remaining_percent", 65.0),
+                observation("perfume_3_remaining_percent", 99.5)
+            ),
+            language = VehicleKpiLanguage.EN
+        )
+
+        assertEquals("12%", kpis.perfume1RemainingPercent)
+        assertEquals("65%", kpis.perfume2RemainingPercent)
+        assertEquals("100%", kpis.perfume3RemainingPercent)
+    }
+
+    @Test
+    fun storedPerfumeValuesFailClosedWhenMissingStaleOrOutOfRange() {
+        val missing = VehicleKpiMapper.from(emptyList())
+        val invalid = VehicleKpiMapper.from(
+            listOf(
+                state("perfume_1_remaining_percent", 25.0, NormalizedQuality.STALE),
+                state("perfume_2_remaining_percent", -0.1),
+                state("perfume_3_remaining_percent", 100.1)
+            )
+        )
+
+        assertEquals("-", missing.perfume1RemainingPercent)
+        assertEquals("-", missing.perfume2RemainingPercent)
+        assertEquals("-", missing.perfume3RemainingPercent)
+        assertEquals("-", invalid.perfume1RemainingPercent)
+        assertEquals("-", invalid.perfume2RemainingPercent)
+        assertEquals("-", invalid.perfume3RemainingPercent)
+    }
+
+    @Test
+    fun currentPerfumeValuesFailClosedWhenNonFiniteOrInvalid() {
+        val kpis = VehicleKpiMapper.fromObservations(
+            observations = listOf(
+                observation("perfume_1_remaining_percent", Double.NaN),
+                observation("perfume_2_remaining_percent", Double.POSITIVE_INFINITY),
+                observation("perfume_3_remaining_percent", 40.0, NormalizedQuality.INVALID)
+            )
+        )
+
+        assertEquals("-", kpis.perfume1RemainingPercent)
+        assertEquals("-", kpis.perfume2RemainingPercent)
+        assertEquals("-", kpis.perfume3RemainingPercent)
+    }
+
+    private fun state(
+        fieldKey: String,
+        valueNumber: Double,
+        quality: NormalizedQuality = NormalizedQuality.OK
+    ): StoredNormalizedState {
         return StoredNormalizedState(
             fieldKey = fieldKey,
             category = "battery",
@@ -119,7 +189,7 @@ class VehicleKpiMapperTest {
             valueText = null,
             valueNumber = valueNumber,
             valueBool = null,
-            quality = NormalizedQuality.OK.name,
+            quality = quality.name,
             unit = null,
             sourcePollId = 1L,
             sourceKeys = fieldKey,

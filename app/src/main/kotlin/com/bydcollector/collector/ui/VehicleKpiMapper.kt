@@ -27,6 +27,9 @@ object VehicleKpiMapper {
             socPercent = byKey.percent("soc"),
             odometerKm = byKey.km("odometer_km", language),
             cabinTempC = byKey.temp("inside_temp_c_raw"),
+            perfume1RemainingPercent = byKey.boundedPercent("perfume_1_remaining_percent"),
+            perfume2RemainingPercent = byKey.boundedPercent("perfume_2_remaining_percent"),
+            perfume3RemainingPercent = byKey.boundedPercent("perfume_3_remaining_percent"),
             sohPercent = byKey.percent("battery_soh_percent"),
             batteryPowerCharging = charging,
             batteryPowerKw = power?.let { formatKw(if (charging) abs(it) else -abs(it), language) } ?: "-",
@@ -59,6 +62,9 @@ object VehicleKpiMapper {
             socPercent = numbers.percentValue("soc"),
             odometerKm = numbers.kmValue("odometer_km", language),
             cabinTempC = numbers.tempValue("inside_temp_c_raw"),
+            perfume1RemainingPercent = numbers.boundedPercentValue("perfume_1_remaining_percent"),
+            perfume2RemainingPercent = numbers.boundedPercentValue("perfume_2_remaining_percent"),
+            perfume3RemainingPercent = numbers.boundedPercentValue("perfume_3_remaining_percent"),
             sohPercent = numbers.percentValue("battery_soh_percent"),
             batteryPowerCharging = charging,
             batteryPowerKw = power?.let { formatKw(if (charging) abs(it) else -abs(it), language) } ?: "-",
@@ -78,6 +84,10 @@ object VehicleKpiMapper {
         return number(fieldKey)?.roundToInt()?.let { "$it%" } ?: "-"
     }
 
+    private fun Map<String, StoredNormalizedState>.boundedPercent(fieldKey: String): String {
+        return number(fieldKey).formatBoundedPercent()
+    }
+
     private fun Map<String, StoredNormalizedState>.km(fieldKey: String, language: VehicleKpiLanguage): String {
         val unit = if (language == VehicleKpiLanguage.UK) "км" else "km"
         return number(fieldKey)?.roundToInt()?.let { "${it.formatInt()} $unit" } ?: "-"
@@ -89,6 +99,18 @@ object VehicleKpiMapper {
 
     private fun Map<String, Double>.percentValue(fieldKey: String): String {
         return this[fieldKey]?.roundToInt()?.let { "$it%" } ?: "-"
+    }
+
+    private fun Map<String, Double>.boundedPercentValue(fieldKey: String): String {
+        return this[fieldKey].formatBoundedPercent()
+    }
+
+    private fun Double?.formatBoundedPercent(): String {
+        return this
+            ?.takeIf { it.isFinite() && it in 0.0..100.0 }
+            ?.roundToInt()
+            ?.let { "$it%" }
+            ?: "-"
     }
 
     private fun Map<String, Double>.kmValue(fieldKey: String, language: VehicleKpiLanguage): String {

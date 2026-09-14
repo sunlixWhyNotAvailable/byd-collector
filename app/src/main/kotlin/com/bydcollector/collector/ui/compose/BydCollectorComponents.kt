@@ -1089,20 +1089,20 @@ fun KpiTile(
     val p = LocalBydPalette.current
     Box(
         modifier = modifier
-            .height(76.dp)
+            .height(64.dp)
             .clip(ControlShape)
             .background(p.surface)
             .border(1.dp, p.border, ControlShape)
-            .padding(start = 10.dp, end = 10.dp, top = 7.dp, bottom = 8.dp)
+            .padding(start = 8.dp, end = 10.dp, top = 5.dp, bottom = 7.dp)
     ) {
         Text(
             text = label,
             color = p.muted,
-            fontSize = 12.sp,
+            fontSize = 11.sp,
             fontWeight = FontWeight.Normal,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.align(Alignment.TopStart)
+            modifier = Modifier.align(Alignment.TopStart).offset(y = (-6).dp)
         )
         Text(
             text = value,

@@ -15,6 +15,7 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
@@ -786,17 +787,34 @@ private fun debugRuntimeDisplay(state: DashboardState?, strings: UiStrings): Pai
 private fun VehicleKpiCard(kpi: VehicleKpis?, strings: UiStrings, modifier: Modifier) {
     val chargeLabel = if (kpi?.batteryPowerCharging == true) strings.kpiCharging else strings.kpiDischarging
     SectionCard(title = strings.currentVehicleState, modifier = modifier, bodyPadding = 14.dp) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            KpiTile(strings.kpiSoc, kpi?.socPercent ?: "-", modifier = Modifier.weight(1f))
-            KpiTile(strings.kpiOdometer, kpi?.odometerKm ?: "-", modifier = Modifier.weight(1f))
-            KpiTile(strings.kpiCabinTemp, kpi?.cabinTempC ?: "-", modifier = Modifier.weight(1f))
-            KpiTile(strings.kpiSoh, kpi?.sohPercent ?: "-", modifier = Modifier.weight(1f))
-        }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            KpiTile(chargeLabel ?: "-", kpi?.batteryPowerKw ?: "-", modifier = Modifier.weight(1f))
-            KpiTile(strings.kpiRange, kpi?.remainingRangeKm ?: "-", modifier = Modifier.weight(1f))
-            KpiTile(strings.kpiBatteryTemp, kpi?.batteryTempC ?: "-", modifier = Modifier.weight(1f))
-            KpiTile(strings.kpiCellDelta, kpi?.cellVoltageDeltaMv ?: "-", modifier = Modifier.weight(1f))
+        Spacer(Modifier.height(5.dp))
+        BoxWithConstraints(Modifier.fillMaxWidth()) {
+            val kpiWidth = (maxWidth - 30.dp) / 4 * 0.6f
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+                    KpiTile(strings.kpiSoc, kpi?.socPercent ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(chargeLabel, kpi?.batteryPowerKw ?: "-", modifier = Modifier.fillMaxWidth())
+                }
+                Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+                    KpiTile(strings.kpiOdometer, kpi?.odometerKm ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(strings.kpiRange, kpi?.remainingRangeKm ?: "-", modifier = Modifier.fillMaxWidth())
+                }
+                Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+                    KpiTile(strings.kpiCabinTemp, kpi?.cabinTempC ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(strings.kpiBatteryTemp, kpi?.batteryTempC ?: "-", modifier = Modifier.fillMaxWidth())
+                }
+                Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+                    KpiTile(strings.kpiPerfume1, kpi?.perfume1RemainingPercent ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(strings.kpiCellDelta, kpi?.cellVoltageDeltaMv ?: "-", modifier = Modifier.fillMaxWidth())
+                }
+                Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+                    KpiTile(strings.kpiPerfume2, kpi?.perfume2RemainingPercent ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(strings.kpiSoh, kpi?.sohPercent ?: "-", modifier = Modifier.fillMaxWidth())
+                }
+                Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+                    KpiTile(strings.kpiPerfume3, kpi?.perfume3RemainingPercent ?: "-", modifier = Modifier.fillMaxWidth())
+                }
+            }
         }
     }
 }
