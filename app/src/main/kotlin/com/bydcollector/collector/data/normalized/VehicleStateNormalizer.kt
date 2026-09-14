@@ -18,7 +18,7 @@ class VehicleStateNormalizer(
         readings: List<PollReading>
     ): List<NormalizedObservation> {
         val byKey = readings.associateBy { it.rawKey }
-        return catalog.filter { it.category != NormalizedCategory.LOCATION }.map { field ->
+        return catalog.filter { it.category != NormalizedCategory.LOCATION && it.normalizerId != "power_session_energy" }.map { field ->
             normalizeField(field, byKey, pollId, observedAt)
         }
     }

@@ -28,7 +28,7 @@ class TelegramRuntimeContractTest {
         val runtime = sourceFile("com/bydcollector/collector/service/TripRuntimeCoordinator.kt").readText()
         val poll = coordinator.substringAfter("fun onSuccessfulPoll(")
             .substringBefore("internal fun bindTripDiagnosticParent")
-        assertInOrder(poll, "ensureStartupRecovery()", "val previousTripId", "engine.onSuccessfulPoll", "handle(result)", "if (committed)")
+        assertInOrder(poll, "ensureStartupRecovery(energySnapshot)", "val previousTripId", "engine.onSuccessfulPoll", "handle(result)", "if (committed)")
         assertTrue(poll.contains("it != previousTripId && result.state.tripPowerSessionId == null"))
         assertTrue(poll.contains("runCatching { onDiagnosticLegStarted?.invoke(legId) }"))
         val bind = coordinator.substringAfter("internal fun bindTripDiagnosticParent")
@@ -43,11 +43,15 @@ class TelegramRuntimeContractTest {
         assertTrue(observer.contains("telegramCoordinator === coordinator"))
         assertTrue(observer.contains("telegramWorkGeneration.get() == generation"))
         assertTrue(observer.contains("bind = coordinator::bindTripDiagnosticParent"))
+        assertTrue(observer.contains("coordinator.onSuccessfulPoll(observations, energySnapshot)"))
         assertFalse(observer.contains("parent.get("))
         assertFalse(observer.contains("parent.join("))
         val powerOff = runtime.substringAfter("private fun handlePowerOff(")
             .substringBefore("private fun ensureGpsRunning")
         assertInOrder(powerOff, "updateOpenSession", "diagnosticPowerSession?.complete(current?.tripId)", "prepareConfirmedPowerOff(")
+        val servicePowerOff = service.substringAfter("private fun prepareConfirmedPowerOff")
+            .substringBefore("private fun telegramLocationSnapshot")
+        assertTrue(servicePowerOff.contains("energySnapshot = event.energySnapshot"))
         val tripsPoll = runtime.substringAfter("fun onSuccessfulPoll(").substringBefore("fun resume()")
         assertTrue(tripsPoll.contains("onDropped = { diagnosticPowerSession?.complete(null) }"))
         assertTrue(tripsPoll.substringAfterLast("finally {").contains("diagnosticPowerSession?.complete(null)"))
@@ -76,6 +80,8 @@ class TelegramRuntimeContractTest {
         assertTrue(coordinator.contains("onDiagnosticLegStarted: ((String) -> Unit)? = null"))
         assertTrue(coordinator.contains("pendingQueueDeadline()"))
         assertTrue(coordinator.contains("flushPending()"))
+        assertTrue(coordinator.contains("energySnapshot ?: runCatching(currentEnergySnapshot).getOrNull()"))
+        assertTrue(service.contains("EnergyStateCodec.decodeState(row.stateJson).currentSnapshot"))
         assertTrue(coordinator.contains("listOfNotNull(eventDeadlineAtMs, queueDeadlineAtMs).minOrNull()"))
         assertTrue(service.contains("private fun scheduleTelegramTick(deadlineAtMs: Long? = null)"))
         assertTrue(schedule.contains("maintenanceBlocksRuntimeStart()"))
@@ -218,10 +224,10 @@ class TelegramRuntimeContractTest {
 
         assertInOrder(recovery, "engine.recoverPendingTrip", "handle(recovered)")
         assertFalse(recovery.contains("attempt("))
-        assertInOrder(startup, "recoverStartupLocally()", "delivery.recover(\"startup\")")
+        assertInOrder(startup, "recoverStartupLocally(energySnapshot)", "delivery.recover(\"startup\")")
         assertInOrder(
             prepare,
-            "recoverStartupLocally()",
+            "recoverStartupLocally(snapshot.energySnapshot)",
             "engine.onPowerOffConfirmed",
             "handle(result)"
         )

@@ -52,12 +52,20 @@ enum class TripMapMetric {
 }
 
 data class TripRoutePointUi(
+    val sequence: Long,
     val latitude: Double,
     val longitude: Double,
     val speedKmh: Double? = null,
     val consumptionKwhPer100Km: Double? = null,
-    val gap: Boolean = false
+    val gap: Boolean = false,
+    val final: Boolean = false
 )
+
+enum class TripEnergyCompleteness {
+    UNAVAILABLE,
+    PARTIAL,
+    COMPLETE
+}
 
 data class TripSummaryUi(
     val id: String,
@@ -68,8 +76,16 @@ data class TripSummaryUi(
     val socStart: Double?,
     val socEnd: Double?,
     val energyKwh: Double?,
+    val dischargedKwh: Double? = null,
+    val regeneratedKwh: Double? = null,
+    val netKwh: Double? = null,
     val averageConsumptionKwhPer100Km: Double?,
-    val route: List<TripRoutePointUi> = emptyList()
+    val energyCompleteness: TripEnergyCompleteness = TripEnergyCompleteness.UNAVAILABLE,
+    val energyCoveredMs: Long? = null,
+    val energyUncoveredMs: Long? = null,
+    val energyObservedAt: String? = null,
+    val route: List<TripRoutePointUi> = emptyList(),
+    val open: Boolean = false
 )
 
 data class TripDayUi(
@@ -77,7 +93,11 @@ data class TripDayUi(
     val title: String,
     val distanceKm: Double?,
     val energyKwh: Double?,
+    val dischargedKwh: Double?,
+    val regeneratedKwh: Double?,
+    val netKwh: Double?,
     val averageConsumptionKwhPer100Km: Double?,
+    val energyCompleteness: TripEnergyCompleteness,
     val trips: List<TripSummaryUi>
 )
 
@@ -86,7 +106,11 @@ data class TripMonthUi(
     val title: String,
     val distanceKm: Double?,
     val energyKwh: Double?,
+    val dischargedKwh: Double?,
+    val regeneratedKwh: Double?,
+    val netKwh: Double?,
     val averageConsumptionKwhPer100Km: Double?,
+    val energyCompleteness: TripEnergyCompleteness,
     val days: List<TripDayUi>
 )
 
@@ -95,8 +119,17 @@ data class TripYearUi(
     val title: String,
     val distanceKm: Double?,
     val energyKwh: Double?,
+    val dischargedKwh: Double?,
+    val regeneratedKwh: Double?,
+    val netKwh: Double?,
     val averageConsumptionKwhPer100Km: Double?,
+    val energyCompleteness: TripEnergyCompleteness,
     val months: List<TripMonthUi>
+)
+
+data class CurrentTripUi(
+    val trip: TripSummaryUi,
+    val nextRouteSequence: Long = 0L
 )
 
 data class TripsUiState(
@@ -108,7 +141,10 @@ data class TripsUiState(
     val consumptionYellowThreshold: Int = 20,
     val routeLoadingId: String? = null,
     val databasePath: String = "",
-    val databaseSizeBytes: Long = 0L
+    val databaseSizeBytes: Long = 0L,
+    val currentTripAvailabilityKnown: Boolean = false,
+    val availableCurrentTrip: CurrentTripUi? = null,
+    val currentTripModal: CurrentTripUi? = null
 )
 
 data class TripsUiActions(
@@ -116,6 +152,8 @@ data class TripsUiActions(
     val onSpeedThresholdsChanged: (green: Int, yellow: Int) -> Unit = { _, _ -> },
     val onConsumptionThresholdsChanged: (green: Int, yellow: Int) -> Unit = { _, _ -> },
     val onRouteRequested: (String) -> Unit = {},
+    val onCurrentTripRequested: () -> Unit = {},
+    val onCurrentTripDismissed: () -> Unit = {},
     val onCompressDatabase: () -> Unit = {},
     val onRefreshRequested: () -> Unit = {}
 )

@@ -1,5 +1,7 @@
 package com.bydcollector.collector.data.trips
 
+import com.bydcollector.collector.data.energy.EnergySnapshot
+
 /** A persisted vehicle power session. A session may span process or kernel gaps. */
 data class TripSession(
     val tripId: String,
@@ -23,6 +25,13 @@ data class TripSession(
     val distanceKm: Double? = null,
     val energyKwh: Double? = null,
     val averageConsumptionKwhPer100Km: Double? = null,
+    val dischargedKwh: Double? = null,
+    val regeneratedKwh: Double? = null,
+    val netKwh: Double? = null,
+    val energyCoveredMs: Long? = null,
+    val energyUncoveredMs: Long? = null,
+    val energyPartial: Boolean? = null,
+    val energyObservedAt: String? = null,
     val termination: String? = null,
     val quality: String = QUALITY_OK,
     val telegramEligible: Boolean = false,
@@ -33,6 +42,19 @@ data class TripSession(
         const val STATE_CLOSED = "closed"
         const val QUALITY_OK = "ok"
     }
+}
+
+fun TripSession.withEnergySnapshot(snapshot: EnergySnapshot): TripSession {
+    if (snapshot.powerSessionId != tripId) return this
+    return copy(
+        dischargedKwh = snapshot.dischargedKwh,
+        regeneratedKwh = snapshot.regeneratedKwh,
+        netKwh = snapshot.netKwh,
+        energyCoveredMs = snapshot.energyCoveredMs,
+        energyUncoveredMs = snapshot.energyUncoveredMs,
+        energyPartial = snapshot.energyPartial,
+        energyObservedAt = snapshot.observedAt
+    )
 }
 
 data class RoutePoint(
@@ -86,7 +108,14 @@ data class TripSummary(
     val energyKwh: Double?,
     val averageConsumptionKwhPer100Km: Double?,
     val quality: String,
-    val movementObserved: Boolean
+    val movementObserved: Boolean,
+    val dischargedKwh: Double? = null,
+    val regeneratedKwh: Double? = null,
+    val netKwh: Double? = null,
+    val energyCoveredMs: Long? = null,
+    val energyUncoveredMs: Long? = null,
+    val energyPartial: Boolean? = null,
+    val energyObservedAt: String? = null
 )
 
 data class TripDayGroup(

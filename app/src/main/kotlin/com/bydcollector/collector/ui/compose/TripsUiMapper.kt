@@ -3,6 +3,7 @@ package com.bydcollector.collector.ui.compose
 import com.bydcollector.collector.data.trips.RoutePoint
 import com.bydcollector.collector.data.trips.TripDayGroup
 import com.bydcollector.collector.data.trips.TripMetrics
+import com.bydcollector.collector.data.trips.TripSession
 import com.bydcollector.collector.data.trips.TripSummary
 import com.bydcollector.collector.data.trips.TripTime
 import java.time.LocalDate
@@ -25,35 +26,98 @@ object TripsUiMapper {
                 val days = monthDays.sortedByDescending { it.day }.map { day ->
                     val dayId = "$monthId-${day.day.toString().padStart(2, '0')}"
                     val trips = day.trips.map { summary -> summary.toUi(routes[summary.tripId].orEmpty()) }
+                    val energy = aggregateEnergy(trips)
                     TripDayUi(
                         id = dayId,
                         title = dayTitle(year, month, day.day, locale),
                         distanceKm = trips.sumOrNull { it.distanceKm },
                         energyKwh = trips.sumOrNull { it.energyKwh },
-                        averageConsumptionKwhPer100Km = average(trips),
+                        dischargedKwh = energy.dischargedKwh,
+                        regeneratedKwh = energy.regeneratedKwh,
+                        netKwh = energy.netKwh,
+                        averageConsumptionKwhPer100Km = energy.averageConsumptionKwhPer100Km,
+                        energyCompleteness = energy.completeness,
                         trips = trips
                     )
                 }
                 val monthTrips = days.flatMap { it.trips }
+                val monthEnergy = aggregateEnergy(monthTrips)
                 TripMonthUi(
                     id = monthId,
                     title = monthTitle(year, month, locale),
                     distanceKm = monthTrips.sumOrNull { it.distanceKm },
                     energyKwh = monthTrips.sumOrNull { it.energyKwh },
-                    averageConsumptionKwhPer100Km = average(monthTrips),
+                    dischargedKwh = monthEnergy.dischargedKwh,
+                    regeneratedKwh = monthEnergy.regeneratedKwh,
+                    netKwh = monthEnergy.netKwh,
+                    averageConsumptionKwhPer100Km = monthEnergy.averageConsumptionKwhPer100Km,
+                    energyCompleteness = monthEnergy.completeness,
                     days = days
                 )
             }
             val yearTrips = months.flatMap { month -> month.days.flatMap { it.trips } }
+            val yearEnergy = aggregateEnergy(yearTrips)
             TripYearUi(
                 id = yearId,
                 title = year.toString(),
                 distanceKm = yearTrips.sumOrNull { it.distanceKm },
                 energyKwh = yearTrips.sumOrNull { it.energyKwh },
-                averageConsumptionKwhPer100Km = average(yearTrips),
+                dischargedKwh = yearEnergy.dischargedKwh,
+                regeneratedKwh = yearEnergy.regeneratedKwh,
+                netKwh = yearEnergy.netKwh,
+                averageConsumptionKwhPer100Km = yearEnergy.averageConsumptionKwhPer100Km,
+                energyCompleteness = yearEnergy.completeness,
                 months = months
             )
         }
+    }
+
+    fun current(session: TripSession, language: UiLanguage, route: List<RoutePoint> = emptyList()): CurrentTripUi {
+        val start = TripTime.localTime(session.startedAt)
+        val end = session.endedAt?.let(TripTime::localTime)
+        val trip = TripSummaryUi(
+            id = session.tripId,
+            startAt = start?.withNano(0)?.toString() ?: session.startedAt,
+            endAt = end?.withNano(0)?.toString() ?: "—",
+            duration = formatDuration(session.durationMs ?: session.endedAt?.let { TripTime.durationMs(session.startedAt, it) }),
+            distanceKm = session.distanceKm,
+            socStart = session.startSoc,
+            socEnd = session.endSoc,
+            energyKwh = session.energyKwh,
+            dischargedKwh = session.dischargedKwh.validNumber(),
+            regeneratedKwh = session.regeneratedKwh.validNumber(),
+            netKwh = session.netKwh.validNumber(),
+            averageConsumptionKwhPer100Km = signedAverage(session.netKwh, session.distanceKm),
+            energyCompleteness = energyCompleteness(
+                session.dischargedKwh,
+                session.regeneratedKwh,
+                session.netKwh,
+                session.energyPartial
+            ),
+            energyCoveredMs = session.energyCoveredMs,
+            energyUncoveredMs = session.energyUncoveredMs,
+            energyObservedAt = session.energyObservedAt?.let { observed ->
+                TripTime.localTime(observed)?.withNano(0)?.toString() ?: observed
+            },
+            route = routePoints(route),
+            open = session.state == TripSession.STATE_OPEN
+        )
+        return CurrentTripUi(
+            trip = trip,
+            nextRouteSequence = route.maxOfOrNull(RoutePoint::sequence)?.takeIf { it != Long.MAX_VALUE }?.plus(1L) ?: 0L
+        )
+    }
+
+    fun routePoints(route: List<RoutePoint>): List<TripRoutePointUi> = route.map { point ->
+        TripRoutePointUi(
+            sequence = point.sequence,
+            latitude = point.latitude ?: 0.0,
+            longitude = point.longitude ?: 0.0,
+            speedKmh = point.speedKmh,
+            consumptionKwhPer100Km = point.instantaneousConsumptionKwhPer100Km,
+            gap = point.kind != RoutePoint.KIND_VALID,
+            final = point.isFinal
+        )
     }
 
     private fun TripSummary.toUi(route: List<RoutePoint>): TripSummaryUi {
@@ -68,16 +132,15 @@ object TripsUiMapper {
             socStart = startSoc,
             socEnd = endSoc,
             energyKwh = energyKwh,
-            averageConsumptionKwhPer100Km = averageConsumptionKwhPer100Km,
-            route = route.map { point ->
-                TripRoutePointUi(
-                    latitude = point.latitude ?: 0.0,
-                    longitude = point.longitude ?: 0.0,
-                    speedKmh = point.speedKmh,
-                    consumptionKwhPer100Km = point.instantaneousConsumptionKwhPer100Km,
-                    gap = point.kind != RoutePoint.KIND_VALID
-                )
-            }
+            dischargedKwh = dischargedKwh.validNumber(),
+            regeneratedKwh = regeneratedKwh.validNumber(),
+            netKwh = netKwh.validNumber(),
+            averageConsumptionKwhPer100Km = signedAverage(netKwh, distanceKm),
+            energyCompleteness = energyCompleteness(dischargedKwh, regeneratedKwh, netKwh, energyPartial),
+            energyCoveredMs = energyCoveredMs,
+            energyUncoveredMs = energyUncoveredMs,
+            energyObservedAt = energyObservedAt,
+            route = routePoints(route)
         )
     }
 
@@ -101,13 +164,58 @@ object TripsUiMapper {
         return "%d:%02d".format(Locale.US, totalMinutes / 60L, totalMinutes % 60L)
     }
 
-    private fun average(trips: List<TripSummaryUi>): Double? = TripMetrics.averageConsumptionKwhPer100Km(
-        trips.sumOrNull { it.energyKwh },
-        trips.sumOrNull { it.distanceKm }
-    )
+    private fun aggregateEnergy(trips: List<TripSummaryUi>): EnergyAggregate {
+        val averageRows = trips.filter { it.netKwh.validNumber() != null && it.distanceKm.validDistance() != null }
+        val completeness = when {
+            trips.none { it.dischargedKwh.validNumber() != null || it.regeneratedKwh.validNumber() != null || it.netKwh.validNumber() != null } ->
+                TripEnergyCompleteness.UNAVAILABLE
+            trips.all { it.energyCompleteness == TripEnergyCompleteness.COMPLETE } && averageRows.size == trips.size ->
+                TripEnergyCompleteness.COMPLETE
+            else -> TripEnergyCompleteness.PARTIAL
+        }
+        return EnergyAggregate(
+            dischargedKwh = trips.sumOrNull { it.dischargedKwh.validNumber() },
+            regeneratedKwh = trips.sumOrNull { it.regeneratedKwh.validNumber() },
+            netKwh = trips.sumOrNull { it.netKwh.validNumber() },
+            averageConsumptionKwhPer100Km = TripMetrics.averageConsumptionKwhPer100Km(
+                averageRows.sumOrNull { it.netKwh.validNumber() },
+                averageRows.sumOrNull { it.distanceKm.validDistance() }
+            ),
+            completeness = completeness
+        )
+    }
+
+    private fun energyCompleteness(
+        dischargedKwh: Double?,
+        regeneratedKwh: Double?,
+        netKwh: Double?,
+        partial: Boolean?
+    ): TripEnergyCompleteness {
+        val values = listOf(dischargedKwh.validNumber(), regeneratedKwh.validNumber(), netKwh.validNumber())
+        return when {
+            values.all { it == null } -> TripEnergyCompleteness.UNAVAILABLE
+            values.all { it != null } && partial == false -> TripEnergyCompleteness.COMPLETE
+            else -> TripEnergyCompleteness.PARTIAL
+        }
+    }
+
+    private fun signedAverage(netKwh: Double?, distanceKm: Double?): Double? =
+        TripMetrics.averageConsumptionKwhPer100Km(netKwh.validNumber(), distanceKm.validDistance())
+
+    private fun Double?.validNumber(): Double? = this?.takeIf(Double::isFinite)
+
+    private fun Double?.validDistance(): Double? = validNumber()?.takeIf { it > 0.0 }
 
     private inline fun List<TripSummaryUi>.sumOrNull(value: (TripSummaryUi) -> Double?): Double? {
         val values = mapNotNull(value)
         return values.takeIf { it.isNotEmpty() }?.sum()
     }
+
+    private data class EnergyAggregate(
+        val dischargedKwh: Double?,
+        val regeneratedKwh: Double?,
+        val netKwh: Double?,
+        val averageConsumptionKwhPer100Km: Double?,
+        val completeness: TripEnergyCompleteness
+    )
 }

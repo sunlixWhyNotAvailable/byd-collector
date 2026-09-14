@@ -578,8 +578,36 @@ class CollectorService : Service() {
     }
 
     private fun createSuccessfulPollObserver(): SuccessfulPollObserver {
+        val trips = BydCollectorApplication.trips(applicationContext)
+        val energy = com.bydcollector.collector.data.energy.EnergySessionCoordinator(trips) {
+            trips.loadOpenSession()?.let {
+                com.bydcollector.collector.data.energy.EnergySessionSeed(it.tripId, it.startedAt)
+            }
+        }
+        val fallbackSource = com.bydcollector.collector.data.polling.LivePollSource()
+        var energyHydrated = false
         //normalizes only after raw poll persistence so raw telemetry remains the source of truth
         return object : SuccessfulPollObserver {
+            private fun prepareEnergyProjection() {
+                if (!energyHydrated) {
+                    energy.stageCurrentProjection()
+                    energyHydrated = true
+                }
+                // Pending domain state is portable across Main archive; drain before any newer receipt.
+                energy.pendingProjection()?.let(::persistEnergyProjection)
+            }
+
+            private fun persistEnergyProjection(
+                pending: com.bydcollector.collector.data.energy.EnergyPendingProjection
+            ) {
+                persistLocationObservations(
+                    com.bydcollector.collector.data.energy.EnergyTelemetryProjection.observations(pending.snapshot)
+                )
+                check(energy.confirmProjected(pending.snapshot.snapshotId)) {
+                    "Energy projection receipt changed"
+                }
+            }
+
             override fun onSuccessfulPoll(
                 sessionId: Long,
                 pollId: Long,
@@ -587,12 +615,33 @@ class CollectorService : Service() {
                 readings: List<PollReading>,
                 origin: PollOrigin
             ) {
+                onSourcePoll(sessionId, pollId, timestamp, readings, origin,
+                    fallbackSource.capture(android.os.SystemClock.elapsedRealtime()))
+            }
+
+            override fun onSourcePoll(
+                sessionId: Long, pollId: Long, timestamp: String, readings: List<PollReading>,
+                origin: PollOrigin, source: com.bydcollector.collector.data.polling.PollSampleSource
+            ) {
+                prepareEnergyProjection()
                 val observations = vehicleStateNormalizer.normalize(
                     pollId = pollId,
                     observedAt = timestamp,
                     readings = readings
                 )
-                val summary = store.applyNormalizedObservations(observations)
+                val energyResult = energy.process(com.bydcollector.collector.data.energy.EnergyTelemetryProjection.receipt(
+                    source, timestamp, readings, observations
+                ))
+                if (energyResult.stale) return
+                val energySnapshot = energyResult.snapshot
+                // Inactive cursor-only receipts retain the final snapshot, but must not
+                // republish it as fresh and oscillate an expired Main value between OK/STALE.
+                val energyObservations = energyResult.pendingProjection?.snapshot
+                    ?.let(com.bydcollector.collector.data.energy.EnergyTelemetryProjection::observations).orEmpty()
+                val summary = store.applyNormalizedObservations(observations + energyObservations)
+                energyResult.pendingProjection?.let {
+                    check(energy.confirmProjected(it.snapshot.snapshotId)) { "Energy projection receipt changed" }
+                }
                 dashboardUiStateStore.incrementMainRowCounts(
                     normalizedCurrentRows = summary.currentInsertedCount.toLong(),
                     normalizedHistoryRows = summary.historyInsertedCount.toLong()
@@ -611,7 +660,7 @@ class CollectorService : Service() {
                         "telegram_event_error",
                         onSuccess = ::postTelegramTickSchedule
                     ) {
-                        coordinator.onSuccessfulPoll(observations) { legId ->
+                        coordinator.onSuccessfulPoll(observations, energySnapshot) { legId ->
                             correlateTripDiagnostic(
                                 legId = legId,
                                 powerSession = parent,
@@ -633,12 +682,33 @@ class CollectorService : Service() {
                     readings,
                     observations,
                     liveTelemetry = origin == PollOrigin.LIVE,
-                    diagnosticPowerSession = diagnosticPowerSession
+                    diagnosticPowerSession = diagnosticPowerSession,
+                    energySnapshot = energySnapshot
                 )
                 if (summary.changedCategories.isNotEmpty()) {
                     normalizedStateChangedCallback?.invoke(summary.changedCategories)
                 }
                 exportInfluxAfterNormalizedWrite(summary)
+            }
+
+            override fun onSourceFailure(
+                sessionId: Long,
+                pollId: Long,
+                timestamp: String,
+                origin: PollOrigin,
+                source: com.bydcollector.collector.data.polling.PollSampleSource
+            ) {
+                prepareEnergyProjection()
+                val energyResult = energy.process(
+                    com.bydcollector.collector.data.energy.EnergyTelemetryProjection.receipt(
+                        source = source,
+                        observedAt = timestamp,
+                        readings = emptyList(),
+                        observations = emptyList()
+                    )
+                )
+                if (energyResult.stale) return
+                energyResult.pendingProjection?.let(::persistEnergyProjection)
             }
         }
     }
@@ -691,7 +761,8 @@ class CollectorService : Service() {
                     snapshot = TelegramPowerOffSnapshot(
                         odometerKm = current?.lastOdometerKm,
                         soc = current?.endSoc,
-                        tripEnergyKwh = current?.lastTripEnergyKwh
+                        tripEnergyKwh = current?.lastTripEnergyKwh,
+                        energySnapshot = event.energySnapshot
                     ),
                     location = event.lastLocation?.let(::telegramLocationSnapshot)
                 )
@@ -3631,7 +3702,12 @@ class CollectorService : Service() {
         return TelegramCoordinator(
             eventStore = store,
             telegramStore = telegramStore,
-            settings = settings
+            settings = settings,
+            currentEnergySnapshot = {
+                BydCollectorApplication.trips(applicationContext).readEnergyRuntimeRow()?.let { row ->
+                    com.bydcollector.collector.data.energy.EnergyStateCodec.decodeState(row.stateJson).currentSnapshot
+                }
+            }
         )
     }
 

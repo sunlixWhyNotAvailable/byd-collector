@@ -25,6 +25,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.bydcollector.collector.adb.AdbAuthorizationManager
 import com.bydcollector.collector.adb.AccessCheckMode
 import com.bydcollector.collector.data.local.TelemetryStore
+import com.bydcollector.collector.data.trips.RoutePoint
+import com.bydcollector.collector.data.trips.TripSession
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
@@ -68,9 +70,11 @@ import com.bydcollector.collector.ui.compose.TelegramMessageType
 import com.bydcollector.collector.ui.compose.TelegramTestStatus
 import com.bydcollector.collector.ui.compose.TelegramUiActions
 import com.bydcollector.collector.ui.compose.TelegramUiState
+import com.bydcollector.collector.ui.compose.CurrentTripUi
 import com.bydcollector.collector.ui.compose.TripsUiActions
 import com.bydcollector.collector.ui.compose.TripsUiState
 import com.bydcollector.collector.ui.compose.TripsUiMapper
+import com.bydcollector.collector.ui.compose.TripYearUi
 import com.bydcollector.collector.ui.compose.UiLanguage
 import com.bydcollector.collector.ui.compose.strings
 import com.bydcollector.collector.update.UpdateRuntime
@@ -142,6 +146,9 @@ class MainActivity : ComponentActivity() {
     private var actionUiState by mutableStateOf(BydCollectorActionUiState())
     private var archiveDeleteDispatchStartedAtMs: Long? = null
     private var tripsRequestGeneration = 0L
+    private var currentTripRefreshGeneration = 0L
+    private var currentTripRefreshInFlight = false
+    private var selectedCurrentTripId: String? = null
     @Volatile private var forcedRefreshPending = false
     private var credentialsLoadStarted = false
     private var credentialsLoaded = false
@@ -159,6 +166,8 @@ class MainActivity : ComponentActivity() {
             tripsUiState = tripsUiState.copy(consumptionGreenThreshold = settings.tripConsumptionGreenThreshold(), consumptionYellowThreshold = settings.tripConsumptionYellowThreshold())
         },
         onRouteRequested = { tripId -> loadTripsUi(tripId) },
+        onCurrentTripRequested = ::openCurrentTrip,
+        onCurrentTripDismissed = ::dismissCurrentTrip,
         onCompressDatabase = { TripCompressionService.start(applicationContext) },
         onRefreshRequested = {
             loadTripsUi()
@@ -173,6 +182,7 @@ class MainActivity : ComponentActivity() {
             handler.postDelayed(this, DASHBOARD_REFRESH_HEARTBEAT_MS)
         }
     }
+    private val currentTripRefreshTask = Runnable { refreshCurrentTrip() }
     private val settingsChangeListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         if (
             key == CollectorSettings.KEY_TELEGRAM_CONNECTION_STATUS ||
@@ -758,6 +768,7 @@ class MainActivity : ComponentActivity() {
         reconcileCutoverArchiveStorageIfNeeded()
         syncTelegramUiRuntimeState()
         if (activeTab == AppTab.TRIPS) loadTripsUi()
+        if (tripsUiState.currentTripModal?.trip?.open == true) scheduleCurrentTripRefresh(0L)
         refresh()
         maybeContinueStartupAccessFlow()
         syncUpdateCheckUi()
@@ -792,6 +803,7 @@ class MainActivity : ComponentActivity() {
         foreground = false
         mainWindowHasFocus = false
         handler.removeCallbacks(refreshTask)
+        handler.removeCallbacks(currentTripRefreshTask)
         super.onPause()
     }
 
@@ -826,6 +838,7 @@ class MainActivity : ComponentActivity() {
         handler.removeCallbacks(updateCheckUiTask)
         handler.removeCallbacks(startupAdbSelfCheckTask)
         handler.removeCallbacks(telegramReconcileTask)
+        handler.removeCallbacks(currentTripRefreshTask)
         super.onDestroy()
     }
 
@@ -1132,16 +1145,18 @@ class MainActivity : ComponentActivity() {
                 val trips = BydCollectorApplication.trips(applicationContext)
                 val groups = trips.queryHierarchy()
                 val routes = routeTripId?.let { id -> mapOf(id to trips.queryRoutePoints(id)) }.orEmpty()
+                val availableCurrentTrip = trips.loadOpenSession()?.let { TripsUiMapper.current(it, requestedLanguage) }
                 val tripsBytes = sqliteFootprintBytes(trips.databaseFile)
                 dashboardUiStateStore.publishDatabaseFootprints(
                     sqliteFootprintBytes(getDatabasePath(com.bydcollector.collector.data.local.TelemetryDatabaseHelper.DATABASE_NAME)),
                     sqliteFootprintBytes(getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME)),
                     tripsBytes
                 )
-                Triple(
-                    TripsUiMapper.years(groups, requestedLanguage, routes),
-                    trips.databaseFile.absolutePath,
-                    tripsBytes
+                TripsLoadResult(
+                    years = TripsUiMapper.years(groups, requestedLanguage, routes),
+                    databasePath = trips.databaseFile.absolutePath,
+                    databaseSizeBytes = tripsBytes,
+                    availableCurrentTrip = availableCurrentTrip
                 )
             }
             runOnUiThread {
@@ -1150,10 +1165,14 @@ class MainActivity : ComponentActivity() {
                     requestGeneration != tripsRequestGeneration ||
                     !navigationSession.isGenerationCurrent(sessionGeneration)
                 ) return@runOnUiThread
-                result.onSuccess { (years, path, size) ->
+                result.onSuccess { loaded ->
                     tripsUiState = tripsUiState.copy(
-                        years = years, routeLoadingId = null,
-                        databasePath = path, databaseSizeBytes = size
+                        years = loaded.years,
+                        routeLoadingId = null,
+                        databasePath = loaded.databasePath,
+                        databaseSizeBytes = loaded.databaseSizeBytes,
+                        currentTripAvailabilityKnown = true,
+                        availableCurrentTrip = loaded.availableCurrentTrip
                     )
                 }.onFailure { error ->
                     tripsUiState = tripsUiState.copy(routeLoadingId = null)
@@ -1168,6 +1187,119 @@ class MainActivity : ComponentActivity() {
                 tripsUiState = tripsUiState.copy(routeLoadingId = null)
                 recordDashboardRefreshFailure("trips", error)
             }
+        }
+    }
+
+    private fun openCurrentTrip() {
+        val available = tripsUiState.availableCurrentTrip ?: return
+        selectedCurrentTripId = available.trip.id
+        currentTripRefreshGeneration++
+        currentTripRefreshInFlight = false
+        tripsUiState = tripsUiState.copy(
+            currentTripModal = available.copy(
+                trip = available.trip.copy(route = emptyList()),
+                nextRouteSequence = 0L
+            )
+        )
+        scheduleCurrentTripRefresh(0L)
+    }
+
+    private fun dismissCurrentTrip() {
+        selectedCurrentTripId = null
+        currentTripRefreshGeneration++
+        currentTripRefreshInFlight = false
+        handler.removeCallbacks(currentTripRefreshTask)
+        tripsUiState = tripsUiState.copy(currentTripModal = null)
+    }
+
+    private fun scheduleCurrentTripRefresh(delayMs: Long = CURRENT_TRIP_REFRESH_MS) {
+        handler.removeCallbacks(currentTripRefreshTask)
+        if (
+            destroyed || !foreground || activeTab != AppTab.TRIPS ||
+            selectedCurrentTripId == null || tripsUiState.currentTripModal?.trip?.open != true
+        ) return
+        handler.postDelayed(currentTripRefreshTask, delayMs.coerceAtLeast(0L))
+    }
+
+    private fun refreshCurrentTrip() {
+        val tripId = selectedCurrentTripId ?: return
+        val modal = tripsUiState.currentTripModal ?: return
+        if (destroyed || !foreground || activeTab != AppTab.TRIPS || currentTripRefreshInFlight) return
+        val generation = currentTripRefreshGeneration
+        val requestedLanguage = uiLanguage
+        //The final marker rewrites the last persisted point without allocating a new sequence.
+        val firstSequence = (modal.nextRouteSequence - 1L).coerceAtLeast(0L)
+        currentTripRefreshInFlight = true
+        runCatching {
+            dashboardExecutor.execute {
+                val result = runCatching {
+                    val trips = BydCollectorApplication.trips(applicationContext)
+                    val session = trips.session(tripId)
+                    session?.let {
+                        val routeFirstSequence = if (it.state == TripSession.STATE_OPEN) {
+                            firstSequence
+                        } else {
+                            //Power-off may mark the last valid point final behind one or more GPS-gap rows.
+                            modal.trip.route.lastOrNull { point -> !point.gap }?.sequence ?: 0L
+                        }
+                        val tail = buildList { trips.forEachRoutePointFrom(tripId, routeFirstSequence, ::add) }
+                        CurrentTripRead(it, routeFirstSequence, tail)
+                    }
+                }
+                runOnUiThread {
+                    if (
+                        destroyed || generation != currentTripRefreshGeneration ||
+                        selectedCurrentTripId != tripId
+                    ) return@runOnUiThread
+                    currentTripRefreshInFlight = false
+                    result.onSuccess { read ->
+                        if (read == null) {
+                            scheduleCurrentTripRefresh()
+                            return@onSuccess
+                        }
+                        val previous = tripsUiState.currentTripModal ?: return@onSuccess
+                        if (previous.trip.id != tripId) return@onSuccess
+                        val mappedTail = TripsUiMapper.routePoints(read.routeTail)
+                        val routeChanged = mappedTail.any { candidate ->
+                            previous.trip.route.lastOrNull { it.sequence == candidate.sequence } != candidate
+                        }
+                        val mergedRoute = if (!routeChanged) {
+                            previous.trip.route
+                        } else {
+                            previous.trip.route.filter { it.sequence < read.firstSequence } + mappedTail
+                        }
+                        val nextSequence = read.routeTail.maxOfOrNull { it.sequence }
+                            ?.takeIf { it != Long.MAX_VALUE }
+                            ?.plus(1L)
+                            ?: modal.nextRouteSequence
+                        val refreshed = TripsUiMapper.current(read.session, requestedLanguage)
+                        val updated = refreshed.copy(
+                            trip = refreshed.trip.copy(route = mergedRoute),
+                            nextRouteSequence = nextSequence
+                        )
+                        tripsUiState = tripsUiState.copy(
+                            currentTripModal = updated,
+                            availableCurrentTrip = if (updated.trip.open) {
+                                updated.copy(trip = updated.trip.copy(route = emptyList()), nextRouteSequence = 0L)
+                            } else {
+                                null
+                            }
+                        )
+                        if (updated.trip.open) {
+                            scheduleCurrentTripRefresh()
+                        } else {
+                            loadTripsUi()
+                        }
+                    }.onFailure { error ->
+                        recordDashboardRefreshFailure("current_trip", error)
+                        scheduleCurrentTripRefresh()
+                    }
+                }
+            }
+        }.onFailure { error ->
+            currentTripRefreshInFlight = false
+            recordDashboardRefreshFailure("current_trip_dispatch", error)
+            scheduleCurrentTripRefresh()
         }
     }
 
@@ -2293,6 +2425,7 @@ class MainActivity : ComponentActivity() {
 }
 
 internal const val DASHBOARD_REFRESH_HEARTBEAT_MS = 1_000L
+internal const val CURRENT_TRIP_REFRESH_MS = 1_000L
 //Chrome/status fields are producer-fed while the service runs. Activity entry, resume, tab changes,
 //and explicit actions still force a reconciliation; the foreground heartbeat does not reread SQLite.
 internal val DASHBOARD_CHROME_REFRESH_INTERVAL_MS: Long? = null
@@ -2369,6 +2502,19 @@ private data class LoadedCredentials(
     val influxUsername: String,
     val influxPassword: String,
     val telegramBotToken: String
+)
+
+private data class TripsLoadResult(
+    val years: List<TripYearUi>,
+    val databasePath: String,
+    val databaseSizeBytes: Long,
+    val availableCurrentTrip: CurrentTripUi?
+)
+
+private data class CurrentTripRead(
+    val session: TripSession,
+    val firstSequence: Long,
+    val routeTail: List<RoutePoint>
 )
 
 internal fun startupHardFlowBlocked(

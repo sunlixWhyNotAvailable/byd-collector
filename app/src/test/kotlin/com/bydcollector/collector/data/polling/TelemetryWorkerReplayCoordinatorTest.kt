@@ -21,6 +21,89 @@ import kotlin.test.assertTrue
 
 class TelemetryWorkerReplayCoordinatorTest {
     @Test
+    fun failedRawSampleNotifiesOnlyFailureObserverBeforeAcknowledgement() {
+        val actions = mutableListOf<String>()
+        val storage = FakeWorkerPollStorage(actions)
+        var successfulCallbacks = 0
+        var failedSource: PollSampleSource? = null
+        val coordinator = coordinator(
+            storage = storage,
+            sample = sample(DirectFidRegistry.CATALOG_VERSION, listOf(TEST_ENTRY), listOf(null)),
+            actions = actions,
+            observer = object : SuccessfulPollObserver {
+                override fun onSuccessfulPoll(
+                    sessionId: Long,
+                    pollId: Long,
+                    timestamp: String,
+                    readings: List<PollReading>,
+                    origin: PollOrigin
+                ) {
+                    successfulCallbacks += 1
+                }
+
+                override fun onSourceFailure(
+                    sessionId: Long,
+                    pollId: Long,
+                    timestamp: String,
+                    origin: PollOrigin,
+                    source: PollSampleSource
+                ) {
+                    actions += "failureObserver:$pollId"
+                    assertEquals(PollOrigin.REPLAY, origin)
+                    failedSource = source
+                }
+            }
+        )
+
+        val result = coordinator.replayNextBatch(sessionId = 7L)
+
+        assertFalse(result.needsReplay)
+        assertEquals(0, successfulCallbacks)
+        assertEquals("helper:boot-a:generation-a:1", failedSource?.identity)
+        assertEquals(900L, failedSource?.capturedElapsedMs)
+        assertEquals(
+            listOf("parameters", "insert:7", "failureObserver:41", "ack:999", "event:worker_spool_replayed"),
+            actions
+        )
+    }
+
+    @Test
+    fun failedSampleObserverFailureLeavesReplaySampleUnacknowledged() {
+        val actions = mutableListOf<String>()
+        val storage = FakeWorkerPollStorage(actions)
+        val coordinator = coordinator(
+            storage = storage,
+            sample = sample(DirectFidRegistry.CATALOG_VERSION, listOf(TEST_ENTRY), listOf(null)),
+            actions = actions,
+            observer = object : SuccessfulPollObserver {
+                override fun onSuccessfulPoll(
+                    sessionId: Long,
+                    pollId: Long,
+                    timestamp: String,
+                    readings: List<PollReading>,
+                    origin: PollOrigin
+                ) = Unit
+
+                override fun onSourceFailure(
+                    sessionId: Long,
+                    pollId: Long,
+                    timestamp: String,
+                    origin: PollOrigin,
+                    source: PollSampleSource
+                ) {
+                    throw IllegalStateException("energy unavailable")
+                }
+            }
+        )
+
+        val result = coordinator.replayNextBatch(sessionId = 7L)
+
+        assertTrue(result.needsReplay)
+        assertEquals("worker_replay_error", result.cycleResult?.category)
+        assertFalse(actions.any { it.startsWith("ack:") })
+    }
+
+    @Test
     fun commitsRawPollAndObserverBeforeAcknowledgingTheHelperSample() {
         val actions = mutableListOf<String>()
         val storage = FakeWorkerPollStorage(actions)

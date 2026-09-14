@@ -37,6 +37,11 @@ enum class PollOrigin {
 }
 
 interface SuccessfulPollObserver {
+    fun onSourcePoll(
+        sessionId: Long, pollId: Long, timestamp: String, readings: List<PollReading>,
+        origin: PollOrigin, source: PollSampleSource
+    ) = onSuccessfulPoll(sessionId, pollId, timestamp, readings, origin)
+
     fun onSuccessfulPoll(
         sessionId: Long,
         pollId: Long,
@@ -44,6 +49,14 @@ interface SuccessfulPollObserver {
         readings: List<PollReading>,
         origin: PollOrigin
     )
+
+    fun onSourceFailure(
+        sessionId: Long,
+        pollId: Long,
+        timestamp: String,
+        origin: PollOrigin,
+        source: PollSampleSource
+    ) = Unit
 }
 
 //ties one vehicle read to raw persistence, normalized observers, and explicit failure records
@@ -56,6 +69,7 @@ class PollPersistenceCoordinator(
     private var lastPersistedFailureKey: String? = null
     private var lastPersistedFailureAtMs: Long = Long.MIN_VALUE
     private var lastDiagnosticKey: String? = null
+    private val liveSource = LivePollSource()
 
     override fun pollOnce(sessionId: Long): PollCycleResult {
         val parameters = store.getActiveCatalogParameters()
@@ -65,6 +79,7 @@ class PollPersistenceCoordinator(
             when (result) {
                 is TelemetryReadResult.Success -> {
                     val timestamp = clock.nowIso()
+                    val source = liveSource.capture(clock.elapsedRealtimeMs())
                     //stores raw readings before observers derive state for mqtt/influx consumers
                     val pollId = store.insertPoll(
                         sessionId,
@@ -85,12 +100,13 @@ class PollPersistenceCoordinator(
                     )
                     persistDiagnosticTransition(result)
                     try {
-                        successfulPollObserver?.onSuccessfulPoll(
+                        successfulPollObserver?.onSourcePoll(
                             sessionId,
                             pollId,
                             timestamp,
                             result.readings,
-                            PollOrigin.LIVE
+                            PollOrigin.LIVE,
+                            source
                         )
                     } catch (error: RuntimeException) {
                         //keeps raw polling alive even if normalized state/export logic has a bug
@@ -132,6 +148,7 @@ class PollPersistenceCoordinator(
                             errorMessage = result.message
                         )
                     }
+                    val source = liveSource.capture(nowMs)
                     val pollId = store.insertPoll(
                         sessionId,
                         PersistedPollInput(
@@ -146,6 +163,13 @@ class PollPersistenceCoordinator(
                             readings = emptyList()
                         ),
                         parameters = parameters
+                    )
+                    successfulPollObserver?.onSourceFailure(
+                        sessionId = sessionId,
+                        pollId = pollId,
+                        timestamp = timestamp,
+                        origin = PollOrigin.LIVE,
+                        source = source
                     )
                     lastPersistedFailureKey = failureKey
                     lastPersistedFailureAtMs = nowMs

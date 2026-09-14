@@ -3,9 +3,13 @@ package com.bydcollector.collector.data.trips
 import android.content.ContentValues
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
+import com.bydcollector.collector.data.energy.EnergyRuntimeRow
+import com.bydcollector.collector.data.energy.EnergyRuntimeStorage
+import com.bydcollector.collector.data.energy.EnergySnapshot
+import com.bydcollector.collector.data.energy.EnergyStateCodec
 import java.time.Instant
 
-class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable {
+class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyRuntimeStorage {
     /** Serializes all TripStore access; Step 8 leases this monitor for cutover. */
     private val changedTripSequences = linkedMapOf<String, Long?>()
     private var changeTracking = false
@@ -41,12 +45,27 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable {
 
     @Synchronized
     fun upsertSession(session: TripSession) {
+        upsertSessionInternal(session, preserveDurableEnergy = true)
+    }
+
+    /** Copies an authoritative source row without overlaying this candidate's older checkpoint. */
+    @Synchronized
+    internal fun copySessionFrom(source: TripStore, tripId: String) {
+        require(source !== this) { "Source and destination stores must differ" }
+        upsertSessionInternal(
+            requireNotNull(source.session(tripId)) { "Source trip disappeared" },
+            preserveDurableEnergy = false
+        )
+    }
+
+    private fun upsertSessionInternal(session: TripSession, preserveDurableEnergy: Boolean) {
         val db = writableDb
         var committed = false
         db.beginTransaction()
         try {
             if (session.state == TripSession.STATE_OPEN) materializeChunksIfNeeded(db, session.tripId)
-            val values = session.toContentValues()
+            val durableSnapshot = durableEnergySnapshot(db).takeIf { preserveDurableEnergy }
+            val values = (durableSnapshot?.let { session.withEnergySnapshot(it) } ?: session).toContentValues()
             if (db.update("trip_sessions", values, "trip_id = ?", arrayOf(session.tripId)) == 0) {
                 db.insertOrThrow("trip_sessions", null, values)
             }
@@ -86,6 +105,99 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable {
     fun loadOpenSession(): TripSession? = openSessions().firstOrNull()
     @Synchronized
     fun updateSession(session: TripSession) = upsertSession(session)
+
+    @Synchronized
+    override fun readEnergyRuntimeRow(): EnergyRuntimeRow? = readableDb.rawQuery(
+        "SELECT state_json, pending_projection_json, updated_at FROM energy_runtime_state WHERE singleton_id = 1",
+        null
+    ).use { cursor ->
+        if (!cursor.moveToFirst()) null else EnergyRuntimeRow(
+            stateJson = cursor.getString(0),
+            pendingProjectionJson = cursor.getStringOrNull(1),
+            updatedAt = cursor.getString(2)
+        )
+    }
+
+    @Synchronized
+    override fun commitEnergyRuntimeRow(stateJson: String, pendingProjectionJson: String?, updatedAt: String) {
+        require(stateJson.isNotBlank() && updatedAt.isNotBlank() && updatedAt.length <= 128)
+        val snapshot = EnergyStateCodec.decodeState(stateJson).currentSnapshot
+        pendingProjectionJson?.let { encoded ->
+            val pending = EnergyStateCodec.decodeProjection(encoded)
+            require(pending.snapshot == snapshot) {
+                "Energy pending projection does not match checkpoint"
+            }
+        }
+        val db = writableDb
+        var mirroredTripId: String? = null
+        db.beginTransaction()
+        try {
+            val values = EnergyRuntimeRow(stateJson, pendingProjectionJson, updatedAt).toContentValues()
+            if (db.update("energy_runtime_state", values, "singleton_id = 1", null) == 0) {
+                values.put("singleton_id", 1)
+                db.insertOrThrow("energy_runtime_state", null, values)
+            }
+            snapshot?.powerSessionId?.let { tripId ->
+                if (db.update("trip_sessions", snapshot.toEnergyContentValues(), "trip_id = ?", arrayOf(tripId)) == 1) {
+                    mirroredTripId = tripId
+                }
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        mirroredTripId?.let(::markSessionChanged)
+    }
+
+    @Synchronized
+    override fun clearEnergyPending(expectedPendingJson: String, updatedAt: String): Boolean {
+        require(expectedPendingJson.isNotBlank() && updatedAt.isNotBlank())
+        val db = writableDb
+        var changed = false
+        db.beginTransaction()
+        try {
+            val values = ContentValues().apply {
+                putNull("pending_projection_json")
+                put("updated_at", updatedAt)
+            }
+            changed = db.update(
+                "energy_runtime_state",
+                values,
+                "singleton_id = 1 AND pending_projection_json = ?",
+                arrayOf(expectedPendingJson)
+            ) == 1
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        return changed
+    }
+
+    /** Exact bounded copy used by Trips compression for its one service-state row. */
+    @Synchronized
+    internal fun replaceEnergyRuntimeRow(row: EnergyRuntimeRow?) {
+        val snapshot = row?.let { EnergyStateCodec.decodeState(it.stateJson).currentSnapshot }
+        row?.pendingProjectionJson?.let { encoded ->
+            require(EnergyStateCodec.decodeProjection(encoded).snapshot == snapshot) {
+                "Energy pending projection does not match checkpoint"
+            }
+        }
+        val db = writableDb
+        db.beginTransaction()
+        try {
+            db.delete("energy_runtime_state", null, null)
+            if (row != null) {
+                val values = row.toContentValues().apply { put("singleton_id", 1) }
+                db.insertOrThrow("energy_runtime_state", null, values)
+            }
+            snapshot?.powerSessionId?.let { tripId ->
+                db.update("trip_sessions", snapshot.toEnergyContentValues(), "trip_id = ?", arrayOf(tripId))
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
 
     @Synchronized
     fun nextRouteSequence(tripId: String): Long {
@@ -508,7 +620,7 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable {
     private class CompressionFallback : RuntimeException()
 
     private fun querySummaries(where: String, args: Array<String>): List<TripSummary> = readableDb.rawQuery(
-        "SELECT trip_id, started_at, ended_at, duration_ms, distance_km, start_soc, end_soc, energy_kwh, average_consumption_kwh_per_100km, quality, movement_observed FROM trip_sessions $where ORDER BY started_at DESC", args
+        "SELECT trip_id, started_at, ended_at, duration_ms, distance_km, start_soc, end_soc, energy_kwh, average_consumption_kwh_per_100km, discharged_kwh, regenerated_kwh, net_kwh, energy_covered_ms, energy_uncovered_ms, energy_partial, energy_observed_at, quality, movement_observed FROM trip_sessions $where ORDER BY started_at DESC", args
     ).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.toTripSummary()) } }
 
     private fun querySessions(
@@ -520,7 +632,7 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable {
         require(limit == null || limit > 0) { "Session query limit must be positive" }
         val limitClause = limit?.let { " LIMIT $it" }.orEmpty()
         return readableDb.rawQuery(
-            "SELECT trip_id, state, started_at, ended_at, start_elapsed_ms, end_elapsed_ms, start_boot_id, end_boot_id, start_segment_id, end_segment_id, movement_observed, start_soc, end_soc, start_odometer_km, last_odometer_km, start_trip_energy_kwh, last_trip_energy_kwh, duration_ms, distance_km, energy_kwh, average_consumption_kwh_per_100km, termination, quality, telegram_eligible, telegram_enqueued FROM trip_sessions WHERE $where ORDER BY $orderBy$limitClause",
+            "SELECT trip_id, state, started_at, ended_at, start_elapsed_ms, end_elapsed_ms, start_boot_id, end_boot_id, start_segment_id, end_segment_id, movement_observed, start_soc, end_soc, start_odometer_km, last_odometer_km, start_trip_energy_kwh, last_trip_energy_kwh, duration_ms, distance_km, energy_kwh, average_consumption_kwh_per_100km, discharged_kwh, regenerated_kwh, net_kwh, energy_covered_ms, energy_uncovered_ms, energy_partial, energy_observed_at, termination, quality, telegram_eligible, telegram_enqueued FROM trip_sessions WHERE $where ORDER BY $orderBy$limitClause",
             args
         ).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.toTripSession()) } }
     }
@@ -531,7 +643,11 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable {
         put("start_segment_id", startSegmentId); put("end_segment_id", endSegmentId); put("movement_observed", if (movementObserved) 1 else 0)
         putNullable("start_soc", startSoc); putNullable("end_soc", endSoc); putNullable("start_odometer_km", startOdometerKm); putNullable("last_odometer_km", lastOdometerKm); putNullable("start_trip_energy_kwh", startTripEnergyKwh); putNullable("last_trip_energy_kwh", lastTripEnergyKwh)
         putNullable("duration_ms", durationMs); putNullable("distance_km", distanceKm); putNullable("energy_kwh", energyKwh)
-        putNullable("average_consumption_kwh_per_100km", averageConsumptionKwhPer100Km); put("termination", termination); put("quality", quality)
+        putNullable("average_consumption_kwh_per_100km", averageConsumptionKwhPer100Km)
+        putNullable("discharged_kwh", dischargedKwh); putNullable("regenerated_kwh", regeneratedKwh); putNullable("net_kwh", netKwh)
+        putNullable("energy_covered_ms", energyCoveredMs); putNullable("energy_uncovered_ms", energyUncoveredMs)
+        when (energyPartial) { null -> putNull("energy_partial"); else -> put("energy_partial", if (energyPartial) 1 else 0) }
+        put("energy_observed_at", energyObservedAt); put("termination", termination); put("quality", quality)
         put("telegram_eligible", if (telegramEligible) 1 else 0); put("telegram_enqueued", if (telegramEnqueued) 1 else 0)
     }
 
@@ -550,9 +666,34 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable {
         else -> put(key, value.toString())
     }
 
-    private fun Cursor.toTripSummary() = TripSummary(getString(0), getString(1), getStringOrNull(2), getLongOrNull(3), getDoubleOrNull(4), getDoubleOrNull(5), getDoubleOrNull(6), getDoubleOrNull(7), getDoubleOrNull(8), getString(9), getInt(10) == 1)
+    private fun Cursor.toTripSummary() = TripSummary(
+        tripId = getString(0),
+        startedAt = getString(1),
+        endedAt = getStringOrNull(2),
+        durationMs = getLongOrNull(3),
+        distanceKm = getDoubleOrNull(4),
+        startSoc = getDoubleOrNull(5),
+        endSoc = getDoubleOrNull(6),
+        energyKwh = getDoubleOrNull(7),
+        averageConsumptionKwhPer100Km = getDoubleOrNull(8),
+        dischargedKwh = getDoubleOrNull(9),
+        regeneratedKwh = getDoubleOrNull(10),
+        netKwh = getDoubleOrNull(11),
+        energyCoveredMs = getLongOrNull(12),
+        energyUncoveredMs = getLongOrNull(13),
+        energyPartial = getBooleanOrNull(14),
+        energyObservedAt = getStringOrNull(15),
+        quality = getString(16),
+        movementObserved = getInt(17) == 1
+    )
 
-    private fun Cursor.toTripSession() = TripSession(getString(0), getString(1), getString(2), getStringOrNull(3), getLongOrNull(4), getLongOrNull(5), getStringOrNull(6), getStringOrNull(7), getStringOrNull(8), getStringOrNull(9), getInt(10) == 1, getDoubleOrNull(11), getDoubleOrNull(12), getDoubleOrNull(13), getDoubleOrNull(14), getDoubleOrNull(15), getDoubleOrNull(16), getLongOrNull(17), getDoubleOrNull(18), getDoubleOrNull(19), getDoubleOrNull(20), getStringOrNull(21), getString(22), getInt(23) == 1, getInt(24) == 1)
+    private fun Cursor.toTripSession() = TripSession(
+        getString(0), getString(1), getString(2), getStringOrNull(3), getLongOrNull(4), getLongOrNull(5), getStringOrNull(6), getStringOrNull(7),
+        getStringOrNull(8), getStringOrNull(9), getInt(10) == 1, getDoubleOrNull(11), getDoubleOrNull(12), getDoubleOrNull(13), getDoubleOrNull(14),
+        getDoubleOrNull(15), getDoubleOrNull(16), getLongOrNull(17), getDoubleOrNull(18), getDoubleOrNull(19), getDoubleOrNull(20),
+        getDoubleOrNull(21), getDoubleOrNull(22), getDoubleOrNull(23), getLongOrNull(24), getLongOrNull(25), getBooleanOrNull(26),
+        getStringOrNull(27), getStringOrNull(28), getString(29), getInt(30) == 1, getInt(31) == 1
+    )
 
     private fun Cursor.toRoutePoint(): RoutePoint {
         val kind = getString(2)
@@ -563,6 +704,7 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable {
     private fun Cursor.getStringOrNull(index: Int): String? = if (isNull(index)) null else getString(index)
     private fun Cursor.getLongOrNull(index: Int): Long? = if (isNull(index)) null else getLong(index)
     private fun Cursor.getDoubleOrNull(index: Int): Double? = if (isNull(index)) null else getDouble(index)
+    private fun Cursor.getBooleanOrNull(index: Int): Boolean? = if (isNull(index)) null else getInt(index) == 1
     private fun isValidCoordinate(latitude: Double?, longitude: Double?) = latitude != null && longitude != null && latitude.isFinite() && longitude.isFinite() && latitude in -90.0..90.0 && longitude in -180.0..180.0
 
     private fun RouteChunkCodec.EncodedChunk.toContentValues() = ContentValues().apply {
@@ -576,6 +718,29 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable {
         put("uncompressed_size", uncompressedBytes)
         put("compressed_size", compressedBytes)
         put("payload", payload)
+    }
+
+    private fun EnergyRuntimeRow.toContentValues() = ContentValues().apply {
+        put("state_json", stateJson)
+        if (pendingProjectionJson == null) putNull("pending_projection_json") else put("pending_projection_json", pendingProjectionJson)
+        put("updated_at", updatedAt)
+    }
+
+    private fun EnergySnapshot.toEnergyContentValues() = ContentValues().apply {
+        putNullable("discharged_kwh", dischargedKwh)
+        putNullable("regenerated_kwh", regeneratedKwh)
+        putNullable("net_kwh", netKwh)
+        put("energy_covered_ms", energyCoveredMs)
+        put("energy_uncovered_ms", energyUncoveredMs)
+        put("energy_partial", if (energyPartial) 1 else 0)
+        put("energy_observed_at", observedAt)
+    }
+
+    private fun durableEnergySnapshot(db: SQLiteDatabase): EnergySnapshot? = db.rawQuery(
+        "SELECT state_json FROM energy_runtime_state WHERE singleton_id = 1",
+        null
+    ).use { cursor ->
+        if (!cursor.moveToFirst()) null else EnergyStateCodec.decodeState(cursor.getString(0)).currentSnapshot
     }
 
     companion object {

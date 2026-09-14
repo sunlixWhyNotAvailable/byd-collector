@@ -2,7 +2,7 @@ package com.bydcollector.collector.data.normalized
 
 //semantic catalog that maps curated raw keys to stable fields exposed to dashboard, mqtt, and influx
 object NormalizedFieldCatalog {
-    const val CATALOG_VERSION = "normalized-direct-v14-20260908-telemetry"
+    const val CATALOG_VERSION = "normalized-direct-v15-20260914-energy"
 
     val soc = number(
         fieldKey = "soc",
@@ -27,6 +27,10 @@ object NormalizedFieldCatalog {
     val socInternal = number("soc_internal", NormalizedCategory.BATTERY, "%", "Battery SOC internal", "battery", "measurement", listOf("statistic_remaining_battery_power"), "decoded_percent_0_100")
     val batteryRemainingEnergy = number("battery_remaining_energy_kwh", NormalizedCategory.BATTERY, "kWh", "Battery remaining energy", "energy_storage", "measurement", listOf("power_battery_remain_electricity"), "decoded_number_non_negative")
     val tripEnergy = number("trip_energy_kwh", NormalizedCategory.BATTERY, "kWh", "Trip energy", "energy", null, listOf("statistic_statistic_this_trip_total_elec_consumption"), "decoded_number_raw")
+    val tripDischarged = number("trip_discharged_kwh", NormalizedCategory.BATTERY, "kWh", "Trip battery discharged", "energy", null, listOf("charging_charge_battery_volt", "charging_charge_current"), "power_session_energy")
+    val tripRegenerated = number("trip_regenerated_kwh", NormalizedCategory.BATTERY, "kWh", "Trip battery recovered", "energy", null, listOf("charging_charge_battery_volt", "charging_charge_current"), "power_session_energy")
+    val tripNet = number("trip_net_kwh", NormalizedCategory.BATTERY, "kWh", "Trip battery net", "energy", null, listOf("charging_charge_battery_volt", "charging_charge_current"), "power_session_energy")
+    val energyFields: List<NormalizedFieldDefinition> get() = listOf(tripDischarged, tripRegenerated, tripNet)
     val cumulativeEnergy = number("cumulative_energy_kwh", NormalizedCategory.BATTERY, "kWh", "Cumulative energy", "energy", "total", listOf("statistic_total_elec_consumption"), "decoded_number_raw")
 
     val batterySoh = number("battery_soh_percent", NormalizedCategory.BATTERY, "%", "Battery SOH", "battery", "measurement", listOf("statistic_1014_1145045032_5"), "decoded_percent_0_100")
@@ -155,6 +159,9 @@ object NormalizedFieldCatalog {
         socInternal,
         batteryRemainingEnergy,
         tripEnergy,
+        tripDischarged,
+        tripRegenerated,
+        tripNet,
         cumulativeEnergy,
         batterySoh,
         hvBatteryVoltage,

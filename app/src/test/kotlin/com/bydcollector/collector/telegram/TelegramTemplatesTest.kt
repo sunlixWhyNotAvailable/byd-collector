@@ -8,6 +8,25 @@ import kotlin.test.assertTrue
 
 class TelegramTemplatesTest {
     @Test
+    fun previousReleaseDefaultsMigrateButCustomLegacyEnergyKeepsItsMeaning() {
+        val uk = "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\nПоточна витрата: {trip_energy_kwh} кВт·год ({trip_avg_kwh_per_100km} кВт·год/100 км), SOC: {soc_start}% -> {soc_end}%\nЗагалом: {total_distance_km} км / {total_duration}\nЗагальна витрата: {total_energy_kwh} кВт·год ({total_avg_kwh_per_100km} кВт·год/100 км), SOC: {total_soc_start}% -> {total_soc_end}%"
+        val en = "Trip complete\nCurrent trip: {trip_distance_km} km / {trip_duration}\nCurrent energy used: {trip_energy_kwh} kWh ({trip_avg_kwh_per_100km} kWh/100 km), SOC: {soc_start}% -> {soc_end}%\nTotal: {total_distance_km} km / {total_duration}\nTotal energy used: {total_energy_kwh} kWh ({total_avg_kwh_per_100km} kWh/100 km), SOC: {total_soc_start}% -> {total_soc_end}%"
+        val type = TelegramEventType.TRIP_SUMMARY
+        assertEquals(TelegramBuiltInTemplates.TRIP_SUMMARY_UK, TelegramBuiltInTemplates.migrateKnownSaved(type.key, uk))
+        assertEquals(TelegramBuiltInTemplates.TRIP_SUMMARY_EN, TelegramBuiltInTemplates.migrateKnownSaved(type.key, en))
+        val custom = "Stock: {trip_energy_kwh}; new: {trip_net_kwh}"
+        assertEquals(custom, TelegramBuiltInTemplates.migrateKnownSaved(type.key, custom))
+        assertEquals("Stock: 3.4; new: -1.2", TelegramTemplateRenderer.render(type, custom,
+            mapOf("trip_energy_kwh" to "3.4", "trip_net_kwh" to "-1.2")).text)
+        val fields = TelegramTemplateCatalog.spec(type).allowedVariables
+        for (prefix in listOf("trip", "total")) {
+            for (suffix in listOf("discharged_kwh", "regenerated_kwh", "net_kwh", "net_kwh_per_100km")) {
+                assertTrue("${prefix}_$suffix" in fields)
+            }
+        }
+    }
+
+    @Test
     fun catalogContainsNineEventsWithValidDefaults() {
         assertEquals(TelegramEventType.entries.toSet(), TelegramTemplateCatalog.events)
         TelegramTemplateCatalog.events.forEach { event ->
@@ -129,12 +148,18 @@ class TelegramTemplatesTest {
             "total_distance_km" to "456.7",
             "total_duration" to "12:34:56",
             "total_energy_kwh" to "98.7",
-            "total_avg_kwh_per_100km" to "21.62"
+            "total_avg_kwh_per_100km" to "21.62",
+            "trip_discharged_kwh" to "4.0", "trip_regenerated_kwh" to "0.6",
+            "trip_net_kwh" to "3.4", "trip_net_kwh_per_100km" to "27.64",
+            "total_discharged_kwh" to "100.0", "total_regenerated_kwh" to "1.3",
+            "total_net_kwh" to "98.7", "total_net_kwh_per_100km" to "21.62"
         )
         assertEquals(
             "Поїздку завершено\nПоточна поїздка: 12.3 км / 00:24:18\n" +
-                "Поточна витрата: 3.4 кВт·год (27.64 кВт·год/100 км), SOC: 81% -> 76%\n" +
-                "Загалом: 456.7 км / 12:34:56\nЗагальна витрата: 98.7 кВт·год (21.62 кВт·год/100 км), SOC: 84% -> 75%",
+                "\nПоточна статистика.\nВитрачено: 4.0 кВт·год\nРекуперовано: 0.6 кВт·год\n" +
+                "Баланс АКБ: 3.4 кВт·год (27.64 кВт·год/100 км), SOC: 81% -> 76%\n" +
+                "Загалом: 456.7 км / 12:34:56\n\nЗагальна статистика.\nВитрачено: 100.0 кВт·год\nРекуперовано: 1.3 кВт·год\n" +
+                "Баланс АКБ: 98.7 кВт·год (21.62 кВт·год/100 км), SOC: 84% -> 75%",
             TelegramTemplateRenderer.render(
                 TelegramEventType.TRIP_SUMMARY,
                 TelegramBuiltInTemplates.TRIP_SUMMARY_UK,
@@ -143,8 +168,10 @@ class TelegramTemplatesTest {
         )
         assertEquals(
             "Trip complete\nCurrent trip: 12.3 km / 00:24:18\n" +
-                "Current energy used: 3.4 kWh (27.64 kWh/100 km), SOC: 81% -> 76%\n" +
-                "Total: 456.7 km / 12:34:56\nTotal energy used: 98.7 kWh (21.62 kWh/100 km), SOC: 84% -> 75%",
+                "\nCurrent statistics.\nUsed: 4.0 kWh\nRecovered: 0.6 kWh\n" +
+                "Battery net: 3.4 kWh (27.64 kWh/100 km), SOC: 81% -> 76%\n" +
+                "Total: 456.7 km / 12:34:56\n\nTotal statistics.\nUsed: 100.0 kWh\nRecovered: 1.3 kWh\n" +
+                "Battery net: 98.7 kWh (21.62 kWh/100 km), SOC: 84% -> 75%",
             TelegramTemplateRenderer.render(
                 TelegramEventType.TRIP_SUMMARY,
                 TelegramBuiltInTemplates.TRIP_SUMMARY_EN,
@@ -167,11 +194,16 @@ class TelegramTemplatesTest {
             "total_distance_km" to "12.3",
             "total_duration" to "00:24:18",
             "total_energy_kwh" to "3.4",
-            "total_avg_kwh_per_100km" to "27.64"
+            "total_avg_kwh_per_100km" to "27.64",
+            "trip_discharged_kwh" to "4.0", "trip_regenerated_kwh" to "0.6",
+            "trip_net_kwh" to "3.4", "trip_net_kwh_per_100km" to "27.64",
+            "total_discharged_kwh" to "4.0", "total_regenerated_kwh" to "0.6",
+            "total_net_kwh" to "3.4", "total_net_kwh_per_100km" to "27.64"
         )
         assertEquals(
             "Поїздку завершено\nПоточна поїздка: 12.3 км / 00:24:18\n" +
-                "Поточна витрата: 3.4 кВт·год (27.64 кВт·год/100 км), SOC: 81% -> 76%",
+                "\nПоточна статистика.\nВитрачено: 4.0 кВт·год\nРекуперовано: 0.6 кВт·год\n" +
+                "Баланс АКБ: 3.4 кВт·год (27.64 кВт·год/100 км), SOC: 81% -> 76%",
             TelegramTemplateRenderer.render(
                 TelegramEventType.TRIP_SUMMARY,
                 TelegramBuiltInTemplates.tripSummaryTemplate(TelegramTemplateLanguage.UK, includeOverall = false),
@@ -180,7 +212,8 @@ class TelegramTemplatesTest {
         )
         assertEquals(
             "Trip complete\nCurrent trip: 12.3 km / 00:24:18\n" +
-                "Current energy used: 3.4 kWh (27.64 kWh/100 km), SOC: 81% -> 76%",
+                "\nCurrent statistics.\nUsed: 4.0 kWh\nRecovered: 0.6 kWh\n" +
+                "Battery net: 3.4 kWh (27.64 kWh/100 km), SOC: 81% -> 76%",
             TelegramTemplateRenderer.render(
                 TelegramEventType.TRIP_SUMMARY,
                 TelegramBuiltInTemplates.tripSummaryTemplate(TelegramTemplateLanguage.EN, includeOverall = false),

@@ -56,7 +56,8 @@ data class InfluxPendingHistoryRow(
     val sourcePollId: Long?,
     val sourceKeys: String,
     val observedAt: String,
-    val changedAt: String
+    val changedAt: String,
+    val qualityDetail: String? = null
 )
 
 data class InfluxExportStateSnapshot(

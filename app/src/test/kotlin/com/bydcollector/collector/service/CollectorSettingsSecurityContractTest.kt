@@ -124,6 +124,10 @@ class CollectorSettingsSecurityContractTest {
             "trip_duration" to "00:24:18",
             "trip_energy_kwh" to "3.4",
             "trip_avg_kwh_per_100km" to "27.64",
+            "trip_discharged_kwh" to "4.0",
+            "trip_regenerated_kwh" to "0.6",
+            "trip_net_kwh" to "3.4",
+            "trip_net_kwh_per_100km" to "27.64",
             "soc_start" to "81",
             "soc_end" to "76",
             "total_soc_start" to "84",
@@ -131,11 +135,15 @@ class CollectorSettingsSecurityContractTest {
             "total_distance_km" to "456.7",
             "total_duration" to "12:34:56",
             "total_energy_kwh" to "98.7",
-            "total_avg_kwh_per_100km" to "21.62"
+            "total_avg_kwh_per_100km" to "21.62",
+            "total_discharged_kwh" to "120.0",
+            "total_regenerated_kwh" to "21.3",
+            "total_net_kwh" to "98.7",
+            "total_net_kwh_per_100km" to "21.62"
         )
         val expected = mapOf(
-            TelegramTemplateLanguage.UK to "Поїздку завершено\nПоточна поїздка: 12.3 км / 00:24:18\nПоточна витрата: 3.4 кВт·год (27.64 кВт·год/100 км), SOC: 81% -> 76%\nЗагалом: 456.7 км / 12:34:56\nЗагальна витрата: 98.7 кВт·год (21.62 кВт·год/100 км), SOC: 84% -> 75%",
-            TelegramTemplateLanguage.EN to "Trip complete\nCurrent trip: 12.3 km / 00:24:18\nCurrent energy used: 3.4 kWh (27.64 kWh/100 km), SOC: 81% -> 76%\nTotal: 456.7 km / 12:34:56\nTotal energy used: 98.7 kWh (21.62 kWh/100 km), SOC: 84% -> 75%"
+            TelegramTemplateLanguage.UK to "Поїздку завершено\nПоточна поїздка: 12.3 км / 00:24:18\n\nПоточна статистика.\nВитрачено: 4.0 кВт·год\nРекуперовано: 0.6 кВт·год\nБаланс АКБ: 3.4 кВт·год (27.64 кВт·год/100 км), SOC: 81% -> 76%\nЗагалом: 456.7 км / 12:34:56\n\nЗагальна статистика.\nВитрачено: 120.0 кВт·год\nРекуперовано: 21.3 кВт·год\nБаланс АКБ: 98.7 кВт·год (21.62 кВт·год/100 км), SOC: 84% -> 75%",
+            TelegramTemplateLanguage.EN to "Trip complete\nCurrent trip: 12.3 km / 00:24:18\n\nCurrent statistics.\nUsed: 4.0 kWh\nRecovered: 0.6 kWh\nBattery net: 3.4 kWh (27.64 kWh/100 km), SOC: 81% -> 76%\nTotal: 456.7 km / 12:34:56\n\nTotal statistics.\nUsed: 120.0 kWh\nRecovered: 21.3 kWh\nBattery net: 98.7 kWh (21.62 kWh/100 km), SOC: 84% -> 75%"
         )
 
         expected.forEach { (language, renderedExpected) ->

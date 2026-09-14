@@ -20,6 +20,7 @@ object InfluxLineProtocol {
             add("desc_value=\"${escapeFieldString(row.valueText ?: "")}\"")
             row.sourcePollId?.let { add("source_poll_id=${it}i") }
             add("changed_at=\"${escapeFieldString(row.changedAt)}\"")
+            row.qualityDetail?.let { add("quality_detail=\"${escapeFieldString(it)}\"") }
         }.joinToString(",")
         val baseLine = "$measurement,$tags $fields"
         return timestampNanos(row.observedAt)?.let { timestamp -> "$baseLine $timestamp" } ?: baseLine

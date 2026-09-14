@@ -8,6 +8,7 @@ object HaMqttPayloadBuilder {
     fun categoryState(category: String, timestamp: String, rows: List<StoredNormalizedState>): String {
         val fields = JSONObject()
         val quality = JSONObject()
+        val qualityDetail = JSONObject()
         val observedAt = JSONObject()
         val changedAt = JSONObject()
         val sourcePollId = JSONObject()
@@ -16,6 +17,7 @@ object HaMqttPayloadBuilder {
         rows.forEach { row ->
             fields.put(row.fieldKey, jsonValue(row))
             quality.put(row.fieldKey, row.quality.lowercase(Locale.US))
+            row.qualityDetail?.let { qualityDetail.put(row.fieldKey, it) }
             observedAt.put(row.fieldKey, row.observedAt)
             changedAt.put(row.fieldKey, row.changedAt)
             sourcePollId.put(row.fieldKey, row.sourcePollId ?: JSONObject.NULL)
@@ -27,6 +29,7 @@ object HaMqttPayloadBuilder {
             .put("ts", timestamp)
             .put("fields", fields)
             .put("quality", quality)
+            .put("quality_detail", qualityDetail)
             .put("observed_at", observedAt)
             .put("changed_at", changedAt)
             .put("source_poll_id", sourcePollId)

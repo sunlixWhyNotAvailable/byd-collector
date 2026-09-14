@@ -41,6 +41,7 @@ final class TelemetryWorkerSpool implements AutoCloseable {
     private final long maxBytes;
     private DiagnosticListener diagnostics = NO_DIAGNOSTICS;
     private Footprint capacityBlockedFootprint;
+    private String pendingBootId;
     private boolean closed;
 
     static TelemetryWorkerSpool open() {
@@ -173,11 +174,40 @@ final class TelemetryWorkerSpool implements AutoCloseable {
                 return compareLong(left.sample.identity.pollSequence, right.sample.identity.pollSequence);
             }
         });
-        List<Sample> result = new ArrayList<Sample>(Math.min(limit, records.size()));
-        for (int index = 0; index < records.size() && index < limit; index++) {
-            result.add(records.get(index).sample);
+
+        // Wall time establishes order only between boot epochs. Once a boot is selected,
+        // keep draining it across bounded pending()/ACK batches and use its monotonic clock.
+        // Mixing conditional wall/elapsed comparisons in one comparator would be non-transitive.
+        if (pendingBootId == null || !containsBoot(records, pendingBootId)) {
+            pendingBootId = records.isEmpty() ? null : records.get(0).sample.identity.bootId;
+        }
+        List<PendingRecord> selected = new ArrayList<PendingRecord>();
+        for (PendingRecord record : records) {
+            if (record.sample.identity.bootId.equals(pendingBootId)) selected.add(record);
+        }
+        Collections.sort(selected, new Comparator<PendingRecord>() {
+            @Override public int compare(PendingRecord left, PendingRecord right) {
+                int result = compareLong(left.sample.capturedElapsedMs, right.sample.capturedElapsedMs);
+                if (result != 0) return result;
+                result = left.sample.identity.helperGeneration.compareTo(right.sample.identity.helperGeneration);
+                if (result != 0) return result;
+                result = compareLong(left.sample.identity.pollSequence, right.sample.identity.pollSequence);
+                if (result != 0) return result;
+                return compareLong(left.sample.capturedWallMs, right.sample.capturedWallMs);
+            }
+        });
+        List<Sample> result = new ArrayList<Sample>(Math.min(limit, selected.size()));
+        for (int index = 0; index < selected.size() && index < limit; index++) {
+            result.add(selected.get(index).sample);
         }
         return result;
+    }
+
+    private static boolean containsBoot(List<PendingRecord> records, String bootId) {
+        for (PendingRecord record : records) {
+            if (record.sample.identity.bootId.equals(bootId)) return true;
+        }
+        return false;
     }
 
     synchronized AckResult acknowledge(TelemetryWorkerSampleIdentity identity, long acknowledgedAtMs) {

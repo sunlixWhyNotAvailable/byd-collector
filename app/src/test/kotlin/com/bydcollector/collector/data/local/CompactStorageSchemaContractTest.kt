@@ -75,7 +75,11 @@ class CompactStorageSchemaContractTest {
             assertTrue(imports.contains("poll_id INTEGER NOT NULL UNIQUE"))
             assertTrue(imports.contains("REFERENCES polls(id) ON DELETE CASCADE"))
         }
-        assertTrue(helper.contains("const val DATABASE_VERSION = 9"))
+        assertTrue(helper.contains("const val DATABASE_VERSION = 10"))
+        assertTrue(helper.contains("ensureNormalizedQualityDetails(db)"))
+        listOf(legacy, compact).forEach { schema ->
+            assertEquals(2, Regex("quality_detail TEXT").findAll(schema).count())
+        }
     }
 
     @Test

@@ -1,5 +1,11 @@
 package com.bydcollector.collector.direct
 
+import com.bydcollector.collector.data.energy.EnergyInput
+import com.bydcollector.collector.data.energy.EnergyReceipt
+import com.bydcollector.collector.data.energy.EnergyRuntimeRow
+import com.bydcollector.collector.data.energy.EnergyRuntimeStorage
+import com.bydcollector.collector.data.energy.EnergySessionCoordinator
+import com.bydcollector.collector.data.energy.EnergySnapshot
 import java.io.File
 import java.nio.file.Files
 import java.io.RandomAccessFile
@@ -7,6 +13,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 class TelemetryWorkerSpoolContractTest {
@@ -25,6 +32,105 @@ class TelemetryWorkerSpoolContractTest {
                 assertEquals(listOf(11, null), pending.first().values.map { it.raw })
                 assertEquals("read failed", pending.last().values.last().error)
             }
+        } finally {
+            deleteRecursively(root)
+        }
+    }
+
+    @Test
+    fun sameBootUsesMonotonicCaptureAcrossBackwardWallClockAndHelperRestart() {
+        val root = tempDirectory()
+        try {
+            val earlier = sample("boot-a", "generation-a", 9, wall = 900, elapsed = 100)
+            val laterAfterRestart = sample("boot-a", "generation-b", 1, wall = 100, elapsed = 200)
+            TelemetryWorkerSpool.openForTest(root, TelemetryWorkerSpool.MAX_SPOOL_BYTES).use { spool ->
+                assertEquals(TelemetryWorkerSpool.AppendResult.SUCCESS, spool.append(laterAfterRestart))
+                assertEquals(TelemetryWorkerSpool.AppendResult.SUCCESS, spool.append(earlier))
+
+                val pending = spool.pending(100)
+                assertEquals(listOf(100L, 200L), pending.map { it.capturedElapsedMs })
+                assertEquals(listOf("generation-a", "generation-b"), pending.map { it.identity.helperGeneration })
+                assertEquals(listOf(900L, 100L), pending.map { it.capturedWallMs })
+            }
+        } finally {
+            deleteRecursively(root)
+        }
+    }
+
+    @Test
+    fun bootGroupingAvoidsConditionalComparatorCycle() {
+        val root = tempDirectory()
+        try {
+            // These three records form a cycle under the invalid conditional comparator:
+            // a-late < b by wall, b < a-early by wall, but a-early < a-late by elapsed.
+            val aLate = sample("boot-a", "generation-a", 2, wall = 100, elapsed = 300)
+            val aEarly = sample("boot-a", "generation-a", 1, wall = 400, elapsed = 100)
+            val b = sample("boot-b", "generation-b", 1, wall = 200, elapsed = 50)
+            TelemetryWorkerSpool.openForTest(root, TelemetryWorkerSpool.MAX_SPOOL_BYTES).use { spool ->
+                listOf(aEarly, b, aLate).forEach {
+                    assertEquals(TelemetryWorkerSpool.AppendResult.SUCCESS, spool.append(it))
+                }
+
+                val first = spool.pending(1).single()
+                assertEquals(aEarly.identity, first.identity)
+                assertEquals(TelemetryWorkerSpool.AckStatus.RELEASED, spool.acknowledge(first.identity, 1).status)
+
+                val second = spool.pending(1).single()
+                assertEquals(aLate.identity, second.identity)
+                assertEquals(TelemetryWorkerSpool.AckStatus.RELEASED, spool.acknowledge(second.identity, 2).status)
+                assertEquals(b.identity, spool.pending(1).single().identity)
+            }
+        } finally {
+            deleteRecursively(root)
+        }
+    }
+
+    @Test
+    fun selectedBootStaysPinnedWhenPartialAckChangesRemainingWallOrder() {
+        val root = tempDirectory()
+        try {
+            val aEarly = sample("boot-a", "generation-a", 1, wall = 100, elapsed = 100)
+            val aLate = sample("boot-a", "generation-a", 2, wall = 400, elapsed = 300)
+            val b = sample("boot-b", "generation-b", 1, wall = 200, elapsed = 50)
+            TelemetryWorkerSpool.openForTest(root, TelemetryWorkerSpool.MAX_SPOOL_BYTES).use { spool ->
+                listOf(aLate, b, aEarly).forEach {
+                    assertEquals(TelemetryWorkerSpool.AppendResult.SUCCESS, spool.append(it))
+                }
+
+                val first = spool.pending(1).single()
+                assertEquals(aEarly.identity, first.identity)
+                assertEquals(TelemetryWorkerSpool.AckStatus.RELEASED, spool.acknowledge(first.identity, 1).status)
+
+                // boot-b now has the earlier remaining wall time, but the pinned boot must finish.
+                val second = spool.pending(1).single()
+                assertEquals(aLate.identity, second.identity)
+                assertEquals(TelemetryWorkerSpool.AckStatus.RELEASED, spool.acknowledge(second.identity, 2).status)
+                assertEquals(b.identity, spool.pending(1).single().identity)
+            }
+        } finally {
+            deleteRecursively(root)
+        }
+    }
+
+    @Test
+    fun filesystemReplayWithBackwardWallClockMatchesMonotonicLiveEnergy() {
+        val root = tempDirectory()
+        try {
+            val earlier = energySample("boot-a", "generation-a", 1, wall = 900, elapsed = 1_000, currentA = 10)
+            val later = energySample("boot-a", "generation-a", 2, wall = 100, elapsed = 1_500, currentA = 20)
+            val replayed = TelemetryWorkerSpool.openForTest(root, TelemetryWorkerSpool.MAX_SPOOL_BYTES).use { spool ->
+                assertEquals(TelemetryWorkerSpool.AppendResult.SUCCESS, spool.append(later))
+                assertEquals(TelemetryWorkerSpool.AppendResult.SUCCESS, spool.append(earlier))
+                spool.pending(100)
+            }
+
+            val replaySnapshot = integrateEnergy(replayed)
+            val liveSnapshot = integrateEnergy(listOf(earlier, later))
+            assertEquals(listOf(1_000L, 1_500L), replayed.map { it.capturedElapsedMs })
+            assertEquals(liveSnapshot.dischargedKwh, replaySnapshot.dischargedKwh)
+            assertEquals(liveSnapshot.regeneratedKwh, replaySnapshot.regeneratedKwh)
+            assertEquals(500L, replaySnapshot.energyCoveredMs)
+            assertTrue(assertNotNull(replaySnapshot.dischargedKwh) > 0.0)
         } finally {
             deleteRecursively(root)
         }
@@ -290,6 +396,26 @@ class TelemetryWorkerSpoolContractTest {
     private fun sample(boot: String, generation: String, sequence: Long, wall: Long): TelemetryWorkerSpool.Sample =
         sample(TelemetryWorkerSampleIdentity(boot, generation, sequence), wall)
 
+    private fun sample(
+        boot: String,
+        generation: String,
+        sequence: Long,
+        wall: Long,
+        elapsed: Long
+    ): TelemetryWorkerSpool.Sample = TelemetryWorkerSpool.Sample(
+        TelemetryWorkerSampleIdentity(boot, generation, sequence),
+        "catalog-v1",
+        wall,
+        elapsed,
+        7,
+        0,
+        CollectorHelperProtocol.MODE_NATIVE,
+        true,
+        0,
+        null,
+        listOf(TelemetryWorkerSpool.Value(0, CollectorHelperProtocol.AUTO_TX_INT, 1001, 11, 0, 11, null))
+    )
+
     private fun sample(identity: TelemetryWorkerSampleIdentity, wall: Long): TelemetryWorkerSpool.Sample =
         TelemetryWorkerSpool.Sample(
             identity,
@@ -307,6 +433,69 @@ class TelemetryWorkerSpoolContractTest {
                 TelemetryWorkerSpool.Value(1, CollectorHelperProtocol.AUTO_TX_FLOAT, 1013, 12, -912, null, "read failed")
             )
         )
+
+    private fun energySample(
+        boot: String,
+        generation: String,
+        sequence: Long,
+        wall: Long,
+        elapsed: Long,
+        currentA: Int
+    ): TelemetryWorkerSpool.Sample = TelemetryWorkerSpool.Sample(
+        TelemetryWorkerSampleIdentity(boot, generation, sequence),
+        "catalog-v1",
+        wall,
+        elapsed,
+        7,
+        0,
+        CollectorHelperProtocol.MODE_NATIVE,
+        true,
+        0,
+        null,
+        listOf(TelemetryWorkerSpool.Value(0, CollectorHelperProtocol.AUTO_TX_INT, 1009, 22, 0, currentA, null))
+    )
+
+    private fun integrateEnergy(samples: List<TelemetryWorkerSpool.Sample>): EnergySnapshot {
+        val storage = FakeEnergyStorage()
+        val coordinator = EnergySessionCoordinator(storage)
+        var result: EnergySnapshot? = null
+        samples.forEach { sample ->
+            result = coordinator.process(
+                EnergyReceipt(
+                    sourceIdentity = "helper:${sample.identity}",
+                    observedAt = "2026-09-14T10:00:${sample.identity.pollSequence.toString().padStart(2, '0')}Z",
+                    input = EnergyInput(
+                        bootId = sample.identity.bootId,
+                        elapsedMs = sample.capturedElapsedMs,
+                        voltage = 400.0,
+                        current = sample.values.single().raw!!.toDouble(),
+                        powerOn = true,
+                        gunDisconnected = true,
+                        externalCharging = false
+                    )
+                )
+            ).snapshot
+            assertTrue(coordinator.confirmProjected(assertNotNull(result).snapshotId))
+        }
+        return assertNotNull(result)
+    }
+
+    private class FakeEnergyStorage : EnergyRuntimeStorage {
+        private var row: EnergyRuntimeRow? = null
+
+        override fun readEnergyRuntimeRow(): EnergyRuntimeRow? = row
+
+        override fun commitEnergyRuntimeRow(stateJson: String, pendingProjectionJson: String?, updatedAt: String) {
+            row = EnergyRuntimeRow(stateJson, pendingProjectionJson, updatedAt)
+        }
+
+        override fun clearEnergyPending(expectedPendingJson: String, updatedAt: String): Boolean {
+            val current = row ?: return false
+            if (current.pendingProjectionJson != expectedPendingJson) return false
+            row = current.copy(pendingProjectionJson = null, updatedAt = updatedAt)
+            return true
+        }
+    }
 
     private fun tempDirectory(): File = Files.createTempDirectory("telemetry-worker-spool").toFile()
 

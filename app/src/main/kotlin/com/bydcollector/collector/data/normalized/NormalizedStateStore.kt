@@ -83,7 +83,7 @@ class NormalizedStateStore(
         db.rawQuery(
             """
             SELECT field_key, category, value_type, value_text, value_number, value_bool,
-                quality, unit, source_poll_id, source_keys, observed_at, changed_at
+                quality, unit, source_poll_id, source_keys, observed_at, changed_at, quality_detail
             FROM vehicle_state_current
             $where
             ORDER BY category, field_key
@@ -177,7 +177,8 @@ class NormalizedStateStore(
             sourcePollId = sourcePollId,
             sourceKeys = field.sourceKeys.joinToString(","),
             observedAt = observedAt,
-            changedAt = observedAt
+            changedAt = observedAt,
+            qualityDetail = reason
         )
     }
 
@@ -185,7 +186,7 @@ class NormalizedStateStore(
         db.rawQuery(
             """
             SELECT field_key, category, value_type, value_text, value_number, value_bool,
-                quality, unit, source_poll_id, source_keys, observed_at, changed_at
+                quality, unit, source_poll_id, source_keys, observed_at, changed_at, quality_detail
             FROM vehicle_state_current
             WHERE field_key = ?
             LIMIT 1
@@ -227,6 +228,7 @@ class NormalizedStateStore(
                 false -> put("value_bool", 0)
             }
             put("quality_code", NormalizedQuality.valueOf(quality).storageCode)
+            put("quality_detail", qualityDetail)
             if (sourcePollId == null) putNull("source_poll_id") else put("source_poll_id", sourcePollId)
             put("observed_at_ms", normalizedEpochMillis(observedAt))
             put("changed_at_ms", normalizedEpochMillis(changedAt))
@@ -298,6 +300,7 @@ class NormalizedStateStore(
                 false -> put("value_bool", 0)
             }
             put("quality", quality)
+            put("quality_detail", qualityDetail)
             put("unit", unit)
             if (sourcePollId == null) putNull("source_poll_id") else put("source_poll_id", sourcePollId)
             put("source_keys", sourceKeys)
@@ -319,7 +322,8 @@ class NormalizedStateStore(
             sourcePollId = getLongOrNull(8),
             sourceKeys = getString(9),
             observedAt = getString(10),
-            changedAt = getString(11)
+            changedAt = getString(11),
+            qualityDetail = getStringOrNull(12)
         )
     }
 

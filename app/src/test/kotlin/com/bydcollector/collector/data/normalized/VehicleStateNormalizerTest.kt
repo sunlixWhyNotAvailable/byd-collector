@@ -572,8 +572,8 @@ class VehicleStateNormalizerTest {
     fun catalogVersionAndExpansionWaveExposeRepresentativeFields() {
         val fieldsByKey = NormalizedFieldCatalog.fields.associateBy { it.fieldKey }
 
-        assertEquals("normalized-direct-v14-20260908-telemetry", NormalizedFieldCatalog.CATALOG_VERSION)
-        assertEquals(102, NormalizedFieldCatalog.fields.size)
+        assertEquals("normalized-direct-v15-20260914-energy", NormalizedFieldCatalog.CATALOG_VERSION)
+        assertEquals(105, NormalizedFieldCatalog.fields.size)
         assertFalse(fieldsByKey.containsKey("charging_state"))
         assertEquals(emptyList(), NormalizedFieldCatalog.fields.filter { field ->
             field.sourceKeys.any {

@@ -30,7 +30,9 @@ internal fun sanitizeDiagnosticSnapshot(snapshot: File): String {
         .sortedBy { it.relativeTo(snapshot).invariantSeparatorsPath }.toList()
     files.forEach { file ->
         val name = file.relativeTo(snapshot).invariantSeparatorsPath
-        if (file.extension !in setOf("txt", "log", "jsonl")) {
+        val unrotatedName = file.name.replace(Regex("\\.[1-3]$"), "")
+        val format = unrotatedName.substringAfterLast('.', "")
+        if (format !in setOf("txt", "log", "jsonl", "json")) {
             check(file.delete()) { "Cannot omit unsupported diagnostic component" }
             reports += "file=$name status=omitted reason=unsupported_type"
             partial = true
@@ -65,7 +67,7 @@ internal fun sanitizeDiagnosticSnapshot(snapshot: File): String {
                     }
                     if (capReached) return@forEachDiagnosticRecord
                     val sanitized = runCatching {
-                        if (file.extension == "jsonl" && text.isNotBlank()) sanitizer.sanitizeJsonLine(text)
+                        if (format in setOf("jsonl", "json") && text.isNotBlank()) sanitizer.sanitizeJsonLine(text)
                         else sanitizer.sanitizeText(text)
                     }.getOrElse {
                         omitted += 1

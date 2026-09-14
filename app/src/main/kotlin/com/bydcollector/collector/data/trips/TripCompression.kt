@@ -69,12 +69,14 @@ internal class TripCompression(
             val sessions = snapshotStore.allSessions()
             sessions.forEach { session ->
                 checkReserve()
-                candidateStore.upsertSession(session)
+                candidateStore.copySessionFrom(snapshotStore, session.tripId)
                 candidateStore.copyRouteFrom(snapshotStore, session.tripId, compress = session.state == TripSession.STATE_CLOSED, beforeWrite = ::checkReserve)
             }
+            candidateStore.replaceEnergyRuntimeRow(snapshotStore.readEnergyRuntimeRow())
             onPhase(TripCompressionPhase.CANDIDATE_BUILT)
             onStep(2)
             check(sameSessions(snapshotStore, candidateStore)) { "Trip sessions changed during compression" }
+            check(sameEnergyRuntime(snapshotStore, candidateStore)) { "Energy runtime state changed during compression" }
             sessions.forEach { session ->
                 checkInterrupted()
                 check(sameRoute(snapshotStore, candidateStore, session.tripId)) { "Route equality verification failed" }
@@ -91,15 +93,19 @@ internal class TripCompression(
                     val changed = store.changedTripSequences()
                     changed.forEach { (tripId, firstSequence) ->
                         checkInterrupted()
-                        val session = checkNotNull(store.session(tripId)) { "Changed trip disappeared" }
-                        candidateStore.upsertSession(session)
+                        candidateStore.copySessionFrom(store, tripId)
                         if (firstSequence != null) {
                             candidateStore.copyRouteTailFrom(store, tripId, firstSequence, beforeWrite = ::checkReserve)
                             check(sameRoute(store, candidateStore, tripId, firstSequence)) { "Trip tail verification failed" }
                         }
                     }
+                    // The singleton can change independently of visible Trips while the
+                    // candidate is built, so refresh it under the final source lease.
+                    candidateStore.replaceEnergyRuntimeRow(store.readEnergyRuntimeRow())
                     check(sameSessions(store, candidateStore)) { "Concurrent trip state was not preserved" }
+                    check(sameEnergyRuntime(store, candidateStore)) { "Concurrent energy runtime state was not preserved" }
                     val expectedCount = candidateStore.sessionCount()
+                    val expectedEnergyRuntime = candidateStore.readEnergyRuntimeRow()
                     candidateStore.checkpointTruncate()
                     candidateStore.closeDatabase()
                     store.checkpointTruncate()
@@ -109,7 +115,7 @@ internal class TripCompression(
                     if (after >= before) {
                         TripCompressionResult(before, before)
                     } else {
-                        replaceVerified(files, expectedCount)
+                        replaceVerified(files, expectedCount, expectedEnergyRuntime)
                         TripCompressionResult(before, after)
                     }
                 }
@@ -131,7 +137,11 @@ internal class TripCompression(
         }
     }
 
-    private fun replaceVerified(files: Files, expectedSessions: Long) {
+    private fun replaceVerified(
+        files: Files,
+        expectedSessions: Long,
+        expectedEnergyRuntime: com.bydcollector.collector.data.energy.EnergyRuntimeRow?
+    ) {
         store.closeForReplacement()
         try {
             prepareClosedDatabaseForMove(files.active)
@@ -145,7 +155,11 @@ internal class TripCompression(
             onPhase(TripCompressionPhase.CANDIDATE_MOVED)
             store.reopenDatabase()
             // Full equality/quick_check already ran off-lease. Keep this barrier small.
-            check(store.schemaVersion() == TripDatabaseHelper.DATABASE_VERSION && store.sessionCount() == expectedSessions) {
+            check(
+                store.schemaVersion() == TripDatabaseHelper.DATABASE_VERSION &&
+                    store.sessionCount() == expectedSessions &&
+                    store.readEnergyRuntimeRow() == expectedEnergyRuntime
+            ) {
                 "Compressed Trips reopen verification failed"
             }
             writePhase(files, COMMITTED)
@@ -316,6 +330,9 @@ internal class TripCompression(
 
         private fun sameSessions(left: TripStore, right: TripStore): Boolean =
             left.allSessions().sortedBy { it.tripId } == right.allSessions().sortedBy { it.tripId }
+
+        private fun sameEnergyRuntime(left: TripStore, right: TripStore): Boolean =
+            left.readEnergyRuntimeRow() == right.readEnergyRuntimeRow()
 
         private fun sameRoute(left: TripStore, right: TripStore, tripId: String, firstSequence: Long = 0L): Boolean =
             routeDigest(left, tripId, firstSequence).contentEquals(routeDigest(right, tripId, firstSequence))

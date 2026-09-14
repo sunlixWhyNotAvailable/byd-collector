@@ -747,7 +747,7 @@ class TelemetryStore(
             SELECT history.id, field.field_key, field.category, field.value_type,
                    history.value_text, history.value_number, history.value_bool,
                    history.quality_code, NULLIF(field.unit, ''), history.source_poll_id,
-                   field.source_keys, history.observed_at_ms, history.changed_at_ms
+                   field.source_keys, history.observed_at_ms, history.changed_at_ms, history.quality_detail
             FROM vehicle_state_history AS history
             INNER JOIN normalized_history_field_catalog AS field ON field.id = history.field_id
             INNER JOIN influx_export_cursor AS export_cursor
@@ -762,7 +762,7 @@ class TelemetryStore(
             SELECT history.id, history.field_key, history.category, history.value_type,
                    history.value_text, history.value_number, history.value_bool,
                    history.quality, history.unit, history.source_poll_id,
-                   history.source_keys, history.observed_at, history.changed_at
+                   history.source_keys, history.observed_at, history.changed_at, history.quality_detail
             FROM vehicle_state_history AS history
             INNER JOIN influx_export_cursor AS export_cursor
                     ON export_cursor.field_key = history.field_key
@@ -796,7 +796,8 @@ class TelemetryStore(
                             sourcePollId = if (cursor.isNull(9)) null else cursor.getLong(9),
                             sourceKeys = cursor.getString(10),
                             observedAt = if (compactV2) normalizedIsoTime(cursor.getLong(11)) else cursor.getString(11),
-                            changedAt = if (compactV2) normalizedIsoTime(cursor.getLong(12)) else cursor.getString(12)
+                            changedAt = if (compactV2) normalizedIsoTime(cursor.getLong(12)) else cursor.getString(12),
+                            qualityDetail = cursor.getNullableString(13)
                         )
                     )
                 }

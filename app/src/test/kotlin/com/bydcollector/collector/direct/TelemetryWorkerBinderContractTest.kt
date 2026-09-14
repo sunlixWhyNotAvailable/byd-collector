@@ -21,7 +21,7 @@ class TelemetryWorkerBinderContractTest {
         val stopClient = client.substringAfter("fun requestStop(ownerMode: DirectHelperOwnerMode)")
             .substringBefore("private fun readWorkerSample")
 
-        assertEquals(8, CollectorHelperProtocol.PROTOCOL_VERSION)
+        assertEquals(9, CollectorHelperProtocol.PROTOCOL_VERSION)
         assertEquals("spool", CollectorHelperProtocol.SPOOL_MODE_ARG)
         assertEquals(100, CollectorHelperProtocol.MAX_PENDING_WORKER_SAMPLES)
         assertEquals(128, CollectorHelperProtocol.MAX_WORKER_FIELD_COUNT)

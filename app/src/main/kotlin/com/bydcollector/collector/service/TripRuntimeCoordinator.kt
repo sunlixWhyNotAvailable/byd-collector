@@ -11,6 +11,8 @@ import com.bydcollector.collector.data.trips.TripMetrics
 import com.bydcollector.collector.data.trips.TripSession
 import com.bydcollector.collector.data.trips.TripStore
 import com.bydcollector.collector.data.trips.TripTime
+import com.bydcollector.collector.data.energy.EnergySnapshot
+import com.bydcollector.collector.data.trips.withEnergySnapshot
 import com.bydcollector.collector.location.AndroidGpsLocationSource
 import com.bydcollector.collector.location.GpsLocationSample
 import com.bydcollector.collector.location.GpsLocationSink
@@ -28,7 +30,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 data class ConfirmedPowerOff(
     val observedAt: String,
     val session: TripSession?,
-    val lastLocation: GpsLocationSample?
+    val lastLocation: GpsLocationSample?,
+    val energySnapshot: EnergySnapshot? = null
 )
 
 /** Serializes power-session, route, and normalized-location writes behind one owner. */
@@ -94,10 +97,11 @@ class TripRuntimeCoordinator(
         readings: List<PollReading>,
         observations: List<NormalizedObservation>,
         liveTelemetry: Boolean,
-        diagnosticPowerSession: CompletableFuture<String?>? = null
+        diagnosticPowerSession: CompletableFuture<String?>? = null,
+        energySnapshot: EnergySnapshot? = null
     ) {
         val receivedElapsedMs = elapsedRealtimeMs()
-        val snapshot = computeTelemetrySnapshot(observations, receivedElapsedMs)
+        val snapshot = computeTelemetrySnapshot(observations, receivedElapsedMs).copy(energy = energySnapshot)
         if (liveTelemetry) vehicleSpeedReference.observe(snapshot.speedKmh, receivedElapsedMs)
         dispatch(onDropped = { diagnosticPowerSession?.complete(null) }) {
             try {
@@ -192,10 +196,10 @@ class TripRuntimeCoordinator(
             if (session == null) {
                 val startEnergy = snapshot.tripEnergyKwh?.takeIf { it.isFinite() && it >= 0.0 }
                 session = TripSession(
-                    tripId = TripId.forPowerSession(bootId, snapshot.receivedElapsedMs),
-                    startedAt = timestamp,
-                    startElapsedMs = snapshot.receivedElapsedMs,
-                    startBootId = bootId,
+                    tripId = snapshot.energy?.powerSessionId ?: TripId.forPowerSession(bootId, snapshot.receivedElapsedMs),
+                    startedAt = snapshot.energy?.startedAt ?: timestamp,
+                    startElapsedMs = snapshot.energy?.sourceElapsedMs ?: snapshot.receivedElapsedMs,
+                    startBootId = snapshot.energy?.sourceBootId ?: bootId,
                     startSegmentId = segmentId,
                     startSoc = snapshot.soc,
                     endSoc = snapshot.soc,
@@ -204,7 +208,7 @@ class TripRuntimeCoordinator(
                     startTripEnergyKwh = startEnergy,
                     lastTripEnergyKwh = startEnergy,
                     energyKwh = startEnergy?.let { 0.0 }
-                ).also(tripStore::upsertSession)
+                ).let { trip -> snapshot.energy?.let(trip::withEnergySnapshot) ?: trip }.also(tripStore::upsertSession)
                 nextRouteSequence = 0L
                 recordEvent("power_trip_started", "Vehicle power session started", "trip_id=${session?.tripId}")
             } else if (session?.startSegmentId != segmentId) {
@@ -256,7 +260,7 @@ class TripRuntimeCoordinator(
             energyKwh = energy,
             averageConsumptionKwhPer100Km = TripMetrics.averageConsumptionKwhPer100Km(energy, distance),
             quality = quality
-        ).also(tripStore::upsertSession)
+        ).let { trip -> snapshot.energy?.let(trip::withEnergySnapshot) ?: trip }.also(tripStore::upsertSession)
     }
 
     private fun handlePowerOff(
@@ -277,15 +281,15 @@ class TripRuntimeCoordinator(
         // Resolve before the existing Telegram-owner handoff; diagnostics must never wait for it.
         diagnosticPowerSession?.complete(current?.tripId)
         val deliverAfterClose = prepareConfirmedPowerOff(
-            ConfirmedPowerOff(timestamp, current, trustedLocation)
+            ConfirmedPowerOff(timestamp, current, trustedLocation, snapshot.energy)
         )
         val closed = current?.let { current ->
             markLastRoutePointFinal(current.tripId)
             current.copy(
                 state = TripSession.STATE_CLOSED,
                 endedAt = timestamp,
-                endElapsedMs = snapshot.receivedElapsedMs,
-                endBootId = bootId,
+                endElapsedMs = snapshot.energy?.sourceElapsedMs ?: snapshot.receivedElapsedMs,
+                endBootId = snapshot.energy?.sourceBootId ?: bootId,
                 endSegmentId = segmentId,
                 termination = "power_off"
             ).also(tripStore::upsertSession)
@@ -453,7 +457,8 @@ class TripRuntimeCoordinator(
         val tripEnergyKwh: Double?,
         val speedKmh: Double?,
         val batteryPowerKw: Double?,
-        val receivedElapsedMs: Long
+        val receivedElapsedMs: Long,
+        val energy: EnergySnapshot? = null
     )
 
     companion object {

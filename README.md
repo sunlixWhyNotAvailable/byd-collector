@@ -61,6 +61,8 @@ Use `Stop` when collection is no longer needed. Background collection and its ve
 
 `All data` is intended for research and diagnostics. It can run independently once the main collection service is available.
 
+Its compact vehicle-status cards include the remaining percentage for all three perfume slots. A valid zero is shown as zero; unavailable readings stay distinct.
+
 - Reads a research catalog of 23,083 read-only signatures.
 - Saves raw values, descriptions, data quality, and changes in a separate database.
 - Helps identify changing fields, but a changing value alone does not prove what the field means.
@@ -72,6 +74,10 @@ This collection can use substantial storage. Stop it after your research session
 ## Trips and routes
 
 The `Trips` tab keeps sessions from vehicle power-on to power-off in a separate local database. It stores trip summaries and GPS routes rather than duplicating all telemetry. Sessions without movement are hidden from the ordinary list.
+
+The table separates battery energy used, energy recovered during driving, and signed battery net (used minus recovered). Average consumption uses that net balance and may be negative. These calculated values are also available in the Battery category for MQTT and InfluxDB. Missing readings are not filled with assumed power; incomplete coverage is marked partial. Older trips are not automatically recalculated, and missing new values show a dash.
+
+`Current trip`, beside route compression, opens the active session's metrics and map. It refreshes while visible without resetting your map position or zoom. Metrics remain available without GPS; an active trip has no Finish marker. When it ends, the same trip stays open for inspection.
 
 Route recording requires Android location access. If you decline the first-run request, grant access later in Android settings. Untrusted GPS readings—including implausible jumps or speeds—are excluded from the displayed route. Loss of reception or rejected readings can leave gaps; the app does not draw a connecting line across rejected points.
 
@@ -131,7 +137,7 @@ Charging reports can include SOC, energy, power, local event time (`dd.MM.yyyy H
 
 - A driving segment ends after the vehicle stays in `P` for the configured delay: 5–300 seconds, 10 seconds by default. A shorter stop remains part of the same segment.
 - The first valid vehicle power-off reading triggers an immediate send attempt without waiting for the parking delay. Delivery still depends on connectivity.
-- The current-trip section shows that drive's distance, duration, energy, average consumption, and start/end SOC. Overall totals cover the vehicle's current power-on session; Overall SOC runs from the first drive to the latest reading, including parked consumption.
+- Current statistics show that drive's energy used, recovered energy, and battery net with net-based average consumption and start/end SOC. Total statistics use the power-on session, including parked consumption; Overall SOC runs from the first drive to the latest reading. Partial energy is marked explicitly. Recognized default templates update automatically; custom text and legacy energy variables retain their meaning.
 - The Overall block is omitted when it duplicates the only trip. Different totals or parked SOC changes keep it visible.
 - A summary requires at least a 1% SOC change, more than 0.1 km, or more than 0.1 kWh.
 
@@ -187,6 +193,8 @@ Archiving can temporarily stop collection and integrations. Read the confirmatio
 
 These controls restore Android services and connections; they do not send vehicle-control commands.
 
+The autonomous telemetry helper asks Android to keep the CPU awake while it is running, including with the screen off. If that request fails, collection continues without this protection. It does not prevent Android from killing the process or the vehicle from rebooting; its effect on parked-car operation still needs vehicle validation.
+
 Automatic update checking starts after a short startup delay and can run while the app operates in the background. When Collector is visible, an available update is offered inside the app. Closing an update offer pauses automatic checks for an hour, or until a new app session. Manual checking remains available and always checks the latest published release.
 
 `New version hint widget` is enabled by default. When a background check finds an update, it can show a hint above other apps for 10 seconds. Tap it to open `Options` and the saved update offer, or close it with the X. Returning to Collector removes its hint without repeating the check; minimizing the app does not replay an old hint. The settings button beside the switch adjusts size, transparency, corners, and frame/stripe color; the default accent is green.
@@ -200,6 +208,8 @@ The hint requires Android's permission to display over other apps. Without that 
 The app keeps a local operational event log, separate from telemetry databases. For a reproducible problem, use `Start logcat` under `Options -> Keep alive`, reproduce the issue, then stop recording. Full-system recording requires ADB authorization and is limited to 128 MiB; the regular event log is limited to 8 MiB.
 
 `Share logs` prepares a fresh ZIP and opens Android's share chooser with just the file. It includes app/device information, recent operational events, available system and background-service logs, and diagnostic summaries for InfluxDB, trips, and Telegram. Missing sources are reported without blocking the rest of the archive. Telemetry and Telegram databases are not included. ZIP preparation needs additional free space; a failure preserves existing logs and the previous valid bundle.
+
+The bundle also includes available telemetry-helper startup logs and a summary of buffered telemetry occupancy, imports, and released space. These diagnostic logs are bounded and can be cleared without deleting unimported telemetry or resetting the current occupancy summary.
 
 `Clear logs` asks for confirmation, removes completed captures and generated bundles, and resets the event log without stopping an active logcat recording. Unavailable background-service logs may result in partial cleanup. A recently shared copy can remain temporarily so the receiving app can finish reading it. Database archives, trip history, and pending Telegram messages are not cleared.
 

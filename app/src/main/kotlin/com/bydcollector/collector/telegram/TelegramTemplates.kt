@@ -63,8 +63,22 @@ object TelegramBuiltInTemplates {
     const val TELEMETRY_UNAVAILABLE_UK = "Телеметрія недоступна\nОстанні дані: {last_data_time}\nПомилка: {error}"
     const val TELEMETRY_UNAVAILABLE_EN = "Telemetry unavailable\nLast data: {last_data_time}\nError: {error}"
     const val TRIP_SUMMARY_UK =
-        "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\nПоточна витрата: {trip_energy_kwh} кВт·год ({trip_avg_kwh_per_100km} кВт·год/100 км), SOC: {soc_start}% -> {soc_end}%\nЗагалом: {total_distance_km} км / {total_duration}\nЗагальна витрата: {total_energy_kwh} кВт·год ({total_avg_kwh_per_100km} кВт·год/100 км), SOC: {total_soc_start}% -> {total_soc_end}%"
+        "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\n\n" +
+            "Поточна статистика.\nВитрачено: {trip_discharged_kwh} кВт·год\nРекуперовано: {trip_regenerated_kwh} кВт·год\n" +
+            "Баланс АКБ: {trip_net_kwh} кВт·год ({trip_net_kwh_per_100km} кВт·год/100 км), SOC: {soc_start}% -> {soc_end}%\n" +
+            "Загалом: {total_distance_km} км / {total_duration}\n\n" +
+            "Загальна статистика.\nВитрачено: {total_discharged_kwh} кВт·год\nРекуперовано: {total_regenerated_kwh} кВт·год\n" +
+            "Баланс АКБ: {total_net_kwh} кВт·год ({total_net_kwh_per_100km} кВт·год/100 км), SOC: {total_soc_start}% -> {total_soc_end}%"
     const val TRIP_SUMMARY_EN =
+        "Trip complete\nCurrent trip: {trip_distance_km} km / {trip_duration}\n\n" +
+            "Current statistics.\nUsed: {trip_discharged_kwh} kWh\nRecovered: {trip_regenerated_kwh} kWh\n" +
+            "Battery net: {trip_net_kwh} kWh ({trip_net_kwh_per_100km} kWh/100 km), SOC: {soc_start}% -> {soc_end}%\n" +
+            "Total: {total_distance_km} km / {total_duration}\n\n" +
+            "Total statistics.\nUsed: {total_discharged_kwh} kWh\nRecovered: {total_regenerated_kwh} kWh\n" +
+            "Battery net: {total_net_kwh} kWh ({total_net_kwh_per_100km} kWh/100 km), SOC: {total_soc_start}% -> {total_soc_end}%"
+    private const val HISTORIC_TRIP_SUMMARY_AVERAGE_UK =
+        "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\nПоточна витрата: {trip_energy_kwh} кВт·год ({trip_avg_kwh_per_100km} кВт·год/100 км), SOC: {soc_start}% -> {soc_end}%\nЗагалом: {total_distance_km} км / {total_duration}\nЗагальна витрата: {total_energy_kwh} кВт·год ({total_avg_kwh_per_100km} кВт·год/100 км), SOC: {total_soc_start}% -> {total_soc_end}%"
+    private const val HISTORIC_TRIP_SUMMARY_AVERAGE_EN =
         "Trip complete\nCurrent trip: {trip_distance_km} km / {trip_duration}\nCurrent energy used: {trip_energy_kwh} kWh ({trip_avg_kwh_per_100km} kWh/100 km), SOC: {soc_start}% -> {soc_end}%\nTotal: {total_distance_km} km / {total_duration}\nTotal energy used: {total_energy_kwh} kWh ({total_avg_kwh_per_100km} kWh/100 km), SOC: {total_soc_start}% -> {total_soc_end}%"
     private const val HISTORIC_TRIP_SUMMARY_SAME_SOC_UK =
         "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\nВитрата: {trip_energy_kwh} кВт·год, SOC: {soc_start}% -> {soc_end}%\nЗагалом: {total_distance_km} км / {total_duration}\nВитрата: {total_energy_kwh} кВт·год, SOC: {soc_start}% -> {soc_end}%"
@@ -126,12 +140,14 @@ object TelegramBuiltInTemplates {
         ),
         TelegramEventType.TRIP_SUMMARY to mapOf(
             TelegramTemplateLanguage.UK to setOf(
+                HISTORIC_TRIP_SUMMARY_AVERAGE_UK,
                 HISTORIC_TRIP_SUMMARY_UK,
                 "Поїздку завершено\nВідстань: {trip_distance_km} км за {trip_duration}\nSOC: {soc_start}% -> {soc_end}%\nЕнергія: {trip_energy_kwh} кВт·год",
                 "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\nВитрата: {trip_energy_kwh} кВт·год, SOC: {soc_start}% -> {soc_end}%\nЗагалом: {total_distance_km} км / {total_duration}\nВитрата: {total_energy_kwh} кВт·год",
                 HISTORIC_TRIP_SUMMARY_SAME_SOC_UK
             ),
             TelegramTemplateLanguage.EN to setOf(
+                HISTORIC_TRIP_SUMMARY_AVERAGE_EN,
                 HISTORIC_TRIP_SUMMARY_EN,
                 "Trip complete\nDistance: {trip_distance_km} km in {trip_duration}\nSOC: {soc_start}% -> {soc_end}%\nEnergy: {trip_energy_kwh} kWh",
                 "Trip complete: {trip_distance_km} km, {trip_energy_kwh} kWh at {time}.",
@@ -175,13 +191,10 @@ object TelegramBuiltInTemplates {
         current.getValue(type).getValue(language)
 
     fun tripSummaryTemplate(language: TelegramTemplateLanguage, includeOverall: Boolean): String {
-        if (includeOverall) return defaultTemplate(TelegramEventType.TRIP_SUMMARY, language)
-        return when (language) {
-            TelegramTemplateLanguage.UK ->
-                "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\nПоточна витрата: {trip_energy_kwh} кВт·год ({trip_avg_kwh_per_100km} кВт·год/100 км), SOC: {soc_start}% -> {soc_end}%"
-            TelegramTemplateLanguage.EN ->
-                "Trip complete\nCurrent trip: {trip_distance_km} km / {trip_duration}\nCurrent energy used: {trip_energy_kwh} kWh ({trip_avg_kwh_per_100km} kWh/100 km), SOC: {soc_start}% -> {soc_end}%"
-        }
+        val full = defaultTemplate(TelegramEventType.TRIP_SUMMARY, language)
+        return if (includeOverall) full else full.substringBefore(
+            if (language == TelegramTemplateLanguage.UK) "\nЗагалом:" else "\nTotal:"
+        )
     }
 
     fun classify(type: TelegramEventType, template: String): TelegramBuiltInTemplateMatch? {
@@ -292,6 +305,10 @@ object TelegramTemplateCatalog {
                 "trip_distance_km",
                 "trip_energy_kwh",
                 "trip_avg_kwh_per_100km",
+                "trip_discharged_kwh",
+                "trip_regenerated_kwh",
+                "trip_net_kwh",
+                "trip_net_kwh_per_100km",
                 "trip_duration",
                 "soc_start",
                 "soc_end",
@@ -300,6 +317,10 @@ object TelegramTemplateCatalog {
                 "total_distance_km",
                 "total_energy_kwh",
                 "total_avg_kwh_per_100km",
+                "total_discharged_kwh",
+                "total_regenerated_kwh",
+                "total_net_kwh",
+                "total_net_kwh_per_100km",
                 "total_duration",
                 "time"
             )

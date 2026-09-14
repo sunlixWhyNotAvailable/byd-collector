@@ -6,6 +6,7 @@ import com.bydcollector.collector.data.local.TelegramOutboxEntry
 import com.bydcollector.collector.data.local.TelegramOutboxMessage
 import com.bydcollector.collector.diagnostics.diagnosticSha256
 import com.bydcollector.collector.data.normalized.NormalizedObservation
+import com.bydcollector.collector.data.energy.EnergySnapshot
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.service.TelegramDetectedEvent
 import com.bydcollector.collector.service.TelegramEventConfig
@@ -28,7 +29,8 @@ class TelegramCoordinator(
     private val settings: CollectorSettings,
     private val client: TelegramHttpClient = TelegramHttpClient(),
     private val retryPolicy: TelegramRetryPolicy = TelegramRetryPolicy(),
-    private val nowMs: () -> Long = System::currentTimeMillis
+    private val nowMs: () -> Long = System::currentTimeMillis,
+    private val currentEnergySnapshot: () -> EnergySnapshot? = { null }
 ) {
     private var engine = TelegramEventEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
     private var enabledRuntimeStartedAtMs: Long? = null
@@ -47,14 +49,15 @@ class TelegramCoordinator(
 
     fun onSuccessfulPoll(
         observations: List<NormalizedObservation>,
+        energySnapshot: EnergySnapshot? = null,
         onDiagnosticLegStarted: ((String) -> Unit)? = null
     ): Long? {
         activateEnabledRuntime() ?: return null
-        val startupDeadline = ensureStartupRecovery()
+        val startupDeadline = ensureStartupRecovery(energySnapshot)
         val previousChargingActive = engine.state.chargingActive
         val previousBmsConflict = engine.state.bmsFinishHighPowerConflictActive
         val previousTripId = engine.state.tripId
-        val result = engine.onSuccessfulPoll(observations, eventConfig(), nowMs())
+        val result = engine.onSuccessfulPoll(observations, eventConfig(), nowMs(), energySnapshot)
         val committed = handle(result)
         // Only a leg created by this poll has a proven relation to this poll's Trips session.
         // Restored active/pending legs without metadata remain explicitly unlinked.
@@ -131,7 +134,7 @@ class TelegramCoordinator(
         location: TelegramLocationSnapshot? = null
     ): TelegramPowerOffPreparation? {
         activateEnabledRuntime() ?: return null
-        val recovered = recoverStartupLocally()
+        val recovered = recoverStartupLocally(snapshot.energySnapshot)
         val pendingSummaryKey = engine.state.pendingPowerOffLocationTripId
             ?.takeIf { !engine.state.pendingPowerOffLocationSummaryDelivered }
             ?.let { "$it:summary" }
@@ -266,14 +269,15 @@ class TelegramCoordinator(
         )
     }
 
-    private fun ensureStartupRecovery(): Long? {
-        val recovered = recoverStartupLocally() ?: return null
+    private fun ensureStartupRecovery(energySnapshot: EnergySnapshot? = null): Long? {
+        val recovered = recoverStartupLocally(energySnapshot) ?: return null
         return nextWakeAt(recovered.nextWakeAtMs, delivery.recover("startup"))
     }
 
-    private fun recoverStartupLocally(): TelegramEventResult? {
+    private fun recoverStartupLocally(energySnapshot: EnergySnapshot? = null): TelegramEventResult? {
         if (!startupRecoveryPending) return null
-        val recovered = engine.recoverPendingTrip(eventConfig(), nowMs())
+        val durableEnergySnapshot = energySnapshot ?: runCatching(currentEnergySnapshot).getOrNull()
+        val recovered = engine.recoverPendingTrip(eventConfig(), nowMs(), durableEnergySnapshot)
         check(handle(recovered)) { "Telegram recovery batch could not be rendered atomically" }
         startupRecoveryPending = false
         return recovered

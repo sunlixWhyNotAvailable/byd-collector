@@ -26,6 +26,7 @@ class TelemetryDatabaseHelper(
         executeSqlAsset(db, if (compactV2) COMPACT_SCHEMA_ASSET else LEGACY_SCHEMA_ASSET)
         createCollectorEvents(db)
         if (!compactV2) ensureLegacySchemaCompatibility(db)
+        ensureNormalizedQualityDetails(db)
     }
 
     override fun onDowngrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -85,6 +86,13 @@ class TelemetryDatabaseHelper(
         ).use { cursor ->
             check(cursor.moveToFirst()) { "Compact storage marker is missing" }
             return cursor.getInt(0)
+        }
+    }
+
+    private fun ensureNormalizedQualityDetails(db: SQLiteDatabase) {
+        // Additive metadata avoids rewriting historical telemetry just to describe partial coverage.
+        listOf("vehicle_state_current", "vehicle_state_history").forEach { table ->
+            ensureColumns(db, table, mapOf("quality_detail" to "TEXT"))
         }
     }
 
@@ -418,7 +426,7 @@ class TelemetryDatabaseHelper(
 
     companion object {
         val DATABASE_NAME: String = BuildConfig.COLLECTOR_DATABASE_NAME
-        const val DATABASE_VERSION = 9
+        const val DATABASE_VERSION = 10
         const val LEGACY_SCHEMA_ASSET = "schema.sql"
         const val COMPACT_SCHEMA_ASSET = "schema_v2.sql"
         const val LEGACY_STORAGE_FORMAT = 1

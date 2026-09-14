@@ -12,7 +12,8 @@ data class StoredNormalizedState(
     val sourcePollId: Long?,
     val sourceKeys: String,
     val observedAt: String,
-    val changedAt: String
+    val changedAt: String,
+    val qualityDetail: String? = null
 ) {
     fun semanticSignature(): String {
         return listOf(
@@ -20,7 +21,8 @@ data class StoredNormalizedState(
             valueText ?: "null",
             valueNumber?.toString() ?: "null",
             valueBool?.toString() ?: "null",
-            quality
+            quality,
+            qualityDetail
         ).joinToString("|")
     }
 }

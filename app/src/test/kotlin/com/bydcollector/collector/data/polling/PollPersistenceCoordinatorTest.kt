@@ -8,10 +8,62 @@ import com.bydcollector.collector.data.remote.TelemetryClient
 import com.bydcollector.collector.data.remote.TelemetryReadResult
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 class PollPersistenceCoordinatorTest {
+    @Test
+    fun failedPollNotifiesOnlyFailureObserverAfterRawPollIsInserted() {
+        val clock = FakeClock(now = "2026-09-14T10:00:00Z")
+        val store = FakePollStorage(onInsert = { clock.elapsed = 9_123L })
+        var successfulCallbacks = 0
+        var failedSource: PollSampleSource? = null
+        val result = PollPersistenceCoordinator(
+            store = store,
+            client = FakeTelemetryClient(
+                TelemetryReadResult.Failure("transport", "offline", rawBody = null, elapsedMs = 14L)
+            ),
+            clock = clock,
+            successfulPollObserver = object : SuccessfulPollObserver {
+                override fun onSuccessfulPoll(
+                    sessionId: Long,
+                    pollId: Long,
+                    timestamp: String,
+                    readings: List<PollReading>,
+                    origin: PollOrigin
+                ) {
+                    successfulCallbacks += 1
+                }
+
+                override fun onSourceFailure(
+                    sessionId: Long,
+                    pollId: Long,
+                    timestamp: String,
+                    origin: PollOrigin,
+                    source: PollSampleSource
+                ) {
+                    store.actions += "failureObserver:$pollId:$timestamp"
+                    assertEquals(PollOrigin.LIVE, origin)
+                    assertEquals(9_123L, clock.elapsed)
+                    failedSource = source
+                }
+            }
+        ).pollOnce(sessionId = 7L)
+
+        assertFalse(result.ok)
+        assertEquals(0, successfulCallbacks)
+        assertEquals(123L, failedSource?.capturedElapsedMs)
+        assertEquals(
+            listOf(
+                "getActiveCatalogParameters",
+                "insertPoll:7:2026-09-14T10:00:00Z",
+                "failureObserver:99:2026-09-14T10:00:00Z"
+            ),
+            store.actions
+        )
+    }
+
     @Test
     fun successfulPollNotifiesObserverAfterRawPollIsInserted() {
         val readings = listOf(PollReading(rawKey = "SOC", rawValue = "72", descValue = "72%"))
@@ -126,7 +178,7 @@ class PollPersistenceCoordinatorTest {
         )
     }
 
-    private class FakePollStorage : PollStorage {
+    private class FakePollStorage(private val onInsert: () -> Unit = {}) : PollStorage {
         val actions = mutableListOf<String>()
         val events = mutableListOf<FakeEvent>()
         var insertedInput: PersistedPollInput? = null
@@ -154,6 +206,7 @@ class PollPersistenceCoordinatorTest {
         ): Long {
             actions += "insertPoll:$sessionId:${input.timestamp}"
             insertedInput = input
+            onInsert()
             return 99L
         }
 
@@ -166,9 +219,9 @@ class PollPersistenceCoordinatorTest {
         override fun read(): TelemetryReadResult = result
     }
 
-    private class FakeClock(val now: String) : Clock {
+    private class FakeClock(val now: String, var elapsed: Long = 123L) : Clock {
         override fun nowIso(): String = now
-        override fun elapsedRealtimeMs(): Long = 123L
+        override fun elapsedRealtimeMs(): Long = elapsed
     }
 
     private data class FakeEvent(

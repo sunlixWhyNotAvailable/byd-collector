@@ -181,6 +181,7 @@ object DiagnosticLogRecorder {
                 val journalStatus = writeOperationalJournalSnapshot(appContext, snapshotDir)
                 val databaseStatus = writeCollectorEventsSnapshot(appContext, snapshotDir)
                 val helperStatus = writeKeepAliveLogSnapshot(appContext, snapshotDir)
+                val telemetryHelperStatus = writeTelemetryHelperSnapshot(appContext, snapshotDir)
                 val tripsTelegramStatus = writeTripsTelegramEvidence(appContext, snapshotDir)
                 val influxStatus = writeInfluxEvidence(appContext, snapshotDir)
                 File(snapshotDir, "diagnostic_info.txt").writeText(
@@ -193,6 +194,7 @@ object DiagnosticLogRecorder {
                         appendLine("operational_journal=$journalStatus")
                         appendLine("collector_events=$databaseStatus")
                         appendLine("keep_alive_log=$helperStatus")
+                        appendLine("telemetry_helper=$telemetryHelperStatus")
                         appendLine("trips_telegram_evidence=$tripsTelegramStatus")
                         appendLine("influx_evidence=$influxStatus")
                     },
@@ -248,6 +250,9 @@ object DiagnosticLogRecorder {
             if (helperResult != null && !helperResult.ok) {
                 warnings += "keep_alive_log=${helperResult.error ?: "truncate failed"}"
             }
+            runCatching { HelperDiagnosticTransport.clear(appContext) }
+                .onSuccess { warning -> warning?.let(warnings::add) }
+                .onFailure { warnings += "helper_diagnostics=${it::class.java.simpleName}: ${diagnosticSafeText(it.message)}" }
             return DiagnosticClearResult(removed = removed, warnings = warnings)
         }
     }
@@ -392,6 +397,20 @@ object DiagnosticLogRecorder {
                 )
             }
             "error"
+        }
+    }
+
+    private fun writeTelemetryHelperSnapshot(context: Context, runDir: File): String {
+        return runCatching { HelperDiagnosticTransport.snapshot(context, runDir) }.getOrElse { error ->
+            // Discard incomplete helper copies only; the rest of the support bundle remains shareable.
+            val component = File(runDir, "helper-diagnostics")
+            check(!component.exists() || component.deleteRecursively()) { "Cannot remove partial helper snapshot" }
+            check(component.mkdirs()) { "Cannot create helper status directory" }
+            File(component, "status.txt").writeText(
+                "status=unavailable\nreason=${error::class.java.simpleName}: ${diagnosticSafeText(error.message)}\n",
+                Charsets.UTF_8
+            )
+            "unavailable"
         }
     }
 

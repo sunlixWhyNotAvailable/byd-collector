@@ -350,7 +350,7 @@ class CollectorHelperDaemonBatchTest {
         val daemon = sourceFile("com/bydcollector/collector/direct/CollectorHelperDaemon.java").readText()
         val client = sourceFile("com/bydcollector/collector/data/direct/DirectVehicleHelperClient.kt").readText()
 
-        assertEquals(8, CollectorHelperProtocol.PROTOCOL_VERSION)
+        assertEquals(9, CollectorHelperProtocol.PROTOCOL_VERSION)
         assertTrue(client.contains("protocolVersion != CollectorHelperProtocol.PROTOCOL_VERSION"))
         assertTrue(client.contains("DirectHelperOwnerMode.fromProtocolValue(ownerMode)"))
         assertTrue(client.contains("TX_PING"))

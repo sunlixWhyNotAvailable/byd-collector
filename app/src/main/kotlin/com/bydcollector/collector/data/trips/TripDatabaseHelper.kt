@@ -5,7 +5,7 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import java.io.File
 
-/** Separate, app-private trip history database. It deliberately has no outbox/meta domain table. */
+/** Separate, app-private trip history and durable power-session state database. */
 class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME) : SQLiteOpenHelper(
     context.applicationContext,
     databaseName,
@@ -46,6 +46,13 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
                 distance_km REAL,
                 energy_kwh REAL,
                 average_consumption_kwh_per_100km REAL,
+                discharged_kwh REAL,
+                regenerated_kwh REAL,
+                net_kwh REAL,
+                energy_covered_ms INTEGER,
+                energy_uncovered_ms INTEGER,
+                energy_partial INTEGER CHECK (energy_partial IS NULL OR energy_partial IN (0, 1)),
+                energy_observed_at TEXT,
                 termination TEXT,
                 quality TEXT NOT NULL DEFAULT 'ok',
                 telegram_eligible INTEGER NOT NULL DEFAULT 0 CHECK (telegram_eligible IN (0, 1)),
@@ -84,12 +91,23 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_trip_sessions_state_movement ON trip_sessions(state, movement_observed, started_at DESC)")
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_route_points_trip_order ON route_points(trip_id, sequence)")
         createRouteChunks(db)
+        createEnergyRuntimeState(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         require(oldVersion <= DATABASE_VERSION) { "Trip database downgrade is unsupported" }
         if (oldVersion < 2) db.execSQL("ALTER TABLE route_points ADD COLUMN receive_wall_time_ms INTEGER")
         if (oldVersion < 3) createRouteChunks(db)
+        if (oldVersion < 4) {
+            db.execSQL("ALTER TABLE trip_sessions ADD COLUMN discharged_kwh REAL")
+            db.execSQL("ALTER TABLE trip_sessions ADD COLUMN regenerated_kwh REAL")
+            db.execSQL("ALTER TABLE trip_sessions ADD COLUMN net_kwh REAL")
+            db.execSQL("ALTER TABLE trip_sessions ADD COLUMN energy_covered_ms INTEGER")
+            db.execSQL("ALTER TABLE trip_sessions ADD COLUMN energy_uncovered_ms INTEGER")
+            db.execSQL("ALTER TABLE trip_sessions ADD COLUMN energy_partial INTEGER CHECK (energy_partial IS NULL OR energy_partial IN (0, 1))")
+            db.execSQL("ALTER TABLE trip_sessions ADD COLUMN energy_observed_at TEXT")
+            createEnergyRuntimeState(db)
+        }
         onCreate(db)
     }
 
@@ -119,8 +137,21 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
         )
     }
 
+    private fun createEnergyRuntimeState(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS energy_runtime_state (
+                singleton_id INTEGER PRIMARY KEY NOT NULL CHECK (singleton_id = 1),
+                state_json TEXT NOT NULL,
+                pending_projection_json TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """.trimIndent()
+        )
+    }
+
     companion object {
         const val DATABASE_NAME = "bydcollector_trips.db"
-        const val DATABASE_VERSION = 3
+        const val DATABASE_VERSION = 4
     }
 }

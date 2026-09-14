@@ -75,6 +75,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -533,6 +534,10 @@ private val TelegramMessageDefinitions = listOf(
             "trip_distance_km",
             "trip_energy_kwh",
             "trip_avg_kwh_per_100km",
+            "trip_discharged_kwh",
+            "trip_regenerated_kwh",
+            "trip_net_kwh",
+            "trip_net_kwh_per_100km",
             "trip_duration",
             "soc_start",
             "soc_end",
@@ -541,6 +546,10 @@ private val TelegramMessageDefinitions = listOf(
             "total_distance_km",
             "total_energy_kwh",
             "total_avg_kwh_per_100km",
+            "total_discharged_kwh",
+            "total_regenerated_kwh",
+            "total_net_kwh",
+            "total_net_kwh_per_100km",
             "total_duration",
             "time"
         )
@@ -879,13 +888,34 @@ private fun TripsTab(
         ScreenTitle(strings.tripsTab, strings.tripsSubtitle)
         SectionCard(title = strings.database, modifier = Modifier.fillMaxWidth()) {
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                InfoRow(strings.size, UiSizeFormatter.bytes(state.databaseSizeBytes, strings), modifier = Modifier.weight(0.84f))
-                ReadOnlyPathField(state.databasePath.ifBlank { "—" }, modifier = Modifier.weight(1.06f))
+                Box(Modifier.width(520.dp)) {
+                    InfoRow(strings.size, UiSizeFormatter.bytes(state.databaseSizeBytes, strings), modifier = Modifier.fillMaxWidth())
+                }
+                Spacer(Modifier.weight(1f))
+                Box(Modifier.width(860.dp)) {
+                    ReadOnlyPathField(state.databasePath.ifBlank { "—" }, modifier = Modifier.fillMaxWidth())
+                }
             }
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Spacer(Modifier.weight(0.84f))
-                ActionButton(strings.compressDatabase, actions.onCompressDatabase, primary = true, modifier = Modifier.weight(1.06f))
+                Box(Modifier.width(520.dp)) {
+                    ActionButton(
+                        text = when {
+                            !state.currentTripAvailabilityKnown -> strings.loading
+                            state.availableCurrentTrip == null -> strings.noCurrentTrip
+                            else -> strings.currentTrip
+                        },
+                        onClick = actions.onCurrentTripRequested,
+                        enabled = state.currentTripAvailabilityKnown && state.availableCurrentTrip != null,
+                        listAction = true,
+                        fontSize = 13.sp,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                Spacer(Modifier.weight(1f))
+                Box(Modifier.width(860.dp)) {
+                    ActionButton(strings.compressDatabase, actions.onCompressDatabase, primary = true, fontSize = 13.sp, modifier = Modifier.fillMaxWidth())
+                }
             }
         }
         SectionCard(
@@ -926,34 +956,42 @@ private fun TripsTab(
                 state.years.forEach { year ->
                     val yearExpanded = year.id in session.expandedTripYears
                     TripGroupRow(
-                        strings, language, year.title, year.distanceKm, year.energyKwh,
-                        year.averageConsumptionKwhPer100Km, year.months.sumOf { it.days.sumOf { day -> day.trips.size } },
+                        strings, language, year.title, year.distanceKm, year.netKwh,
+                        year.averageConsumptionKwhPer100Km, year.energyCompleteness,
+                        year.months.sumOf { it.days.sumOf { day -> day.trips.size } },
                         level = 0, expanded = yearExpanded,
                         onClick = { session.setTripYearExpanded(year.id, !yearExpanded, sessionGeneration) }
                     )
                     if (yearExpanded) year.months.forEach { month ->
                         val monthExpanded = month.id in session.expandedTripMonths
                         TripGroupRow(
-                            strings, language, month.title, month.distanceKm, month.energyKwh,
-                            month.averageConsumptionKwhPer100Km, month.days.sumOf { it.trips.size },
+                            strings, language, month.title, month.distanceKm, month.netKwh,
+                            month.averageConsumptionKwhPer100Km, month.energyCompleteness,
+                            month.days.sumOf { it.trips.size },
                             level = 1, expanded = monthExpanded,
                             onClick = { session.setTripMonthExpanded(month.id, !monthExpanded, sessionGeneration) }
                         )
                         if (monthExpanded) month.days.forEach { day ->
                             val dayExpanded = day.id in session.expandedTripDays
                             TripGroupRow(
-                                strings, language, day.title, day.distanceKm, day.energyKwh,
-                                day.averageConsumptionKwhPer100Km, day.trips.size,
+                                strings, language, day.title, day.distanceKm, day.netKwh,
+                                day.averageConsumptionKwhPer100Km, day.energyCompleteness, day.trips.size,
                                 level = 2, expanded = dayExpanded,
                                 onClick = { session.setTripDayExpanded(day.id, !dayExpanded, sessionGeneration) }
                             )
                             if (dayExpanded) {
                                 TripTableHeader(strings)
                                 day.trips.forEach { trip ->
-                                    TripTableRow(strings, language, trip, loading = state.routeLoadingId == trip.id) {
-                                        selectedTripId = trip.id
-                                        actions.onRouteRequested(trip.id)
-                                    }
+                                    TripTableRow(
+                                        strings,
+                                        language,
+                                        trip,
+                                        loading = state.routeLoadingId == trip.id,
+                                        onRoute = {
+                                            selectedTripId = trip.id
+                                            actions.onRouteRequested(trip.id)
+                                        }
+                                    )
                                 }
                             }
                         }
@@ -969,6 +1007,16 @@ private fun TripsTab(
             strings = strings,
             language = language,
             onDismiss = { selectedTripId = null }
+        )
+    }
+    state.currentTripModal?.trip?.let { trip ->
+        TripRouteDialog(
+            trip = trip,
+            state = state,
+            strings = strings,
+            language = language,
+            currentTrip = true,
+            onDismiss = actions.onCurrentTripDismissed
         )
     }
 }
@@ -1013,6 +1061,7 @@ private fun TripGroupRow(
     distanceKm: Double?,
     energyKwh: Double?,
     averageConsumption: Double?,
+    energyCompleteness: TripEnergyCompleteness,
     tripCount: Int,
     level: Int,
     expanded: Boolean,
@@ -1038,7 +1087,10 @@ private fun TripGroupRow(
                 Text(title, color = p.text, fontSize = if (level == 0) 17.sp else if (level == 1) 14.sp else 13.sp, fontWeight = if (level < 2) FontWeight.SemiBold else FontWeight.Medium)
             }
             Text(
-                "${formatTripNumber(distanceKm, language)} ${distanceUnit(language)} • ${formatTripNumber(energyKwh, language)} ${energyUnit(language)} • ${formatTripNumber(averageConsumption, language)} ${consumptionUnit(language)} • ${tripCountLabel(tripCount, language)}",
+                buildString {
+                    append("${formatTripNumber(distanceKm, language)} ${distanceUnit(language)} • ${formatTripNumber(energyKwh, language)} ${energyUnit(language)} • ${formatTripNumber(averageConsumption, language)} ${consumptionUnit(language)} • ${tripCountLabel(tripCount, language)}")
+                    if (energyCompleteness == TripEnergyCompleteness.PARTIAL) append(" • ${strings.partial}")
+                },
                 color = p.muted,
                 fontSize = 12.sp,
                 textAlign = TextAlign.End
@@ -1049,12 +1101,33 @@ private fun TripGroupRow(
 }
 
 @Composable
-private fun TripTableHeader(strings: UiStrings) {
-    Row(Modifier.fillMaxWidth().height(34.dp).background(LocalBydPalette.current.pathField.copy(alpha = 0.48f)).padding(start = 48.dp, end = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-        listOf(strings.startEnd, strings.duration, strings.distance, "SOC", strings.used, strings.averageConsumption, strings.route).forEach { label ->
-            TripTableCell(label, LocalBydPalette.current.muted, Modifier.weight(1f))
+private fun TripTableHeader(strings: UiStrings, currentTripOpen: Boolean = false, includeRoute: Boolean = true) {
+    val p = LocalBydPalette.current
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .height(34.dp)
+            .background(p.pathField.copy(alpha = 0.48f))
+            .padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        val labels = buildList {
+            add(if (currentTripOpen) strings.startNow else strings.startEnd)
+            add(strings.duration)
+            add(strings.distance)
+            add("SOC")
+            add(strings.used)
+            add(strings.recovered)
+            add(strings.batteryNet)
+            add(strings.averageConsumption)
+            if (includeRoute) add(strings.route)
+        }
+        labels.forEachIndexed { index, label ->
+            if (index > 0) TripTableDivider()
+            TripTableCell(label, p.muted, Modifier.weight(1f), fontSize = 12.sp)
         }
     }
+    Box(Modifier.fillMaxWidth().height(1.dp).background(p.border))
 }
 
 @Composable
@@ -1063,33 +1136,65 @@ private fun TripTableRow(
     language: UiLanguage,
     trip: TripSummaryUi,
     loading: Boolean,
-    onRoute: () -> Unit
+    onRoute: (() -> Unit)?,
+    currentTrip: Boolean = false
 ) {
     val p = LocalBydPalette.current
-    Row(Modifier.fillMaxWidth().heightIn(min = 54.dp).padding(start = 48.dp, end = 12.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-        TripTableCell("${trip.startAt} → ${trip.endAt}", p.text, Modifier.weight(1f), FontWeight.SemiBold)
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = 54.dp)
+            .height(IntrinsicSize.Min)
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        val endLabel = if (currentTrip && trip.open) strings.now else trip.endAt
+        TripTableCell("${trip.startAt} → $endLabel", p.text, Modifier.weight(1f), FontWeight.SemiBold)
+        TripTableDivider()
         TripTableCell(trip.duration, p.text, Modifier.weight(1f))
+        TripTableDivider()
         TripTableCell("${formatTripNumber(trip.distanceKm, language)} ${distanceUnit(language)}", p.text, Modifier.weight(1f))
+        TripTableDivider()
         TripTableCell("${formatSoc(trip.socStart, language)} → ${formatSoc(trip.socEnd, language)}", p.text, Modifier.weight(1f))
-        TripTableCell("${formatTripNumber(trip.energyKwh, language)} ${energyUnit(language)}", p.text, Modifier.weight(1f))
-        TripTableCell("${formatTripNumber(trip.averageConsumptionKwhPer100Km, language)} ${consumptionUnit(language)}", p.green, Modifier.weight(1f), FontWeight.SemiBold)
-        Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
-            ActionButton(
-                if (loading) strings.loading else strings.route,
-                onRoute,
-                enabled = !loading,
-                modifier = Modifier.width(108.dp),
-                listAction = true,
-                fontSize = 12.sp
-            )
+        TripTableDivider()
+        TripTableCell(formatTripEnergy(trip.dischargedKwh, trip.energyCompleteness, language, strings), p.text, Modifier.weight(1f))
+        TripTableDivider()
+        TripTableCell(formatTripEnergy(trip.regeneratedKwh, trip.energyCompleteness, language, strings), p.text, Modifier.weight(1f))
+        TripTableDivider()
+        TripTableCell(formatTripEnergy(trip.netKwh, trip.energyCompleteness, language, strings), p.text, Modifier.weight(1f))
+        TripTableDivider()
+        TripTableCell(formatTripConsumption(trip.averageConsumptionKwhPer100Km, trip.energyCompleteness, language, strings), p.green, Modifier.weight(1f), FontWeight.SemiBold)
+        onRoute?.let { openRoute ->
+            TripTableDivider()
+            Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                ActionButton(
+                    if (loading) strings.loading else strings.route,
+                    openRoute,
+                    enabled = !loading,
+                    modifier = Modifier.width(108.dp),
+                    listAction = true,
+                    fontSize = 12.sp
+                )
+            }
         }
     }
     Box(Modifier.fillMaxWidth().height(1.dp).background(p.border.copy(alpha = 0.55f)))
 }
 
 @Composable
-private fun RowScope.TripTableCell(text: String, color: Color, modifier: Modifier, weight: FontWeight = FontWeight.Normal) {
-    Text(text, color = color, fontSize = 11.sp, fontWeight = weight, textAlign = TextAlign.Center, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = modifier.padding(horizontal = 4.dp))
+private fun TripTableDivider() {
+    Box(Modifier.width(1.dp).fillMaxHeight().padding(vertical = 4.dp).background(LocalBydPalette.current.border))
+}
+
+@Composable
+private fun RowScope.TripTableCell(
+    text: String,
+    color: Color,
+    modifier: Modifier,
+    weight: FontWeight = FontWeight.Normal,
+    fontSize: TextUnit = 11.sp
+) {
+    Text(text, color = color, fontSize = fontSize, fontWeight = weight, textAlign = TextAlign.Center, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = modifier.padding(horizontal = 2.dp))
 }
 
 @Composable
@@ -1112,6 +1217,26 @@ private fun formatTripNumber(value: Double?, language: UiLanguage): String = val
 } ?: "—"
 
 private fun formatSoc(value: Double?, language: UiLanguage): String = formatTripNumber(value, language).let { if (it == "—") it else "$it%" }
+
+private fun formatTripEnergy(value: Double?, completeness: TripEnergyCompleteness, language: UiLanguage, strings: UiStrings): String =
+    formatTripMetric(value, completeness, language, strings, energyUnit(language))
+
+private fun formatTripConsumption(value: Double?, completeness: TripEnergyCompleteness, language: UiLanguage, strings: UiStrings): String =
+    formatTripMetric(value, completeness, language, strings, consumptionUnit(language))
+
+private fun formatTripMetric(
+    value: Double?,
+    completeness: TripEnergyCompleteness,
+    language: UiLanguage,
+    strings: UiStrings,
+    unit: String
+): String {
+    val formatted = value?.takeIf(Double::isFinite)?.let {
+        "%.1f".format(Locale.US, it).let { text -> if (language == UiLanguage.UK) text.replace('.', ',') else text }
+    } ?: "—"
+    if (formatted == "—") return formatted
+    return "$formatted $unit" + if (completeness == TripEnergyCompleteness.PARTIAL) "\n${strings.partial}" else ""
+}
 
 private fun distanceUnit(language: UiLanguage) = if (language == UiLanguage.UK) "км" else "km"
 private fun energyUnit(language: UiLanguage) = if (language == UiLanguage.UK) "кВт·год" else "kWh"
@@ -1163,6 +1288,7 @@ private fun TripRouteDialog(
     state: TripsUiState,
     strings: UiStrings,
     language: UiLanguage,
+    currentTrip: Boolean = false,
     onDismiss: () -> Unit
 ) {
     var metric by rememberSaveable(trip.id) { mutableStateOf(TripMapMetric.SPEED) }
@@ -1173,11 +1299,29 @@ private fun TripRouteDialog(
             Column(Modifier.fillMaxWidth(0.92f).fillMaxHeight(0.86f).background(p.panel, Rounded8).border(1.dp, p.borderStrong, Rounded8).padding(14.dp)) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     Column {
-                        Text(strings.tripRoute, color = p.text, fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
-                        Text("${trip.startAt} → ${trip.endAt} • ${formatTripNumber(trip.distanceKm, language)} ${distanceUnit(language)}", color = p.muted, fontSize = 12.sp)
+                        Text(if (currentTrip) strings.currentTrip else strings.tripRoute, color = p.text, fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            if (currentTrip) {
+                                when {
+                                    !trip.open -> strings.currentTripCompleted
+                                    trip.energyObservedAt != null -> String.format(strings.currentTripUpdatedAt, trip.energyObservedAt)
+                                    else -> strings.currentTripActive
+                                }
+                            } else {
+                                "${trip.startAt} → ${trip.endAt} • ${formatTripNumber(trip.distanceKm, language)} ${distanceUnit(language)}"
+                            },
+                            color = p.muted,
+                            fontSize = 12.sp
+                        )
                     }
                 }
                 Spacer(Modifier.height(12.dp))
+                if (currentTrip) {
+                    TripTableHeader(strings, currentTripOpen = trip.open, includeRoute = false)
+                    TripTableRow(strings, language, trip, loading = false, onRoute = null, currentTrip = true)
+                    Spacer(Modifier.height(12.dp))
+                }
+                val currentTripHasFinish = !trip.open && trip.route.any { !it.gap && it.final }
                 TripMapView(
                     points = trip.route,
                     metric = metric,
@@ -1185,6 +1329,10 @@ private fun TripRouteDialog(
                     speedYellow = state.speedYellowThreshold,
                     consumptionGreen = state.consumptionGreenThreshold,
                     consumptionYellow = state.consumptionYellowThreshold,
+                    viewportKey = trip.id,
+                    preserveViewportOnUpdate = currentTrip,
+                    showFinish = !currentTrip || currentTripHasFinish,
+                    requireFinalFinish = currentTrip,
                     modifier = Modifier.weight(1f).fillMaxWidth()
                 )
                 Row(Modifier.fillMaxWidth().padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1201,8 +1349,10 @@ private fun TripRouteDialog(
                     )
                     Spacer(Modifier.width(18.dp))
                     TripEndpointLegend(R.drawable.ic_trip_start_marker, strings.tripStart)
-                    Spacer(Modifier.width(12.dp))
-                    TripEndpointLegend(R.drawable.ic_trip_finish_marker, strings.tripFinish)
+                    if (!currentTrip || currentTripHasFinish) {
+                        Spacer(Modifier.width(12.dp))
+                        TripEndpointLegend(R.drawable.ic_trip_finish_marker, strings.tripFinish)
+                    }
                     Spacer(Modifier.width(12.dp))
                     TripNoDataLegend(strings.tripNoData)
                     Spacer(Modifier.weight(1f))
@@ -1252,6 +1402,10 @@ private fun TripMapView(
     speedYellow: Int,
     consumptionGreen: Int,
     consumptionYellow: Int,
+    viewportKey: String,
+    preserveViewportOnUpdate: Boolean = false,
+    showFinish: Boolean = true,
+    requireFinalFinish: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     val p = LocalBydPalette.current
@@ -1263,7 +1417,12 @@ private fun TripMapView(
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
                 factory = { createTripMap(context) },
-                update = { map -> updateTripMap(map, points, metric, speedGreen, speedYellow, consumptionGreen, consumptionYellow) },
+                update = { map ->
+                    updateTripMap(
+                        map, points, metric, speedGreen, speedYellow, consumptionGreen, consumptionYellow,
+                        viewportKey, preserveViewportOnUpdate, showFinish, requireFinalFinish
+                    )
+                },
                 onRelease = MapView::onDetach
             )
             Text("© OpenStreetMap contributors", color = p.muted, fontSize = 10.sp, modifier = Modifier.align(Alignment.BottomEnd).background(p.surface.copy(alpha = 0.86f), Rounded8).padding(horizontal = 8.dp, vertical = 4.dp))
@@ -1278,8 +1437,19 @@ private fun updateTripMap(
     speedGreen: Int,
     speedYellow: Int,
     consumptionGreen: Int,
-    consumptionYellow: Int
+    consumptionYellow: Int,
+    viewportKey: String,
+    preserveViewportOnUpdate: Boolean,
+    showFinish: Boolean,
+    requireFinalFinish: Boolean
 ) {
+    val priorRender = map.tag as? TripMapRenderState
+    if (
+        priorRender?.points === points && priorRender.metric == metric &&
+        priorRender.speedGreen == speedGreen && priorRender.speedYellow == speedYellow &&
+        priorRender.consumptionGreen == consumptionGreen && priorRender.consumptionYellow == consumptionYellow &&
+        priorRender.showFinish == showFinish && priorRender.requireFinalFinish == requireFinalFinish
+    ) return
     map.overlays.clear()
     val runs = buildList {
         var run = mutableListOf<TripRoutePointUi>()
@@ -1294,7 +1464,14 @@ private fun updateTripMap(
         if (run.isNotEmpty()) add(run)
     }
     val p = runs.flatten()
-    if (p.isEmpty()) return
+    if (p.isEmpty()) {
+        map.tag = TripMapRenderState(
+            viewportKey, initialized = false, points, metric, speedGreen, speedYellow,
+            consumptionGreen, consumptionYellow, showFinish, requireFinalFinish
+        )
+        map.invalidate()
+        return
+    }
     runs.filter { it.size > 1 }.forEach { run ->
         map.overlays += Polyline(map).apply {
             setPoints(run.map { GeoPoint(it.latitude, it.longitude) })
@@ -1320,23 +1497,56 @@ private fun updateTripMap(
         }
     }
     map.overlays += tripMapMarker(map, p.first(), R.drawable.ic_trip_start_marker)
-    if (p.size > 1) {
-        map.overlays += tripMapMarker(map, p.last(), R.drawable.ic_trip_finish_marker)
-    }
-    map.post {
-        if (p.size == 1) {
-            map.controller.setCenter(GeoPoint(p.first().latitude, p.first().longitude))
-            map.controller.setZoom(14.0)
+    if (showFinish && p.size > 1) {
+        if (requireFinalFinish) {
+            points.lastOrNull { !it.gap && it.final }
+                ?.let { map.overlays += tripMapMarker(map, it, R.drawable.ic_trip_finish_marker) }
         } else {
-            map.zoomToBoundingBox(
-                BoundingBox.fromGeoPoints(p.map { GeoPoint(it.latitude, it.longitude) }),
-                true,
-                64
-            )
+            map.overlays += tripMapMarker(map, p.last(), R.drawable.ic_trip_finish_marker)
+        }
+    }
+    val shouldFitViewport = !preserveViewportOnUpdate || priorRender?.viewportKey != viewportKey || !priorRender.initialized
+    map.tag = TripMapRenderState(
+        viewportKey,
+        initialized = shouldFitViewport || priorRender?.initialized == true,
+        points,
+        metric,
+        speedGreen,
+        speedYellow,
+        consumptionGreen,
+        consumptionYellow,
+        showFinish,
+        requireFinalFinish
+    )
+    if (shouldFitViewport) {
+        map.post {
+            if (p.size == 1) {
+                map.controller.setCenter(GeoPoint(p.first().latitude, p.first().longitude))
+                map.controller.setZoom(14.0)
+            } else {
+                map.zoomToBoundingBox(
+                    BoundingBox.fromGeoPoints(p.map { GeoPoint(it.latitude, it.longitude) }),
+                    true,
+                    64
+                )
+            }
         }
     }
     map.invalidate()
 }
+
+private class TripMapRenderState(
+    val viewportKey: String,
+    val initialized: Boolean,
+    val points: List<TripRoutePointUi>,
+    val metric: TripMapMetric,
+    val speedGreen: Int,
+    val speedYellow: Int,
+    val consumptionGreen: Int,
+    val consumptionYellow: Int,
+    val showFinish: Boolean,
+    val requireFinalFinish: Boolean
+)
 
 private fun tripMapMarker(map: MapView, point: TripRoutePointUi, drawableRes: Int): Marker =
     Marker(map).apply {

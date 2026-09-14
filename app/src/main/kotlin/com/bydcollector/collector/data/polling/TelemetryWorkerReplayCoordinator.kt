@@ -103,13 +103,27 @@ class TelemetryWorkerReplayCoordinator(
                 lastTimestamp = input.timestamp
                 lastElapsedMs = sample.pollElapsedMs
 
+                val source = PollSampleSource(
+                    "helper:${sample.identity}",
+                    sample.identity.bootId,
+                    sample.capturedElapsedMs
+                )
                 if (input.ok) {
-                    successfulPollObserver?.onSuccessfulPoll(
+                    successfulPollObserver?.onSourcePoll(
                         sessionId,
                         imported.pollId,
                         input.timestamp,
                         input.readings,
-                        PollOrigin.REPLAY
+                        PollOrigin.REPLAY,
+                        source
+                    )
+                } else {
+                    successfulPollObserver?.onSourceFailure(
+                        sessionId,
+                        imported.pollId,
+                        input.timestamp,
+                        PollOrigin.REPLAY,
+                        source
                     )
                 }
                 ackAttempts += 1L
