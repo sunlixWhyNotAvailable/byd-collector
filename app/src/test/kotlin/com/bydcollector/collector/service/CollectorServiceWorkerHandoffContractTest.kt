@@ -32,12 +32,35 @@ class CollectorServiceWorkerHandoffContractTest {
 
         assertFalse(settings.substringAfter("fun mainHelperOwnerMode").substringBefore("fun isDebugPollingEnabled").contains("isAutonomousMainWorkerEnabled()"))
         assertTrue(settings.contains("DirectHelperOwnerMode.APP_GAP_SPOOL"))
+        val ownerMode = settings.substringAfter("fun mainHelperOwnerMode").substringBefore("fun isDebugPollingEnabled")
+        assertTrue(ownerMode.contains("isPollingEnabled()"))
+        assertTrue(ownerMode.contains("!isMainManuallyStopped()"))
+        assertTrue(ownerMode.contains("DirectHelperOwnerMode.APP"))
         assertTrue(service.contains("ownerMode: DirectHelperOwnerMode = DirectHelperOwnerMode.APP_GAP_SPOOL"))
         assertTrue(service.contains("ownerMode = settings.mainHelperOwnerMode()"))
         assertTrue(activity.contains("helperOwnerMode = settings.mainHelperOwnerMode()"))
         assertTrue(autoStart.contains("helperOwnerMode = settings.mainHelperOwnerMode()"))
         assertTrue(access.contains("DirectVehicleHelperClient().ownerMode() == helperOwnerMode"))
         assertTrue(access.contains("ownerMode = helperOwnerMode"))
+    }
+
+    @Test
+    fun ordinaryServiceTeardownReleasesOnlyTheAppLockAndPreservesAutonomousHelper() {
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val destroy = service.substringAfter("override fun onDestroy()").substringBefore("override fun onTaskRemoved")
+        val stopCollection = service.substringAfter("private fun stopCollection").substringBefore("private fun shutdownByUser")
+        val stopWorker = service.substringAfter("private fun stopAppGapSpoolHelper").substringBefore("private fun exportInfluxAfterNormalizedWrite")
+        val shutdown = service.substringAfter("private fun stopRuntimeForUserShutdown").substringBefore("private fun finishUserShutdown")
+
+        assertTrue(destroy.contains("stopCollection(\"service_destroyed\")"))
+        assertFalse(destroy.contains("setPollingEnabled(false)"))
+        assertTrue(stopCollection.contains("stopMain(reason)"))
+        assertTrue(stopCollection.contains("releaseWakeLock()"))
+        val preservedTeardown = stopWorker.indexOf("if (reason == \"service_destroyed\") return")
+        assertTrue(preservedTeardown >= 0)
+        assertTrue(preservedTeardown < stopWorker.indexOf("DirectVehicleHelperClient()"))
+        assertTrue(shutdown.contains("settings.setPollingEnabled(false)"))
+        assertTrue(shutdown.contains("stopMain(\"user_shutdown\")"))
     }
 
     @Test

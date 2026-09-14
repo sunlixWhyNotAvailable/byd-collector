@@ -113,7 +113,12 @@ public final class CollectorHelperDaemon {
                 workerSpool,
                 readLock,
                 address -> scalarRead(autoservice, autoserviceDescriptor, address),
-                nativeReader
+                nativeReader,
+                new HelperWakeLockController(
+                    SystemClock::elapsedRealtime,
+                    HelperWakeLockPlatform::acquireShellPartialWakeLock,
+                    WorkerPollLoop::log
+                )
             )
             : null;
         Binder helperBinder = new Binder() {
@@ -317,6 +322,7 @@ public final class CollectorHelperDaemon {
         };
         helperBinder.attachInterface(null, CollectorHelperProtocol.DESCRIPTOR);
         try {
+            if (workerPollLoop != null) workerPollLoop.startAutonomousMode();
             Method addService = serviceManager.getMethod("addService", String.class, IBinder.class);
             addService.invoke(null, CollectorHelperProtocol.SERVICE_NAME, helperBinder);
             System.out.println(
@@ -340,6 +346,9 @@ public final class CollectorHelperDaemon {
                 ownerLock.close();
             }
         }
+        // ActivityThread/Binder threads may outlive main; process death is the final
+        // fallback that releases a lock whose explicit teardown persistently failed.
+        System.exit(0);
     }
 
     private static ReadValue scalarRead(
@@ -709,6 +718,7 @@ public final class CollectorHelperDaemon {
         private final ScalarReader scalarReader;
         private final NativeReader nativeReader;
         private final ConsumerLease consumerLease;
+        private final HelperWakeLockController wakeLockController;
         private long sequence;
         private boolean stopped;
         private String lastError;
@@ -722,7 +732,8 @@ public final class CollectorHelperDaemon {
             TelemetryWorkerSpool spool,
             Object readLock,
             ScalarReader scalarReader,
-            NativeReader nativeReader
+            NativeReader nativeReader,
+            HelperWakeLockController wakeLockController
         ) {
             this.handler = handler;
             this.rows = rows;
@@ -733,6 +744,7 @@ public final class CollectorHelperDaemon {
             this.readLock = readLock;
             this.scalarReader = scalarReader;
             this.nativeReader = nativeReader;
+            this.wakeLockController = wakeLockController;
             this.consumerLease = new ConsumerLease(
                 SystemClock.elapsedRealtime(),
                 CONSUMER_LEASE_MS
@@ -743,9 +755,14 @@ public final class CollectorHelperDaemon {
             handler.post(this);
         }
 
+        void startAutonomousMode() {
+            wakeLockController.enterAutonomousMode();
+        }
+
         void stop() {
             stopped = true;
             handler.removeCallbacks(this);
+            wakeLockController.exitAutonomousMode();
         }
 
         void markConsumerHeartbeat() {
@@ -768,6 +785,7 @@ public final class CollectorHelperDaemon {
         @Override public void run() {
             if (stopped) return;
             long cycleStartedAt = SystemClock.elapsedRealtime();
+            wakeLockController.maintain();
             try {
                 synchronized (readLock) {
                     long now = SystemClock.elapsedRealtime();
@@ -822,7 +840,7 @@ public final class CollectorHelperDaemon {
             }
         }
 
-        private static void log(String message) {
+        static void log(String message) {
             System.err.println(message);
             System.err.flush();
         }
