@@ -81,6 +81,7 @@ data class TripSummaryUi(
     val netKwh: Double? = null,
     val averageConsumptionKwhPer100Km: Double?,
     val energyCompleteness: TripEnergyCompleteness = TripEnergyCompleteness.UNAVAILABLE,
+    val netCompleteness: TripEnergyCompleteness = energyCompleteness,
     val energyCoveredMs: Long? = null,
     val energyUncoveredMs: Long? = null,
     val energyObservedAt: String? = null,
@@ -98,6 +99,7 @@ data class TripDayUi(
     val netKwh: Double?,
     val averageConsumptionKwhPer100Km: Double?,
     val energyCompleteness: TripEnergyCompleteness,
+    val netCompleteness: TripEnergyCompleteness = energyCompleteness,
     val trips: List<TripSummaryUi>
 )
 
@@ -111,6 +113,7 @@ data class TripMonthUi(
     val netKwh: Double?,
     val averageConsumptionKwhPer100Km: Double?,
     val energyCompleteness: TripEnergyCompleteness,
+    val netCompleteness: TripEnergyCompleteness = energyCompleteness,
     val days: List<TripDayUi>
 )
 
@@ -124,6 +127,7 @@ data class TripYearUi(
     val netKwh: Double?,
     val averageConsumptionKwhPer100Km: Double?,
     val energyCompleteness: TripEnergyCompleteness,
+    val netCompleteness: TripEnergyCompleteness = energyCompleteness,
     val months: List<TripMonthUi>
 )
 

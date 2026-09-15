@@ -75,7 +75,9 @@ This collection can use substantial storage. Stop it after your research session
 
 The `Trips` tab keeps sessions from vehicle power-on to power-off in a separate local database. It stores trip summaries and GPS routes rather than duplicating all telemetry. Sessions without movement are hidden from the ordinary list.
 
-The table separates battery energy used, energy recovered during driving, and signed battery net (used minus recovered). Average consumption uses that net balance and may be negative. These calculated values are also available in the Battery category for MQTT and InfluxDB. Missing readings are not filled with assumed power; incomplete coverage is marked partial. Older trips are not automatically recalculated, and missing new values show a dash.
+The table separates battery energy used, energy recovered during driving, and signed battery net (used minus recovered). Average consumption uses that net balance and may be negative. These calculated values are also available in the Battery category for MQTT and InfluxDB. Missing readings are not filled with assumed power; incomplete new calculations are marked partial. Older trips retain their previous energy value as battery net and keep the corresponding average consumption; unavailable used/recovered values show a dash.
+
+Older trips are recalculated in the background when the current main database still contains complete, usable telemetry for them. If that history is incomplete, their previous balance is retained and average consumption is calculated from that balance and the trip distance. Archived databases are not used for this recalculation.
 
 `Current trip`, beside route compression, opens the active session's metrics and map. It refreshes while visible without resetting your map position or zoom. Metrics remain available without GPS; an active trip has no Finish marker. When it ends, the same trip stays open for inspection.
 

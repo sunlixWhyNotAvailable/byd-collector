@@ -105,6 +105,7 @@ import java.util.concurrent.atomic.AtomicReference
 
 //owns the runtime lifecycle so collection, exports, and keep-alive can continue without an open activity
 class CollectorService : Service() {
+    private var historicalEnergyGeneration = 0L
     private lateinit var store: TelemetryStore
     private lateinit var settings: CollectorSettings
     private lateinit var poller: TelemetryPoller
@@ -285,7 +286,9 @@ class CollectorService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        (applicationContext as BydCollectorApplication).updateRuntime.start("collector_service")
+        val application = applicationContext as BydCollectorApplication
+        historicalEnergyGeneration = application.beginHistoricalEnergyBackfillOwner()
+        application.updateRuntime.start("collector_service")
         influxRuntimeDiagnostics.attachJournal(applicationContext)
         running.set(true)
         mainRuntimeStatus = RuntimeActionStatus.STOPPED
@@ -459,6 +462,7 @@ class CollectorService : Service() {
 
     override fun onDestroy() {
         requireRuntimeOwner()
+        (applicationContext as BydCollectorApplication).cancelHistoricalEnergyBackfill()
         maintenanceRuntimeRestoreAllowed.set(false)
         telegramWorkGeneration.incrementAndGet()
         telegramRecoveryCoalescer.invalidate()
@@ -623,6 +627,9 @@ class CollectorService : Service() {
                 sessionId: Long, pollId: Long, timestamp: String, readings: List<PollReading>,
                 origin: PollOrigin, source: com.bydcollector.collector.data.polling.PollSampleSource
             ) {
+                if (origin == PollOrigin.LIVE) {
+                    (applicationContext as BydCollectorApplication).scheduleHistoricalEnergyBackfill(historicalEnergyGeneration)
+                }
                 prepareEnergyProjection()
                 val observations = vehicleStateNormalizer.normalize(
                     pollId = pollId,
@@ -698,6 +705,9 @@ class CollectorService : Service() {
                 origin: PollOrigin,
                 source: com.bydcollector.collector.data.polling.PollSampleSource
             ) {
+                if (origin == PollOrigin.LIVE) {
+                    (applicationContext as BydCollectorApplication).scheduleHistoricalEnergyBackfill(historicalEnergyGeneration)
+                }
                 prepareEnergyProjection()
                 val energyResult = energy.process(
                     com.bydcollector.collector.data.energy.EnergyTelemetryProjection.receipt(

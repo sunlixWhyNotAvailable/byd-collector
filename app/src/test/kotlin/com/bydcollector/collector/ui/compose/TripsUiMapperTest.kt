@@ -100,7 +100,7 @@ class TripsUiMapperTest {
     }
 
     @Test
-    fun legacyEnergyIsNotSubstitutedForNewGrossAndNetFields() {
+    fun legacyEnergyRestoresNetAndAverageWithoutInventingSplitOrBadge() {
         val legacy = summary("legacy").copy(
             energyKwh = 7.5,
             averageConsumptionKwhPer100Km = 60.0,
@@ -117,15 +117,21 @@ class TripsUiMapperTest {
         val mapped = year.months.single().days.single().trips.single()
 
         assertEquals(null, mapped.dischargedKwh)
-        assertEquals(null, mapped.netKwh)
-        assertEquals(null, mapped.averageConsumptionKwhPer100Km)
+        assertEquals(null, mapped.regeneratedKwh)
+        assertEquals(7.5, mapped.netKwh)
+        assertEquals(60.0, mapped.averageConsumptionKwhPer100Km)
         assertEquals(TripEnergyCompleteness.UNAVAILABLE, mapped.energyCompleteness)
-        assertEquals(null, year.netKwh)
+        assertEquals(TripEnergyCompleteness.COMPLETE, mapped.netCompleteness)
+        assertEquals(7.5, year.netKwh)
+        assertEquals(60.0, year.averageConsumptionKwhPer100Km)
+        assertEquals(7.5, year.months.single().netKwh)
+        assertEquals(7.5, year.months.single().days.single().netKwh)
+        assertEquals(TripEnergyCompleteness.COMPLETE, year.netCompleteness)
         assertEquals(TripEnergyCompleteness.UNAVAILABLE, year.energyCompleteness)
     }
 
     @Test
-    fun groupAverageUsesOnlyDistanceCorrespondingToNewNetAndMarksMixedHistoryPartial() {
+    fun mixedHistoryUsesSelectedNetAndMatchingDistanceWithoutLegacyBadge() {
         val downhill = summary("new").copy(
             distanceKm = 10.0,
             dischargedKwh = 1.0,
@@ -147,10 +153,66 @@ class TripsUiMapperTest {
         ).single()
 
         assertEquals(30.0, year.distanceKm)
-        assertEquals(-1.0, year.netKwh)
-        assertEquals(-10.0, year.averageConsumptionKwhPer100Km)
+        assertEquals(1.0, year.netKwh)
+        assertEquals(100.0 / 30.0, year.averageConsumptionKwhPer100Km)
         assertEquals(TripEnergyCompleteness.PARTIAL, year.energyCompleteness)
+        assertEquals(TripEnergyCompleteness.COMPLETE, year.netCompleteness)
     }
+
+    @Test
+    fun selectedNetKeepsZeroNegativeAndRealPartialValuesAheadOfLegacy() {
+        for (net in listOf(0.0, -2.0)) {
+            val mapped = map(summary("new").copy(netKwh = net, energyKwh = 50.0, energyPartial = true))
+            assertEquals(net, mapped.netKwh)
+            assertEquals(net * 100.0 / 12.5, mapped.averageConsumptionKwhPer100Km)
+            assertEquals(TripEnergyCompleteness.PARTIAL, mapped.netCompleteness)
+        }
+    }
+
+    @Test
+    fun unavailableEnergyAndInvalidDistanceNeverInventValues() {
+        val legacy = summary("legacy").copy(dischargedKwh = null, regeneratedKwh = null, netKwh = null, energyPartial = null)
+        for (distance in listOf(null, 0.0, -1.0, Double.NaN)) {
+            val mapped = map(legacy.copy(distanceKm = distance))
+            assertEquals(2.0, mapped.netKwh)
+            assertEquals(null, mapped.averageConsumptionKwhPer100Km)
+            assertEquals(TripEnergyCompleteness.COMPLETE, mapped.netCompleteness)
+        }
+        for (energy in listOf(null, Double.NaN, Double.POSITIVE_INFINITY)) {
+            val mapped = map(legacy.copy(energyKwh = energy))
+            assertEquals(null, mapped.netKwh)
+            assertEquals(null, mapped.averageConsumptionKwhPer100Km)
+            assertEquals(TripEnergyCompleteness.UNAVAILABLE, mapped.netCompleteness)
+        }
+        assertEquals(0.0, map(legacy.copy(energyKwh = 0.0)).netKwh)
+        assertEquals(2.0, map(legacy.copy(netKwh = Double.NaN)).netKwh)
+    }
+
+    @Test
+    fun groupExcludesDistanceWithNoEnergyAndKeepsRealMissingCoverage() {
+        val missing = summary("missing").copy(energyKwh = null, dischargedKwh = null, regeneratedKwh = null, netKwh = null)
+        val year = TripsUiMapper.years(listOf(TripDayGroup(2026, 8, 17, listOf(summary("new"), missing))), UiLanguage.UK).single()
+        assertEquals(25.0, year.distanceKm)
+        assertEquals(2.0, year.netKwh)
+        assertEquals(16.0, year.averageConsumptionKwhPer100Km)
+        assertEquals(TripEnergyCompleteness.PARTIAL, year.netCompleteness)
+    }
+
+    @Test
+    fun currentTripUsesSameLegacyNetFallbackWithoutDatabaseRewrite() {
+        val session = TripSession(tripId = "open", startedAt = "2026-08-17T12:00:00Z", distanceKm = 10.0, energyKwh = 1.5)
+        val mapped = TripsUiMapper.current(session, UiLanguage.UK).trip
+        assertEquals(1.5, mapped.netKwh)
+        assertEquals(15.0, mapped.averageConsumptionKwhPer100Km)
+        assertEquals(null, mapped.dischargedKwh)
+        assertEquals(null, mapped.regeneratedKwh)
+        assertEquals(TripEnergyCompleteness.COMPLETE, mapped.netCompleteness)
+        assertEquals(null, session.netKwh)
+    }
+
+    private fun map(trip: TripSummary): TripSummaryUi = TripsUiMapper.years(
+        listOf(TripDayGroup(2026, 8, 17, listOf(trip))), UiLanguage.EN
+    ).single().months.single().days.single().trips.single()
 
     @Test
     fun mapsCurrentSessionWithoutInventingAnEndAndKeepsIncrementalSequence() {

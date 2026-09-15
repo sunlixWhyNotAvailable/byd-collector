@@ -13,6 +13,14 @@ class BydCollectorStringsTest {
     }
 
     @Test
+    fun headerLanguageLabelsStayFixedInBothLocalizations() {
+        UiLanguage.entries.forEach { language ->
+            assertEquals("Укр", strings(language).uk)
+            assertEquals("ENG", strings(language).en)
+        }
+    }
+
+    @Test
     fun influxCountersUsePointsInsteadOfMainDatabaseRows() {
         assertEquals("точок", strings(UiLanguage.UK).points)
         assertEquals("points", strings(UiLanguage.EN).points)

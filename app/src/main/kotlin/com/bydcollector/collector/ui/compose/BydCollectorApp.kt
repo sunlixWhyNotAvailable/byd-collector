@@ -957,7 +957,7 @@ private fun TripsTab(
                     val yearExpanded = year.id in session.expandedTripYears
                     TripGroupRow(
                         strings, language, year.title, year.distanceKm, year.netKwh,
-                        year.averageConsumptionKwhPer100Km, year.energyCompleteness,
+                        year.averageConsumptionKwhPer100Km, year.netCompleteness,
                         year.months.sumOf { it.days.sumOf { day -> day.trips.size } },
                         level = 0, expanded = yearExpanded,
                         onClick = { session.setTripYearExpanded(year.id, !yearExpanded, sessionGeneration) }
@@ -966,7 +966,7 @@ private fun TripsTab(
                         val monthExpanded = month.id in session.expandedTripMonths
                         TripGroupRow(
                             strings, language, month.title, month.distanceKm, month.netKwh,
-                            month.averageConsumptionKwhPer100Km, month.energyCompleteness,
+                            month.averageConsumptionKwhPer100Km, month.netCompleteness,
                             month.days.sumOf { it.trips.size },
                             level = 1, expanded = monthExpanded,
                             onClick = { session.setTripMonthExpanded(month.id, !monthExpanded, sessionGeneration) }
@@ -975,7 +975,7 @@ private fun TripsTab(
                             val dayExpanded = day.id in session.expandedTripDays
                             TripGroupRow(
                                 strings, language, day.title, day.distanceKm, day.netKwh,
-                                day.averageConsumptionKwhPer100Km, day.energyCompleteness, day.trips.size,
+                                day.averageConsumptionKwhPer100Km, day.netCompleteness, day.trips.size,
                                 level = 2, expanded = dayExpanded,
                                 onClick = { session.setTripDayExpanded(day.id, !dayExpanded, sessionGeneration) }
                             )
@@ -1161,9 +1161,9 @@ private fun TripTableRow(
         TripTableDivider()
         TripTableCell(formatTripEnergy(trip.regeneratedKwh, trip.energyCompleteness, language, strings), p.text, Modifier.weight(1f))
         TripTableDivider()
-        TripTableCell(formatTripEnergy(trip.netKwh, trip.energyCompleteness, language, strings), p.text, Modifier.weight(1f))
+        TripTableCell(formatTripEnergy(trip.netKwh, trip.netCompleteness, language, strings), p.text, Modifier.weight(1f))
         TripTableDivider()
-        TripTableCell(formatTripConsumption(trip.averageConsumptionKwhPer100Km, trip.energyCompleteness, language, strings), p.green, Modifier.weight(1f), FontWeight.SemiBold)
+        TripTableCell(formatTripConsumption(trip.averageConsumptionKwhPer100Km, trip.netCompleteness, language, strings), p.green, Modifier.weight(1f), FontWeight.SemiBold)
         onRoute?.let { openRoute ->
             TripTableDivider()
             Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {

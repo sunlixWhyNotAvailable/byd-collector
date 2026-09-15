@@ -10,6 +10,10 @@ import com.bydcollector.collector.data.local.TelegramStore
 import com.bydcollector.collector.data.trips.TripDatabaseHelper
 import com.bydcollector.collector.data.trips.TripStore
 import com.bydcollector.collector.data.trips.TripCompression
+import com.bydcollector.collector.data.trips.HistoricalEnergyBackfillRecord
+import com.bydcollector.collector.data.energy.HistoricalEnergyAccumulator
+import com.bydcollector.collector.data.energy.HistoricalEnergyResult
+import com.bydcollector.collector.data.energy.HistoricalBackfillFinalizationGate
 import java.util.concurrent.locks.ReentrantLock
 import com.bydcollector.collector.diagnostics.OperationalEventJournal
 import com.bydcollector.collector.maintenance.DatabaseMaintenanceGate
@@ -29,6 +33,9 @@ import com.bydcollector.collector.util.namedSingleThreadExecutor
 import com.bydcollector.collector.util.sharedOperationalEventExecutor
 import java.io.File
 import java.time.Instant
+import java.util.concurrent.atomic.AtomicBoolean
+import com.bydcollector.collector.data.local.HistoricalMainIdentity
+import com.bydcollector.collector.data.local.HistoricalPollEndpoint
 
 //starts process-scoped app bookkeeping before either CollectorService or MainActivity is created
 class BydCollectorApplication : Application() {
@@ -46,6 +53,13 @@ class BydCollectorApplication : Application() {
     val dashboardUiStateStore by lazy { DashboardUiStateStore() }
     val navigationSession by lazy { UiSessionState() }
     private val updateCheckExecutorDelegate = lazy { namedSingleThreadExecutor("byd-update-check") }
+    private val historicalEnergyExecutorDelegate = lazy { namedSingleThreadExecutor("byd-historical-energy") }
+    private val historicalEnergyScheduled = AtomicBoolean(false)
+    private val historicalEnergyFinished = AtomicBoolean(false)
+    private val historicalEnergyFinalization = HistoricalBackfillFinalizationGate()
+    private var historicalEndpointIndex: HistoricalEndpointIndex? = null
+    private var historicalLastRetry: String? = null
+    private var historicalLastRetryAtElapsedMs = Long.MIN_VALUE
     internal val updateChecks by lazy {
         UpdateCheckSession(updateCheckExecutorDelegate.value) {
             val startedAt = SystemClock.elapsedRealtime()
@@ -80,6 +94,7 @@ class BydCollectorApplication : Application() {
 
     override fun onTerminate() {
         if (updateCheckExecutorDelegate.isInitialized()) updateCheckExecutorDelegate.value.shutdownNow()
+        if (historicalEnergyExecutorDelegate.isInitialized()) historicalEnergyExecutorDelegate.value.shutdownNow()
         tripsStore?.close()
         telemetryStore?.close()
         telegramStore?.close()
@@ -94,6 +109,202 @@ class BydCollectorApplication : Application() {
         val elapsedMs = SystemClock.elapsedRealtime()
         dispatchOperationalEvent(sharedOperationalEventExecutor) {
             operationalEventJournal.append(timestamp, elapsedMs, "update", message, detail)
+        }
+    }
+
+    internal fun beginHistoricalEnergyBackfillOwner(): Long = historicalEnergyFinalization.enable()
+
+    /** Called only after a LIVE cycle proves helper replay has drained. */
+    internal fun scheduleHistoricalEnergyBackfill(generation: Long) {
+        if (!historicalEnergyCanContinue(generation)) return
+        if (historicalEnergyFinished.get()) return
+        if (!historicalEnergyScheduled.compareAndSet(false, true)) return
+        historicalEnergyExecutorDelegate.value.execute {
+            val progressed = runCatching { runHistoricalEnergyBackfillTrip(generation) }
+                .onFailure { recordHistoricalEnergyEvent("retry", it.message ?: it::class.java.simpleName) }
+                .getOrDefault(false)
+            historicalEnergyScheduled.set(false)
+            if (progressed && historicalEnergyCanContinue(generation)) scheduleHistoricalEnergyBackfill(generation)
+        }
+    }
+
+    internal fun cancelHistoricalEnergyBackfill() {
+        historicalEnergyFinalization.cancel()
+    }
+
+    private fun runHistoricalEnergyBackfillTrip(generation: Long): Boolean {
+        if (!historicalEnergyCanContinue(generation)) return false
+        val trips = tripsStoreOrNull() ?: return false
+        if (!tripsFileOperationLock.tryLock()) return historicalEnergyRetry("trips_maintenance_busy")
+        val candidate = try {
+            trips.nextHistoricalEnergyCandidate()
+        } finally {
+            tripsFileOperationLock.unlock()
+        }
+        if (candidate == null) {
+            historicalEnergyFinished.set(true)
+            return false
+        }
+        val endpointIndex = historicalEndpointIndex?.takeIf { candidate.tripId in it.candidateIds }
+            ?: buildHistoricalEndpointIndex(trips, generation)?.also { historicalEndpointIndex = it }
+            ?: return if (historicalEnergyCanContinue(generation)) historicalEnergyRetry("endpoint_index_unavailable") else false
+        val sourceKey = endpointIndex.sourceIdentity.stableKey
+        val reject: (String) -> Boolean = { reason ->
+            val record = HistoricalEnergyBackfillRecord(
+                candidate.tripId, candidate.startedAt, candidate.endedAt!!, sourceKey,
+                "rejected", reason.take(128), Instant.now().toString()
+            )
+            val committed = finalizeHistoricalEnergy(generation, trips, record, null)
+            if (committed) recordHistoricalEnergyEvent("rejected", "trip=${candidate.tripId.take(80)} reason=$reason")
+            committed
+        }
+        val startInstant = runCatching { Instant.parse(candidate.startedAt) }.getOrNull()
+            ?: return reject("malformed_trip_bounds")
+        val endInstant = runCatching { Instant.parse(candidate.endedAt!!) }.getOrNull()
+            ?: return reject("malformed_trip_bounds")
+        val starts = endpointIndex.endpoints[startInstant].orEmpty()
+        val ends = endpointIndex.endpoints[endInstant].orEmpty()
+        if (starts.size != 1) return reject("missing_or_ambiguous_start_bookend")
+        if (ends.size != 1) return reject("missing_or_ambiguous_end_bookend")
+        val first = starts.single()
+        val last = ends.single()
+        if (first.pollId >= last.pollId || first.sessionId != last.sessionId) return reject("invalid_bookend_session_or_order")
+
+        var afterTripId: String? = null
+        while (true) {
+            if (!historicalEnergyCanContinue(generation)) return false
+            val page = tryTripsRead(trips) { closedTripBoundsPage(afterTripId, HISTORICAL_TRIP_PAGE_SIZE) }
+                ?: return historicalEnergyRetry("trips_maintenance_busy")
+            if (page.any { HistoricalEnergyAccumulator.overlaps(candidate, it) }) return reject("ambiguous_overlapping_trip")
+            if (page.size < HISTORICAL_TRIP_PAGE_SIZE) break
+            afterTripId = page.last().tripId
+        }
+
+        val accumulator = HistoricalEnergyAccumulator(candidate, first.pollId, last.pollId, first.sessionId)
+        var afterPollId = first.pollId - 1L
+        while (afterPollId < last.pollId) {
+            if (!historicalEnergyCanContinue(generation)) return false
+            val page = try {
+                tryDatabaseRead {
+                    StoreReadResult(
+                        synchronized(this) { telemetryStore }
+                            ?.historicalEnergyPollPage(first.pollId, last.pollId, afterPollId, HISTORICAL_POLL_PAGE_SIZE)
+                    )
+                }?.value ?: return historicalEnergyRetry("main_maintenance_busy")
+            } catch (error: IllegalArgumentException) {
+                if (error.message?.startsWith("historical_energy_") == true) return reject(error.message!!)
+                throw error
+            }
+            if (page.sourceIdentity.stableKey != sourceKey) {
+                historicalEndpointIndex = null
+                return historicalEnergyRetry("active_main_replaced")
+            }
+            if (page.polls.isEmpty()) break
+            page.polls.forEach(accumulator::accept)
+            val next = page.polls.last().pollId
+            if (next <= afterPollId) return false
+            afterPollId = next
+        }
+        val result = accumulator.finish()
+        val record = HistoricalEnergyBackfillRecord(
+            candidate.tripId,
+            candidate.startedAt,
+            candidate.endedAt!!,
+            sourceKey,
+            if (result is HistoricalEnergyResult.Complete) "complete" else "rejected",
+            when (result) {
+                is HistoricalEnergyResult.Complete -> "complete"
+                is HistoricalEnergyResult.Rejected -> result.reason
+            },
+            Instant.now().toString()
+        )
+        val snapshot = (result as? HistoricalEnergyResult.Complete)?.snapshot
+        val committed = finalizeHistoricalEnergy(generation, trips, record, snapshot)
+        if (committed) recordHistoricalEnergyEvent(record.outcome, "trip=${candidate.tripId.take(80)} reason=${record.reason}")
+        return committed
+    }
+
+    private fun buildHistoricalEndpointIndex(trips: TripStore, generation: Long): HistoricalEndpointIndex? {
+        val candidates = mutableListOf<com.bydcollector.collector.data.trips.TripSession>()
+        var afterTripId: String? = null
+        while (true) {
+            if (!historicalEnergyCanContinue(generation)) return null
+            val page = tryTripsRead(trips) { historicalEnergyCandidatePage(afterTripId, HISTORICAL_TRIP_PAGE_SIZE) } ?: return null
+            candidates += page
+            if (page.size < HISTORICAL_TRIP_PAGE_SIZE) break
+            afterTripId = page.last().tripId
+        }
+        if (candidates.isEmpty()) return null
+        val targets = candidates.flatMap { listOfNotNull(runCatching { Instant.parse(it.startedAt) }.getOrNull(), it.endedAt?.let { end -> runCatching { Instant.parse(end) }.getOrNull() }) }.toSet()
+        val endpoints = targets.associateWith { mutableListOf<HistoricalPollEndpoint>() }.toMutableMap()
+        var sourceIdentity: HistoricalMainIdentity? = null
+        var afterPollId = 0L
+        while (true) {
+            if (!historicalEnergyCanContinue(generation)) return null
+            val page = tryDatabaseRead {
+                StoreReadResult(
+                    synchronized(this) { telemetryStore }?.historicalPollHeaderPage(afterPollId, HISTORICAL_HEADER_PAGE_SIZE)
+                )
+            }?.value ?: return null
+            val expected = sourceIdentity
+            if (expected != null && expected.stableKey != page.sourceIdentity.stableKey) return null
+            sourceIdentity = page.sourceIdentity
+            page.polls.forEach { endpoint ->
+                val instant = runCatching { Instant.parse(endpoint.timestamp) }.getOrNull()
+                endpoints[instant]?.let { matches -> if (matches.size < 2) matches += endpoint }
+            }
+            if (page.polls.size < HISTORICAL_HEADER_PAGE_SIZE) break
+            val next = page.polls.last().pollId
+            if (next <= afterPollId) return null
+            afterPollId = next
+        }
+        return HistoricalEndpointIndex(
+            sourceIdentity = sourceIdentity ?: return null,
+            candidateIds = candidates.mapTo(mutableSetOf()) { it.tripId },
+            endpoints = endpoints
+        )
+    }
+
+    private fun historicalEnergyCanContinue(generation: Long): Boolean =
+        historicalEnergyFinalization.isCurrent(generation)
+
+    private fun finalizeHistoricalEnergy(
+        generation: Long,
+        store: TripStore,
+        record: HistoricalEnergyBackfillRecord,
+        snapshot: com.bydcollector.collector.data.energy.EnergySnapshot?
+    ): Boolean {
+        if (!tripsFileOperationLock.tryLock()) return false
+        return try {
+            historicalEnergyFinalization.finalizeIfCurrent(generation) {
+                store.commitHistoricalEnergyBackfill(record, snapshot)
+            } == true
+        } finally {
+            tripsFileOperationLock.unlock()
+        }
+    }
+
+    private fun historicalEnergyRetry(reason: String): Boolean {
+        recordHistoricalEnergyEvent("retry", reason)
+        return false
+    }
+
+    private fun <T : Any> tryTripsRead(store: TripStore, action: TripStore.() -> T): T? {
+        if (!tripsFileOperationLock.tryLock()) return null
+        return try { store.action() } finally { tripsFileOperationLock.unlock() }
+    }
+
+    private fun recordHistoricalEnergyEvent(message: String, detail: String) {
+        if (message == "retry") {
+            val now = SystemClock.elapsedRealtime()
+            if (detail == historicalLastRetry && now - historicalLastRetryAtElapsedMs < HISTORICAL_RETRY_LOG_INTERVAL_MS) return
+            historicalLastRetry = detail
+            historicalLastRetryAtElapsedMs = now
+        }
+        dispatchOperationalEvent(sharedOperationalEventExecutor) {
+            operationalEventJournal.append(
+                Instant.now().toString(), SystemClock.elapsedRealtime(), "historical_energy", message, detail.take(320)
+            )
         }
     }
 
@@ -174,6 +385,10 @@ class BydCollectorApplication : Application() {
 
     companion object {
         const val TELEGRAM_STORAGE_ERROR = "telegram_storage_migration_failed"
+        private const val HISTORICAL_TRIP_PAGE_SIZE = 64
+        private const val HISTORICAL_POLL_PAGE_SIZE = 128
+        private const val HISTORICAL_HEADER_PAGE_SIZE = 512
+        private const val HISTORICAL_RETRY_LOG_INTERVAL_MS = 30_000L
 
         fun store(context: Context): TelemetryStore {
             return (context.applicationContext as BydCollectorApplication).store()
@@ -220,6 +435,12 @@ class BydCollectorApplication : Application() {
 
     private data class StoreReadResult<T>(val value: T)
 
+    private data class HistoricalEndpointIndex(
+        val sourceIdentity: HistoricalMainIdentity,
+        val candidateIds: Set<String>,
+        val endpoints: Map<Instant, List<HistoricalPollEndpoint>>
+    )
+
     @Synchronized
     private fun trips(): TripStore {
         tripsStore?.let { return it }
@@ -229,6 +450,7 @@ class BydCollectorApplication : Application() {
             tripsStore = store
         }
     }
+
 
     private fun coordinator(): StorageFormatCutoverCoordinator {
         return cutoverCoordinator ?: StorageFormatCutoverCoordinator(

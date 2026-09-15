@@ -14,11 +14,13 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
     private val changedTripSequences = linkedMapOf<String, Long?>()
     private var changeTracking = false
     private var fileAccessSuspended = false
+    private var historicalBackfillChanged = false
 
     @Synchronized
     internal fun beginChangeTracking() {
         check(!changeTracking) { "Trips change tracking already active" }
         changedTripSequences.clear()
+        historicalBackfillChanged = false
         changeTracking = true
     }
 
@@ -26,10 +28,14 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
     internal fun changedTripSequences(): Map<String, Long?> = changedTripSequences.toMap()
 
     @Synchronized
+    internal fun historicalBackfillChanged(): Boolean = historicalBackfillChanged
+
+    @Synchronized
     internal fun endChangeTracking() {
         check(changeTracking) { "Trips change tracking is not active" }
         changeTracking = false
         changedTripSequences.clear()
+        historicalBackfillChanged = false
     }
 
     private fun markSessionChanged(tripId: String) {
@@ -41,6 +47,103 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
         if (!changeTracking) return
         val prior = changedTripSequences[tripId]
         changedTripSequences[tripId] = if (prior == null) firstSequence else minOf(prior, firstSequence)
+    }
+
+    private fun markHistoricalBackfillChanged() {
+        if (changeTracking) historicalBackfillChanged = true
+    }
+
+    @Synchronized
+    internal fun nextHistoricalEnergyCandidate(): TripSession? = querySessions(
+        "state = ? AND ended_at IS NOT NULL AND discharged_kwh IS NULL AND regenerated_kwh IS NULL " +
+            "AND net_kwh IS NULL AND energy_covered_ms IS NULL AND energy_uncovered_ms IS NULL " +
+            "AND energy_partial IS NULL AND energy_observed_at IS NULL " +
+            "AND NOT EXISTS (SELECT 1 FROM historical_energy_backfill b WHERE b.trip_id = trip_sessions.trip_id)",
+        arrayOf(TripSession.STATE_CLOSED),
+        limit = 1
+    ).firstOrNull()
+
+    @Synchronized
+    internal fun historicalEnergyCandidatePage(afterTripId: String?, limit: Int): List<TripSession> {
+        require(limit in 1..100)
+        val eligibility = "state = ? AND ended_at IS NOT NULL AND discharged_kwh IS NULL AND regenerated_kwh IS NULL " +
+            "AND net_kwh IS NULL AND energy_covered_ms IS NULL AND energy_uncovered_ms IS NULL " +
+            "AND energy_partial IS NULL AND energy_observed_at IS NULL " +
+            "AND NOT EXISTS (SELECT 1 FROM historical_energy_backfill b WHERE b.trip_id = trip_sessions.trip_id)"
+        return if (afterTripId == null) {
+            querySessions(eligibility, arrayOf(TripSession.STATE_CLOSED), "trip_id", limit)
+        } else {
+            querySessions("$eligibility AND trip_id > ?", arrayOf(TripSession.STATE_CLOSED, afterTripId), "trip_id", limit)
+        }
+    }
+
+    @Synchronized
+    internal fun closedTripBoundsPage(afterTripId: String?, limit: Int): List<TripSession> {
+        require(limit in 1..100)
+        return if (afterTripId == null) {
+            querySessions("state = ? AND ended_at IS NOT NULL", arrayOf(TripSession.STATE_CLOSED), "trip_id", limit)
+        } else {
+            querySessions(
+                "state = ? AND ended_at IS NOT NULL AND trip_id > ?",
+                arrayOf(TripSession.STATE_CLOSED, afterTripId),
+                "trip_id",
+                limit
+            )
+        }
+    }
+
+    @Synchronized
+    internal fun commitHistoricalEnergyBackfill(record: HistoricalEnergyBackfillRecord, snapshot: EnergySnapshot?): Boolean {
+        require(record.tripId.isNotBlank() && record.startedAt.isNotBlank() && record.endedAt.isNotBlank())
+        require(record.sourceIdentity.isNotBlank() && record.reason.isNotBlank() && record.updatedAt.isNotBlank())
+        require((snapshot == null) == (record.outcome == "rejected"))
+        if (snapshot != null) require(snapshot.powerSessionId == record.tripId && !snapshot.energyPartial && snapshot.energyCoveredMs > 0L)
+        val db = writableDb
+        var committed = false
+        db.beginTransaction()
+        try {
+            val eligibleWhere = "trip_id = ? AND state = 'closed' AND started_at = ? AND ended_at = ? " +
+                "AND discharged_kwh IS NULL AND regenerated_kwh IS NULL AND net_kwh IS NULL " +
+                "AND energy_covered_ms IS NULL AND energy_uncovered_ms IS NULL AND energy_partial IS NULL " +
+                "AND energy_observed_at IS NULL"
+            val args = arrayOf(record.tripId, record.startedAt, record.endedAt)
+            val eligible = if (snapshot == null) {
+                db.rawQuery("SELECT 1 FROM trip_sessions WHERE $eligibleWhere", args).use { it.moveToFirst() }
+            } else {
+                db.update("trip_sessions", snapshot.toEnergyContentValues(), eligibleWhere, args) == 1
+            }
+            if (eligible) {
+                db.insertOrThrow("historical_energy_backfill", null, record.toContentValues())
+                db.setTransactionSuccessful()
+                committed = true
+            }
+        } finally {
+            db.endTransaction()
+        }
+        if (committed) {
+            if (snapshot != null) markSessionChanged(record.tripId)
+            markHistoricalBackfillChanged()
+        }
+        return committed
+    }
+
+    @Synchronized
+    internal fun historicalEnergyBackfillRecords(): List<HistoricalEnergyBackfillRecord> = readableDb.rawQuery(
+        "SELECT trip_id, started_at, ended_at, source_identity, outcome, reason, updated_at FROM historical_energy_backfill ORDER BY trip_id",
+        null
+    ).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.toHistoricalEnergyBackfillRecord()) } }
+
+    @Synchronized
+    internal fun replaceHistoricalEnergyBackfillRecords(records: List<HistoricalEnergyBackfillRecord>) {
+        val db = writableDb
+        db.beginTransaction()
+        try {
+            db.delete("historical_energy_backfill", null, null)
+            records.forEach { db.insertOrThrow("historical_energy_backfill", null, it.toContentValues()) }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
     }
 
     @Synchronized
@@ -725,6 +828,26 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
         if (pendingProjectionJson == null) putNull("pending_projection_json") else put("pending_projection_json", pendingProjectionJson)
         put("updated_at", updatedAt)
     }
+
+    private fun HistoricalEnergyBackfillRecord.toContentValues() = ContentValues().apply {
+        put("trip_id", tripId)
+        put("started_at", startedAt)
+        put("ended_at", endedAt)
+        put("source_identity", sourceIdentity)
+        put("outcome", outcome)
+        put("reason", reason)
+        put("updated_at", updatedAt)
+    }
+
+    private fun Cursor.toHistoricalEnergyBackfillRecord() = HistoricalEnergyBackfillRecord(
+        tripId = getString(0),
+        startedAt = getString(1),
+        endedAt = getString(2),
+        sourceIdentity = getString(3),
+        outcome = getString(4),
+        reason = getString(5),
+        updatedAt = getString(6)
+    )
 
     private fun EnergySnapshot.toEnergyContentValues() = ContentValues().apply {
         putNullable("discharged_kwh", dischargedKwh)

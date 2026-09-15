@@ -8,7 +8,7 @@ class TripEnergyPersistenceContractTest {
     @Test
     fun schemaIsAdditiveAndKeepsCheckpointAndPendingInOneSingletonRow() {
         val schema = source("TripDatabaseHelper.kt")
-        assertTrue(schema.contains("const val DATABASE_VERSION = 4"))
+        assertTrue(schema.contains("const val DATABASE_VERSION = 5"))
         assertTrue(schema.contains("CREATE TABLE IF NOT EXISTS energy_runtime_state"))
         assertTrue(schema.contains("singleton_id INTEGER PRIMARY KEY NOT NULL CHECK (singleton_id = 1)"))
         assertTrue(schema.contains("state_json TEXT NOT NULL"))

@@ -92,6 +92,7 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_route_points_trip_order ON route_points(trip_id, sequence)")
         createRouteChunks(db)
         createEnergyRuntimeState(db)
+        createHistoricalEnergyBackfill(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -108,6 +109,7 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
             db.execSQL("ALTER TABLE trip_sessions ADD COLUMN energy_observed_at TEXT")
             createEnergyRuntimeState(db)
         }
+        if (oldVersion < 5) createHistoricalEnergyBackfill(db)
         onCreate(db)
     }
 
@@ -150,8 +152,25 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
         )
     }
 
+    private fun createHistoricalEnergyBackfill(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS historical_energy_backfill (
+                trip_id TEXT PRIMARY KEY NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT NOT NULL,
+                source_identity TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK (outcome IN ('complete', 'rejected')),
+                reason TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (trip_id) REFERENCES trip_sessions(trip_id) ON DELETE CASCADE
+            )
+            """.trimIndent()
+        )
+    }
+
     companion object {
         const val DATABASE_NAME = "bydcollector_trips.db"
-        const val DATABASE_VERSION = 4
+        const val DATABASE_VERSION = 5
     }
 }

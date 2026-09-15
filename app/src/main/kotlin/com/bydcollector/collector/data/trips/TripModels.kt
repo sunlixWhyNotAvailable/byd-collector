@@ -127,6 +127,16 @@ data class TripDayGroup(
     val tripCount: Int get() = trips.size
 }
 
+internal data class HistoricalEnergyBackfillRecord(
+    val tripId: String,
+    val startedAt: String,
+    val endedAt: String,
+    val sourceIdentity: String,
+    val outcome: String,
+    val reason: String,
+    val updatedAt: String
+)
+
 /** Hash-free internal route proof; diagnostics serializes only the safe fields. */
 internal data class TripRouteDiagnosticPoint(
     val sequence: Long,

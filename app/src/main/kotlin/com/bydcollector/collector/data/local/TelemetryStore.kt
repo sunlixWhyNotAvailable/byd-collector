@@ -36,6 +36,36 @@ import java.util.Collections
 import java.util.LinkedHashMap
 import java.util.Locale
 
+internal data class HistoricalMainIdentity(
+    val canonicalPath: String,
+    val schemaVersion: Long,
+    val userVersion: Long,
+    val lineage: String
+) {
+    val stableKey: String
+        get() = "$canonicalPath|$schemaVersion|$userVersion|$lineage"
+}
+
+internal data class HistoricalPollEndpoint(val pollId: Long, val sessionId: Long, val timestamp: String)
+
+internal data class HistoricalEnergyPoll(
+    val pollId: Long,
+    val sessionId: Long,
+    val timestamp: String,
+    val ok: Boolean,
+    val readings: List<PollReading>
+)
+
+internal data class HistoricalEnergyPollPage(
+    val sourceIdentity: HistoricalMainIdentity,
+    val polls: List<HistoricalEnergyPoll>
+)
+
+internal data class HistoricalPollHeaderPage(
+    val sourceIdentity: HistoricalMainIdentity,
+    val polls: List<HistoricalPollEndpoint>
+)
+
 //central sqlite facade that keeps raw polls, normalized state, mqtt outbox, and influx cursors consistent
 class TelemetryStore(
     private val context: Context,
@@ -1081,6 +1111,88 @@ class TelemetryStore(
 
     fun databaseFile(): File = context.getDatabasePath(TelemetryDatabaseHelper.DATABASE_NAME)
 
+    /** Read-only active-Main access for bounded historical reconstruction; never uses polls.elapsed_ms as time. */
+    internal fun historicalPollHeaderPage(afterPollId: Long, limit: Int): HistoricalPollHeaderPage {
+        require(afterPollId >= 0L && limit in 1..1024)
+        val before = historicalMainIdentity()
+        val polls = helper.readableDatabase.rawQuery(
+            "SELECT id, session_id, ts FROM polls WHERE id > ? ORDER BY id LIMIT $limit",
+            arrayOf(afterPollId.toString())
+        ).use { cursor ->
+            buildList { while (cursor.moveToNext()) add(HistoricalPollEndpoint(cursor.getLong(0), cursor.getLong(1), cursor.getString(2))) }
+        }
+        check(before == historicalMainIdentity()) { "active_main_replaced" }
+        return HistoricalPollHeaderPage(before, polls)
+    }
+
+    internal fun historicalEnergyPollPage(
+        firstPollId: Long,
+        lastPollId: Long,
+        afterPollId: Long,
+        limit: Int
+    ): HistoricalEnergyPollPage {
+        require(firstPollId > 0L && lastPollId >= firstPollId && afterPollId < lastPollId && limit in 1..256)
+        val db = helper.readableDatabase
+        val before = historicalMainIdentity()
+        val columns = tableColumns(db, "poll_values")
+        val keys = HISTORICAL_ENERGY_KEYS.filter { PollValueColumns.raw(it) in columns }
+        require(HISTORICAL_REQUIRED_ENERGY_KEYS.all { PollValueColumns.raw(it) in columns }) {
+            "historical_energy_schema_missing"
+        }
+        val compact = keys.any { PollValueColumns.descId(it) in columns }
+        if (compact) require(tableColumns(db, "decoded_value_dictionary").containsAll(setOf("id", "value"))) {
+            "historical_energy_dictionary_missing"
+        }
+        val valuesSql = keys.joinToString(separator = "") { key ->
+            val raw = quoteIdentifier(PollValueColumns.raw(key))
+            val decoded = when {
+                PollValueColumns.descId(key) in columns ->
+                    "(SELECT d.value FROM decoded_value_dictionary d WHERE d.id = v.${quoteIdentifier(PollValueColumns.descId(key))})"
+                PollValueColumns.desc(key) in columns -> "v.${quoteIdentifier(PollValueColumns.desc(key))}"
+                else -> "NULL"
+            }
+            ", v.$raw, $decoded"
+        }
+        val sql = "SELECT p.id, p.session_id, p.ts, p.ok$valuesSql FROM polls p " +
+            "LEFT JOIN poll_values v ON v.poll_id = p.id WHERE p.id > ? AND p.id >= ? AND p.id <= ? ORDER BY p.id LIMIT $limit"
+        val polls = db.rawQuery(sql, arrayOf(afterPollId.toString(), firstPollId.toString(), lastPollId.toString())).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) {
+                    var index = 4
+                    val readings = keys.map { key ->
+                        PollReading(
+                            rawKey = key,
+                            rawValue = if (cursor.isNull(index)) null else cursor.getString(index),
+                            descValue = if (cursor.isNull(index + 1)) null else cursor.getString(index + 1)
+                        ).also { index += 2 }
+                    }
+                    add(HistoricalEnergyPoll(cursor.getLong(0), cursor.getLong(1), cursor.getString(2), cursor.getInt(3) == 1, readings))
+                }
+            }
+        }
+        check(before == historicalMainIdentity()) { "active_main_replaced" }
+        return HistoricalEnergyPollPage(before, polls)
+    }
+
+    private fun historicalMainIdentity(): HistoricalMainIdentity {
+        val file = databaseFile().canonicalFile
+        val db = helper.readableDatabase
+        fun pragma(name: String): Long = db.rawQuery("PRAGMA $name", null).use { if (it.moveToFirst()) it.getLong(0) else -1L }
+        val lineage = if (tableColumns(db, "storage_meta").containsAll(setOf("schema_family", "created_at_ms"))) {
+            db.rawQuery("SELECT schema_family || ':' || created_at_ms FROM storage_meta ORDER BY schema_family LIMIT 1", null)
+                .use { if (it.moveToFirst()) it.getString(0) else "storage-meta-empty" }
+        } else {
+            db.rawQuery("SELECT id || ':' || session_id || ':' || ts FROM polls ORDER BY id LIMIT 1", null)
+                .use { if (it.moveToFirst()) it.getString(0) else "legacy-empty" }
+        }
+        return HistoricalMainIdentity(file.path, pragma("schema_version"), pragma("user_version"), lineage)
+    }
+
+    private fun tableColumns(db: SQLiteDatabase, table: String): Set<String> =
+        db.rawQuery("PRAGMA table_info(${quoteIdentifier(table)})", null).use { cursor ->
+            buildSet { while (cursor.moveToNext()) add(cursor.getString(1)) }
+        }
+
     private fun activeSessionId(): Long? = scalarLongOrNull(
         "SELECT id FROM collection_sessions WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1"
     )
@@ -1495,6 +1607,18 @@ class TelemetryStore(
     }
 
     companion object {
+        internal val HISTORICAL_REQUIRED_ENERGY_KEYS = listOf(
+            "charging_charge_battery_volt",
+            "charging_charge_current",
+            "bodywork_power_level",
+            "charging_1009_876609586_5"
+        )
+        internal val HISTORICAL_OPTIONAL_VETO_KEYS = listOf(
+            "charging_1009_89128973_5",
+            "charging_charging_vtov_discharge_status",
+            "charging_1009_876609560_5"
+        )
+        internal val HISTORICAL_ENERGY_KEYS = HISTORICAL_REQUIRED_ENERGY_KEYS + HISTORICAL_OPTIONAL_VETO_KEYS
         private const val TAG = "BYDCollectorEvent"
         private const val MAX_ERROR_TEXT_LENGTH = 2_048
         private const val MAX_RAW_RESPONSE_BODY_LENGTH = 4_096

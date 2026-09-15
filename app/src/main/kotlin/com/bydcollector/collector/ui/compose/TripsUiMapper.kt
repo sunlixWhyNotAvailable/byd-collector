@@ -37,6 +37,7 @@ object TripsUiMapper {
                         netKwh = energy.netKwh,
                         averageConsumptionKwhPer100Km = energy.averageConsumptionKwhPer100Km,
                         energyCompleteness = energy.completeness,
+                        netCompleteness = energy.netCompleteness,
                         trips = trips
                     )
                 }
@@ -52,6 +53,7 @@ object TripsUiMapper {
                     netKwh = monthEnergy.netKwh,
                     averageConsumptionKwhPer100Km = monthEnergy.averageConsumptionKwhPer100Km,
                     energyCompleteness = monthEnergy.completeness,
+                    netCompleteness = monthEnergy.netCompleteness,
                     days = days
                 )
             }
@@ -67,6 +69,7 @@ object TripsUiMapper {
                 netKwh = yearEnergy.netKwh,
                 averageConsumptionKwhPer100Km = yearEnergy.averageConsumptionKwhPer100Km,
                 energyCompleteness = yearEnergy.completeness,
+                netCompleteness = yearEnergy.netCompleteness,
                 months = months
             )
         }
@@ -75,6 +78,8 @@ object TripsUiMapper {
     fun current(session: TripSession, language: UiLanguage, route: List<RoutePoint> = emptyList()): CurrentTripUi {
         val start = TripTime.localTime(session.startedAt)
         val end = session.endedAt?.let(TripTime::localTime)
+        val selectedNet = session.netKwh.validNumber() ?: session.energyKwh.validNumber()
+        val splitCompleteness = energyCompleteness(session.dischargedKwh, session.regeneratedKwh, session.netKwh, session.energyPartial)
         val trip = TripSummaryUi(
             id = session.tripId,
             startAt = start?.withNano(0)?.toString() ?: session.startedAt,
@@ -86,14 +91,10 @@ object TripsUiMapper {
             energyKwh = session.energyKwh,
             dischargedKwh = session.dischargedKwh.validNumber(),
             regeneratedKwh = session.regeneratedKwh.validNumber(),
-            netKwh = session.netKwh.validNumber(),
-            averageConsumptionKwhPer100Km = signedAverage(session.netKwh, session.distanceKm),
-            energyCompleteness = energyCompleteness(
-                session.dischargedKwh,
-                session.regeneratedKwh,
-                session.netKwh,
-                session.energyPartial
-            ),
+            netKwh = selectedNet,
+            averageConsumptionKwhPer100Km = signedAverage(selectedNet, session.distanceKm),
+            energyCompleteness = splitCompleteness,
+            netCompleteness = netCompleteness(session.netKwh, session.energyKwh, splitCompleteness),
             energyCoveredMs = session.energyCoveredMs,
             energyUncoveredMs = session.energyUncoveredMs,
             energyObservedAt = session.energyObservedAt?.let { observed ->
@@ -123,6 +124,8 @@ object TripsUiMapper {
     private fun TripSummary.toUi(route: List<RoutePoint>): TripSummaryUi {
         val start = TripTime.localTime(startedAt)
         val end = endedAt?.let(TripTime::localTime)
+        val selectedNet = netKwh.validNumber() ?: energyKwh.validNumber()
+        val splitCompleteness = energyCompleteness(dischargedKwh, regeneratedKwh, netKwh, energyPartial)
         return TripSummaryUi(
             id = tripId,
             startAt = start?.withNano(0)?.toString() ?: startedAt,
@@ -134,9 +137,10 @@ object TripsUiMapper {
             energyKwh = energyKwh,
             dischargedKwh = dischargedKwh.validNumber(),
             regeneratedKwh = regeneratedKwh.validNumber(),
-            netKwh = netKwh.validNumber(),
-            averageConsumptionKwhPer100Km = signedAverage(netKwh, distanceKm),
-            energyCompleteness = energyCompleteness(dischargedKwh, regeneratedKwh, netKwh, energyPartial),
+            netKwh = selectedNet,
+            averageConsumptionKwhPer100Km = signedAverage(selectedNet, distanceKm),
+            energyCompleteness = splitCompleteness,
+            netCompleteness = netCompleteness(netKwh, energyKwh, splitCompleteness),
             energyCoveredMs = energyCoveredMs,
             energyUncoveredMs = energyUncoveredMs,
             energyObservedAt = energyObservedAt,
@@ -167,7 +171,7 @@ object TripsUiMapper {
     private fun aggregateEnergy(trips: List<TripSummaryUi>): EnergyAggregate {
         val averageRows = trips.filter { it.netKwh.validNumber() != null && it.distanceKm.validDistance() != null }
         val completeness = when {
-            trips.none { it.dischargedKwh.validNumber() != null || it.regeneratedKwh.validNumber() != null || it.netKwh.validNumber() != null } ->
+            trips.none { it.dischargedKwh.validNumber() != null || it.regeneratedKwh.validNumber() != null } ->
                 TripEnergyCompleteness.UNAVAILABLE
             trips.all { it.energyCompleteness == TripEnergyCompleteness.COMPLETE } && averageRows.size == trips.size ->
                 TripEnergyCompleteness.COMPLETE
@@ -181,7 +185,13 @@ object TripsUiMapper {
                 averageRows.sumOrNull { it.netKwh.validNumber() },
                 averageRows.sumOrNull { it.distanceKm.validDistance() }
             ),
-            completeness = completeness
+            completeness = completeness,
+            netCompleteness = when {
+                trips.none { it.netKwh.validNumber() != null } -> TripEnergyCompleteness.UNAVAILABLE
+                trips.all { it.netCompleteness == TripEnergyCompleteness.COMPLETE } && averageRows.size == trips.size ->
+                    TripEnergyCompleteness.COMPLETE
+                else -> TripEnergyCompleteness.PARTIAL
+            }
         )
     }
 
@@ -202,6 +212,10 @@ object TripsUiMapper {
     private fun signedAverage(netKwh: Double?, distanceKm: Double?): Double? =
         TripMetrics.averageConsumptionKwhPer100Km(netKwh.validNumber(), distanceKm.validDistance())
 
+    // The legacy total is an approved display fallback, never fabricated gross/regeneration.
+    private fun netCompleteness(netKwh: Double?, legacyKwh: Double?, split: TripEnergyCompleteness): TripEnergyCompleteness =
+        if (netKwh.validNumber() == null && legacyKwh.validNumber() != null) TripEnergyCompleteness.COMPLETE else split
+
     private fun Double?.validNumber(): Double? = this?.takeIf(Double::isFinite)
 
     private fun Double?.validDistance(): Double? = validNumber()?.takeIf { it > 0.0 }
@@ -216,6 +230,7 @@ object TripsUiMapper {
         val regeneratedKwh: Double?,
         val netKwh: Double?,
         val averageConsumptionKwhPer100Km: Double?,
-        val completeness: TripEnergyCompleteness
+        val completeness: TripEnergyCompleteness,
+        val netCompleteness: TripEnergyCompleteness
     )
 }
