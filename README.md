@@ -75,7 +75,7 @@ This collection can use substantial storage. Stop it after your research session
 
 The `Trips` tab keeps sessions from vehicle power-on to power-off in a separate local database. It stores trip summaries and GPS routes rather than duplicating all telemetry. Sessions without movement are hidden from the ordinary list.
 
-The table separates battery energy used, energy recovered during driving, and signed battery net (used minus recovered). Average consumption uses that net balance and may be negative. These calculated values are also available in the Battery category for MQTT and InfluxDB. Missing readings are not filled with assumed power; incomplete new calculations are marked partial. Older trips retain their previous energy value as battery net and keep the corresponding average consumption; unavailable used/recovered values show a dash.
+The table separates battery energy used, energy recovered during driving, and signed battery net (used minus recovered). Average consumption uses that net balance and may be negative. These calculated values are also available in the Battery category for MQTT and InfluxDB. Missing readings are not filled with assumed power. Data-quality information remains available in stored telemetry. Older trips retain their previous energy value as battery net and keep the corresponding average consumption; unavailable used/recovered values show a dash.
 
 Older trips are recalculated in the background when the current main database still contains complete, usable telemetry for them. If that history is incomplete, their previous balance is retained and average consumption is calculated from that balance and the trip distance. Archived databases are not used for this recalculation.
 
@@ -139,7 +139,7 @@ Charging reports can include SOC, energy, power, local event time (`dd.MM.yyyy H
 
 - A driving segment ends after the vehicle stays in `P` for the configured delay: 5–300 seconds, 10 seconds by default. A shorter stop remains part of the same segment.
 - The first valid vehicle power-off reading triggers an immediate send attempt without waiting for the parking delay. Delivery still depends on connectivity.
-- Current statistics show that drive's energy used, recovered energy, and battery net with net-based average consumption and start/end SOC. Total statistics use the power-on session, including parked consumption; Overall SOC runs from the first drive to the latest reading. Partial energy is marked explicitly. Recognized default templates update automatically; custom text and legacy energy variables retain their meaning.
+- Current statistics show that drive's energy used, recovered energy, and battery net with net-based average consumption and start/end SOC. Total statistics use the power-on session, including parked consumption; Overall SOC runs from the first drive to the latest reading. Recognized default templates update automatically; custom text and legacy energy variables retain their meaning.
 - The Overall block is omitted when it duplicates the only trip. Different totals or parked SOC changes keep it visible.
 - A summary requires at least a 1% SOC change, more than 0.1 km, or more than 0.1 kWh.
 
@@ -199,9 +199,9 @@ The autonomous telemetry helper asks Android to keep the CPU awake while it is r
 
 Automatic update checking starts after a short startup delay and can run while the app operates in the background. When Collector is visible, an available update is offered inside the app. Closing an update offer pauses automatic checks for an hour, or until a new app session. Manual checking remains available and always checks the latest published release.
 
-`New version hint widget` is enabled by default. When a background check finds an update, it can show a hint above other apps for 10 seconds. Tap it to open `Options` and the saved update offer, or close it with the X. Returning to Collector removes its hint without repeating the check; minimizing the app does not replay an old hint. The settings button beside the switch adjusts size, transparency, corners, and frame/stripe color; the default accent is green.
+`New version hint widget` is enabled by default. When a background check finds an update, it can show a hint above other apps for 10 seconds. Tap it to open `Options` and the saved update offer, or close it with the X. Returning to Collector removes its hint without repeating the check; minimizing the app does not replay a hint or offer that was already shown. The settings button beside the switch adjusts size, transparency, corners, and frame/stripe color; the default accent is green.
 
-The hint requires Android's permission to display over other apps. Without that permission, normal update offers and collection still work. With compatible BYD HUD and BYD Extend versions, update hints arrange themselves in the available screen area and temporarily shrink when needed; each keeps its own display time and saved appearance settings.
+The hint requires Android's permission to display over other apps, requested through the system settings screen. Declining does not trigger repeated prompts; enable the hint again to retry. If a hint could not be displayed, its saved offer remains available without another network check. Without that permission, normal update offers and collection still work. With compatible BYD HUD and BYD Extend versions, update hints arrange themselves in the available screen area and temporarily shrink when needed; each keeps its own display time and saved appearance settings.
 
 <p align="center"><img src="docs/screenshots/en/options.png" alt="BYD Collector options and runtime settings" width="100%"></p>
 
@@ -215,7 +215,7 @@ The bundle also includes available telemetry-helper startup logs and a summary o
 
 `Clear logs` asks for confirmation, removes completed captures and generated bundles, and resets the event log without stopping an active logcat recording. Unavailable background-service logs may result in partial cleanup. A recently shared copy can remain temporarily so the receiving app can finish reading it. Database archives, trip history, and pending Telegram messages are not cleared.
 
-Before sharing, recognized credentials, explicit coordinates, and private vehicle/chat/account identifiers are masked in the diagnostic copies. App/firmware versions, vehicle names, hosts/IP addresses, and ports remain readable for troubleshooting. Original logs and database archives are not changed. **This filtering does not guarantee that full-system logs are anonymous.**
+Before sharing, recognized credentials, Wi-Fi network identifiers (SSID/BSSID), explicit coordinates, and private vehicle/chat/account identifiers are masked in the diagnostic copies. App/firmware versions, vehicle names, hosts/IP addresses, and ports remain readable for troubleshooting. Original logs and database archives are not changed. **This filtering does not guarantee that full-system logs are anonymous.**
 
 Review the ZIP before sharing: system logs and background-service output may still contain private information or data from other apps. Database archives are shared separately through `Storage` and may contain raw telemetry, trips, and location data.
 

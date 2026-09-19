@@ -82,7 +82,7 @@ object AdbAuthorizationManager {
             var permissionsGranted = !RequiredAccessChecker.hasMissingRequiredAccess(appContext)
             var helperReady = helperReadyAfterRebind(cancellation, helperOwnerMode)
             var adbAuthorized = runtimeSnapshot.adbAuthorized
-            val repairNeeded = !permissionsGranted || !helperReady || RequiredAccessChecker.missingOverlayGrantCommand(appContext) != null
+            val repairNeeded = !permissionsGranted || !helperReady
             val repairAllowed = repairNeeded && (
                 mode == AccessCheckMode.FORCE || repairThrottle.tryAcquire(SystemClock.elapsedRealtime())
             )
@@ -236,23 +236,6 @@ object AdbAuthorizationManager {
                 if (bridge.ok) "Direct autoservice helper is ready" else "Direct autoservice helper is unavailable",
                 "source=$source ${bridge.message}"
             )
-        }
-        RequiredAccessChecker.missingOverlayGrantCommand(appContext)?.let { command ->
-            cancellation.throwIfCancelled()
-            try {
-                val result = client.execShell(command, timeoutMs = 10_000)
-                store.recordEvent(
-                    "update_hint_overlay_grant",
-                    "Optional update hint permission checked",
-                    "ok=${result.ok} allowed=${android.provider.Settings.canDrawOverlays(appContext)}"
-                )
-            } catch (error: AdbOperationCancelledException) {
-                throw error
-            } catch (error: InterruptedException) {
-                throw error
-            } catch (error: Exception) {
-                store.recordEvent("update_hint_overlay_grant_failed", "Optional update hint permission unavailable", error::class.java.simpleName)
-            }
         }
     }
 

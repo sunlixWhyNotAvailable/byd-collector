@@ -21,7 +21,8 @@ class TelemetryWorkerBinderContractTest {
         val stopClient = client.substringAfter("fun requestStop(ownerMode: DirectHelperOwnerMode)")
             .substringBefore("private fun readWorkerSample")
 
-        assertEquals(9, CollectorHelperProtocol.PROTOCOL_VERSION)
+        assertEquals(10, CollectorHelperProtocol.PROTOCOL_VERSION)
+        assertEquals(-915, CollectorHelperProtocol.STATUS_REPLAY_PENDING)
         assertEquals("spool", CollectorHelperProtocol.SPOOL_MODE_ARG)
         assertEquals(100, CollectorHelperProtocol.MAX_PENDING_WORKER_SAMPLES)
         assertEquals(128, CollectorHelperProtocol.MAX_WORKER_FIELD_COUNT)
@@ -30,6 +31,7 @@ class TelemetryWorkerBinderContractTest {
         assertTrue(daemon.contains("code == CollectorHelperProtocol.TX_WORKER_ACK"))
         assertTrue(client.contains("binder.transact(CollectorHelperProtocol.TX_WORKER_PENDING"))
         assertTrue(client.contains("binder.transact(CollectorHelperProtocol.TX_WORKER_ACK"))
+        assertTrue(client.contains("status = batchStatus"))
         assertTrue(stopEndpoint.contains("boolean accepted = expectedOwnerMode == actualOwnerMode"))
         assertTrue(stopEndpoint.contains("if (accepted)"))
         assertTrue(stopEndpoint.contains("mainHandler.postDelayed"))
@@ -43,6 +45,7 @@ class TelemetryWorkerBinderContractTest {
         assertTrue(daemon.contains("handler.removeCallbacks(this)"))
         assertTrue(daemon.contains("consumerLease.renew(now)"))
         assertTrue(liveBatchEndpoint.contains("workerSpool.pending(1, replaySampleValidator)"))
+        assertTrue(liveBatchEndpoint.contains("BatchResult.replayPending("))
         assertTrue(
             liveBatchEndpoint.indexOf("workerSpool.pending(1, replaySampleValidator)") <
                 liveBatchEndpoint.indexOf("BatchEngine.run(")

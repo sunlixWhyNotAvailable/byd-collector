@@ -8,7 +8,7 @@ public final class CollectorHelperProtocol {
     public static final String SPOOL_MODE_ARG = "spool";
     public static final String LOG_PATH = "/data/local/tmp/bydcollector_helper.log";
     public static final String LOCK_PATH = "/data/local/tmp/bydcollector_helper.lock";
-    public static final int PROTOCOL_VERSION = 9;
+    public static final int PROTOCOL_VERSION = 10;
     public static final int TX_PING = 1;
     public static final int TX_READ = 2;
     public static final int TX_READ_BATCH = 3;
@@ -29,6 +29,7 @@ public final class CollectorHelperProtocol {
     public static final int STATUS_READ_ERROR = -912;
     public static final int STATUS_SPOOL_UNAVAILABLE = -913;
     public static final int STATUS_SAMPLE_NOT_FOUND = -914;
+    public static final int STATUS_REPLAY_PENDING = -915;
 
     public static final int MODE_REJECTED = 0;
     public static final int MODE_NATIVE = 1;

@@ -2,6 +2,13 @@ package com.bydcollector.collector.data.trips
 
 import com.bydcollector.collector.data.energy.EnergySnapshot
 
+internal data class EnergyQuarantineRecord(
+    val identity: String,
+    val row: com.bydcollector.collector.data.energy.EnergyRuntimeRow,
+    val reason: String,
+    val quarantinedAt: String
+)
+
 /** A persisted vehicle power session. A session may span process or kernel gaps. */
 data class TripSession(
     val tripId: String,
@@ -134,7 +141,25 @@ internal data class HistoricalEnergyBackfillRecord(
     val sourceIdentity: String,
     val outcome: String,
     val reason: String,
-    val updatedAt: String
+    val updatedAt: String,
+    val algorithmVersion: Int = ALGORITHM_VERSION
+) {
+    companion object {
+        const val ALGORITHM_VERSION = 2
+        const val RETRY_REASON = "final_off_uncovered_interval"
+    }
+}
+
+/** Shared real OFF bookend: history and reconstruction must use this exact receipt time. */
+internal fun TripSession.closedAtPowerOff(
+    timestamp: String, elapsedMs: Long, bootId: String, segmentId: String
+): TripSession = copy(
+    state = TripSession.STATE_CLOSED,
+    endedAt = timestamp,
+    endElapsedMs = elapsedMs,
+    endBootId = bootId,
+    endSegmentId = segmentId,
+    termination = "power_off"
 )
 
 /** Hash-free internal route proof; diagnostics serializes only the safe fields. */

@@ -102,6 +102,7 @@ internal class UpdateHintOverlay(private val app: BydCollectorApplication) {
             view.doOnPreDraw {
                 if (card !== view || activeResultId != resultId || !attached) return@doOnPreDraw
                 lifetime.shown(SystemClock.elapsedRealtime())
+                app.updateRuntime.onHintPresented(resultId)
                 handler.removeCallbacks(drawTimeout)
                 handler.postDelayed(expire, (lifetime.expiresAtElapsedMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L))
                 UpdateHintCoordinator.markVisible(id, lifetime.expiresAtElapsedMs)

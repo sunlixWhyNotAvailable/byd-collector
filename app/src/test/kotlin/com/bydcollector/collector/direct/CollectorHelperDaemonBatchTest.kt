@@ -133,6 +133,17 @@ class CollectorHelperDaemonBatchTest {
     }
 
     @Test
+    fun replayPendingUsesDedicatedBatchAndFieldStatusWithoutChangingWhitelistRejection() {
+        val replayPending = CollectorHelperDaemon.BatchResult.replayPending(2, "app-gap spool pending")
+        val rejected = CollectorHelperDaemon.BatchResult.rejected(2, "address is not whitelisted")
+
+        assertEquals(CollectorHelperProtocol.STATUS_REPLAY_PENDING, replayPending.batchStatus)
+        assertTrue(replayPending.values.all { it.status == CollectorHelperProtocol.STATUS_REPLAY_PENDING })
+        assertEquals(CollectorHelperProtocol.STATUS_INVALID_REQUEST, rejected.batchStatus)
+        assertTrue(rejected.values.all { it.status == CollectorHelperProtocol.STATUS_NOT_WHITELISTED })
+    }
+
+    @Test
     fun fallbackCatalogKeepsCurrent95AndExactLegacy82StrictAndOrdered() {
         val rows = CollectorHelperDaemon.loadMainRows()
         val legacyRows = requireNotNull(
@@ -345,12 +356,12 @@ class CollectorHelperDaemonBatchTest {
     }
 
     @Test
-    fun protocolV8RejectsStaleOrWrongModeHelpersAndExposesReadOnlyEndpointsOnly() {
+    fun protocolV10RejectsStaleOrWrongModeHelpersAndExposesReadOnlyEndpointsOnly() {
         val protocol = sourceFile("com/bydcollector/collector/direct/CollectorHelperProtocol.java").readText()
         val daemon = sourceFile("com/bydcollector/collector/direct/CollectorHelperDaemon.java").readText()
         val client = sourceFile("com/bydcollector/collector/data/direct/DirectVehicleHelperClient.kt").readText()
 
-        assertEquals(9, CollectorHelperProtocol.PROTOCOL_VERSION)
+        assertEquals(10, CollectorHelperProtocol.PROTOCOL_VERSION)
         assertTrue(client.contains("protocolVersion != CollectorHelperProtocol.PROTOCOL_VERSION"))
         assertTrue(client.contains("DirectHelperOwnerMode.fromProtocolValue(ownerMode)"))
         assertTrue(client.contains("TX_PING"))

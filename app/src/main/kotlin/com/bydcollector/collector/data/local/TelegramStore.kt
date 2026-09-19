@@ -20,18 +20,47 @@ class TelegramStore(
     fun commitTelegramEvents(
         messages: List<TelegramOutboxMessage>,
         stateJson: String?,
-        nowMs: Long = clockMs()
+        nowMs: Long = clockMs(),
+        completionSequence: Long? = null,
+        completionIdentity: String? = null
     ): List<TelegramEnqueueResult> {
-        if (messages.isEmpty() && stateJson == null) return emptyList()
+        require((completionSequence == null) == (completionIdentity == null))
+        if (messages.isEmpty() && stateJson == null && completionSequence == null) return emptyList()
         val db = helper.writableDatabase
         db.beginTransaction()
         try {
+            if (completionSequence != null && hasTripCompletionReceipt(db, completionSequence, completionIdentity!!)) {
+                db.setTransactionSuccessful()
+                return emptyList()
+            }
             val results = messages.map { enqueueTelegramMessage(db, it, nowMs) }
             stateJson?.let { saveTelegramRuntimeState(db, it, nowMs) }
+            if (completionSequence != null) {
+                db.delete("telegram_trip_completion_receipt", "id = 1", emptyArray())
+                db.insertOrThrow("telegram_trip_completion_receipt", null, ContentValues().apply {
+                    put("id", 1)
+                    put("sequence", completionSequence)
+                    put("identity", completionIdentity)
+                })
+            }
             db.setTransactionSuccessful()
             return results
         } finally {
             db.endTransaction()
+        }
+    }
+
+    fun hasTripCompletionReceipt(sequence: Long, identity: String): Boolean =
+        hasTripCompletionReceipt(helper.readableDatabase, sequence, identity)
+
+    private fun hasTripCompletionReceipt(db: SQLiteDatabase, sequence: Long, identity: String): Boolean {
+        require(sequence > 0L && identity.isNotBlank())
+        return db.rawQuery("SELECT sequence, identity FROM telegram_trip_completion_receipt WHERE id = 1", emptyArray()).use {
+            if (!it.moveToFirst()) return@use false
+            check(it.getLong(0) <= sequence) { "Trip completion handoff is out of order" }
+            if (it.getLong(0) != sequence) return@use false
+            check(it.getString(1) == identity) { "Trip completion identity changed" }
+            true
         }
     }
 
@@ -526,60 +555,64 @@ class TelegramStore(
         snapshot: TelegramLegacySnapshot,
         nowMs: Long = clockMs()
     ): TelegramMigrationResult {
-        if (!snapshot.validForImport || snapshot.outbox.size > TelegramDatabaseHelper.MAX_PENDING || snapshot.runtimeStateJson?.isBlank() == true) {
-            return TelegramMigrationResult(
-                status = TelegramMigrationResult.Status.SKIPPED_INVALID,
-                expectedOutboxCount = snapshot.outbox.size,
-                errorMessage = snapshot.readError ?: "Legacy Telegram snapshot is invalid"
-            )
-        }
-        if ((snapshot.runtimeStateJson == null) != (snapshot.runtimeStateUpdatedAtMs == null) ||
-            snapshot.runtimeStateUpdatedAtMs?.let { it < 0L } == true
-        ) {
-            return TelegramMigrationResult(
-                status = TelegramMigrationResult.Status.SKIPPED_INVALID,
-                expectedOutboxCount = snapshot.outbox.size,
-                errorMessage = "Legacy Telegram runtime-state timestamp is invalid"
-            )
-        }
-        snapshot.outbox.firstOrNull { invalidLegacyRow(it) }?.let { row ->
-            return TelegramMigrationResult(
-                status = TelegramMigrationResult.Status.SKIPPED_INVALID,
-                expectedOutboxCount = snapshot.outbox.size,
-                errorMessage = "Legacy Telegram outbox row ${row.id} is invalid"
-            )
-        }
-        snapshot.runtimeStateJson?.let { state ->
-            if (TelegramEventState.fromJsonOrNull(state) == null) {
-                return TelegramMigrationResult(
-                    status = TelegramMigrationResult.Status.SKIPPED_INVALID,
-                    expectedOutboxCount = snapshot.outbox.size,
-                    errorMessage = "Legacy Telegram runtime state is not parseable"
-                )
-            }
-        }
-
-        return runCatching {
+        return try {
             val db = helper.writableDatabase
             db.beginTransaction()
             try {
-                if (mainImportComplete(db)) {
+                // The sidecar marker is authoritative even when Main is temporarily
+                // unreadable or has already been cleaned/archived.
+                val marker = mainImportMarker(db)
+                if (marker.complete) {
                     val copiedCount = countOutbox(db)
-                    // Once Main has been cleaned, an empty legacy snapshot is the
-                    // expected steady state; the sidecar is allowed to contain
-                    // newer rows/state created after the original migration.
-                    val exact = snapshot.outbox.isEmpty() && snapshot.runtimeStateJson == null ||
-                        exactSnapshot(db, snapshot, nowMs)
+                    val cleanupVerified = snapshot.completedImportCleanupVerified(
+                        exactSidecarSnapshot = snapshot.validForImport &&
+                            !snapshot.provenEmpty &&
+                            exactSnapshot(db, snapshot, nowMs)
+                    )
                     db.setTransactionSuccessful()
-                    return@runCatching TelegramMigrationResult(
+                    return TelegramMigrationResult(
                         status = TelegramMigrationResult.Status.ALREADY_COMPLETE,
                         copiedOutboxCount = copiedCount,
                         expectedOutboxCount = snapshot.outbox.size,
-                        stateCopied = snapshot.runtimeStateJson != null && exactRuntimeState(db, snapshot, nowMs),
-                        errorMessage = if (exact) null else "Completed Telegram migration does not match the Main snapshot",
-                        sidecarVerified = exact
+                        stateCopied = marker.importedStatePresent,
+                        errorMessage = if (cleanupVerified) null else "Completed Telegram migration is authoritative; legacy cleanup is not verified",
+                        sidecarVerified = true,
+                        cleanupVerified = cleanupVerified
                     )
                 }
+                if (!snapshot.validForImport || snapshot.outbox.size > TelegramDatabaseHelper.MAX_PENDING || snapshot.runtimeStateJson?.isBlank() == true) {
+                    return TelegramMigrationResult(
+                        status = TelegramMigrationResult.Status.SKIPPED_INVALID,
+                        expectedOutboxCount = snapshot.outbox.size,
+                        errorMessage = snapshot.readError ?: "Legacy Telegram snapshot is invalid"
+                    )
+                }
+                if ((snapshot.runtimeStateJson == null) != (snapshot.runtimeStateUpdatedAtMs == null) ||
+                    snapshot.runtimeStateUpdatedAtMs?.let { it < 0L } == true
+                ) {
+                    return TelegramMigrationResult(
+                        status = TelegramMigrationResult.Status.SKIPPED_INVALID,
+                        expectedOutboxCount = snapshot.outbox.size,
+                        errorMessage = "Legacy Telegram runtime-state timestamp is invalid"
+                    )
+                }
+                snapshot.outbox.firstOrNull { invalidLegacyRow(it) }?.let { row ->
+                    return TelegramMigrationResult(
+                        status = TelegramMigrationResult.Status.SKIPPED_INVALID,
+                        expectedOutboxCount = snapshot.outbox.size,
+                        errorMessage = "Legacy Telegram outbox row ${row.id} is invalid"
+                    )
+                }
+                snapshot.runtimeStateJson?.let { state ->
+                    if (TelegramEventState.fromJsonOrNull(state) == null) {
+                        return TelegramMigrationResult(
+                            status = TelegramMigrationResult.Status.SKIPPED_INVALID,
+                            expectedOutboxCount = snapshot.outbox.size,
+                            errorMessage = "Legacy Telegram runtime state is not parseable"
+                        )
+                    }
+                }
+
                 // A previous process may have inserted rows before dying. IGNORE
                 // makes replay safe; the count checks below reject partial/corrupt copies.
                 snapshot.outbox.forEach { row ->
@@ -628,7 +661,7 @@ class TelegramStore(
                     emptyArray()
                 ).also { check(it == 1) { "Telegram migration marker is missing" } }
                 db.setTransactionSuccessful()
-                TelegramMigrationResult(
+                return TelegramMigrationResult(
                     status = TelegramMigrationResult.Status.COMMITTED,
                     copiedOutboxCount = copiedCount,
                     expectedOutboxCount = snapshot.outbox.size,
@@ -637,7 +670,8 @@ class TelegramStore(
             } finally {
                 db.endTransaction()
             }
-        }.getOrElse { error ->
+        } catch (error: Exception) {
+            if (error is InterruptedException) throw error
             TelegramMigrationResult(
                 status = TelegramMigrationResult.Status.FAILED,
                 expectedOutboxCount = snapshot.outbox.size,
@@ -654,10 +688,22 @@ class TelegramStore(
         emptyArray()
     ).use { cursor -> cursor.moveToFirst() && cursor.getInt(0) == 1 }
 
-    private fun mainImportComplete(db: SQLiteDatabase): Boolean = db.rawQuery(
-        "SELECT main_import_complete FROM telegram_migration_state WHERE id = 1",
+    private fun mainImportMarker(db: SQLiteDatabase): MainImportMarker = db.rawQuery(
+        "SELECT main_import_complete, imported_state_present " +
+            "FROM telegram_migration_state WHERE id = 1",
         emptyArray()
-    ).use { cursor -> cursor.moveToFirst() && cursor.getInt(0) == 1 }
+    ).use { cursor ->
+        if (!cursor.moveToFirst()) MainImportMarker(false, false)
+        else MainImportMarker(
+            complete = cursor.getInt(0) == 1,
+            importedStatePresent = cursor.getInt(1) == 1
+        )
+    }
+
+    private data class MainImportMarker(
+        val complete: Boolean,
+        val importedStatePresent: Boolean
+    )
 
     private fun countOutbox(): Int = countOutbox(helper.readableDatabase)
 

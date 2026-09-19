@@ -8,7 +8,8 @@ class TripEnergyPersistenceContractTest {
     @Test
     fun schemaIsAdditiveAndKeepsCheckpointAndPendingInOneSingletonRow() {
         val schema = source("TripDatabaseHelper.kt")
-        assertTrue(schema.contains("const val DATABASE_VERSION = 5"))
+        assertTrue(schema.contains("const val DATABASE_VERSION = 6"))
+        assertTrue(schema.contains("CREATE TABLE IF NOT EXISTS energy_runtime_quarantine"))
         assertTrue(schema.contains("CREATE TABLE IF NOT EXISTS energy_runtime_state"))
         assertTrue(schema.contains("singleton_id INTEGER PRIMARY KEY NOT NULL CHECK (singleton_id = 1)"))
         assertTrue(schema.contains("state_json TEXT NOT NULL"))
@@ -39,6 +40,9 @@ class TripEnergyPersistenceContractTest {
         assertTrue(compression.contains("candidateStore.replaceEnergyRuntimeRow(store.readEnergyRuntimeRow())"))
         assertTrue(compression.contains("sameEnergyRuntime(store, candidateStore)"))
         assertTrue(compression.contains("store.readEnergyRuntimeRow() == expectedEnergyRuntime"))
+        assertTrue(compression.contains("candidateStore.replaceEnergyQuarantineRecords(snapshotStore.energyQuarantineRecords())"))
+        assertTrue(compression.contains("candidateStore.replaceEnergyQuarantineRecords(store.energyQuarantineRecords())"))
+        assertTrue(compression.contains("store.energyQuarantineRecords() == expectedEnergyQuarantine"))
     }
 
     private fun source(name: String): String = listOf(

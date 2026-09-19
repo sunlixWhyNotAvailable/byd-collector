@@ -5,6 +5,7 @@ import com.bydcollector.collector.data.local.Clock
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class InfluxExportCoordinatorTest {
@@ -448,7 +449,8 @@ class InfluxExportCoordinatorTest {
         assertEquals(1, store.influxEvents.count { it.eventType == "influx_export_poison_row" })
         val poison = store.influxEvents.single { it.eventType == "influx_export_poison_row" }
         assertTrue(poison.message.orEmpty().contains("history_id=3"))
-        assertTrue(poison.message.orEmpty().contains("reason=partial_write"))
+        assertTrue(poison.message.orEmpty().contains("reason=field_type_conflict"))
+        assertEquals(1, poison.batchCount)
         assertEquals(3L, poison.fromHistoryId)
         assertEquals(3L, poison.toHistoryId)
     }
@@ -481,6 +483,189 @@ class InfluxExportCoordinatorTest {
         assertFalse(result.ok)
         assertEquals(listOf(300), store.pendingBatchLimits)
         assertEquals(listOf(4), client.writtenLines.map { it.size })
+        assertEquals(0L, store.cursor("soc").lastExportedHistoryId)
+    }
+
+    @Test
+    fun `recognized 422 retention error is split per row without skipping valid neighbors`() {
+        val store = FakeInfluxStore((1L..4L).map { id -> row(id, "soc") })
+        val retention = InfluxActionResult.fail(
+            "influx_http_error",
+            "partial write: points beyond retention policy dropped=1",
+            httpStatus = 422,
+            failureKind = InfluxFailureKind.DATA
+        )
+        val client = ScriptedInfluxClient(
+            retention,
+            InfluxActionResult.ok(),
+            retention,
+            retention,
+            InfluxActionResult.ok()
+        )
+
+        val result = coordinator(store, client).runOneCycle(force = true)
+
+        assertTrue(result.ok)
+        assertEquals(listOf(4, 2, 2, 1, 1), client.writtenLineSizes)
+        assertEquals(4L, store.cursor("soc").lastExportedHistoryId)
+        val poison = store.influxEvents.single { it.eventType == "influx_export_poison_row" }
+        assertEquals(1, poison.batchCount)
+        assertTrue(poison.message.orEmpty().contains("reason=retention_policy"))
+    }
+
+    @Test
+    fun `unknown 422 remains pending and enters backoff`() {
+        val store = FakeInfluxStore((1L..2L).map { id -> row(id, "soc") })
+        val client = FakeInfluxClient(
+            writeResult = InfluxActionResult.fail(
+                "influx_http_error",
+                "partial write: unsupported shard rejection",
+                httpStatus = 422,
+                failureKind = InfluxFailureKind.DATA
+            )
+        )
+
+        val result = coordinator(store, client).runOneCycle(force = true)
+
+        assertFalse(result.ok)
+        assertEquals(0L, store.cursor("soc").lastExportedHistoryId)
+        assertEquals("backoff", store.influxExportState().status)
+        assertTrue(store.influxEvents.none { it.eventType == "influx_export_poison_row" })
+    }
+
+    @Test
+    fun `split pass is capped at 64 writes and resume excludes confirmed poison prefix`() {
+        val store = FakeInfluxStore((1L..100L).map { id -> row(id, "soc") })
+        val client = AlwaysDataFailureClient(firstTransportFailure = true)
+        val coordinator = coordinator(
+            store,
+            client,
+            influxConfig = config(alternativeHost = "influx-alt.local", alternativePort = 8087)
+        )
+
+        val first = coordinator.runOneCycle(force = true)
+        val confirmed = store.cursor("soc").lastExportedHistoryId
+
+        assertTrue(first.ok)
+        assertEquals(64, client.writeCalls)
+        assertTrue(confirmed in 1L..99L)
+        assertEquals("scheduled", store.influxExportState().status)
+        val firstSummary = store.influxEvents.single { it.eventType == "influx_export_poison_row" }
+        assertEquals(confirmed.toInt(), firstSummary.batchCount)
+        assertTrue(firstSummary.message.orEmpty().split("history_id=").size - 1 <= 5)
+
+        coordinator.runOneCycle(force = true)
+
+        assertEquals((100L - confirmed).toInt(), client.writtenLineSizes[64])
+        assertTrue(client.writeCalls <= 128)
+    }
+
+    @Test
+    fun `cancellation after successful child preserves cursor and resume starts at remainder`() {
+        val store = FakeInfluxStore((1L..4L).map { id -> row(id, "soc") })
+        val dataFailure = InfluxActionResult.fail(
+            "influx_http_error",
+            "partial write: field type conflict",
+            httpStatus = 400
+        )
+        val client = ScriptedInfluxClient(dataFailure, InfluxActionResult.ok(), InfluxActionResult.ok())
+        lateinit var coordinator: InfluxExportCoordinator
+        coordinator = coordinator(store, client)
+        client.afterWrite = { call -> if (call == 2) coordinator.cancelInFlight() }
+
+        val stopped = coordinator.runOneCycle(force = true)
+
+        assertTrue(stopped.ok)
+        assertEquals(2, client.writeCalls)
+        assertEquals(2L, store.cursor("soc").lastExportedHistoryId)
+        assertEquals(2L, store.influxExportState().pendingRows)
+        client.afterWrite = null
+
+        assertTrue(coordinator.runOneCycle(force = true).ok)
+        assertEquals(listOf(4, 2, 2), client.writtenLineSizes)
+        assertEquals(4L, store.cursor("soc").lastExportedHistoryId)
+    }
+
+    @Test
+    fun `poison summary is emitted once even when a later split fails`() {
+        val store = FakeInfluxStore((1L..2L).map { id -> row(id, "soc") })
+        val dataFailure = InfluxActionResult.fail(
+            "influx_http_error",
+            "partial write: unable to parse",
+            httpStatus = 400
+        )
+        val unknown = InfluxActionResult.fail(
+            "influx_http_error",
+            "unprocessable request",
+            httpStatus = 422,
+            failureKind = InfluxFailureKind.DATA
+        )
+        val client = ScriptedInfluxClient(dataFailure, dataFailure, unknown)
+
+        val result = coordinator(store, client).runOneCycle(force = true)
+
+        assertFalse(result.ok)
+        assertEquals(1L, store.cursor("soc").lastExportedHistoryId)
+        val summaries = store.influxEvents.filter { it.eventType == "influx_export_poison_row" }
+        assertEquals(1, summaries.size)
+        assertEquals(1, summaries.single().batchCount)
+    }
+
+    @Test
+    fun `poison summary survives cancellation later in the same split pass`() {
+        val store = FakeInfluxStore((1L..4L).map { id -> row(id, "soc") })
+        val dataFailure = InfluxActionResult.fail(
+            "influx_http_error",
+            "partial write: field type conflict",
+            httpStatus = 400
+        )
+        val client = ScriptedInfluxClient(dataFailure, dataFailure, dataFailure)
+        lateinit var coordinator: InfluxExportCoordinator
+        coordinator = coordinator(store, client)
+        client.afterWrite = { call -> if (call == 3) coordinator.cancelInFlight() }
+
+        val result = coordinator.runOneCycle(force = true)
+
+        assertTrue(result.ok)
+        assertEquals(1L, store.cursor("soc").lastExportedHistoryId)
+        val summaries = store.influxEvents.filter { it.eventType == "influx_export_poison_row" }
+        assertEquals(1, summaries.size)
+        assertEquals(1, summaries.single().batchCount)
+        assertEquals("scheduled", store.influxExportState().status)
+    }
+
+    @Test
+    fun `interrupted split rethrows with flag and poison logging cannot mask it`() {
+        val store = FakeInfluxStore(
+            rows = (1L..4L).map { id -> row(id, "soc") },
+            eventFailure = IllegalStateException("event store unavailable")
+        )
+        val coordinator = coordinator(store, PoisonThenInterruptedClient())
+
+        try {
+            assertFailsWith<InterruptedException> {
+                coordinator.runOneCycle(force = true)
+            }
+            assertTrue(Thread.currentThread().isInterrupted)
+            assertEquals(1L, store.cursor("soc").lastExportedHistoryId)
+        } finally {
+            Thread.interrupted()
+        }
+    }
+
+    @Test
+    fun `fatal client error is not converted into export backoff`() {
+        val store = FakeInfluxStore(rows = listOf(row(1L, "soc")))
+        val fatal = object : InfluxClient {
+            override fun test(config: InfluxConfig): InfluxActionResult = InfluxActionResult.ok()
+            override fun write(config: InfluxConfig, lines: List<String>): InfluxActionResult {
+                throw AssertionError("fatal")
+            }
+        }
+
+        assertFailsWith<AssertionError> {
+            coordinator(store, fatal).runOneCycle(force = true)
+        }
         assertEquals(0L, store.cursor("soc").lastExportedHistoryId)
     }
 
@@ -768,6 +953,7 @@ class InfluxExportCoordinatorTest {
     ) : InfluxClient {
         private val results = ArrayDeque(results.toList())
         var writeCalls = 0
+        var afterWrite: ((Int) -> Unit)? = null
         val writtenLineSizes = mutableListOf<Int>()
         val configs = mutableListOf<InfluxConfig>()
         val writtenLines = mutableListOf<List<String>>()
@@ -779,13 +965,58 @@ class InfluxExportCoordinatorTest {
             writtenLineSizes += lines.size
             configs += config
             writtenLines += lines
-            return results.removeFirst()
+            return results.removeFirst().also { afterWrite?.invoke(writeCalls) }
+        }
+    }
+
+    private class AlwaysDataFailureClient(
+        private val firstTransportFailure: Boolean = false
+    ) : InfluxClient {
+        var writeCalls = 0
+        val writtenLineSizes = mutableListOf<Int>()
+
+        override fun test(config: InfluxConfig): InfluxActionResult = InfluxActionResult.ok()
+
+        override fun write(config: InfluxConfig, lines: List<String>): InfluxActionResult {
+            writeCalls += 1
+            writtenLineSizes += lines.size
+            if (firstTransportFailure && writeCalls == 1) {
+                return InfluxActionResult.fail(
+                    "influx_network_error",
+                    "primary offline",
+                    failureKind = InfluxFailureKind.TRANSPORT
+                )
+            }
+            return InfluxActionResult.fail(
+                "influx_http_error",
+                "partial write: points beyond retention policy dropped=${lines.size}",
+                httpStatus = 422,
+                failureKind = InfluxFailureKind.DATA
+            )
+        }
+    }
+
+    private class PoisonThenInterruptedClient : InfluxClient {
+        private var writeCalls = 0
+
+        override fun test(config: InfluxConfig): InfluxActionResult = InfluxActionResult.ok()
+
+        override fun write(config: InfluxConfig, lines: List<String>): InfluxActionResult {
+            writeCalls += 1
+            if (writeCalls == 4) throw InterruptedException("stop")
+            return InfluxActionResult.fail(
+                "influx_http_error",
+                "partial write: field type conflict",
+                httpStatus = 400,
+                failureKind = InfluxFailureKind.DATA
+            )
         }
     }
 
     private class FakeInfluxStore(
         rows: List<InfluxPendingHistoryRow>,
-        private val cursorFailureField: String? = null
+        private val cursorFailureField: String? = null,
+        private val eventFailure: RuntimeException? = null
     ) : InfluxExportStore {
         private val rows = rows.toMutableList()
         val cursors = linkedMapOf<String, InfluxCursor>()
@@ -871,7 +1102,8 @@ class InfluxExportCoordinatorTest {
             fromHistoryId: Long?,
             toHistoryId: Long?
         ) {
-            influxEvents += InfluxEvent(eventType, message, fromHistoryId, toHistoryId)
+            eventFailure?.let { throw it }
+            influxEvents += InfluxEvent(eventType, message, batchCount, fromHistoryId, toHistoryId)
         }
 
         fun setNextRetryAt(nextRetryAt: String) {
@@ -893,6 +1125,7 @@ class InfluxExportCoordinatorTest {
     private data class InfluxEvent(
         val eventType: String,
         val message: String?,
+        val batchCount: Int?,
         val fromHistoryId: Long?,
         val toHistoryId: Long?
     )

@@ -163,6 +163,58 @@ object BatteryEnergyIntegrator {
         )
     }
 
+    fun finishSession(
+        previousAnchor: EnergyAnchor?,
+        totals: EnergyTotals,
+        input: EnergyInput
+    ): EnergyIntegrationResult {
+        require(input.powerOn == false) { "Energy session can finish only on confirmed power off" }
+        val intervalMs = previousAnchor
+            ?.takeIf { it.bootId == input.bootId }
+            ?.let { input.elapsedMs - it.elapsedMs }
+        val invalidReason = when {
+            previousAnchor == null -> EnergyIntegrationReason.INVALID_SAMPLE
+            input.externalCharging == true -> EnergyIntegrationReason.EXTERNAL_CHARGING
+            input.gunDisconnected == false -> EnergyIntegrationReason.CHARGE_GUN_CONNECTED
+            input.gunDisconnected != true -> EnergyIntegrationReason.CHARGE_GUN_NOT_CONFIRMED
+            input.bootId.isBlank() || input.elapsedMs < 0L -> EnergyIntegrationReason.INVALID_SAMPLE
+            previousAnchor.bootId.isBlank() || previousAnchor.elapsedMs < 0L || !previousAnchor.powerKw.isFinite() ->
+                EnergyIntegrationReason.INVALID_SAMPLE
+            previousAnchor.bootId != input.bootId -> EnergyIntegrationReason.BOOT_CHANGED
+            intervalMs == null || intervalMs <= 0L -> EnergyIntegrationReason.NON_MONOTONIC_TIME
+            intervalMs > MAX_INTERVAL_MS -> EnergyIntegrationReason.GAP_EXCEEDED
+            !validPower(input) -> EnergyIntegrationReason.INVALID_SAMPLE
+            else -> null
+        }
+        if (invalidReason != null) {
+            val uncoveredMs = intervalMs?.takeIf { it > 0L } ?: 0L
+            return EnergyIntegrationResult(
+                totals = totals.copy(
+                    uncoveredMs = addDuration(totals.uncoveredMs, uncoveredMs),
+                    partial = true
+                ),
+                anchor = null,
+                quality = EnergyIntegrationQuality.PARTIAL,
+                reason = invalidReason
+            )
+        }
+
+        val closingAnchor = requireNotNull(previousAnchor)
+        val durationMs = requireNotNull(intervalMs)
+        val powerKw = requireNotNull(input.voltage) * requireNotNull(input.current) / 1_000.0
+        val energy = splitTrapezoid(closingAnchor.powerKw, powerKw, durationMs)
+        return EnergyIntegrationResult(
+            totals = totals.copy(
+                dischargedKwh = totals.dischargedKwh + energy.dischargedKwh,
+                regeneratedKwh = totals.regeneratedKwh + energy.regeneratedKwh,
+                coveredMs = addDuration(totals.coveredMs, durationMs)
+            ),
+            anchor = null,
+            quality = EnergyIntegrationQuality.COVERED,
+            reason = EnergyIntegrationReason.INTEGRATED
+        )
+    }
+
     private fun partial(
         previousAnchor: EnergyAnchor?,
         totals: EnergyTotals,
@@ -193,6 +245,13 @@ object BatteryEnergyIntegrator {
         quality = EnergyIntegrationQuality.EXCLUDED,
         reason = reason
     )
+
+    private fun validPower(input: EnergyInput): Boolean {
+        val voltage = input.voltage
+        val current = input.current
+        return voltage != null && voltage.isFinite() && voltage > 0.0 &&
+            current != null && current.isFinite() && (voltage * current / 1_000.0).isFinite()
+    }
 
     private fun splitTrapezoid(startKw: Double, endKw: Double, intervalMs: Long): EnergySlice {
         val duration = intervalMs.toDouble()

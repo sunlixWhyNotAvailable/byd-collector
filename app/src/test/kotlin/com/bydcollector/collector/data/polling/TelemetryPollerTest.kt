@@ -45,7 +45,7 @@ class TelemetryPollerTest {
         val poller = TelemetryPoller(
             coordinator = object : PollCycleRunner {
                 override fun pollOnce(sessionId: Long): PollCycleResult {
-                    throw IllegalStateException("database locked")
+                    throw Exception("Android checked exception")
                 }
             },
             clock = clock,
@@ -86,6 +86,24 @@ class TelemetryPollerTest {
         assertTrue(cycleFinished.await(1, TimeUnit.SECONDS))
         poller.stop()
 
+        assertTrue(results.isEmpty())
+    }
+
+    @Test
+    fun replayPendingCycleDoesNotPublishFakeSuccess() {
+        val results = mutableListOf<PollCycleResult>()
+        val cycleFinished = CountDownLatch(1)
+        val poller = TelemetryPoller(
+            coordinator = object : PollCycleRunner {
+                override fun pollOnce(sessionId: Long) = PollCycleResult(null, true, null, 3, 0, deferred = true)
+            },
+            clock = FakeClock(),
+            onCycleResult = { results += it },
+            sleeper = { cycleFinished.countDown(); pollerStopSignal() }
+        )
+        poller.start(1L)
+        assertTrue(cycleFinished.await(1, TimeUnit.SECONDS))
+        assertTrue(poller.stopAndJoin(1_000))
         assertTrue(results.isEmpty())
     }
 

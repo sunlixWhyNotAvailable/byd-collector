@@ -113,7 +113,7 @@ class UserShutdownContractTest {
 
         assertInOrder(shutdown, "awaitSerializedExecutorAction(", "influxCoordinator.stopExport()")
         assertInOrder(shutdown, "influxCoordinator.stopExport()", "mainHandler.post { stopServiceAfterUserShutdown() }")
-        assertInOrder(shutdown, "awaitExecutorTermination(", "mainHandler.post { stopServiceAfterUserShutdown() }")
+        assertInOrder(shutdown, "quiesceTelegramForUserShutdown()", "mainHandler.post { stopServiceAfterUserShutdown() }")
         assertInOrder(shutdown, "shutdownMqttExecutor()", "awaitMqttWorkerTermination(")
         assertTrue(shutdown.contains("if (!mqttStopped || !influxStopped || !telegramStopped)"))
         assertTrue(shutdown.contains("if (!mqttStopped && influxStopped && telegramStopped)"))

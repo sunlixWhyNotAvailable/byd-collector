@@ -659,7 +659,7 @@ class TelemetryStore(
     fun cleanupLegacyTelegramStorage(
         snapshot: TelegramLegacySnapshot,
         migration: TelegramMigrationResult
-    ): Boolean = cleanupLegacyTelegramStorage(snapshot, migration.verified)
+    ): Boolean = cleanupLegacyTelegramStorage(snapshot, migration.cleanupVerified)
 
     private fun mainTableExists(db: SQLiteDatabase, tableName: String): Boolean = db.rawQuery(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",

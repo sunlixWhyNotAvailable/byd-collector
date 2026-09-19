@@ -83,7 +83,7 @@ class CollectorServiceLocationGateContractTest {
         assertTrue(helper.contains("receive_wall_time_ms INTEGER"))
         assertTrue(helper.contains("oldVersion < 2"))
         assertTrue(helper.contains("ALTER TABLE route_points ADD COLUMN receive_wall_time_ms INTEGER"))
-        assertTrue(helper.contains("const val DATABASE_VERSION = 5"))
+        assertTrue(helper.contains("const val DATABASE_VERSION = 6"))
         assertTrue(store.contains("putNullable(\"receive_wall_time_ms\", receiveWallTimeMs)"))
         assertTrue(store.contains("SELECT trip_id, sequence, kind, observed_at, elapsed_ms, receive_wall_time_ms"))
     }

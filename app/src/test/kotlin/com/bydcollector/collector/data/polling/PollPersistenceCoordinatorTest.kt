@@ -9,10 +9,63 @@ import com.bydcollector.collector.data.remote.TelemetryReadResult
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 class PollPersistenceCoordinatorTest {
+    @Test
+    fun replayBarrierDoesNotPersistOrNotifyAMeasurement() {
+        val store = FakePollStorage()
+        val coordinator = PollPersistenceCoordinator(store,
+            FakeTelemetryClient(TelemetryReadResult.ReplayPending(3)), FakeClock("2026-09-19T10:00:00Z"),
+            object : SuccessfulPollObserver {
+                override fun onSuccessfulPoll(sessionId: Long, pollId: Long, timestamp: String,
+                    readings: List<PollReading>, origin: PollOrigin) = error("not a measurement")
+                override fun onSourceFailure(sessionId: Long, pollId: Long, timestamp: String,
+                    origin: PollOrigin, source: PollSampleSource) = error("not a failed measurement")
+            })
+        repeat(2) {
+            val cycle = coordinator.pollOnce(7)
+            assertTrue(cycle.deferred)
+            assertEquals(null, cycle.pollId)
+            assertEquals(null, cycle.timestamp)
+            assertEquals(0L, cycle.pollRowsPersisted)
+        }
+        assertEquals(null, store.insertedInput)
+        assertEquals(listOf("worker_replay_pending"), store.events.map { it.category })
+    }
+
+    @Test
+    fun checkedObserverFailurePreservesRawFailureThrottleAndCategory() {
+        val store = FakePollStorage()
+        val coordinator = PollPersistenceCoordinator(store,
+            FakeTelemetryClient(TelemetryReadResult.Failure("transport", "offline", null, 4)),
+            FakeClock("2026-09-19T10:00:00Z"), object : SuccessfulPollObserver {
+                override fun onSuccessfulPoll(sessionId: Long, pollId: Long, timestamp: String,
+                    readings: List<PollReading>, origin: PollOrigin) = Unit
+                override fun onSourceFailure(sessionId: Long, pollId: Long, timestamp: String,
+                    origin: PollOrigin, source: PollSampleSource) { throw Exception("checked Android-style exception") }
+            })
+        assertEquals("transport", coordinator.pollOnce(7).category)
+        assertEquals(null, coordinator.pollOnce(7).pollId)
+        assertEquals(1, store.actions.count { it.startsWith("insertPoll:") })
+        assertEquals(listOf("normalized_write_error", "poll_failure"), store.events.map { it.category })
+    }
+
+    @Test
+    fun observerCancellationIsNotConvertedIntoStorageFailure() {
+        val store = FakePollStorage()
+        val coordinator = PollPersistenceCoordinator(store,
+            FakeTelemetryClient(TelemetryReadResult.Success("{}", 1, emptyList())),
+            FakeClock("2026-09-19T10:00:00Z"), object : SuccessfulPollObserver {
+                override fun onSuccessfulPoll(sessionId: Long, pollId: Long, timestamp: String,
+                    readings: List<PollReading>, origin: PollOrigin) { throw InterruptedException() }
+            })
+        assertFailsWith<InterruptedException> { coordinator.pollOnce(7) }
+        assertTrue(store.events.isEmpty())
+    }
+
     @Test
     fun failedPollNotifiesOnlyFailureObserverAfterRawPollIsInserted() {
         val clock = FakeClock(now = "2026-09-14T10:00:00Z")

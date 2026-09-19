@@ -92,7 +92,9 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_route_points_trip_order ON route_points(trip_id, sequence)")
         createRouteChunks(db)
         createEnergyRuntimeState(db)
+        createEnergyQuarantine(db)
         createHistoricalEnergyBackfill(db)
+        createTripCompletions(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -110,6 +112,10 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
             createEnergyRuntimeState(db)
         }
         if (oldVersion < 5) createHistoricalEnergyBackfill(db)
+        if (oldVersion in 5 until 6) {
+            db.execSQL("ALTER TABLE historical_energy_backfill ADD COLUMN algorithm_version INTEGER NOT NULL DEFAULT 1")
+        }
+        if (oldVersion < 6) createTripCompletions(db)
         onCreate(db)
     }
 
@@ -163,14 +169,53 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
                 outcome TEXT NOT NULL CHECK (outcome IN ('complete', 'rejected')),
                 reason TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
+                algorithm_version INTEGER NOT NULL DEFAULT 2,
                 FOREIGN KEY (trip_id) REFERENCES trip_sessions(trip_id) ON DELETE CASCADE
             )
             """.trimIndent()
         )
     }
 
+    private fun createEnergyQuarantine(db: SQLiteDatabase) {
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS energy_runtime_quarantine (
+                identity TEXT PRIMARY KEY NOT NULL,
+                state_json TEXT NOT NULL,
+                pending_projection_json TEXT,
+                updated_at TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                quarantined_at TEXT NOT NULL
+            )
+        """.trimIndent())
+    }
+
+    private fun createTripCompletions(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS trip_completion_state (
+                singleton_id INTEGER PRIMARY KEY NOT NULL CHECK (singleton_id = 1),
+                high_water_sequence INTEGER NOT NULL CHECK (high_water_sequence >= 0)
+            )
+            """.trimIndent()
+        )
+        db.execSQL(
+            "INSERT OR IGNORE INTO trip_completion_state(singleton_id, high_water_sequence) VALUES(1, 0)"
+        )
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS trip_completion_outbox (
+                sequence INTEGER PRIMARY KEY NOT NULL CHECK (sequence > 0),
+                identity TEXT NOT NULL UNIQUE CHECK (length(identity) BETWEEN 1 AND 512),
+                observed_at TEXT NOT NULL CHECK (length(observed_at) BETWEEN 1 AND 128),
+                payload TEXT NOT NULL CHECK (length(payload) BETWEEN 1 AND 262144)
+            )
+            """.trimIndent()
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_trip_completion_outbox_fifo ON trip_completion_outbox(sequence)")
+    }
+
     companion object {
         const val DATABASE_NAME = "bydcollector_trips.db"
-        const val DATABASE_VERSION = 5
+        const val DATABASE_VERSION = 6
     }
 }

@@ -12,7 +12,8 @@ class CollectorServiceTelegramRecoveryContractTest {
 
         assertTrue(service.contains("onConfirmedPowerOn = { requestTelegramRecovery(RECOVERY_VEHICLE_ON) }"))
         assertTrue(service.contains("requestTelegramRecovery(\n            if (unblockBlocked) RECOVERY_STARTUP_CREDENTIALS else RECOVERY_STARTUP\n        )"))
-        assertTrue(service.contains("requestTelegramRecovery(RECOVERY_MANUAL_TEST_SUCCESS, submittedGeneration)"))
+        assertTrue(service.contains("requestTelegramRecovery(RECOVERY_MANUAL_TEST_SUCCESS)"))
+        assertTrue(service.contains("coordinator.testConnection { result ->"))
         assertTrue(service.contains("coordinator.recoverPending(request.trigger)"))
         assertTrue(service.contains("telegramRecoveryCoalescer.request(trigger, key, replacePendingKey)"))
         assertTrue(service.contains("onSettled = { completeTelegramRecovery(request.token, generation) }"))

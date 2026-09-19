@@ -3,6 +3,7 @@ package com.bydcollector.collector.data.remote
 import android.content.Context
 import com.bydcollector.collector.adb.AdbLocalClient
 import com.bydcollector.collector.data.direct.DirectAutoserviceReader
+import com.bydcollector.collector.data.direct.DirectAutoserviceSnapshot
 import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
 import com.bydcollector.collector.data.direct.DirectVehicleHelper
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
@@ -26,27 +27,7 @@ class DirectTelemetryClient(
         ensureHelperReady(startedAt, expectedOwnerMode)?.let { return it }
 
         val snapshot = reader.readSnapshot()
-        return if (snapshot.readings.isEmpty()) {
-            //records an explicit failed poll instead of pretending an empty autoservice snapshot is success
-            failure(
-                category = "autoservice_snapshot_empty",
-                message = snapshot.errorSummary().ifBlank { "Direct autoservice helper returned no usable readings" },
-                startedAt = startedAt,
-                rawBody = snapshot.toJson(ok = false, includeFields = false)
-            )
-        } else {
-            val warningMessage = snapshot.errorSummary().takeIf { it.isNotBlank() }
-            //keeps partial successes usable while preserving warning metadata for diagnostics
-            TelemetryReadResult.Success(
-                rawBody = snapshot.toJson(ok = true, includeFields = false),
-                elapsedMs = clock.elapsedRealtimeMs() - startedAt,
-                readings = snapshot.readings,
-                warningCategory = warningMessage?.let { "autoservice_partial_failure" },
-                warningMessage = warningMessage,
-                diagnosticKey = snapshot.batchDiagnostics.stateKey,
-                diagnosticMessage = snapshot.batchDiagnostics.summary()
-            )
-        }
+        return directSnapshotResult(snapshot, clock.elapsedRealtimeMs() - startedAt)
     }
 
     internal fun ensureHelperReady(
@@ -121,5 +102,38 @@ class DirectTelemetryClient(
 
     companion object {
         private const val LAUNCH_FAILURE_BACKOFF_MS = 30_000L
+    }
+}
+
+internal fun directSnapshotResult(
+    snapshot: DirectAutoserviceSnapshot,
+    elapsedMs: Long
+): TelemetryReadResult {
+    if (snapshot.replayPending) {
+        return TelemetryReadResult.ReplayPending(
+            elapsedMs = elapsedMs,
+            rawBody = snapshot.toJson(ok = false, includeFields = false)
+        )
+    }
+    return if (snapshot.readings.isEmpty()) {
+        //records an explicit failed poll instead of pretending an empty autoservice snapshot is success
+        TelemetryReadResult.Failure(
+            category = "autoservice_snapshot_empty",
+            message = snapshot.errorSummary().ifBlank { "Direct autoservice helper returned no usable readings" },
+            rawBody = snapshot.toJson(ok = false, includeFields = false),
+            elapsedMs = elapsedMs
+        )
+    } else {
+        val warningMessage = snapshot.errorSummary().takeIf { it.isNotBlank() }
+        //keeps partial successes usable while preserving warning metadata for diagnostics
+        TelemetryReadResult.Success(
+            rawBody = snapshot.toJson(ok = true, includeFields = false),
+            elapsedMs = elapsedMs,
+            readings = snapshot.readings,
+            warningCategory = warningMessage?.let { "autoservice_partial_failure" },
+            warningMessage = warningMessage,
+            diagnosticKey = snapshot.batchDiagnostics.stateKey,
+            diagnosticMessage = snapshot.batchDiagnostics.summary()
+        )
     }
 }

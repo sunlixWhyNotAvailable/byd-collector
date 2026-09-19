@@ -22,6 +22,11 @@ sealed class TelemetryReadResult {
         override val rawBody: String?,
         override val elapsedMs: Long
     ) : TelemetryReadResult()
+
+    data class ReplayPending(
+        override val elapsedMs: Long,
+        override val rawBody: String? = null
+    ) : TelemetryReadResult()
 }
 
 interface TelemetryClient {

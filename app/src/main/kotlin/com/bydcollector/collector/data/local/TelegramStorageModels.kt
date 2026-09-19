@@ -79,11 +79,42 @@ data class TelegramLegacySnapshot(
     val truncated: Boolean = false,
     val readError: String? = null
 ) {
+    val readUnknown: Boolean
+        get() = readError != null
+
+    val hasProvenLegacyData: Boolean
+        get() = outbox.isNotEmpty() || runtimeStatePresent
+
     val validForImport: Boolean
         get() = readError == null && !truncated && runtimeStateValid
 
+    val provenEmpty: Boolean
+        get() = validForImport && !hasProvenLegacyData
+
     val requiresPreservation: Boolean
         get() = outbox.isNotEmpty() || runtimeStatePresent || !validForImport
+
+    internal fun completedImportCleanupVerified(exactSidecarSnapshot: Boolean): Boolean =
+        validForImport && (provenEmpty || exactSidecarSnapshot)
+
+    internal fun migrationDecision(
+        importAlreadyComplete: Boolean,
+        migrationPreviouslyRequired: Boolean
+    ): TelegramLegacyMigrationDecision = when {
+        importAlreadyComplete -> TelegramLegacyMigrationDecision.VERIFY_COMPLETED_IMPORT
+        hasProvenLegacyData -> TelegramLegacyMigrationDecision.IMPORT_PROVEN_DATA
+        readUnknown -> TelegramLegacyMigrationDecision.RETRY_UNKNOWN_READ
+        migrationPreviouslyRequired && provenEmpty -> TelegramLegacyMigrationDecision.FAIL_PROVEN_MISSING
+        else -> TelegramLegacyMigrationDecision.IMPORT_EMPTY
+    }
+}
+
+internal enum class TelegramLegacyMigrationDecision {
+    VERIFY_COMPLETED_IMPORT,
+    RETRY_UNKNOWN_READ,
+    IMPORT_PROVEN_DATA,
+    FAIL_PROVEN_MISSING,
+    IMPORT_EMPTY
 }
 
 data class TelegramMigrationResult(
@@ -92,7 +123,8 @@ data class TelegramMigrationResult(
     val expectedOutboxCount: Int = 0,
     val stateCopied: Boolean = false,
     val errorMessage: String? = null,
-    val sidecarVerified: Boolean = status == Status.COMMITTED
+    val sidecarVerified: Boolean = status == Status.COMMITTED,
+    val cleanupVerified: Boolean = sidecarVerified
 ) {
     enum class Status {
         COMMITTED,

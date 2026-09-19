@@ -27,9 +27,13 @@ class TripRuntimeEnergyContractTest {
         assertInOrder(runtime, "ensureInitialized()", "powerTracker.observe(decodedPower)")
         assertTrue(runtime.contains("VehiclePowerState.OFF -> handlePowerOff(timestamp, snapshot, diagnosticPowerSession)"))
         assertTrue(runtime.contains("transition?.let(powerTracker::rollback)"))
-        assertInOrder(runtime, "private fun handlePowerOff", "prepareConfirmedPowerOff(")
-        assertInOrder(runtime, "prepareConfirmedPowerOff(", "state = TripSession.STATE_CLOSED")
-        assertInOrder(runtime, "state = TripSession.STATE_CLOSED", "deliverAfterClose()")
+        assertInOrder(runtime, "private fun handlePowerOff", "current.closedAtPowerOff(")
+        assertInOrder(runtime, "current.closedAtPowerOff(", "tripStore.closeSessionWithCompletion(closed, completion)")
+        assertInOrder(runtime, "tripStore.closeSessionWithCompletion(closed, completion)", "onCompletionReady(it.sequence)")
+        assertFalse(runtime.contains("prepareConfirmedPowerOff"))
+        val models = sourceFile("com/bydcollector/collector/data/trips/TripModels.kt").readText()
+        assertTrue(models.contains("endedAt = timestamp"))
+        assertTrue(models.contains("state = TripSession.STATE_CLOSED"))
     }
 
     private fun sourceFile(path: String): File = listOf(

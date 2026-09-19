@@ -49,6 +49,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.painterResource
@@ -137,6 +138,7 @@ fun BydCollectorApp(
     updateHintEnabled: Boolean = true,
     updateHintAppearance: UpdateHintAppearance = UpdateHintAppearance(),
     updateUiState: UpdateUiState = UpdateUiState.Hidden,
+    onUpdateOfferPresented: () -> Unit = {},
     databaseMaintenanceUiState: DbMaintenanceUiState? = null,
     diagnosticsBusy: Boolean = false,
     actionUiState: BydCollectorActionUiState = BydCollectorActionUiState(),
@@ -311,6 +313,7 @@ fun BydCollectorApp(
                         appVersionName = appVersionName,
                         language = language,
                         state = updateUiState,
+                        onPresented = onUpdateOfferPresented,
                         onDismiss = actions::onDismissUpdateDialog,
                         onUpdate = actions::onInstallUpdate
                     )
@@ -1089,7 +1092,6 @@ private fun TripGroupRow(
             Text(
                 buildString {
                     append("${formatTripNumber(distanceKm, language)} ${distanceUnit(language)} • ${formatTripNumber(energyKwh, language)} ${energyUnit(language)} • ${formatTripNumber(averageConsumption, language)} ${consumptionUnit(language)} • ${tripCountLabel(tripCount, language)}")
-                    if (energyCompleteness == TripEnergyCompleteness.PARTIAL) append(" • ${strings.partial}")
                 },
                 color = p.muted,
                 fontSize = 12.sp,
@@ -1235,7 +1237,7 @@ private fun formatTripMetric(
         "%.1f".format(Locale.US, it).let { text -> if (language == UiLanguage.UK) text.replace('.', ',') else text }
     } ?: "—"
     if (formatted == "—") return formatted
-    return "$formatted $unit" + if (completeness == TripEnergyCompleteness.PARTIAL) "\n${strings.partial}" else ""
+    return "$formatted $unit"
 }
 
 private fun distanceUnit(language: UiLanguage) = if (language == UiLanguage.UK) "км" else "km"
@@ -1330,7 +1332,7 @@ private fun TripRouteDialog(
                     consumptionGreen = state.consumptionGreenThreshold,
                     consumptionYellow = state.consumptionYellowThreshold,
                     viewportKey = trip.id,
-                    preserveViewportOnUpdate = currentTrip,
+                    preserveViewportOnUpdate = true,
                     showFinish = !currentTrip || currentTripHasFinish,
                     requireFinalFinish = currentTrip,
                     modifier = Modifier.weight(1f).fillMaxWidth()
@@ -1520,6 +1522,7 @@ private fun updateTripMap(
     )
     if (shouldFitViewport) {
         map.post {
+            if ((map.tag as? TripMapRenderState)?.viewportKey != viewportKey) return@post
             if (p.size == 1) {
                 map.controller.setCenter(GeoPoint(p.first().latitude, p.first().longitude))
                 map.controller.setZoom(14.0)
@@ -2723,6 +2726,7 @@ private fun UpdateCheckDialog(
     appVersionName: String,
     language: UiLanguage,
     state: UpdateUiState,
+    onPresented: () -> Unit,
     onDismiss: () -> Unit,
     onUpdate: () -> Unit
 ) {
@@ -2741,6 +2745,10 @@ private fun UpdateCheckDialog(
             modifier = Modifier
                 .widthIn(min = 360.dp, max = 540.dp)
                 .height(430.dp)
+                .drawWithContent {
+                    drawContent()
+                    if (state is UpdateUiState.Available) onPresented()
+                }
                 .background(p.panel, Rounded8)
                 .border(1.dp, p.borderStrong, Rounded8)
                 .padding(20.dp),

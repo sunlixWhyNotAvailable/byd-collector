@@ -123,6 +123,46 @@ class BatteryEnergyIntegratorTest {
     }
 
     @Test
+    fun confirmedOffIntegratesTheRealClosingEndpointAndAlwaysClearsAnchor() {
+        val anchored = State().advance(input(elapsedMs = 1_000L, current = 100.0))
+        val finished = BatteryEnergyIntegrator.finishSession(
+            anchored.anchor,
+            anchored.totals,
+            input(elapsedMs = 2_000L, current = 100.0, powerOn = false)
+        )
+
+        assertClose(0.011111111111111112, finished.totals.dischargedKwh)
+        assertEquals(1_000L, finished.totals.coveredMs)
+        assertFalse(finished.totals.partial)
+        assertNull(finished.anchor)
+        assertEquals(EnergyIntegrationQuality.COVERED, finished.quality)
+        assertEquals(EnergyIntegrationReason.INTEGRATED, finished.reason)
+    }
+
+    @Test
+    fun invalidClosingEndpointIsAnExplicitGapAndNeverLeavesAnAnchor() {
+        val anchored = State().advance(input(elapsedMs = 1_000L))
+        val invalid = listOf(
+            input(elapsedMs = 2_000L, powerOn = false, voltage = null) to EnergyIntegrationReason.INVALID_SAMPLE,
+            input(elapsedMs = 2_000L, powerOn = false, gunDisconnected = null) to EnergyIntegrationReason.CHARGE_GUN_NOT_CONFIRMED,
+            input(elapsedMs = 2_000L, powerOn = false, externalCharging = true) to EnergyIntegrationReason.EXTERNAL_CHARGING,
+            input(bootId = "boot-b", elapsedMs = 2_000L, powerOn = false) to EnergyIntegrationReason.BOOT_CHANGED,
+            input(elapsedMs = 3_001L, powerOn = false) to EnergyIntegrationReason.GAP_EXCEEDED
+        )
+
+        invalid.forEach { (endpoint, expectedReason) ->
+            val result = BatteryEnergyIntegrator.finishSession(anchored.anchor, anchored.totals, endpoint)
+            assertNull(result.anchor)
+            assertTrue(result.totals.partial)
+            assertEquals(0L, result.totals.coveredMs)
+            assertEquals(expectedReason, result.reason)
+        }
+        assertFails {
+            BatteryEnergyIntegrator.finishSession(anchored.anchor, anchored.totals, input(powerOn = true))
+        }
+    }
+
+    @Test
     fun climateLikeStationarySamplesRemainEligibleAndCalendarIsIrrelevant() {
         var state = State().advance(input(elapsedMs = 86_399_500, current = 5.0))
         state = state.advance(input(elapsedMs = 86_400_000, current = 5.0))

@@ -7,6 +7,48 @@ import kotlin.test.assertTrue
 
 class MainActivityUpdateTimerContractTest {
     @Test
+    fun overlayPermissionIsNativeOptionalAndPromptedOnceUnlessUserRetries() {
+        val activity = source("MainActivity.kt")
+        val access = source("system/RequiredAccessChecker.kt")
+        val adb = source("adb/AdbAuthorizationManager.kt")
+        assertFalse(access.contains("missingOverlayGrantCommand"))
+        assertFalse(adb.contains("SYSTEM_ALERT_WINDOW"))
+        assertFalse(adb.contains("missingOverlayGrantCommand"))
+        assertTrue(adb.contains("val repairNeeded = !permissionsGranted || !helperReady"))
+        val permission = activity.substringAfter("private fun maybeRequestOverlayAccess(")
+            .substringBefore("private fun maybeRunStartupLocationPermission()")
+        assertTrue(permission.contains("!foreground || !mainWindowHasFocus"))
+        assertTrue(permission.contains("!userInitiated && prefs.getBoolean(KEY_OVERLAY_PERMISSION_SETUP_CONSUMED, false)"))
+        assertTrue(permission.indexOf("putBoolean(KEY_OVERLAY_PERMISSION_SETUP_CONSUMED, true)") <
+            permission.indexOf("overlayPermissionLauncher.launch("))
+        assertTrue(permission.contains("Settings.ACTION_MANAGE_OVERLAY_PERMISSION"))
+        assertFalse(permission.contains("requestAccessCheck"))
+        assertFalse(permission.contains("CollectorService"))
+        assertTrue(activity.contains("if (enabled) maybeRequestOverlayAccess(userInitiated = true)"))
+    }
+
+    @Test
+    fun cachedOpportunityIsConsumedOnDrawingNotEligibilityOrVisibility() {
+        val runtime = source("update/UpdateRuntime.kt")
+        val visible = runtime.substringAfter("fun onUiVisible()").substringBefore("fun onUiHidden()")
+        assertFalse(visible.contains("presentation."))
+        val pending = runtime.substringAfter("private fun presentPendingHint()").substringBefore("fun onAutoCheckEnabledChanged()")
+        assertFalse(pending.contains("request("))
+        assertFalse(pending.contains("postDelayed"))
+        val overlay = source("update/UpdateHintOverlay.kt")
+        val draw = overlay.substringAfter("view.doOnPreDraw {").substringBefore("// Bounded safety net")
+        assertTrue(draw.contains("app.updateRuntime.onHintPresented(resultId)"))
+        assertFalse(overlay.substringBefore("view.doOnPreDraw {").contains("onHintPresented("))
+        val activity = source("MainActivity.kt")
+        val sync = activity.substringAfter("private fun syncUpdateCheckUi()").substringBefore("private fun recordUpdateEvent")
+        assertFalse(sync.contains("offer_shown"))
+        assertTrue(activity.contains("renderedOfferResultId?.let(updateRuntime::onOfferPresented)"))
+        val dialog = source("ui/compose/BydCollectorApp.kt").substringAfter("private fun UpdateCheckDialog(")
+            .substringBefore("private fun TripsCompressionDialog(")
+        assertTrue(dialog.replace("\r", "").contains("drawContent()\n                    if (state is UpdateUiState.Available) onPresented()"))
+    }
+
+    @Test
     fun processOwnsTimerAndActivityOnlyReportsVisibility() {
         val activity = source("MainActivity.kt")
         val runtime = source("update/UpdateRuntime.kt")

@@ -45,7 +45,7 @@ class TelegramEnergyEventEngineTest {
     }
 
     @Test
-    fun completeLegAfterEarlierGapIsNotMarkedPartialButTotalIs() {
+    fun energyGapDoesNotAppendUserFacingPartialLabels() {
         val engine = TelegramEventEngine()
         engine.onSuccessfulPoll(vehicle("P", 100.0, 10.0), config, 0L, energy(5_000L, 0.5, 0.1, partial = true, uncoveredMs = 250L))
         engine.onSuccessfulPoll(vehicle("D", 100.0, 10.1), config, 1_000L, energy(6_000L, 0.6, 0.1, partial = true, uncoveredMs = 250L))
@@ -56,8 +56,12 @@ class TelegramEnergyEventEngineTest {
         val summary = engine.onTick(config, false, null, 14_000L).events.single()
         assertEquals("0.2", summary.variables["trip_discharged_kwh"])
         assertEquals("0.1", summary.variables["trip_regenerated_kwh"])
-        assertEquals("0.9 (partial)", summary.variables["total_discharged_kwh"])
-        assertEquals("0.2 (partial)", summary.variables["total_regenerated_kwh"])
+        assertEquals("0.9", summary.variables["total_discharged_kwh"])
+        assertEquals("0.2", summary.variables["total_regenerated_kwh"])
+        val custom = "partial note / частково: {total_discharged_kwh}"
+        assertEquals("partial note / частково: 0.9", com.bydcollector.collector.telegram.TelegramTemplateRenderer.render(
+            TelegramEventType.TRIP_SUMMARY, custom, summary.variables
+        ).text)
     }
 
     @Test
@@ -72,7 +76,7 @@ class TelegramEnergyEventEngineTest {
         val summary = engine.onTick(config, false, null, 14_000L).events.single()
         assertEquals("n/a", summary.variables["trip_discharged_kwh"])
         assertEquals("n/a", summary.variables["trip_net_kwh"])
-        assertEquals("0.3 (partial)", summary.variables["total_discharged_kwh"])
+        assertEquals("0.3", summary.variables["total_discharged_kwh"])
     }
 
     @Test

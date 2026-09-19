@@ -15,6 +15,8 @@ import com.bydcollector.collector.data.local.WorkerPollImportResult
 import com.bydcollector.collector.direct.CollectorHelperProtocol
 import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
 import java.time.Instant
+import org.json.JSONArray
+import org.json.JSONObject
 
 interface WorkerPollStorage {
     fun getActiveCatalogParameters(): List<CatalogParameter>
@@ -87,12 +89,15 @@ class TelemetryWorkerReplayCoordinator(
             for (sample in pending.samples) {
                 if (Thread.currentThread().isInterrupted) throw InterruptedException()
                 lastIdentity = sample.identity
-                val entries = requireNotNull(replayEntriesForCatalog(sample.catalogVersion)) {
-                    "unsupported worker catalog: ${sample.catalogVersion}"
+                val entries = replayEntriesForCatalog(sample.catalogVersion)
+                val input = try {
+                    if (entries == null) throw WorkerSampleFormatException("unsupported worker catalog: ${sample.catalogVersion}")
+                    persistedInput(sample, entries)
+                } catch (error: WorkerSampleFormatException) {
+                    quarantinedInput(sample, error.message.orEmpty())
                 }
-                val input = persistedInput(sample, entries)
                 // Count the fields this helper actually requested, not newly added APP fields.
-                val parameters = entries.map { entry ->
+                val parameters = if (input.errorCategory == "worker_sample_quarantined") emptyList() else entries.orEmpty().map { entry ->
                     requireNotNull(parametersByKey[entry.key]) { "missing replay parameter: ${entry.key}" }
                 }
                 importAttempts += 1L
@@ -129,7 +134,7 @@ class TelemetryWorkerReplayCoordinator(
                 ackAttempts += 1L
                 val ack = try {
                     acknowledgeSample(sample.identity, acknowledgedAtMs())
-                } catch (error: RuntimeException) {
+                } catch (error: Exception) {
                     failedAcks += 1L
                     throw error
                 }
@@ -193,7 +198,8 @@ class TelemetryWorkerReplayCoordinator(
                     valueRowsPersisted = insertedPolls
                 )
             )
-        } catch (error: RuntimeException) {
+        } catch (error: Exception) {
+            if (error is InterruptedException) throw error
             return failure(
                 category = "worker_replay_error",
                 message = "${error::class.java.simpleName}: ${error.message ?: "no message"}",
@@ -219,19 +225,16 @@ class TelemetryWorkerReplayCoordinator(
     }
 
     private fun persistedInput(sample: TelemetryWorkerSample, entries: List<DirectFidEntry>): PersistedPollInput {
-        require(sample.values.size == entries.size) {
-            "worker field count mismatch: expected=${entries.size} actual=${sample.values.size}"
-        }
+        if (sample.values.size != entries.size) throw WorkerSampleFormatException(
+            "worker field count mismatch: expected=${entries.size} actual=${sample.values.size}")
         val fields = entries.mapIndexed { index, entry ->
             val value = sample.values[index]
-            require(
+            if (!(
                 value.fieldIndex == index &&
                     value.tx == entry.tx &&
                     value.dev == entry.dev &&
                     value.fid == entry.fid
-            ) {
-                "worker field mismatch at index=$index"
-            }
+            )) throw WorkerSampleFormatException("worker field mismatch at index=$index")
             DirectAutoserviceField(
                 entry = entry,
                 status = value.status,
@@ -279,6 +282,31 @@ class TelemetryWorkerReplayCoordinator(
             readings = snapshot.readings
         )
     }
+
+    // Only explicit shape/catalogue rejection is terminal. Preserve the entire raw
+    // payload in Main before notifying a source gap and acknowledging the shell file.
+    private fun quarantinedInput(sample: TelemetryWorkerSample, reason: String): PersistedPollInput {
+        val payload = JSONObject().apply {
+            put("identity", JSONObject().put("boot_id", sample.identity.bootId)
+                .put("helper_generation", sample.identity.helperGeneration).put("poll_sequence", sample.identity.pollSequence))
+            put("catalog_version", sample.catalogVersion)
+            put("captured_wall_ms", sample.capturedWallMs); put("captured_elapsed_ms", sample.capturedElapsedMs)
+            put("poll_elapsed_ms", sample.pollElapsedMs); put("batch_status", sample.batchStatus)
+            put("batch_mode", sample.batchMode); put("native_available", sample.nativeAvailable)
+            put("group_failure_count", sample.groupFailureCount); put("error", sample.error ?: JSONObject.NULL)
+            put("values", JSONArray().apply { sample.values.forEach { field ->
+                put(JSONObject().put("field_index", field.fieldIndex).put("tx", field.tx)
+                    .put("dev", field.dev).put("fid", field.fid).put("status", field.status)
+                    .put("raw", field.raw ?: JSONObject.NULL).put("error", field.error ?: JSONObject.NULL))
+            } })
+        }
+        return PersistedPollInput(timestamp = Instant.ofEpochMilli(sample.capturedWallMs).toString(),
+            ok = false, elapsedMs = sample.pollElapsedMs, requestCount = 1,
+            errors = "worker_sample_quarantined: $reason", errorCategory = "worker_sample_quarantined",
+            errorMessage = reason, rawResponseBody = payload.toString(), readings = emptyList())
+    }
+
+    private class WorkerSampleFormatException(message: String) : IllegalArgumentException(message)
 
     private fun failure(
         category: String,

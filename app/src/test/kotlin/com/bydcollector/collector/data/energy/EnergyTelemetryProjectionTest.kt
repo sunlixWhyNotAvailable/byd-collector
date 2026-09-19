@@ -15,8 +15,11 @@ class EnergyTelemetryProjectionTest {
     @Test fun inactiveHighWaterReceiptsDoNotRepublishExpiredMainEnergy() {
         val path = "src/main/kotlin/com/bydcollector/collector/service/CollectorService.kt"
         val source = listOf(java.io.File(path), java.io.File("app/$path")).first { it.isFile }.readText()
-        assertTrue(source.contains("val energyObservations = energyResult.pendingProjection?.snapshot"))
+        assertTrue(source.contains("val energyObservations = energyResult?.pendingProjection?.snapshot"))
         assertFalse(source.contains("val energyObservations = energySnapshot?.let"))
+        assertFalse(source.contains("if (energyResult.stale) return"))
+        val successful = source.substringAfter("override fun onSourcePoll(").substringBefore("override fun onSourceFailure(")
+        assertTrue(successful.indexOf("tripRuntime.onSuccessfulPoll(") < successful.indexOf("finishEnergyAttempt(origin)"))
     }
 
     @Test fun failedPollWiringFeedsOnlyAnUnknownEmptyEnergyReceipt() {
@@ -122,7 +125,8 @@ class EnergyTelemetryProjectionTest {
         val values = EnergyTelemetryProjection.observations(snapshot())
         assertEquals(listOf(1.0, 2.0, -1.0), values.map { it.value.number })
         assertTrue(values.all { it.sourcePollId == null && it.observedAt == AT && it.reason == "partial" })
-        val missing = EnergyTelemetryProjection.observations(snapshot().copy(dischargedKwh = null, regeneratedKwh = null, netKwh = null))
+        val missing = EnergyTelemetryProjection.observations(snapshot().copy(
+            dischargedKwh = null, regeneratedKwh = null, netKwh = null, energyCoveredMs = 0))
         assertTrue(missing.all { it.quality == NormalizedQuality.MISSING && it.value.number == null })
     }
 

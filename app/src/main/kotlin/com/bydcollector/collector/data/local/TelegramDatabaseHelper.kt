@@ -75,6 +75,16 @@ class TelegramDatabaseHelper(
             )
             """.trimIndent()
         )
+        // FIFO completion handoff: advance only together with the rendered batch/state.
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS telegram_trip_completion_receipt (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                sequence INTEGER NOT NULL,
+                identity TEXT NOT NULL
+            )
+            """.trimIndent()
+        )
         db.execSQL(
             """
             INSERT OR IGNORE INTO telegram_migration_state(id, main_import_complete)
@@ -103,7 +113,7 @@ class TelegramDatabaseHelper(
 
     companion object {
         const val DATABASE_NAME = "bydcollector_telegram.db"
-        const val DATABASE_VERSION = 3
+        const val DATABASE_VERSION = 4
         const val MAX_PENDING = 1_000L
         const val RETENTION_MS = 30L * 24L * 60L * 60L * 1_000L
         const val LEGACY_UNCLAIMED_BOT_SCOPE = "__legacy_unclaimed__"

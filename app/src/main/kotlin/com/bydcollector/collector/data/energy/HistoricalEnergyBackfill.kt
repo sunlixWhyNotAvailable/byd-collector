@@ -88,13 +88,16 @@ internal class HistoricalEnergyAccumulator(
         )
         val input = receipt.input
         val finalOff = poll.pollId == lastPollId && input.powerOn == false
-        if (input.externalCharging == true || input.gunDisconnected == false) return reject("charging_veto")
-        // The unchanged live integrator excludes POWER_OFF and cannot account for the positive closure tail.
-        if (finalOff) return reject("final_off_uncovered_interval")
-        if (input.voltage == null || input.current == null || input.powerOn != true || input.gunDisconnected != true) {
-            return reject("missing_or_invalid_required")
+        val integrated = if (finalOff) {
+            BatteryEnergyIntegrator.finishSession(anchor, totals, input)
+        } else {
+            if (input.externalCharging == true || input.gunDisconnected == false) return reject("charging_veto")
+            if (input.voltage == null || input.current == null ||
+                input.powerOn != true || input.gunDisconnected != true) {
+                return reject("missing_or_invalid_required")
+            }
+            BatteryEnergyIntegrator.integrate(anchor, totals, input)
         }
-        val integrated = BatteryEnergyIntegrator.integrate(anchor, totals, input)
         if (
             integrated.reason != EnergyIntegrationReason.INITIAL_ANCHOR &&
             integrated.reason != EnergyIntegrationReason.INTEGRATED

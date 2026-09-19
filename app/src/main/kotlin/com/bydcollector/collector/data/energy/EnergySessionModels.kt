@@ -40,6 +40,12 @@ enum class EnergySessionTransition {
     STOPPED
 }
 
+enum class EnergyRecoveryState {
+    NONE,
+    WAITING_FOR_OFF,
+    WAITING_FOR_ON
+}
+
 data class EnergySnapshot(
     val snapshotId: String,
     val sourceIdentity: String,
@@ -69,12 +75,16 @@ data class EnergySnapshot(
         require(sourceBootId.length <= 256)
         require(powerSessionId == null || (powerSessionId.isNotBlank() && powerSessionId.length <= 520))
         require(startedAt == null || (startedAt.isNotBlank() && startedAt.length <= 128))
+        require((powerSessionId == null) == (startedAt == null))
+        require(!active || (powerSessionId != null && startedAt != null))
         require(reason.isNotBlank() && reason.length <= 128)
         require(sourceElapsedMs >= 0L)
         require(energyCoveredMs >= 0L)
         require(energyUncoveredMs >= 0L)
         require(listOfNotNull(dischargedKwh, regeneratedKwh, netKwh).all(Double::isFinite))
         require((dischargedKwh == null) == (regeneratedKwh == null) && (dischargedKwh == null) == (netKwh == null))
+        require((dischargedKwh != null) == (energyCoveredMs > 0L))
+        require(energyUncoveredMs == 0L || energyPartial)
         if (dischargedKwh != null) {
             require(dischargedKwh >= 0.0 && regeneratedKwh!! >= 0.0)
             require(kotlin.math.abs((dischargedKwh - regeneratedKwh) - netKwh!!) <= NET_EPSILON)
@@ -110,13 +120,15 @@ data class EnergyRuntimeState(
     val totals: EnergyTotals = EnergyTotals(),
     val integrationQuality: EnergyIntegrationQuality = EnergyIntegrationQuality.EXCLUDED,
     val reason: String = REASON_UNAVAILABLE,
-    val currentSnapshot: EnergySnapshot? = null
+    val currentSnapshot: EnergySnapshot? = null,
+    val recoveryState: EnergyRecoveryState = EnergyRecoveryState.NONE
 ) {
     init {
         require(schemaVersion == CURRENT_SCHEMA_VERSION)
         require(!active || (powerSessionId != null && startedAt != null))
         require(powerSessionId == null || (powerSessionId.isNotBlank() && powerSessionId.length <= 520))
         require(startedAt == null || (startedAt.isNotBlank() && startedAt.length <= 128))
+        require((powerSessionId == null) == (startedAt == null))
         require((lastSourceIdentity == null) == (lastSourceBootId == null))
         require((lastSourceIdentity == null) == (lastSourceElapsedMs == null))
         require(lastSourceIdentity == null || (lastSourceIdentity.isNotBlank() && lastSourceIdentity.length <= 512))
@@ -124,20 +136,39 @@ data class EnergyRuntimeState(
         require(lastSourceElapsedMs == null || lastSourceElapsedMs >= 0L)
         require(reason.isNotBlank() && reason.length <= 128)
         anchor?.let {
+            require(active)
             require(it.bootId.isNotBlank() && it.bootId.length <= 256)
             require(it.elapsedMs >= 0L && it.powerKw.isFinite())
+            require(it.bootId == lastSourceBootId)
+            require(it.elapsedMs == lastSourceElapsedMs)
         }
         currentSnapshot?.let {
             require(it.powerSessionId == powerSessionId)
             require(it.startedAt == startedAt)
             require(it.active == active)
+            require(it.energyCoveredMs == totals.coveredMs)
+            require(it.energyUncoveredMs == totals.uncoveredMs)
+            require(it.energyPartial == totals.partial)
+            require(it.dischargedKwh == totals.dischargedKwh.takeIf { totals.coveredMs > 0L })
+            require(it.regeneratedKwh == totals.regeneratedKwh.takeIf { totals.coveredMs > 0L })
+            require(it.netKwh == totals.netKwh.takeIf { totals.coveredMs > 0L })
+            require(it.integrationQuality == integrationQuality)
+            require(it.reason == reason)
+            if (active) {
+                require(it.sourceIdentity == lastSourceIdentity)
+                require(it.sourceBootId == lastSourceBootId)
+                require(it.sourceElapsedMs == lastSourceElapsedMs)
+            }
         }
+        require(recoveryState == EnergyRecoveryState.NONE || (!active && anchor == null && currentSnapshot == null))
     }
 
     companion object {
         const val CURRENT_SCHEMA_VERSION = 1
         const val REASON_UNAVAILABLE = "unavailable"
         const val REASON_STARTED_MID_POWER_SESSION = "started_mid_power_session"
+        const val REASON_RECOVERED_PENDING = "recovered_pending_without_anchor"
+        const val REASON_CORRUPT_STATE = "corrupt_state_waiting_for_power_cycle"
     }
 }
 
@@ -151,6 +182,10 @@ interface EnergyRuntimeStorage {
     fun readEnergyRuntimeRow(): EnergyRuntimeRow?
     fun commitEnergyRuntimeRow(stateJson: String, pendingProjectionJson: String?, updatedAt: String)
     fun clearEnergyPending(expectedPendingJson: String, updatedAt: String): Boolean
+
+    fun quarantineEnergyRuntimeRow(row: EnergyRuntimeRow, reason: String, updatedAt: String) {
+        throw UnsupportedOperationException("Energy runtime quarantine storage is not configured")
+    }
 }
 
 class EnergyProjectionPendingException(val projection: EnergyPendingProjection) :

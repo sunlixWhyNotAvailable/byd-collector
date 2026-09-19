@@ -1,6 +1,8 @@
 package com.bydcollector.collector.telegram
 
 import com.bydcollector.collector.data.local.TelegramLegacySnapshot
+import com.bydcollector.collector.data.local.TelegramLegacyMigrationDecision
+import com.bydcollector.collector.data.local.TelegramMigrationResult
 import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertFalse
@@ -9,10 +11,68 @@ import kotlin.test.assertTrue
 class TelegramSidecarStorageContractTest {
     @Test
     fun legacySnapshotRequiresPreservationForAnyDataOrUncertainRead() {
-        assertFalse(TelegramLegacySnapshot().requiresPreservation)
-        assertTrue(TelegramLegacySnapshot(runtimeStatePresent = true, runtimeStateValid = false).requiresPreservation)
-        assertTrue(TelegramLegacySnapshot(readError = "read failed").requiresPreservation)
+        val empty = TelegramLegacySnapshot()
+        val invalidData = TelegramLegacySnapshot(runtimeStatePresent = true, runtimeStateValid = false)
+        val unknown = TelegramLegacySnapshot(readError = "read failed")
+
+        assertFalse(empty.requiresPreservation)
+        assertTrue(empty.provenEmpty)
+        assertTrue(invalidData.requiresPreservation)
+        assertTrue(invalidData.hasProvenLegacyData)
+        assertTrue(unknown.requiresPreservation)
+        assertTrue(unknown.readUnknown)
+        assertFalse(unknown.hasProvenLegacyData)
+        assertFalse(unknown.provenEmpty)
         assertTrue(TelegramLegacySnapshot(truncated = true).requiresPreservation)
+    }
+
+    @Test
+    fun migrationDecisionSeparatesUnknownProvenMissingAndCompletedSidecar() {
+        val unknown = TelegramLegacySnapshot(readError = "read failed")
+        val empty = TelegramLegacySnapshot()
+        val withData = TelegramLegacySnapshot(runtimeStateJson = "{}", runtimeStateUpdatedAtMs = 1L)
+
+        assertTrue(
+            unknown.migrationDecision(importAlreadyComplete = false, migrationPreviouslyRequired = false) ==
+                TelegramLegacyMigrationDecision.RETRY_UNKNOWN_READ
+        )
+        assertTrue(
+            empty.migrationDecision(importAlreadyComplete = false, migrationPreviouslyRequired = true) ==
+                TelegramLegacyMigrationDecision.FAIL_PROVEN_MISSING
+        )
+        assertTrue(
+            withData.migrationDecision(importAlreadyComplete = false, migrationPreviouslyRequired = false) ==
+                TelegramLegacyMigrationDecision.IMPORT_PROVEN_DATA
+        )
+        assertTrue(
+            unknown.migrationDecision(importAlreadyComplete = true, migrationPreviouslyRequired = true) ==
+                TelegramLegacyMigrationDecision.VERIFY_COMPLETED_IMPORT
+        )
+        val partialRead = TelegramLegacySnapshot(runtimeStatePresent = true, readError = "state payload failed")
+        assertTrue(
+            partialRead.migrationDecision(importAlreadyComplete = false, migrationPreviouslyRequired = false) ==
+                TelegramLegacyMigrationDecision.IMPORT_PROVEN_DATA
+        )
+    }
+
+    @Test
+    fun completedMarkerCanVerifyRuntimeWhileDenyingStaleLegacyCleanup() {
+        val staleLegacy = TelegramLegacySnapshot(runtimeStateJson = "{}", runtimeStateUpdatedAtMs = 1L)
+        assertFalse(staleLegacy.completedImportCleanupVerified(exactSidecarSnapshot = false))
+        assertTrue(TelegramLegacySnapshot().completedImportCleanupVerified(exactSidecarSnapshot = false))
+        assertFalse(
+            TelegramLegacySnapshot(readError = "read failed")
+                .completedImportCleanupVerified(exactSidecarSnapshot = true)
+        )
+
+        val completed = TelegramMigrationResult(
+            status = TelegramMigrationResult.Status.ALREADY_COMPLETE,
+            sidecarVerified = true,
+            cleanupVerified = false
+        )
+
+        assertTrue(completed.verified)
+        assertFalse(completed.cleanupVerified)
     }
 
     @Test
@@ -23,7 +83,8 @@ class TelegramSidecarStorageContractTest {
         val storeSource = store.readText()
 
         assertTrue(source.contains("bydcollector_telegram.db"))
-        assertTrue(source.contains("DATABASE_VERSION = 3"))
+        assertTrue(source.contains("DATABASE_VERSION = 4"))
+        assertTrue(source.contains("CREATE TABLE IF NOT EXISTS telegram_trip_completion_receipt"))
         assertTrue(source.contains("setWriteAheadLoggingEnabled(true)"))
         assertTrue(source.contains("CREATE TABLE IF NOT EXISTS telegram_outbox"))
         assertTrue(source.contains("waits_for_summary_key TEXT"))
@@ -35,8 +96,12 @@ class TelegramSidecarStorageContractTest {
         assertTrue(storeSource.contains("ORDER BY id"))
         assertTrue(storeSource.contains("db.beginTransactionNonExclusive()"))
         assertTrue(storeSource.contains("check(copiedCount == snapshot.outbox.size)"))
-        assertTrue(storeSource.contains("snapshot.outbox.isEmpty() && snapshot.runtimeStateJson == null"))
-        assertTrue(storeSource.contains("sidecarVerified = exact"))
+        assertTrue(storeSource.contains("snapshot.provenEmpty"))
+        assertTrue(storeSource.contains("exactSnapshot(db, snapshot, nowMs)"))
+        assertTrue(storeSource.contains("snapshot.completedImportCleanupVerified("))
+        assertTrue(storeSource.contains("marker.importedStatePresent"))
+        assertTrue(storeSource.contains("sidecarVerified = true"))
+        assertTrue(storeSource.contains("cleanupVerified = cleanupVerified"))
         assertTrue(storeSource.contains("TelegramEventState.fromJsonOrNull(state)"))
         assertTrue(storeSource.contains("fun verifyRuntimeState()"))
         assertTrue(storeSource.contains("TelegramEventState.fromJsonOrNull(cursor.getString(0))"))
@@ -58,6 +123,7 @@ class TelegramSidecarStorageContractTest {
         assertTrue(snapshot.contains("runtimeStatePresent = runtimeStateRowPresent"))
         assertTrue(snapshot.contains("LIMIT ?"))
         assertTrue(cleanup.contains("if (!sidecarCommitVerified || !snapshot.validForImport) return false"))
+        assertTrue(cleanup.contains("migration.cleanupVerified"))
         assertTrue(cleanup.contains("db.setTransactionSuccessful()"))
         assertTrue(cleanup.contains("legacyTableRowCount(db, \"telegram_outbox\") != 0L"))
         assertTrue(cleanup.contains("legacyTableRowCount(db, \"telegram_runtime_state\") != 0L"))
@@ -67,26 +133,58 @@ class TelegramSidecarStorageContractTest {
     }
 
     @Test
-    fun migrationFailurePersistsAcrossMainArchiveAndRetriesWithAFreshSidecarHandle() {
+    fun migrationChecksDurableMarkerBeforeMainAndRetriesWithAFreshSidecarHandle() {
         val app = sourceFile("com/bydcollector/collector/BydCollectorApplication.kt").readText()
+        val sidecar = sourceFile("com/bydcollector/collector/data/local/TelegramStore.kt").readText()
         val settings = sourceFile("com/bydcollector/collector/service/CollectorSettings.kt").readText()
+        val initialize = app.substringAfter("private fun initializeTelegramStorage")
+            .substringBefore("private fun markTelegramStorageFailure")
+        val import = sidecar.substringAfter("fun importLegacySnapshot")
+            .substringBefore("fun migrateFromMain")
 
-        assertTrue(app.contains("snapshot.requiresPreservation"))
-        assertTrue(app.contains("telegramLegacyMigrationUnresolved = true"))
-        assertTrue(app.contains("settings.setTelegramLegacyMigrationRequired(true)"))
-        assertTrue(app.contains("settings.telegramLegacyMigrationRequired() || telegramLegacyMigrationUnresolved"))
-        assertTrue(app.contains("Legacy Telegram data remains in an archived Main database"))
-        assertTrue(app.contains("settings.setTelegramLegacyMigrationRequired(false)"))
         assertInOrder(
-            app,
+            initialize,
+            "sidecar.isMainImportComplete()",
+            "mainStore.readLegacyTelegramSnapshot()",
+            "snapshot.migrationDecision("
+        )
+        assertInOrder(
+            import,
+            "mainImportMarker(db)",
+            "if (!snapshot.validForImport"
+        )
+        assertTrue(initialize.contains("TelegramLegacyMigrationDecision.RETRY_UNKNOWN_READ"))
+        assertTrue(initialize.contains("TelegramLegacyMigrationDecision.IMPORT_PROVEN_DATA"))
+        assertTrue(initialize.contains("TelegramLegacyMigrationDecision.FAIL_PROVEN_MISSING"))
+        assertTrue(initialize.contains("telegramLegacyMigrationUnresolved = true"))
+        assertTrue(initialize.contains("settings.setTelegramLegacyMigrationRequired(true)"))
+        assertTrue(initialize.contains("Legacy Telegram data remains in an archived Main database"))
+        assertTrue(initialize.contains("settings.setTelegramLegacyMigrationRequired(false)"))
+        assertTrue(initialize.contains("TelegramLegacySnapshot("))
+        assertTrue(initialize.contains("if (error is InterruptedException) throw error"))
+        assertTrue(initialize.contains("if (migration.cleanupVerified)"))
+        assertInOrder(
+            initialize,
             "settings.setTelegramLegacyMigrationRequired(false)",
             "mainStore.cleanupLegacyTelegramStorage(snapshot, migration)",
             "telegramLegacyMigrationUnresolved = false"
         )
-        assertTrue(app.contains("telegramStore?.let { runCatching { it.close() } }"))
+        val afterCleanup = initialize.substringAfter("mainStore.cleanupLegacyTelegramStorage(snapshot, migration)")
+        assertFalse(afterCleanup.contains("settings.setTelegramLegacyMigrationRequired(true)"))
+        assertFalse(afterCleanup.contains("markTelegramStorageFailure"))
+        assertTrue(afterCleanup.contains("telegram_legacy_cleanup_deferred"))
+        assertTrue(app.contains("internal fun reconcileTelegramStorage(mainStore: TelemetryStore): TelegramStore?"))
+        assertInOrder(
+            app.substringAfter("internal fun reconcileTelegramStorage"),
+            "telegramStoreOrNull()?.let { return it }",
+            "initializeTelegramStorage(mainStore)",
+            "return telegramStoreOrNull()"
+        )
+        assertTrue(app.contains("telegramStore?.let {"))
+        assertFalse(app.contains("runCatching { it.close() }"))
         assertTrue(app.contains("telegramStore = null"))
         assertTrue(app.contains("StorageFormatCutoverCoordinator.readMainPreflight(mainStore.databaseFile())"))
-        assertInOrder(app, "sidecar.verifyRuntimeState()", "settings.setTelegramLegacyMigrationRequired(false)")
+        assertInOrder(initialize, "sidecar.verifyRuntimeState()", "settings.setTelegramLegacyMigrationRequired(false)")
         assertTrue(settings.contains("KEY_TELEGRAM_LEGACY_MIGRATION_REQUIRED"))
         assertTrue(settings.contains("putBoolean(KEY_TELEGRAM_LEGACY_MIGRATION_REQUIRED, true)"))
         assertTrue(settings.contains("remove(KEY_TELEGRAM_LEGACY_MIGRATION_REQUIRED)"))

@@ -3,6 +3,9 @@ package com.bydcollector.collector.data.energy
 import com.bydcollector.collector.data.local.HistoricalEnergyPoll
 import com.bydcollector.collector.data.local.PollReading
 import com.bydcollector.collector.data.trips.TripSession
+import com.bydcollector.collector.data.trips.closedAtPowerOff
+import com.bydcollector.collector.service.VehiclePowerBoundaryTracker
+import com.bydcollector.collector.service.VehiclePowerState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -27,7 +30,7 @@ class HistoricalEnergyBackfillTest {
     }
 
     @Test
-    fun `final off is excluded only after its interval clock is validated`() {
+    fun `final off with an oversized closing gap cannot claim complete coverage`() {
         val trip = trip("2026-08-21T15:00:00Z", "2026-08-21T15:00:03Z")
         val accumulator = HistoricalEnergyAccumulator(trip, 1, 2, 1)
         accumulator.accept(poll(1, trip.startedAt))
@@ -36,13 +39,49 @@ class HistoricalEnergyBackfillTest {
     }
 
     @Test
-    fun `final off cannot publish a trimmed fragment as complete`() {
+    fun `final off integrates the closing interval instead of trimming it`() {
         val trip = trip("2026-08-21T15:00:00Z", "2026-08-21T15:00:02Z")
         val accumulator = HistoricalEnergyAccumulator(trip, 1, 3, 1)
         accumulator.accept(poll(1, trip.startedAt))
         accumulator.accept(poll(2, "2026-08-21T15:00:01Z"))
-        accumulator.accept(poll(3, trip.endedAt!!, power = "0", voltage = null, current = null, gun = null))
-        assertRejected(accumulator, "final_off_uncovered_interval")
+        accumulator.accept(poll(3, trip.endedAt!!, power = "0"))
+
+        val result = accumulator.finish() as HistoricalEnergyResult.Complete
+        assertEquals(2_000L, result.snapshot.energyCoveredMs)
+        assertEquals(0L, result.snapshot.energyUncoveredMs)
+    }
+
+    @Test
+    fun `production power boundary closes a normal trip that backfills through the shared off path`() {
+        val start = "2026-08-21T15:00:00Z"
+        val middle = "2026-08-21T15:00:01Z"
+        val end = "2026-08-21T15:00:02Z"
+        val tracker = VehiclePowerBoundaryTracker()
+        assertEquals(VehiclePowerState.ON, tracker.observe(2)?.current)
+        assertEquals(null, tracker.observe(2))
+        assertEquals(VehiclePowerState.OFF, tracker.observe(0)?.current)
+        val closed = TripSession(tripId = "trip", startedAt = start)
+            .closedAtPowerOff(end, 2_000L, "boot-a", "segment-a")
+        val accumulator = HistoricalEnergyAccumulator(closed, 1, 3, 1)
+
+        accumulator.accept(poll(1, start))
+        accumulator.accept(poll(2, middle))
+        accumulator.accept(poll(3, end, power = "0"))
+
+        val result = accumulator.finish() as HistoricalEnergyResult.Complete
+        assertEquals(end, closed.endedAt)
+        assertEquals(2_000L, result.snapshot.energyCoveredMs)
+        assertTrue(result.snapshot.dischargedKwh!! > 0.0)
+    }
+
+    @Test
+    fun `invalid final off endpoint rejects instead of claiming complete coverage`() {
+        val trip = trip("2026-08-21T15:00:00Z", "2026-08-21T15:00:01Z")
+        val accumulator = HistoricalEnergyAccumulator(trip, 1, 2, 1)
+        accumulator.accept(poll(1, trip.startedAt))
+        accumulator.accept(poll(2, trip.endedAt!!, power = "0", voltage = null))
+
+        assertRejected(accumulator, "invalid_sample")
     }
 
     @Test
@@ -79,6 +118,7 @@ class HistoricalEnergyBackfillTest {
 
         val zero = HistoricalEnergyAccumulator(trip("2026-08-21T15:00:00Z", "2026-08-21T15:00:01Z"), 1, 2, 1)
         zero.accept(poll(1, "2026-08-21T15:00:00Z", power = "0", voltage = null, current = null, gun = null))
+        // This is the initial bookend, not the final OFF endpoint handled by finishSession.
         assertRejected(zero, "missing_or_invalid_required")
 
         val missingRow = HistoricalEnergyAccumulator(trip("2026-08-21T15:00:00Z", "2026-08-21T15:00:01Z"), 1, 3, 1)

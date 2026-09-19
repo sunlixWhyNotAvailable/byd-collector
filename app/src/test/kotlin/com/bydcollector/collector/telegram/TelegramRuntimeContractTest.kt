@@ -7,6 +7,22 @@ import kotlin.test.assertTrue
 
 class TelegramRuntimeContractTest {
     @Test
+    fun absentStorageRecoversOnExistingWorkerWithGenerationAndInflightGuards() {
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val reconcile = service.substringAfter("private fun reconcileTelegramRuntime")
+            .substringBefore("private fun testTelegramConnection")
+        assertInOrder(reconcile, "if (coordinator == null)",
+            "telegramStorageRecoveryInFlight.compareAndSet(false, true)", "executeTelegram(")
+        assertTrue(reconcile.contains("reconcileTelegramStorage(store)"))
+        assertTrue(reconcile.contains("createTelegramCoordinator()"))
+        assertTrue(reconcile.contains("telegramRecoveryRuntimeAvailable(generation)"))
+        assertTrue(reconcile.contains("telegramStorageRecoveryInFlight.set(false)"))
+        assertTrue(reconcile.contains("CollectorAutoStart.scheduleWatchdog"))
+        assertFalse(reconcile.contains("postDelayed"))
+        assertFalse(reconcile.contains("Thread.sleep"))
+    }
+
+    @Test
     fun newTripsPreserveEveryQueuedTripSummary() {
         val coordinator = sourceFile("com/bydcollector/collector/telegram/TelegramCoordinator.kt").readText()
         val poll = coordinator.substringAfter("fun onSuccessfulPoll")
@@ -39,7 +55,7 @@ class TelegramRuntimeContractTest {
         assertFalse(bind.contains("settings."))
         val observer = service.substringAfter("private fun createSuccessfulPollObserver")
             .substringBefore("private fun createTripRuntimeCoordinator")
-        assertInOrder(observer, "CompletableFuture<String?>()", "executeTelegram(", "tripRuntime.onSuccessfulPoll(")
+        assertInOrder(observer, "CompletableFuture<String?>()", "tripRuntime.onSuccessfulPoll(", "beforeBoundary = { watermark ->", "executeTelegram(", "drainTripCompletions(coordinator, watermark)", "coordinator.onSuccessfulPoll")
         assertTrue(observer.contains("telegramCoordinator === coordinator"))
         assertTrue(observer.contains("telegramWorkGeneration.get() == generation"))
         assertTrue(observer.contains("bind = coordinator::bindTripDiagnosticParent"))
@@ -48,10 +64,10 @@ class TelegramRuntimeContractTest {
         assertFalse(observer.contains("parent.join("))
         val powerOff = runtime.substringAfter("private fun handlePowerOff(")
             .substringBefore("private fun ensureGpsRunning")
-        assertInOrder(powerOff, "updateOpenSession", "diagnosticPowerSession?.complete(current?.tripId)", "prepareConfirmedPowerOff(")
-        val servicePowerOff = service.substringAfter("private fun prepareConfirmedPowerOff")
+        assertInOrder(powerOff, "updateOpenSession", "diagnosticPowerSession?.complete(current?.tripId)", "tripStore.closeSessionWithCompletion(closed, completion)", "onCompletionReady(it.sequence)")
+        val servicePowerOff = service.substringAfter("private fun drainTripCompletions")
             .substringBefore("private fun telegramLocationSnapshot")
-        assertTrue(servicePowerOff.contains("energySnapshot = event.energySnapshot"))
+        assertTrue(servicePowerOff.contains("coordinator.acceptTripCompletion(intent,"))
         val tripsPoll = runtime.substringAfter("fun onSuccessfulPoll(").substringBefore("fun resume()")
         assertTrue(tripsPoll.contains("onDropped = { diagnosticPowerSession?.complete(null) }"))
         assertTrue(tripsPoll.substringAfterLast("finally {").contains("diagnosticPowerSession?.complete(null)"))
@@ -124,7 +140,7 @@ class TelegramRuntimeContractTest {
         val helper = sourceFile("com/bydcollector/collector/data/local/TelegramDatabaseHelper.kt").readText()
         val flush = coordinator.substringAfter("fun flushPending").substringBefore("private fun pendingQueueDeadline")
         val sender = sourceFile("com/bydcollector/collector/telegram/TelegramDeliveryQueue.kt").readText()
-        val attempt = sender.substringAfter("fun flush(").substringBefore("fun pendingDeadline")
+        val attempt = sender.substringAfter("fun beginAttempt(").substringBefore("fun pendingDeadline")
         val oldest = store.substringAfter("fun oldestUnblockedTelegramMessage")
             .substringBefore("fun telegramMessageByDedupeKey")
         val connectionTest = coordinator.substringAfter("fun testConnection")
@@ -135,22 +151,25 @@ class TelegramRuntimeContractTest {
         assertTrue(oldest.contains("ORDER BY id"))
         assertTrue(oldest.contains("LIMIT 1"))
         assertTrue(oldest.contains("WHERE blocked = 0"))
-        assertTrue(flush.contains("delivery.flush"))
+        assertTrue(flush.contains("dispatchAttempt(delivery.beginAttempt"))
+        assertTrue(flush.contains("delivery.completeAttempt(attempt, response)"))
+        assertFalse(coordinator.contains("delivery.flush("))
+        assertFalse(coordinator.contains("delivery.testConnection("))
         assertTrue(attempt.contains("oldestDueTelegramMessage(now)"))
         assertInOrder(attempt, "entry.blocked || entry.waitsForSummaryKey", "entry.nextAttemptAtMs > now")
         assertInOrder(attempt, "entry.nextAttemptAtMs > now", "Thread.currentThread().isInterrupted")
-        assertInOrder(attempt, "Thread.currentThread().isInterrupted", "send(TelegramSendMessage")
+        assertInOrder(attempt, "Thread.currentThread().isInterrupted", "return TelegramDeliveryAttempt(")
         assertFalse(flush.contains("for ("))
         assertTrue(attempt.contains("entry.failureCount + 1"))
         assertTrue(attempt.contains("markTelegramBlocked"))
         assertTrue(attempt.contains("entry.waitsForSummaryKey"))
-        assertInOrder(attempt, "entry.waitsForSummaryKey", "send(TelegramSendMessage")
-        assertInOrder(attempt, "telegramServerNotBefore", "send(TelegramSendMessage")
+        assertInOrder(attempt, "entry.waitsForSummaryKey", "return TelegramDeliveryAttempt(")
+        assertInOrder(attempt, "telegramServerNotBefore", "return TelegramDeliveryAttempt(")
         assertFalse(coordinator.contains("BACKLOG_SUCCESS_DELAY_MS"))
         assertFalse(store.contains("delayOldestTelegramMessageUntil"))
         assertTrue(helper.contains("MAX_PENDING = 1_000L"))
         assertTrue(helper.contains("RETENTION_MS = 30L * 24L * 60L * 60L * 1_000L"))
-        assertInOrder(connectionTest, "delivery.testConnection", "unblockTelegramMessages(nowMs())")
+        assertInOrder(connectionTest, "delivery.beginConnectionTest", "dispatchSend(selection.attempt.request)", "delivery.completeConnectionTest", "unblockTelegramMessages(nowMs())")
         assertTrue(credentialsChanged.contains("unblockTelegramMessages(nowMs())"))
     }
 
@@ -217,26 +236,26 @@ class TelegramRuntimeContractTest {
             .substringBefore("/** Performs network work")
         val delivery = coordinator.substringAfter("internal fun deliverPreparedPowerOff")
             .substringBefore("/** Compatibility hook")
-        val servicePowerOff = service.substringAfter("private fun prepareConfirmedPowerOff")
+        val servicePowerOff = service.substringAfter("private fun drainTripCompletions")
             .substringBefore("private fun telegramLocationSnapshot")
         val tripPowerOff = tripRuntime.substringAfter("private fun handlePowerOff")
             .substringBefore("private fun ensureGpsRunning")
 
         assertInOrder(recovery, "engine.recoverPendingTrip", "handle(recovered)")
         assertFalse(recovery.contains("attempt("))
-        assertInOrder(startup, "recoverStartupLocally(energySnapshot)", "delivery.recover(\"startup\")")
+        assertInOrder(startup, "recoverStartupLocally(energySnapshot)", "delivery.beginRecovery(\"startup\")")
         assertInOrder(
             prepare,
-            "recoverStartupLocally(snapshot.energySnapshot)",
+            "recoverStartupLocally(snapshot.energySnapshot, occurredAtMs)",
             "engine.onPowerOffConfirmed",
-            "handle(result)"
+            "handle(result, completion)"
         )
         assertFalse(prepare.contains("flushPending("))
         assertFalse(prepare.contains("client.sendMessage"))
         assertInOrder(delivery, "preparation.priorityKeys.forEach", "flushPending(key, force = true)")
         assertInOrder(delivery, "flushPending(key, force = true)", "flushPending()")
         assertFalse(prepare.contains("oldestUnblockedTelegramMessage()"))
-        assertTrue(prepare.contains("check(handle(result))"))
+        assertTrue(prepare.contains("check(handle(result, completion))"))
         assertTrue(recovery.contains("check(handle(recovered))"))
         assertTrue(prepare.contains("!engine.state.pendingPowerOffLocationSummaryDelivered"))
         assertTrue(coordinator.contains("val runtimeStartedAtMs = activateEnabledRuntime() ?: return null"))
@@ -247,16 +266,25 @@ class TelegramRuntimeContractTest {
         assertTrue(prepare.contains("activateEnabledRuntime() ?: return null"))
         assertInOrder(
             servicePowerOff,
-            "runOnTelegramExecutorBlocking",
-            "coordinator.preparePowerOffConfirmed(",
+            "handoffTripCompletions(",
+            "coordinator.acceptTripCompletion(intent,",
+            "trips.acknowledgeCompletion(intent.sequence, intent.identity)",
             "coordinator.deliverPreparedPowerOff(preparation)"
         )
         assertInOrder(
             tripPowerOff,
-            "prepareConfirmedPowerOff(",
-            "state = TripSession.STATE_CLOSED",
-            "deliverAfterClose()"
+            "current.closedAtPowerOff(",
+            "tripStore.closeSessionWithCompletion(closed, completion)",
+            "session = null",
+            "onCompletionReady(it.sequence)"
         )
+        assertFalse(service.contains("runOnTelegramExecutorBlocking"))
+        assertFalse(service.contains("TELEGRAM_POWER_OFF_PREPARE_TIMEOUT_MS"))
+        val ordered = service.substringAfter("private fun <T> executeOrderedTelegram").substringBefore("private fun <T> executeTelegram")
+        assertInOrder(ordered, "afterPendingTrips", "executeTelegram(", "drainTripCompletions(coordinator, watermark)", "action()")
+        assertTrue(sourceFile("com/bydcollector/collector/data/trips/TripModels.kt").readText()
+            .substringAfter("internal fun TripSession.closedAtPowerOff")
+            .contains("state = TripSession.STATE_CLOSED"))
         assertFalse(servicePowerOff.contains("coordinator.flushPending()"))
         assertTrue(coordinator.contains("telegram_location_eligibility"))
         assertTrue(coordinator.contains("trigger=power_off reason="))

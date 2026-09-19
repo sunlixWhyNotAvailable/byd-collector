@@ -23,14 +23,14 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(source.contains("check(stopped) { \"MQTT worker did not stop before database maintenance\" }"))
         assertTrue(source.contains("previous.awaitTermination(INFLUX_MAINTENANCE_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)"))
         assertTrue(source.contains("if (!stopped) maintenanceRuntimeRestoreAllowed.set(false)"))
-        assertTrue(source.contains("previous.awaitTermination(TELEGRAM_MAINTENANCE_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)"))
-        assertTrue(source.contains("check(stopped) { \"Telegram worker did not stop before database maintenance\" }"))
+        assertTrue(source.contains("telegramDeliveryRuntime.quiesceAndAwait(TELEGRAM_MAINTENANCE_STOP_TIMEOUT_MS)"))
+        assertTrue(source.contains("check(stopped) { \"Telegram HTTP/receipt did not settle before database maintenance\" }"))
         assertInOrder(
             source.substringAfter("private fun resetTelegramExecutorForMaintenance")
-                .substringBefore("private fun shutdownTelegramExecutorForUserShutdown"),
-            "previous.awaitTermination(TELEGRAM_MAINTENANCE_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)",
+                .substringBefore("private fun quiesceTelegramForUserShutdown"),
+            "telegramDeliveryRuntime.quiesceAndAwait(TELEGRAM_MAINTENANCE_STOP_TIMEOUT_MS)",
             "check(stopped)",
-            "telegramExecutor = namedSingleThreadExecutor(\"byd-telegram\")"
+            "telegramCoordinator = null"
         )
         assertFalse(stop.contains("settings.setPollingEnabled(false)"))
         assertFalse(stop.contains("settings.setDebugPollingEnabled(false)"))
@@ -125,7 +125,7 @@ class CollectorServiceMaintenanceContractTest {
         val influxReset = source.substringAfter("private fun resetInfluxExecutorForMaintenance")
             .substringBefore("private fun startDatabaseMaintenance")
         val telegramReset = source.substringAfter("private fun resetTelegramExecutorForMaintenance")
-            .substringBefore("private fun shutdownTelegramExecutorForUserShutdown")
+            .substringBefore("private fun quiesceTelegramForUserShutdown")
 
         assertTrue(source.contains("private fun isRuntimeOwner(): Boolean = Looper.myLooper() == mainHandler.looper"))
         assertTrue(source.contains("private fun <T> runOnRuntimeOwnerBlocking(action: () -> T): T"))
@@ -153,10 +153,12 @@ class CollectorServiceMaintenanceContractTest {
         assertTrue(source.substringAfter("private fun releaseWakeLock").substringBefore("private fun handlePollCycleResult").contains("requireRuntimeOwner()"))
         assertTrue(source.contains("if (restoringRuntime.get() && isRuntimeOwner()) return false"))
         assertTrue(stop.contains("check(!isRuntimeOwner())"))
-        listOf(mqttReset, influxReset, telegramReset).forEach { reset ->
+        listOf(mqttReset, influxReset).forEach { reset ->
             assertInOrder(reset, "runOnRuntimeOwnerBlocking", "awaitTermination(", "runOnRuntimeOwnerBlocking")
             assertTrue(reset.contains("requireRuntimeOwner()"))
         }
+        assertInOrder(telegramReset, "runOnRuntimeOwnerBlocking", "telegramWorkGeneration.incrementAndGet()", "quiesceAndAwait", "check(stopped)", "telegramCoordinator = null")
+        assertFalse(telegramReset.contains("shutdownNow"))
     }
 
     @Test

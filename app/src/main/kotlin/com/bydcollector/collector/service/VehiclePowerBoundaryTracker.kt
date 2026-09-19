@@ -17,6 +17,12 @@ class VehiclePowerBoundaryTracker {
 
     fun current(): VehiclePowerState = state
 
+    /** Restores the only durable power evidence before the first sample is observed. */
+    internal fun restoreBaseline(hasOpenSession: Boolean) {
+        check(state == VehiclePowerState.UNKNOWN) { "Vehicle power baseline is already established" }
+        state = if (hasOpenSession) VehiclePowerState.ON else VehiclePowerState.OFF
+    }
+
     fun observe(decodedPowerLevel: Int?): VehiclePowerTransition? {
         if (decodedPowerLevel == null || decodedPowerLevel < 0) {
             return null

@@ -8,8 +8,27 @@ import com.bydcollector.collector.data.trips.TripTime
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
+import kotlin.test.assertSame
 
 class TripsUiMapperTest {
+    @Test
+    fun hierarchyRefreshRetainsLoadedRouteIdentityButRefreshesMetricsAndTitles() {
+        val groups = listOf(TripDayGroup(2026, 8, 17, listOf(summary("trip-1"))))
+        val previous = TripsUiMapper.years(groups, UiLanguage.EN, mapOf("trip-1" to listOf(
+            RoutePoint("trip-1", 0, observedAt = "2026-08-17T12:00:00Z", latitude = 50.0, longitude = 30.0)
+        )))
+        val fresh = TripsUiMapper.years(listOf(groups.single().copy(trips = listOf(
+            summary("trip-1").copy(distanceKm = 25.0)
+        ))), UiLanguage.UK)
+        fun trip(years: List<TripYearUi>) = years.single().months.single().days.single().trips.single()
+        val retained = TripsUiMapper.retainRoutes(fresh, previous, null)
+        assertSame(trip(previous).route, trip(retained).route)
+        assertEquals(25.0, trip(retained).distanceKm)
+        assertEquals("Серпень 2026", retained.single().months.single().title)
+        assertTrue(trip(TripsUiMapper.retainRoutes(fresh, previous, "trip-1")).route.isEmpty())
+        assertTrue(TripsUiMapper.retainRoutes(emptyList(), previous, null).isEmpty())
+    }
+
     @Test
     fun mapsStableHierarchyIdsAndLocalizedTitles() {
         val group = TripDayGroup(2026, 8, 17, listOf(summary("trip-1")))

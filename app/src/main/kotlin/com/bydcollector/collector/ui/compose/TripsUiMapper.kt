@@ -13,6 +13,23 @@ import java.time.format.TextStyle
 import java.util.Locale
 
 object TripsUiMapper {
+    /** Keep the loaded route while refreshing metrics/localized hierarchy.
+     * A new route request replaces the cache, including an empty result. */
+    fun retainRoutes(
+        fresh: List<TripYearUi>,
+        previous: List<TripYearUi>,
+        refreshedRouteId: String?
+    ): List<TripYearUi> {
+        if (refreshedRouteId != null) return fresh
+        val cached = previous.flatMap { it.months }.flatMap { it.days }
+            .flatMap { it.trips }.associate { it.id to it.route }
+        return fresh.map { year -> year.copy(months = year.months.map { month ->
+            month.copy(days = month.days.map { day -> day.copy(trips = day.trips.map { trip ->
+                cached[trip.id]?.let { trip.copy(route = it) } ?: trip
+            }) })
+        }) }
+    }
+
     fun years(
         groups: List<TripDayGroup>,
         language: UiLanguage,

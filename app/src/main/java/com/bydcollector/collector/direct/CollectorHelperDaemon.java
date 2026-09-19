@@ -246,7 +246,7 @@ public final class CollectorHelperDaemon {
                                     workerPollLoop != null &&
                                     !workerSpool.pending(1, replaySampleValidator).isEmpty()
                                 ) {
-                                    result = BatchResult.rejected(
+                                    result = BatchResult.replayPending(
                                         rows.size(),
                                         "app-gap spool pending; replay before live read"
                                     );
@@ -1172,6 +1172,25 @@ public final class CollectorHelperDaemon {
             }
             return new BatchResult(
                 CollectorHelperProtocol.STATUS_INVALID_REQUEST,
+                CollectorHelperProtocol.MODE_REJECTED,
+                false,
+                0,
+                0,
+                0,
+                0,
+                0,
+                values,
+                error
+            );
+        }
+
+        static BatchResult replayPending(int count, String error) {
+            ReadValue[] values = new ReadValue[count];
+            for (int index = 0; index < count; index++) {
+                values[index] = ReadValue.error(CollectorHelperProtocol.STATUS_REPLAY_PENDING, null);
+            }
+            return new BatchResult(
+                CollectorHelperProtocol.STATUS_REPLAY_PENDING,
                 CollectorHelperProtocol.MODE_REJECTED,
                 false,
                 0,

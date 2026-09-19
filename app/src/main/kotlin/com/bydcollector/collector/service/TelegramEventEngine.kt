@@ -1556,21 +1556,17 @@ private fun tripSummaryVariables(
         TripMetrics.averageConsumptionKwhPer100Km(totalEnergy, totalDistance)
     ),
     "total_duration" to formatDuration(totalDurationMs),
-    "trip_discharged_kwh" to formatEnergyMetric(tripEnergyMetrics.dischargedKwh, tripEnergyMetrics.partial, language),
-    "trip_regenerated_kwh" to formatEnergyMetric(tripEnergyMetrics.regeneratedKwh, tripEnergyMetrics.partial, language),
-    "trip_net_kwh" to formatEnergyMetric(tripEnergyMetrics.netKwh, tripEnergyMetrics.partial, language),
-    "trip_net_kwh_per_100km" to formatEnergyMetric(
-        TripMetrics.averageConsumptionKwhPer100Km(tripEnergyMetrics.netKwh, distance),
-        tripEnergyMetrics.partial,
-        language
+    "trip_discharged_kwh" to formatNumber(tripEnergyMetrics.dischargedKwh),
+    "trip_regenerated_kwh" to formatNumber(tripEnergyMetrics.regeneratedKwh),
+    "trip_net_kwh" to formatNumber(tripEnergyMetrics.netKwh),
+    "trip_net_kwh_per_100km" to formatNumber(
+        TripMetrics.averageConsumptionKwhPer100Km(tripEnergyMetrics.netKwh, distance)
     ),
-    "total_discharged_kwh" to formatEnergyMetric(totalEnergyMetrics.dischargedKwh, totalEnergyMetrics.partial, language),
-    "total_regenerated_kwh" to formatEnergyMetric(totalEnergyMetrics.regeneratedKwh, totalEnergyMetrics.partial, language),
-    "total_net_kwh" to formatEnergyMetric(totalEnergyMetrics.netKwh, totalEnergyMetrics.partial, language),
-    "total_net_kwh_per_100km" to formatEnergyMetric(
-        TripMetrics.averageConsumptionKwhPer100Km(totalEnergyMetrics.netKwh, totalDistance),
-        totalEnergyMetrics.partial,
-        language
+    "total_discharged_kwh" to formatNumber(totalEnergyMetrics.dischargedKwh),
+    "total_regenerated_kwh" to formatNumber(totalEnergyMetrics.regeneratedKwh),
+    "total_net_kwh" to formatNumber(totalEnergyMetrics.netKwh),
+    "total_net_kwh_per_100km" to formatNumber(
+        TripMetrics.averageConsumptionKwhPer100Km(totalEnergyMetrics.netKwh, totalDistance)
     ),
     "time" to formatTime(nowMs)
 )
@@ -1592,20 +1588,16 @@ private fun displayedTripTotalsMatch(
 ): Boolean {
     val newEnergyAvailable = tripEnergyMetrics.netKwh != null || totalEnergyMetrics.netKwh != null
     val displayedEnergyMatches = if (newEnergyAvailable) {
-        formatEnergyMetric(tripEnergyMetrics.dischargedKwh, tripEnergyMetrics.partial, language) ==
-            formatEnergyMetric(totalEnergyMetrics.dischargedKwh, totalEnergyMetrics.partial, language) &&
-            formatEnergyMetric(tripEnergyMetrics.regeneratedKwh, tripEnergyMetrics.partial, language) ==
-            formatEnergyMetric(totalEnergyMetrics.regeneratedKwh, totalEnergyMetrics.partial, language) &&
-            formatEnergyMetric(tripEnergyMetrics.netKwh, tripEnergyMetrics.partial, language) ==
-            formatEnergyMetric(totalEnergyMetrics.netKwh, totalEnergyMetrics.partial, language) &&
-            formatEnergyMetric(
-                TripMetrics.averageConsumptionKwhPer100Km(tripEnergyMetrics.netKwh, distance),
-                tripEnergyMetrics.partial,
-                language
-            ) == formatEnergyMetric(
-                TripMetrics.averageConsumptionKwhPer100Km(totalEnergyMetrics.netKwh, totalDistance),
-                totalEnergyMetrics.partial,
-                language
+        formatNumber(tripEnergyMetrics.dischargedKwh) ==
+            formatNumber(totalEnergyMetrics.dischargedKwh) &&
+            formatNumber(tripEnergyMetrics.regeneratedKwh) ==
+            formatNumber(totalEnergyMetrics.regeneratedKwh) &&
+            formatNumber(tripEnergyMetrics.netKwh) ==
+            formatNumber(totalEnergyMetrics.netKwh) &&
+            formatNumber(
+                TripMetrics.averageConsumptionKwhPer100Km(tripEnergyMetrics.netKwh, distance)
+            ) == formatNumber(
+                TripMetrics.averageConsumptionKwhPer100Km(totalEnergyMetrics.netKwh, totalDistance)
             )
     } else {
         formatNumber(energy) == formatNumber(totalEnergy)
@@ -1677,20 +1669,6 @@ private fun nonNegativeEnergyDelta(end: Double?, start: Double?): Double? {
         delta >= -ENERGY_COUNTER_EPSILON_KWH -> 0.0
         else -> null
     }
-}
-
-private fun formatEnergyMetric(
-    value: Double?,
-    partial: Boolean,
-    language: TelegramTemplateLanguage
-): String {
-    val formatted = formatNumber(value)
-    if (value == null || !partial) return formatted
-    val suffix = when (language) {
-        TelegramTemplateLanguage.UK -> "частково"
-        TelegramTemplateLanguage.EN -> "partial"
-    }
-    return "$formatted ($suffix)"
 }
 
 private const val ENERGY_COUNTER_EPSILON_KWH = 1e-9

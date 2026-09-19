@@ -1,6 +1,7 @@
 package com.bydcollector.collector.data.direct
 
 import com.bydcollector.collector.data.local.PollReading
+import com.bydcollector.collector.direct.CollectorHelperProtocol
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -13,7 +14,11 @@ class DirectAutoserviceReader(
         val batch = helper.readBatch(entries)
         val fields = entries.mapIndexed { index, entry ->
             val result = batch.results.getOrElse(index) {
-                DirectHelperReadResult(-913, null, "batch result missing at index $index")
+                DirectHelperReadResult(
+                    CollectorHelperProtocol.STATUS_SPOOL_UNAVAILABLE,
+                    null,
+                    "batch result missing at index $index"
+                )
             }
             val raw = result.raw
             DirectAutoserviceField(
@@ -47,6 +52,11 @@ data class DirectAutoserviceSnapshot(
 
     val errors: List<String> = errorFields.map { field -> errorSummary(field) }
 
+    val replayPending: Boolean =
+        batchDiagnostics.status == CollectorHelperProtocol.STATUS_REPLAY_PENDING
+
+    val batchStatus: Int = batchDiagnostics.status
+
     fun errorSummary(maxSamples: Int = DEFAULT_ERROR_SAMPLE_LIMIT): String {
         if (errors.isEmpty()) return ""
         val sample = errors.take(maxSamples).joinToString(separator = "; ")
@@ -70,6 +80,7 @@ data class DirectAutoserviceSnapshot(
         json.put("reading_count", readings.size)
         json.put("error_count", errors.size)
         json.put("batch", JSONObject().apply {
+            put("status", batchStatus)
             put("mode", batchDiagnostics.mode)
             put("native_available", batchDiagnostics.nativeAvailable)
             put("native_groups", batchDiagnostics.nativeGroupCount)

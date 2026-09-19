@@ -20,14 +20,17 @@ class DiagnosticShareSnapshotTest {
             val event = JSONObject().put("version", "2.7.7").put("model", "BYD Sea Lion 07")
                 .put("host", "100.100.1.2").put("port", 8086).put("pid", 512)
                 .put("password", "fixture-secret").put("latitude", 50.123456)
-                .put("longitude", 30.654321).put("vin", "L1234567890123456X")
-                .put("chat_id", "-1001234567890").toString()
+                .put("longitude", 30.654321).put("vin", "L123456789012345X")
+                .put("chat_id", "-1001234567890").put("SSID", "Private Home Network")
+                .put("BSSID", "aa:bb:cc:dd:ee:ff").toString()
             val source = File(original, "operational_events.jsonl").apply { writeText(event + "\n") }
             val sourceBytes = source.readBytes()
             val databaseArchive = File(root, "database.zip").apply { writeBytes(sourceBytes) }
             val snapshot = File(root, "snapshot_test").apply { mkdirs() }
             original.copyRecursively(snapshot, overwrite = true)
-            File(snapshot, "helper.log").writeText("vin=L1234567890123456X version=2.7.7 host=100.100.1.2\n")
+            File(snapshot, "helper.log").writeText("vin=L123456789012345X version=2.7.7 host=100.100.1.2\n" +
+                "WifiInfo: SSID: Private Home Network, BSSID: aa:bb:cc:dd:ee:ff\n" +
+                "CarPropertyService: getVin() -> L123456789012345X\n")
 
             assertEquals("ok", sanitizeDiagnosticSnapshot(snapshot))
             val zip = File(root, "shared.zip")
@@ -45,8 +48,10 @@ class DiagnosticShareSnapshotTest {
             assertFalse(shared.contains("fixture-secret"))
             assertFalse(shared.contains("50.123456"))
             assertFalse(shared.contains("30.654321"))
-            assertFalse(shared.contains("L1234567890123456X"))
+            assertFalse(shared.contains("L123456789012345X"))
             assertFalse(shared.contains("-1001234567890"))
+            assertFalse(shared.contains("Private Home Network"))
+            assertFalse(shared.contains("aa:bb:cc:dd:ee:ff"))
             assertTrue(shared.contains("2.7.7"))
             assertTrue(shared.contains("BYD Sea Lion 07"))
             assertTrue(shared.contains("100.100.1.2"))

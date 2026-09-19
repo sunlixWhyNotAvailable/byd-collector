@@ -104,6 +104,7 @@ internal fun sanitizeDiagnosticSnapshot(snapshot: File): String {
         appendLine("status=$status")
         appendLine("scope=share_copy_only")
         appendLine("policy=recognized_sensitive_contexts")
+        appendLine("masked_contexts=SSID,BSSID,labelled_VIN,VIN_API_results,secrets,coordinates")
         appendLine("record_limit_bytes=$DIAGNOSTIC_RECORD_LIMIT_BYTES")
         appendLine("warning=Review before sharing; arbitrary system logcat is best-effort, not guaranteed anonymous")
         appendLine("retained=versions,vehicle_names,firmware,hosts,IP_addresses,ports,technical_ids,timing,cursors")

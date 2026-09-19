@@ -17,6 +17,7 @@ import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.FileProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -113,8 +114,16 @@ class MainActivity : ComponentActivity() {
     private var startupAdbSelfCheckPosted = false
     private var startupAdbSelfCheckSource = "startup"
     private var startupAccessFlowCompleted = false
-    private var mainWindowHasFocus = false
+    private var mainWindowHasFocus by mutableStateOf(false)
     private var runtimePermissionRequestInFlight = false
+    private val overlayPermissionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        runtimePermissionRequestInFlight = false
+        if (!destroyed && ::settings.isInitialized) {
+            recordUpdateEvent("overlay_permission_returned", "allowed=${Settings.canDrawOverlays(this)}")
+            updateRuntime.onPresentationAccessChanged()
+            maybeContinueStartupAccessFlow()
+        }
+    }
     @Volatile private var refreshInFlight = false
     @Volatile private var foreground = false
     @Volatile private var destroyed = false
@@ -134,6 +143,7 @@ class MainActivity : ComponentActivity() {
     private var telegramUiState by mutableStateOf(TelegramUiState())
     private var tripsUiState by mutableStateOf(TripsUiState())
     private var updateUiState by mutableStateOf<UpdateUiState>(UpdateUiState.Hidden)
+    private var updateOfferResultId by mutableStateOf<Long?>(null)
     private var updateUiGeneration = 0L
     private var updatePresentationRevision = -1L
     private var pendingMaintenanceOperation by mutableStateOf<DbMaintenanceOperation?>(null)
@@ -592,9 +602,8 @@ class MainActivity : ComponentActivity() {
             settings.setUpdateHintEnabled(enabled)
             updateHintEnabled = settings.isUpdateHintEnabled()
             (applicationContext as BydCollectorApplication).updateHints.refresh(darkTheme)
-            if (enabled && !Settings.canDrawOverlays(applicationContext)) {
-                requestAccessCheck("update_hint_enabled", AccessCheckMode.NORMAL)
-            }
+            if (enabled) maybeRequestOverlayAccess(userInitiated = true)
+            updateRuntime.onPresentationAccessChanged()
         }
 
         override fun onUpdateHintAppearanceChanged(appearance: UpdateHintAppearance) {
@@ -697,6 +706,7 @@ class MainActivity : ComponentActivity() {
         }
         scheduleDashboardCountBootstrap(force = false)
         setContent {
+            val renderedOfferResultId = updateOfferResultId
             val chromeSnapshot by dashboardUiStateStore.chromeState.collectAsStateWithLifecycle()
             val tabSnapshot by dashboardUiStateStore.tabState(activeTab).collectAsStateWithLifecycle()
             val renderedChrome = chromeSnapshot?.state
@@ -724,6 +734,13 @@ class MainActivity : ComponentActivity() {
                 updateHintEnabled = updateHintEnabled,
                 updateHintAppearance = updateHintAppearance,
                 updateUiState = updateUiState,
+                onUpdateOfferPresented = {
+                    // A frame drawn behind native permission UI is not an offer
+                    // shown to the user. Focus is observed in the draw callback.
+                    if (mainWindowHasFocus && foreground) {
+                        renderedOfferResultId?.let(updateRuntime::onOfferPresented)
+                    }
+                },
                 databaseMaintenanceUiState = currentMaintenanceUiState(renderedChrome),
                 diagnosticsBusy = diagnosticsBusy,
                 actionUiState = actionUiState,
@@ -1139,12 +1156,15 @@ class MainActivity : ComponentActivity() {
         val requestedLanguage = uiLanguage
         val requestGeneration = ++tripsRequestGeneration
         val sessionGeneration = navigationSession.captureGeneration()
-        tripsUiState = tripsUiState.copy(routeLoadingId = routeTripId)
+        // A refresh superseding an in-flight route request must finish that
+        // request, not replace it with a route-less hierarchy.
+        val requestedRouteId = routeTripId ?: tripsUiState.routeLoadingId
+        tripsUiState = tripsUiState.copy(routeLoadingId = requestedRouteId)
         runCatching { dashboardExecutor.execute {
             val result = runCatching {
                 val trips = BydCollectorApplication.trips(applicationContext)
                 val groups = trips.queryHierarchy()
-                val routes = routeTripId?.let { id -> mapOf(id to trips.queryRoutePoints(id)) }.orEmpty()
+                val routes = requestedRouteId?.let { id -> mapOf(id to trips.queryRoutePoints(id)) }.orEmpty()
                 val availableCurrentTrip = trips.loadOpenSession()?.let { TripsUiMapper.current(it, requestedLanguage) }
                 val tripsBytes = sqliteFootprintBytes(trips.databaseFile)
                 dashboardUiStateStore.publishDatabaseFootprints(
@@ -1154,6 +1174,7 @@ class MainActivity : ComponentActivity() {
                 )
                 TripsLoadResult(
                     years = TripsUiMapper.years(groups, requestedLanguage, routes),
+                    refreshedRouteId = requestedRouteId,
                     databasePath = trips.databaseFile.absolutePath,
                     databaseSizeBytes = tripsBytes,
                     availableCurrentTrip = availableCurrentTrip
@@ -1167,7 +1188,7 @@ class MainActivity : ComponentActivity() {
                 ) return@runOnUiThread
                 result.onSuccess { loaded ->
                     tripsUiState = tripsUiState.copy(
-                        years = loaded.years,
+                        years = TripsUiMapper.retainRoutes(loaded.years, tripsUiState.years, loaded.refreshedRouteId),
                         routeLoadingId = null,
                         databasePath = loaded.databasePath,
                         databaseSizeBytes = loaded.databaseSizeBytes,
@@ -1594,8 +1615,29 @@ class MainActivity : ComponentActivity() {
         if (startupHardFlowBlocked()) return
         if (maybeRunStartupSetup()) return
         if (maybeRunStartupLocationPermission()) return
+        if (maybeRequestOverlayAccess(userInitiated = false)) return
         if (startupHardFlowBlocked()) return
         maybeRunStartupAdbSelfCheck(startupAdbSelfCheckSource)
+    }
+
+    private fun maybeRequestOverlayAccess(userInitiated: Boolean): Boolean {
+        if (destroyed || !foreground || !mainWindowHasFocus || !settings.isUpdateHintEnabled()) return false
+        if (runtimePermissionRequestInFlight) return true
+        if (Settings.canDrawOverlays(this)) return false
+        val prefs = getSharedPreferences(STARTUP_SETUP_PREFS, MODE_PRIVATE)
+        if (!userInitiated && prefs.getBoolean(KEY_OVERLAY_PERMISSION_SETUP_CONSUMED, false)) return false
+        // Persist before opening Settings so denial/recreation is not another prompt.
+        prefs.edit().putBoolean(KEY_OVERLAY_PERMISSION_SETUP_CONSUMED, true).apply()
+        runtimePermissionRequestInFlight = true
+        return try {
+            overlayPermissionLauncher.launch(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+            recordUpdateEvent("overlay_permission_requested", "source=${if (userInitiated) "toggle" else "visible_startup"}")
+            true
+        } catch (error: RuntimeException) {
+            runtimePermissionRequestInFlight = false
+            recordUpdateEvent("overlay_permission_unavailable", error::class.java.simpleName)
+            false // Optional access cannot block the required access/collection flow.
+        }
     }
 
     private fun maybeRunStartupLocationPermission(): Boolean {
@@ -1720,10 +1762,8 @@ class MainActivity : ComponentActivity() {
         val snapshot = updateChecks.snapshot()
         if (snapshot.revision == updatePresentationRevision) return
         updatePresentationRevision = snapshot.revision
+        updateOfferResultId = snapshot.availableResultId
         updateUiState = snapshot.uiState
-        if (snapshot.uiState is UpdateUiState.Available) {
-            recordUpdateEvent("offer_shown", "version=${snapshot.uiState.info.version}")
-        }
     }
 
     private fun recordUpdateEvent(message: String, detail: String? = null) {
@@ -2415,6 +2455,7 @@ class MainActivity : ComponentActivity() {
     companion object {
         private const val TAG = "BYDCollectorUI"
         private const val STARTUP_SETUP_PREFS = "startup_setup"
+        private const val KEY_OVERLAY_PERMISSION_SETUP_CONSUMED = "overlay_permission_setup_consumed"
         private const val KEY_BACKGROUND_SETTINGS_VERSION = "background_settings_version"
         private const val KEY_BACKGROUND_SETTINGS_PENDING_RETURN = "background_settings_pending_return"
         private const val KEY_LOCATION_PERMISSION_SETUP_CONSUMED = "location_permission_setup_consumed"
@@ -2506,6 +2547,7 @@ private data class LoadedCredentials(
 
 private data class TripsLoadResult(
     val years: List<TripYearUi>,
+    val refreshedRouteId: String?,
     val databasePath: String,
     val databaseSizeBytes: Long,
     val availableCurrentTrip: CurrentTripUi?

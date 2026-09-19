@@ -18,7 +18,8 @@ data class PollCycleResult(
     val timestamp: String? = null,
     val errorMessage: String? = null,
     val pollRowsPersisted: Long = 0L,
-    val valueRowsPersisted: Long = 0L
+    val valueRowsPersisted: Long = 0L,
+    val deferred: Boolean = false
 )
 
 interface PollCycleRunner {
@@ -69,14 +70,24 @@ class PollPersistenceCoordinator(
     private var lastPersistedFailureKey: String? = null
     private var lastPersistedFailureAtMs: Long = Long.MIN_VALUE
     private var lastDiagnosticKey: String? = null
+    private var replayPendingLogged = false
     private val liveSource = LivePollSource()
 
     override fun pollOnce(sessionId: Long): PollCycleResult {
         val parameters = store.getActiveCatalogParameters()
         val result = client.read()
+        if (result !is TelemetryReadResult.ReplayPending) replayPendingLogged = false
 
         return try {
             when (result) {
+                is TelemetryReadResult.ReplayPending -> {
+                    if (!replayPendingLogged) {
+                        recordEventSafely("worker_replay_pending", "Live read deferred until helper spool is replayed", null)
+                        replayPendingLogged = true
+                    }
+                    PollCycleResult(null, ok = true, category = null, elapsedMs = result.elapsedMs,
+                        requestCount = 0, deferred = true)
+                }
                 is TelemetryReadResult.Success -> {
                     val timestamp = clock.nowIso()
                     val source = liveSource.capture(clock.elapsedRealtimeMs())
@@ -99,7 +110,7 @@ class PollPersistenceCoordinator(
                         parameters = parameters
                     )
                     persistDiagnosticTransition(result)
-                    try {
+                    notifyObserver {
                         successfulPollObserver?.onSourcePoll(
                             sessionId,
                             pollId,
@@ -108,15 +119,6 @@ class PollPersistenceCoordinator(
                             PollOrigin.LIVE,
                             source
                         )
-                    } catch (error: RuntimeException) {
-                        //keeps raw polling alive even if normalized state/export logic has a bug
-                        val detail = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
-                        logError("Normalized state write failed", error)
-                        try {
-                            store.recordEvent("normalized_write_error", "Normalized state write failed", detail)
-                        } catch (eventError: RuntimeException) {
-                            logError("Failed to record normalized state write failure", eventError)
-                        }
                     }
                     lastPersistedFailureKey = null
                     lastPersistedFailureAtMs = Long.MIN_VALUE
@@ -164,16 +166,15 @@ class PollPersistenceCoordinator(
                         ),
                         parameters = parameters
                     )
-                    successfulPollObserver?.onSourceFailure(
-                        sessionId = sessionId,
-                        pollId = pollId,
-                        timestamp = timestamp,
-                        origin = PollOrigin.LIVE,
-                        source = source
-                    )
                     lastPersistedFailureKey = failureKey
                     lastPersistedFailureAtMs = nowMs
-                    store.recordEvent("poll_failure", "Poll failed: ${result.category}", result.message)
+                    notifyObserver {
+                        successfulPollObserver?.onSourceFailure(
+                            sessionId = sessionId, pollId = pollId, timestamp = timestamp,
+                            origin = PollOrigin.LIVE, source = source
+                        )
+                    }
+                    recordEventSafely("poll_failure", "Poll failed: ${result.category}", result.message)
                     PollCycleResult(
                         pollId = pollId,
                         ok = false,
@@ -186,12 +187,14 @@ class PollPersistenceCoordinator(
                     )
                 }
             }
-        } catch (error: RuntimeException) {
+        } catch (error: Exception) {
+            if (error is InterruptedException) throw error
             val detail = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
             runCatching { Log.e(TAG, "Database write failed", error) }
             try {
                 store.recordEvent("db_write_error", "Database write failed", detail)
-            } catch (eventError: RuntimeException) {
+            } catch (eventError: Exception) {
+                if (eventError is InterruptedException) throw eventError
                 logError("Failed to record database write failure", eventError)
             }
             PollCycleResult(null, ok = false, category = "db_write_error", elapsedMs = 0, requestCount = DIRECT_REQUEST_COUNT)
@@ -208,7 +211,8 @@ class PollPersistenceCoordinator(
                 result.diagnosticMessage
             )
             lastDiagnosticKey = key
-        } catch (error: RuntimeException) {
+        } catch (error: Exception) {
+            if (error is InterruptedException) throw error
             logError("Failed to record direct read mode", error)
         }
     }
@@ -218,7 +222,27 @@ class PollPersistenceCoordinator(
         return nowMs - lastPersistedFailureAtMs < REPEATED_FAILURE_PERSIST_INTERVAL_MS
     }
 
-    private fun logError(message: String, error: RuntimeException) {
+    private fun notifyObserver(action: () -> Unit) {
+        try {
+            action()
+        } catch (error: Exception) {
+            if (error is InterruptedException) throw error
+            logError("Normalized state write failed", error)
+            recordEventSafely("normalized_write_error", "Normalized state write failed",
+                "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+        }
+    }
+
+    private fun recordEventSafely(category: String, message: String, detail: String?) {
+        try {
+            store.recordEvent(category, message, detail)
+        } catch (error: Exception) {
+            if (error is InterruptedException) throw error
+            logError("Failed to record $category", error)
+        }
+    }
+
+    private fun logError(message: String, error: Exception) {
         runCatching { Log.e(TAG, message, error) }
     }
 

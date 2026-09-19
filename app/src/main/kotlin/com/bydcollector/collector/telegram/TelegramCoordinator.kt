@@ -7,6 +7,8 @@ import com.bydcollector.collector.data.local.TelegramOutboxMessage
 import com.bydcollector.collector.diagnostics.diagnosticSha256
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.data.energy.EnergySnapshot
+import com.bydcollector.collector.data.trips.TripCompletionIntent
+import com.bydcollector.collector.data.trips.TripTime
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.service.TelegramDetectedEvent
 import com.bydcollector.collector.service.TelegramEventConfig
@@ -27,7 +29,8 @@ class TelegramCoordinator(
     private val eventStore: TelemetryStore,
     private val telegramStore: TelegramStore,
     private val settings: CollectorSettings,
-    private val client: TelegramHttpClient = TelegramHttpClient(),
+    private val dispatchSend: (TelegramSendMessage, (TelegramSendResult) -> Unit) -> Unit,
+    private val onDeliveryReady: (Long?) -> Unit = {},
     private val retryPolicy: TelegramRetryPolicy = TelegramRetryPolicy(),
     private val nowMs: () -> Long = System::currentTimeMillis,
     private val currentEnergySnapshot: () -> EnergySnapshot? = { null }
@@ -40,7 +43,6 @@ class TelegramCoordinator(
     private val delivery = TelegramDeliveryQueue(
         store = telegramStore,
         credentials = { TelegramDeliveryCredentials(settings.isTelegramEnabled(), settings.telegramBotToken(), settings.telegramChatId()) },
-        send = client::sendMessage,
         commitDelivery = ::commitDelivery,
         record = ::recordDelivery,
         nowMs = nowMs,
@@ -128,19 +130,39 @@ class TelegramCoordinator(
         return nextWakeAt(result.nextWakeAtMs, nextWakeAt(startupDeadline, flushPending()))
     }
 
-    /** Commits the power-off obligation locally before the Trips database is closed. */
+    /** Accepts a durable Trips completion. The receipt and batch commit together. */
+    internal fun acceptTripCompletion(
+        intent: TripCompletionIntent,
+        location: TelegramLocationSnapshot?
+    ): TelegramPowerOffPreparation? {
+        if (telegramStore.hasTripCompletionReceipt(intent.sequence, intent.identity)) return null
+        check(settings.isTelegramEnabled()) { "Telegram completion is waiting for the enabled runtime" }
+        return preparePowerOffConfirmed(
+            snapshot = TelegramPowerOffSnapshot(intent.odometerKm, intent.soc, intent.tripEnergyKwh, intent.energySnapshot),
+            location = location,
+            occurredAtMs = checkNotNull(TripTime.instant(intent.observedAt)).toEpochMilli(),
+            completion = intent
+        )
+    }
+
+    /** Local processing only; no network dependency in the Trips commit path. */
     internal fun preparePowerOffConfirmed(
         snapshot: TelegramPowerOffSnapshot = TelegramPowerOffSnapshot(),
-        location: TelegramLocationSnapshot? = null
+        location: TelegramLocationSnapshot? = null,
+        occurredAtMs: Long = nowMs(),
+        completion: TripCompletionIntent? = null
     ): TelegramPowerOffPreparation? {
         activateEnabledRuntime() ?: return null
-        val recovered = recoverStartupLocally(snapshot.energySnapshot)
+        val recovered = recoverStartupLocally(snapshot.energySnapshot, occurredAtMs)
+        // No Telegram samples may have been processed while its SQLite was unavailable.
+        // Preserve the known complete power session instead of inventing moving-leg splits.
+        if (completion != null) engine = TelegramEventEngine(recoverCompletionState(engine.state, completion))
         val pendingSummaryKey = engine.state.pendingPowerOffLocationTripId
             ?.takeIf { !engine.state.pendingPowerOffLocationSummaryDelivered }
             ?.let { "$it:summary" }
         val pendingLocationTripId = engine.state.pendingPowerOffLocationTripId
-        val result = engine.onPowerOffConfirmed(eventConfig(), snapshot, location, nowMs())
-        check(handle(result)) { "Telegram power-off batch could not be rendered atomically" }
+        val result = engine.onPowerOffConfirmed(eventConfig(), snapshot, location, occurredAtMs)
+        check(handle(result, completion)) { "Telegram power-off batch could not be rendered atomically" }
         result.locationEligibilityReason?.let { reason ->
             eventStore.recordEvent(
                 "telegram_location_eligibility",
@@ -187,15 +209,29 @@ class TelegramCoordinator(
         return deliverPreparedPowerOff(preparation)
     }
 
-    fun testConnection(): TelegramSendResult {
+    fun testConnection(onComplete: (TelegramSendResult) -> Unit) {
         settings.setTelegramConnectionStatus("testing", null)
-        val result = delivery.testConnection(
+        val selection = delivery.beginConnectionTest(
             TelegramSendMessage(
                 botToken = settings.telegramBotToken(),
                 chatId = settings.telegramChatId(),
                 text = "BYD Collector: Telegram connection test"
             )
         )
+        when (selection) {
+            is TelegramConnectionSelection.Immediate -> finishConnectionTest(selection.result, onComplete)
+            is TelegramConnectionSelection.Ready -> dispatchSend(selection.attempt.request) { response ->
+                finishConnectionTest(delivery.completeConnectionTest(selection.attempt, response), onComplete)
+                onDeliveryReady(delivery.pendingDeadline())
+            }
+            TelegramConnectionSelection.Busy -> {
+                settings.setTelegramConnectionStatus("failed", "sender_busy")
+                onComplete(TelegramSendResult.Failure(TelegramSendFailureKind.CONFIGURATION))
+            }
+        }
+    }
+
+    private fun finishConnectionTest(result: TelegramSendResult, onComplete: (TelegramSendResult) -> Unit) {
         when (result) {
             TelegramSendResult.Success -> {
                 settings.setTelegramConnectionStatus("success", null)
@@ -211,7 +247,7 @@ class TelegramCoordinator(
                 )
             }
         }
-        return result
+        onComplete(result)
     }
 
     fun credentialsChanged() {
@@ -227,18 +263,25 @@ class TelegramCoordinator(
     }
 
     fun flushPending(): Long? {
-        return delivery.flush("tick")
+        return dispatchAttempt(delivery.beginAttempt("tick"))
     }
 
     private fun flushPending(dedupeKey: String, force: Boolean): Long? {
-        return delivery.flush("power_off", dedupeKey, expediteLocal = force)
+        return dispatchAttempt(delivery.beginAttempt("power_off", dedupeKey, expediteLocal = force))
     }
 
     /** Called only on the existing serialized Telegram worker after lifecycle guards. */
     fun recoverPending(trigger: String): Long? {
         activateEnabledRuntime() ?: return null
         val recovered = recoverStartupLocally()
-        return nextWakeAt(recovered?.nextWakeAtMs, delivery.recover(trigger))
+        return nextWakeAt(recovered?.nextWakeAtMs, dispatchAttempt(delivery.beginRecovery(trigger)))
+    }
+
+    private fun dispatchAttempt(attempt: TelegramDeliveryAttempt?): Long? {
+        if (attempt != null) dispatchSend(attempt.request) { response ->
+            onDeliveryReady(delivery.completeAttempt(attempt, response))
+        }
+        return delivery.pendingDeadline()
     }
 
     private fun pendingQueueDeadline(): Long? {
@@ -249,7 +292,8 @@ class TelegramCoordinator(
         val deliveredState = engine.markTripSummaryDelivered(entry.dedupeKey, deliveredAtMs)
         try {
             telegramStore.markTelegramDelivered(entry.id, deliveredState?.toJson(), deliveredAtMs)
-        } catch (error: RuntimeException) {
+        } catch (error: Exception) {
+            if (error is InterruptedException) throw error
             engine = TelegramEventEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
             throw error
         }
@@ -271,13 +315,13 @@ class TelegramCoordinator(
 
     private fun ensureStartupRecovery(energySnapshot: EnergySnapshot? = null): Long? {
         val recovered = recoverStartupLocally(energySnapshot) ?: return null
-        return nextWakeAt(recovered.nextWakeAtMs, delivery.recover("startup"))
+        return nextWakeAt(recovered.nextWakeAtMs, dispatchAttempt(delivery.beginRecovery("startup")))
     }
 
-    private fun recoverStartupLocally(energySnapshot: EnergySnapshot? = null): TelegramEventResult? {
+    private fun recoverStartupLocally(energySnapshot: EnergySnapshot? = null, occurredAtMs: Long = nowMs()): TelegramEventResult? {
         if (!startupRecoveryPending) return null
         val durableEnergySnapshot = energySnapshot ?: runCatching(currentEnergySnapshot).getOrNull()
-        val recovered = engine.recoverPendingTrip(eventConfig(), nowMs(), durableEnergySnapshot)
+        val recovered = engine.recoverPendingTrip(eventConfig(), occurredAtMs, durableEnergySnapshot)
         check(handle(recovered)) { "Telegram recovery batch could not be rendered atomically" }
         startupRecoveryPending = false
         return recovered
@@ -292,7 +336,7 @@ class TelegramCoordinator(
         return listOfNotNull(eventDeadlineAtMs, queueDeadlineAtMs).minOrNull()
     }
 
-    private fun handle(result: TelegramEventResult): Boolean {
+    private fun handle(result: TelegramEventResult, completion: TripCompletionIntent? = null): Boolean {
         val messages = renderTelegramBatch(result.events, ::render)
         if (messages == null) {
             engine = TelegramEventEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
@@ -303,9 +347,12 @@ class TelegramCoordinator(
             telegramStore.commitTelegramEvents(
                 messages = messages,
                 stateJson = result.state.toJson().takeIf { result.shouldPersist },
-                nowMs = committedAt
+                nowMs = committedAt,
+                completionSequence = completion?.sequence,
+                completionIdentity = completion?.identity
             )
-        } catch (error: RuntimeException) {
+        } catch (error: Exception) {
+            if (error is InterruptedException) throw error
             engine = TelegramEventEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
             throw error
         }
@@ -445,6 +492,31 @@ class TelegramCoordinator(
     private fun failureDetail(result: TelegramSendResult.Failure): String {
         return telegramFailureDetail(result)
     }
+}
+
+/** A fallback only when the sender has no surviving leg/parked obligation. */
+internal fun recoverCompletionState(state: TelegramEventState, intent: TripCompletionIntent): TelegramEventState {
+    if (state.tripId != null || state.pendingPowerOffLocationTripId != null) return state
+    val trip = intent.session?.takeIf { it.movementObserved } ?: return state
+    return state.copy(
+        tripId = "${intent.identity}:recovered",
+        tripPowerSessionId = trip.tripId,
+        tripStartedAtMs = TripTime.instant(trip.startedAt)?.toEpochMilli(),
+        tripStartOdometerKm = trip.startOdometerKm,
+        tripStartSoc = trip.startSoc,
+        tripStartEnergyKwh = trip.startTripEnergyKwh,
+        tripParkedSinceMs = null,
+        tripEndOdometerKm = trip.lastOdometerKm,
+        tripEndSoc = trip.endSoc,
+        tripEndEnergyKwh = trip.lastTripEnergyKwh,
+        tripAccumulatedEnergyKwh = trip.energyKwh,
+        lastTripEnergyCounterKwh = trip.lastTripEnergyKwh,
+        bootStartSoc = trip.startSoc,
+        bootEndSoc = trip.endSoc,
+        bootTotalDistanceKm = 0.0,
+        bootTotalEnergyKwh = 0.0,
+        bootTotalDurationMs = 0L
+    )
 }
 
 /** Joins one poll's results without waiting or changing either owner's execution order. */

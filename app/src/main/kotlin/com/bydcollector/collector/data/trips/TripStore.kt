@@ -15,12 +15,14 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
     private var changeTracking = false
     private var fileAccessSuspended = false
     private var historicalBackfillChanged = false
+    private var tripCompletionsChanged = false
 
     @Synchronized
     internal fun beginChangeTracking() {
         check(!changeTracking) { "Trips change tracking already active" }
         changedTripSequences.clear()
         historicalBackfillChanged = false
+        tripCompletionsChanged = false
         changeTracking = true
     }
 
@@ -31,11 +33,15 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
     internal fun historicalBackfillChanged(): Boolean = historicalBackfillChanged
 
     @Synchronized
+    internal fun tripCompletionsChanged(): Boolean = tripCompletionsChanged
+
+    @Synchronized
     internal fun endChangeTracking() {
         check(changeTracking) { "Trips change tracking is not active" }
         changeTracking = false
         changedTripSequences.clear()
         historicalBackfillChanged = false
+        tripCompletionsChanged = false
     }
 
     private fun markSessionChanged(tripId: String) {
@@ -53,12 +59,16 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
         if (changeTracking) historicalBackfillChanged = true
     }
 
+    private fun markTripCompletionsChanged() {
+        if (changeTracking) tripCompletionsChanged = true
+    }
+
     @Synchronized
     internal fun nextHistoricalEnergyCandidate(): TripSession? = querySessions(
         "state = ? AND ended_at IS NOT NULL AND discharged_kwh IS NULL AND regenerated_kwh IS NULL " +
             "AND net_kwh IS NULL AND energy_covered_ms IS NULL AND energy_uncovered_ms IS NULL " +
             "AND energy_partial IS NULL AND energy_observed_at IS NULL " +
-            "AND NOT EXISTS (SELECT 1 FROM historical_energy_backfill b WHERE b.trip_id = trip_sessions.trip_id)",
+            "AND $HISTORICAL_PROGRESS_ELIGIBLE",
         arrayOf(TripSession.STATE_CLOSED),
         limit = 1
     ).firstOrNull()
@@ -69,7 +79,7 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
         val eligibility = "state = ? AND ended_at IS NOT NULL AND discharged_kwh IS NULL AND regenerated_kwh IS NULL " +
             "AND net_kwh IS NULL AND energy_covered_ms IS NULL AND energy_uncovered_ms IS NULL " +
             "AND energy_partial IS NULL AND energy_observed_at IS NULL " +
-            "AND NOT EXISTS (SELECT 1 FROM historical_energy_backfill b WHERE b.trip_id = trip_sessions.trip_id)"
+            "AND $HISTORICAL_PROGRESS_ELIGIBLE"
         return if (afterTripId == null) {
             querySessions(eligibility, arrayOf(TripSession.STATE_CLOSED), "trip_id", limit)
         } else {
@@ -96,6 +106,7 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
     internal fun commitHistoricalEnergyBackfill(record: HistoricalEnergyBackfillRecord, snapshot: EnergySnapshot?): Boolean {
         require(record.tripId.isNotBlank() && record.startedAt.isNotBlank() && record.endedAt.isNotBlank())
         require(record.sourceIdentity.isNotBlank() && record.reason.isNotBlank() && record.updatedAt.isNotBlank())
+        require(record.algorithmVersion == HistoricalEnergyBackfillRecord.ALGORITHM_VERSION)
         require((snapshot == null) == (record.outcome == "rejected"))
         if (snapshot != null) require(snapshot.powerSessionId == record.tripId && !snapshot.energyPartial && snapshot.energyCoveredMs > 0L)
         val db = writableDb
@@ -105,7 +116,7 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
             val eligibleWhere = "trip_id = ? AND state = 'closed' AND started_at = ? AND ended_at = ? " +
                 "AND discharged_kwh IS NULL AND regenerated_kwh IS NULL AND net_kwh IS NULL " +
                 "AND energy_covered_ms IS NULL AND energy_uncovered_ms IS NULL AND energy_partial IS NULL " +
-                "AND energy_observed_at IS NULL"
+                "AND energy_observed_at IS NULL AND $HISTORICAL_PROGRESS_ELIGIBLE"
             val args = arrayOf(record.tripId, record.startedAt, record.endedAt)
             val eligible = if (snapshot == null) {
                 db.rawQuery("SELECT 1 FROM trip_sessions WHERE $eligibleWhere", args).use { it.moveToFirst() }
@@ -113,6 +124,8 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
                 db.update("trip_sessions", snapshot.toEnergyContentValues(), eligibleWhere, args) == 1
             }
             if (eligible) {
+                db.delete("historical_energy_backfill", "trip_id = ? AND outcome = 'rejected' AND reason = ? AND algorithm_version < ?",
+                    arrayOf(record.tripId, HistoricalEnergyBackfillRecord.RETRY_REASON, record.algorithmVersion.toString()))
                 db.insertOrThrow("historical_energy_backfill", null, record.toContentValues())
                 db.setTransactionSuccessful()
                 committed = true
@@ -129,7 +142,7 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
 
     @Synchronized
     internal fun historicalEnergyBackfillRecords(): List<HistoricalEnergyBackfillRecord> = readableDb.rawQuery(
-        "SELECT trip_id, started_at, ended_at, source_identity, outcome, reason, updated_at FROM historical_energy_backfill ORDER BY trip_id",
+        "SELECT trip_id, started_at, ended_at, source_identity, outcome, reason, updated_at, algorithm_version FROM historical_energy_backfill ORDER BY trip_id",
         null
     ).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.toHistoricalEnergyBackfillRecord()) } }
 
@@ -166,18 +179,22 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
         var committed = false
         db.beginTransaction()
         try {
-            if (session.state == TripSession.STATE_OPEN) materializeChunksIfNeeded(db, session.tripId)
-            val durableSnapshot = durableEnergySnapshot(db).takeIf { preserveDurableEnergy }
-            val values = (durableSnapshot?.let { session.withEnergySnapshot(it) } ?: session).toContentValues()
-            if (db.update("trip_sessions", values, "trip_id = ?", arrayOf(session.tripId)) == 0) {
-                db.insertOrThrow("trip_sessions", null, values)
-            }
+            upsertSession(db, session, preserveDurableEnergy)
             db.setTransactionSuccessful()
             committed = true
         } finally {
             db.endTransaction()
         }
         if (committed) markSessionChanged(session.tripId)
+    }
+
+    private fun upsertSession(db: SQLiteDatabase, session: TripSession, preserveDurableEnergy: Boolean) {
+        if (session.state == TripSession.STATE_OPEN) materializeChunksIfNeeded(db, session.tripId)
+        val durableSnapshot = durableEnergySnapshot(db).takeIf { preserveDurableEnergy }
+        val values = (durableSnapshot?.let { session.withEnergySnapshot(it) } ?: session).toContentValues()
+        if (db.update("trip_sessions", values, "trip_id = ?", arrayOf(session.tripId)) == 0) {
+            db.insertOrThrow("trip_sessions", null, values)
+        }
     }
 
     @Synchronized
@@ -209,6 +226,129 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
     @Synchronized
     fun updateSession(session: TripSession) = upsertSession(session)
 
+    /** Atomically persists a CLOSED session and its immutable Telegram completion intent. */
+    @Synchronized
+    fun closeSessionWithCompletion(
+        session: TripSession?,
+        completion: TripCompletionIntent?
+    ): TripCompletionIntent? {
+        require(session == null || session.state == TripSession.STATE_CLOSED) { "Completion session must be closed" }
+        val db = writableDb
+        var result: TripCompletionIntent? = null
+        var inserted = false
+        db.beginTransaction()
+        try {
+            session?.let { upsertSession(db, it, preserveDurableEnergy = true) }
+            if (completion != null) {
+                result = completionByIdentity(db, completion.identity)
+                if (result != null) {
+                    require(completion.sequence == 0L || completion.sequence == result?.sequence) {
+                        "Completion retry sequence does not match stored identity"
+                    }
+                } else {
+                    require(completion.sequence == 0L) { "Completion sequence is assigned by storage" }
+                    val highWater = completionWatermark(db)
+                    check(highWater < Long.MAX_VALUE) { "Trip completion sequence exhausted" }
+                    val stored = completion.copy(sequence = highWater + 1L)
+                    val values = ContentValues().apply {
+                        put("sequence", stored.sequence)
+                        put("identity", stored.identity)
+                        put("observed_at", stored.observedAt)
+                        put("payload", TripCompletionIntentCodec.encode(stored))
+                    }
+                    db.insertOrThrow("trip_completion_outbox", null, values)
+                    check(
+                        db.update(
+                            "trip_completion_state",
+                            ContentValues().apply { put("high_water_sequence", stored.sequence) },
+                            "singleton_id = 1 AND high_water_sequence = ?",
+                            arrayOf(highWater.toString())
+                        ) == 1
+                    ) { "Trip completion high-water update failed" }
+                    result = stored
+                    inserted = true
+                }
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        session?.let { markSessionChanged(it.tripId) }
+        if (inserted) markTripCompletionsChanged()
+        return result
+    }
+
+    @Synchronized
+    fun completionWatermark(): Long = completionWatermark(readableDb)
+
+    @Synchronized
+    fun pendingCompletions(
+        upToSequence: Long,
+        limit: Int = DEFAULT_COMPLETION_LIMIT
+    ): List<TripCompletionIntent> {
+        require(upToSequence >= 0L) { "Completion watermark must be non-negative" }
+        require(limit in 1..MAX_COMPLETION_LIMIT) { "Completion limit must be 1..$MAX_COMPLETION_LIMIT" }
+        return readableDb.rawQuery(
+            "SELECT sequence, identity, observed_at, payload FROM trip_completion_outbox " +
+                "WHERE sequence <= ? ORDER BY sequence LIMIT ?",
+            arrayOf(upToSequence.toString(), limit.toString())
+        ).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.toTripCompletionIntent()) } }
+    }
+
+    @Synchronized
+    fun acknowledgeCompletion(sequence: Long, identity: String): Boolean {
+        if (sequence <= 0L || identity.isBlank()) return false
+        val deleted = writableDb.delete(
+            "trip_completion_outbox",
+            "sequence = ? AND identity = ?",
+            arrayOf(sequence.toString(), identity)
+        ) == 1
+        if (deleted) markTripCompletionsChanged()
+        return deleted
+    }
+
+    @Synchronized
+    internal fun allPendingCompletions(): List<TripCompletionIntent> = readableDb.rawQuery(
+        "SELECT sequence, identity, observed_at, payload FROM trip_completion_outbox ORDER BY sequence",
+        null
+    ).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.toTripCompletionIntent()) } }
+
+    @Synchronized
+    internal fun replaceCompletionState(highWater: Long, completions: List<TripCompletionIntent>) {
+        require(highWater >= 0L)
+        require(completions.all { it.sequence in 1L..highWater })
+        require(completions.map { it.sequence }.toSet().size == completions.size)
+        require(completions.map { it.identity }.toSet().size == completions.size)
+        val db = writableDb
+        db.beginTransaction()
+        try {
+            db.delete("trip_completion_outbox", null, null)
+            check(
+                db.update(
+                    "trip_completion_state",
+                    ContentValues().apply { put("high_water_sequence", highWater) },
+                    "singleton_id = 1",
+                    null
+                ) == 1
+            ) { "Trip completion state is missing" }
+            completions.sortedBy { it.sequence }.forEach { completion ->
+                db.insertOrThrow(
+                    "trip_completion_outbox",
+                    null,
+                    ContentValues().apply {
+                        put("sequence", completion.sequence)
+                        put("identity", completion.identity)
+                        put("observed_at", completion.observedAt)
+                        put("payload", TripCompletionIntentCodec.encode(completion))
+                    }
+                )
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
     @Synchronized
     override fun readEnergyRuntimeRow(): EnergyRuntimeRow? = readableDb.rawQuery(
         "SELECT state_json, pending_projection_json, updated_at FROM energy_runtime_state WHERE singleton_id = 1",
@@ -219,6 +359,49 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
             pendingProjectionJson = cursor.getStringOrNull(1),
             updatedAt = cursor.getString(2)
         )
+    }
+
+    @Synchronized
+    override fun quarantineEnergyRuntimeRow(row: EnergyRuntimeRow, reason: String, updatedAt: String) {
+        val bytes = (row.stateJson + "\u0000" + row.pendingProjectionJson.orEmpty()).toByteArray(Charsets.UTF_8)
+        val identity = java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        val values = row.toContentValues().apply {
+            put("identity", identity)
+            put("reason", reason)
+            put("quarantined_at", updatedAt)
+        }
+        // A failed evidence write must prevent replacement of the poisoned checkpoint.
+        writableDb.insertWithOnConflict("energy_runtime_quarantine", null, values, android.database.sqlite.SQLiteDatabase.CONFLICT_IGNORE)
+        check(readableDb.rawQuery("SELECT 1 FROM energy_runtime_quarantine WHERE identity = ?", arrayOf(identity))
+            .use { it.moveToFirst() }) { "Energy quarantine was not persisted" }
+    }
+
+    @Synchronized
+    internal fun energyQuarantineRecords(): List<EnergyQuarantineRecord> = readableDb.rawQuery(
+        "SELECT identity, state_json, pending_projection_json, updated_at, reason, quarantined_at FROM energy_runtime_quarantine ORDER BY identity", null
+    ).use { cursor -> buildList {
+        while (cursor.moveToNext()) add(EnergyQuarantineRecord(cursor.getString(0),
+            EnergyRuntimeRow(cursor.getString(1), cursor.getStringOrNull(2), cursor.getString(3)),
+            cursor.getString(4), cursor.getString(5)))
+    } }
+
+    @Synchronized
+    internal fun replaceEnergyQuarantineRecords(records: List<EnergyQuarantineRecord>) {
+        val db = writableDb
+        db.beginTransaction()
+        try {
+            db.delete("energy_runtime_quarantine", null, null)
+            records.forEach { record ->
+                val values = record.row.toContentValues().apply {
+                    put("identity", record.identity); put("reason", record.reason); put("quarantined_at", record.quarantinedAt)
+                }
+                db.insertOrThrow("energy_runtime_quarantine", null, values)
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
     }
 
     @Synchronized
@@ -798,6 +981,30 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
         getStringOrNull(27), getStringOrNull(28), getString(29), getInt(30) == 1, getInt(31) == 1
     )
 
+    private fun Cursor.toTripCompletionIntent(): TripCompletionIntent {
+        val sequence = getLong(0)
+        val identity = getString(1)
+        val observedAt = getString(2)
+        return TripCompletionIntentCodec.decode(getString(3)).also { intent ->
+            check(intent.sequence == sequence && intent.identity == identity && intent.observedAt == observedAt) {
+                "Trip completion payload identity mismatch"
+            }
+        }
+    }
+
+    private fun completionByIdentity(db: SQLiteDatabase, identity: String): TripCompletionIntent? = db.rawQuery(
+        "SELECT sequence, identity, observed_at, payload FROM trip_completion_outbox WHERE identity = ?",
+        arrayOf(identity)
+    ).use { cursor -> if (cursor.moveToFirst()) cursor.toTripCompletionIntent() else null }
+
+    private fun completionWatermark(db: SQLiteDatabase): Long = db.rawQuery(
+        "SELECT high_water_sequence FROM trip_completion_state WHERE singleton_id = 1",
+        null
+    ).use { cursor ->
+        check(cursor.moveToFirst()) { "Trip completion state is missing" }
+        cursor.getLong(0).also { check(it >= 0L) { "Trip completion high-water is invalid" } }
+    }
+
     private fun Cursor.toRoutePoint(): RoutePoint {
         val kind = getString(2)
         val quality = getString(15)
@@ -837,6 +1044,7 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
         put("outcome", outcome)
         put("reason", reason)
         put("updated_at", updatedAt)
+        put("algorithm_version", algorithmVersion)
     }
 
     private fun Cursor.toHistoricalEnergyBackfillRecord() = HistoricalEnergyBackfillRecord(
@@ -846,7 +1054,8 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
         sourceIdentity = getString(3),
         outcome = getString(4),
         reason = getString(5),
-        updatedAt = getString(6)
+        updatedAt = getString(6),
+        algorithmVersion = getInt(7)
     )
 
     private fun EnergySnapshot.toEnergyContentValues() = ContentValues().apply {
@@ -863,10 +1072,24 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
         "SELECT state_json FROM energy_runtime_state WHERE singleton_id = 1",
         null
     ).use { cursor ->
-        if (!cursor.moveToFirst()) null else EnergyStateCodec.decodeState(cursor.getString(0)).currentSnapshot
+        if (!cursor.moveToFirst()) null else try {
+            EnergyStateCodec.decodeState(cursor.getString(0)).currentSnapshot
+        } catch (_: org.json.JSONException) {
+            // Energy recovery owns preservation/repair; optional projection parsing
+            // must not prevent a valid Trips close. SQLite failures still propagate.
+            null
+        } catch (_: IllegalArgumentException) {
+            null
+        }
     }
 
     companion object {
+        const val DEFAULT_COMPLETION_LIMIT = 100
+        const val MAX_COMPLETION_LIMIT = 1_000
+        private const val HISTORICAL_PROGRESS_ELIGIBLE =
+            "NOT EXISTS (SELECT 1 FROM historical_energy_backfill b WHERE b.trip_id = trip_sessions.trip_id " +
+                "AND NOT (b.outcome = 'rejected' AND b.reason = '${HistoricalEnergyBackfillRecord.RETRY_REASON}' " +
+                "AND b.algorithm_version < ${HistoricalEnergyBackfillRecord.ALGORITHM_VERSION}))"
         private const val CHUNK_SELECT =
             "SELECT trip_id, chunk_index, first_sequence, last_sequence, point_count, first_observed_at, last_observed_at, uncompressed_size, compressed_size, payload FROM route_chunks WHERE trip_id = ? ORDER BY chunk_index"
         private const val RAW_ROUTE_FROM_SELECT =

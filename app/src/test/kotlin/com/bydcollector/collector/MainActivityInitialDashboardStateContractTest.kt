@@ -53,6 +53,17 @@ class MainActivityInitialDashboardStateContractTest {
         assertFalse(readiness.contains("inFlight"))
         assertTrue(readiness.contains("archiveStorageScanPending"))
         assertTrue(readiness.contains("archiveStorageSnapshot.entries.isNotEmpty()"))
+        val load = activity.substringAfter("private fun loadTripsUi(").substringBefore("private fun openCurrentTrip()")
+        assertTrue(load.contains("routeTripId ?: tripsUiState.routeLoadingId"))
+        assertTrue(load.contains("requestedRouteId?.let { id -> mapOf(id to trips.queryRoutePoints(id)) }"))
+        assertTrue(load.contains("TripsUiMapper.retainRoutes(loaded.years, tripsUiState.years, loaded.refreshedRouteId)"))
+        // Reversed worker completion cannot publish over a newer request/session/language.
+        val publish = load.indexOf("TripsUiMapper.retainRoutes")
+        for (guard in listOf("requestGeneration != tripsRequestGeneration", "uiLanguage != requestedLanguage",
+            "!navigationSession.isGenerationCurrent(sessionGeneration)")) {
+            assertTrue(load.indexOf(guard) in 0 until publish, guard)
+        }
+        assertFalse(load.substringBefore("runCatching { dashboardExecutor.execute").contains("years ="))
     }
 
     private fun sourceFile(path: String): File {

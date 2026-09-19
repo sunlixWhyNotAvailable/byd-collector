@@ -4,11 +4,15 @@ import com.bydcollector.collector.data.local.TelegramDeliveryStore
 import com.bydcollector.collector.data.local.TelegramOutboxEntry
 import java.time.LocalDate
 import java.time.ZoneOffset
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -609,6 +613,113 @@ class TelegramDeliveryQueueTest {
         assertEquals(future, store.rows[2L]?.nextAttemptAtMs)
         assertEquals(2, store.rows[2L]?.failureCount)
         assertEquals(listOf("attempt"), records.map { it.kind })
+    }
+
+    @Test
+    fun twoPhaseAttemptLeavesOwnerResponsiveWhileHttpIsBlockedAndKeepsSingleFlight() {
+        val store = FakeDeliveryStore(entries = listOf(entry(id = 1)))
+        var synchronousSenderCalls = 0
+        val queue = queue(
+            store,
+            send = {
+                synchronousSenderCalls += 1
+                TelegramSendResult.Success
+            }
+        )
+
+        val attempt = assertNotNull(queue.beginAttempt("ordinary"))
+        assertEquals("payload-1", attempt.request.text)
+        assertEquals(0, synchronousSenderCalls, "beginAttempt must not perform HTTP")
+        assertNull(queue.pendingDeadline(), "an active HTTP attempt must not schedule an owner spin")
+
+        val httpEntered = CountDownLatch(1)
+        val releaseHttp = CountDownLatch(1)
+        val result = AtomicReference<TelegramSendResult>()
+        val httpThread = Thread {
+            httpEntered.countDown()
+            releaseHttp.await()
+            result.set(TelegramSendResult.Success)
+        }
+        try {
+            httpThread.start()
+            assertTrue(httpEntered.await(1, TimeUnit.SECONDS))
+
+            // These calls execute while the simulated HTTP worker remains blocked.
+            assertNull(queue.beginAttempt("duplicate"))
+            assertIs<TelegramConnectionSelection.Busy>(
+                queue.beginConnectionTest(TelegramSendMessage("123:token", "chat", "manual"))
+            )
+            queue.resetSession()
+            assertNull(queue.beginAttempt("after_reset"), "resetSession must not erase the active attempt")
+        } finally {
+            releaseHttp.countDown()
+            httpThread.join(1_000L)
+        }
+
+        assertFalse(httpThread.isAlive)
+        queue.completeAttempt(attempt, assertNotNull(result.get()))
+        assertTrue(store.rows.isEmpty())
+        assertFailsWith<IllegalStateException> {
+            queue.completeAttempt(attempt, TelegramSendResult.Success)
+        }
+    }
+
+    @Test
+    fun capturedAttemptCommitsSuccessAfterCredentialsChangeAndNextAttemptUsesNewCredentials() {
+        var config = TelegramDeliveryCredentials(enabled = true, token = "123:old", chatId = "old-chat")
+        val store = FakeDeliveryStore(entries = listOf(entry(id = 1)))
+        val queue = queue(store, credentials = { config })
+
+        val oldAttempt = assertNotNull(queue.beginAttempt("ordinary"))
+        assertEquals("123:old", oldAttempt.request.botToken)
+        assertEquals("old-chat", oldAttempt.request.chatId)
+
+        config = TelegramDeliveryCredentials(enabled = true, token = "456:new", chatId = "new-chat")
+        queue.completeAttempt(oldAttempt, TelegramSendResult.Success)
+        assertTrue(store.rows.isEmpty(), "accepted old-credential success must still commit its exact row")
+
+        store.add(entry(id = 2))
+        val newAttempt = assertNotNull(queue.beginAttempt("ordinary"))
+        assertEquals("456:new", newAttempt.request.botToken)
+        assertEquals("new-chat", newAttempt.request.chatId)
+    }
+
+    @Test
+    fun failedCapturedAttemptAppliesServerCooldownToTheBotThatActuallySentIt() {
+        var now = 5_000L
+        var config = TelegramDeliveryCredentials(enabled = true, token = "123:old", chatId = "chat")
+        val store = FakeDeliveryStore(entries = listOf(entry(id = 1, nextAttemptAtMs = now)))
+        val queue = queue(store, credentials = { config }, now = { now })
+
+        val attempt = assertNotNull(queue.beginAttempt("ordinary"))
+        config = TelegramDeliveryCredentials(enabled = true, token = "456:new", chatId = "chat")
+        now = 7_000L
+        queue.completeAttempt(
+            attempt,
+            TelegramSendResult.Failure(
+                kind = TelegramSendFailureKind.RATE_LIMITED,
+                retryAfterSeconds = 30L
+            )
+        )
+
+        assertEquals(37_000L, store.telegramServerNotBefore(TelegramDeliveryQueue.botScope("123:rotated")))
+        assertEquals(0L, store.telegramServerNotBefore(TelegramDeliveryQueue.botScope("456:new")))
+        assertEquals(37_000L, store.rows[1L]?.nextAttemptAtMs)
+    }
+
+    @Test
+    fun connectionTestAndDurableDeliveryShareOneTwoPhaseLane() {
+        val store = FakeDeliveryStore(entries = listOf(entry(id = 1)))
+        val queue = queue(store)
+        val request = TelegramSendMessage("123:token", "chat", "manual")
+
+        val delivery = assertNotNull(queue.beginAttempt("ordinary"))
+        assertIs<TelegramConnectionSelection.Busy>(queue.beginConnectionTest(request))
+        queue.completeAttempt(delivery, TelegramSendResult.Success)
+
+        val connection = assertIs<TelegramConnectionSelection.Ready>(queue.beginConnectionTest(request)).attempt
+        assertNull(queue.beginAttempt("ordinary"))
+        assertEquals(TelegramSendResult.Success, queue.completeConnectionTest(connection, TelegramSendResult.Success))
     }
 
     private fun queue(

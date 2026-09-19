@@ -6,6 +6,8 @@ import android.os.SystemClock
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
+import com.bydcollector.collector.data.local.TelegramLegacyMigrationDecision
+import com.bydcollector.collector.data.local.TelegramLegacySnapshot
 import com.bydcollector.collector.data.local.TelegramStore
 import com.bydcollector.collector.data.trips.TripDatabaseHelper
 import com.bydcollector.collector.data.trips.TripStore
@@ -20,6 +22,7 @@ import com.bydcollector.collector.maintenance.DatabaseMaintenanceGate
 import com.bydcollector.collector.maintenance.StorageFormatCutoverCoordinator
 import com.bydcollector.collector.maintenance.StorageFormat
 import com.bydcollector.collector.service.CollectorSettings
+import com.bydcollector.collector.telegram.TelegramDeliveryRuntime
 import com.bydcollector.collector.ui.ArchiveStorageSnapshotCache
 import com.bydcollector.collector.ui.DashboardUiStateStore
 import com.bydcollector.collector.ui.UiSessionState
@@ -54,6 +57,7 @@ class BydCollectorApplication : Application() {
     val navigationSession by lazy { UiSessionState() }
     private val updateCheckExecutorDelegate = lazy { namedSingleThreadExecutor("byd-update-check") }
     private val historicalEnergyExecutorDelegate = lazy { namedSingleThreadExecutor("byd-historical-energy") }
+    private val telegramDeliveryRuntimeDelegate = lazy { TelegramDeliveryRuntime() }
     private val historicalEnergyScheduled = AtomicBoolean(false)
     private val historicalEnergyFinished = AtomicBoolean(false)
     private val historicalEnergyFinalization = HistoricalBackfillFinalizationGate()
@@ -75,6 +79,7 @@ class BydCollectorApplication : Application() {
         }
     }
     internal val updateRuntime by lazy { UpdateRuntime(this) }
+    val telegramDeliveryRuntime by telegramDeliveryRuntimeDelegate
     internal val updateHints by lazy { UpdateHintOverlay(this) }
     private val archiveStorageSnapshotCacheDelegate = lazy {
         ArchiveStorageSnapshotCache(
@@ -95,6 +100,7 @@ class BydCollectorApplication : Application() {
     override fun onTerminate() {
         if (updateCheckExecutorDelegate.isInitialized()) updateCheckExecutorDelegate.value.shutdownNow()
         if (historicalEnergyExecutorDelegate.isInitialized()) historicalEnergyExecutorDelegate.value.shutdownNow()
+        if (telegramDeliveryRuntimeDelegate.isInitialized()) telegramDeliveryRuntime.close()
         tripsStore?.close()
         telemetryStore?.close()
         telegramStore?.close()
@@ -348,6 +354,13 @@ class BydCollectorApplication : Application() {
     }
 
     @Synchronized
+    internal fun reconcileTelegramStorage(mainStore: TelemetryStore): TelegramStore? {
+        telegramStoreOrNull()?.let { return it }
+        initializeTelegramStorage(mainStore)
+        return telegramStoreOrNull()
+    }
+
+    @Synchronized
     fun reopenTelemetryStoreForMaintenance(): TelemetryStore {
         return TelemetryStore(
             applicationContext,
@@ -462,35 +475,62 @@ class BydCollectorApplication : Application() {
     @Synchronized
     private fun initializeTelegramStorage(mainStore: TelemetryStore) {
         val settings = CollectorSettings(applicationContext, mainStore)
-        val snapshot = mainStore.readLegacyTelegramSnapshot()
-        if (snapshot.requiresPreservation) {
-            telegramLegacyMigrationUnresolved = true
-            if (!settings.setTelegramLegacyMigrationRequired(true)) {
-                markTelegramStorageFailure(mainStore, IllegalStateException("Cannot persist Telegram migration requirement"))
-                return
-            }
-        }
-        val sidecar = telegramStore ?: runCatching { TelegramStore(applicationContext) }
-            .getOrElse { error ->
-                markTelegramStorageFailure(mainStore, error)
-                return
-            }
-            .also { telegramStore = it }
-        if (
-            (settings.telegramLegacyMigrationRequired() || telegramLegacyMigrationUnresolved) &&
-            !snapshot.requiresPreservation
-        ) {
-            markTelegramStorageFailure(
-                mainStore,
-                IllegalStateException("Legacy Telegram data remains in an archived Main database")
-            )
+        val sidecar = telegramStore ?: try {
+            TelegramStore(applicationContext)
+        } catch (error: Exception) {
+            if (error is InterruptedException) throw error
+            markTelegramStorageFailure(mainStore, error)
+            return
+        }.also { telegramStore = it }
+        val importAlreadyComplete = try {
+            sidecar.isMainImportComplete()
+        } catch (error: Exception) {
+            if (error is InterruptedException) throw error
+            markTelegramStorageFailure(mainStore, error)
             return
         }
-        val migration = runCatching { sidecar.importLegacySnapshot(snapshot) }
-            .getOrElse { error ->
-                markTelegramStorageFailure(mainStore, error)
+        // Read Main only after the durable sidecar marker. A transient unknown
+        // read cannot erase a completed import or manufacture a new obligation.
+        val snapshot = try {
+            mainStore.readLegacyTelegramSnapshot()
+        } catch (error: Exception) {
+            if (error is InterruptedException) throw error
+            TelegramLegacySnapshot(
+                readError = "${error::class.java.simpleName}: ${error.message ?: "Legacy Telegram snapshot read failed"}"
+            )
+        }
+        when (
+            snapshot.migrationDecision(
+                importAlreadyComplete = importAlreadyComplete,
+                migrationPreviouslyRequired = settings.telegramLegacyMigrationRequired() ||
+                    telegramLegacyMigrationUnresolved
+            )
+        ) {
+            TelegramLegacyMigrationDecision.VERIFY_COMPLETED_IMPORT,
+            TelegramLegacyMigrationDecision.IMPORT_EMPTY -> Unit
+            TelegramLegacyMigrationDecision.RETRY_UNKNOWN_READ -> {
+                markTelegramStorageFailure(
+                    mainStore,
+                    IllegalStateException(snapshot.readError ?: "Legacy Telegram snapshot read is unknown")
+                )
                 return
             }
+            TelegramLegacyMigrationDecision.IMPORT_PROVEN_DATA -> {
+                telegramLegacyMigrationUnresolved = true
+                if (!settings.setTelegramLegacyMigrationRequired(true)) {
+                    markTelegramStorageFailure(mainStore, IllegalStateException("Cannot persist Telegram migration requirement"))
+                    return
+                }
+            }
+            TelegramLegacyMigrationDecision.FAIL_PROVEN_MISSING -> {
+                markTelegramStorageFailure(
+                    mainStore,
+                    IllegalStateException("Legacy Telegram data remains in an archived Main database")
+                )
+                return
+            }
+        }
+        val migration = sidecar.importLegacySnapshot(snapshot)
         if (!migration.verified) {
             markTelegramStorageFailure(
                 mainStore,
@@ -498,11 +538,13 @@ class BydCollectorApplication : Application() {
             )
             return
         }
-        val sidecarStateValid = runCatching { sidecar.verifyRuntimeState() }
-            .getOrElse { error ->
-                markTelegramStorageFailure(mainStore, error)
-                return
-            }
+        val sidecarStateValid = try {
+            sidecar.verifyRuntimeState()
+        } catch (error: Exception) {
+            if (error is InterruptedException) throw error
+            markTelegramStorageFailure(mainStore, error)
+            return
+        }
         if (!sidecarStateValid) {
             markTelegramStorageFailure(mainStore, IllegalStateException("Telegram sidecar runtime state is malformed"))
             return
@@ -511,13 +553,34 @@ class BydCollectorApplication : Application() {
             markTelegramStorageFailure(mainStore, IllegalStateException("Cannot clear Telegram migration requirement"))
             return
         }
-        val cleaned = runCatching { mainStore.cleanupLegacyTelegramStorage(snapshot, migration) }
-            .getOrDefault(false)
-        if (!cleaned) {
-            telegramLegacyMigrationUnresolved = true
-            settings.setTelegramLegacyMigrationRequired(true)
-            markTelegramStorageFailure(mainStore, IllegalStateException("Legacy Telegram cleanup was not verified"))
-            return
+        if (migration.cleanupVerified) {
+            val cleaned = try {
+                mainStore.cleanupLegacyTelegramStorage(snapshot, migration)
+            } catch (error: Exception) {
+                if (error is InterruptedException) throw error
+                false
+            }
+            if (!cleaned && snapshot.requiresPreservation) {
+                try {
+                    mainStore.recordEvent(
+                        "telegram_legacy_cleanup_deferred",
+                        "Legacy Telegram cleanup was deferred after verified sidecar import",
+                        null
+                    )
+                } catch (error: Exception) {
+                    if (error is InterruptedException) throw error
+                }
+            }
+        } else if (snapshot.requiresPreservation) {
+            try {
+                mainStore.recordEvent(
+                    "telegram_legacy_cleanup_deferred",
+                    "Legacy Telegram cleanup was deferred because the Main snapshot was not verified",
+                    migration.errorMessage
+                )
+            } catch (error: Exception) {
+                if (error is InterruptedException) throw error
+            }
         }
         telegramLegacyMigrationUnresolved = false
         telegramStorageError = null
@@ -537,17 +600,25 @@ class BydCollectorApplication : Application() {
 
     private fun markTelegramStorageFailure(mainStore: TelemetryStore, error: Throwable) {
         val detail = (error.message ?: error::class.java.simpleName).take(300)
-        telegramStore?.let { runCatching { it.close() } }
+        telegramStore?.let {
+            try {
+                it.close()
+            } catch (closeError: Exception) {
+                if (closeError is InterruptedException) throw closeError
+            }
+        }
         telegramStore = null
         telegramStorageError = detail
         CollectorSettings(applicationContext, mainStore)
             .setTelegramConnectionStatus("storage_error", TELEGRAM_STORAGE_ERROR)
-        runCatching {
+        try {
             mainStore.recordEvent(
                 TELEGRAM_STORAGE_ERROR,
                 "Telegram sidecar migration failed",
                 detail
             )
+        } catch (eventError: Exception) {
+            if (eventError is InterruptedException) throw eventError
         }
     }
 

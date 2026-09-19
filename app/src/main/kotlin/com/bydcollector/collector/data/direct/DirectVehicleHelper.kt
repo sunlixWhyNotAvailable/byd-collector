@@ -57,7 +57,8 @@ data class DirectBatchDiagnostics(
     val groupFailureCount: Int,
     val helperElapsedMs: Long,
     val returnedCount: Int,
-    val error: String? = null
+    val error: String? = null,
+    val status: Int = CollectorHelperProtocol.STATUS_OK
 ) {
     val stateKey: String = listOf(
         mode,
@@ -65,7 +66,8 @@ data class DirectBatchDiagnostics(
     ).joinToString("|")
 
     fun summary(): String = buildString {
-        append("mode=").append(mode)
+        append("status=").append(status)
+        append(" mode=").append(mode)
         append(" native_available=").append(nativeAvailable)
         append(" native_groups=").append(nativeGroupCount)
         append(" fallback_groups=").append(fallbackGroupCount)

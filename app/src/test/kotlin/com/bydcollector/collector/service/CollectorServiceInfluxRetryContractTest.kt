@@ -23,6 +23,8 @@ class CollectorServiceInfluxRetryContractTest {
             .substringBefore("private fun flushPendingMqttAsync")
         val liveness = service.substringAfter("private fun currentRuntimeLiveness")
             .substringBefore("private fun hasRuntimeOwner")
+        val generation = service.substringAfter("private fun advanceInfluxGeneration")
+            .substringBefore("private fun <T> executeOrderedTelegram")
 
         assertTrue(normalizedWrite.contains("requestInfluxCycle()"))
         assertTrue(service.contains("private val influxRetryTask"))
@@ -67,6 +69,8 @@ class CollectorServiceInfluxRetryContractTest {
         assertTrue(stateDetails.contains("coordinator?.frozenEndpoints ?: \"none\""))
         assertTrue(influxPath.contains("influxDiagnosticStateDetails(influxWorkGeneration.get(), queued = true)"))
         assertTrue(influxPath.contains("workGeneration = if (isCurrentGeneration && !influxRequestQueued.get())"))
+        assertTrue(generation.contains("influxWorkGeneration.incrementAndGet()"))
+        assertTrue(generation.contains("influxCoordinator.cancelInFlight()"))
     }
 
     private fun sourceFile(path: String): File {

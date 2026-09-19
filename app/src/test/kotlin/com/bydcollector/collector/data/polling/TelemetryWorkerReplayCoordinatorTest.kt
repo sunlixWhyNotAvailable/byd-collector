@@ -91,7 +91,7 @@ class TelemetryWorkerReplayCoordinatorTest {
                     origin: PollOrigin,
                     source: PollSampleSource
                 ) {
-                    throw IllegalStateException("energy unavailable")
+                    throw Exception("checked energy storage failure")
                 }
             }
         )
@@ -496,7 +496,7 @@ class TelemetryWorkerReplayCoordinatorTest {
     }
 
     @Test
-    fun addressCorruptCatalogSampleIsRejectedBeforeStorageAndAck() {
+    fun addressCorruptCatalogSampleIsPreservedBeforeAck() {
         val actions = mutableListOf<String>()
         val storage = FakeWorkerPollStorage(actions)
         val wrongAddress = TEST_ENTRY.copy(fid = TEST_ENTRY.fid + 1)
@@ -518,14 +518,18 @@ class TelemetryWorkerReplayCoordinatorTest {
 
         val corrupt = coordinator.replayNextBatch(7L)
 
-        assertTrue(corrupt.needsReplay)
-        assertEquals("worker_replay_error", corrupt.cycleResult?.category)
-        assertTrue(storage.inputs.isEmpty())
-        assertFalse(actions.contains("ack"))
+        assertFalse(corrupt.needsReplay)
+        val input = storage.inputs.single()
+        assertEquals("worker_sample_quarantined", input.errorCategory)
+        assertTrue(input.readings.isEmpty())
+        val raw = org.json.JSONObject(input.rawResponseBody!!)
+        assertEquals(wrongAddress.fid, raw.getJSONArray("values").getJSONObject(0).getInt("fid"))
+        assertEquals(72, raw.getJSONArray("values").getJSONObject(0).getInt("raw"))
+        assertTrue(actions.indexOf("insert:7") < actions.indexOf("ack"))
     }
 
     @Test
-    fun unknownCatalogSampleIsRejectedBeforeStorageAndAck() {
+    fun unknownCatalogSampleIsPreservedBeforeAckAndDiskFailureRemainsRetryable() {
         val actions = mutableListOf<String>()
         val storage = FakeWorkerPollStorage(actions)
         val coordinator = TelemetryWorkerReplayCoordinator(
@@ -546,9 +550,16 @@ class TelemetryWorkerReplayCoordinatorTest {
 
         val unknown = coordinator.replayNextBatch(7L)
 
-        assertTrue(unknown.needsReplay)
-        assertEquals("worker_replay_error", unknown.cycleResult?.category)
-        assertTrue(storage.inputs.isEmpty())
+        assertFalse(unknown.needsReplay)
+        assertEquals("worker_sample_quarantined", storage.inputs.single().errorCategory)
+        val raw = org.json.JSONObject(storage.inputs.single().rawResponseBody!!)
+        assertEquals("unknown", raw.getString("catalog_version"))
+        assertEquals("boot-a", raw.getJSONObject("identity").getString("boot_id"))
+        assertTrue(actions.indexOf("insert:7") < actions.indexOf("ack"))
+
+        storage.failInsertAttempt = 2
+        actions.clear()
+        assertTrue(coordinator.replayNextBatch(7L).needsReplay)
         assertFalse(actions.contains("ack"))
     }
 

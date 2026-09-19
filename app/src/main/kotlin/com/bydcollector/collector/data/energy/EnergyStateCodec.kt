@@ -17,6 +17,7 @@ object EnergyStateCodec {
         put("integration_quality", state.integrationQuality.name)
         put("reason", state.reason)
         putNullable("current_snapshot", state.currentSnapshot?.let(::encodeSnapshotObject))
+        put("recovery_state", state.recoveryState.name)
     }.toString()
 
     fun decodeState(value: String): EnergyRuntimeState {
@@ -37,7 +38,12 @@ object EnergyStateCodec {
             totals = decodeTotals(json.getJSONObject("totals")),
             integrationQuality = enumValueOf(json.getString("integration_quality")),
             reason = json.getString("reason"),
-            currentSnapshot = json.objectOrNull("current_snapshot")?.let(::decodeSnapshotObject)
+            currentSnapshot = json.objectOrNull("current_snapshot")?.let(::decodeSnapshotObject),
+            recoveryState = if (json.has("recovery_state")) {
+                enumValueOf(json.getString("recovery_state"))
+            } else {
+                EnergyRecoveryState.NONE
+            }
         )
     }
 
@@ -51,7 +57,11 @@ object EnergyStateCodec {
         require(json.getInt("schema_version") == EnergyRuntimeState.CURRENT_SCHEMA_VERSION) {
             "Unsupported energy projection schema"
         }
-        return EnergyPendingProjection(decodeSnapshotObject(json.getJSONObject("snapshot")))
+        val snapshot = decodeSnapshotObject(json.getJSONObject("snapshot"))
+        require(snapshot.snapshotId == "energy:${snapshot.sourceIdentity}") {
+            "Energy projection identity mismatch"
+        }
+        return EnergyPendingProjection(snapshot)
     }
 
     private fun encodeAnchor(anchor: EnergyAnchor) = JSONObject()

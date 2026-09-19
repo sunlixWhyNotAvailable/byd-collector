@@ -47,10 +47,10 @@ class TelemetryPoller(
         while (running.get()) {
             val startedAt = clock.elapsedRealtimeMs()
             try {
-                coordinator.pollOnce(sessionId)?.let(onCycleResult)
+                coordinator.pollOnce(sessionId)?.takeUnless { it.deferred }?.let(onCycleResult)
             } catch (_: InterruptedException) {
                 running.set(false)
-            } catch (_: RuntimeException) {
+            } catch (_: Exception) {
                 //continues polling after one bad cycle because vehicle access can be transiently unavailable
                 runCatching {
                     onCycleResult(PollCycleResult(null, ok = false, category = "poller_runtime_error", elapsedMs = 0, requestCount = 0))

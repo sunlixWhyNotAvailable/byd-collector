@@ -1,5 +1,6 @@
 package com.bydcollector.collector.data.direct
 
+import com.bydcollector.collector.direct.CollectorHelperProtocol
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -72,7 +73,80 @@ class DirectAutoserviceReaderTest {
         )
 
         assertEquals(first.stateKey, rotatedDebugCycle.stateKey)
+        assertEquals(CollectorHelperProtocol.STATUS_OK, first.status)
+        assertTrue(first.summary().startsWith("status=0 mode=native"))
     }
+
+    @Test
+    fun rejectedReplayBatchIsTypedAndPreservedInCompactDiagnostics() {
+        val entries = DirectFidRegistry.entries.take(2)
+        val helper = batchHelper(
+            CollectorHelperProtocol.STATUS_REPLAY_PENDING,
+            "app-gap spool pending; replay before live read"
+        )
+
+        val snapshot = DirectAutoserviceReader(helper, entries).readSnapshot()
+        val compact = snapshot.toJson(ok = false, includeFields = false)
+
+        assertTrue(snapshot.replayPending)
+        assertEquals(CollectorHelperProtocol.STATUS_REPLAY_PENDING, snapshot.batchStatus)
+        assertTrue(snapshot.fields.all { it.status == CollectorHelperProtocol.STATUS_REPLAY_PENDING })
+        assertTrue(compact.contains("\"status\":-915"))
+        assertTrue(compact.contains("\"mode\":\"rejected\""))
+    }
+
+    @Test
+    fun replayBatchStatusSurvivesMissingFieldResults() {
+        val entries = DirectFidRegistry.entries.take(2)
+        val helper = object : DirectVehicleHelper {
+            override fun isAlive(): Boolean = true
+            override fun read(entry: DirectFidEntry): DirectHelperReadResult = error("scalar read must not be used")
+            override fun readBatch(entries: List<DirectFidEntry>): DirectHelperBatchResult = DirectHelperBatchResult(
+                results = emptyList(),
+                diagnostics = testDiagnostics(0).copy(
+                    mode = "rejected",
+                    error = "app-gap spool pending; replay before live read",
+                    status = CollectorHelperProtocol.STATUS_REPLAY_PENDING
+                )
+            )
+        }
+
+        val snapshot = DirectAutoserviceReader(helper, entries).readSnapshot()
+
+        assertTrue(snapshot.replayPending)
+        assertEquals(CollectorHelperProtocol.STATUS_REPLAY_PENDING, snapshot.batchStatus)
+        assertTrue(snapshot.fields.all { it.status == CollectorHelperProtocol.STATUS_SPOOL_UNAVAILABLE })
+    }
+
+    @Test
+    fun notWhitelistedFieldDoesNotBecomeReplayPending() {
+        val entries = DirectFidRegistry.entries.take(2)
+        val snapshot = DirectAutoserviceReader(
+            batchHelper(CollectorHelperProtocol.STATUS_NOT_WHITELISTED, "address is not whitelisted"),
+            entries
+        ).readSnapshot()
+
+        assertFalse(snapshot.replayPending)
+        assertTrue(snapshot.fields.all { it.status == CollectorHelperProtocol.STATUS_NOT_WHITELISTED })
+    }
+
+    private fun batchHelper(status: Int, error: String) =
+        object : DirectVehicleHelper {
+            override fun isAlive(): Boolean = true
+            override fun read(entry: DirectFidEntry): DirectHelperReadResult = error("scalar read must not be used")
+            override fun readBatch(entries: List<DirectFidEntry>): DirectHelperBatchResult = DirectHelperBatchResult(
+                results = entries.map { DirectHelperReadResult(status, null, error) },
+                diagnostics = testDiagnostics(entries.size).copy(
+                    mode = "rejected",
+                    error = error,
+                    status = if (status == CollectorHelperProtocol.STATUS_REPLAY_PENDING) {
+                        CollectorHelperProtocol.STATUS_REPLAY_PENDING
+                    } else {
+                        CollectorHelperProtocol.STATUS_INVALID_REQUEST
+                    }
+                )
+            )
+        }
 
     private fun testDiagnostics(count: Int) = DirectBatchDiagnostics(
         mode = "native",

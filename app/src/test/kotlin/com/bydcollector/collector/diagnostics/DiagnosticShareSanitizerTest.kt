@@ -10,6 +10,34 @@ import kotlin.test.assertTrue
 
 class DiagnosticShareSanitizerTest {
     @Test
+    fun wifiAndVinContextsAreMaskedWithoutGenericIdentifierHeuristics() {
+        val sanitizer = DiagnosticShareSanitizer()
+        val vin = "L123456789012345X"
+        val text = sanitizer.sanitizeText(
+            "WifiInfo: SSID: Home Network, BSSID: aa:bb:cc:dd:ee:ff, RSSI: -40\n" +
+                "mSSID=\"Home, Network\" mBSSID=aa:bb:cc:dd:ee:ff version=2.8.1\n" +
+                "wifi_ssid=Home Network firmware=1.2.3.4\n" +
+                "CarPropertyService: getVin() -> $vin\nINFO_VIN value=$vin\n" +
+                "device_id=$vin bluetooth_mac=aa:bb:cc:dd:ee:ff model=BYD Sea Lion 07"
+        )
+        assertFalse(text.contains("Home"))
+        assertTrue(text.contains("SSID: [redacted], BSSID: [redacted], RSSI: -40"))
+        assertTrue(text.contains("mSSID=\"[redacted]\" mBSSID=[redacted] version=2.8.1"))
+        assertTrue(text.contains("wifi_ssid=[redacted] firmware=1.2.3.4"))
+        assertTrue(text.contains("getVin() -> [VIN-1]"))
+        assertTrue(text.contains("INFO_VIN value=[VIN-1]"))
+        assertTrue(text.contains("device_id=$vin bluetooth_mac=aa:bb:cc:dd:ee:ff model=BYD Sea Lion 07"))
+        val json = JSONObject(sanitizer.sanitizeJsonLine(
+            """{"SSID":"Home Network","wifi_BSSID":"aa:bb:cc:dd:ee:ff","INFO_VIN":"$vin","technical_id":"$vin","firmware":"1.2.3.4"}"""
+        ))
+        assertEquals("[redacted]", json.getString("SSID"))
+        assertEquals("[redacted]", json.getString("wifi_BSSID"))
+        assertEquals("[VIN-1]", json.getString("INFO_VIN"))
+        assertEquals(vin, json.getString("technical_id"))
+        assertEquals("1.2.3.4", json.getString("firmware"))
+    }
+
+    @Test
     fun masksKnownSecretsHeadersCredentialsAndCoordinates() {
         val sanitizer = DiagnosticShareSanitizer()
         val line = sanitizer.sanitizeJsonLine(

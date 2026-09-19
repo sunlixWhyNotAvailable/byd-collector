@@ -73,12 +73,19 @@ internal class TripCompression(
                 candidateStore.copyRouteFrom(snapshotStore, session.tripId, compress = session.state == TripSession.STATE_CLOSED, beforeWrite = ::checkReserve)
             }
             candidateStore.replaceEnergyRuntimeRow(snapshotStore.readEnergyRuntimeRow())
+            candidateStore.replaceEnergyQuarantineRecords(snapshotStore.energyQuarantineRecords())
             candidateStore.replaceHistoricalEnergyBackfillRecords(snapshotStore.historicalEnergyBackfillRecords())
+            candidateStore.replaceCompletionState(
+                snapshotStore.completionWatermark(),
+                snapshotStore.allPendingCompletions()
+            )
             onPhase(TripCompressionPhase.CANDIDATE_BUILT)
             onStep(2)
             check(sameSessions(snapshotStore, candidateStore)) { "Trip sessions changed during compression" }
             check(sameEnergyRuntime(snapshotStore, candidateStore)) { "Energy runtime state changed during compression" }
+            check(snapshotStore.energyQuarantineRecords() == candidateStore.energyQuarantineRecords()) { "Energy recovery evidence changed during compression" }
             check(sameHistoricalEnergyBackfill(snapshotStore, candidateStore)) { "Historical energy progress changed during compression" }
+            check(sameTripCompletions(snapshotStore, candidateStore)) { "Trip completion intents changed during compression" }
             sessions.forEach { session ->
                 checkInterrupted()
                 check(sameRoute(snapshotStore, candidateStore, session.tripId)) { "Route equality verification failed" }
@@ -104,15 +111,26 @@ internal class TripCompression(
                     // The singleton can change independently of visible Trips while the
                     // candidate is built, so refresh it under the final source lease.
                     candidateStore.replaceEnergyRuntimeRow(store.readEnergyRuntimeRow())
+                    candidateStore.replaceEnergyQuarantineRecords(store.energyQuarantineRecords())
                     if (store.historicalBackfillChanged()) {
                         candidateStore.replaceHistoricalEnergyBackfillRecords(store.historicalEnergyBackfillRecords())
+                    }
+                    if (store.tripCompletionsChanged()) {
+                        candidateStore.replaceCompletionState(
+                            store.completionWatermark(),
+                            store.allPendingCompletions()
+                        )
                     }
                     check(sameSessions(store, candidateStore)) { "Concurrent trip state was not preserved" }
                     check(sameEnergyRuntime(store, candidateStore)) { "Concurrent energy runtime state was not preserved" }
                     check(sameHistoricalEnergyBackfill(store, candidateStore)) { "Concurrent historical energy progress was not preserved" }
+                    check(sameTripCompletions(store, candidateStore)) { "Concurrent trip completion intents were not preserved" }
                     val expectedCount = candidateStore.sessionCount()
                     val expectedEnergyRuntime = candidateStore.readEnergyRuntimeRow()
+                    val expectedEnergyQuarantine = candidateStore.energyQuarantineRecords()
                     val expectedHistoricalBackfill = candidateStore.historicalEnergyBackfillRecords()
+                    val expectedCompletionWatermark = candidateStore.completionWatermark()
+                    val expectedCompletions = candidateStore.allPendingCompletions()
                     candidateStore.checkpointTruncate()
                     candidateStore.closeDatabase()
                     store.checkpointTruncate()
@@ -122,7 +140,15 @@ internal class TripCompression(
                     if (after >= before) {
                         TripCompressionResult(before, before)
                     } else {
-                        replaceVerified(files, expectedCount, expectedEnergyRuntime, expectedHistoricalBackfill)
+                        replaceVerified(
+                            files,
+                            expectedCount,
+                            expectedEnergyRuntime,
+                            expectedHistoricalBackfill,
+                            expectedEnergyQuarantine,
+                            expectedCompletionWatermark,
+                            expectedCompletions
+                        )
                         TripCompressionResult(before, after)
                     }
                 }
@@ -148,7 +174,10 @@ internal class TripCompression(
         files: Files,
         expectedSessions: Long,
         expectedEnergyRuntime: com.bydcollector.collector.data.energy.EnergyRuntimeRow?,
-        expectedHistoricalBackfill: List<HistoricalEnergyBackfillRecord>
+        expectedHistoricalBackfill: List<HistoricalEnergyBackfillRecord>,
+        expectedEnergyQuarantine: List<EnergyQuarantineRecord>,
+        expectedCompletionWatermark: Long,
+        expectedCompletions: List<TripCompletionIntent>
     ) {
         store.closeForReplacement()
         try {
@@ -167,7 +196,10 @@ internal class TripCompression(
                 store.schemaVersion() == TripDatabaseHelper.DATABASE_VERSION &&
                     store.sessionCount() == expectedSessions &&
                     store.readEnergyRuntimeRow() == expectedEnergyRuntime &&
-                    store.historicalEnergyBackfillRecords() == expectedHistoricalBackfill
+                    store.historicalEnergyBackfillRecords() == expectedHistoricalBackfill &&
+                    store.energyQuarantineRecords() == expectedEnergyQuarantine &&
+                    store.completionWatermark() == expectedCompletionWatermark &&
+                    store.allPendingCompletions() == expectedCompletions
             ) {
                 "Compressed Trips reopen verification failed"
             }
@@ -345,6 +377,10 @@ internal class TripCompression(
 
         private fun sameHistoricalEnergyBackfill(left: TripStore, right: TripStore): Boolean =
             left.historicalEnergyBackfillRecords() == right.historicalEnergyBackfillRecords()
+
+        private fun sameTripCompletions(left: TripStore, right: TripStore): Boolean =
+            left.completionWatermark() == right.completionWatermark() &&
+                left.allPendingCompletions() == right.allPendingCompletions()
 
         private fun sameRoute(left: TripStore, right: TripStore, tripId: String, firstSequence: Long = 0L): Boolean =
             routeDigest(left, tripId, firstSequence).contentEquals(routeDigest(right, tripId, firstSequence))

@@ -13,6 +13,9 @@ import com.bydcollector.collector.data.trips.TripStore
 import com.bydcollector.collector.data.trips.TripTime
 import com.bydcollector.collector.data.energy.EnergySnapshot
 import com.bydcollector.collector.data.trips.withEnergySnapshot
+import com.bydcollector.collector.data.trips.closedAtPowerOff
+import com.bydcollector.collector.data.trips.TripCompletionIntent
+import com.bydcollector.collector.data.trips.TripCompletionLocation
 import com.bydcollector.collector.location.AndroidGpsLocationSource
 import com.bydcollector.collector.location.GpsLocationSample
 import com.bydcollector.collector.location.GpsLocationSink
@@ -27,13 +30,6 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
-data class ConfirmedPowerOff(
-    val observedAt: String,
-    val session: TripSession?,
-    val lastLocation: GpsLocationSample?,
-    val energySnapshot: EnergySnapshot? = null
-)
-
 /** Serializes power-session, route, and normalized-location writes behind one owner. */
 class TripRuntimeCoordinator(
     context: Context,
@@ -41,7 +37,8 @@ class TripRuntimeCoordinator(
     private val historyEnabled: () -> Boolean,
     private val locationCaptureEnabled: () -> Boolean,
     private val persistLocation: (List<NormalizedObservation>) -> Unit,
-    private val prepareConfirmedPowerOff: (ConfirmedPowerOff) -> (() -> Unit),
+    private val completionEnabled: () -> Boolean,
+    private val onCompletionReady: (Long) -> Unit,
     private val recordEvent: (String, String, String?) -> Unit,
     private val onConfirmedPowerOn: () -> Unit = {},
     private val elapsedRealtimeMs: () -> Long = SystemClock::elapsedRealtime,
@@ -98,7 +95,8 @@ class TripRuntimeCoordinator(
         observations: List<NormalizedObservation>,
         liveTelemetry: Boolean,
         diagnosticPowerSession: CompletableFuture<String?>? = null,
-        energySnapshot: EnergySnapshot? = null
+        energySnapshot: EnergySnapshot? = null,
+        beforeBoundary: (Long) -> Unit = {}
     ) {
         val receivedElapsedMs = elapsedRealtimeMs()
         val snapshot = computeTelemetrySnapshot(observations, receivedElapsedMs).copy(energy = energySnapshot)
@@ -106,6 +104,9 @@ class TripRuntimeCoordinator(
         dispatch(onDropped = { diagnosticPowerSession?.complete(null) }) {
             try {
                 ensureInitialized()
+                // Capture the frontier here, not when Telegram eventually runs: a later
+                // OFF must never be applied before this earlier queued ON/poll input.
+                beforeBoundary(tripStore.completionWatermark())
                 latestBatteryPowerKw = snapshot.batteryPowerKw
                 latestBatteryPowerAtMs = snapshot.receivedElapsedMs
 
@@ -143,6 +144,13 @@ class TripRuntimeCoordinator(
 
     fun resume() {
         if (running.get()) paused.set(false)
+    }
+
+    /** Orders ticks/recovery behind already submitted Trips inputs, even with polling paused. */
+    fun afterPendingTrips(onDropped: () -> Unit = {}, action: (Long) -> Unit) {
+        dispatch(onDropped = onDropped, allowWhilePaused = true) {
+            action(tripStore.completionWatermark())
+        }
     }
 
     /** Stops callbacks and records a route gap without treating process/maintenance death as vehicle-off. */
@@ -278,28 +286,34 @@ class TripRuntimeCoordinator(
                 .lastOrNull { it.kind == RoutePoint.KIND_VALID }
                 ?.toGpsSample()
         }
-        // Resolve before the existing Telegram-owner handoff; diagnostics must never wait for it.
         diagnosticPowerSession?.complete(current?.tripId)
-        val deliverAfterClose = prepareConfirmedPowerOff(
-            ConfirmedPowerOff(timestamp, current, trustedLocation, snapshot.energy)
-        )
         val closed = current?.let { current ->
             markLastRoutePointFinal(current.tripId)
-            current.copy(
-                state = TripSession.STATE_CLOSED,
-                endedAt = timestamp,
-                endElapsedMs = snapshot.energy?.sourceElapsedMs ?: snapshot.receivedElapsedMs,
-                endBootId = snapshot.energy?.sourceBootId ?: bootId,
-                endSegmentId = segmentId,
-                termination = "power_off"
-            ).also(tripStore::upsertSession)
+            current.closedAtPowerOff(
+                timestamp = timestamp,
+                elapsedMs = snapshot.energy?.sourceElapsedMs ?: snapshot.receivedElapsedMs,
+                bootId = snapshot.energy?.sourceBootId ?: bootId,
+                segmentId = segmentId
+            )
         }
-        if (closed != null) {
-            recordEvent("power_trip_finished", "Vehicle power session finished", "trip_id=${closed.tripId}")
-        }
+        val completion = if (completionEnabled()) TripCompletionIntent(
+            identity = "power_off:${closed?.tripId ?: snapshot.energy?.powerSessionId ?: "$bootId:${snapshot.receivedElapsedMs}"}",
+            observedAt = timestamp,
+            session = closed,
+            lastLocation = trustedLocation?.let { TripCompletionLocation(it.latitude, it.longitude, it.observedAt) },
+            energySnapshot = snapshot.energy,
+            odometerKm = snapshot.odometerKm ?: closed?.lastOdometerKm,
+            soc = snapshot.soc ?: closed?.endSoc,
+            tripEnergyKwh = snapshot.tripEnergyKwh ?: closed?.lastTripEnergyKwh
+        ) else null
+        val durableCompletion = tripStore.closeSessionWithCompletion(closed, completion)
+        // Only the atomic local commit above controls whether this boundary succeeded.
         session = null
         nextRouteSequence = 0L
-        deliverAfterClose()
+        if (closed != null) runCatching {
+            recordEvent("power_trip_finished", "Vehicle power session finished", "trip_id=${closed.tripId}")
+        }
+        durableCompletion?.let { runCatching { onCompletionReady(it.sequence) } }
     }
 
     private fun ensureGpsRunning() {
@@ -381,10 +395,14 @@ class TripRuntimeCoordinator(
             tripStore.queryRoutePoints(current.tripId).lastOrNull { it.kind == RoutePoint.KIND_VALID }?.toGpsSample()
         }
         lastLocationTripId = session?.tripId?.takeIf { lastLocation != null }
+        // An open trip is durable evidence that ON still needs a matching OFF. Without
+        // one (including when history is disabled), OFF is the restart baseline rather
+        // than a new boundary. Establish it only after retryable store reads succeed.
+        powerTracker.restoreBaseline(hasOpenSession = session != null)
         initialized = true
     }
 
-    private fun dispatch(onDropped: () -> Unit = {}, block: () -> Unit) {
+    private fun dispatch(onDropped: () -> Unit = {}, allowWhilePaused: Boolean = false, block: () -> Unit) {
         if (!running.get()) {
             onDropped()
             return
@@ -393,7 +411,7 @@ class TripRuntimeCoordinator(
             block()
             return
         }
-        if (paused.get()) {
+        if (paused.get() && !allowWhilePaused) {
             onDropped()
             return
         }

@@ -16,7 +16,7 @@ class TripRuntimeReceiptClockContractTest {
         assertTrue(poll.contains("latestBatteryPowerAtMs = snapshot.receivedElapsedMs"))
         assertTrue(runtime.contains("tripId = snapshot.energy?.powerSessionId ?: TripId.forPowerSession(bootId, snapshot.receivedElapsedMs)"))
         assertTrue(runtime.contains("startElapsedMs = snapshot.energy?.sourceElapsedMs ?: snapshot.receivedElapsedMs"))
-        assertTrue(runtime.contains("endElapsedMs = snapshot.energy?.sourceElapsedMs ?: snapshot.receivedElapsedMs"))
+        assertTrue(runtime.contains("elapsedMs = snapshot.energy?.sourceElapsedMs ?: snapshot.receivedElapsedMs"))
         assertTrue(runtime.contains("LocationNormalizer.observations(sample, sample.receiveWallTimeMs)"))
         assertTrue(runtime.contains("sample.receiveElapsedRealtimeNanos / 1_000_000L - latestBatteryPowerAtMs"))
         assertTrue(runtime.contains("powerAgeMs in 0L..TELEMETRY_FRESH_MS"))

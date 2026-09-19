@@ -21,6 +21,15 @@ internal class DiagnosticShareSanitizer {
     fun sanitizeText(text: String): String {
         var sanitized = replaceCookieHeaders(text)
         sanitized = replaceAuthHeaders(sanitized)
+        // Android Wi-Fi dumps allow an unquoted SSID containing spaces. Match
+        // only named properties, ending at the next property or record boundary.
+        sanitized = WIFI_PROPERTY_PATTERN.replace(sanitized) { match ->
+            match.groups["prefix"]!!.value + replaceMaskedToken(match.groups["value"]!!.value, REDACTED)
+        }
+        sanitized = VIN_RESULT_PATTERN.replace(sanitized) { match ->
+            match.groups["prefix"]!!.value + replaceMaskedToken(match.groups["value"]!!.value,
+                alias(IdentityKind.VIN, match.groups["value"]!!.value))
+        }
         sanitized = ASSIGNMENT_PATTERN.replace(sanitized) { match ->
             val key = match.groups["key"]?.value.orEmpty()
             val token = match.groups["value"]?.value.orEmpty()
@@ -178,9 +187,10 @@ internal class DiagnosticShareSanitizer {
             "password", "passwd", "mqttpassword", "influxpassword",
             "bottoken", "telegrambottoken", "apikey", "accesstoken",
             "refreshtoken", "clientsecret", "authorization", "proxyauthorization",
-            "cookie", "setcookie", "xapikey"
+            "cookie", "setcookie", "xapikey",
+            "ssid", "bssid", "mssid", "mbssid", "wifissid", "wifibssid"
         )
-        private val VIN_KEYS = setOf("vin", "vehiclevin", "autovin", "realautovin", "bodyworkautovin", "bodyworkrealautovin")
+        private val VIN_KEYS = setOf("vin", "infovin", "vehiclevin", "autovin", "realautovin", "bodyworkautovin", "bodyworkrealautovin")
         private val CHAT_ID_KEYS = setOf("chatid", "telegramchatid")
         private val ACCOUNT_ID_KEYS = setOf("accountid", "telegramaccountid")
         private val COORDINATE_KEYS = setOf(
@@ -190,11 +200,18 @@ internal class DiagnosticShareSanitizer {
             "(?:password|passwd|mqtt[-_.]?password|influx[-_.]?password|(?:telegram[-_.]?)?bot[-_.]?token|" +
                 "api[-_.]?key|access[-_.]?token|refresh[-_.]?token|client[-_.]?secret|" +
                 "authorization|proxy[-_.]?authorization|cookie|set[-_.]?cookie|x[-_.]?api[-_.]?key|" +
-                "vin|vehicle[-_.]?vin|(?:bodywork[-_.]?)?(?:real[-_.]?)?auto[-_.]?vin|" +
+                "vin|info[-_.]?vin|vehicle[-_.]?vin|(?:bodywork[-_.]?)?(?:real[-_.]?)?auto[-_.]?vin|" +
                 "(?:telegram[-_.]?)?chat[-_.]?id|(?:telegram[-_.]?)?account[-_.]?id|" +
                 "latitude|longitude|location[-_.]?(?:latitude|longitude)|lat|lon|lng)"
         private val ASSIGNMENT_PATTERN = Regex(
             "(?i)(?<![A-Za-z0-9_.-])(?<prefix>(?<key>$ASSIGNMENT_KEYS)(?<separator>[ \\t]*(?:[\\\"'][ \\t]*)?[:=][ \\t]*))(?<value>\\\"(?:\\\\.|[^\\\"\\\\])*\\\"|'(?:\\\\.|[^'\\\\])*'|\\[redacted(?:-coordinate)?\\]|[^\\s,;}&\\]]+)"
+        )
+        private val WIFI_PROPERTY_PATTERN = Regex(
+            """(?i)(?<![A-Za-z0-9_.-])(?<prefix>(?:m?(?:ssid|bssid)|wifi[-_.]?(?:ssid|bssid))[ \t]*(?:["'][ \t]*)?[:=][ \t]*)(?<value>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^,;\r\n}\]]+?)(?=[ \t]+[A-Za-z][A-Za-z0-9_.-]*[ \t]*[:=]|[,;\r\n}\]]|$)"""
+        )
+        // VIN-valued API/property results, not arbitrary 17-character IDs or MACs.
+        private val VIN_RESULT_PATTERN = Regex(
+            """(?i)(?<![A-Za-z0-9_.-])(?<prefix>(?:get(?:Vehicle)?Vin\(\)[ \t]*(?:[:=]|->|returns?)[ \t]*|INFO_VIN[ \t]+(?:value|result)[ \t]*[:=][ \t]*))(?<value>"[A-HJ-NPR-Z0-9]{17}"|'[A-HJ-NPR-Z0-9]{17}'|[A-HJ-NPR-Z0-9]{17})(?![A-Za-z0-9])"""
         )
         private val AUTH_HEADER_PATTERN = Regex(
             "(?i)(?<![A-Za-z0-9_.-])(?<prefix>(?:Authorization|Proxy-Authorization)[ \\t]*(?:[\\\"'][ \\t]*)?[:=][ \\t]*)(?<value>\\\"(?:\\\\.|[^\\\"\\\\])*\\\"|'(?:\\\\.|[^'\\\\])*'|(?:(?:Bearer|Basic)[ \\t]+)?[^\\s,;&}\\]]+)"

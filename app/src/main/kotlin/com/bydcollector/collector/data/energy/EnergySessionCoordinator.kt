@@ -17,6 +17,9 @@ class EnergySessionCoordinator(
         val stored = readStored()
         val state = stored?.state ?: EnergyRuntimeState()
         val pending = stored?.pending
+        if (state.recoveryState != EnergyRecoveryState.NONE) {
+            return recoverAfterCorruption(state, receipt)
+        }
         if (pending != null && pending.snapshot.sourceIdentity != receipt.sourceIdentity) {
             throw EnergyProjectionPendingException(pending)
         }
@@ -39,7 +42,7 @@ class EnergySessionCoordinator(
         }
         if (!state.active && receipt.input.powerOn != true && state.currentSnapshot != null) {
             val next = state.copy(
-                powerState = receipt.input.powerOn.toPowerState(),
+                powerState = if (receipt.input.powerOn == false) EnergyPowerState.OFF else state.powerState,
                 lastSourceIdentity = receipt.sourceIdentity,
                 lastSourceBootId = receipt.input.bootId,
                 lastSourceElapsedMs = receipt.input.elapsedMs,
@@ -62,7 +65,8 @@ class EnergySessionCoordinator(
     @Synchronized
     fun confirmProjected(snapshotId: String): Boolean {
         val stored = readStored() ?: return false
-        val pending = stored.pending ?: return false
+        val pending = stored.pending
+            ?: return stored.state.currentSnapshot?.snapshotId == snapshotId
         if (pending.snapshot.snapshotId != snapshotId) return false
         return storage.clearEnergyPending(
             expectedPendingJson = requireNotNull(stored.row.pendingProjectionJson),
@@ -100,7 +104,9 @@ class EnergySessionCoordinator(
             if (!knownBoundary) forcedReason = EnergyRuntimeState.REASON_STARTED_MID_POWER_SESSION
         }
 
-        val integration = if (active) {
+        val integration = if (active && nextPower == EnergyPowerState.OFF) {
+            BatteryEnergyIntegrator.finishSession(anchor, totals, receipt.input)
+        } else if (active) {
             BatteryEnergyIntegrator.integrate(anchor, totals, receipt.input)
         } else {
             EnergyIntegrationResult(
@@ -161,16 +167,122 @@ class EnergySessionCoordinator(
         )
     }
 
+    private fun recoverAfterCorruption(state: EnergyRuntimeState, receipt: EnergyReceipt): EnergyProcessResult {
+        if (state.lastSourceIdentity == receipt.sourceIdentity) {
+            return EnergyProcessResult(snapshot = null, pendingProjection = null, duplicate = true)
+        }
+        if (
+            state.lastSourceBootId == receipt.input.bootId &&
+            state.lastSourceElapsedMs != null &&
+            receipt.input.elapsedMs <= state.lastSourceElapsedMs
+        ) {
+            return EnergyProcessResult(snapshot = null, pendingProjection = null, stale = true)
+        }
+        if (
+            state.recoveryState == EnergyRecoveryState.WAITING_FOR_ON &&
+            receipt.input.powerOn == true
+        ) {
+            val next = advance(state.copy(recoveryState = EnergyRecoveryState.NONE), receipt)
+            val projection = EnergyPendingProjection(requireNotNull(next.state.currentSnapshot))
+            write(next.state, projection, receipt.observedAt)
+            return EnergyProcessResult(next.state.currentSnapshot, projection, transition = next.transition)
+        }
+
+        val confirmedOff = receipt.input.powerOn == false
+        val next = state.copy(
+            powerState = if (confirmedOff) EnergyPowerState.OFF else state.powerState,
+            lastSourceIdentity = receipt.sourceIdentity,
+            lastSourceBootId = receipt.input.bootId,
+            lastSourceElapsedMs = receipt.input.elapsedMs,
+            recoveryState = if (confirmedOff) {
+                EnergyRecoveryState.WAITING_FOR_ON
+            } else {
+                state.recoveryState
+            }
+        )
+        write(next, null, receipt.observedAt)
+        return EnergyProcessResult(snapshot = null, pendingProjection = null)
+    }
+
     private fun readStored(): Stored? {
         val row = storage.readEnergyRuntimeRow() ?: return null
-        val state = EnergyStateCodec.decodeState(row.stateJson)
-        val pending = row.pendingProjectionJson?.let(EnergyStateCodec::decodeProjection)
-        if (pending != null) {
-            require(state.currentSnapshot == pending.snapshot) {
-                "Energy pending projection does not match current checkpoint"
-            }
+        val state = decodeOrNull { EnergyStateCodec.decodeState(row.stateJson) }
+        val pending = row.pendingProjectionJson?.let { value ->
+            decodeOrNull { EnergyStateCodec.decodeProjection(value) }
         }
-        return Stored(row, state, pending)
+        if (state != null && (pending == null || state.currentSnapshot == pending.snapshot)) {
+            if (row.pendingProjectionJson == null || pending != null) return Stored(row, state, pending)
+        }
+
+        val reason = when {
+            state != null -> QUARANTINE_BAD_PENDING
+            pending != null -> QUARANTINE_BAD_CHECKPOINT
+            else -> QUARANTINE_BAD_RUNTIME
+        }
+        storage.quarantineEnergyRuntimeRow(row, reason, row.updatedAt)
+        val recoveredPending = when {
+            state != null -> state.currentSnapshot?.let(::EnergyPendingProjection)
+            pending != null -> pending.withTechnicalGap()
+            else -> null
+        }
+        val recoveredState = state ?: recoveredPending?.let(::reconstructFromPending) ?: quarantinedState()
+        val recoveredRow = EnergyRuntimeRow(
+            stateJson = EnergyStateCodec.encodeState(recoveredState),
+            pendingProjectionJson = recoveredPending?.let(EnergyStateCodec::encodeProjection),
+            updatedAt = row.updatedAt
+        )
+        storage.commitEnergyRuntimeRow(
+            recoveredRow.stateJson,
+            recoveredRow.pendingProjectionJson,
+            recoveredRow.updatedAt
+        )
+        return Stored(recoveredRow, recoveredState, recoveredPending)
+    }
+
+    private fun reconstructFromPending(pending: EnergyPendingProjection): EnergyRuntimeState {
+        val snapshot = pending.snapshot
+        val totals = EnergyTotals(
+            dischargedKwh = snapshot.dischargedKwh ?: 0.0,
+            regeneratedKwh = snapshot.regeneratedKwh ?: 0.0,
+            coveredMs = snapshot.energyCoveredMs,
+            uncoveredMs = snapshot.energyUncoveredMs,
+            partial = true
+        )
+        return EnergyRuntimeState(
+            powerState = if (snapshot.active) EnergyPowerState.ON else EnergyPowerState.OFF,
+            powerSessionId = snapshot.powerSessionId,
+            startedAt = snapshot.startedAt,
+            active = snapshot.active,
+            lastSourceIdentity = snapshot.sourceIdentity,
+            lastSourceBootId = snapshot.sourceBootId,
+            lastSourceElapsedMs = snapshot.sourceElapsedMs,
+            anchor = null,
+            totals = totals,
+            integrationQuality = EnergyIntegrationQuality.PARTIAL,
+            reason = EnergyRuntimeState.REASON_RECOVERED_PENDING,
+            currentSnapshot = snapshot
+        )
+    }
+
+    private fun EnergyPendingProjection.withTechnicalGap() = EnergyPendingProjection(
+        snapshot.copy(
+            energyPartial = true,
+            integrationQuality = EnergyIntegrationQuality.PARTIAL,
+            reason = EnergyRuntimeState.REASON_RECOVERED_PENDING
+        )
+    )
+
+    private fun quarantinedState() = EnergyRuntimeState(
+        reason = EnergyRuntimeState.REASON_CORRUPT_STATE,
+        recoveryState = EnergyRecoveryState.WAITING_FOR_OFF
+    )
+
+    private inline fun <T> decodeOrNull(block: () -> T): T? = try {
+        block()
+    } catch (interrupted: InterruptedException) {
+        throw interrupted
+    } catch (_: Exception) {
+        null
     }
 
     private fun write(state: EnergyRuntimeState, pending: EnergyPendingProjection?, updatedAt: String) {
@@ -197,4 +309,10 @@ class EnergySessionCoordinator(
         val state: EnergyRuntimeState,
         val transition: EnergySessionTransition
     )
+
+    private companion object {
+        const val QUARANTINE_BAD_PENDING = "invalid_or_mismatched_pending_projection"
+        const val QUARANTINE_BAD_CHECKPOINT = "invalid_checkpoint_recovered_from_pending"
+        const val QUARANTINE_BAD_RUNTIME = "invalid_energy_runtime_state"
+    }
 }

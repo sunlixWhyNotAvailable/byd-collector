@@ -11,13 +11,17 @@ class HistoricalEnergyPersistenceContractTest {
         val store = source("TripStore.kt")
         val compression = source("TripCompression.kt")
         assertTrue(helper.contains("CREATE TABLE IF NOT EXISTS historical_energy_backfill"))
-        assertTrue(helper.contains("DATABASE_VERSION = 5"))
+        assertTrue(helper.contains("DATABASE_VERSION = 6"))
         assertTrue(store.contains("db.beginTransaction()"))
         assertTrue(store.contains("AND discharged_kwh IS NULL"))
         assertTrue(store.contains("insertOrThrow(\"historical_energy_backfill\""))
         assertTrue(store.contains("markSessionChanged(record.tripId)"))
         assertTrue(compression.contains("replaceHistoricalEnergyBackfillRecords"))
         assertTrue(compression.contains("sameHistoricalEnergyBackfill"))
+        assertTrue(helper.contains("ALTER TABLE historical_energy_backfill ADD COLUMN algorithm_version INTEGER NOT NULL DEFAULT 1"))
+        assertTrue(store.contains("b.algorithm_version < \${HistoricalEnergyBackfillRecord.ALGORITHM_VERSION}"))
+        assertTrue(store.contains("b.outcome = 'rejected' AND b.reason = '\${HistoricalEnergyBackfillRecord.RETRY_REASON}'"))
+        assertTrue(store.contains("AND energy_observed_at IS NULL AND \$HISTORICAL_PROGRESS_ELIGIBLE"))
     }
 
     @Test

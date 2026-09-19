@@ -22,10 +22,7 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
             if (app.updateHints.activeResultId != null && app.updateHints.activeResultId != snapshot.availableResultId) {
                 app.updateHints.dismiss("stale_result")
             }
-            if (presentation.accept(snapshot, ownUiVisible, started && !installing && settings.isUpdateHintEnabled())) {
-                val available = snapshot.uiState as? UpdateUiState.Available
-                if (available != null) app.updateHints.show(checkNotNull(snapshot.availableResultId), available.info)
-            }
+            presentPendingHint()
             if (started && !app.updateChecks.snapshot().inFlight) {
                 applyAction(UpdateAutoCheckRuntime.onTimerElapsed(enabled(), ownUiVisible))
             }
@@ -47,9 +44,6 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
 
     fun onUiVisible() {
         ownUiVisible = true
-        // Consume the result at the visibility boundary too, before a queued
-        // check callback could mistake a later minimize for a new hint event.
-        presentation.accept(app.updateChecks.snapshot(), ownUiVisible = true, hintEnabled = settings.isUpdateHintEnabled())
         app.updateHints.dismiss("own_ui_visible")
         start("activity")
         applyAction(UpdateAutoCheckRuntime.onForeground(enabled()))
@@ -57,11 +51,39 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
 
     fun onUiHidden() {
         ownUiVisible = false
+        presentPendingHint()
         if (started) applyAction(UpdateAutoCheckRuntime.onBackground(enabled()))
     }
 
     fun onUiResumed() {
         if (awaitingInstallerReturn) onInstallFinished()
+        presentPendingHint()
+    }
+
+    /** Reuses the cached result after permission/lifecycle changes; no HTTP check. */
+    fun onPresentationAccessChanged() {
+        presentPendingHint()
+    }
+
+    fun onOfferPresented(resultId: Long) {
+        if (!ownUiVisible || !started || installing || settings.isUserShutdownRequested()) return
+        val snapshot = app.updateChecks.snapshot()
+        if (presentation.markPresented(snapshot, resultId)) {
+            app.recordUpdateEvent("offer_shown", "result_id=$resultId version=${(snapshot.uiState as UpdateUiState.Available).info.version}")
+        }
+    }
+
+    fun onHintPresented(resultId: Long) {
+        if (ownUiVisible || !started || installing || settings.isUserShutdownRequested()) return
+        presentation.markPresented(app.updateChecks.snapshot(), resultId)
+    }
+
+    private fun presentPendingHint() {
+        val snapshot = app.updateChecks.snapshot()
+        if (presentation.canPresentHint(snapshot, ownUiVisible,
+                started && !installing && !settings.isUserShutdownRequested() && settings.isUpdateHintEnabled())) {
+            app.updateHints.show(checkNotNull(snapshot.availableResultId), (snapshot.uiState as UpdateUiState.Available).info)
+        }
     }
 
     fun onAutoCheckEnabledChanged() {

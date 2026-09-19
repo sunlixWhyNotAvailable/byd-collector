@@ -115,7 +115,10 @@ class CollectorService : Service() {
     private lateinit var vehicleStateNormalizer: VehicleStateNormalizer
     private lateinit var mqttCoordinator: MqttPublishCoordinator
     private lateinit var influxCoordinator: InfluxExportCoordinator
-    @Volatile private var telegramCoordinator: TelegramCoordinator? = null
+    private val telegramDeliveryRuntime get() = (applicationContext as BydCollectorApplication).telegramDeliveryRuntime
+    private var telegramCoordinator: TelegramCoordinator?
+        get() = telegramDeliveryRuntime.coordinator
+        set(value) { telegramDeliveryRuntime.coordinator = value }
     private lateinit var tripRuntime: TripRuntimeCoordinator
     private lateinit var maintenanceCoordinator: DbMaintenanceCoordinator
     private lateinit var dashboardUiStateStore: DashboardUiStateStore
@@ -152,7 +155,8 @@ class CollectorService : Service() {
     private val influxRuntimeDiagnostics = InfluxRuntimeDiagnosticsProcess.instance
     private val influxDiagnosticRuntimeId = java.util.UUID.randomUUID().toString()
     private val telegramExecutorLock = Any()
-    private var telegramExecutor: ExecutorService = namedSingleThreadExecutor("byd-telegram")
+    private val telegramExecutor: ExecutorService get() = telegramDeliveryRuntime.executor
+    private val telegramStorageRecoveryInFlight = AtomicBoolean(false)
     private val telegramRecoveryCoalescer = TelegramRecoveryCoalescer()
     private val telegramNetworkRecoveryEdge = TelegramNetworkRecoveryEdge()
     private val telegramNetworkRecoveryRevision = AtomicLong(0L)
@@ -245,8 +249,9 @@ class CollectorService : Service() {
             if (!running.get() || !settings.isTelegramEnabled() || maintenanceBlocksRuntimeStart()) return
             val coordinator = telegramCoordinator ?: return
             scheduleTelegramTick()
-            executeTelegram(
+            executeOrderedTelegram(
                 "telegram_tick_error",
+                coordinator = coordinator,
                 onSuccess = ::postTelegramTickSchedule
             ) {
                 coordinator.tick(
@@ -592,6 +597,33 @@ class CollectorService : Service() {
         var energyHydrated = false
         //normalizes only after raw poll persistence so raw telemetry remains the source of truth
         return object : SuccessfulPollObserver {
+            private var energyFailure: Exception? = null
+            private var lastEnergyFailureKey: String? = null
+
+            private fun <T> energyAttempt(action: () -> T): T? = try {
+                action()
+            } catch (error: Exception) {
+                if (error is InterruptedException) throw error
+                energyFailure = error
+                val detail = "${error::class.java.simpleName}: ${error.message.orEmpty()}"
+                if (detail != lastEnergyFailureKey) {
+                    try {
+                        store.recordEvent("energy_processing_error", "Energy processing is unavailable; raw collection continues", detail)
+                        lastEnergyFailureKey = detail
+                    } catch (diagnosticError: Exception) {
+                        if (diagnosticError is InterruptedException) throw diagnosticError
+                    }
+                }
+                null
+            }
+
+            private fun finishEnergyAttempt(origin: PollOrigin) {
+                if (energyFailure == null) lastEnergyFailureKey = null
+                // Ordinary energy storage/projection faults are still retryable, not
+                // permission to ACK an unfinished shell sample. Core consumers ran first.
+                if (origin == PollOrigin.REPLAY) energyFailure?.let { throw it }
+            }
+
             private fun prepareEnergyProjection() {
                 if (!energyHydrated) {
                     energy.stageCurrentProjection()
@@ -627,27 +659,31 @@ class CollectorService : Service() {
                 sessionId: Long, pollId: Long, timestamp: String, readings: List<PollReading>,
                 origin: PollOrigin, source: com.bydcollector.collector.data.polling.PollSampleSource
             ) {
+                energyFailure = null
                 if (origin == PollOrigin.LIVE) {
                     (applicationContext as BydCollectorApplication).scheduleHistoricalEnergyBackfill(historicalEnergyGeneration)
                 }
-                prepareEnergyProjection()
                 val observations = vehicleStateNormalizer.normalize(
                     pollId = pollId,
                     observedAt = timestamp,
                     readings = readings
                 )
-                val energyResult = energy.process(com.bydcollector.collector.data.energy.EnergyTelemetryProjection.receipt(
-                    source, timestamp, readings, observations
-                ))
-                if (energyResult.stale) return
-                val energySnapshot = energyResult.snapshot
+                val energyResult = energyAttempt {
+                    prepareEnergyProjection()
+                    energy.process(com.bydcollector.collector.data.energy.EnergyTelemetryProjection.receipt(
+                        source, timestamp, readings, observations
+                    ))
+                }?.takeUnless { it.stale }
+                val energySnapshot = energyResult?.snapshot
                 // Inactive cursor-only receipts retain the final snapshot, but must not
                 // republish it as fresh and oscillate an expired Main value between OK/STALE.
-                val energyObservations = energyResult.pendingProjection?.snapshot
+                val energyObservations = energyResult?.pendingProjection?.snapshot
                     ?.let(com.bydcollector.collector.data.energy.EnergyTelemetryProjection::observations).orEmpty()
                 val summary = store.applyNormalizedObservations(observations + energyObservations)
-                energyResult.pendingProjection?.let {
-                    check(energy.confirmProjected(it.snapshot.snapshotId)) { "Energy projection receipt changed" }
+                energyResult?.pendingProjection?.let {
+                    energyAttempt {
+                        check(energy.confirmProjected(it.snapshot.snapshotId)) { "Energy projection receipt changed" }
+                    }
                 }
                 dashboardUiStateStore.incrementMainRowCounts(
                     normalizedCurrentRows = summary.currentInsertedCount.toLong(),
@@ -660,42 +696,41 @@ class CollectorService : Service() {
                     )
                 )
                 scheduleDatabaseFootprintRefresh(force = false)
-                val diagnosticPowerSession = telegramCoordinator?.let { coordinator ->
-                    val parent = CompletableFuture<String?>()
-                    val generation = telegramWorkGeneration.get()
-                    executeTelegram(
-                        "telegram_event_error",
-                        onSuccess = ::postTelegramTickSchedule
-                    ) {
-                        coordinator.onSuccessfulPoll(observations, energySnapshot) { legId ->
-                            correlateTripDiagnostic(
-                                legId = legId,
-                                powerSession = parent,
-                                isCurrent = {
-                                    running.get() && telegramCoordinator === coordinator &&
-                                        telegramWorkGeneration.get() == generation
-                                },
-                                enqueue = { action ->
-                                    executeTelegram("telegram_diagnostic_correlation_error") { action() }
-                                },
-                                bind = coordinator::bindTripDiagnosticParent
-                            )
-                        }
-                    }
-                    parent
-                }
+                val diagnosticPowerSession = CompletableFuture<String?>()
                 tripRuntime.onSuccessfulPoll(
                     timestamp,
                     readings,
                     observations,
                     liveTelemetry = origin == PollOrigin.LIVE,
                     diagnosticPowerSession = diagnosticPowerSession,
-                    energySnapshot = energySnapshot
+                    energySnapshot = energySnapshot,
+                    beforeBoundary = { watermark ->
+                        val coordinator = telegramCoordinator
+                        if (coordinator != null) {
+                            val generation = telegramWorkGeneration.get()
+                            executeTelegram("telegram_event_error", onSuccess = ::postTelegramTickSchedule) {
+                                if (telegramCoordinator !== coordinator) return@executeTelegram null
+                                drainTripCompletions(coordinator, watermark)
+                                coordinator.onSuccessfulPoll(observations, energySnapshot) { legId ->
+                                    correlateTripDiagnostic(
+                                        legId, diagnosticPowerSession,
+                                        isCurrent = {
+                                            running.get() && telegramCoordinator === coordinator &&
+                                                telegramWorkGeneration.get() == generation
+                                        },
+                                        enqueue = { action -> executeTelegram("telegram_diagnostic_correlation_error") { action() } },
+                                        bind = coordinator::bindTripDiagnosticParent
+                                    )
+                                }
+                            }
+                        }
+                    }
                 )
                 if (summary.changedCategories.isNotEmpty()) {
                     normalizedStateChangedCallback?.invoke(summary.changedCategories)
                 }
                 exportInfluxAfterNormalizedWrite(summary)
+                finishEnergyAttempt(origin)
             }
 
             override fun onSourceFailure(
@@ -705,20 +740,23 @@ class CollectorService : Service() {
                 origin: PollOrigin,
                 source: com.bydcollector.collector.data.polling.PollSampleSource
             ) {
+                energyFailure = null
                 if (origin == PollOrigin.LIVE) {
                     (applicationContext as BydCollectorApplication).scheduleHistoricalEnergyBackfill(historicalEnergyGeneration)
                 }
-                prepareEnergyProjection()
-                val energyResult = energy.process(
-                    com.bydcollector.collector.data.energy.EnergyTelemetryProjection.receipt(
-                        source = source,
-                        observedAt = timestamp,
-                        readings = emptyList(),
-                        observations = emptyList()
+                energyAttempt {
+                    prepareEnergyProjection()
+                    val energyResult = energy.process(
+                        com.bydcollector.collector.data.energy.EnergyTelemetryProjection.receipt(
+                            source = source,
+                            observedAt = timestamp,
+                            readings = emptyList(),
+                            observations = emptyList()
+                        )
                     )
-                )
-                if (energyResult.stale) return
-                energyResult.pendingProjection?.let(::persistEnergyProjection)
+                    if (!energyResult.stale) energyResult.pendingProjection?.let(::persistEnergyProjection)
+                }
+                finishEnergyAttempt(origin)
             }
         }
     }
@@ -735,7 +773,12 @@ class CollectorService : Service() {
                     settings.effectiveInfluxCategories().contains("location")
             },
             persistLocation = ::persistLocationObservations,
-            prepareConfirmedPowerOff = ::prepareConfirmedPowerOff,
+            completionEnabled = settings::isTelegramEnabled,
+            onCompletionReady = { watermark ->
+                executeTelegram("telegram_power_off_error", onSuccess = ::postTelegramTickSchedule) {
+                    telegramCoordinator?.let { drainTripCompletions(it, watermark) }
+                }
+            },
             recordEvent = store::recordEvent,
             onConfirmedPowerOn = { requestTelegramRecovery(RECOVERY_VEHICLE_ON) }
         )
@@ -754,59 +797,31 @@ class CollectorService : Service() {
         exportInfluxAfterNormalizedWrite(summary)
     }
 
-    private fun prepareConfirmedPowerOff(event: ConfirmedPowerOff): () -> Unit {
-        if (!settings.isTelegramEnabled()) return {}
-        val coordinator = telegramCoordinator ?: run {
-            store.recordEvent(
-                "telegram_power_off_error",
-                "Telegram power-off event could not be persisted",
-                BydCollectorApplication.TELEGRAM_STORAGE_ERROR
-            )
-            error(BydCollectorApplication.TELEGRAM_STORAGE_ERROR)
-        }
-        val current = event.session
-        val preparation = try {
-            runOnTelegramExecutorBlocking {
-                coordinator.preparePowerOffConfirmed(
-                    snapshot = TelegramPowerOffSnapshot(
-                        odometerKm = current?.lastOdometerKm,
-                        soc = current?.endSoc,
-                        tripEnergyKwh = current?.lastTripEnergyKwh,
-                        energySnapshot = event.energySnapshot
-                    ),
-                    location = event.lastLocation?.let(::telegramLocationSnapshot)
-                )
+    private fun drainTripCompletions(coordinator: TelegramCoordinator, watermark: Long): Long? {
+        if (!settings.isTelegramEnabled()) return null
+        val trips = BydCollectorApplication.trips(applicationContext)
+        var deadline: Long? = null
+        com.bydcollector.collector.telegram.handoffTripCompletions(
+            frontier = watermark,
+            pending = { trips.pendingCompletions(watermark) },
+            accept = { intent -> coordinator.acceptTripCompletion(intent, intent.lastLocation?.let(::telegramLocationSnapshot)) },
+            acknowledge = { intent -> trips.acknowledgeCompletion(intent.sequence, intent.identity) },
+            afterAck = { preparation ->
+                if (preparation != null) deadline = coordinator.deliverPreparedPowerOff(preparation)
             }
-        } catch (error: Throwable) {
-            runCatching {
-                store.recordEvent(
-                    "telegram_power_off_error",
-                    "Telegram power-off event could not be persisted",
-                    "${error::class.java.simpleName}: ${error.message ?: "no message"}"
-                )
-            }
-            handleTelegramExecutionFailure(error)
-            throw error
-        } ?: return {}
-        return {
-            executeTelegram(
-                "telegram_power_off_error",
-                onSuccess = ::postTelegramTickSchedule
-            ) {
-                coordinator.deliverPreparedPowerOff(preparation)
-            }
-        }
+        )
+        return deadline
     }
 
-    private fun telegramLocationSnapshot(sample: com.bydcollector.collector.location.GpsLocationSample): TelegramLocationSnapshot {
+    private fun telegramLocationSnapshot(sample: com.bydcollector.collector.data.trips.TripCompletionLocation): TelegramLocationSnapshot {
         val latitude = sample.latitude
         val longitude = sample.longitude
-        val capturedAtMs = runCatching { Instant.parse(sample.observedAt).toEpochMilli() }.getOrDefault(sample.wallTimeMs)
+        val capturedAtMs = Instant.parse(sample.capturedAt).toEpochMilli()
         val ageSeconds = ((System.currentTimeMillis() - capturedAtMs).coerceAtLeast(0L) / 1_000L)
         return TelegramLocationSnapshot(
             latitude = latitude,
             longitude = longitude,
-            capturedAt = sample.observedAt,
+            capturedAt = sample.capturedAt,
             ageSeconds = ageSeconds,
             osmUrl = "https://www.openstreetmap.org/?mlat=$latitude&mlon=$longitude#map=17/$latitude/$longitude",
             googleUrl = "https://www.google.com/maps/search/?api=1&query=$latitude,$longitude",
@@ -1390,7 +1405,7 @@ class CollectorService : Service() {
         try {
             maintenanceExecutor.execute {
                 val mqttWorker = shutdownMqttExecutor()
-                val telegramWorker = shutdownTelegramExecutorForUserShutdown()
+                val telegramStopped = quiesceTelegramForUserShutdown()
                 val influxWorker = synchronized(influxExecutorLock) { influxExecutor }
                 val influxStopped = awaitSerializedExecutorAction(
                     executor = influxWorker,
@@ -1399,11 +1414,6 @@ class CollectorService : Service() {
                 ) {
                     check(influxCoordinator.stopExport().ok) { "Influx stop failed" }
                 }
-                val telegramStopped = awaitExecutorTermination(
-                    executor = telegramWorker,
-                    executorThreadName = "byd-telegram",
-                    timeoutMs = USER_SHUTDOWN_STOP_TIMEOUT_MS
-                )
                 val mqttStopped = awaitMqttWorkerTermination(mqttWorker, USER_SHUTDOWN_STOP_TIMEOUT_MS)
                 if (!mqttStopped || !influxStopped || !telegramStopped) {
                     userShutdownFinalizationStarted.set(false)
@@ -2385,7 +2395,29 @@ class CollectorService : Service() {
                 "storage_error",
                 BydCollectorApplication.TELEGRAM_STORAGE_ERROR
             )
-            stopIfNoActiveRuntime()
+            // Reuse the existing owner/watchdog events; SQLite repair never runs on the UI thread.
+            ensureForegroundForChannel("Recovering Telegram storage")
+            CollectorAutoStart.scheduleWatchdog(applicationContext, settings, store)
+            if (!telegramStorageRecoveryInFlight.compareAndSet(false, true)) return
+            executeTelegram(
+                errorCategory = "telegram_storage_recovery_error",
+                onSuccess = { recovered, generation ->
+                    mainHandler.post {
+                        if (!telegramRecoveryRuntimeAvailable(generation)) return@post
+                        if (recovered != null && telegramCoordinator == null) {
+                            telegramCoordinator = recovered
+                            reconcileTelegramRuntime(unblockBlocked)
+                        }
+                        scheduleIntegrationDashboardRefresh()
+                    }
+                },
+                onSettled = { telegramStorageRecoveryInFlight.set(false) }
+            ) {
+                if (!settings.isTelegramEnabled() || settings.isUserShutdownRequested() ||
+                    telegramDeliveryRuntime.hasInFlightDelivery) null
+                else (applicationContext as BydCollectorApplication).reconcileTelegramStorage(store)
+                    ?.let { createTelegramCoordinator() }
+            }
             return
         }
         ensureForegroundForChannel("Telegram notifications enabled")
@@ -2413,15 +2445,13 @@ class CollectorService : Service() {
                 settings.setTelegramConnectionStatus("failed", "telegram_test_error")
                 mainHandler.post { stopIfNoActiveRuntime() }
             },
-            onSuccess = { result, submittedGeneration ->
-                if (result == TelegramSendResult.Success && settings.isTelegramEnabled()) {
-                    requestTelegramRecovery(RECOVERY_MANUAL_TEST_SUCCESS, submittedGeneration)
-                }
-            }
         ) {
-            val result = coordinator.testConnection()
-            mainHandler.post { stopIfNoActiveRuntime() }
-            result
+            coordinator.testConnection { result ->
+                if (result == TelegramSendResult.Success && settings.isTelegramEnabled()) {
+                    requestTelegramRecovery(RECOVERY_MANUAL_TEST_SUCCESS)
+                }
+                mainHandler.post { stopIfNoActiveRuntime() }
+            }
         }
     }
 
@@ -2467,8 +2497,9 @@ class CollectorService : Service() {
             return
         }
         try {
-            executeTelegram(
+            executeOrderedTelegram(
                 errorCategory = "telegram_recovery_error",
+                coordinator = coordinator,
                 onSuccess = ::postTelegramTickSchedule,
                 onSettled = { completeTelegramRecovery(request.token, generation) }
             ) {
@@ -2480,9 +2511,9 @@ class CollectorService : Service() {
                     !settings.isTelegramEnabled() ||
                     settings.isUserShutdownRequested() ||
                     maintenanceBlocksRuntimeStart()
-                ) return@executeTelegram null
+                ) return@executeOrderedTelegram null
                 if (RECOVERY_STARTUP_CREDENTIALS in request.reasons) coordinator.credentialsChanged()
-                if (!telegramRecoveryCoalescer.isCurrent(request.token)) return@executeTelegram null
+                if (!telegramRecoveryCoalescer.isCurrent(request.token)) return@executeOrderedTelegram null
                 coordinator.recoverPending(request.trigger)
             }
         } catch (_: RuntimeException) {
@@ -2983,10 +3014,28 @@ class CollectorService : Service() {
     }
 
     private fun advanceInfluxGeneration(): Long {
-        return synchronized(influxQueueLock) {
+        val generation = synchronized(influxQueueLock) {
             influxRequestQueued.set(false)
             influxWorkQueuedAtElapsedMs = null
             influxWorkGeneration.incrementAndGet()
+        }
+        if (::influxCoordinator.isInitialized) influxCoordinator.cancelInFlight()
+        return generation
+    }
+
+    private fun <T> executeOrderedTelegram(
+        errorCategory: String,
+        coordinator: TelegramCoordinator,
+        onSuccess: ((T, Long) -> Unit)? = null,
+        onSettled: (() -> Unit)? = null,
+        action: () -> T
+    ) {
+        tripRuntime.afterPendingTrips(onDropped = { onSettled?.invoke() }) { watermark ->
+            executeTelegram(errorCategory, onSuccess = onSuccess, onSettled = onSettled) {
+                check(telegramCoordinator === coordinator) { "Telegram coordinator changed before ordered input" }
+                drainTripCompletions(coordinator, watermark)
+                action()
+            }
         }
     }
 
@@ -3279,45 +3328,25 @@ class CollectorService : Service() {
     }
 
     private fun resetTelegramExecutorForMaintenance() {
-        val previous = runOnRuntimeOwnerBlocking {
-            requireRuntimeOwner()
-            telegramWorkGeneration.incrementAndGet()
-            synchronized(telegramExecutorLock) {
-                telegramExecutor.also { it.shutdownNow() }
-            }
-        }
-        val stopped = try {
-            previous.awaitTermination(TELEGRAM_MAINTENANCE_STOP_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-            false
-        }
-        if (!stopped) maintenanceRuntimeRestoreAllowed.set(false)
-        check(stopped) { "Telegram worker did not stop before database maintenance" }
         runOnRuntimeOwnerBlocking {
             requireRuntimeOwner()
-            synchronized(telegramExecutorLock) {
-                if (telegramExecutor !== previous) {
-                    maintenanceRuntimeRestoreAllowed.set(false)
-                    error("Telegram executor changed during database maintenance")
-                }
-                telegramExecutor = namedSingleThreadExecutor("byd-telegram")
-            }
+            telegramWorkGeneration.incrementAndGet()
         }
+        val stopped = telegramDeliveryRuntime.quiesceAndAwait(TELEGRAM_MAINTENANCE_STOP_TIMEOUT_MS)
+        if (!stopped) maintenanceRuntimeRestoreAllowed.set(false)
+        check(stopped) { "Telegram HTTP/receipt did not settle before database maintenance" }
+        telegramCoordinator = null
     }
 
-    private fun shutdownTelegramExecutorForUserShutdown(): ExecutorService {
+    private fun quiesceTelegramForUserShutdown(): Boolean {
         telegramWorkGeneration.incrementAndGet()
-        return synchronized(telegramExecutorLock) {
-            telegramExecutor.also { it.shutdownNow() }
-        }
+        return telegramDeliveryRuntime.quiesceAndAwait(TELEGRAM_MAINTENANCE_STOP_TIMEOUT_MS)
     }
 
     private fun shutdownTelegramExecutor() {
         telegramWorkGeneration.incrementAndGet()
-        synchronized(telegramExecutorLock) {
-            telegramExecutor.shutdown()
-        }
+        // Process ownership keeps a returned HTTP result commit-able across Service recreation.
+        telegramDeliveryRuntime.detach(this)
     }
 
     private fun cancelDatabaseMaintenance() {
@@ -3595,38 +3624,6 @@ class CollectorService : Service() {
         }
     }
 
-    private fun <T> runOnTelegramExecutorBlocking(action: () -> T): T {
-        if (Thread.currentThread().name == "byd-telegram") return action()
-        check(!maintenanceBlocksRuntimeStart()) { "Telegram storage maintenance is active" }
-        val submittedGeneration = telegramWorkGeneration.get()
-        val selectedExecutor = synchronized(telegramExecutorLock) { telegramExecutor }
-        val task = FutureTask<T> {
-            check(submittedGeneration == telegramWorkGeneration.get() && !maintenanceBlocksRuntimeStart()) {
-                "Telegram worker changed before power-off persistence"
-            }
-            action()
-        }
-        try {
-            selectedExecutor.execute(task)
-        } catch (error: RejectedExecutionException) {
-            throw IllegalStateException("Telegram worker rejected power-off persistence", error)
-        }
-        return try {
-            task.get(TELEGRAM_POWER_OFF_PREPARE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-        } catch (error: InterruptedException) {
-            task.cancel(false)
-            Thread.currentThread().interrupt()
-            throw IllegalStateException("Interrupted while persisting Telegram power-off event", error)
-        } catch (error: TimeoutException) {
-            task.cancel(false)
-            throw IllegalStateException("Timed out persisting Telegram power-off event", error)
-        } catch (error: ExecutionException) {
-            val cause = error.cause ?: error
-            if (cause is RuntimeException) throw cause
-            throw IllegalStateException("Telegram power-off persistence failed", cause)
-        }
-    }
-
     private fun recoverInterruptedMaintenanceIfNeeded(action: String) {
         if (action == ACTION_ARCHIVE_DATABASE || action == ACTION_ARCHIVE_DEBUG_DATABASE) return
         if (maintenanceActive.get()) return
@@ -3702,6 +3699,14 @@ class CollectorService : Service() {
 
     private fun createTelegramCoordinator(): TelegramCoordinator? {
         val application = applicationContext as BydCollectorApplication
+        telegramDeliveryRuntime.attach(
+            this,
+            onReady = { postTelegramTickSchedule(it, telegramWorkGeneration.get()) },
+            onFailure = ::handleTelegramExecutionFailure
+        )
+        telegramDeliveryRuntime.resume()
+        telegramCoordinator?.let { return it }
+        if (telegramDeliveryRuntime.hasInFlightDelivery) return null
         val telegramStore = application.telegramStoreOrNull() ?: run {
             settings.setTelegramConnectionStatus(
                 "storage_error",
@@ -3713,8 +3718,10 @@ class CollectorService : Service() {
             eventStore = store,
             telegramStore = telegramStore,
             settings = settings,
+            dispatchSend = telegramDeliveryRuntime::dispatchSend,
+            onDeliveryReady = telegramDeliveryRuntime::deliveryReady,
             currentEnergySnapshot = {
-                BydCollectorApplication.trips(applicationContext).readEnergyRuntimeRow()?.let { row ->
+                BydCollectorApplication.trips(application).readEnergyRuntimeRow()?.let { row ->
                     com.bydcollector.collector.data.energy.EnergyStateCodec.decodeState(row.stateJson).currentSnapshot
                 }
             }
@@ -3811,7 +3818,6 @@ class CollectorService : Service() {
         private const val MQTT_MAINTENANCE_STOP_TIMEOUT_MS = 16_000L
         private const val INFLUX_MAINTENANCE_STOP_TIMEOUT_MS = 16_000L
         private const val TELEGRAM_MAINTENANCE_STOP_TIMEOUT_MS = 16_000L
-        private const val TELEGRAM_POWER_OFF_PREPARE_TIMEOUT_MS = 5_000L
         private const val RUNTIME_OWNER_HANDOFF_TIMEOUT_MS = 30_000L
         private const val USER_SHUTDOWN_STOP_TIMEOUT_MS = 16_000L
         private const val TAG = "BYDCollectorService"

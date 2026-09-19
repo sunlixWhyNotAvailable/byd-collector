@@ -46,11 +46,6 @@ object RequiredAccessChecker {
         return check(context).any { !it.enabled }
     }
 
-    // Optional presentation access never changes the required permissions pill.
-    fun missingOverlayGrantCommand(context: Context): String? =
-        if (Settings.canDrawOverlays(context)) null
-        else "appops set ${BuildConfig.APPLICATION_ID} SYSTEM_ALERT_WINDOW allow"
-
     fun missingShellGrantCommands(context: Context): List<String> {
         val commands = mutableListOf<String>()
         if (!hasStorageReadAccess(context)) {

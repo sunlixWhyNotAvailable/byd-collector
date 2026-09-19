@@ -7,6 +7,8 @@ import com.bydcollector.collector.ha.HaEndpointProfile
 import java.time.OffsetDateTime
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.CancellationException
+import java.util.concurrent.atomic.AtomicLong
 
 //exports normalized vehicle_state_history to influx as the durable analytics channel
 class InfluxExportCoordinator(
@@ -17,6 +19,7 @@ class InfluxExportCoordinator(
     private val diagnostics: InfluxDiagnosticSink = {}
 ) {
     private var currentBatchSize: Int? = null
+    private val cancellationGeneration = AtomicLong(0L)
     @Volatile private var sessionConnection: InfluxConfig? = null
     private var lastDiagnosticGate: String? = null
 
@@ -64,6 +67,11 @@ class InfluxExportCoordinator(
         sessionConnection = null
         currentRoute = null
         diagnostic("influx_session_ended", mapOf("frozen" to "false", "actual_route" to "none"))
+    }
+
+    /** Cancels split work between HTTP requests without discarding an acknowledged write. */
+    fun cancelInFlight() {
+        cancellationGeneration.incrementAndGet()
     }
 
     fun startExport(): InfluxActionResult {
@@ -132,6 +140,7 @@ class InfluxExportCoordinator(
     }
 
     fun stopExport(): InfluxActionResult {
+        cancelInFlight()
         return try {
             val config = configProvider()
             val fieldKeys = effectiveFields(config)
@@ -238,7 +247,24 @@ class InfluxExportCoordinator(
         )
         return try {
             val exportedAt = clock.nowIso()
-            val batch = exportRows(config, rows, exportedAt)
+            val pass = ExportPass(cancellationGeneration.get())
+            var exportFailure: Throwable? = null
+            val batch = try {
+                exportRows(config, rows, exportedAt, pass = pass)
+            } catch (error: Throwable) {
+                exportFailure = error
+                throw error
+            } finally {
+                if (exportFailure == null) {
+                    recordPoisonSummary(pass)
+                } else {
+                    try {
+                        recordPoisonSummary(pass)
+                    } catch (_: Throwable) {
+                        // Preserve the original cancellation/fatal signal.
+                    }
+                }
+            }
             batch.failure?.let { failure ->
                 val pendingAfterFailure = store.pendingInfluxSummary(fieldKeys)
                 if (isTransientFailure(failure)) {
@@ -246,6 +272,30 @@ class InfluxExportCoordinator(
                 }
                 recordFailure(STATUS_BACKOFF, failure.message, pendingAfterFailure)
                 return failure
+            }
+
+            if (batch.deferred || batch.cancelled) {
+                val pendingAfter = store.pendingInfluxSummary(fieldKeys)
+                val stopped = batch.cancelled && !configProvider().enabled
+                store.updateInfluxExportState(
+                    status = if (stopped) STATUS_STOPPED else STATUS_SCHEDULED,
+                    mode = modeFor(pendingAfter.rows),
+                    pendingRows = pendingAfter.rows,
+                    oldestPendingAt = pendingAfter.oldestObservedAt,
+                    nextRetryAt = if (!stopped && pendingAfter.rows > 0L) {
+                        plusSeconds(exportedAt, SUCCESS_BATCH_INTERVAL_SECONDS)
+                    } else {
+                        null
+                    },
+                    lastSuccessAt = exportedAt.takeIf { batch.exportedRows > 0 } ?: state.lastSuccessAt,
+                    lastErrorAt = null,
+                    lastError = null,
+                    exportedRowsDelta = batch.exportedRows.toLong()
+                )
+                return InfluxActionResult.ok(
+                    if (batch.cancelled) "influx export stopped between requests"
+                    else "influx split pass scheduled"
+                )
             }
 
             val pendingAfter = store.pendingInfluxSummary(fieldKeys)
@@ -280,6 +330,13 @@ class InfluxExportCoordinator(
             }
             val poisonSuffix = if (batch.poisonRows > 0) "; quarantined ${batch.poisonRows} poison rows" else ""
             InfluxActionResult.ok("exported ${batch.exportedRows} rows$poisonSuffix")
+        } catch (error: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw error
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Error) {
+            throw error
         } catch (error: RuntimeException) {
             val detail = "${error::class.java.simpleName}: ${error.message ?: "no message"}".take(512)
             deescalateBatchSize(pendingBefore.rows)
@@ -361,15 +418,18 @@ class InfluxExportCoordinator(
         config: InfluxConfig,
         rows: List<InfluxPendingHistoryRow>,
         exportedAt: String,
-        pinnedRoute: HaEndpointProfile? = null
+        pinnedRoute: HaEndpointProfile? = null,
+        pass: ExportPass
     ): BatchExportResult {
         if (rows.isEmpty()) return BatchExportResult()
         val route = pinnedRoute ?: currentRoute ?: HaEndpointProfile.PRIMARY
         val lines = rows.map { InfluxLineProtocol.toLine(it, config) }
         val writeAttempt = if (pinnedRoute == null) {
-            writeWithFailover(config, route, lines)
+            writeWithFailover(config, route, lines, pass)
         } else {
-            writeOnce(config, route, lines)
+            writeOnce(config, route, lines, pass)
+        } ?: return pass.cancelled().let { cancelled ->
+            BatchExportResult(deferred = !cancelled, cancelled = cancelled)
         }
         val write = writeAttempt.result
         val actualRoute = writeAttempt.route
@@ -444,23 +504,19 @@ class InfluxExportCoordinator(
             if (rows.size == 1) {
                 val row = rows.single()
                 store.updateInfluxCursorSuccess(row.fieldKey, row.id, exportedAt)
-                store.recordInfluxEvent(
-                    eventType = "influx_export_poison_row",
-                    message = "field=${row.fieldKey} history_id=${row.id} reason=${influxDataFormatReason(write)}",
-                    batchCount = null,
-                    fromHistoryId = row.id,
-                    toHistoryId = row.id
-                )
+                pass.recordPoison(row, checkNotNull(influxDataFormatReason(write)))
                 return BatchExportResult(poisonRows = 1)
             }
             val midpoint = rows.size / 2
-            val left = exportRows(config, rows.subList(0, midpoint), exportedAt, pinnedRoute = actualRoute)
-            left.failure?.let { return left }
-            val right = exportRows(config, rows.subList(midpoint, rows.size), exportedAt, pinnedRoute = actualRoute)
+            val left = exportRows(config, rows.subList(0, midpoint), exportedAt, pinnedRoute = actualRoute, pass = pass)
+            if (left.failure != null || left.deferred || left.cancelled) return left
+            val right = exportRows(config, rows.subList(midpoint, rows.size), exportedAt, pinnedRoute = actualRoute, pass = pass)
             return BatchExportResult(
                 exportedRows = left.exportedRows + right.exportedRows,
                 poisonRows = left.poisonRows + right.poisonRows,
-                failure = right.failure
+                failure = right.failure,
+                deferred = right.deferred,
+                cancelled = right.cancelled
             )
         }
         rows.map { it.fieldKey }.distinct().forEach { fieldKey ->
@@ -472,9 +528,10 @@ class InfluxExportCoordinator(
     private fun writeWithFailover(
         config: InfluxConfig,
         preferred: HaEndpointProfile,
-        lines: List<String>
-    ): RouteWriteResult {
-        val first = writeOnce(config, preferred, lines)
+        lines: List<String>,
+        pass: ExportPass
+    ): RouteWriteResult? {
+        val first = writeOnce(config, preferred, lines, pass) ?: return null
         if (first.result.ok || !isFallbackEligible(first.result)) {
             return first
         }
@@ -491,7 +548,7 @@ class InfluxExportCoordinator(
                 "request_id" to first.requestId
             )
         )
-        val second = writeOnce(config, alternate, lines)
+        val second = writeOnce(config, alternate, lines, pass) ?: return null
         if (!second.result.ok) currentRoute = null
         return second
     }
@@ -499,8 +556,10 @@ class InfluxExportCoordinator(
     private fun writeOnce(
         config: InfluxConfig,
         route: HaEndpointProfile,
-        lines: List<String>
-    ): RouteWriteResult {
+        lines: List<String>,
+        pass: ExportPass
+    ): RouteWriteResult? {
+        if (!pass.reserveWrite()) return null
         val requestId = UUID.randomUUID().toString()
         val startedNs = System.nanoTime()
         val routeConfig = runCatching { configForRoute(config, route) }.getOrElse { error ->
@@ -533,11 +592,20 @@ class InfluxExportCoordinator(
             )
         )
         var thrownErrorClass: String? = null
-        val result = runCatching { client.write(routeConfig, lines, requestId, route) }.getOrElse {
-            thrownErrorClass = it::class.java.simpleName
+        val result = try {
+            client.write(routeConfig, lines, requestId, route)
+        } catch (error: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw error
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Error) {
+            throw error
+        } catch (error: RuntimeException) {
+            thrownErrorClass = error::class.java.simpleName
             InfluxActionResult.fail(
                 "influx_write_exception",
-                "${it::class.java.simpleName}: ${it.message ?: "no message"}",
+                "${error::class.java.simpleName}: ${error.message ?: "no message"}",
                 failureKind = InfluxFailureKind.OTHER
             )
         }
@@ -579,6 +647,58 @@ class InfluxExportCoordinator(
         val requestId: String,
         val result: InfluxActionResult
     )
+
+    private inner class ExportPass(private val generation: Long) {
+        private var writes = 0
+        var poisonRows = 0
+            private set
+        private val poisonExamples = mutableListOf<String>()
+        private var firstPoisonId: Long? = null
+        private var lastPoisonId: Long? = null
+
+        fun cancelled(): Boolean = Thread.currentThread().isInterrupted ||
+            generation != cancellationGeneration.get() ||
+            !configProvider().enabled
+
+        fun reserveWrite(): Boolean {
+            if (cancelled() || writes >= MAX_HTTP_WRITES_PER_PASS) return false
+            writes += 1
+            return true
+        }
+
+        fun recordPoison(row: InfluxPendingHistoryRow, reason: String) {
+            poisonRows += 1
+            firstPoisonId = firstPoisonId?.let { minOf(it, row.id) } ?: row.id
+            lastPoisonId = lastPoisonId?.let { maxOf(it, row.id) } ?: row.id
+            if (poisonExamples.size < MAX_POISON_EXAMPLES) {
+                poisonExamples += "field=${row.fieldKey} history_id=${row.id} reason=$reason"
+            }
+        }
+
+        fun recordSummary() {
+            if (poisonRows == 0) return
+            store.recordInfluxEvent(
+                eventType = "influx_export_poison_row",
+                message = "count=$poisonRows examples=${poisonExamples.joinToString(" | ")}",
+                batchCount = poisonRows,
+                fromHistoryId = firstPoisonId,
+                toHistoryId = lastPoisonId
+            )
+        }
+    }
+
+    private fun recordPoisonSummary(pass: ExportPass) {
+        try {
+            pass.recordSummary()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: RuntimeException) {
+            diagnostic(
+                "influx_poison_summary_failure",
+                mapOf("error_class" to error::class.java.simpleName)
+            )
+        }
+    }
 
     private fun isTransientFailure(result: InfluxActionResult): Boolean {
         val detail = "${result.category} ${result.message}".lowercase(Locale.US)
@@ -707,6 +827,8 @@ class InfluxExportCoordinator(
         const val CATCH_UP_THRESHOLD = 5_000
         const val SUCCESS_BATCH_INTERVAL_SECONDS = 1L
         const val FAILURE_RETRY_INTERVAL_SECONDS = 30L
+        const val MAX_HTTP_WRITES_PER_PASS = 64
+        const val MAX_POISON_EXAMPLES = 5
         const val STATUS_IDLE = "idle"
         const val STATUS_SCHEDULED = "scheduled"
         const val STATUS_EXPORTING = "exporting"
@@ -724,12 +846,12 @@ internal fun isInfluxLineProtocolDataFailure(result: InfluxActionResult): Boolea
 }
 
 internal fun influxDataFormatReason(result: InfluxActionResult): String? {
-    if (result.httpStatus != 400) return null
+    if (result.httpStatus != 400 && result.httpStatus != 422) return null
     val text = "${result.category} ${result.message}".lowercase(Locale.US)
     return when {
-        text.contains("partial write") -> "partial_write"
         text.contains("field type conflict") -> "field_type_conflict"
         text.contains("unable to parse") -> "unable_to_parse"
+        text.contains("points beyond retention policy") -> "retention_policy"
         else -> null
     }
 }
@@ -737,5 +859,7 @@ internal fun influxDataFormatReason(result: InfluxActionResult): String? {
 private data class BatchExportResult(
     val exportedRows: Int = 0,
     val poisonRows: Int = 0,
-    val failure: InfluxActionResult? = null
+    val failure: InfluxActionResult? = null,
+    val deferred: Boolean = false,
+    val cancelled: Boolean = false
 )

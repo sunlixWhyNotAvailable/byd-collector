@@ -103,7 +103,8 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                         groupFailureCount = groupFailureCount,
                         helperElapsedMs = helperElapsedMs,
                         returnedCount = returnedCount,
-                        error = batchError ?: if (batchStatus == 0) null else "batch_status=$batchStatus"
+                        error = batchError ?: if (batchStatus == 0) null else "batch_status=$batchStatus",
+                        status = batchStatus
                     )
                 )
             } catch (error: DeadObjectException) {
@@ -329,7 +330,8 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                 groupFailureCount = 0,
                 helperElapsedMs = 0,
                 returnedCount = 0,
-                error = error
+                error = error,
+                status = status
             )
         )
     }
