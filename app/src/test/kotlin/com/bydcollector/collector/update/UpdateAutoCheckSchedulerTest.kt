@@ -112,16 +112,16 @@ class UpdateAutoCheckSchedulerTest {
     }
 
     @Test
-    fun acceptedCheckArmsFreshCycleOnBackground() {
+    fun acceptedCheckDoesNotRearmFromBackgroundLifecycle() {
         scheduler.onRuntimeStarted(enabled = true)
         nowMs = 31_000L
         assertEquals(UpdateAutoCheckAction.Run, scheduler.onTimerElapsed(enabled = true, foreground = true))
         scheduler.onCheckStarted()
 
         nowMs = 40_000L
-        assertEquals(UpdateAutoCheckAction.Schedule(30_000L), scheduler.onBackground(enabled = true))
+        assertEquals(UpdateAutoCheckAction.None, scheduler.onBackground(enabled = true))
         nowMs = 45_000L
-        assertEquals(UpdateAutoCheckAction.Schedule(25_000L), scheduler.onForeground(enabled = true))
+        assertEquals(UpdateAutoCheckAction.None, scheduler.onForeground(enabled = true))
     }
 
     @Test
@@ -166,5 +166,72 @@ class UpdateAutoCheckSchedulerTest {
         assertTrue(state.contains("initialized=true"))
         assertTrue(state.contains("deadline_elapsed_ms="))
         assertTrue(state.contains("suppressed_until_elapsed_ms=null"))
+        assertTrue(state.contains("retry_attempt=0"))
+    }
+
+    @Test
+    fun errorsRetryFromActualCompletionWithBoundedBackoff() {
+        scheduler.onRuntimeStarted(enabled = true)
+        nowMs = 31_000L
+        scheduler.onCheckStarted()
+
+        val expectedDelays = listOf(30_000L, 60_000L, 120_000L, 300_000L, 300_000L)
+        expectedDelays.forEachIndexed { index, delay ->
+            val completedAt = 100_000L + index * 1_000_000L
+            nowMs = completedAt + 7_000L
+            assertEquals(
+                UpdateAutoCheckAction.Schedule(delay - 7_000L),
+                scheduler.onCheckCompleted(UpdateCheckResult.Error("offline"), completedAt, enabled = true)
+            )
+            assertEquals(UpdateAutoCheckAction.Schedule(delay - 7_000L), scheduler.onBackground(enabled = true))
+            assertEquals(UpdateAutoCheckAction.Schedule(delay - 7_000L), scheduler.onRuntimeStarted(enabled = true))
+            nowMs = completedAt + delay
+            assertEquals(UpdateAutoCheckAction.Run, scheduler.onTimerElapsed(enabled = true, foreground = false))
+            scheduler.onCheckStarted()
+        }
+    }
+
+    @Test
+    fun eitherSuccessfulResultStopsRetriesAcrossLifecycleCallbacks() {
+        listOf<UpdateCheckResult>(UpdateCheckResult.UpToDate, UpdateCheckResult.Available(
+            UpdateInfo("2.8.2", "https://example.test/update.apk", "notes")
+        )).forEach { result ->
+            val current = UpdateAutoCheckScheduler(delayMs = 30_000L, nowMs = { nowMs })
+            current.onRuntimeStarted(enabled = true)
+            current.onCheckStarted()
+            assertEquals(UpdateAutoCheckAction.None, current.onCheckCompleted(result, nowMs, enabled = true))
+            assertEquals(UpdateAutoCheckAction.None, current.onForeground(enabled = true))
+            assertEquals(UpdateAutoCheckAction.None, current.onBackground(enabled = true))
+            assertEquals(UpdateAutoCheckAction.None, current.onRuntimeStarted(enabled = true))
+        }
+    }
+
+    @Test
+    fun disabledCompletionCannotArmRetryAndReenableStartsFreshDelay() {
+        scheduler.onRuntimeStarted(enabled = true)
+        scheduler.onCheckStarted()
+        assertEquals(UpdateAutoCheckAction.None, scheduler.onAutoCheckEnabledChanged(enabled = false))
+        nowMs = 50_000L
+        assertEquals(
+            UpdateAutoCheckAction.None,
+            scheduler.onCheckCompleted(UpdateCheckResult.Error("offline"), nowMs, enabled = false)
+        )
+        assertEquals(UpdateAutoCheckAction.Schedule(30_000L), scheduler.onAutoCheckEnabledChanged(enabled = true))
+    }
+
+    @Test
+    fun successfulManualCheckDuringSuppressionKeepsPostTtlEligibility() {
+        scheduler.onRuntimeStarted(enabled = true)
+        scheduler.onCheckStarted()
+        scheduler.onDismissed()
+        nowMs += 10_000L
+        scheduler.onCheckStarted()
+
+        assertEquals(
+            UpdateAutoCheckAction.Schedule(60 * 60 * 1000L - 10_000L),
+            scheduler.onCheckCompleted(UpdateCheckResult.UpToDate, nowMs, enabled = true)
+        )
+        nowMs += 60 * 60 * 1000L - 10_000L
+        assertEquals(UpdateAutoCheckAction.Run, scheduler.onTimerElapsed(enabled = true, foreground = false))
     }
 }

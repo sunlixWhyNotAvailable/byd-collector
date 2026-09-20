@@ -197,7 +197,9 @@ These controls restore Android services and connections; they do not send vehicl
 
 The autonomous telemetry helper asks Android to keep the CPU awake while it is running, including with the screen off. If that request fails, collection continues without this protection. It does not prevent Android from killing the process or the vehicle from rebooting; its effect on parked-car operation still needs vehicle validation.
 
-Automatic update checking starts after a short startup delay and can run while the app operates in the background. When Collector is visible, an available update is offered inside the app. Closing an update offer pauses automatic checks for an hour, or until a new app session. Manual checking remains available and always checks the latest published release.
+Automatic update checking starts after 30 seconds and runs in the background without opening Collector. Failed checks retry after 30, 60, 120, and then every 300 seconds, measured from completion of the failed attempt; a successful check stops retries. Screen-off pauses only update checking, not telemetry collection. The next screen wake starts a fresh 30-second cycle. Opening or minimizing Collector does not reset this timer.
+
+When Collector is visible, an available update is offered inside the app. Closing an update offer pauses automatic checks for an hour, unless a new wake starts a fresh cycle first. Manual checking remains available and checks the latest published release; if a valid check is already running, it shares that request instead of starting another.
 
 `New version hint widget` is enabled by default. When a background check finds an update, it can show a hint above other apps for 10 seconds. Tap it to open `Options` and the saved update offer, or close it with the X. Returning to Collector removes its hint without repeating the check; minimizing the app does not replay a hint or offer that was already shown. The settings button beside the switch adjusts size, transparency, corners, and frame/stripe color; the default accent is green.
 

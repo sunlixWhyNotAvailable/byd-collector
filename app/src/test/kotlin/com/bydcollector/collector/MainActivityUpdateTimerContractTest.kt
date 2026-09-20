@@ -2,6 +2,7 @@ package com.bydcollector.collector
 
 import java.io.File
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -83,8 +84,13 @@ class MainActivityUpdateTimerContractTest {
         assertTrue(dismiss.contains("updateUiGeneration += 1L"))
         assertTrue(runtime.contains("app.updateChecks.request(manual)"))
         assertTrue(runtime.contains("UpdateAutoCheckRuntime.onCheckStarted()"))
+        assertTrue(runtime.contains("UpdateAutoCheckRuntime.onCheckCompleted("))
         assertTrue(runtime.contains("UpdateAutoCheckRuntime.onDismissed()"))
-        assertTrue(runtime.contains("!app.updateChecks.snapshot().inFlight"))
+        assertTrue(runtime.contains("app.updateChecks.completionsAfter(lastProcessedCompletionToken)"))
+        assertTrue(runtime.contains("completion.generation != generation"))
+        assertTrue(runtime.contains("app.updateChecks.acknowledgeCompletionsThrough(lastProcessedCompletionToken)"))
+        assertTrue(runtime.contains("if (staleFlightReleased)"))
+        assertTrue(runtime.substringAfter("if (staleFlightReleased)").contains("UpdateAutoCheckRuntime.onTimerElapsed("))
         assertTrue(download.contains("updateChecks.clearPresentation()"))
         assertTrue(download.contains("val uiGeneration = ++updateUiGeneration"))
         assertTrue(Regex("uiGeneration == updateUiGeneration").findAll(download).count() >= 3)
@@ -121,6 +127,44 @@ class MainActivityUpdateTimerContractTest {
         assertTrue(show.contains("dismiss(\"window_failed\")"))
         assertFalse(show.contains("clearPresentation()"))
         assertFalse(show.contains("updateChecks.reset()"))
+    }
+
+    @Test
+    fun admittedRuntimeObservesScreenAndBootWithoutStartingVehicleWork() {
+        val runtime = source("update/UpdateRuntime.kt")
+        val start = runtime.substringAfter("fun start(source: String)").substringBefore("fun onSystemWake(")
+        assertTrue(start.indexOf("settings.isUserShutdownRequested()") < start.indexOf("observeWake()"))
+        assertTrue(start.contains("wakePolicy.onEntry(SystemClock.elapsedRealtime(), isInteractive())"))
+        assertTrue(start.contains("wakePolicy.sleeping ->"))
+        assertTrue(runtime.contains("addAction(Intent.ACTION_SCREEN_OFF)"))
+        assertTrue(runtime.contains("addAction(Intent.ACTION_SCREEN_ON)"))
+        assertTrue(runtime.contains("addAction(Intent.ACTION_USER_PRESENT)"))
+        val sleep = runtime.substringAfter("private fun pauseForSleep()").substringBefore("private fun restartAfterWake(")
+        assertTrue(sleep.contains("handler.removeCallbacks(timer)"))
+        assertTrue(sleep.contains("app.updateChecks.invalidateAutomatic()"))
+        assertFalse(runtime.contains("CollectorServiceController"))
+        assertFalse(runtime.contains("CollectorAutoStart"))
+        val boot = source("system/BootReceiver.kt")
+        assertTrue(boot.contains("action == Intent.ACTION_BOOT_COMPLETED || action == ACTION_QUICKBOOT_POWERON"))
+        assertTrue(boot.indexOf("updateRuntime.onSystemWake(action)") < boot.indexOf("handoffAutoStartRecovery("))
+        assertTrue(runtime.contains("app.unregisterReceiver(receiver)"))
+    }
+
+    @Test
+    fun newWakeResetsCloseSuppressionButRetainsManualFlightAndOneTimer() {
+        val runtime = source("update/UpdateRuntime.kt")
+        val wake = runtime.substringAfter("private fun restartAfterWake(").substringBefore("fun onUiVisible()")
+        assertTrue(wake.contains("UpdateAutoCheckRuntime.reset()"))
+        assertTrue(wake.contains("app.updateChecks.hasCurrentManualRequest()"))
+        assertTrue(wake.contains("if (manualInFlight) UpdateAutoCheckRuntime.onCheckStarted()"))
+        assertTrue(wake.contains("else applyAction(action)"))
+        val request = runtime.substringAfter("fun request(manual: Boolean)").substringBefore("fun dismissOffer()")
+        assertTrue(request.indexOf("processCompletions(applyScheduling = false)") < request.indexOf("app.updateChecks.request(manual)"))
+        assertTrue(request.contains("action != UpdateAutoCheckAction.Run"))
+        assertTrue(runtime.contains("started && !wakePolicy.sleeping && settings.isUpdateAutoCheckEnabled()"))
+        val disabled = runtime.substringAfter("fun onAutoCheckEnabledChanged()").substringBefore("fun request(")
+        assertTrue(disabled.contains("if (!settings.isUpdateAutoCheckEnabled()) app.updateChecks.invalidateAutomatic()"))
+        assertEquals(1, Regex("private val timer = Runnable").findAll(runtime).count())
     }
 
     private fun source(path: String): String = listOf(

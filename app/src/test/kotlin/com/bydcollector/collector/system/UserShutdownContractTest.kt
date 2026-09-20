@@ -34,7 +34,10 @@ class UserShutdownContractTest {
         assertTrue(activity.contains("settings.clearRuntimeManualStops()"))
         assertTrue(activity.contains("CollectorAutoStart.recoverFromForeground(applicationContext, settings, runtimeStore)"))
         assertInOrder(activity, "settings.clearUserShutdownRequestIfSet()", "updateRuntime.start(\"activity\")")
-        assertTrue(updateRuntime.contains("if (started || settings.isUserShutdownRequested()) return"))
+        val updateStart = updateRuntime.substringAfter("fun start(source: String)").substringBefore("fun onSystemWake(")
+        val updateWake = updateRuntime.substringAfter("fun onSystemWake(").substringBefore("private fun observeWake()")
+        assertInOrder(updateStart, "if (settings.isUserShutdownRequested()) return", "val firstEntry = !started")
+        assertInOrder(updateWake, "if (settings.isUserShutdownRequested()) return", "if (!started)")
     }
 
     @Test

@@ -12,11 +12,17 @@ sealed interface UpdateAutoCheckAction {
 class UpdateAutoCheckScheduler(
     private val delayMs: Long,
     private val nowMs: () -> Long,
-    private val suppressionMs: Long = 60 * 60 * 1000L
+    private val suppressionMs: Long = 60 * 60 * 1000L,
+    private val retryDelaysMs: LongArray = longArrayOf(30_000L, 60_000L, 120_000L, 300_000L)
 ) {
+    init {
+        require(retryDelaysMs.isNotEmpty() && retryDelaysMs.all { it > 0L })
+    }
+
     private var initialized = false
     private var deadlineMs: Long? = null
     private var suppressedUntilMs: Long? = null
+    private var retryAttempt = 0
 
     fun onRuntimeStarted(enabled: Boolean): UpdateAutoCheckAction {
         if (!enabled) return UpdateAutoCheckAction.None
@@ -60,6 +66,7 @@ class UpdateAutoCheckScheduler(
             // intentionally leaves a Close suppression window intact.
             initialized = false
             deadlineMs = null
+            retryAttempt = 0
             return UpdateAutoCheckAction.None
         }
         return onRuntimeStarted(enabled = true)
@@ -69,13 +76,8 @@ class UpdateAutoCheckScheduler(
     fun onBackground(enabled: Boolean): UpdateAutoCheckAction {
         if (!enabled) return UpdateAutoCheckAction.None
         suppressionRemainingMs()?.let { return UpdateAutoCheckAction.Schedule(it) }
+        if (!initialized) return onRuntimeStarted(enabled = true)
         val now = nowMs()
-        if (deadlineMs == null) {
-            // The previous accepted request consumed its deadline. A later
-            // stop/return is a new automatic-check cycle.
-            initialized = true
-            deadlineMs = now + delayMs
-        }
         val deadline = deadlineMs ?: return UpdateAutoCheckAction.None
         return UpdateAutoCheckAction.Schedule((deadline - now).coerceAtLeast(0L))
     }
@@ -87,12 +89,39 @@ class UpdateAutoCheckScheduler(
         if (suppressionRemainingMs() == null) deadlineMs = null
     }
 
+    /** Advances retry state from the physical completion time, never from UI lifecycle timing. */
+    fun onCheckCompleted(
+        result: UpdateCheckResult,
+        completedAtElapsedMs: Long,
+        enabled: Boolean
+    ): UpdateAutoCheckAction {
+        if (!enabled) return UpdateAutoCheckAction.None
+        initialized = true
+        when (result) {
+            is UpdateCheckResult.Error -> {
+                val retryDelay = retryDelaysMs[retryAttempt.coerceAtMost(retryDelaysMs.lastIndex)]
+                if (retryAttempt < retryDelaysMs.lastIndex) retryAttempt++
+                deadlineMs = completedAtElapsedMs + retryDelay
+            }
+            UpdateCheckResult.UpToDate,
+            is UpdateCheckResult.Available -> {
+                retryAttempt = 0
+                // A manual check may complete during Close suppression. Keep
+                // its latent post-TTL eligibility; outside suppression success
+                // is terminal for this runtime.
+                if (suppressionRemainingMs() == null) deadlineMs = null
+            }
+        }
+        return actionForCurrentDeadline()
+    }
+
     /** Starts the process-local close suppression window. */
     fun onDismissed() {
         val now = nowMs()
         suppressedUntilMs = now + suppressionMs
         initialized = true
         deadlineMs = now
+        retryAttempt = 0
     }
 
     /** Clears all process state for shutdown or a new runtime session. */
@@ -100,11 +129,19 @@ class UpdateAutoCheckScheduler(
         initialized = false
         deadlineMs = null
         suppressedUntilMs = null
+        retryAttempt = 0
     }
 
     fun diagnosticState(): String =
         "initialized=$initialized deadline_elapsed_ms=${deadlineMs ?: "null"} " +
-            "suppressed_until_elapsed_ms=${suppressedUntilMs ?: "null"}"
+            "suppressed_until_elapsed_ms=${suppressedUntilMs ?: "null"} retry_attempt=$retryAttempt"
+
+    private fun actionForCurrentDeadline(): UpdateAutoCheckAction {
+        suppressionRemainingMs()?.let { return UpdateAutoCheckAction.Schedule(it) }
+        val deadline = deadlineMs ?: return UpdateAutoCheckAction.None
+        val remaining = deadline - nowMs()
+        return if (remaining > 0L) UpdateAutoCheckAction.Schedule(remaining) else UpdateAutoCheckAction.Run
+    }
 
     private fun suppressionRemainingMs(): Long? {
         val until = suppressedUntilMs ?: return null
@@ -151,6 +188,15 @@ object UpdateAutoCheckRuntime {
     @Synchronized
     fun onCheckStarted() {
         scheduler.onCheckStarted()
+    }
+
+    @Synchronized
+    fun onCheckCompleted(
+        result: UpdateCheckResult,
+        completedAtElapsedMs: Long,
+        enabled: Boolean
+    ): UpdateAutoCheckAction {
+        return scheduler.onCheckCompleted(result, completedAtElapsedMs, enabled)
     }
 
     @Synchronized

@@ -146,6 +146,11 @@ class UpdateCheckSessionTest {
         tasks.removeFirst().invoke()
         assertEquals(UpdateUiState.Hidden, session.snapshot().uiState)
 
+        scheduler.onCheckCompleted(
+            result = UpdateCheckResult.Error("offline"),
+            completedAtElapsedMs = elapsedMs,
+            enabled = true
+        )
         scheduler.onBackground(enabled = true)
         elapsedMs += 5_000L
         assertEquals(UpdateAutoCheckAction.Schedule(25_000L), scheduler.onForeground(enabled = true))
@@ -155,6 +160,7 @@ class UpdateCheckSessionTest {
         scheduler.onCheckStarted()
         result = UpdateCheckResult.Available(info)
         tasks.removeFirst().invoke() // UI may have disappeared; the process retains the offer.
+        scheduler.onCheckCompleted(result, elapsedMs, enabled = true)
         assertEquals(UpdateUiState.Available(info), session.snapshot().uiState)
         assertTrue(session.dismiss())
         assertEquals(null, session.snapshot().availableResultId)
@@ -163,5 +169,104 @@ class UpdateCheckSessionTest {
         assertEquals(UpdateAutoCheckAction.Schedule(1L), scheduler.onForeground(enabled = true))
         elapsedMs++
         assertEquals(UpdateAutoCheckAction.Run, scheduler.onForeground(enabled = true))
+    }
+
+    @Test
+    fun hiddenAndDismissedResultsStillExposeImmutableCompletions() {
+        var elapsedMs = 10_000L
+        var result: UpdateCheckResult = UpdateCheckResult.Error("offline")
+        val tasks = ArrayDeque<() -> Unit>()
+        val session = UpdateCheckSession(
+            dispatch = { tasks += it },
+            checker = { result },
+            elapsedRealtimeMs = { elapsedMs }
+        )
+
+        assertTrue(session.request(manual = false))
+        tasks.removeFirst().invoke()
+        assertEquals(UpdateUiState.Hidden, session.snapshot().uiState)
+        val failure = assertNotNull(session.snapshot().completion)
+        assertEquals(UpdateCheckResult.Error("offline"), failure.result)
+        assertEquals(10_000L, failure.completedAtElapsedMs)
+
+        elapsedMs = 20_000L
+        result = UpdateCheckResult.Available(info)
+        assertTrue(session.request(manual = true))
+        assertFalse(session.dismiss())
+        tasks.removeFirst().invoke()
+        assertEquals(UpdateUiState.Hidden, session.snapshot().uiState)
+        val completions = session.completionsAfter(0L)
+        assertEquals(2, completions.size)
+        assertEquals(result, completions.last().result)
+        assertEquals(20_000L, completions.last().completedAtElapsedMs)
+    }
+
+    @Test
+    fun automaticFenceStalesAutoFlightButPreservesManualFlightAndPhysicalBusy() {
+        val tasks = ArrayDeque<() -> Unit>()
+        val session = UpdateCheckSession(dispatch = { tasks += it }, checker = { UpdateCheckResult.UpToDate })
+
+        assertTrue(session.request(manual = false))
+        val oldGeneration = session.snapshot().generation
+        session.invalidateAutomatic()
+        assertTrue(session.snapshot().inFlight)
+        assertTrue(session.snapshot().generation > oldGeneration)
+        assertFalse(session.request(manual = true))
+        tasks.removeFirst().invoke()
+        val stale = assertNotNull(session.snapshot().completion)
+        assertTrue(stale.generation < session.snapshot().generation)
+        assertEquals(UpdateUiState.Hidden, session.snapshot().uiState)
+
+        assertTrue(session.request(manual = true))
+        session.invalidateAutomatic()
+        val manualGeneration = session.snapshot().generation
+        tasks.removeFirst().invoke()
+        val current = assertNotNull(session.snapshot().completion)
+        assertEquals(manualGeneration, current.generation)
+        assertIs<UpdateUiState.UpToDate>(session.snapshot().uiState)
+    }
+
+    @Test
+    fun joinedManualFlightSurvivesAutomaticFenceWithoutSecondHttpCall() {
+        val tasks = ArrayDeque<() -> Unit>()
+        val session = UpdateCheckSession(dispatch = { tasks += it }, checker = { UpdateCheckResult.UpToDate })
+
+        assertTrue(session.request(manual = false))
+        assertFalse(session.request(manual = true))
+        assertEquals(1, tasks.size)
+        session.invalidateAutomatic()
+        val currentGeneration = session.snapshot().generation
+        assertIs<UpdateUiState.Checking>(session.snapshot().uiState)
+        tasks.removeFirst().invoke()
+
+        assertEquals(currentGeneration, session.snapshot().completion?.generation)
+        assertIs<UpdateUiState.UpToDate>(session.snapshot().uiState)
+    }
+
+    @Test
+    fun automaticFenceCannotReviveManualFlightInvalidatedByReset() {
+        val tasks = ArrayDeque<() -> Unit>()
+        val session = UpdateCheckSession(dispatch = { tasks += it }, checker = { UpdateCheckResult.UpToDate })
+
+        assertTrue(session.request(manual = true))
+        session.reset()
+        session.invalidateAutomatic()
+        tasks.removeFirst().invoke()
+
+        assertEquals(UpdateUiState.Hidden, session.snapshot().uiState)
+        assertTrue(session.snapshot().completion!!.generation < session.snapshot().generation)
+    }
+
+    @Test
+    fun acknowledgedCompletionHistoryIsBoundedWithoutChangingSnapshotPresentation() {
+        val session = UpdateCheckSession(dispatch = { it() }, checker = { UpdateCheckResult.UpToDate })
+        repeat(3) { assertTrue(session.request(manual = false)) }
+        val latestToken = session.snapshot().completion!!.token
+        assertEquals(3, session.completionsAfter(0L).size)
+
+        session.acknowledgeCompletionsThrough(latestToken)
+
+        assertTrue(session.completionsAfter(0L).isEmpty())
+        assertEquals(UpdateUiState.Hidden, session.snapshot().uiState)
     }
 }

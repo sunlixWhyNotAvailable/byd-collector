@@ -3,6 +3,7 @@ package com.bydcollector.collector.system
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import com.bydcollector.collector.BydCollectorApplication
 
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
@@ -13,6 +14,9 @@ class BootReceiver : BroadcastReceiver() {
             action != ACTION_QUICKBOOT_POWERON
         ) {
             return
+        }
+        if (action == Intent.ACTION_BOOT_COMPLETED || action == ACTION_QUICKBOOT_POWERON) {
+            (context.applicationContext as BydCollectorApplication).updateRuntime.onSystemWake(action)
         }
         handoffAutoStartRecovery(
             receiver = this,
