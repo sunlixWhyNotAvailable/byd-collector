@@ -1102,7 +1102,7 @@ fun KpiTile(
             fontWeight = FontWeight.Normal,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.align(Alignment.TopStart).offset(y = (-6).dp)
+            modifier = Modifier.align(Alignment.TopStart).offset(y = (-4).dp)
         )
         Text(
             text = value,

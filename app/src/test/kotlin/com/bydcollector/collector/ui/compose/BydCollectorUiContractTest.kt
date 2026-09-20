@@ -40,7 +40,7 @@ class BydCollectorUiContractTest {
         assertTrue(tile.contains(".height(64.dp)"))
         assertTrue(tile.contains(".padding(start = 8.dp, end = 10.dp, top = 5.dp, bottom = 7.dp)"))
         assertTrue(tile.contains("fontSize = 11.sp"))
-        assertTrue(tile.contains("offset(y = (-6).dp)"))
+        assertTrue(tile.contains("offset(y = (-4).dp)"))
         assertTrue(tile.contains("fontSize = 18.sp"))
         assertTrue(tile.contains("fontWeight = FontWeight.SemiBold"))
         assertTrue(tile.contains("Modifier.align(Alignment.Center)"))
