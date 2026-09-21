@@ -76,7 +76,7 @@ class DirectBridgeManagerTest {
 
         assertTrue(text.contains("private val launchLock = ReentrantLock()"))
         assertTrue(ensure.contains("launchLock.lockInterruptibly()"))
-        assertTrue(ensure.indexOf("launchLock.lockInterruptibly()") < ensure.indexOf("if (helper.ownerMode() == ownerMode)"))
+        assertTrue(ensure.indexOf("launchLock.lockInterruptibly()") < ensure.indexOf("if (helper.isAlive())"))
         assertTrue(ensure.contains("launchLock.unlock()"))
     }
 }

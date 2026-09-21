@@ -34,7 +34,8 @@ internal object StorageCutoverRecovery {
         val unknownArchiveFiles: Boolean,
         val manual: Boolean = false,
         val activeDatabaseName: String = "",
-        val activeSidecarNames: Set<String> = emptySet()
+        val activeSidecarNames: Set<String> = emptySet(),
+        val sourceDatabaseName: String = ""
     )
 
     fun decide(snapshot: Snapshot): Action {
@@ -80,15 +81,17 @@ internal object StorageCutoverRecovery {
     }
 
     private fun decideManual(snapshot: Snapshot): Action {
-        val databaseName = databaseName(snapshot)
+        val sourceDatabaseName = snapshot.sourceDatabaseName.ifBlank { databaseName(snapshot) }
         val expected = snapshot.expectedSidecarNames
         val active = snapshot.activeSidecarNames
         val archived = snapshot.archivedSidecarNames
-        if (databaseName.isBlank() || databaseName !in expected || expected.isEmpty() ||
+        if (sourceDatabaseName.isBlank() || sourceDatabaseName !in expected || expected.isEmpty() ||
             snapshot.unknownArchiveFiles || archived.any { it !in expected }
         ) return Action.FAIL_CLOSED
 
-        if (archived.isEmpty() && active == expected && snapshot.activeDatabaseExists) {
+        if (snapshot.activeDatabaseName == sourceDatabaseName &&
+            archived.isEmpty() && active == expected && snapshot.activeDatabaseExists
+        ) {
             return Action.CLEAR_INTACT_SOURCE
         }
         if (archived == expected &&

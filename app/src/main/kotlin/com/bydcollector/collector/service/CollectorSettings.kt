@@ -821,13 +821,17 @@ class CollectorSettings(
         }.commit()
     }
 
-    fun storageCutoverJournal(): StorageCutoverJournal? {
+    fun storageCutoverJournal(): StorageCutoverJournal? = readStorageCutoverJournal(prefs)
+
+    private fun readStorageCutoverJournal(prefs: SharedPreferences): StorageCutoverJournal? {
         val journalKeys = listOf(
             KEY_STORAGE_CUTOVER_JOURNAL_FAMILY,
             KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH,
             KEY_STORAGE_CUTOVER_JOURNAL_PHASE,
             KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT,
-            KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_NAMES
+            KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_NAMES,
+            KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_DATABASE_NAME,
+            KEY_STORAGE_CUTOVER_JOURNAL_TARGET_DATABASE_NAME
         )
         if (runCatching { journalKeys.none(prefs::contains) }.getOrDefault(false)) return null
         fun journalString(key: String): String? = runCatching { prefs.getString(key, null) }.getOrNull()
@@ -848,7 +852,9 @@ class CollectorSettings(
                     .orEmpty()
                     .filter(String::isNotBlank)
                     .toSet()
-            }.getOrDefault(emptySet())
+            }.getOrDefault(emptySet()),
+            sourceDatabaseName = journalString(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_DATABASE_NAME).orEmpty(),
+            targetDatabaseName = journalString(KEY_STORAGE_CUTOVER_JOURNAL_TARGET_DATABASE_NAME).orEmpty()
         )
     }
 
@@ -859,6 +865,8 @@ class CollectorSettings(
             putString(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT, journal.sourceFormat.name)
             putBoolean(KEY_STORAGE_CUTOVER_JOURNAL_MANUAL, journal.manual)
             putStringSet(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_NAMES, journal.sourceNames.toSet())
+            putString(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_DATABASE_NAME, journal.sourceDatabaseName)
+            putString(KEY_STORAGE_CUTOVER_JOURNAL_TARGET_DATABASE_NAME, journal.targetDatabaseName)
             journal.archivePath?.let { putString(KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH, it) }
                 ?: remove(KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH)
         }.commit()
@@ -871,6 +879,8 @@ class CollectorSettings(
             .remove(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT)
             .remove(KEY_STORAGE_CUTOVER_JOURNAL_MANUAL)
             .remove(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_NAMES)
+            .remove(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_DATABASE_NAME)
+            .remove(KEY_STORAGE_CUTOVER_JOURNAL_TARGET_DATABASE_NAME)
             .commit()
 
     fun isCutoverArchiveStoragePending(): Boolean =
@@ -1264,6 +1274,8 @@ class CollectorSettings(
         const val KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT = "storageCutoverJournalSourceFormat"
         const val KEY_STORAGE_CUTOVER_JOURNAL_MANUAL = "storageCutoverJournalManual"
         const val KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_NAMES = "storageCutoverJournalSourceNames"
+        const val KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_DATABASE_NAME = "storageCutoverJournalSourceDatabaseName"
+        const val KEY_STORAGE_CUTOVER_JOURNAL_TARGET_DATABASE_NAME = "storageCutoverJournalTargetDatabaseName"
         const val KEY_STORAGE_CUTOVER_ARCHIVE_PENDING = "storageCutoverArchivePending"
         const val DB_MAINTENANCE_RECOVERY_GRACE_MS = 15_000L
         const val DEFAULT_ARCHIVE_STORAGE_LIMIT_GB = 2

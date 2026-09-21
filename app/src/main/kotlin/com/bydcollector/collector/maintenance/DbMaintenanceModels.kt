@@ -27,20 +27,20 @@ enum class DbMaintenanceOperation(
     DEBUG_ARCHIVE(
         key = "debug_archive",
         stepsUk = listOf(
-            "Зупиняємо round-robin збір",
-            "Закриваємо тестову базу даних",
-            "Переносимо тестову базу в архів",
-            "Створюємо нову тестову базу",
-            "Перевіряємо нову тестову базу",
-            "Відновлюємо round-robin збір"
+            "Зупиняємо вторинний збір",
+            "Закриваємо вторинну базу даних",
+            "Переносимо вторинну базу в архів",
+            "Створюємо нову вторинну базу",
+            "Перевіряємо нову вторинну базу",
+            "Відновлюємо вторинний збір"
         ),
         stepsEn = listOf(
-            "Stopping round-robin collection",
-            "Closing test database",
-            "Moving test database to archive",
-            "Creating new test database",
-            "Verifying new test database",
-            "Restoring round-robin collection"
+            "Stopping secondary collection",
+            "Closing secondary database",
+            "Moving secondary database to archive",
+            "Creating new secondary database",
+            "Verifying new secondary database",
+            "Restoring secondary collection"
         )
     );
 
@@ -107,5 +107,9 @@ data class StorageCutoverJournal(
     /** Manual archives tolerate inspection-only failures; old journals default to strict automatic recovery. */
     val manual: Boolean = false,
     /** Exact stable source set captured after SQLite owners are closed. */
-    val sourceNames: Set<String> = emptySet()
+    val sourceNames: Set<String> = emptySet(),
+    /** Exact active filename before the archive operation. */
+    val sourceDatabaseName: String = "",
+    /** Exact filename opened after the archive operation. */
+    val targetDatabaseName: String = sourceDatabaseName
 )

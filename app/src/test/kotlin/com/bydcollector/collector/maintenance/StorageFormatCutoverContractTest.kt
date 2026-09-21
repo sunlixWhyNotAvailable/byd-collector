@@ -60,10 +60,10 @@ class StorageFormatCutoverContractTest {
             "PHASE_CREATING",
             "createDatabase()",
             "PHASE_VERIFYING",
-            "quickCheck(databaseFile)"
+            "quickCheck(createdDatabaseFile)"
         )
         assertTrue(source.contains("cursor.moveToFirst() && cursor.getInt(0) == 0"))
-        assertTrue(rollback.contains("deleteExactDatabaseSet(databaseFile)"))
+        assertTrue(rollback.contains("deleteExactDatabaseSet(createdDatabaseFile)"))
         assertTrue(rollback.contains("DatabaseArchiveManager.restore(databaseFile, movedFiles)"))
         assertInOrder(rollback, "legacyFormat(family, databaseFile)", "quickCheck(databaseFile)", "clearStorageCutoverJournal()")
         assertTrue(source.contains("DatabaseArchiveManager.sidecarFiles(expected).forEach"))
@@ -74,8 +74,8 @@ class StorageFormatCutoverContractTest {
         val source = source("com/bydcollector/collector/maintenance/StorageFormatCutover.kt")
         val ensureLegacy = source.substringAfter("private fun ensureLegacyMain").substringBefore("private fun deferMain")
         val recovery = source.substringAfter("private fun recoverInterruptedCutover").substringBefore("private fun createMainDatabase")
-        val intactSource = recovery.substringAfter("if (activeFormat == journal.sourceFormat && archivedFiles.isEmpty())")
-            .substringBefore("if (journal.phase == PHASE_ROLLBACK")
+        val intactSource = recovery.substringAfter("recoveryAction == StorageCutoverRecovery.Action.CLEAR_INTACT_SOURCE")
+            .substringBefore("// A partial rollback")
 
         assertInOrder(
             ensureLegacy,
@@ -85,7 +85,7 @@ class StorageFormatCutoverContractTest {
         )
         assertInOrder(
             intactSource,
-            "quickCheck(databaseFile)",
+            "quickCheck(activeDatabaseFile)",
             "clearStorageCutoverJournal()"
         )
         assertFalse(intactSource.contains("deleteExactDatabaseSet(databaseFile)"))
@@ -109,12 +109,17 @@ class StorageFormatCutoverContractTest {
         assertTrue(maintenance.contains("manual = true"))
         assertTrue(maintenance.contains("sourceNames = sourceNames"))
         assertTrue(recovery.contains("val expectedNames = if (journal.manual) journal.sourceNames else allowedNames"))
-        assertTrue(recovery.contains("activeSourceFileSetIntact(databaseFile, expectedNames)"))
+        assertTrue(recovery.contains("activeSourceFileSetIntact(sourceDatabaseFile, expectedNames)"))
         assertTrue(recovery.contains("archivedFormatMatches(family, archivedDatabase, journal.sourceFormat)"))
-        assertTrue(recovery.contains("formatMatches(family, databaseFile, journal.sourceFormat)"))
+        assertTrue(recovery.contains("formatMatches(family, sourceDatabaseFile, journal.sourceFormat)"))
         assertTrue(recovery.contains("journal.manual"))
         assertTrue(recovery.contains("!journal.manual && (!archivedFormatMatches"))
-        assertTrue(recovery.contains("!quickCheck(databaseFile)"))
+        assertTrue(recovery.contains("!quickCheck(activeDatabaseFile)"))
+        assertTrue(recovery.contains("sourceDatabaseName = sourceDatabaseFile.name"))
+        assertTrue(recovery.contains("journal.sourceDatabaseName !in allowedDatabaseNames"))
+        assertTrue(recovery.contains("journal.targetDatabaseName !in allowedDatabaseNames"))
+        assertTrue(settings.contains("KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_DATABASE_NAME"))
+        assertTrue(settings.contains("KEY_STORAGE_CUTOVER_JOURNAL_TARGET_DATABASE_NAME"))
         assertTrue(settings.contains("KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT"))
         assertTrue(settings.contains("KEY_STORAGE_CUTOVER_JOURNAL_MANUAL"))
         assertTrue(settings.contains("KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_NAMES"))
@@ -144,7 +149,7 @@ class StorageFormatCutoverContractTest {
             "if (journal.phase == PHASE_ROLLBACK) return false",
             "recoveryAction != StorageCutoverRecovery.Action.RESTORE_ARCHIVE",
             "deleteActive = { file ->",
-            "deleteExactDatabaseSet(file)",
+            "deleteExactDatabaseSet(targetDatabaseFile)",
             "restore = { file, moved -> DatabaseArchiveManager.restore(file, moved) }"
         )
     }

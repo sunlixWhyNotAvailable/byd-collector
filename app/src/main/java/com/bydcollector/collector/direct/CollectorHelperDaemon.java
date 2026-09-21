@@ -100,6 +100,7 @@ public final class CollectorHelperDaemon {
     ) throws Exception {
         prepareMainLooper();
         final List<Address> mainRows = loadMainRows();
+        final List<Address> secondaryRows = loadSecondaryRows(apkPath);
         final Set<Address> whitelist = loadWhitelist(apkPath, mainRows);
         Class<?> serviceManager = Class.forName("android.os.ServiceManager");
         Method getService = serviceManager.getMethod("getService", String.class);
@@ -112,6 +113,11 @@ public final class CollectorHelperDaemon {
         String descriptor = autoservice.getInterfaceDescriptor();
         final String autoserviceDescriptor = descriptor == null ? "" : descriptor;
         final NativeArrayReader nativeReader = NativeArrayReader.create();
+        final SecondarySpoolBinder secondarySpoolBinder = new SecondarySpoolBinder();
+        resources.secondarySpoolBinder = secondarySpoolBinder;
+        if (secondarySpoolBinder.openError() != null) {
+            helperDiagnostics.error("secondary spool unavailable: " + secondarySpoolBinder.openError());
+        }
         TelemetryWorkerSpool openedSpool = null;
         String openedSpoolError = null;
         try {
@@ -123,11 +129,6 @@ public final class CollectorHelperDaemon {
         final TelemetryWorkerSpool workerSpool = openedSpool;
         resources.workerSpool = workerSpool;
         final String workerSpoolError = openedSpoolError;
-        if (spoolMode && workerSpool == null) {
-            System.err.println("ERR: app-gap spool unavailable: " + workerSpoolError);
-            helperDiagnostics.error("app-gap spool unavailable: " + workerSpoolError);
-            return 4;
-        }
         if (workerSpool != null) {
             try {
                 TelemetryWorkerSpool.Footprint initialFootprint = workerSpool.observe();
@@ -142,6 +143,7 @@ public final class CollectorHelperDaemon {
         final Object readLock = new Object();
         final Handler mainHandler = new Handler(Looper.myLooper());
         final String mainCatalogVersion = loadMainCatalogVersion();
+        final String secondaryCatalogVersion = loadSecondaryCatalogVersion();
         final String legacyWorkerCatalogVersion = loadLegacyWorkerCatalogVersion();
         final List<Address> legacyWorkerRows = mainCatalogVersion.equals(legacyWorkerCatalogVersion)
             ? mainRows
@@ -155,33 +157,33 @@ public final class CollectorHelperDaemon {
                 legacyWorkerCatalogVersion,
                 legacyWorkerRows
             );
-        final WorkerPollLoop workerPollLoop = spoolMode
-            ? new WorkerPollLoop(
-                mainHandler,
-                mainRows,
-                mainCatalogVersion,
-                helperBootId,
-                helperGeneration,
-                workerSpool,
-                readLock,
-                address -> scalarRead(autoservice, autoserviceDescriptor, address),
-                nativeReader,
-                new HelperWakeLockController(
-                    SystemClock::elapsedRealtime,
-                    HelperWakeLockPlatform::acquireShellPartialWakeLock,
-                    message -> {
-                        WorkerPollLoop.log(message);
-                        if (message.startsWith("WARN:") || message.startsWith("ERR:")) {
-                            helperDiagnostics.error("wake_lock: " + message);
-                        } else {
-                            helperDiagnostics.context("wake_lock", message);
-                        }
+        final HelperDualStreamRuntime runtime = new HelperDualStreamRuntime(
+            mainHandler,
+            mainRows,
+            secondaryRows,
+            mainCatalogVersion,
+            secondaryCatalogVersion,
+            helperBootId,
+            helperGeneration,
+            workerSpool,
+            secondarySpoolBinder.spool(),
+            address -> scalarRead(autoservice, autoserviceDescriptor, address),
+            nativeReader,
+            new HelperWakeLockController(
+                SystemClock::elapsedRealtime,
+                HelperWakeLockPlatform::acquireShellPartialWakeLock,
+                message -> {
+                    log(message);
+                    if (message.startsWith("WARN:") || message.startsWith("ERR:")) {
+                        helperDiagnostics.error("wake_lock: " + message);
+                    } else {
+                        helperDiagnostics.context("wake_lock", message);
                     }
-                ),
-                helperDiagnostics
-            )
-            : null;
-        resources.workerPollLoop = workerPollLoop;
+                }
+            ),
+            helperDiagnostics
+        );
+        resources.runtime = runtime;
         Binder helperBinder = new Binder() {
             @Override
             protected boolean onTransact(int code, Parcel data, Parcel reply, int flags) throws RemoteException {
@@ -190,8 +192,56 @@ public final class CollectorHelperDaemon {
                     return false;
                 }
                 data.enforceInterface(CollectorHelperProtocol.DESCRIPTOR);
+                if (code == CollectorHelperProtocol.TX_STREAM_CONTROL) {
+                    HelperStreamRuntimeState.ControlResult result;
+                    try {
+                        result = runtime.control(
+                            data.readInt(), data.readString(), data.readLong(), data.readInt(),
+                            data.readLong(), data.readInt());
+                    } catch (Throwable error) {
+                        HelperStreamRuntimeState.ControlResult snapshot = runtime.control(
+                            -1, null, 0L, 0, 0L, 0);
+                        result = new HelperStreamRuntimeState.ControlResult(
+                            CollectorHelperProtocol.STATUS_INVALID_REQUEST,
+                            snapshot.controllerToken, snapshot.mainEpoch, snapshot.secondaryEpoch,
+                            0L, describe(error));
+                    }
+                    if (reply != null) writeControlReply(reply, result);
+                    return true;
+                }
+                if (code == CollectorHelperProtocol.TX_SECONDARY_READ_BATCH) {
+                    BatchResult result;
+                    try {
+                        result = runtime.readSecondary(data.readLong(), data.readLong(), data.readString());
+                    } catch (Throwable error) {
+                        result = BatchResult.rejected(secondaryRows.size(), describe(error));
+                    }
+                    if (reply != null) writeSecondaryBatchReply(reply, secondaryCatalogVersion, result);
+                    return true;
+                }
+                if (code == CollectorHelperProtocol.TX_SECONDARY_STATUS) {
+                    secondarySpoolBinder.writeStatus(
+                        reply, runtime.barrierPending(CollectorHelperProtocol.STREAM_SECONDARY));
+                    return true;
+                }
+                if (
+                    code == CollectorHelperProtocol.TX_SECONDARY_PENDING_PAGE ||
+                    code == CollectorHelperProtocol.TX_SECONDARY_ACK ||
+                    code == CollectorHelperProtocol.TX_SECONDARY_QUARANTINE
+                ) {
+                    if (!runtime.replayAllowed(CollectorHelperProtocol.STREAM_SECONDARY)) {
+                        SecondarySpoolBinder.writeUnavailable(
+                            code, reply, CollectorHelperProtocol.STATUS_LEASE_EXPIRED, "secondary stream stopped or lease expired");
+                        return true;
+                    }
+                    if (runtime.barrierPending(CollectorHelperProtocol.STREAM_SECONDARY)) {
+                        SecondarySpoolBinder.writeUnavailable(
+                            code, reply, CollectorHelperProtocol.STATUS_REPLAY_PENDING, "secondary persistence pending");
+                        return true;
+                    }
+                    return secondarySpoolBinder.onTransact(code, data, reply);
+                }
                 if (code == CollectorHelperProtocol.TX_PING) {
-                    if (workerPollLoop != null) workerPollLoop.markConsumerHeartbeat();
                     if (reply != null) {
                         reply.writeInt(CollectorHelperProtocol.STATUS_OK);
                         reply.writeInt(CollectorHelperProtocol.PROTOCOL_VERSION);
@@ -206,7 +256,6 @@ public final class CollectorHelperDaemon {
                     return true;
                 }
                 if (code == CollectorHelperProtocol.TX_READ) {
-                    if (workerPollLoop != null) workerPollLoop.markConsumerHeartbeat();
                     int tx = data.readInt();
                     int dev = data.readInt();
                     int fid = data.readInt();
@@ -217,9 +266,7 @@ public final class CollectorHelperDaemon {
                     } else if (!whitelist.contains(address)) {
                         result = ReadValue.error(CollectorHelperProtocol.STATUS_NOT_WHITELISTED, "address is not whitelisted");
                     } else {
-                        synchronized (readLock) {
-                            result = scalarRead(autoservice, autoserviceDescriptor, address);
-                        }
+                        result = runtime.readDiagnostic(address);
                     }
                     if (reply != null) {
                         int status = result.status == CollectorHelperProtocol.STATUS_OK && result.raw == null
@@ -228,37 +275,19 @@ public final class CollectorHelperDaemon {
                         reply.writeInt(status);
                         reply.writeInt(result.raw == null ? 0 : result.raw);
                     }
-                    if (workerPollLoop != null) workerPollLoop.markConsumerHeartbeat();
                     return true;
                 }
                 if (code == CollectorHelperProtocol.TX_READ_BATCH) {
                     BatchResult result;
                     try {
+                        long controllerToken = data.readLong();
+                        long mainEpoch = data.readLong();
                         List<Address> rows = readBatchRequest(data);
                         String validationError = validateRows(rows, whitelist);
                         if (validationError != null) {
                             result = BatchResult.rejected(rows.size(), validationError);
                         } else {
-                            synchronized (readLock) {
-                                if (workerPollLoop != null) workerPollLoop.markConsumerHeartbeat();
-                                if (
-                                    workerSpool != null &&
-                                    workerPollLoop != null &&
-                                    !workerSpool.pending(1, replaySampleValidator).isEmpty()
-                                ) {
-                                    result = BatchResult.replayPending(
-                                        rows.size(),
-                                        "app-gap spool pending; replay before live read"
-                                    );
-                                } else {
-                                    result = BatchEngine.run(
-                                        rows,
-                                        address -> scalarRead(autoservice, autoserviceDescriptor, address),
-                                        nativeReader
-                                    );
-                                }
-                                if (workerPollLoop != null) workerPollLoop.markConsumerHeartbeat();
-                            }
+                            result = runtime.readMain(controllerToken, mainEpoch, rows);
                         }
                     } catch (Throwable error) {
                         result = BatchResult.rejected(0, describe(error));
@@ -267,9 +296,16 @@ public final class CollectorHelperDaemon {
                     return true;
                 }
                 if (code == CollectorHelperProtocol.TX_WORKER_PENDING) {
-                    if (workerPollLoop != null) workerPollLoop.markConsumerHeartbeat();
                     if (reply != null) {
-                        if (workerSpool == null) {
+                        if (!runtime.replayAllowed(CollectorHelperProtocol.STREAM_MAIN)) {
+                            writeWorkerPendingReply(
+                                reply, CollectorHelperProtocol.STATUS_LEASE_EXPIRED,
+                                "main stream stopped or lease expired", Collections.<TelemetryWorkerSpool.Sample>emptyList());
+                        } else if (runtime.barrierPending(CollectorHelperProtocol.STREAM_MAIN)) {
+                            writeWorkerPendingReply(
+                                reply, CollectorHelperProtocol.STATUS_REPLAY_PENDING,
+                                "main persistence pending", Collections.<TelemetryWorkerSpool.Sample>emptyList());
+                        } else if (workerSpool == null) {
                             writeWorkerPendingReply(
                                 reply,
                                 CollectorHelperProtocol.STATUS_SPOOL_UNAVAILABLE,
@@ -305,13 +341,18 @@ public final class CollectorHelperDaemon {
                             }
                         }
                     }
-                    if (workerPollLoop != null) workerPollLoop.markConsumerHeartbeat();
                     return true;
                 }
                 if (code == CollectorHelperProtocol.TX_WORKER_ACK) {
-                    if (workerPollLoop != null) workerPollLoop.markConsumerHeartbeat();
                     if (reply != null) {
-                        if (workerSpool == null) {
+                        if (!runtime.replayAllowed(CollectorHelperProtocol.STREAM_MAIN)) {
+                            writeWorkerAckReply(
+                                reply, CollectorHelperProtocol.STATUS_LEASE_EXPIRED, 0,
+                                "main stream stopped or lease expired");
+                        } else if (runtime.barrierPending(CollectorHelperProtocol.STREAM_MAIN)) {
+                            writeWorkerAckReply(
+                                reply, CollectorHelperProtocol.STATUS_REPLAY_PENDING, 0, "main persistence pending");
+                        } else if (workerSpool == null) {
                             recordFailedAck(helperDiagnostics, workerSpoolError);
                             writeWorkerAckReply(
                                 reply,
@@ -356,7 +397,6 @@ public final class CollectorHelperDaemon {
                             }
                         }
                     }
-                    if (workerPollLoop != null) workerPollLoop.markConsumerHeartbeat();
                     return true;
                 }
                 if (code == CollectorHelperProtocol.TX_STOP_OWNER) {
@@ -377,7 +417,6 @@ public final class CollectorHelperDaemon {
                     if (accepted) {
                         //allows the synchronous Binder reply to leave the shell process before its main looper exits
                         mainHandler.postDelayed(() -> {
-                            if (workerPollLoop != null) workerPollLoop.stop();
                             mainHandler.getLooper().quitSafely();
                         }, 100L);
                     }
@@ -387,7 +426,7 @@ public final class CollectorHelperDaemon {
             }
         };
         helperBinder.attachInterface(null, CollectorHelperProtocol.DESCRIPTOR);
-        if (workerPollLoop != null) workerPollLoop.startAutonomousMode();
+        runtime.start();
         Method addService = serviceManager.getMethod("addService", String.class, IBinder.class);
         addService.invoke(null, CollectorHelperProtocol.SERVICE_NAME, helperBinder);
         System.out.println(
@@ -402,7 +441,6 @@ public final class CollectorHelperDaemon {
         );
         System.out.flush();
         helperDiagnostics.context("helper_ready", "spool_mode=" + spoolMode);
-        if (workerPollLoop != null) workerPollLoop.start();
         Looper.loop();
         // ActivityThread/Binder threads may outlive main; process death is the final
         // fallback that releases a lock whose explicit teardown persistently failed.
@@ -451,6 +489,11 @@ public final class CollectorHelperDaemon {
         }
     }
 
+    static void log(String message) {
+        System.err.println(message);
+        System.err.flush();
+    }
+
     private static List<Address> readBatchRequest(Parcel data) {
         int count = data.readInt();
         if (count < 1 || count > CollectorHelperProtocol.MAX_BATCH_SIZE) {
@@ -491,6 +534,49 @@ public final class CollectorHelperDaemon {
             reply.writeInt(value.raw == null ? 0 : 1);
             if (value.raw != null) reply.writeInt(value.raw);
         }
+    }
+
+    private static void writeControlReply(Parcel reply, HelperStreamRuntimeState.ControlResult result) {
+        reply.writeInt(result.status);
+        reply.writeLong(result.controllerToken);
+        reply.writeLong(result.mainEpoch);
+        reply.writeLong(result.secondaryEpoch);
+        reply.writeLong(result.leaseExpiresElapsedMs);
+        reply.writeString(boundError(result.error));
+    }
+
+    private static void writeSecondaryBatchReply(Parcel reply, String catalogVersion, BatchResult result) {
+        int count = result.batchStatus == CollectorHelperProtocol.STATUS_OK ? result.values.length : 0;
+        int[] statuses = new int[count];
+        byte[] rawPresent = new byte[(count + 7) / 8];
+        int[] raws = new int[count];
+        for (int index = 0; index < count; index++) {
+            ReadValue value = result.values[index];
+            statuses[index] = value.status;
+            if (value.raw != null) {
+                rawPresent[index >>> 3] = (byte) (rawPresent[index >>> 3] | (1 << (index & 7)));
+                raws[index] = value.raw;
+            }
+        }
+        reply.writeInt(result.batchStatus);
+        reply.writeInt(result.mode);
+        reply.writeInt(result.nativeAvailable ? 1 : 0);
+        reply.writeInt(result.nativeGroupCount);
+        reply.writeInt(result.fallbackGroupCount);
+        reply.writeInt(result.fallbackReadCount);
+        reply.writeInt(result.groupFailureCount);
+        reply.writeLong(result.elapsedMs);
+        reply.writeInt(count);
+        reply.writeString(boundError(result.error));
+        reply.writeString(catalogVersion);
+        reply.writeIntArray(statuses);
+        reply.writeByteArray(rawPresent);
+        reply.writeIntArray(raws);
+    }
+
+    private static String boundError(String error) {
+        if (error == null || error.length() <= 512) return error;
+        return error.substring(0, 512);
     }
 
     private static void writeWorkerPendingReply(
@@ -562,6 +648,64 @@ public final class CollectorHelperDaemon {
         }
         if (rows.isEmpty()) throw new IllegalStateException("empty main telemetry catalog");
         return Collections.unmodifiableList(rows);
+    }
+
+    static List<Address> loadSecondaryRows(String apkPath) throws Exception {
+        List<Address> rows = new ArrayList<Address>(SecondaryTelemetrySpool.EXPECTED_FIELD_COUNT);
+        try (ZipFile apk = new ZipFile(apkPath)) {
+            String[] assetNames = {
+                "assets/direct_debug_round_robin_parameters_1.csv",
+                "assets/direct_debug_round_robin_parameters_2.csv",
+                "assets/direct_debug_round_robin_parameters_3.csv"
+            };
+            int[] expectedSizes = { 7_692, 7_693, 7_698 };
+            List<String> expectedHeader = java.util.Arrays.asList(
+                "key", "feature_group", "dev", "fid", "tx",
+                "feature_names", "feature_refs", "candidate_source");
+            for (int shardIndex = 0; shardIndex < assetNames.length; shardIndex++) {
+                String assetName = assetNames[shardIndex];
+                ZipEntry asset = apk.getEntry(assetName);
+                if (asset == null) throw new IllegalStateException("secondary catalog asset missing: " + assetName);
+                try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(apk.getInputStream(asset), StandardCharsets.UTF_8)
+                )) {
+                    List<String> header = splitCsvLine(reader.readLine());
+                    if (!expectedHeader.equals(header)) {
+                        throw new IllegalArgumentException("unexpected secondary catalog header");
+                    }
+                    int devIndex = header.indexOf("dev");
+                    int fidIndex = header.indexOf("fid");
+                    int txIndex = header.indexOf("tx");
+                    int shardStart = rows.size();
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        if (line.trim().isEmpty()) continue;
+                        List<String> columns = splitCsvLine(line);
+                        int tx = Integer.parseInt(columns.get(txIndex));
+                        if (!isAllowedTx(tx)) throw new IllegalArgumentException("unsupported secondary catalog tx: " + tx);
+                        rows.add(new Address(
+                            tx,
+                            Integer.parseInt(columns.get(devIndex)),
+                            Integer.parseInt(columns.get(fidIndex))
+                        ));
+                    }
+                    int shardSize = rows.size() - shardStart;
+                    if (shardSize != expectedSizes[shardIndex]) {
+                        throw new IllegalStateException(
+                            "unexpected secondary catalog shard size: " + assetName + "=" + shardSize);
+                    }
+                }
+            }
+        }
+        if (rows.size() != SecondaryTelemetrySpool.EXPECTED_FIELD_COUNT) {
+            throw new IllegalStateException("unexpected secondary catalog size: " + rows.size());
+        }
+        return Collections.unmodifiableList(rows);
+    }
+
+    private static String loadSecondaryCatalogVersion() throws Exception {
+        Class<?> assetClass = Class.forName("com.bydcollector.collector.data.debug.DirectDebugParameterAsset");
+        return (String) assetClass.getField("SOURCE_VERSION").get(null);
     }
 
     private static String loadMainCatalogVersion() throws Exception {
@@ -775,189 +919,6 @@ public final class CollectorHelperDaemon {
             ) {
                 throw new IllegalArgumentException("worker field mismatch at index=" + index);
             }
-        }
-    }
-
-    static final class WorkerPollLoop implements Runnable {
-        static final long FALLBACK_INTERVAL_MS = 500L;
-        static final long CONSUMER_LEASE_MS = 2_000L;
-
-        private final Handler handler;
-        private final List<Address> rows;
-        private final String catalogVersion;
-        private final String bootId;
-        private final String helperGeneration;
-        private final TelemetryWorkerSpool spool;
-        private final Object readLock;
-        private final ScalarReader scalarReader;
-        private final NativeReader nativeReader;
-        private final ConsumerLease consumerLease;
-        private final HelperWakeLockController wakeLockController;
-        private final HelperDiagnostics diagnostics;
-        private long sequence;
-        private boolean stopped;
-        private String lastError;
-
-        WorkerPollLoop(
-            Handler handler,
-            List<Address> rows,
-            String catalogVersion,
-            String bootId,
-            String helperGeneration,
-            TelemetryWorkerSpool spool,
-            Object readLock,
-            ScalarReader scalarReader,
-            NativeReader nativeReader,
-            HelperWakeLockController wakeLockController,
-            HelperDiagnostics diagnostics
-        ) {
-            this.handler = handler;
-            this.rows = rows;
-            this.catalogVersion = catalogVersion;
-            this.bootId = bootId;
-            this.helperGeneration = helperGeneration;
-            this.spool = spool;
-            this.readLock = readLock;
-            this.scalarReader = scalarReader;
-            this.nativeReader = nativeReader;
-            this.wakeLockController = wakeLockController;
-            this.diagnostics = diagnostics;
-            this.consumerLease = new ConsumerLease(
-                SystemClock.elapsedRealtime(),
-                CONSUMER_LEASE_MS
-            );
-        }
-
-        void start() {
-            handler.post(this);
-        }
-
-        void startAutonomousMode() {
-            wakeLockController.enterAutonomousMode();
-            diagnostics.context("helper_owner", "app_gap_spool");
-        }
-
-        void stop() {
-            stopped = true;
-            handler.removeCallbacks(this);
-            wakeLockController.exitAutonomousMode();
-        }
-
-        void markConsumerHeartbeat() {
-            long now = SystemClock.elapsedRealtime();
-            boolean wakeFallback;
-            synchronized (readLock) {
-                wakeFallback = !consumerLease.isActive(now);
-                if (consumerLease.renew(now)) {
-                    log("INFO: app consumer lease restored");
-                    diagnostics.mode("app");
-                    lastError = null;
-                }
-            }
-            if (wakeFallback) {
-                //wake a fallback loop immediately; repeated active heartbeats do not repost work
-                handler.removeCallbacks(this);
-                if (!stopped) handler.post(this);
-            }
-        }
-
-        @Override public void run() {
-            if (stopped) return;
-            long cycleStartedAt = SystemClock.elapsedRealtime();
-            wakeLockController.maintain();
-            try {
-                synchronized (readLock) {
-                    long now = SystemClock.elapsedRealtime();
-                    if (!consumerLease.isActive(now)) {
-                        if (consumerLease.beginFallback(now)) {
-                            log("INFO: app consumer lease expired; fallback spool started");
-                            diagnostics.mode("autonomous");
-                        }
-                        if (!spool.canAppend()) {
-                            diagnostics.capSkippedPollCycle();
-                            recordError("app-gap spool cap reached");
-                        } else {
-                            long capturedWallMs = System.currentTimeMillis();
-                            long capturedElapsedMs = SystemClock.elapsedRealtime();
-                            long pollSequence = sequence++;
-                            BatchResult result = BatchEngine.run(rows, scalarReader, nativeReader);
-                            //the read lock also serializes lease renewal, so a restored APP cannot
-                            //race this append and leave a sample after the lease becomes active
-                            if (!consumerLease.isActive(SystemClock.elapsedRealtime())) {
-                                TelemetryWorkerSpool.AppendResult appendResult = spool.append(workerSample(
-                                    new TelemetryWorkerSampleIdentity(bootId, helperGeneration, pollSequence),
-                                    catalogVersion,
-                                    capturedWallMs,
-                                    capturedElapsedMs,
-                                    rows,
-                                    result
-                                ));
-                                if (appendResult != TelemetryWorkerSpool.AppendResult.SUCCESS) {
-                                    recordError(
-                                        appendResult == TelemetryWorkerSpool.AppendResult.DUPLICATE
-                                            ? "app-gap spool append rejected (duplicate)"
-                                            : "app-gap spool append rejected (cap)"
-                                    );
-                                } else {
-                                    lastError = null;
-                                }
-                            }
-                        }
-                    }
-                }
-            } catch (Throwable error) {
-                recordError("app-gap spool poll failed: " + describe(error));
-            }
-            scheduleNext(cycleStartedAt);
-        }
-
-        private void scheduleNext(long cycleStartedAt) {
-            if (!stopped) {
-                long delayMs = Math.max(0L, FALLBACK_INTERVAL_MS - (SystemClock.elapsedRealtime() - cycleStartedAt));
-                handler.postDelayed(this, delayMs);
-            }
-        }
-
-        private void recordError(String message) {
-            diagnostics.error(message);
-            if (!message.equals(lastError)) {
-                log("WARN: " + message);
-                lastError = message;
-            }
-        }
-
-        static void log(String message) {
-            System.err.println(message);
-            System.err.flush();
-        }
-    }
-
-    static final class ConsumerLease {
-        private final long durationMs;
-        private long expiresAtMs;
-        private boolean fallbackActive;
-
-        ConsumerLease(long startedAtMs, long durationMs) {
-            if (durationMs < 1L) throw new IllegalArgumentException("lease duration must be positive");
-            this.durationMs = durationMs;
-            this.expiresAtMs = startedAtMs + durationMs;
-        }
-
-        synchronized boolean isActive(long nowMs) {
-            return nowMs < expiresAtMs;
-        }
-
-        synchronized boolean renew(long nowMs) {
-            boolean restored = fallbackActive;
-            fallbackActive = false;
-            expiresAtMs = nowMs + durationMs;
-            return restored;
-        }
-
-        synchronized boolean beginFallback(long nowMs) {
-            if (isActive(nowMs) || fallbackActive) return false;
-            fallbackActive = true;
-            return true;
         }
     }
 
@@ -1318,7 +1279,8 @@ public final class CollectorHelperDaemon {
         private final OwnerLock ownerLock;
         private final HelperDiagnostics diagnostics;
         private TelemetryWorkerSpool workerSpool;
-        private WorkerPollLoop workerPollLoop;
+        private SecondarySpoolBinder secondarySpoolBinder;
+        private HelperDualStreamRuntime runtime;
         private boolean closed;
 
         HelperResources(OwnerLock ownerLock, HelperDiagnostics diagnostics) {
@@ -1330,14 +1292,19 @@ public final class CollectorHelperDaemon {
             if (closed) return;
             closed = true;
             try {
-                if (workerPollLoop != null) workerPollLoop.stop();
+                if (runtime != null) runtime.close();
             } catch (Throwable error) {
-                recordDiagnosticError(diagnostics, "helper worker teardown failed: " + describe(error));
+                recordDiagnosticError(diagnostics, "helper runtime teardown failed: " + describe(error));
             }
             try {
                 if (workerSpool != null) workerSpool.close();
             } catch (Throwable error) {
                 recordDiagnosticError(diagnostics, "helper spool teardown failed: " + describe(error));
+            }
+            try {
+                if (secondarySpoolBinder != null) secondarySpoolBinder.close();
+            } catch (Throwable error) {
+                recordDiagnosticError(diagnostics, "secondary spool teardown failed: " + describe(error));
             }
             try {
                 ownerLock.close();

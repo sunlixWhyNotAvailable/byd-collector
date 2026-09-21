@@ -319,14 +319,14 @@ class HelperDiagnosticsTest {
     @Test
     fun reporterSourceHasNoSpoolScanOrSynchronousTelemetryWrite() {
         val source = sourceFile("HelperDiagnostics.java").readText()
-        val loop = sourceFile("CollectorHelperDaemon.java").readText()
+        val loop = sourceFile("HelperDualStreamRuntime.java").readText()
         assertTrue(!source.contains("listFiles("))
         assertTrue(source.contains("ArrayBlockingQueue"))
         assertTrue(source.contains("queue.offer"))
-        assertTrue(loop.contains("FALLBACK_INTERVAL_MS = 500L"))
-        assertTrue(loop.contains("spool.canAppend()"))
-        val cappedBranch = loop.substringAfter("if (!spool.canAppend())")
-            .substringBefore("} else {")
+        assertTrue(loop.contains("POLL_INTERVAL_MS = 500L"))
+        assertTrue(loop.contains("mainSpool.canAppend()"))
+        val cappedBranch = loop.substringAfter("if (!mainSpool.canAppend())")
+            .substringBefore("return;")
         assertTrue(cappedBranch.contains("diagnostics.capSkippedPollCycle()"))
     }
 
@@ -349,9 +349,9 @@ class HelperDiagnosticsTest {
         assertTrue(body.contains("prepareMainLooper();"))
         assertTrue(body.contains("loadWhitelist(apkPath, mainRows)"))
         assertTrue(body.contains("resources.workerSpool = workerSpool"))
-        assertTrue(body.contains("resources.workerPollLoop = workerPollLoop"))
+        assertTrue(body.contains("resources.runtime = runtime"))
         assertTrue(!body.contains("System.exit("))
-        assertTrue(resources.indexOf("workerPollLoop.stop()") < resources.indexOf("workerSpool.close()"))
+        assertTrue(resources.indexOf("runtime.close()") < resources.indexOf("workerSpool.close()"))
         assertTrue(resources.indexOf("workerSpool.close()") < resources.indexOf("ownerLock.close()"))
     }
 

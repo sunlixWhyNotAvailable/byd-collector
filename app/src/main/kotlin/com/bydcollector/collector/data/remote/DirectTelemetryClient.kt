@@ -5,8 +5,10 @@ import com.bydcollector.collector.adb.AdbLocalClient
 import com.bydcollector.collector.data.direct.DirectAutoserviceReader
 import com.bydcollector.collector.data.direct.DirectAutoserviceSnapshot
 import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
+import com.bydcollector.collector.data.direct.DirectStreamController
 import com.bydcollector.collector.data.direct.DirectVehicleHelper
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
+import com.bydcollector.collector.direct.CollectorHelperProtocol
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import java.io.File
@@ -17,7 +19,11 @@ class DirectTelemetryClient(
     private val adbClient: AdbLocalClient = AdbLocalClient(File(context.filesDir, "adb_keys")),
     private val helper: DirectVehicleHelper = DirectVehicleHelperClient(),
     private val reader: DirectAutoserviceReader = DirectAutoserviceReader(helper),
-    private val expectedOwnerMode: DirectHelperOwnerMode = DirectHelperOwnerMode.APP
+    private val expectedOwnerMode: DirectHelperOwnerMode = DirectHelperOwnerMode.APP,
+    private val ensureStreamReady: () -> Boolean = {
+        helper !is DirectVehicleHelperClient ||
+            DirectStreamController.ensureReady(CollectorHelperProtocol.STREAM_MAIN)
+    }
 ) : TelemetryClient {
     private val appContext = context.applicationContext
     @Volatile private var nextLaunchAttemptAtMs: Long = 0
@@ -40,7 +46,7 @@ class DirectTelemetryClient(
         startedAt: Long,
         ownerMode: DirectHelperOwnerMode
     ): TelemetryReadResult.Failure? {
-        if (helper.ownerMode() != ownerMode) {
+        if (!helper.isAlive()) {
             val now = clock.elapsedRealtimeMs()
             //backs off helper launch failures because adb/app_process startup can block for seconds
             if (now < nextLaunchAttemptAtMs) {
@@ -56,17 +62,20 @@ class DirectTelemetryClient(
                 nextLaunchAttemptAtMs = clock.elapsedRealtimeMs() + LAUNCH_FAILURE_BACKOFF_MS
                 return launchFailure(launch, startedAt)
             }
-            if (!waitForHelper(ownerMode)) {
+            if (!waitForHelper()) {
                 nextLaunchAttemptAtMs = clock.elapsedRealtimeMs() + LAUNCH_FAILURE_BACKOFF_MS
                 return failure("helper_unavailable", "Direct helper did not answer Binder ping", startedAt)
             }
         }
+        if (!ensureStreamReady()) {
+            return failure("helper_stream_control_failed", "Direct helper stream claim/reconcile failed", startedAt)
+        }
         return null
     }
 
-    private fun waitForHelper(ownerMode: DirectHelperOwnerMode): Boolean {
+    private fun waitForHelper(): Boolean {
         repeat(10) {
-            if (helper.ownerMode() == ownerMode) return true
+            if (helper.isAlive()) return true
             Thread.sleep(250)
         }
         return false

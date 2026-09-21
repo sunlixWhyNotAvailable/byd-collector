@@ -24,10 +24,13 @@ import com.bydcollector.collector.adb.AdbAuthorizationManager
 import com.bydcollector.collector.adb.AccessCheckMode
 import com.bydcollector.collector.adb.AdbLocalClient
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
+import com.bydcollector.collector.data.debug.DirectDebugDatabaseResolver
 import com.bydcollector.collector.data.debug.DirectDebugParameterAsset
 import com.bydcollector.collector.data.debug.DirectDebugRoundRobinPoller
 import com.bydcollector.collector.data.debug.DirectDebugStore
+import com.bydcollector.collector.data.debug.SecondaryReplayCoordinator
 import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
+import com.bydcollector.collector.data.direct.DirectStreamController
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.local.HealthSnapshotDetail
@@ -44,6 +47,7 @@ import com.bydcollector.collector.data.local.PollReading
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.data.remote.DirectTelemetryClient
 import com.bydcollector.collector.data.remote.DirectBridgeManager
+import com.bydcollector.collector.direct.CollectorHelperProtocol
 import com.bydcollector.collector.diagnostics.diagnosticSafeText
 import com.bydcollector.collector.keepalive.KeepAliveConfig
 import com.bydcollector.collector.keepalive.KeepAliveSupervisor
@@ -169,7 +173,9 @@ class CollectorService : Service() {
     private val debugWorkGeneration = AtomicLong(0L)
     private val debugStartInProgress = AtomicBoolean(false)
     private val debugStartQueued = AtomicBoolean(false)
-    private val debugOwnerHandoffPending = AtomicBoolean(false)
+    private val secondaryArchiveFenced = AtomicBoolean(false)
+    private val debugStoreCloseRequested = AtomicBoolean(false)
+    private val debugPollerShutdownInProgress = AtomicBoolean(false)
     @Volatile private var mqttRuntimeStatus = RuntimeActionStatus.STOPPED
     @Volatile private var influxRuntimeStatus = RuntimeActionStatus.STOPPED
     private val mqttRuntimeActive = AtomicBoolean(false)
@@ -322,8 +328,11 @@ class CollectorService : Service() {
         )
         store = BydCollectorApplication.store(applicationContext)
         settings = CollectorSettings(applicationContext, store)
+        configureDesiredStreams()
+        reconcilePersistedHelperStateAsync()
         debugStorageReady = BydCollectorApplication.isDebugStorageReady(applicationContext)
-        debugStore = DirectDebugStore(applicationContext, DirectDebugDatabaseHelper(applicationContext))
+        // Keep Main available when the secondary filename is ambiguous; readiness fails closed on start.
+        debugStore = DirectDebugStore(applicationContext)
         dashboardUiStateStore = BydCollectorApplication.dashboardUiStateStore(applicationContext)
         dashboardStateProvider = DashboardStateProvider(applicationContext, { store }, settings)
         if (dashboardUiStateStore.currentChrome() == null) {
@@ -467,6 +476,8 @@ class CollectorService : Service() {
 
     override fun onDestroy() {
         requireRuntimeOwner()
+        running.set(false)
+        debugStoreCloseRequested.set(true)
         (applicationContext as BydCollectorApplication).cancelHistoricalEnergyBackfill()
         maintenanceRuntimeRestoreAllowed.set(false)
         telegramWorkGeneration.incrementAndGet()
@@ -481,9 +492,11 @@ class CollectorService : Service() {
         cancelTelegramTick()
         accessSelfCheckScheduled = false
         stopCollection("service_destroyed")
+        DirectStreamController.releaseApp()
         if (::tripRuntime.isInitialized) tripRuntime.close()
         keepAliveSupervisor.shutdown()
         debugStartExecutor.shutdownNow()
+        closeDebugStoreAfterDebugStartExecutorStops()
         maintenanceExecutor.shutdownNow()
         archiveStorageExecutor.shutdownNow()
         tailscaleExecutor.shutdownNow()
@@ -496,7 +509,6 @@ class CollectorService : Service() {
         maintenanceActive.set(false)
         maintenanceRunningInProcess.set(false)
         mainPollingRunning.set(false)
-        running.set(false)
         mainRuntimeStatus = RuntimeActionStatus.STOPPED
         debugRuntimeStatus = DebugRuntimeStatus.STOPPED
         debugRuntimeError = null
@@ -525,9 +537,7 @@ class CollectorService : Service() {
         mqttConnection.release()
         influxConnection.release()
         clearDashboardVehicleKpis()
-        if (::debugStore.isInitialized) {
-            debugStore.close()
-        }
+        closeDebugStoreAfterLocalWorkers()
         super.onDestroy()
     }
 
@@ -895,6 +905,7 @@ class CollectorService : Service() {
     ) {
         if (maintenanceBlocksRuntimeStart()) return
         try {
+            configureDesiredStreams()
             val mainEnabled = settings.isPollingEnabled()
             val debugEnabled = settings.isDebugPollingEnabled()
             val mainAllowed = mainEnabled && !settings.isMainManuallyStopped()
@@ -1002,6 +1013,30 @@ class CollectorService : Service() {
                     finishKeepAliveStopAfterFailure(retryAttempt = 0, "keep_alive_stop_deferred")
                 }
             }
+        }
+    }
+
+    private fun configureDesiredStreams() {
+        val userShutdown = settings.isUserShutdownRequested()
+        DirectStreamController.configureDesired(
+            main = !userShutdown && settings.isPollingEnabled() && !settings.isMainManuallyStopped(),
+            secondary = !userShutdown && settings.isDebugPollingEnabled() && !settings.isDebugManuallyStopped()
+        )
+    }
+
+    private fun reconcilePersistedHelperStateAsync() {
+        try {
+            debugStartExecutor.execute {
+                val helper = DirectVehicleHelperClient()
+                if (helper.isAlive() && !DirectStreamController.ensureReady()) {
+                    store.recordEvent(
+                        "direct_stream_reconcile_failed",
+                        "Persisted direct stream state could not be reconciled"
+                    )
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            // Service teardown owns executor rejection; helper fallback retains desired collection.
         }
     }
 
@@ -1151,43 +1186,99 @@ class CollectorService : Service() {
         setDebugRuntime(DebugRuntimeStatus.STARTING, generation = startGeneration)
         try {
             debugStartExecutor.execute {
+                var streamLeaseHandedToPoller = false
                 try {
-                //Readiness failures are deliberately retried only when a start is requested.
-                debugStorageReady = BydCollectorApplication.ensureDebugStorageReady(applicationContext)
-                if (!debugStorageReady) {
-                    val detail = settings.debugStorageCutoverError() ?: "Debug database readiness failed"
-                    if (debugStartStillCurrent(startGeneration)) {
-                        setDebugRuntime(DebugRuntimeStatus.ERROR, detail, generation = startGeneration)
-                        store.recordEvent("debug_polling_start_error", "Debug database is not ready", detail)
-                        updateNotification("Polling error: $detail")
+                    //Readiness failures are deliberately retried only when a start is requested.
+                    debugStorageReady = BydCollectorApplication.ensureDebugStorageReady(applicationContext)
+                    if (!debugStorageReady) {
+                        val detail = settings.debugStorageCutoverError() ?: "Debug database readiness failed"
+                        if (debugStartStillCurrent(startGeneration)) {
+                            setDebugRuntime(DebugRuntimeStatus.ERROR, detail, generation = startGeneration)
+                            store.recordEvent("debug_polling_start_error", "Debug database is not ready", detail)
+                            updateNotification("Polling error: $detail")
+                        }
+                        return@execute
                     }
-                    return@execute
-                }
-                if (!debugStartStillCurrent(startGeneration)) return@execute
-                scheduleDashboardCountBootstrap(force = true)
-                val parameters = DirectDebugParameterAsset.load(applicationContext)
-                val helper = DirectVehicleHelperClient()
-                val launch = DirectBridgeManager.ensureRunning(
-                    context = applicationContext,
-                    adbClient = AdbLocalClient(File(applicationContext.filesDir, "adb_keys")),
-                    helper = helper,
-                    ownerMode = settings.mainHelperOwnerMode()
-                )
-                if (!launch.ok) {
-                    if (debugStartStillCurrent(startGeneration)) {
-                        setDebugRuntime(DebugRuntimeStatus.ERROR, launch.message, generation = startGeneration)
-                        store.recordEvent("debug_polling_start_error", "Debug direct helper unavailable", launch.message)
-                        updateNotification("Polling error: ${PollingErrorSummaries.summary(launch.message)}")
+                    if (!debugStartStillCurrent(startGeneration)) return@execute
+                    scheduleDashboardCountBootstrap(force = true)
+                    val parameters = DirectDebugParameterAsset.load(applicationContext)
+                    val helper = DirectVehicleHelperClient()
+                    val launch = DirectBridgeManager.ensureRunning(
+                        context = applicationContext,
+                        adbClient = AdbLocalClient(File(applicationContext.filesDir, "adb_keys")),
+                        helper = helper,
+                        ownerMode = settings.mainHelperOwnerMode()
+                    )
+                    if (!launch.ok) {
+                        if (debugStartStillCurrent(startGeneration)) {
+                            setDebugRuntime(DebugRuntimeStatus.ERROR, launch.message, generation = startGeneration)
+                            store.recordEvent("debug_polling_start_error", "Debug direct helper unavailable", launch.message)
+                            updateNotification("Polling error: ${PollingErrorSummaries.summary(launch.message)}")
+                        }
+                        return@execute
                     }
-                    return@execute
-                }
-                if (!debugStartStillCurrent(startGeneration)) return@execute
-                val batchSize = DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT
-                var lastDebugReadModeKey: String? = null
-                val nextPoller = DirectDebugRoundRobinPoller(
-                    parameters = parameters,
-                    helper = helper,
-                    store = debugStore,
+                    configureDesiredStreams()
+                    if (!DirectStreamController.ensureReady(CollectorHelperProtocol.STREAM_SECONDARY)) {
+                        val detail = "Secondary stream claim/reconcile failed"
+                        if (debugStartStillCurrent(startGeneration)) {
+                            setDebugRuntime(DebugRuntimeStatus.ERROR, detail, generation = startGeneration)
+                            store.recordEvent("debug_polling_start_error", "Debug direct helper unavailable", detail)
+                        }
+                        return@execute
+                    }
+                    if (!debugStartStillCurrent(startGeneration)) return@execute
+                    val batchSize = DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT
+                    var lastDebugReadModeKey: String? = null
+                    val nextPoller = DirectDebugRoundRobinPoller(
+                        parameters = parameters,
+                        helper = helper,
+                        store = debugStore,
+                        pauseSecondary = {
+                            DirectStreamController.pauseAndFence(CollectorHelperProtocol.STREAM_SECONDARY)
+                        },
+                    drainSecondaryReplay = { openedSessionId ->
+                        SecondaryReplayCoordinator(
+                            fetchPage = helper::secondarySpoolPage,
+                            acknowledge = helper::acknowledgeSecondarySpool,
+                            quarantine = helper::quarantineSecondarySpool,
+                            importRecord = { record, digest ->
+                                debugStore.importSecondaryRecord(openedSessionId, record, digest)
+                            }
+                        ).drain()
+                    },
+                    resumeSecondary = {
+                        DirectStreamController.resume(CollectorHelperProtocol.STREAM_SECONDARY)
+                    },
+                    onStarted = started@{ openedSessionId ->
+                        mainHandler.post {
+                            if (!debugStartStillCurrent(startGeneration)) return@post
+                            setDebugRuntime(DebugRuntimeStatus.RUNNING, generation = startGeneration)
+                            val previous = dashboardUiStateStore.currentTab(AppTab.ALL_PARAMETERS)
+                            dashboardUiStateStore.publishDebugPollState(
+                                DashboardDebugPollState(
+                                    lastReadingAt = previous?.debugLastReadingAt,
+                                    lastErrorAt = previous?.debugLastErrorAt,
+                                    lastError = previous?.debugLastError,
+                                    errorCount = previous?.debugErrorCount ?: 0L,
+                                    lastSessionId = openedSessionId
+                                )
+                            )
+                        }
+                    },
+                    onFailure = failure@{ detail ->
+                        mainHandler.post {
+                            if (startGeneration != debugWorkGeneration.get()) return@post
+                            setDebugRuntime(DebugRuntimeStatus.ERROR, detail, generation = startGeneration)
+                            store.recordEvent("debug_polling_runtime_error", "Secondary polling stopped", detail)
+                            updateNotification("Polling error: secondary replay/live cycle failed")
+                        }
+                    },
+                    onTerminalFailure = {
+                        if (startGeneration == debugWorkGeneration.get()) {
+                            DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_SECONDARY)
+                        }
+                    },
+                    onStopped = ::onDebugPollerStopped,
                     onCycle = cycle@{ summary ->
                         if (!debugStartStillCurrent(startGeneration)) return@cycle
                         dashboardUiStateStore.incrementDebugReadingCount(summary.changedCount.toLong())
@@ -1233,36 +1324,36 @@ class CollectorService : Service() {
                         }
                     }
                 )
-                val started = runOnRuntimeOwnerBlocking {
-                    requireRuntimeOwner()
-                    synchronized(debugPollerLock) {
-                        if (
-                            startGeneration != debugWorkGeneration.get() ||
-                            !settings.isDebugPollingEnabled() ||
-                            settings.isDebugManuallyStopped() ||
-                            maintenanceBlocksRuntimeStart(debugRuntime = true) ||
-                            debugPoller?.isRunning() == true
-                        ) {
-                            false
-                        } else {
-                            nextPoller.start(batchSize)
-                            debugPoller = nextPoller
-                            setDebugRuntime(DebugRuntimeStatus.RUNNING, generation = startGeneration)
-                            true
+                    val started = runOnRuntimeOwnerBlocking {
+                        requireRuntimeOwner()
+                        synchronized(debugPollerLock) {
+                            if (
+                                startGeneration != debugWorkGeneration.get() ||
+                                !settings.isDebugPollingEnabled() ||
+                                settings.isDebugManuallyStopped() ||
+                                maintenanceBlocksRuntimeStart(debugRuntime = true) ||
+                                debugPoller?.isRunning() == true
+                            ) {
+                                false
+                            } else {
+                                nextPoller.start(batchSize)
+                                debugPoller = nextPoller
+                                true
+                            }
                         }
                     }
-                }
-                if (!started) {
-                    nextPoller.shutdown("debug_start_cancelled")
-                    return@execute
-                }
-                if (debugStartStillCurrent(startGeneration)) {
-                    store.recordEvent(
-                        "debug_polling_started",
-                        "Debug round-robin polling started",
-                        "reason=$reason batch_size=$batchSize parameters=${parameters.size}"
-                    )
-                }
+                    if (!started) {
+                        nextPoller.shutdown("debug_start_cancelled")
+                        return@execute
+                    }
+                    streamLeaseHandedToPoller = true
+                    if (debugStartStillCurrent(startGeneration)) {
+                        store.recordEvent(
+                            "debug_polling_started",
+                            "Debug round-robin polling started",
+                            "reason=$reason batch_size=$batchSize parameters=${parameters.size}"
+                        )
+                    }
                 } catch (error: RuntimeException) {
                     val detail = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
                     if (debugStartStillCurrent(startGeneration)) {
@@ -1275,7 +1366,11 @@ class CollectorService : Service() {
                         updateNotification("Polling error: debug startup failed")
                     }
                 } finally {
+                    if (!streamLeaseHandedToPoller) {
+                        DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_SECONDARY)
+                    }
                     debugStartInProgress.set(false)
+                    closeDebugStoreAfterLocalWorkers()
                     if (
                         debugStartQueued.getAndSet(false) &&
                         settings.isDebugPollingEnabled() &&
@@ -1285,23 +1380,12 @@ class CollectorService : Service() {
                             if (running.get()) startDebugIfNeeded(DEBUG_REASON_MANUAL)
                         }
                     }
-                    if (debugOwnerHandoffPending.getAndSet(false)) {
-                        mainHandler.post {
-                            if (!running.get()) return@post
-                            val debugAllowed = settings.isDebugPollingEnabled() && !settings.isDebugManuallyStopped()
-                            val ownerMismatch = DirectVehicleHelperClient().ownerMode() != settings.mainHelperOwnerMode()
-                            if (debugAllowed && (!isDebugPollerRunning() || ownerMismatch)) {
-                                stopDebug("helper_owner_handoff")
-                                startDebugIfNeeded(DEBUG_REASON_AUTOSTART)
-                            }
-                        }
-                    }
                 }
             }
         } catch (error: RejectedExecutionException) {
             debugStartInProgress.set(false)
             debugStartQueued.set(false)
-            debugOwnerHandoffPending.set(false)
+            closeDebugStoreAfterLocalWorkers()
             val detail = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
             if (startGeneration == debugWorkGeneration.get()) {
                 setDebugRuntime(DebugRuntimeStatus.ERROR, detail, generation = startGeneration)
@@ -1374,6 +1458,7 @@ class CollectorService : Service() {
         settings.setDebugPollingEnabled(false)
         settings.setMqttEnabled(false)
         settings.setInfluxEnabled(false)
+        configureDesiredStreams()
         cancelMqttRetry()
         cancelInfluxRetry("maintenance")
         cancelTelegramTick()
@@ -1391,6 +1476,8 @@ class CollectorService : Service() {
         settings.setDebugPollingEnabled(false)
         settings.setMqttEnabled(false)
         settings.setInfluxEnabled(false)
+        configureDesiredStreams()
+        if (DirectVehicleHelperClient().isAlive()) DirectStreamController.ensureReady()
         stopMain("user_shutdown")
         stopDebug("user_shutdown")
         cancelMqttRetry()
@@ -1473,12 +1560,17 @@ class CollectorService : Service() {
     }
 
     private fun stopMain(reason: String) {
+        if (reason != "service_destroyed" && reason != "database_maintenance" &&
+            (!settings.isPollingEnabled() || settings.isMainManuallyStopped() || reason == "user_shutdown")
+        ) {
+            DirectStreamController.setDesired(CollectorHelperProtocol.STREAM_MAIN, false)
+        }
         val wasActive = mainRuntimeStatus != RuntimeActionStatus.STOPPED
         if (wasActive) setMainRuntime(RuntimeActionStatus.STOPPING)
         val wasPolling = poller.isRunning()
         if (wasPolling) poller.stop()
         if (::tripRuntime.isInitialized && reason != "service_destroyed") tripRuntime.pause(reason)
-        stopAppGapSpoolHelper(reason)
+        if (reason == "user_shutdown") stopAppGapSpoolHelper(reason)
         mainPollingRunning.set(false)
         sessionId?.let { openedSessionId ->
             runCatching { store.endSession(openedSessionId, reason) }
@@ -1507,15 +1599,7 @@ class CollectorService : Service() {
     private fun stopAppGapSpoolHelper(reason: String) {
         if (reason == "service_destroyed") return
         val helper = DirectVehicleHelperClient()
-        if (
-            debugStartInProgress.get() &&
-            settings.isDebugPollingEnabled() &&
-            !settings.isDebugManuallyStopped()
-        ) {
-            debugOwnerHandoffPending.set(true)
-        }
-        if (helper.ownerMode() != DirectHelperOwnerMode.APP_GAP_SPOOL) return
-        if (isDebugPollerRunning()) stopDebug("helper_owner_handoff")
+        if (!helper.isAlive()) return
         val result = helper.requestStop(DirectHelperOwnerMode.APP_GAP_SPOOL)
         store.recordEvent(
             if (result.ok) "telemetry_spool_helper_stop_requested" else "telemetry_spool_helper_stop_failed",
@@ -1700,10 +1784,20 @@ class CollectorService : Service() {
     }
 
     private fun stopDebug(reason: String) {
+        if (reason != "service_destroyed" && reason != "debug_database_maintenance" &&
+            (!settings.isDebugPollingEnabled() || settings.isDebugManuallyStopped() || reason == "user_shutdown")
+        ) {
+            DirectStreamController.setDesired(CollectorHelperProtocol.STREAM_SECONDARY, false)
+        }
         val stopGeneration = debugWorkGeneration.incrementAndGet()
         debugStartQueued.set(false)
         setDebugRuntime(DebugRuntimeStatus.STOPPING, generation = stopGeneration)
-        detachDebugPoller()?.shutdown(reason)
+        val detached = detachDebugPoller()
+        if (reason == "service_destroyed" && detached != null) {
+            debugPollerShutdownInProgress.set(true)
+            if (!detached.isRunning()) debugPollerShutdownInProgress.set(false)
+        }
+        detached?.shutdown(reason)
         if (!settings.isDebugPollingEnabled() || settings.isDebugManuallyStopped()) {
             setDebugRuntime(DebugRuntimeStatus.STOPPED)
         }
@@ -1775,6 +1869,35 @@ class CollectorService : Service() {
             telegramEnabled = settings.isTelegramEnabled(),
             debugRunning = isDebugPollerRunning()
         )
+    }
+
+    private fun onDebugPollerStopped() {
+        debugPollerShutdownInProgress.set(false)
+        closeDebugStoreAfterLocalWorkers()
+    }
+
+    private fun closeDebugStoreAfterDebugStartExecutorStops() {
+        CompletableFuture.runAsync {
+            val terminated = try {
+                debugStartExecutor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
+            }
+            if (terminated) {
+                debugStartInProgress.set(false)
+                closeDebugStoreAfterLocalWorkers()
+            }
+        }
+    }
+
+    private fun closeDebugStoreAfterLocalWorkers() {
+        if (!debugStoreCloseRequested.get() || debugStartInProgress.get() ||
+            debugPollerShutdownInProgress.get() || isDebugPollerRunning()
+        ) return
+        if (debugStoreCloseRequested.compareAndSet(true, false) && ::debugStore.isInitialized) {
+            debugStore.close()
+        }
     }
 
     private fun publishDashboardRuntimeFlags() {
@@ -1896,7 +2019,7 @@ class CollectorService : Service() {
             dashboardMetricsExecutor.execute {
                 try {
                     val mainBytes = sqliteFootprintBytes(applicationContext.getDatabasePath(com.bydcollector.collector.data.local.TelemetryDatabaseHelper.DATABASE_NAME))
-                    val debugBytes = sqliteFootprintBytes(applicationContext.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME))
+                    val debugBytes = sqliteFootprintBytes(DirectDebugDatabaseResolver.databaseFile(applicationContext))
                     val tripsBytes = sqliteFootprintBytes(applicationContext.getDatabasePath(com.bydcollector.collector.data.trips.TripDatabaseHelper.DATABASE_NAME))
                     if (generation == dashboardMetricsGeneration.get()) {
                         dashboardUiStateStore.publishDatabaseFootprints(mainBytes, debugBytes, tripsBytes)
@@ -1977,7 +2100,8 @@ class CollectorService : Service() {
     private data class DetachedMaintenanceRuntime(
         val mainPoller: TelemetryPoller? = null,
         val debugPoller: DirectDebugRoundRobinPoller? = null,
-        val openedSessionId: Long? = null
+        val openedSessionId: Long? = null,
+        val secondaryWasRunning: Boolean = false
     )
 
     private fun stopRuntimeForMaintenance(operation: DbMaintenanceOperation) {
@@ -1989,9 +2113,6 @@ class CollectorService : Service() {
             maintenanceRuntimeRestoreAllowed.set(false)
             error("Main poller did not stop for database maintenance")
         }
-        if (operation != DbMaintenanceOperation.DEBUG_ARCHIVE) {
-            stopAppGapSpoolHelper("database_maintenance")
-        }
         val debugStopReason = if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
             "debug_database_maintenance"
         } else {
@@ -2001,7 +2122,10 @@ class CollectorService : Service() {
             maintenanceRuntimeRestoreAllowed.set(false)
             error("Debug poller did not stop for database maintenance")
         }
-        if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) return
+        if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
+            prepareSecondaryArchive(detached.secondaryWasRunning)
+            return
+        }
 
         if (!tripRuntime.pauseAndAwait("database_maintenance")) {
             maintenanceRuntimeRestoreAllowed.set(false)
@@ -2040,7 +2164,10 @@ class CollectorService : Service() {
             val detachedDebugPoller = detachDebugPoller()
             setDebugRuntime(DebugRuntimeStatus.STOPPING, generation = stopGeneration)
             setDebugRuntime(DebugRuntimeStatus.STOPPED)
-            return DetachedMaintenanceRuntime(debugPoller = detachedDebugPoller)
+            return DetachedMaintenanceRuntime(
+                debugPoller = detachedDebugPoller,
+                secondaryWasRunning = detachedDebugPoller?.isRunning() == true
+            )
         }
 
         cancelMqttRetry()
@@ -2063,6 +2190,46 @@ class CollectorService : Service() {
             debugPoller = detachedDebugPoller,
             openedSessionId = openedSessionId
         )
+    }
+
+    private fun prepareSecondaryArchive(wasRunning: Boolean) {
+        val helper = DirectVehicleHelperClient()
+        if (!wasRunning) {
+            check(!settings.isDebugPollingEnabled() || settings.isDebugManuallyStopped()) {
+                "Secondary archive requires the enabled collector to be running; restart it before archiving"
+            }
+            check(DirectStreamController.setDesired(CollectorHelperProtocol.STREAM_SECONDARY, false)) {
+                "Secondary archive could not quiesce the stopped helper stream"
+            }
+            val backlog = helper.secondarySpoolStatus()
+            check(backlog.ok) {
+                "Secondary archive cannot prove the stopped backlog is empty: ${backlog.error ?: backlog.status}"
+            }
+            check(!backlog.pending) {
+                "Secondary archive blocked by retained backlog; Start secondary collection to drain it first"
+            }
+            return
+        }
+
+        check(DirectStreamController.pauseAndFence(CollectorHelperProtocol.STREAM_SECONDARY)) {
+            "Secondary archive pause/fence failed"
+        }
+        secondaryArchiveFenced.set(true)
+        val parameters = DirectDebugParameterAsset.load(applicationContext)
+        val archiveSessionId = debugStore.openSession(parameters, DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT)
+        try {
+            val replay = SecondaryReplayCoordinator(
+                fetchPage = helper::secondarySpoolPage,
+                acknowledge = helper::acknowledgeSecondarySpool,
+                quarantine = helper::quarantineSecondarySpool,
+                importRecord = { record, digest ->
+                    debugStore.importSecondaryRecord(archiveSessionId, record, digest)
+                }
+            ).drain()
+            check(replay.drained) { replay.blockedReason ?: "Secondary archive replay did not drain" }
+        } finally {
+            debugStore.endSession(archiveSessionId, "debug_database_maintenance")
+        }
     }
 
     private fun restoreRuntimeAfterMaintenance(operation: DbMaintenanceOperation, snapshot: RuntimeSnapshot) {
@@ -3315,6 +3482,17 @@ class CollectorService : Service() {
         restoreAfterMaintenance: Boolean
     ) {
         requireRuntimeOwner()
+        if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE && secondaryArchiveFenced.getAndSet(false)) {
+            if (!settings.isUserShutdownRequested() && settings.isDebugPollingEnabled() &&
+                !settings.isDebugManuallyStopped() &&
+                !DirectStreamController.resume(CollectorHelperProtocol.STREAM_SECONDARY)
+            ) {
+                store.recordEvent(
+                    "secondary_archive_resume_failed",
+                    "Secondary helper stream did not resume after archive"
+                )
+            }
+        }
         activeMaintenanceOperation = null
         maintenanceActive.set(false)
         maintenanceRunningInProcess.set(false)
@@ -3365,7 +3543,7 @@ class CollectorService : Service() {
             val rawArchiveRemains = File(applicationContext.filesDir, "db_archive").listFiles().orEmpty().any { file ->
                 file.isDirectory && (
                     file.name.startsWith("${File(store.databaseFile().name).nameWithoutExtension}_") ||
-                        file.name.startsWith("${File(DirectDebugDatabaseHelper.DATABASE_NAME).nameWithoutExtension}_")
+                        ArchiveStorageManager.isSecondaryArchiveName(file.name)
                     )
             }
             check(!rawArchiveRemains) { "Raw database archive compression remains pending" }
@@ -3572,6 +3750,7 @@ class CollectorService : Service() {
             archiveRoot = File(applicationContext.filesDir, "db_archive"),
             mainDatabaseFile = store.databaseFile(),
             debugDatabaseFile = applicationContext.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME),
+            debugDatabaseFileProvider = { DirectDebugDatabaseResolver.databaseFile(applicationContext) },
             tripsDatabaseFile = applicationContext.getDatabasePath(com.bydcollector.collector.data.trips.TripDatabaseHelper.DATABASE_NAME),
             isRetentionProtected = archiveShareLeaseRegistry::isActive
         )

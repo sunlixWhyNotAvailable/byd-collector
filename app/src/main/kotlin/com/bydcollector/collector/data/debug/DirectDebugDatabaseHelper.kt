@@ -6,10 +6,17 @@ import android.database.sqlite.SQLiteOpenHelper
 
 class DirectDebugDatabaseHelper(
     context: Context,
-    databaseName: String = DATABASE_NAME
+    databaseName: String = DirectDebugDatabaseResolver.databaseFile(context).name
 ) : SQLiteOpenHelper(context, databaseName, null, DATABASE_VERSION) {
     override fun onCreate(db: SQLiteDatabase) {
         createCompactSchema(db)
+    }
+
+    override fun onOpen(db: SQLiteDatabase) {
+        super.onOpen(db)
+        // The replay tables are an additive extension of compact-v2. Keep the SQLiteOpenHelper
+        // version and the storage marker unchanged so existing compact databases open in place.
+        if (!db.isReadOnly && isCompactV2(db)) createSecondaryReplaySchema(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -127,10 +134,94 @@ class DirectDebugDatabaseHelper(
         db.execSQL(
             "CREATE INDEX idx_debug_direct_readings_candidate_id ON debug_direct_readings(candidate_id, id)"
         )
+        createSecondaryReplaySchema(db)
+    }
+
+    private fun createSecondaryReplaySchema(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS debug_secondary_receipts (
+                boot_id TEXT NOT NULL,
+                helper_generation TEXT NOT NULL,
+                gap_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                digest TEXT NOT NULL,
+                spool_order INTEGER NOT NULL,
+                catalog_version TEXT NOT NULL,
+                record_kind TEXT NOT NULL,
+                cycle_id INTEGER NOT NULL,
+                committed_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(boot_id, helper_generation, gap_id, sequence)
+            ) WITHOUT ROWID
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS debug_secondary_cycle_metadata (
+                cycle_id INTEGER PRIMARY KEY,
+                source_wall_ms INTEGER NOT NULL,
+                source_elapsed_ms INTEGER NOT NULL,
+                source_cycle_elapsed_ms INTEGER NOT NULL,
+                batch_status INTEGER NOT NULL,
+                batch_mode INTEGER NOT NULL,
+                native_available INTEGER NOT NULL,
+                native_group_count INTEGER NOT NULL,
+                fallback_group_count INTEGER NOT NULL,
+                fallback_read_count INTEGER NOT NULL,
+                group_failure_count INTEGER NOT NULL,
+                source_error TEXT,
+                loss_count INTEGER,
+                loss_first_boot_id TEXT,
+                loss_first_helper_generation TEXT,
+                loss_first_gap_id TEXT,
+                loss_first_sequence INTEGER,
+                loss_last_boot_id TEXT,
+                loss_last_helper_generation TEXT,
+                loss_last_gap_id TEXT,
+                loss_last_sequence INTEGER,
+                loss_first_wall_ms INTEGER,
+                loss_last_wall_ms INTEGER,
+                loss_first_elapsed_ms INTEGER,
+                loss_last_elapsed_ms INTEGER
+            )
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS debug_secondary_replay_cursor (
+                catalog_version_id INTEGER PRIMARY KEY,
+                boot_id TEXT NOT NULL,
+                helper_generation TEXT NOT NULL,
+                gap_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                digest TEXT NOT NULL,
+                cycle_id INTEGER NOT NULL,
+                field_count INTEGER NOT NULL
+            ) WITHOUT ROWID
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS debug_secondary_rejections (
+                boot_id TEXT NOT NULL,
+                helper_generation TEXT NOT NULL,
+                gap_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                digest TEXT NOT NULL,
+                catalog_version TEXT NOT NULL,
+                spool_order INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                detected_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(boot_id, helper_generation, gap_id, sequence, digest)
+            ) WITHOUT ROWID
+            """.trimIndent()
+        )
     }
 
     companion object {
-        const val DATABASE_NAME = "bydcollector_debug_round_robin.db"
+        const val DATABASE_NAME = "bydcollector_secondary.db"
+        const val LEGACY_DATABASE_NAME = "bydcollector_debug_round_robin.db"
+        val DATABASE_NAMES = setOf(DATABASE_NAME, LEGACY_DATABASE_NAME)
         const val SCHEMA_FAMILY = "debug_round_robin"
         const val FORMAT_VERSION = 2
         // Marker-based format detection keeps an older file checkpointable and verifiable

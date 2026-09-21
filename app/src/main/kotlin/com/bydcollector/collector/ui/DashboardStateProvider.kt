@@ -5,7 +5,7 @@ import android.os.SystemClock
 import android.util.Log
 import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.adb.AdbAuthorizationManager
-import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
+import com.bydcollector.collector.data.debug.DirectDebugDatabaseResolver
 import com.bydcollector.collector.data.debug.DirectDebugParameterAsset
 import com.bydcollector.collector.data.debug.DirectDebugStatus
 import com.bydcollector.collector.data.debug.DirectDebugStore
@@ -474,11 +474,12 @@ class DashboardStateProvider(
     }
 
     private fun lightweightDebugStatus(): DirectDebugStatus {
-        val dbFile = context.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME)
+        val resolution = runCatching { DirectDebugDatabaseResolver.databaseFile(context) }
+        val dbFile = resolution.getOrNull()
         //keeps debug card geometry stable without reading round-robin history outside All data
         return DirectDebugStatus(
-            databasePath = dbFile.absolutePath,
-            databaseSizeBytes = sqliteFootprintBytes(dbFile),
+            databasePath = dbFile?.absolutePath.orEmpty(),
+            databaseSizeBytes = dbFile?.let(::sqliteFootprintBytes) ?: 0L,
             lastSessionId = null,
             lastSessionStartedAt = null,
             lastSessionEndedAt = null,
@@ -487,8 +488,8 @@ class DashboardStateProvider(
             readingCount = UNKNOWN_DASHBOARD_COUNT,
             lastReadingAt = null,
             lastErrorAt = null,
-            lastError = null,
-            errorCount = 0
+            lastError = resolution.exceptionOrNull()?.message,
+            errorCount = if (resolution.isFailure) 1L else 0L
         )
     }
 

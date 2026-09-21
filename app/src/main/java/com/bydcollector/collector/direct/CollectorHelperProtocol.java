@@ -8,13 +8,27 @@ public final class CollectorHelperProtocol {
     public static final String SPOOL_MODE_ARG = "spool";
     public static final String LOG_PATH = "/data/local/tmp/bydcollector_helper.log";
     public static final String LOCK_PATH = "/data/local/tmp/bydcollector_helper.lock";
-    public static final int PROTOCOL_VERSION = 10;
+    public static final int PROTOCOL_VERSION = 11;
     public static final int TX_PING = 1;
     public static final int TX_READ = 2;
     public static final int TX_READ_BATCH = 3;
     public static final int TX_WORKER_PENDING = 4;
     public static final int TX_WORKER_ACK = 5;
     public static final int TX_STOP_OWNER = 6;
+    public static final int TX_SECONDARY_PENDING_PAGE = 7;
+    public static final int TX_SECONDARY_ACK = 8;
+    public static final int TX_SECONDARY_QUARANTINE = 9;
+    public static final int TX_STREAM_CONTROL = 10;
+    public static final int TX_SECONDARY_READ_BATCH = 11;
+    public static final int TX_SECONDARY_STATUS = 12;
+    public static final int STREAM_MAIN = 1;
+    public static final int STREAM_SECONDARY = 2;
+    public static final int CONTROL_CLAIM = 1;
+    public static final int CONTROL_SET_DESIRED = 2;
+    public static final int CONTROL_RENEW = 3;
+    public static final int CONTROL_PAUSE_FENCE = 4;
+    public static final int CONTROL_RESUME = 5;
+    public static final int SECONDARY_CHUNK_SIZE = 128;
     public static final int AUTO_TX_INT = 5;
     public static final int AUTO_TX_FLOAT = 7;
     public static final int MAX_BATCH_SIZE = 23_096;
@@ -30,6 +44,8 @@ public final class CollectorHelperProtocol {
     public static final int STATUS_SPOOL_UNAVAILABLE = -913;
     public static final int STATUS_SAMPLE_NOT_FOUND = -914;
     public static final int STATUS_REPLAY_PENDING = -915;
+    public static final int STATUS_STALE_TOKEN = -916;
+    public static final int STATUS_LEASE_EXPIRED = -917;
 
     public static final int MODE_REJECTED = 0;
     public static final int MODE_NATIVE = 1;

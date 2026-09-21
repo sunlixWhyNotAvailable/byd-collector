@@ -3,6 +3,7 @@ package com.bydcollector.collector.maintenance
 import android.content.Context
 import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
+import com.bydcollector.collector.data.debug.DirectDebugDatabaseResolver
 import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
@@ -121,7 +122,9 @@ class DbMaintenanceCoordinator(
             PHASE_ARCHIVING,
             sourceFormat,
             manual = true,
-            sourceNames = sourceNames
+            sourceNames = sourceNames,
+            sourceDatabaseName = databaseFile.name,
+            targetDatabaseName = databaseFile.name
         )
         if (!runCatching { settings.setStorageCutoverJournal(journal) }.getOrDefault(false)) {
             reopenMainAndVerifyRestored(databaseFile)
@@ -230,7 +233,7 @@ class DbMaintenanceCoordinator(
 
     private fun archiveDebug(operation: DbMaintenanceOperation): DbMaintenanceResult {
         check(settings.storageCutoverJournal() == null) { "Database cutover recovery is pending" }
-        val databaseFile = context.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME)
+        val databaseFile = DirectDebugDatabaseResolver.databaseFile(context)
         val warnings = mutableListOf<String>()
         check(databaseFile.isFile) { "Debug database source is not preservable" }
         val sourceFormat = runCatching {
@@ -259,7 +262,9 @@ class DbMaintenanceCoordinator(
             PHASE_ARCHIVING,
             sourceFormat,
             manual = true,
-            sourceNames = sourceNames
+            sourceNames = sourceNames,
+            sourceDatabaseName = databaseFile.name,
+            targetDatabaseName = DirectDebugDatabaseHelper.DATABASE_NAME
         )
         if (!runCatching { settings.setStorageCutoverJournal(journal) }.getOrDefault(false)) {
             reopenDebugAndVerifyRestored(databaseFile)
@@ -303,34 +308,43 @@ class DbMaintenanceCoordinator(
             )) { "Cannot persist debug database verification journal" }
             check(newStore.verifyWritableDatabase()) { "New debug database quick_check failed" }
         }.exceptionOrNull()
-        if (createFailure != null) rollbackDebug(databaseFile, archive, createFailure, manual = true)
+        if (createFailure != null) {
+            rollbackDebug(
+                sourceDatabaseFile = databaseFile,
+                createdDatabaseFile = context.getDatabasePath(journal.targetDatabaseName),
+                archive = archive,
+                cause = createFailure,
+                manual = true
+            )
+        }
 
         if (!runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)) {
             throw RuntimeException("Cannot clear debug database cutover journal after successful archive")
         }
         return DbMaintenanceResult(
             ok = true,
-            message = "Debug database archived",
+            message = "Secondary database archived",
             archivePath = archive.archiveDirectory.absolutePath,
             warning = warnings.takeIf { it.isNotEmpty() }?.distinct()?.joinToString("; ")
         )
     }
 
     private fun rollbackDebug(
-        databaseFile: File,
+        sourceDatabaseFile: File,
+        createdDatabaseFile: File,
         archive: DatabaseArchiveManager.ArchiveResult,
         cause: Throwable,
         manual: Boolean = false
     ): Nothing {
         runCatching { closeDebugStore() }
         markRollbackPhase()
-        if (!deleteExactNewDatabaseSet(databaseFile)) {
+        if (!deleteExactNewDatabaseSet(createdDatabaseFile)) {
             throw TerminalArchiveFailure("Cannot remove failed new debug database before restoring archive: ${cause.message ?: cause::class.java.simpleName}")
         }
-        if (!DatabaseArchiveManager.restore(databaseFile, archive.movedFiles)) {
+        if (!DatabaseArchiveManager.restore(sourceDatabaseFile, archive.movedFiles)) {
             throw TerminalArchiveFailure("Debug database archive restore was incomplete after new database failure: ${cause.message ?: cause::class.java.simpleName}")
         }
-        if (manual) reopenDebugAndVerifyRestored(databaseFile) else reopenDebugAndVerifyRestored(databaseFile, manual = false)
+        if (manual) reopenDebugAndVerifyRestored(sourceDatabaseFile) else reopenDebugAndVerifyRestored(sourceDatabaseFile, manual = false)
         if (!runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)) {
             throw TerminalArchiveFailure("Cannot clear debug rollback journal after restore")
         }
@@ -373,7 +387,7 @@ class DbMaintenanceCoordinator(
 
     private fun deleteExactNewDatabaseSet(databaseFile: File): Boolean {
         val allowedName = databaseFile.name == TelemetryDatabaseHelper.DATABASE_NAME ||
-            databaseFile.name == DirectDebugDatabaseHelper.DATABASE_NAME
+            databaseFile.name in DirectDebugDatabaseHelper.DATABASE_NAMES
         val expected = runCatching { context.getDatabasePath(databaseFile.name).canonicalFile }.getOrNull()
             ?: return false
         if (!allowedName || runCatching { databaseFile.canonicalFile }.getOrNull() != expected) return false

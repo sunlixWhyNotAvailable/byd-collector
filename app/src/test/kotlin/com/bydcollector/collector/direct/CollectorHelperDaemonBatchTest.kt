@@ -125,7 +125,7 @@ class CollectorHelperDaemonBatchTest {
         assertEquals(rows.map { Triple(it.tx, it.dev, it.fid) }, sample.values.map { Triple(it.tx, it.dev, it.fid) })
         assertEquals(listOf(110, null), sample.values.map { it.raw })
         assertEquals(listOf(null, "read failed"), sample.values.map { it.error })
-        assertEquals(500L, CollectorHelperDaemon.WorkerPollLoop.FALLBACK_INTERVAL_MS)
+        assertEquals(500L, HelperDualStreamRuntime.POLL_INTERVAL_MS)
 
         assertFailsWith<IllegalArgumentException> {
             CollectorHelperDaemon.workerSample(identity, "catalog-a", 100, 90, rows.dropLast(1), result)
@@ -283,6 +283,7 @@ class CollectorHelperDaemonBatchTest {
             }
 
             val whitelist = CollectorHelperDaemon.loadWhitelist(apk.absolutePath)
+            val orderedSecondary = CollectorHelperDaemon.loadSecondaryRows(apk.absolutePath)
             val known = address(5, 1014, 1145045040)
             val debugRows = assets.flatMap { DirectDebugParameterAsset.parse(it.readText(Charsets.UTF_8)) }
             val debugAddresses = debugRows.map { address(it.tx, it.dev, it.fid) }
@@ -290,6 +291,7 @@ class CollectorHelperDaemonBatchTest {
             assertEquals(3, assets.size)
             assertEquals(23177, whitelist.size)
             assertEquals(23083, debugAddresses.size)
+            assertEquals(debugAddresses, orderedSecondary)
             assertTrue(debugAddresses.size <= CollectorHelperProtocol.MAX_BATCH_SIZE)
             assertNull(CollectorHelperDaemon.validateRows(debugAddresses, whitelist))
             assets.forEach { asset ->
@@ -342,26 +344,12 @@ class CollectorHelperDaemonBatchTest {
     }
 
     @Test
-    fun consumerLeaseStartsActiveRestoresOnceAndEntersFallbackOnlyAfterExpiry() {
-        val lease = CollectorHelperDaemon.ConsumerLease(1_000L, 2_000L)
-
-        assertTrue(lease.isActive(1_000L))
-        assertTrue(lease.isActive(2_999L))
-        assertTrue(!lease.isActive(3_000L))
-        assertTrue(lease.beginFallback(3_000L))
-        assertTrue(!lease.beginFallback(3_001L))
-        assertTrue(lease.renew(3_100L))
-        assertTrue(lease.isActive(5_099L))
-        assertTrue(!lease.renew(3_200L))
-    }
-
-    @Test
     fun protocolV10RejectsStaleOrWrongModeHelpersAndExposesReadOnlyEndpointsOnly() {
         val protocol = sourceFile("com/bydcollector/collector/direct/CollectorHelperProtocol.java").readText()
         val daemon = sourceFile("com/bydcollector/collector/direct/CollectorHelperDaemon.java").readText()
         val client = sourceFile("com/bydcollector/collector/data/direct/DirectVehicleHelperClient.kt").readText()
 
-        assertEquals(10, CollectorHelperProtocol.PROTOCOL_VERSION)
+        assertEquals(11, CollectorHelperProtocol.PROTOCOL_VERSION)
         assertTrue(client.contains("protocolVersion != CollectorHelperProtocol.PROTOCOL_VERSION"))
         assertTrue(client.contains("DirectHelperOwnerMode.fromProtocolValue(ownerMode)"))
         assertTrue(client.contains("TX_PING"))

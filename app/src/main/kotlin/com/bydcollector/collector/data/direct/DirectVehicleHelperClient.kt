@@ -6,6 +6,9 @@ import android.os.Parcel
 import android.util.Log
 import com.bydcollector.collector.direct.CollectorHelperProtocol
 import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
+import com.bydcollector.collector.direct.SecondarySpoolBinder
+import com.bydcollector.collector.direct.SecondaryTelemetrySpool
+import com.bydcollector.collector.data.debug.DirectDebugParameterAsset
 
 //wraps the helper binder so autoservice calls stay behind one read-only app-facing interface
 class DirectVehicleHelperClient : DirectVehicleHelper {
@@ -55,12 +58,16 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
             return batchFailure(entries.size, STATUS_CLIENT_ERROR, "invalid batch size: ${entries.size}")
         }
         return synchronized(lock) {
+            val owner = DirectStreamController.credentials(CollectorHelperProtocol.STREAM_MAIN)
+                ?: return@synchronized batchFailure(entries.size, CollectorHelperProtocol.STATUS_STALE_TOKEN, "Main stream is not claimed")
             val binder = ensureBinder()
                 ?: return@synchronized batchFailure(entries.size, STATUS_NO_BINDER, "helper binder unavailable")
             val data = Parcel.obtain()
             val reply = Parcel.obtain()
             try {
                 data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
+                data.writeLong(owner.controllerToken)
+                data.writeLong(owner.epoch)
                 data.writeInt(entries.size)
                 entries.forEach { entry ->
                     data.writeInt(entry.tx)
@@ -116,6 +123,242 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                 data.recycle()
                 reply.recycle()
             }
+        }
+    }
+
+    override fun readSecondaryBatch(entries: List<DirectFidEntry>): DirectHelperBatchResult {
+        if (entries.size != DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT) {
+            return batchFailure(entries.size, STATUS_CLIENT_ERROR, "secondary requires complete ordered catalog")
+        }
+        val owner = DirectStreamController.credentials(CollectorHelperProtocol.STREAM_SECONDARY)
+            ?: return batchFailure(entries.size, CollectorHelperProtocol.STATUS_STALE_TOKEN, "Secondary stream is not claimed")
+        return synchronized(lock) {
+            val binder = ensureBinder() ?: return@synchronized batchFailure(entries.size, STATUS_NO_BINDER, "helper binder unavailable")
+            val data = Parcel.obtain()
+            val reply = Parcel.obtain()
+            try {
+                data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
+                data.writeLong(owner.controllerToken)
+                data.writeLong(owner.epoch)
+                data.writeString(DirectDebugParameterAsset.SOURCE_VERSION)
+                if (!binder.transact(CollectorHelperProtocol.TX_SECONDARY_READ_BATCH, data, reply, 0)) {
+                    cached = null
+                    return@synchronized batchFailure(entries.size, STATUS_TRANSACT_FALSE, "secondary live transact returned false")
+                }
+                require(reply.dataSize() <= SecondarySpoolBinder.MAX_REPLY_BYTES) { "oversize secondary live reply" }
+                val status = reply.readInt()
+                val mode = modeName(reply.readInt())
+                val native = reply.readInt() == 1
+                val nativeGroups = reply.readInt()
+                val fallbackGroups = reply.readInt()
+                val fallbackReads = reply.readInt()
+                val groupFailures = reply.readInt()
+                val elapsed = reply.readLong()
+                val count = reply.readInt()
+                val batchError = reply.readString()
+                val catalog = reply.readString()
+                val statuses = reply.createIntArray() ?: error("missing secondary statuses")
+                val presence = reply.createByteArray() ?: error("missing secondary presence")
+                val raws = reply.createIntArray() ?: error("missing secondary raw values")
+                require(count in 0..entries.size && statuses.size == count && raws.size == count &&
+                    presence.size == (count + 7) / 8 && reply.dataAvail() == 0
+                ) { "invalid secondary packed payload" }
+                require(catalog == DirectDebugParameterAsset.SOURCE_VERSION) { "secondary catalog mismatch" }
+                require(elapsed >= 0 && listOf(nativeGroups, fallbackGroups, fallbackReads, groupFailures).all { it >= 0 }) {
+                    "invalid secondary diagnostics"
+                }
+                if (count == 0 && status != CollectorHelperProtocol.STATUS_OK) {
+                    return@synchronized batchFailure(entries.size, status, batchError ?: "secondary live unavailable")
+                }
+                require(count == entries.size) { "incomplete secondary cycle" }
+                DirectHelperBatchResult(
+                    List(count) { i ->
+                        DirectHelperReadResult(statuses[i], if ((presence[i / 8].toInt() and (1 shl (i % 8))) != 0) raws[i] else null)
+                    },
+                    DirectBatchDiagnostics(mode, native, nativeGroups, fallbackGroups, fallbackReads,
+                        groupFailures, elapsed, count, batchError, status)
+                )
+            } catch (error: DeadObjectException) {
+                cached = null
+                batchFailure(entries.size, STATUS_DEAD_OBJECT, error.message ?: "dead binder")
+            } catch (error: Exception) {
+                batchFailure(entries.size, STATUS_CLIENT_ERROR, "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+            } finally {
+                data.recycle()
+                reply.recycle()
+            }
+        }
+    }
+
+    fun streamControl(
+        action: Int, nonce: String, controllerToken: Long, stream: Int, epoch: Long, value: Int
+    ): DirectStreamControlResult = synchronized(lock) {
+        val binder = ensureBinder() ?: return@synchronized DirectStreamControlResult(STATUS_NO_BINDER, error = "helper binder unavailable")
+        val data = Parcel.obtain()
+        val reply = Parcel.obtain()
+        try {
+            require(nonce.isNotEmpty() && nonce.length <= 64) { "invalid controller nonce" }
+            data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
+            data.writeInt(action)
+            data.writeString(nonce)
+            data.writeLong(controllerToken)
+            data.writeInt(stream)
+            data.writeLong(epoch)
+            data.writeInt(value)
+            if (!binder.transact(CollectorHelperProtocol.TX_STREAM_CONTROL, data, reply, 0)) {
+                cached = null
+                return@synchronized DirectStreamControlResult(STATUS_TRANSACT_FALSE, error = "stream control transact returned false")
+            }
+            require(reply.dataSize() <= 4096) { "oversize stream control reply" }
+            val result = DirectStreamControlResult(reply.readInt(), reply.readLong(), reply.readLong(), reply.readLong(), reply.readLong(), reply.readString())
+            require(reply.dataAvail() == 0 && result.controllerToken >= 0 && result.mainEpoch >= 0 && result.secondaryEpoch >= 0 &&
+                result.leaseExpiresElapsedMs >= 0 && (result.error?.length ?: 0) <= 512
+            ) { "invalid stream control reply" }
+            result
+        } catch (error: DeadObjectException) {
+            cached = null
+            DirectStreamControlResult(STATUS_DEAD_OBJECT, error = error.message ?: "dead binder")
+        } catch (error: Exception) {
+            DirectStreamControlResult(STATUS_CLIENT_ERROR, error = "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+        } finally {
+            data.recycle()
+            reply.recycle()
+        }
+    }
+
+    fun secondarySpoolStatus(): SecondarySpoolStatus = synchronized(lock) {
+        val binder = ensureBinder() ?: return@synchronized SecondarySpoolStatus(STATUS_NO_BINDER, error = "helper binder unavailable")
+        val data = Parcel.obtain()
+        val reply = Parcel.obtain()
+        try {
+            data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
+            if (!binder.transact(CollectorHelperProtocol.TX_SECONDARY_STATUS, data, reply, 0)) {
+                cached = null
+                return@synchronized SecondarySpoolStatus(STATUS_TRANSACT_FALSE, error = "secondary status transact returned false")
+            }
+            require(reply.dataSize() <= 4096) { "oversize secondary status" }
+            val status = reply.readInt()
+            val ready = reply.readInt()
+            val busy = reply.readInt()
+            val error = reply.readString()
+            require(ready >= 0 && busy in 0..1 && reply.dataAvail() == 0 && (error?.length ?: 0) <= 512) {
+                "invalid secondary status"
+            }
+            SecondarySpoolStatus(status, ready, busy == 1, error)
+        } catch (error: DeadObjectException) {
+            cached = null
+            SecondarySpoolStatus(STATUS_DEAD_OBJECT, error = error.message ?: "dead binder")
+        } catch (error: Exception) {
+            SecondarySpoolStatus(STATUS_CLIENT_ERROR, error = "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+        } finally {
+            data.recycle()
+            reply.recycle()
+        }
+    }
+
+    fun secondarySpoolPage(
+        descriptor: SecondaryTelemetrySpool.Descriptor? = null,
+        offset: Long = 0,
+        limit: Int = SecondaryTelemetrySpool.MAX_SLICE_BYTES
+    ): SecondarySpoolPage {
+        fun failure(status: Int, error: String) = SecondarySpoolPage(status, null, 0, byteArrayOf(), error)
+        if (offset < 0 || limit !in 1..SecondaryTelemetrySpool.MAX_SLICE_BYTES ||
+            (descriptor == null && offset != 0L)
+        ) return failure(STATUS_CLIENT_ERROR, "invalid secondary page request")
+        return synchronized(lock) {
+            val binder = ensureBinder() ?: return@synchronized failure(STATUS_NO_BINDER, "helper binder unavailable")
+            val data = Parcel.obtain()
+            val reply = Parcel.obtain()
+            try {
+                data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
+                SecondarySpoolBinder.writeDescriptor(data, descriptor)
+                data.writeLong(offset)
+                data.writeInt(limit)
+                if (!binder.transact(CollectorHelperProtocol.TX_SECONDARY_PENDING_PAGE, data, reply, 0)) {
+                    cached = null
+                    return@synchronized failure(STATUS_TRANSACT_FALSE, "secondary page transact returned false")
+                }
+                require(reply.dataSize() <= SecondarySpoolBinder.MAX_REPLY_BYTES) { "oversize secondary reply" }
+                val status = reply.readInt()
+                val responseError = reply.readString()
+                val selected = SecondarySpoolBinder.readDescriptor(reply)
+                val returnedOffset = reply.readLong()
+                val bytes = reply.createByteArray() ?: error("missing secondary page bytes")
+                require(bytes.size <= limit) { "oversize secondary page" }
+                require(reply.dataAvail() == 0) { "unexpected secondary reply data" }
+                if (status == CollectorHelperProtocol.STATUS_OK) {
+                    require(returnedOffset == offset) { "secondary page offset mismatch" }
+                    if (selected == null) {
+                        require(descriptor == null && bytes.isEmpty()) { "secondary record disappeared" }
+                    } else {
+                        require(returnedOffset <= selected.length && bytes.size.toLong() <= selected.length - returnedOffset) {
+                            "secondary page exceeds record"
+                        }
+                        if (descriptor != null) require(
+                            selected.identity == descriptor.identity && selected.sha256 == descriptor.sha256 &&
+                                selected.length == descriptor.length && selected.spoolOrder == descriptor.spoolOrder &&
+                                selected.kind == descriptor.kind && selected.fileName == descriptor.fileName &&
+                                selected.capturedWallMs == descriptor.capturedWallMs &&
+                                selected.capturedElapsedMs == descriptor.capturedElapsedMs
+                        ) { "secondary descriptor changed during paging" }
+                    }
+                }
+                SecondarySpoolPage(status, selected, returnedOffset, bytes, responseError)
+            } catch (error: DeadObjectException) {
+                cached = null
+                failure(STATUS_DEAD_OBJECT, error.message ?: "dead binder")
+            } catch (error: Exception) {
+                failure(STATUS_CLIENT_ERROR, "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+            } finally {
+                data.recycle()
+                reply.recycle()
+            }
+        }
+    }
+
+    fun acknowledgeSecondarySpool(descriptor: SecondaryTelemetrySpool.Descriptor): SecondarySpoolActionResult =
+        secondarySpoolAction(CollectorHelperProtocol.TX_SECONDARY_ACK, descriptor, null)
+
+    fun quarantineSecondarySpool(
+        descriptor: SecondaryTelemetrySpool.Descriptor,
+        reason: String
+    ): SecondarySpoolActionResult = secondarySpoolAction(
+        CollectorHelperProtocol.TX_SECONDARY_QUARANTINE, descriptor, reason.take(512)
+    )
+
+    private fun secondarySpoolAction(
+        transaction: Int,
+        descriptor: SecondaryTelemetrySpool.Descriptor,
+        reason: String?
+    ): SecondarySpoolActionResult = synchronized(lock) {
+        val binder = ensureBinder() ?: return@synchronized SecondarySpoolActionResult(
+            STATUS_NO_BINDER, error = "helper binder unavailable"
+        )
+        val data = Parcel.obtain()
+        val reply = Parcel.obtain()
+        try {
+            data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
+            SecondarySpoolBinder.writeDescriptor(data, descriptor)
+            if (transaction == CollectorHelperProtocol.TX_SECONDARY_QUARANTINE) data.writeString(reason)
+            if (!binder.transact(transaction, data, reply, 0)) {
+                cached = null
+                return@synchronized SecondarySpoolActionResult(STATUS_TRANSACT_FALSE, error = "secondary action transact returned false")
+            }
+            val status = reply.readInt()
+            val affected = reply.readInt()
+            require(affected >= 0) { "negative secondary action count" }
+            if (transaction == CollectorHelperProtocol.TX_SECONDARY_ACK) require(affected <= 1) { "invalid ACK count" }
+            val error = reply.readString()
+            require(reply.dataAvail() == 0) { "unexpected secondary action reply" }
+            SecondarySpoolActionResult(status, affected, error)
+        } catch (error: DeadObjectException) {
+            cached = null
+            SecondarySpoolActionResult(STATUS_DEAD_OBJECT, error = error.message ?: "dead binder")
+        } catch (error: Exception) {
+            SecondarySpoolActionResult(STATUS_CLIENT_ERROR, error = "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+        } finally {
+            data.recycle()
+            reply.recycle()
         }
     }
 

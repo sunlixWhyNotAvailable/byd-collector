@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import android.os.SystemClock
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
+import com.bydcollector.collector.data.debug.DirectDebugDatabaseResolver
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.local.TelegramLegacyMigrationDecision
@@ -86,6 +87,7 @@ class BydCollectorApplication : Application() {
             archiveRoot = File(filesDir, "db_archive"),
             mainDatabaseFile = getDatabasePath(TelemetryDatabaseHelper.DATABASE_NAME),
             debugDatabaseFile = getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME),
+            debugDatabaseFileProvider = { DirectDebugDatabaseResolver.databaseFile(this) },
             tripsDatabaseFile = getDatabasePath(TripDatabaseHelper.DATABASE_NAME)
         )
     }

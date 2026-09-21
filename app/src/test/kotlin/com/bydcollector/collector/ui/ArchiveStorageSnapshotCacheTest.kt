@@ -9,6 +9,49 @@ import kotlin.test.assertTrue
 
 class ArchiveStorageSnapshotCacheTest {
     @Test
+    fun secondaryNameFailureKeepsMainSnapshotAvailableAndExplicitlyErrored() {
+        val root = Files.createTempDirectory("archive-cache-secondary-error").toFile()
+        val main = root.resolve("main.db").apply { writeText("main") }
+        val cache = ArchiveStorageSnapshotCache(
+            archiveRoot = root.resolve("archive"),
+            mainDatabaseFile = main,
+            debugDatabaseFile = root.resolve("bydcollector_secondary.db"),
+            debugDatabaseFileProvider = { error("secondary name ambiguous") },
+            clock = { 0L },
+            executor = java.util.concurrent.Executor { it.run() }
+        )
+
+        val result = cache.snapshot(1_024L, includeDetails = false)
+        assertEquals(main.length(), result.snapshot.mainDatabaseSizeBytes)
+        assertEquals(0L, result.snapshot.debugDatabaseSizeBytes)
+        assertEquals("secondary name ambiguous", result.error?.message)
+        cache.close()
+    }
+
+    @Test
+    fun lightweightSnapshotRebindsSecondaryDatabaseAfterArchiveRename() {
+        val root = Files.createTempDirectory("archive-cache-rebind").toFile()
+        val archiveRoot = root.resolve("archive").apply { mkdirs() }
+        val main = root.resolve("main.db").apply { writeText("main") }
+        val legacy = root.resolve("bydcollector_debug_round_robin.db").apply { writeText("legacy") }
+        val secondary = root.resolve("bydcollector_secondary.db").apply { writeText("secondary-new") }
+        var active = legacy
+        val cache = ArchiveStorageSnapshotCache(
+            archiveRoot = archiveRoot,
+            mainDatabaseFile = main,
+            debugDatabaseFile = legacy,
+            debugDatabaseFileProvider = { active },
+            clock = { 0L },
+            executor = java.util.concurrent.Executor { it.run() }
+        )
+
+        assertEquals(legacy.length(), cache.snapshot(1_024L, includeDetails = false).snapshot.debugDatabaseSizeBytes)
+        active = secondary
+        assertEquals(secondary.length(), cache.snapshot(1_024L, includeDetails = false).snapshot.debugDatabaseSizeBytes)
+        cache.close()
+    }
+
+    @Test
     fun allThreeFootprintsStayFreshIncludingWalAndFailedArchiveScans() {
         val root = Files.createTempDirectory("byd-three-footprints").toFile()
         try {

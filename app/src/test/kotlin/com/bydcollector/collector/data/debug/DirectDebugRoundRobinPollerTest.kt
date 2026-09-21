@@ -5,6 +5,7 @@ import java.security.MessageDigest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -66,8 +67,59 @@ class DirectDebugRoundRobinPollerTest {
         assertTrue(source.contains("executor.awaitTermination(timeoutMs, TimeUnit.MILLISECONDS)"))
         assertTrue(source.contains("fun shutdown(reason: String = \"shutdown\")"))
         assertTrue(source.contains("shutdownAndAwait(reason, 0L)"))
-        assertTrue(source.contains("helper.readBatch(entries)"))
+        assertTrue(source.contains("helper.readSecondaryBatch(entries)"))
         assertTrue(!source.contains("helper.read(parameter.toDirectFidEntry())"))
+        assertTrue(source.indexOf("store.openSession(parameters, safeBatchSize)") > source.indexOf("executor.submit"))
+        assertTrue(source.contains("openedSessionId?.let { opened ->"))
+        assertTrue(source.contains("running.set(false)"))
+        assertTrue(source.contains("onTerminalFailure"))
+        assertTrue(source.contains("if (!stopRequested.get()) runCatching(onTerminalFailure)"))
+        assertTrue(source.indexOf("store.endSession(opened, stopReason)") < source.indexOf("runCatching(onStopped)"))
+        assertTrue(
+            source.indexOf("batchResult.diagnostics.status == CollectorHelperProtocol.STATUS_OK") <
+                source.indexOf("return store.recordCycle(")
+        )
+        assertTrue(source.contains("batchResult.results.size == batch.size"))
+    }
+
+    @Test
+    fun secondaryCycleFencesDrainsAndResumesBeforeLiveRead() {
+        val events = mutableListOf<String>()
+
+        val value = SecondaryLiveCycleGate.run(
+            pause = { events += "pause"; true },
+            drain = {
+                events += "drain"
+                SecondaryReplayDrainResult(true, 1, 0, 0)
+            },
+            resume = { events += "resume"; true },
+            live = { events += "live"; 42 }
+        )
+
+        assertEquals(42, value)
+        assertEquals(listOf("pause", "drain", "resume", "live"), events)
+    }
+
+    @Test
+    fun replayFailureNeverPerformsLiveReadAndRestoresFallback() {
+        val events = mutableListOf<String>()
+        var live = false
+
+        val error = assertFailsWith<IllegalStateException> {
+            SecondaryLiveCycleGate.run(
+                pause = { events += "pause"; true },
+                drain = {
+                    events += "drain"
+                    SecondaryReplayDrainResult(false, 0, 0, 0, "receipt commit failed")
+                },
+                resume = { events += "resume"; true },
+                live = { live = true }
+            )
+        }
+
+        assertTrue(error.message!!.contains("receipt commit failed"))
+        assertFalse(live)
+        assertEquals(listOf("pause", "drain", "resume"), events)
     }
 
     @Test

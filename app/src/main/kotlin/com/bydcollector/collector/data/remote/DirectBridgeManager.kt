@@ -33,9 +33,10 @@ object DirectBridgeManager {
         }
         try {
             cancellation.throwIfCancelled()
-            //rechecks under the launch lock so concurrent callers cannot replace a correct fresh helper
-            if (helper.ownerMode() == ownerMode) {
-                return DirectBridgeResult(ok = true, message = "Direct helper already running in ${ownerMode.name} mode")
+            // Stream desire is reconciled through DirectStreamController. A live protocol helper
+            // must not be killed merely because its legacy owner-mode label differs.
+            if (helper.isAlive()) {
+                return DirectBridgeResult(ok = true, message = "Direct helper already running")
             }
 
             val launch = adbClient.execShell(launchCommand(context, ownerMode), timeoutMs = 15_000)
@@ -54,8 +55,8 @@ object DirectBridgeManager {
                     throw AdbOperationCancelledException()
                 }
                 cancellation.throwIfCancelled()
-                if (helper.ownerMode() == ownerMode) {
-                    return DirectBridgeResult(ok = true, message = "Direct helper started in ${ownerMode.name} mode")
+                if (helper.isAlive()) {
+                    return DirectBridgeResult(ok = true, message = "Direct helper started")
                 }
             }
             return DirectBridgeResult(ok = false, message = "Direct helper did not register Binder service after launch")

@@ -9,6 +9,42 @@ import kotlin.test.assertTrue
 
 class StorageCutoverRecoveryTest {
     @Test
+    fun renamedSecondaryTargetCompletesForwardOrRestoresExactLegacySource() {
+        val sourceName = "bydcollector_debug_round_robin.db"
+        val targetName = "bydcollector_secondary.db"
+        val expectedSource = setOf(sourceName, "$sourceName-wal")
+        val completed = StorageCutoverRecovery.Snapshot(
+            phase = StorageCutoverRecovery.PHASE_VERIFYING,
+            sourceFormat = StorageFormat.COMPACT_V2,
+            activeFormat = StorageFormat.COMPACT_V2,
+            activeDatabaseExists = true,
+            activeQuickCheck = true,
+            archivedDatabasePresent = true,
+            archivedFormat = StorageFormat.UNKNOWN,
+            archivedQuickCheck = false,
+            archivedSidecarNames = expectedSource,
+            expectedSidecarNames = expectedSource,
+            unknownArchiveFiles = false,
+            manual = true,
+            activeDatabaseName = targetName,
+            activeSidecarNames = setOf(targetName),
+            sourceDatabaseName = sourceName
+        )
+
+        assertEquals(StorageCutoverRecovery.Action.COMPLETE_FORWARD, StorageCutoverRecovery.decide(completed))
+        assertEquals(
+            StorageCutoverRecovery.Action.RESTORE_ARCHIVE,
+            StorageCutoverRecovery.decide(
+                completed.copy(
+                    activeFormat = StorageFormat.UNKNOWN,
+                    activeQuickCheck = false,
+                    activeSidecarNames = setOf(targetName, "$targetName-wal")
+                )
+            )
+        )
+    }
+
+    @Test
     fun automaticUnknownJournalFailsClosedButManualArchiveCanFinishWithWarning() {
         val base = StorageCutoverRecovery.Snapshot(
             phase = StorageCutoverRecovery.PHASE_VERIFYING,

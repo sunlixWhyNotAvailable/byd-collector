@@ -34,9 +34,9 @@ class DbMaintenanceModelsTest {
     }
 
     @Test
-    fun debugArchiveStepsDescribeRoundRobinOnly() {
-        assertEquals("Зупиняємо round-robin збір", DbMaintenanceOperation.DEBUG_ARCHIVE.stepsUk.first())
-        assertEquals("Restoring round-robin collection", DbMaintenanceOperation.DEBUG_ARCHIVE.stepsEn.last())
+    fun debugArchiveStepsDescribeSecondaryCollectionOnly() {
+        assertEquals("Зупиняємо вторинний збір", DbMaintenanceOperation.DEBUG_ARCHIVE.stepsUk.first())
+        assertEquals("Restoring secondary collection", DbMaintenanceOperation.DEBUG_ARCHIVE.stepsEn.last())
     }
 
     @Test

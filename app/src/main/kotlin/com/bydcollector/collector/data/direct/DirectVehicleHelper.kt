@@ -24,6 +24,9 @@ interface DirectVehicleHelper {
             )
         )
     }
+
+    /** Dedicated secondary stream; scalar/test helpers retain compatible readBatch behavior. */
+    fun readSecondaryBatch(entries: List<DirectFidEntry>): DirectHelperBatchResult = readBatch(entries)
 }
 
 enum class DirectHelperOwnerMode(val protocolValue: Int) {

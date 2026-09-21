@@ -13,6 +13,22 @@ class BydCollectorStringsTest {
     }
 
     @Test
+    fun secondaryCollectionCopyMatchesApprovedPreviewWithoutRenamingTab() {
+        val uk = strings(UiLanguage.UK)
+        val en = strings(UiLanguage.EN)
+        assertEquals("Всі дані", uk.allTab)
+        assertEquals("All data", en.allTab)
+        assertEquals("Вторинний збір додаткових параметрів.", uk.allSubtitle)
+        assertEquals("Secondary collection of additional parameters.", en.allSubtitle)
+        assertEquals("Архівація вторинної бази", uk.archiveDebugDatabase)
+        assertEquals("Archive secondary database", en.archiveDebugDatabase)
+        assertEquals("%s: основна %s + вторинна %s + поїздки %s", uk.activeDatabaseSizeTemplate)
+        assertEquals("%s: main %s + secondary %s + trips %s", en.activeDatabaseSizeTemplate)
+        assertEquals("Буде тимчасово зупинено лише вторинний збір. Основний збір, MQTT та InfluxDB продовжать роботу.", uk.dbMaintenanceDebugStopWarning)
+        assertEquals("Only secondary collection will stop temporarily. Main collection, MQTT, and InfluxDB will continue running.", en.dbMaintenanceDebugStopWarning)
+    }
+
+    @Test
     fun headerLanguageLabelsStayFixedInBothLocalizations() {
         UiLanguage.entries.forEach { language ->
             assertEquals("Укр", strings(language).uk)
@@ -147,7 +163,7 @@ class BydCollectorStringsTest {
         val en = strings(UiLanguage.EN)
 
         assertEquals("Поточні бази", uk.activeDatabase)
-        assertEquals("%s: основна %s + тестова %s + поїздки %s", uk.activeDatabaseSizeTemplate)
+        assertEquals("%s: основна %s + вторинна %s + поїздки %s", uk.activeDatabaseSizeTemplate)
         assertEquals("Перехід основної бази відкладено до ручної архівації.", uk.mainStorageCutoverDeferred)
         assertEquals("Основна база: %s", uk.mainStorageCutoverErrorTemplate)
         assertEquals("База «Всі дані»: %s", uk.debugStorageCutoverErrorTemplate)
@@ -168,7 +184,7 @@ class BydCollectorStringsTest {
         assertEquals("(%d арх.)", uk.archiveCountShortTemplate)
 
         assertEquals("Active databases", en.activeDatabase)
-        assertEquals("%s: main %s + test %s + trips %s", en.activeDatabaseSizeTemplate)
+        assertEquals("%s: main %s + secondary %s + trips %s", en.activeDatabaseSizeTemplate)
         assertEquals("Main database transition deferred until manual archive.", en.mainStorageCutoverDeferred)
         assertEquals("Main database: %s", en.mainStorageCutoverErrorTemplate)
         assertEquals("All data database: %s", en.debugStorageCutoverErrorTemplate)

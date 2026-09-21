@@ -29,6 +29,7 @@ import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.trips.RoutePoint
 import com.bydcollector.collector.data.trips.TripSession
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
+import com.bydcollector.collector.data.debug.DirectDebugDatabaseResolver
 import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
 import com.bydcollector.collector.influx.InfluxActionResult
@@ -913,6 +914,7 @@ class MainActivity : ComponentActivity() {
                     ArchiveStorageManager(
                         archiveRoot = File(filesDir, "db_archive"),
                         mainDatabaseFile = currentStore().databaseFile(),
+                        // Sharing archive metadata does not read the active secondary database.
                         debugDatabaseFile = getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME),
                         tripsDatabaseFile = getDatabasePath(com.bydcollector.collector.data.trips.TripDatabaseHelper.DATABASE_NAME)
                     ).resolveShareZipFiles(requestedIds)
@@ -1167,11 +1169,15 @@ class MainActivity : ComponentActivity() {
                 val routes = requestedRouteId?.let { id -> mapOf(id to trips.queryRoutePoints(id)) }.orEmpty()
                 val availableCurrentTrip = trips.loadOpenSession()?.let { TripsUiMapper.current(it, requestedLanguage) }
                 val tripsBytes = sqliteFootprintBytes(trips.databaseFile)
-                dashboardUiStateStore.publishDatabaseFootprints(
-                    sqliteFootprintBytes(getDatabasePath(com.bydcollector.collector.data.local.TelemetryDatabaseHelper.DATABASE_NAME)),
-                    sqliteFootprintBytes(getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME)),
-                    tripsBytes
-                )
+                runCatching { sqliteFootprintBytes(DirectDebugDatabaseResolver.databaseFile(this@MainActivity)) }
+                    .getOrNull()
+                    ?.let { debugBytes ->
+                        dashboardUiStateStore.publishDatabaseFootprints(
+                            sqliteFootprintBytes(getDatabasePath(com.bydcollector.collector.data.local.TelemetryDatabaseHelper.DATABASE_NAME)),
+                            debugBytes,
+                            tripsBytes
+                        )
+                    }
                 TripsLoadResult(
                     years = TripsUiMapper.years(groups, requestedLanguage, routes),
                     refreshedRouteId = requestedRouteId,

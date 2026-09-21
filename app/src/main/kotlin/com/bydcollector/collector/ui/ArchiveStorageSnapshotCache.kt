@@ -20,6 +20,7 @@ class ArchiveStorageSnapshotCache(
     private val archiveRoot: File,
     private val mainDatabaseFile: File,
     private val debugDatabaseFile: File,
+    private val debugDatabaseFileProvider: () -> File = { debugDatabaseFile },
     private val tripsDatabaseFile: File = File(mainDatabaseFile.parentFile, TripDatabaseHelper.DATABASE_NAME),
     private val ttlMs: Long = 30_000L,
     private val clock: () -> Long = { SystemClock.elapsedRealtime() },
@@ -28,7 +29,7 @@ class ArchiveStorageSnapshotCache(
         ArchiveStorageManager(
             archiveRoot = archiveRoot,
             mainDatabaseFile = mainDatabaseFile,
-            debugDatabaseFile = debugDatabaseFile,
+            debugDatabaseFile = debugDatabaseFileProvider(),
             tripsDatabaseFile = tripsDatabaseFile
         ).snapshot(limitBytes)
     }
@@ -47,6 +48,7 @@ class ArchiveStorageSnapshotCache(
     fun snapshot(limitBytes: Long, includeDetails: Boolean): ArchiveStorageSnapshotResult {
         val nowMs = clock()
         val requestedLimitBytes = limitBytes
+        val activeDebugError = runCatching { debugDatabaseFileProvider() }.exceptionOrNull()
         var shouldStartScan = false
         var scanGeneration = 0L
         val result = synchronized(lock) {
@@ -61,19 +63,20 @@ class ArchiveStorageSnapshotCache(
                     snapshot = current?.snapshot?.withCurrentActiveDatabases(requestedLimitBytes)
                         ?.visible()
                         ?: lightweightSnapshot(requestedLimitBytes),
-                    pending = false
+                    pending = false,
+                    error = activeDebugError
                 )
                 fresh -> ArchiveStorageSnapshotResult(
                     snapshot = current.snapshot.withCurrentActiveDatabases(requestedLimitBytes).visible(),
                     pending = false,
-                    error = lastError
+                    error = lastError ?: activeDebugError
                 )
                 retryCoolingDown -> ArchiveStorageSnapshotResult(
                     snapshot = current?.snapshot?.withCurrentActiveDatabases(requestedLimitBytes)
                         ?.visible()
                         ?: lightweightSnapshot(requestedLimitBytes),
                     pending = false,
-                    error = lastError
+                    error = lastError ?: activeDebugError
                 )
                 else -> {
                     if (running && pendingForcedScan) {
@@ -89,7 +92,7 @@ class ArchiveStorageSnapshotCache(
                             ?.visible()
                             ?: lightweightSnapshot(requestedLimitBytes),
                         pending = true,
-                        error = lastError
+                        error = lastError ?: activeDebugError
                     )
                 }
             }
@@ -137,7 +140,7 @@ class ArchiveStorageSnapshotCache(
         return ArchiveStorageSnapshot(
             archiveRootPath = archiveRoot.absolutePath,
             mainDatabaseSizeBytes = databaseSize(mainDatabaseFile),
-            debugDatabaseSizeBytes = databaseSize(debugDatabaseFile),
+            debugDatabaseSizeBytes = currentDebugDatabaseSize(),
             tripsDatabaseSizeBytes = databaseSize(tripsDatabaseFile),
             archiveBytes = 0L,
             archiveLimitBytes = limitBytes,
@@ -148,7 +151,7 @@ class ArchiveStorageSnapshotCache(
     private fun ArchiveStorageSnapshot.withCurrentActiveDatabases(limitBytes: Long): ArchiveStorageSnapshot {
         return copy(
             mainDatabaseSizeBytes = databaseSize(mainDatabaseFile),
-            debugDatabaseSizeBytes = databaseSize(debugDatabaseFile),
+            debugDatabaseSizeBytes = currentDebugDatabaseSize(),
             tripsDatabaseSizeBytes = databaseSize(tripsDatabaseFile),
             archiveLimitBytes = limitBytes
         )
@@ -160,6 +163,9 @@ class ArchiveStorageSnapshotCache(
     }
 
     private fun databaseSize(file: File): Long = sqliteFootprintBytes(file)
+
+    private fun currentDebugDatabaseSize(): Long =
+        runCatching { databaseSize(debugDatabaseFileProvider()) }.getOrDefault(0L)
 
     private fun launchScan(requestedLimitBytes: Long, scanGeneration: Long) {
         val scan = Runnable {

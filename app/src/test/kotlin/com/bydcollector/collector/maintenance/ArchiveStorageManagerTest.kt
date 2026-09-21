@@ -133,7 +133,7 @@ class ArchiveStorageManagerTest {
         assertEquals(8L, snapshot.tripsDatabaseSizeBytes)
         assertEquals(main.length() + debug.length() + 7L + 8L, snapshot.activeDatabaseSizeBytes)
         assertEquals(1, snapshot.entries.size)
-        assertTrue(snapshot.entries.single().id.startsWith(ArchiveStorageManager.DEBUG_ARCHIVE_PREFIX))
+        assertTrue(ArchiveStorageManager.isSecondaryArchiveName(snapshot.entries.single().id))
     }
 
     @Test
@@ -145,7 +145,7 @@ class ArchiveStorageManagerTest {
         val oldMain = archive(archiveRoot, "bydcollector_telemetry_20260713_010000.zip", 1_000L)
         val newMain = archive(archiveRoot, "bydcollector_telemetry_20260713_020000.zip", 2_000L)
         val oldDebug = archive(archiveRoot, "bydcollector_debug_round_robin_20260713_010000.zip", 1_500L)
-        val newDebug = archive(archiveRoot, "bydcollector_debug_round_robin_20260713_020000.zip", 2_500L)
+        val newDebug = archive(archiveRoot, "bydcollector_secondary_20260713_020000.zip", 2_500L)
         val manager = ArchiveStorageManager(archiveRoot, main, debug)
 
         assertEquals(2, manager.enforceRetention(limitBytes = 1L))

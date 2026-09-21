@@ -16,6 +16,7 @@ class ArchiveStorageManager(
     private val mainDatabaseFile: File,
     private val debugDatabaseFile: File,
     private val tripsDatabaseFile: File = File(mainDatabaseFile.parentFile, TripDatabaseHelper.DATABASE_NAME),
+    private val debugDatabaseFileProvider: () -> File = { debugDatabaseFile },
     private val clock: () -> Long = { System.currentTimeMillis() },
     private val isRetentionProtected: (String) -> Boolean = { false }
 ) {
@@ -28,7 +29,7 @@ class ArchiveStorageManager(
         return ArchiveStorageSnapshot(
             archiveRootPath = archiveRoot.absolutePath,
             mainDatabaseSizeBytes = sqliteFootprintBytes(mainDatabaseFile),
-            debugDatabaseSizeBytes = sqliteFootprintBytes(debugDatabaseFile),
+            debugDatabaseSizeBytes = sqliteFootprintBytes(debugDatabaseFileProvider()),
             tripsDatabaseSizeBytes = sqliteFootprintBytes(tripsDatabaseFile),
             archiveBytes = entries.sumOf { it.sizeBytes },
             archiveLimitBytes = limitBytes,
@@ -266,7 +267,7 @@ class ArchiveStorageManager(
 
     private fun archiveFamily(name: String): String? = when {
         name.startsWith(MAIN_ARCHIVE_PREFIX) -> MAIN_ARCHIVE_PREFIX
-        name.startsWith(DEBUG_ARCHIVE_PREFIX) -> DEBUG_ARCHIVE_PREFIX
+        isSecondaryArchiveName(name) -> DEBUG_ARCHIVE_FAMILY
         else -> null
     }
 
@@ -308,6 +309,11 @@ class ArchiveStorageManager(
 
     companion object {
         const val MAIN_ARCHIVE_PREFIX = "bydcollector_telemetry_"
-        const val DEBUG_ARCHIVE_PREFIX = "bydcollector_debug_round_robin_"
+        const val DEBUG_ARCHIVE_PREFIX = "bydcollector_secondary_"
+        const val LEGACY_DEBUG_ARCHIVE_PREFIX = "bydcollector_debug_round_robin_"
+        private const val DEBUG_ARCHIVE_FAMILY = "bydcollector_secondary"
+
+        fun isSecondaryArchiveName(name: String): Boolean =
+            name.startsWith(DEBUG_ARCHIVE_PREFIX) || name.startsWith(LEGACY_DEBUG_ARCHIVE_PREFIX)
     }
 }

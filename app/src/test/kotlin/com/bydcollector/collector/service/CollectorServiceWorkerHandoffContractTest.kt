@@ -53,6 +53,7 @@ class CollectorServiceWorkerHandoffContractTest {
         val shutdown = service.substringAfter("private fun stopRuntimeForUserShutdown").substringBefore("private fun finishUserShutdown")
 
         assertTrue(destroy.contains("stopCollection(\"service_destroyed\")"))
+        assertTrue(destroy.contains("DirectStreamController.releaseApp()"))
         assertFalse(destroy.contains("setPollingEnabled(false)"))
         assertTrue(stopCollection.contains("stopMain(reason)"))
         assertTrue(stopCollection.contains("releaseWakeLock()"))
@@ -64,19 +65,18 @@ class CollectorServiceWorkerHandoffContractTest {
     }
 
     @Test
-    fun intentionalMainStopStopsOnlyTheAppGapSpoolOwner() {
+    fun intentionalStopsDisableOnlyTheirStreamAndShutdownStopsHelperProcess() {
         val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
         val stopMain = service.substringAfter("private fun stopMain").substringBefore("private fun exportInfluxAfterNormalizedWrite")
         val stopWorker = stopMain.substringAfter("private fun stopAppGapSpoolHelper")
 
-        assertTrue(stopMain.indexOf("poller.stop()") < stopMain.indexOf("stopAppGapSpoolHelper(reason)"))
+        assertTrue(stopMain.contains("setDesired(CollectorHelperProtocol.STREAM_MAIN, false)"))
+        assertTrue(stopMain.contains("if (reason == \"user_shutdown\") stopAppGapSpoolHelper(reason)"))
         assertTrue(stopWorker.contains("if (reason == \"service_destroyed\") return"))
-        assertTrue(stopWorker.contains("helper.ownerMode() != DirectHelperOwnerMode.APP_GAP_SPOOL"))
-        assertTrue(stopWorker.indexOf("stopDebug(\"helper_owner_handoff\")") < stopWorker.indexOf("helper.requestStop"))
         assertTrue(stopWorker.contains("helper.requestStop(DirectHelperOwnerMode.APP_GAP_SPOOL)"))
-        assertTrue(service.contains("debugOwnerHandoffPending.getAndSet(false)"))
-        assertTrue(service.contains("DirectVehicleHelperClient().ownerMode() != settings.mainHelperOwnerMode()"))
-        assertTrue(service.contains("stopAppGapSpoolHelper(\"database_maintenance\")"))
+        assertFalse(service.contains("debugOwnerHandoffPending"))
+        assertFalse(service.contains("helper_owner_handoff"))
+        assertFalse(service.contains("stopAppGapSpoolHelper(\"database_maintenance\")"))
     }
 
     private fun sourceFile(path: String): File {
