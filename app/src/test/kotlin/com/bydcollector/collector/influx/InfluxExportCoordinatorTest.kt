@@ -2,6 +2,7 @@ package com.bydcollector.collector.influx
 
 import com.bydcollector.collector.ha.HaEndpointProfile
 import com.bydcollector.collector.data.local.Clock
+import com.bydcollector.collector.service.InfluxCycleDemand
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -9,6 +10,189 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class InfluxExportCoordinatorTest {
+    @Test
+    fun staleServiceOwnershipCannotEnterCycleStartOrResume() {
+        val store = FakeInfluxStore(listOf(row(10, "soc")))
+        val client = FakeInfluxClient()
+        val coordinator = coordinator(store, client)
+        val before = store.influxExportState()
+        var serviceGeneration = 1
+        val submittedGeneration = serviceGeneration
+        val isCurrent = { submittedGeneration == serviceGeneration }
+        serviceGeneration++ // The executor's last admission check already passed.
+        coordinator.cancelInFlight()
+
+        assertTrue(coordinator.runOneCycle(isCurrent = isCurrent).ok)
+        assertTrue(coordinator.startExport(isCurrent = isCurrent).ok)
+        assertTrue(coordinator.resumeExport(isCurrent = isCurrent).ok)
+        assertFalse(coordinator.sessionFrozen)
+        assertEquals(0, store.ensureCalls)
+        assertEquals(0, store.summaryCalls)
+        assertTrue(client.writtenLines.isEmpty())
+        assertEquals(before, store.influxExportState())
+    }
+
+    @Test
+    fun cancellationDuringQueueReadCannotBeAdoptedAsANewPass() {
+        val store = FakeInfluxStore(listOf(row(10, "soc")))
+        val client = FakeInfluxClient()
+        val coordinator = coordinator(store, client)
+        val before = store.influxExportState()
+        store.afterPendingSummary = { coordinator.cancelInFlight() }
+
+        assertTrue(coordinator.runOneCycle(force = true).ok)
+        assertTrue(client.writtenLines.isEmpty())
+        assertEquals(0L, store.cursor("soc").lastExportedHistoryId)
+        assertEquals(before, store.influxExportState())
+
+        store.afterPendingSummary = null
+        assertTrue(coordinator.startExport().ok)
+        assertEquals(10L, store.cursor("soc").lastExportedHistoryId)
+    }
+
+    @Test
+    fun serviceOwnershipLossDuringPreparationStopsStartAndResume() {
+        for (resume in listOf(false, true)) {
+            val store = FakeInfluxStore(listOf(row(10, "soc")))
+            val client = FakeInfluxClient()
+            val coordinator = coordinator(store, client)
+            val before = store.influxExportState()
+            var current = true
+            store.afterPendingSummary = { current = false }
+
+            val result = if (resume) coordinator.resumeExport(isCurrent = { current })
+            else coordinator.startExport(isCurrent = { current })
+
+            assertTrue(result.ok)
+            assertTrue(client.writtenLines.isEmpty())
+            assertEquals(0L, store.cursor("soc").lastExportedHistoryId)
+            assertEquals(before, store.influxExportState())
+        }
+    }
+
+    @Test
+    fun serviceOwnershipLossAfterHttpStillPersistsAcknowledgedCursor() {
+        val store = FakeInfluxStore((1L..4L).map { row(it, "soc") })
+        val client = ScriptedInfluxClient(
+            InfluxActionResult.fail("influx_http_error", "partial write: field type conflict", httpStatus = 400),
+            InfluxActionResult.ok(),
+            InfluxActionResult.ok()
+        )
+        val coordinator = coordinator(store, client)
+        var current = true
+        client.afterWrite = { call -> if (call == 2) current = false }
+
+        assertTrue(coordinator.runOneCycle(isCurrent = { current }).ok)
+        assertEquals(2, client.writeCalls)
+        assertEquals(2L, store.cursor("soc").lastExportedHistoryId)
+        assertEquals(2L, store.influxExportState().exportedRowsTotal)
+        assertEquals(2L, store.influxExportState().pendingRows)
+    }
+
+    @Test
+    fun newHistoryAfterFinalSummaryIsExportedByRetainedDemand() {
+        val store = FakeInfluxStore(listOf(row(10, "soc")))
+        val client = FakeInfluxClient()
+        val coordinator = coordinator(store, client)
+        val demand = InfluxCycleDemand()
+        val first = requireNotNull(demand.tryAcquire(revision = 1, generation = 1))
+        var inserted = false
+        store.afterPendingSummary = { summary ->
+            if (!inserted && summary.rows == 0L) {
+                inserted = true
+                store.addRow(row(11, "soc"))
+                demand.signal()
+            }
+        }
+
+        assertTrue(coordinator.runOneCycle().ok)
+        assertEquals(0L, store.influxExportState().pendingRows) // Snapshot predates row 11.
+        assertEquals(null, coordinator.retryDelayMs())
+        assertTrue(demand.settle(first, represented = true).followUpDemand)
+        val second = requireNotNull(demand.tryAcquire(revision = 2, generation = 1))
+        assertTrue(coordinator.runOneCycle().ok)
+        assertFalse(demand.settle(second, represented = true).followUpDemand)
+        assertEquals(11L, store.cursor("soc").lastExportedHistoryId)
+        assertEquals(2, client.writtenLines.size)
+        assertEquals(4, store.summaryCalls)
+    }
+
+    @Test
+    fun successfulCycleAndRepeatedSchedulingUseOnlyTwoAggregates() {
+        val store = FakeInfluxStore((1L..350L).map { row(it, "soc") })
+        val coordinator = coordinator(store, FakeInfluxClient())
+
+        assertTrue(coordinator.runOneCycle().ok)
+        assertEquals(50L, store.influxExportState().pendingRows)
+        assertEquals(2, store.summaryCalls)
+        val ensuresAfterCycle = store.ensureCalls
+        repeat(5) { assertEquals(1_000L, coordinator.retryDelayMs()) }
+        assertEquals(2, store.summaryCalls)
+        assertEquals(ensuresAfterCycle, store.ensureCalls)
+    }
+
+    @Test
+    fun earlyBackoffAndSchedulingDoNoQueueWorkAndPreserveSnapshot() {
+        val store = FakeInfluxStore(listOf(row(10, "soc")))
+        store.setNextRetryAt("2026-06-15T12:01:00Z")
+        val before = store.influxExportState()
+        val client = FakeInfluxClient()
+        val coordinator = coordinator(store, client)
+
+        repeat(5) {
+            assertTrue(coordinator.runOneCycle().ok)
+            assertEquals(60_000L, coordinator.retryDelayMs())
+        }
+        assertEquals(0, store.summaryCalls)
+        assertEquals(0, store.ensureCalls)
+        assertTrue(store.pendingBatchLimits.isEmpty())
+        assertTrue(client.writtenLines.isEmpty())
+        assertEquals(before, store.influxExportState())
+    }
+
+    @Test
+    fun failedCycleSchedulesWithoutRecountingOrAdvancingCursors() {
+        val store = FakeInfluxStore(listOf(row(10, "soc")))
+        val client = FakeInfluxClient(writeResult = InfluxActionResult.fail("influx_error", "offline"))
+        val coordinator = coordinator(store, client)
+
+        assertFalse(coordinator.runOneCycle().ok)
+        assertEquals(2, store.summaryCalls)
+        assertEquals(30_000L, coordinator.retryDelayMs())
+        assertTrue(coordinator.runOneCycle().ok)
+        assertEquals(2, store.summaryCalls)
+        assertEquals(0L, store.cursor("soc").lastExportedHistoryId)
+        assertEquals(1, client.writtenLines.size)
+        assertEquals("offline", store.influxExportState().lastError)
+    }
+
+    @Test
+    fun categoryChangesPreserveDivergentCursorsAndReadEarlierNewlyEnabledHistory() {
+        val store = FakeInfluxStore(listOf(
+            row(5, "speed_kmh").copy(category = "motion"),
+            row(10, "soc"), row(11, "soc"),
+            row(20, "speed_kmh").copy(category = "motion")
+        ))
+        store.updateInfluxCursorSuccess("soc", 10, "2026-06-15T12:00:00Z")
+        var liveConfig = config()
+        val client = FakeInfluxClient()
+        val coordinator = InfluxExportCoordinator(store, client, { liveConfig }, FakeClock())
+
+        assertTrue(coordinator.runOneCycle().ok)
+        assertEquals(11L, store.cursor("soc").lastExportedHistoryId)
+        assertEquals(0L, store.cursor("speed_kmh").lastExportedHistoryId)
+        store.addRow(row(12, "soc"))
+        liveConfig = liveConfig.copy(enabledCategories = setOf("motion"))
+        assertTrue(coordinator.runOneCycle().ok)
+        assertEquals(20L, store.cursor("speed_kmh").lastExportedHistoryId)
+        assertEquals(11L, store.cursor("soc").lastExportedHistoryId)
+        assertEquals(2, client.writtenLines[1].size)
+        liveConfig = liveConfig.copy(enabledCategories = setOf("battery", "motion"))
+        assertTrue(coordinator.runOneCycle().ok)
+        assertEquals(12L, store.cursor("soc").lastExportedHistoryId)
+        assertEquals(listOf(1, 2, 1), client.writtenLines.map { it.size })
+    }
+
     @Test
     fun failedWriteDoesNotAdvanceCursor() {
         val store = FakeInfluxStore(rows = listOf(row(id = 10, fieldKey = "soc")))
@@ -1023,6 +1207,9 @@ class InfluxExportCoordinatorTest {
         val cursorErrors = linkedMapOf<String, String>()
         val pendingBatchLimits = mutableListOf<Int>()
         val influxEvents = mutableListOf<InfluxEvent>()
+        var summaryCalls = 0
+        var ensureCalls = 0
+        var afterPendingSummary: ((InfluxPendingSummary) -> Unit)? = null
         private var state = InfluxExportStateSnapshot(
             status = "stopped",
             mode = null,
@@ -1036,10 +1223,12 @@ class InfluxExportCoordinatorTest {
         )
 
         override fun ensureInfluxCursors(fieldKeys: Set<String>) {
+            ensureCalls++
             fieldKeys.forEach { fieldKey -> cursors.putIfAbsent(fieldKey, InfluxCursor(fieldKey, 0)) }
         }
 
         override fun pendingInfluxSummary(fieldKeys: Set<String>): InfluxPendingSummary {
+            summaryCalls++
             ensureInfluxCursors(fieldKeys)
             val pending = rows.filter { row ->
                 fieldKeys.contains(row.fieldKey) && row.id > cursor(row.fieldKey).lastExportedHistoryId
@@ -1047,7 +1236,7 @@ class InfluxExportCoordinatorTest {
             return InfluxPendingSummary(
                 rows = pending.size.toLong(),
                 oldestObservedAt = pending.minByOrNull { it.id }?.observedAt
-            )
+            ).also { afterPendingSummary?.invoke(it) }
         }
 
         override fun pendingInfluxRows(fieldKeys: Set<String>, limit: Int): List<InfluxPendingHistoryRow> {

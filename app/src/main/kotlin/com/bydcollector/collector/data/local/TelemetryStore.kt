@@ -84,6 +84,7 @@ class TelemetryStore(
     private val directImporter = DirectCatalogImporter(helper)
     private val ecImporter = EcDatabaseImporter(context, helper, clock)
     private val normalizedStore = NormalizedStateStore(helper, clock)
+    private val influxCursorInitializer = InfluxCursorInitializer()
     private val compactV2 by lazy { helper.isCompactV2() }
     private val decodedValueIds = Collections.synchronizedMap(
         object : LinkedHashMap<String, Long>(DECODED_VALUE_CACHE_SIZE, 0.75f, true) {
@@ -95,6 +96,7 @@ class TelemetryStore(
     @Volatile private var normalizedCatalogEnsured = false
 
     override fun close() {
+        influxCursorInitializer.clear()
         helper.close()
     }
 
@@ -708,11 +710,10 @@ class TelemetryStore(
         }
 
     override fun ensureInfluxCursors(fieldKeys: Set<String>) {
-        if (fieldKeys.isEmpty()) return
-        val db = helper.writableDatabase
         //creates one cursor per normalized field so enabling categories later does not reset old exports
-        fieldKeys.forEach { fieldKey ->
-            db.insertWithOnConflict(
+        influxCursorInitializer.ensure(fieldKeys) { fieldKey ->
+            val db = helper.writableDatabase
+            val inserted = db.insertWithOnConflict(
                 "influx_export_cursor",
                 null,
                 ContentValues().apply {
@@ -721,6 +722,14 @@ class TelemetryStore(
                 },
                 SQLiteDatabase.CONFLICT_IGNORE
             )
+            if (inserted == -1L) {
+                // IGNORE can mean an existing row; never cache an unconfirmed failed insert.
+                val exists = db.rawQuery(
+                    "SELECT 1 FROM influx_export_cursor WHERE field_key = ? LIMIT 1",
+                    arrayOf(fieldKey)
+                ).use { it.moveToFirst() }
+                check(exists) { "Cannot initialize Influx cursor for $fieldKey" }
+            }
         }
     }
 

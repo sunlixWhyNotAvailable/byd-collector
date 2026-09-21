@@ -7,6 +7,22 @@ import kotlin.test.assertTrue
 
 class TelemetryStoreInfluxContractTest {
     @Test
+    fun influxCursorInitializationIsStoreScopedAndConfirmsIgnoredInserts() {
+        val source = sourceFile("com/bydcollector/collector/data/local/TelemetryStore.kt").readText()
+        val ensure = source.substringAfter("override fun ensureInfluxCursors")
+            .substringBefore("override fun pendingInfluxSummary")
+        val close = source.substringAfter("override fun close()")
+            .substringBefore("fun checkpointForArchive")
+
+        assertTrue(source.contains("private val influxCursorInitializer = InfluxCursorInitializer()"))
+        assertTrue(ensure.contains("influxCursorInitializer.ensure(fieldKeys)"))
+        assertTrue(ensure.contains("if (inserted == -1L)"))
+        assertTrue(ensure.contains("SELECT 1 FROM influx_export_cursor WHERE field_key = ? LIMIT 1"))
+        assertTrue(ensure.contains("check(exists)"))
+        assertTrue(close.contains("influxCursorInitializer.clear()"))
+    }
+
+    @Test
     fun influxBatchUsesOneGlobalCursorBoundedHistoryQuery() {
         val source = sourceFile("com/bydcollector/collector/data/local/TelemetryStore.kt").readText()
         val query = source.substringAfter("override fun pendingInfluxRows")

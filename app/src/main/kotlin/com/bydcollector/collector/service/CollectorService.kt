@@ -152,8 +152,10 @@ class CollectorService : Service() {
     private val influxQueueLock = Any()
     private var influxExecutor: ExecutorService = namedSingleThreadExecutor("byd-influx")
     private val influxRequestQueued = AtomicBoolean(false)
+    private val influxCycleDemand = InfluxCycleDemand()
+    private var influxRequestRevision = 0L
     private val influxWorkInFlight = AtomicInteger(0)
-    private var influxRetryScheduled = false
+    @Volatile private var influxRetryScheduled = false
     private var influxRetryAtElapsedMs: Long? = null
     @Volatile private var influxWorkQueuedAtElapsedMs: Long? = null
     private val influxRuntimeDiagnostics = InfluxRuntimeDiagnosticsProcess.instance
@@ -1612,12 +1614,16 @@ class CollectorService : Service() {
         //exports history after normalized changes because influx is the long-term time-series channel
         if (summary.historyInsertedCount <= 0) return
         if (!settings.isInfluxEnabled()) return
-        requestInfluxCycle()
+        requestInfluxCycle(newData = true)
     }
 
-    private fun requestInfluxCycle() {
+    private fun requestInfluxCycle(newData: Boolean = false) {
         if (!settings.isInfluxEnabled()) {
             recordInfluxGate("disabled")
+            return
+        }
+        if (influxConnection.stopping) {
+            recordInfluxGate("stopped")
             return
         }
         if (maintenanceBlocksRuntimeStart()) {
@@ -1628,69 +1634,76 @@ class CollectorService : Service() {
             recordInfluxGate("missing_coordinator")
             return
         }
-        val submittedGeneration = synchronized(influxQueueLock) {
-            if (!influxRequestQueued.compareAndSet(false, true)) {
+        val request = synchronized(influxQueueLock) {
+            if (newData) influxCycleDemand.signal()
+            if (influxRetryScheduled || influxWorkInFlight.get() > 0 || influxRequestQueued.get()) {
                 recordInfluxGate(
                     "singleflight_occupied",
-                    influxDiagnosticStateDetails(influxWorkGeneration.get(), queued = true)
+                    influxDiagnosticStateDetails(
+                        influxWorkGeneration.get(),
+                        queued = influxRequestQueued.get()
+                    )
                 )
                 return
             }
+            influxRequestRevision += 1
+            val acquired = checkNotNull(
+                influxCycleDemand.tryAcquire(influxRequestRevision, influxWorkGeneration.get())
+            )
+            influxRequestQueued.set(true)
             influxWorkQueuedAtElapsedMs = SystemClock.elapsedRealtime()
-            influxWorkGeneration.get()
+            acquired
         }
         recordInfluxDiagnostic(
             com.bydcollector.collector.influx.InfluxDiagnosticEvent(
                 "influx_work_queued",
-                influxDiagnosticStateDetails(submittedGeneration, queued = true)
+                influxDiagnosticStateDetails(request.generation, queued = true)
             )
         )
-        val accepted = executeInflux("influx_cycle_error") {
-            try {
-                influxCoordinator.runOneCycle(force = false)
-            } finally {
-                val isCurrentGeneration = synchronized(influxQueueLock) {
-                    val current = submittedGeneration == influxWorkGeneration.get()
-                    if (current) {
-                        influxRequestQueued.set(false)
-                        influxWorkQueuedAtElapsedMs = null
-                    }
-                    current
-                }
-                recordInfluxDiagnostic(
-                    com.bydcollector.collector.influx.InfluxDiagnosticEvent(
-                        "influx_work_settled",
-                        influxDiagnosticStateDetails(
-                            workGeneration = if (isCurrentGeneration && !influxRequestQueued.get()) {
-                                null
-                            } else {
-                                submittedGeneration
-                            },
-                            queued = if (isCurrentGeneration) false else influxRequestQueued.get()
-                        )
-                    )
-                )
-                postInfluxRetrySchedule(submittedGeneration)
-            }
+        val coordinator = influxCoordinator
+        val isCurrentRequest = {
+            request.generation == influxWorkGeneration.get() && influxCoordinator === coordinator
         }
-        val rejectedForCurrentGeneration = if (!accepted) synchronized(influxQueueLock) {
-            val current = submittedGeneration == influxWorkGeneration.get()
-            if (current) {
-                influxRequestQueued.set(false)
-                influxWorkQueuedAtElapsedMs = null
-            }
-            current
-        } else {
-            false
+        val represented = AtomicBoolean(false)
+        val accepted = executeInflux(
+            errorCategory = "influx_cycle_error",
+            expectedGeneration = request.generation,
+            afterSettled = { settleInfluxCycle(request, represented.get()) }
+        ) {
+            represented.set(true)
+            coordinator.runOneCycle(force = false, isCurrent = isCurrentRequest)
         }
         if (!accepted) {
             recordInfluxGate(
                 "queue_rejected",
                 influxDiagnosticStateDetails(
-                    workGeneration = if (rejectedForCurrentGeneration) null else submittedGeneration,
+                    workGeneration = request.generation.takeUnless { it == influxWorkGeneration.get() },
                     queued = influxRequestQueued.get()
                 )
             )
+        }
+    }
+
+    private fun settleInfluxCycle(request: InfluxCycleRequest, represented: Boolean) {
+        val settlement = synchronized(influxQueueLock) {
+            val result = influxCycleDemand.settle(request, represented)
+            if (result.current) {
+                influxRequestQueued.set(false)
+                influxWorkQueuedAtElapsedMs = null
+            }
+            result
+        }
+        recordInfluxDiagnostic(
+            com.bydcollector.collector.influx.InfluxDiagnosticEvent(
+                "influx_work_settled",
+                influxDiagnosticStateDetails(
+                    workGeneration = request.generation.takeUnless { settlement.current },
+                    queued = influxRequestQueued.get()
+                )
+            )
+        )
+        if (settlement.current && represented) {
+            postInfluxRetrySchedule(request.generation, request.revision)
         }
     }
 
@@ -1717,8 +1730,11 @@ class CollectorService : Service() {
         influxRuntimeDiagnostics.gate(reason, details + ("runtime_id" to influxDiagnosticRuntimeId))
     }
 
-    private fun postInfluxRetrySchedule(submittedGeneration: Long) {
-        if (submittedGeneration != influxWorkGeneration.get()) {
+    private fun postInfluxRetrySchedule(
+        submittedGeneration: Long,
+        requestRevision: Long
+    ) {
+        if (!isCurrentInfluxRequest(submittedGeneration, requestRevision)) {
             recordInfluxGate(
                 "stale_generation",
                 influxDiagnosticStateDetails(submittedGeneration, queued = influxRequestQueued.get())
@@ -1727,15 +1743,44 @@ class CollectorService : Service() {
         }
         val delayMs = runCatching { influxCoordinator.retryDelayMs() }.getOrNull()
         mainHandler.post {
-            if (submittedGeneration != influxWorkGeneration.get()) {
+            val applied = synchronized(influxQueueLock) {
+                when (
+                    influxFollowUpAction(
+                        currentRequest = submittedGeneration == influxWorkGeneration.get() &&
+                            requestRevision == influxRequestRevision,
+                        retryDelayMs = delayMs,
+                        followUpDemand = influxCycleDemand.pending
+                    )
+                ) {
+                    InfluxFollowUpAction.IGNORE_STALE -> false
+                    InfluxFollowUpAction.SCHEDULE_RETRY -> {
+                        scheduleInfluxRetry(delayMs)
+                        true
+                    }
+                    InfluxFollowUpAction.REQUEST_CYCLE -> {
+                        requestInfluxCycle()
+                        true
+                    }
+                    InfluxFollowUpAction.IDLE -> {
+                        scheduleInfluxRetry(null)
+                        true
+                    }
+                }
+            }
+            if (!applied) {
                 recordInfluxGate(
                     "stale_generation",
                     influxDiagnosticStateDetails(submittedGeneration, queued = influxRequestQueued.get())
                 )
                 return@post
             }
-            scheduleInfluxRetry(delayMs)
             stopIfNoActiveRuntime()
+        }
+    }
+
+    private fun isCurrentInfluxRequest(generation: Long, revision: Long): Boolean {
+        return synchronized(influxQueueLock) {
+            generation == influxWorkGeneration.get() && revision == influxRequestRevision
         }
     }
 
@@ -2433,18 +2478,53 @@ class CollectorService : Service() {
             return
         }
         influxConnection.reserve()
+        settings.setInfluxEnabled(true)
+        if (!clearManualStop) {
+            val workActive = influxRequestQueued.get() || influxWorkInFlight.get() > 0
+            when (
+                influxRecoveryAction(
+                    sessionInitialized = influxCoordinator.sessionFrozen,
+                    workActive = workActive,
+                    retryScheduled = influxRetryScheduled
+                )
+            ) {
+                InfluxRecoveryAction.PRESERVE -> return
+                InfluxRecoveryAction.REQUEST_CYCLE -> {
+                    requestInfluxCycle()
+                    return
+                }
+                InfluxRecoveryAction.INITIALIZE -> Unit
+            }
+        }
         advanceInfluxGeneration()
         if (clearManualStop) settings.setInfluxManuallyStopped(false)
-        settings.setInfluxEnabled(true)
         setInfluxRuntime(RuntimeActionStatus.STARTING)
         publishDashboardRuntimeFlags()
         ensureForegroundForChannel("Influx export running")
         val submittedGeneration = influxWorkGeneration.get()
-        val accepted = executeInflux("influx_start_error") {
-            try {
-                if (clearManualStop) influxCoordinator.startExport() else influxCoordinator.resumeExport()
-            } finally {
-                postInfluxRetrySchedule(submittedGeneration)
+        val requestRevision = synchronized(influxQueueLock) {
+            influxRequestRevision += 1
+            influxRequestRevision
+        }
+        val coordinator = influxCoordinator
+        val isCurrentRequest = {
+            submittedGeneration == influxWorkGeneration.get() && influxCoordinator === coordinator
+        }
+        val represented = AtomicBoolean(false)
+        val accepted = executeInflux(
+            errorCategory = "influx_start_error",
+            expectedGeneration = submittedGeneration,
+            afterSettled = {
+                if (represented.get()) {
+                    postInfluxRetrySchedule(submittedGeneration, requestRevision)
+                }
+            }
+        ) {
+            represented.set(true)
+            if (clearManualStop) {
+                coordinator.startExport(isCurrent = isCurrentRequest)
+            } else {
+                coordinator.resumeExport(isCurrent = isCurrentRequest)
             }
         }
         if (!accepted) stopIfNoActiveRuntime()
@@ -3114,6 +3194,8 @@ class CollectorService : Service() {
         activateTailscaleOnFailure: Boolean = true,
         isStop: Boolean = false,
         afterComplete: (() -> Unit)? = null,
+        afterSettled: (() -> Unit)? = null,
+        expectedGeneration: Long? = null,
         action: () -> InfluxActionResult
     ): Boolean {
         if (!isStop && settings.isInfluxEnabled() && !maintenanceBlocksRuntimeStart()) influxConnection.reserve()
@@ -3126,7 +3208,8 @@ class CollectorService : Service() {
             generation = influxWorkGeneration,
             lowPriority = true,
             canExecute = {
-                !maintenanceBlocksRuntimeStart() &&
+                isInfluxSubmissionCurrent(expectedGeneration, influxWorkGeneration.get()) &&
+                    !maintenanceBlocksRuntimeStart() &&
                     (if (isStop) !settings.isInfluxEnabled() else settings.isInfluxEnabled() && !influxConnection.stopping)
             },
             action = action,
@@ -3145,9 +3228,17 @@ class CollectorService : Service() {
                 scheduleIntegrationDashboardRefresh()
                 afterComplete?.invoke()
             },
-            onSettled = ::settleInfluxWork,
+            onSettled = {
+                try {
+                    settleInfluxWork()
+                } finally {
+                    afterSettled?.invoke()
+                }
+            },
             onFailedAction = {
-                if (isStop || (settings.isInfluxEnabled() && !influxConnection.stopping)) {
+                if (isInfluxSubmissionCurrent(expectedGeneration, influxWorkGeneration.get()) &&
+                    (isStop || (settings.isInfluxEnabled() && !influxConnection.stopping))
+                ) {
                     setInfluxRuntime(RuntimeActionStatus.ERROR)
                     if (activateTailscaleOnFailure) maybeActivateTailscaleAfterHaFailure("influx")
                 }
@@ -3184,6 +3275,8 @@ class CollectorService : Service() {
         val generation = synchronized(influxQueueLock) {
             influxRequestQueued.set(false)
             influxWorkQueuedAtElapsedMs = null
+            influxCycleDemand.invalidate()
+            influxRequestRevision += 1
             influxWorkGeneration.incrementAndGet()
         }
         if (::influxCoordinator.isInitialized) influxCoordinator.cancelInFlight()

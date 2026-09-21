@@ -74,12 +74,14 @@ class InfluxExportCoordinator(
         cancellationGeneration.incrementAndGet()
     }
 
-    fun startExport(): InfluxActionResult {
+    fun startExport(isCurrent: () -> Boolean = { true }): InfluxActionResult {
         //a real batch write is the only start success signal; a separate HTTP test caused a false-success flicker
-        return runOneCycle(force = true)
+        return runOneCycle(force = true, isCurrent = isCurrent)
     }
 
-    fun resumeExport(): InfluxActionResult {
+    fun resumeExport(isCurrent: () -> Boolean = { true }): InfluxActionResult {
+        val pass = ExportPass(cancellationGeneration.get(), isCurrent)
+        if (!isCurrent()) return InfluxActionResult.ok("influx work superseded")
         val liveConfig = configProvider()
         if (sessionConnection == null) {
             validate(liveConfig)?.let {
@@ -97,6 +99,7 @@ class InfluxExportCoordinator(
         store.ensureInfluxCursors(fieldKeys)
         val pending = store.pendingInfluxSummary(fieldKeys)
         val state = store.influxExportState()
+        if (pass.cancelled()) return InfluxActionResult.ok("influx work superseded")
         val preservesFailure = pending.rows > 0L && state.status == STATUS_BACKOFF && !state.nextRetryAt.isNullOrBlank()
         store.updateInfluxExportState(
             status = when {
@@ -128,10 +131,7 @@ class InfluxExportCoordinator(
             diagnosticGate("no_categories")
             return null
         }
-        if (store.pendingInfluxSummary(fieldKeys).rows == 0L) {
-            diagnosticGate("no_work")
-            return null
-        }
+        // The completed cycle already persisted its deadline; scheduling must not rescan history.
         val nextRetryAt = store.influxExportState().nextRetryAt ?: return null
         return runCatching {
             val now = OffsetDateTime.parse(clock.nowIso()).toInstant().toEpochMilli()
@@ -164,7 +164,10 @@ class InfluxExportCoordinator(
         }
     }
 
-    fun runOneCycle(force: Boolean = false): InfluxActionResult {
+    fun runOneCycle(force: Boolean = false, isCurrent: () -> Boolean = { true }): InfluxActionResult {
+        // Capture before config/SQL; old work must not adopt a cancellation generation advanced during preparation.
+        val pass = ExportPass(cancellationGeneration.get(), isCurrent)
+        if (!isCurrent()) return InfluxActionResult.ok("influx work superseded")
         val liveConfig = configProvider()
         if (sessionConnection == null) {
             validate(liveConfig)?.let {
@@ -195,29 +198,19 @@ class InfluxExportCoordinator(
             )
             return InfluxActionResult.ok("no fields enabled")
         }
-        store.ensureInfluxCursors(fieldKeys)
-        //counts pending history points from cursors so dashboard queue state is not just the current batch size
-        val pendingBefore = store.pendingInfluxSummary(fieldKeys)
         //honors the short success pacing and the longer persisted failure backoff
         if (!force && !state.nextRetryAt.isNullOrBlank() && !retryDue(state.nextRetryAt, clock.nowIso())) {
             diagnosticGate("backoff", mapOf("retry_deadline" to state.nextRetryAt))
-            val preservesFailure = state.status == STATUS_BACKOFF
-            store.updateInfluxExportState(
-                status = if (preservesFailure) STATUS_BACKOFF else STATUS_SCHEDULED,
-                mode = modeFor(pendingBefore.rows),
-                pendingRows = pendingBefore.rows,
-                oldestPendingAt = pendingBefore.oldestObservedAt,
-                nextRetryAt = state.nextRetryAt,
-                lastSuccessAt = state.lastSuccessAt,
-                lastErrorAt = state.lastErrorAt.takeIf { preservesFailure },
-                lastError = state.lastError.takeIf { preservesFailure },
-                exportedRowsDelta = 0
-            )
+            // Keep the last calculated snapshot/error, rather than rewriting it as a fresh count.
             return InfluxActionResult.ok("influx next attempt pending")
         }
+        store.ensureInfluxCursors(fieldKeys)
+        //counts pending history points from cursors so dashboard queue state is not just the current batch size
+        val pendingBefore = store.pendingInfluxSummary(fieldKeys)
 
         val batchLimit = nextBatchLimit(pendingBefore.rows)
         val rows = store.pendingInfluxRows(fieldKeys, batchLimit)
+        if (pass.cancelled()) return InfluxActionResult.ok("influx work superseded")
         if (rows.isEmpty()) {
             diagnosticGate("no_work")
             store.updateInfluxExportState(
@@ -247,7 +240,6 @@ class InfluxExportCoordinator(
         )
         return try {
             val exportedAt = clock.nowIso()
-            val pass = ExportPass(cancellationGeneration.get())
             var exportFailure: Throwable? = null
             val batch = try {
                 exportRows(config, rows, exportedAt, pass = pass)
@@ -648,7 +640,7 @@ class InfluxExportCoordinator(
         val result: InfluxActionResult
     )
 
-    private inner class ExportPass(private val generation: Long) {
+    private inner class ExportPass(private val generation: Long, private val isCurrent: () -> Boolean) {
         private var writes = 0
         var poisonRows = 0
             private set
@@ -658,6 +650,7 @@ class InfluxExportCoordinator(
 
         fun cancelled(): Boolean = Thread.currentThread().isInterrupted ||
             generation != cancellationGeneration.get() ||
+            !isCurrent() ||
             !configProvider().enabled
 
         fun reserveWrite(): Boolean {
