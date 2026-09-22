@@ -78,6 +78,12 @@ class HelperStreamRuntimeStateTest {
         assertEquals(CollectorHelperProtocol.STATUS_REPLAY_PENDING,
             state.authorizeLive(claim.controllerToken, CollectorHelperProtocol.STREAM_SECONDARY,
                 paused.secondaryEpoch, 2_200))
+        assertEquals(CollectorHelperProtocol.STATUS_OK,
+            state.authorizeReplay(claim.controllerToken, CollectorHelperProtocol.STREAM_SECONDARY,
+                paused.secondaryEpoch, 2_200))
+        assertEquals(CollectorHelperProtocol.STATUS_STALE_TOKEN,
+            state.authorizeReplay(claim.controllerToken, CollectorHelperProtocol.STREAM_SECONDARY,
+                claim.secondaryEpoch, 2_200))
     }
 
     @Test
@@ -91,5 +97,16 @@ class HelperStreamRuntimeStateTest {
             claim.secondaryEpoch, 2_000)
         assertEquals(CollectorHelperProtocol.STATUS_LEASE_EXPIRED, completed.status)
         assertTrue(state.fallbackAllowed(CollectorHelperProtocol.STREAM_SECONDARY, 2_000))
+    }
+
+    @Test
+    fun callbackPublishingHoldTracksPauseAndExpiresWithoutResume() {
+        val state = HelperStreamRuntimeState()
+        val claim = state.claim("app", 2, 0)
+        assertTrue(!state.callbackPublishingHeld(CollectorHelperProtocol.STREAM_SECONDARY, 100))
+        state.beginPause(claim.controllerToken, CollectorHelperProtocol.STREAM_SECONDARY,
+            claim.secondaryEpoch, 200)
+        assertTrue(state.callbackPublishingHeld(CollectorHelperProtocol.STREAM_SECONDARY, 300))
+        assertTrue(!state.callbackPublishingHeld(CollectorHelperProtocol.STREAM_SECONDARY, 2_000))
     }
 }

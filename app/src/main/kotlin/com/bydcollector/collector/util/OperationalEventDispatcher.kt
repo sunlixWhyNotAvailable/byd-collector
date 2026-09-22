@@ -20,6 +20,11 @@ internal fun dispatchOperationalEvent(executor: Executor, action: () -> Unit) {
     }
 }
 
+internal fun Throwable.diagnosticDetail(context: String? = null): String = buildString {
+    context?.takeIf(String::isNotBlank)?.let { append(it).append('\n') }
+    append(stackTraceToString())
+}.take(MAX_DIAGNOSTIC_DETAIL_CHARS)
+
 private fun runOperationalEventTask(action: () -> Unit) {
     try {
         action()
@@ -32,3 +37,5 @@ private fun logOperationalEventError(message: String, error: Throwable) {
     // Local JVM tests do not provide Android's Log implementation.
     runCatching { Log.e(TAG, message, error) }
 }
+
+private const val MAX_DIAGNOSTIC_DETAIL_CHARS = 32_768

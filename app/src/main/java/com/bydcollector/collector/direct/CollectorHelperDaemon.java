@@ -22,6 +22,7 @@ import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -118,6 +119,8 @@ public final class CollectorHelperDaemon {
         if (secondarySpoolBinder.openError() != null) {
             helperDiagnostics.error("secondary spool unavailable: " + secondarySpoolBinder.openError());
         }
+        final CallbackSpoolBinder callbackSpoolBinder = new CallbackSpoolBinder();
+        resources.callbackSpoolBinder = callbackSpoolBinder;
         TelemetryWorkerSpool openedSpool = null;
         String openedSpoolError = null;
         try {
@@ -169,6 +172,7 @@ public final class CollectorHelperDaemon {
             secondarySpoolBinder.spool(),
             address -> scalarRead(autoservice, autoserviceDescriptor, address),
             nativeReader,
+            callbackSpoolBinder,
             new HelperWakeLockController(
                 SystemClock::elapsedRealtime,
                 HelperWakeLockPlatform::acquireShellPartialWakeLock,
@@ -223,6 +227,32 @@ public final class CollectorHelperDaemon {
                     secondarySpoolBinder.writeStatus(
                         reply, runtime.barrierPending(CollectorHelperProtocol.STREAM_SECONDARY));
                     return true;
+                }
+                if (code == CollectorHelperProtocol.TX_CALLBACK_PENDING_PAGE ||
+                    code == CollectorHelperProtocol.TX_CALLBACK_ACK ||
+                    code == CollectorHelperProtocol.TX_CALLBACK_STATUS ||
+                    code == CollectorHelperProtocol.TX_CALLBACK_QUARANTINE) {
+                    long token;
+                    int stream;
+                    long epoch;
+                    try {
+                        token = data.readLong();
+                        stream = data.readInt();
+                        epoch = data.readLong();
+                    } catch (Throwable error) {
+                        CallbackSpoolBinder.writeUnavailable(code, reply,
+                            CollectorHelperProtocol.STATUS_INVALID_REQUEST, describe(error));
+                        return true;
+                    }
+                    int access = runtime.authorizeCallbackTransport(token, stream, epoch);
+                    if (access != CollectorHelperProtocol.STATUS_OK) {
+                        CallbackSpoolBinder.writeUnavailable(code, reply, access,
+                            access == CollectorHelperProtocol.STATUS_REPLAY_PENDING
+                                ? "callback persistence or archive fence pending"
+                                : "callback stream credentials are stale or stopped");
+                        return true;
+                    }
+                    return callbackSpoolBinder.onTransact(code, stream, data, reply);
                 }
                 if (
                     code == CollectorHelperProtocol.TX_SECONDARY_PENDING_PAGE ||
@@ -533,6 +563,7 @@ public final class CollectorHelperDaemon {
             reply.writeInt(value.status);
             reply.writeInt(value.raw == null ? 0 : 1);
             if (value.raw != null) reply.writeInt(value.raw);
+            CallbackValueSource.writeNullable(reply, value.callbackSource);
         }
     }
 
@@ -549,6 +580,7 @@ public final class CollectorHelperDaemon {
         int count = result.batchStatus == CollectorHelperProtocol.STATUS_OK ? result.values.length : 0;
         int[] statuses = new int[count];
         byte[] rawPresent = new byte[(count + 7) / 8];
+        byte[] callbackCached = new byte[(count + 7) / 8];
         int[] raws = new int[count];
         for (int index = 0; index < count; index++) {
             ReadValue value = result.values[index];
@@ -557,6 +589,8 @@ public final class CollectorHelperDaemon {
                 rawPresent[index >>> 3] = (byte) (rawPresent[index >>> 3] | (1 << (index & 7)));
                 raws[index] = value.raw;
             }
+            if (value.callbackSource != null) callbackCached[index >>> 3] =
+                (byte) (callbackCached[index >>> 3] | (1 << (index & 7)));
         }
         reply.writeInt(result.batchStatus);
         reply.writeInt(result.mode);
@@ -572,6 +606,7 @@ public final class CollectorHelperDaemon {
         reply.writeIntArray(statuses);
         reply.writeByteArray(rawPresent);
         reply.writeIntArray(raws);
+        reply.writeByteArray(callbackCached);
     }
 
     private static String boundError(String error) {
@@ -611,6 +646,7 @@ public final class CollectorHelperDaemon {
                 reply.writeInt(value.raw == null ? 0 : 1);
                 if (value.raw != null) reply.writeInt(value.raw);
                 reply.writeString(value.error);
+                CallbackValueSource.writeNullable(reply, value.callbackSource);
             }
         }
     }
@@ -644,7 +680,7 @@ public final class CollectorHelperDaemon {
             int dev = (Integer) entryClass.getMethod("getDev").invoke(entry);
             int fid = (Integer) entryClass.getMethod("getFid").invoke(entry);
             if (!isAllowedTx(tx)) throw new IllegalArgumentException("unsupported main whitelist tx: " + tx);
-            rows.add(new Address(tx, dev, fid));
+            if (TelemetryCatalogPolicy.isRuntimeSelected(dev, fid)) rows.add(new Address(tx, dev, fid));
         }
         if (rows.isEmpty()) throw new IllegalStateException("empty main telemetry catalog");
         return Collections.unmodifiableList(rows);
@@ -652,6 +688,7 @@ public final class CollectorHelperDaemon {
 
     static List<Address> loadSecondaryRows(String apkPath) throws Exception {
         List<Address> rows = new ArrayList<Address>(SecondaryTelemetrySpool.EXPECTED_FIELD_COUNT);
+        MessageDigest fingerprint = TelemetryCatalogPolicy.newFingerprint();
         try (ZipFile apk = new ZipFile(apkPath)) {
             String[] assetNames = {
                 "assets/direct_debug_round_robin_parameters_1.csv",
@@ -676,29 +713,34 @@ public final class CollectorHelperDaemon {
                     int devIndex = header.indexOf("dev");
                     int fidIndex = header.indexOf("fid");
                     int txIndex = header.indexOf("tx");
-                    int shardStart = rows.size();
+                    int definitionCount = 0;
                     String line;
                     while ((line = reader.readLine()) != null) {
                         if (line.trim().isEmpty()) continue;
+                        definitionCount++;
                         List<String> columns = splitCsvLine(line);
                         int tx = Integer.parseInt(columns.get(txIndex));
                         if (!isAllowedTx(tx)) throw new IllegalArgumentException("unsupported secondary catalog tx: " + tx);
-                        rows.add(new Address(
-                            tx,
-                            Integer.parseInt(columns.get(devIndex)),
-                            Integer.parseInt(columns.get(fidIndex))
-                        ));
+                        int dev = Integer.parseInt(columns.get(devIndex));
+                        int fid = Integer.parseInt(columns.get(fidIndex));
+                        if (TelemetryCatalogPolicy.isRuntimeSelected(dev, fid)) {
+                            rows.add(new Address(tx, dev, fid));
+                            TelemetryCatalogPolicy.addToFingerprint(fingerprint, dev, fid, tx);
+                        }
                     }
-                    int shardSize = rows.size() - shardStart;
-                    if (shardSize != expectedSizes[shardIndex]) {
+                    if (definitionCount != expectedSizes[shardIndex]) {
                         throw new IllegalStateException(
-                            "unexpected secondary catalog shard size: " + assetName + "=" + shardSize);
+                            "unexpected secondary catalog shard size: " + assetName + "=" + definitionCount);
                     }
                 }
             }
         }
         if (rows.size() != SecondaryTelemetrySpool.EXPECTED_FIELD_COUNT) {
             throw new IllegalStateException("unexpected secondary catalog size: " + rows.size());
+        }
+        String actualFingerprint = TelemetryCatalogPolicy.finishFingerprint(fingerprint);
+        if (!TelemetryCatalogPolicy.SECONDARY_ACTIVE_FINGERPRINT.equals(actualFingerprint)) {
+            throw new IllegalStateException("unexpected secondary catalog fingerprint: " + actualFingerprint);
         }
         return Collections.unmodifiableList(rows);
     }
@@ -778,7 +820,9 @@ public final class CollectorHelperDaemon {
                     int dev = Integer.parseInt(columns.get(devIndex));
                     int fid = Integer.parseInt(columns.get(fidIndex));
                     if (!isAllowedTx(tx)) throw new IllegalArgumentException("unsupported debug whitelist tx: " + tx);
-                    whitelist.add(new Address(tx, dev, fid));
+                    if (TelemetryCatalogPolicy.isRuntimeSelected(dev, fid)) {
+                        whitelist.add(new Address(tx, dev, fid));
+                    }
                 }
                 }
             }
@@ -859,7 +903,8 @@ public final class CollectorHelperDaemon {
                 row.fid,
                 value.status,
                 value.raw,
-                value.error
+                value.error,
+                value.callbackSource
             ));
         }
         return new TelemetryWorkerSpool.Sample(
@@ -1074,11 +1119,20 @@ public final class CollectorHelperDaemon {
         final int status;
         final Integer raw;
         final String error;
+        final CallbackValueSource callbackSource;
 
         ReadValue(int status, Integer raw, String error) {
+            this(status, raw, error, null);
+        }
+
+        ReadValue(int status, Integer raw, String error, CallbackValueSource callbackSource) {
             this.status = status;
             this.raw = raw;
             this.error = error;
+            if (callbackSource != null && (status != CollectorHelperProtocol.STATUS_OK || raw == null)) {
+                throw new IllegalArgumentException("callback source requires a usable raw value");
+            }
+            this.callbackSource = callbackSource;
         }
 
         static ReadValue ok(int raw) {
@@ -1087,6 +1141,11 @@ public final class CollectorHelperDaemon {
 
         static ReadValue error(int status, String error) {
             return new ReadValue(status, null, error);
+        }
+
+        static ReadValue cached(int raw, CallbackValueSource source) {
+            if (source == null || source.rawBits != raw) throw new IllegalArgumentException("invalid cached callback value");
+            return new ReadValue(CollectorHelperProtocol.STATUS_OK, raw, null, source);
         }
     }
 
@@ -1228,6 +1287,8 @@ public final class CollectorHelperDaemon {
                 throw error.getTargetException();
             }
         }
+
+        Object manager() { return manager; }
     }
 
     private static OwnerLock acquireSingleOwnerLock() {
@@ -1280,6 +1341,7 @@ public final class CollectorHelperDaemon {
         private final HelperDiagnostics diagnostics;
         private TelemetryWorkerSpool workerSpool;
         private SecondarySpoolBinder secondarySpoolBinder;
+        private CallbackSpoolBinder callbackSpoolBinder;
         private HelperDualStreamRuntime runtime;
         private boolean closed;
 
@@ -1305,6 +1367,11 @@ public final class CollectorHelperDaemon {
                 if (secondarySpoolBinder != null) secondarySpoolBinder.close();
             } catch (Throwable error) {
                 recordDiagnosticError(diagnostics, "secondary spool teardown failed: " + describe(error));
+            }
+            try {
+                if (callbackSpoolBinder != null) callbackSpoolBinder.close();
+            } catch (Throwable error) {
+                recordDiagnosticError(diagnostics, "callback spool teardown failed: " + describe(error));
             }
             try {
                 ownerLock.close();

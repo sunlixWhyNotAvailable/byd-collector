@@ -13,12 +13,17 @@ class DirectFidRegistryTest {
         val entries = DirectFidRegistry.entries
 
         assertEquals(95, entries.size)
+        assertTrue(entries.any { it.key == "speed_1013_-1807745016_7" })
         assertEquals(entries.size, entries.map { it.key }.distinct().size)
         assertEquals(
             entries.size,
             entries.map { Triple(it.dev, it.fid, it.tx) }.distinct().size
         )
         assertEquals("autoservice-fid-direct-20260908-curated-95-telemetry-v1", DirectFidRegistry.CATALOG_VERSION)
+        assertEquals(
+            "EE469CF73CCF1E7FE562FF6F500E4208866D881A580F6212E18525E983798B8D",
+            DirectFidRegistry.CATALOG_FINGERPRINT
+        )
         assertNotEquals(DirectFidRegistry.CATALOG_VERSION, DirectFidRegistry.LEGACY_WORKER_CATALOG_VERSION)
         assertEquals(entries, DirectFidRegistry.workerReplayEntriesForCatalog(DirectFidRegistry.CATALOG_VERSION))
         assertNotNull(entries.firstOrNull { it.key == "statistic_1014_1134559272_5" && it.dev == 1014 && it.fid == 1134559272 && it.tx == 5 })

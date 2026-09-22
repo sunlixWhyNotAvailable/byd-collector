@@ -11,7 +11,8 @@ data class SecondaryReplayDrainResult(
     val committedRecords: Int,
     val duplicateRecords: Int,
     val quarantinedFiles: Int,
-    val blockedReason: String? = null
+    val blockedReason: String? = null,
+    val retryable: Boolean = false
 )
 
 /** Passive APP-side replay. Runtime ordering and activation are owned by the caller. */

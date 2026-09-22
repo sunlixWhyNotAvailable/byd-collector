@@ -73,6 +73,7 @@ class DirectDebugRoundRobinPollerTest {
         assertTrue(source.contains("openedSessionId?.let { opened ->"))
         assertTrue(source.contains("running.set(false)"))
         assertTrue(source.contains("onTerminalFailure"))
+        assertTrue(source.contains("onRuntimeError(error)"))
         assertTrue(source.contains("if (!stopRequested.get()) runCatching(onTerminalFailure)"))
         assertTrue(source.indexOf("store.endSession(opened, stopReason)") < source.indexOf("runCatching(onStopped)"))
         assertTrue(
@@ -118,6 +119,27 @@ class DirectDebugRoundRobinPollerTest {
         }
 
         assertTrue(error.message!!.contains("receipt commit failed"))
+        assertFalse(live)
+        assertEquals(listOf("pause", "drain", "resume"), events)
+    }
+
+    @Test
+    fun retryableReplayPendingNeverPerformsLiveReadAndRestoresFallback() {
+        val events = mutableListOf<String>()
+        var live = false
+
+        assertFailsWith<SecondaryReplayPendingException> {
+            SecondaryLiveCycleGate.run(
+                pause = { events += "pause"; true },
+                drain = {
+                    events += "drain"
+                    SecondaryReplayDrainResult(false, 0, 0, 0, "callback pending", retryable = true)
+                },
+                resume = { events += "resume"; true },
+                live = { live = true }
+            )
+        }
+
         assertFalse(live)
         assertEquals(listOf("pause", "drain", "resume"), events)
     }
@@ -174,7 +196,8 @@ class DirectDebugRoundRobinPollerTest {
         val shards = assets.map { DirectDebugParameterAsset.parse(it.readText(Charsets.UTF_8)) }
         val rows = shards.flatten()
 
-        assertEquals("fid-catalog-20260908-main95-roundrobin23083-both-read-tx-v1", DirectDebugParameterAsset.SOURCE_VERSION)
+        assertEquals("fid-catalog-20260908-main95-roundrobin23083-both-read-tx-v1", DirectDebugParameterAsset.LEGACY_SOURCE_VERSION)
+        assertEquals("fid-catalog-20260922-main95-roundrobin23069-exclusions7-v2", DirectDebugParameterAsset.SOURCE_VERSION)
         assertEquals(listOf(7_692, 7_693, 7_698), shards.map { it.size })
         assertEquals(23_083, rows.size)
         assertEquals(7_698, DirectDebugParameterAsset.MAX_SHARD_SIZE)
@@ -185,6 +208,27 @@ class DirectDebugRoundRobinPollerTest {
         assertEquals(rows.size, rows.map { it.key }.distinct().size)
         assertEquals(rows.size, rows.map { Triple(it.dev, it.fid, it.tx) }.distinct().size)
         assertTrue(rows.all { it.tx == 5 || it.tx == 7 })
+
+        val active = rows.filter(DirectDebugParameterAsset::isRuntimeSelected)
+        assertEquals(23_069, active.size)
+        assertEquals(11_588, active.map { it.dev to it.fid }.distinct().size)
+        assertEquals(DirectDebugParameterAsset.ACTIVE_FINGERPRINT, DirectDebugParameterAsset.fingerprint(active))
+        assertEquals(14, rows.size - active.size)
+        assertEquals(
+            setOf(
+                1061 to -1728053216,
+                1039 to -1728053217,
+                1034 to -1728053215,
+                1033 to -1728052891,
+                1043 to -1728052722,
+                1023 to -1728052840,
+                1001 to -1728052203
+            ),
+            (rows - active.toSet()).map { it.dev to it.fid }.toSet()
+        )
+        assertTrue(active.any { it.dev == 1001 && it.fid == 148898864 }) // steering angle
+        assertTrue(active.any { it.dev == 1049 && it.fid == 304087048 }) // wheel speed FL
+        assertTrue(active.any { it.dev == 1038 && it.fid == 327155736 }) // vehicle speed
 
         val dumpRows = rows.filter { it.candidateSource == "fid_catalog_20260804_6e29ad30" }
         val aliasesByPair = dumpRows.groupBy { it.dev to it.fid }.values.map { it.first().featureNames.split(";") }
@@ -239,14 +283,40 @@ class DirectDebugRoundRobinPollerTest {
     @Test
     fun generatedShardsFlattenIntoOneCompleteHelperBatch() {
         val rows = debugAssetFiles().flatMap { DirectDebugParameterAsset.parse(it.readText(Charsets.UTF_8)) }
-        val cursor = DirectDebugRoundRobinCursor(rows)
+        val active = rows.filter(DirectDebugParameterAsset::isRuntimeSelected)
+        val cursor = DirectDebugRoundRobinCursor(active)
         val batch = cursor.nextBatch(DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT)
 
-        assertEquals(23_083, batch.size)
-        assertEquals(rows.map { it.key }, batch.map { it.key })
-        assertEquals(rows.size, batch.map { Triple(it.dev, it.fid, it.tx) }.distinct().size)
+        assertEquals(23_069, batch.size)
+        assertEquals(active.map { it.key }, batch.map { it.key })
+        assertEquals(active.size, batch.map { Triple(it.dev, it.fid, it.tx) }.distinct().size)
         assertEquals(batch.map { it.key }, cursor.nextBatch(DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT).map { it.key })
     }
+
+    @Test
+    fun oldAndNewCatalogVersionsKeepTheirOwnExplicitOrdinalMaps() {
+        val definitions = (0 until 4).map { index -> parameter(index, 1000, index) }
+        val active = definitions.drop(1)
+
+        assertEquals(active, DirectDebugParameterAsset.parametersForCatalog(
+            DirectDebugParameterAsset.SOURCE_VERSION, definitions, active
+        ))
+        assertEquals(definitions, DirectDebugParameterAsset.parametersForCatalog(
+            DirectDebugParameterAsset.LEGACY_SOURCE_VERSION, definitions, active
+        ))
+        assertNull(DirectDebugParameterAsset.parametersForCatalog("unknown", definitions, active))
+    }
+
+    private fun parameter(index: Int, dev: Int, fid: Int) = DirectDebugParameter(
+        key = "p$index",
+        featureGroup = "TEST",
+        dev = dev,
+        fid = fid,
+        tx = 5,
+        featureNames = "P$index",
+        featureRefs = "P$index",
+        candidateSource = "test"
+    )
 
     private fun debugAssetFiles(): List<File> = DirectDebugParameterAsset.ASSET_NAMES.map { name ->
         listOf(File("src/main/assets/$name"), File("app/src/main/assets/$name"))

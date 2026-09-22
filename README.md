@@ -19,6 +19,10 @@ The collector is an engineering and research tool, not an OEM diagnostic or safe
 
 The app reads vehicle parameters without changing them. It keeps raw values, available Chinese names and descriptions, timestamps, and data-quality information in a local SQLite database. These readings also provide the vehicle status shown in the app and shared with enabled integrations. Unavailable or unknown values remain identifiable rather than being presented as valid readings.
 
+The v2.8.3 personal-test build uses hybrid callback collection. Supported fields switch to push updates after usable callbacks are observed, with verification reads every five seconds; unproven fields keep polling. Power, gear and SOC keep their regular fast reads. Every received callback, including repeated equal values, is retained separately in the existing SQLite databases. Vehicle validation is still required before a wider release.
+
+Callback buffering is bounded: each stream has a combined 4 MiB allowance for queued/in-flight callback payloads, while poll and callback files share its existing 128 MiB fallback-spool allowance. The app imports committed batches idempotently after interruptions. Capacity or I/O losses are reported explicitly; data still in memory is not guaranteed to survive a kernel reboot.
+
 The app remembers your selected tab, scroll positions, and expanded trip groups during the current session, including when you switch tabs or return from another app. Closing the app with `Shutdown` or restarting its process resets navigation.
 
 You can toggle a switch by tapping its label or row; Telegram message switches also respond to their section headers. Finish editing a single-line field with the keyboard's `Done` button or by hiding the keyboard. Telegram templates keep Enter for new lines and finish editing when the keyboard is hidden.
@@ -28,7 +32,7 @@ You can toggle a switch by tapping its label or row; Telegram message switches a
 | Area | What it provides |
 | --- | --- |
 | Main tab | Collection of 95 selected vehicle fields, automatic start, current status, and database information |
-| All data tab | Research collection from a catalog of 23,083 read-only signatures, with raw values and recorded changes |
+| All data tab | Research collection of 23,069 active read-only signatures, with raw values and recorded changes |
 | Vehicle status | SOC, SOH, range, odometer, battery energy, charging, power, temperatures, doors, tires, climate, speed, and related readings |
 | MQTT / Home Assistant | Home Assistant MQTT Discovery and live state for selected categories, with primary and alternative connections |
 | InfluxDB | Historical export to `InfluxDB v1`, with automatic retries and progress saved between sessions |
@@ -63,7 +67,7 @@ Use `Stop` when collection is no longer needed. Background collection and its ve
 
 Its compact vehicle-status cards include the remaining percentage for all three perfume slots. A valid zero is shown as zero; unavailable readings stay distinct.
 
-- Reads a research catalog of 23,083 read-only signatures.
+- Reads 23,069 active signatures from the retained 23,083-definition research catalog. Seven high-volume or irrelevant native fields are excluded from both polling and subscriptions; their old data remains available.
 - Saves raw values, descriptions, data quality, and changes in a separate database.
 - Helps identify changing fields, but a changing value alone does not prove what the field means.
 
@@ -79,7 +83,7 @@ The table separates battery energy used, energy recovered during driving, and si
 
 Older trips are recalculated in the background when the current main database still contains complete, usable telemetry for them. If that history is incomplete, their previous balance is retained and average consumption is calculated from that balance and the trip distance. Archived databases are not used for this recalculation.
 
-`Current trip`, beside route compression, opens the active session's metrics and map. It refreshes while visible without resetting your map position or zoom. Metrics remain available without GPS; an active trip has no Finish marker. When it ends, the same trip stays open for inspection.
+`Current trip`, beside route compression, opens the active session's metrics and map. It refreshes while visible without resetting your map position or zoom. The existing Finish flag artwork marks the latest trusted coordinate as `Current position`, or `Last known position` when stale or followed by a GPS gap. No trusted coordinate means no flag. This uses the existing route refresh, without additional GPS collection or database writes. When the trip ends, the same trip stays open with its actual Finish marker.
 
 Route recording requires Android location access. If you decline the first-run request, grant access later in Android settings. Untrusted GPS readings—including implausible jumps or speeds—are excluded from the displayed route. Loss of reception or rejected readings can leave gaps; the app does not draw a connecting line across rejected points.
 

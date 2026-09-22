@@ -3,11 +3,16 @@ package com.bydcollector.collector.data.debug
 import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
+import android.os.CancellationSignal
+import com.bydcollector.collector.data.callback.CallbackDelivery
+import com.bydcollector.collector.data.callback.CallbackImportResult
+import com.bydcollector.collector.data.callback.CallbackRawStore
 import com.bydcollector.collector.data.direct.DirectBatchDiagnostics
 import com.bydcollector.collector.data.direct.DirectHelperReadResult
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import com.bydcollector.collector.direct.SecondaryTelemetrySpool
+import com.bydcollector.collector.direct.TelemetryCallbackBatch
 import com.bydcollector.collector.util.sqliteFootprintBytes
 import java.io.Closeable
 import java.io.File
@@ -80,7 +85,8 @@ data class DirectDebugStatus(
 private data class DebugTransition(
     val candidateId: Long,
     val observed: DirectDebugObserved,
-    val reason: String
+    val reason: String,
+    val callbackCached: Boolean
 )
 
 private data class DebugSessionSnapshot(
@@ -100,8 +106,14 @@ class DirectDebugStore(
 ) : Closeable {
     private val helperDelegate = lazy { helper ?: DirectDebugDatabaseHelper(context) }
     private val helper by helperDelegate
+    private val callbackRawStore = CallbackRawStore(
+        database = { helperDelegate.value.writableDatabase },
+        nowMs = { OffsetDateTime.parse(clock.nowIso()).toInstant().toEpochMilli() }
+    )
     private val candidateIdsByKey = HashMap<String, Long>()
     private val candidateIdsByOrdinal = ArrayList<Long>()
+    private val candidateIdsByCatalogVersion = HashMap<String, List<Long>>()
+    private val catalogVersionIdsBySource = HashMap<String, Long>()
     private val candidateState = HashMap<Long, DirectDebugPrevious>()
     private var activeCatalogVersionId: Long? = null
     private var activeSessionId: Long? = null
@@ -117,9 +129,19 @@ class DirectDebugStore(
             db.beginTransaction()
             val catalogVersionId: Long
             try {
-                val (ensuredCatalogVersionId, sourceVersionChanged) = ensureCatalogVersion(db)
+                val (ensuredCatalogVersionId, sourceVersionChanged) =
+                    ensureCatalogVersion(db, DirectDebugParameterAsset.SOURCE_VERSION)
                 catalogVersionId = ensuredCatalogVersionId
-                ensureCandidates(db, parameters, sourceVersionChanged)
+                catalogVersionIdsBySource[DirectDebugParameterAsset.SOURCE_VERSION] = catalogVersionId
+                catalogVersionIdsBySource[DirectDebugParameterAsset.LEGACY_SOURCE_VERSION] =
+                    ensureCatalogVersion(db, DirectDebugParameterAsset.LEGACY_SOURCE_VERSION).first
+                val definitions = DirectDebugParameterAsset.loadDefinitions(context)
+                ensureCandidates(db, definitions, sourceVersionChanged)
+                candidateIdsByOrdinal += parameters.map { candidateIdsByKey.getValue(it.key) }
+                candidateIdsByCatalogVersion[DirectDebugParameterAsset.SOURCE_VERSION] =
+                    parameters.map { candidateIdsByKey.getValue(it.key) }
+                candidateIdsByCatalogVersion[DirectDebugParameterAsset.LEGACY_SOURCE_VERSION] =
+                    definitions.map { candidateIdsByKey.getValue(it.key) }
                 loadCandidateState(db, catalogVersionId)
                 openedSessionId = db.insertOrThrow(
                     "debug_direct_sessions",
@@ -145,6 +167,8 @@ class DirectDebugStore(
             activeSessionId = null
             candidateIdsByKey.clear()
             candidateIdsByOrdinal.clear()
+            candidateIdsByCatalogVersion.clear()
+            catalogVersionIdsBySource.clear()
             candidateState.clear()
             throw error
         }
@@ -191,9 +215,15 @@ class DirectDebugStore(
                 "Debug candidate missing for ${parameter.key}"
             }
             DirectDebugChangeDetector.reason(candidateState[candidateId], observed)?.let { reason ->
-                transitions += DebugTransition(candidateId, observed, reason)
+                transitions += DebugTransition(
+                    candidateId,
+                    observed,
+                    reason,
+                    callbackCached = result.callbackCached
+                )
             }
         }
+        val recordedTransitions = transitions.filterNot(DebugTransition::callbackCached)
 
         val db = helper.writableDatabase
         val cycleId: Long
@@ -209,12 +239,20 @@ class DirectDebugStore(
                     put("elapsed_ms", elapsedMs.coerceAtLeast(0L))
                     put("attempted_count", batch.size)
                     put("ok_count", okCount)
-                    put("changed_count", transitions.size)
+                    put("changed_count", recordedTransitions.size)
                     put("error_count", errorCount)
                 }
             )
             transitions.forEach { transition ->
-                insertTransition(db, sessionId, cycleId, catalogVersionId, sampledAtMs, transition)
+                insertTransition(
+                    db,
+                    sessionId,
+                    cycleId,
+                    catalogVersionId,
+                    sampledAtMs,
+                    transition,
+                    recordReading = !transition.callbackCached
+                )
             }
             db.execSQL(
                 """
@@ -227,15 +265,11 @@ class DirectDebugStore(
                     last_scan_at_ms = ?
                 WHERE id = ?
                 """.trimIndent(),
-                arrayOf(batch.size, okCount, transitions.size, errorCount, sampledAtMs, sessionId)
+                arrayOf(batch.size, okCount, recordedTransitions.size, errorCount, sampledAtMs, sessionId)
             )
             // APP-live values are now the materialized truth. A queued DELTA must not be
             // interpreted against them after this transaction commits.
-            db.delete(
-                "debug_secondary_replay_cursor",
-                "catalog_version_id = ?",
-                arrayOf(catalogVersionId.toString())
-            )
+            deleteSecondaryCursor(db, "catalog_version_id = ?", arrayOf(catalogVersionId.toString()))
             db.setTransactionSuccessful()
         } finally {
             db.endTransaction()
@@ -247,7 +281,7 @@ class DirectDebugStore(
             cycleId = cycleId,
             attemptedCount = batch.size,
             okCount = okCount,
-            changedCount = transitions.size,
+            changedCount = recordedTransitions.size,
             errorCount = errorCount,
             elapsedMs = elapsedMs
         )
@@ -279,37 +313,48 @@ class DirectDebugStore(
                 } else {
                     val reason = "identity digest mismatch"
                     persistSecondaryRejection(db, record, digest, reason)
-                    db.delete("debug_secondary_replay_cursor", null, null)
+                    deleteSecondaryCursor(db)
                     SecondaryImportResult.Rejected(reason)
                 }
-            } else if (
-                record.catalogVersion != DirectDebugParameterAsset.SOURCE_VERSION ||
-                record.fieldCount != candidateIdsByOrdinal.size
-            ) {
+            } else if (candidateIdsFor(record) == null) {
                 val reason = "catalog mismatch: ${record.catalogVersion}/${record.fieldCount}"
                 persistSecondaryRejection(db, record, digest, reason)
-                db.delete("debug_secondary_replay_cursor", null, null)
+                deleteSecondaryCursor(db)
                 result = SecondaryImportResult.Rejected(reason)
             } else {
-                val persistedState = readCandidateState(db, catalogVersionId)
-                val materialized = materializeSecondaryRecord(db, catalogVersionId, record, persistedState)
+                val recordCandidateIds = checkNotNull(candidateIdsFor(record))
+                val recordCatalogVersionId = catalogVersionIdsBySource.getValue(record.catalogVersion)
+                val persistedState = readCandidateState(db, recordCatalogVersionId)
+                val materialized = materializeSecondaryRecord(
+                    db,
+                    recordCatalogVersionId,
+                    record,
+                    recordCandidateIds,
+                    persistedState
+                )
                 if (materialized == null) {
                     val reason = "orphan DELTA: exact persisted predecessor unavailable"
                     persistSecondaryRejection(db, record, digest, reason)
-                    db.delete(
-                        "debug_secondary_replay_cursor",
+                    deleteSecondaryCursor(
+                        db,
                         "catalog_version_id = ?",
-                        arrayOf(catalogVersionId.toString())
+                        arrayOf(recordCatalogVersionId.toString())
                     )
                     result = SecondaryImportResult.Rejected(reason)
                 } else {
                     val transitions = materialized.mapIndexedNotNull { ordinal, value ->
-                        val candidateId = candidateIdsByOrdinal[ordinal]
+                        val candidateId = recordCandidateIds[ordinal]
                         val observed = DirectDebugObserved(value.status, value.rawPresent, value.raw, value.error)
                         DirectDebugChangeDetector.reason(persistedState[candidateId], observed)?.let { reason ->
-                            DebugTransition(candidateId, observed, reason)
+                            DebugTransition(
+                                candidateId,
+                                observed,
+                                reason,
+                                callbackCached = value.cached
+                            )
                         }
                     }
+                    val recordedTransitions = transitions.filterNot(DebugTransition::callbackCached)
                     val cycleId = db.insertOrThrow(
                         "debug_direct_cycles",
                         null,
@@ -320,7 +365,7 @@ class DirectDebugStore(
                             put("elapsed_ms", record.cycleElapsedMs)
                             put("attempted_count", record.fieldCount)
                             put("ok_count", record.okCount)
-                            put("changed_count", transitions.size)
+                            put("changed_count", recordedTransitions.size)
                             put("error_count", record.errorCount)
                         }
                     )
@@ -329,10 +374,11 @@ class DirectDebugStore(
                             db,
                             sessionId,
                             cycleId,
-                            catalogVersionId,
+                            recordCatalogVersionId,
                             record.capturedWallMs,
                             transition,
-                            persistedState.containsKey(transition.candidateId)
+                            persistedState.containsKey(transition.candidateId),
+                            recordReading = !transition.callbackCached
                         )
                     }
                     insertSecondaryMetadata(db, cycleId, record)
@@ -350,16 +396,23 @@ class DirectDebugStore(
                         arrayOf(
                             record.fieldCount,
                             record.okCount,
-                            transitions.size,
+                            recordedTransitions.size,
                             record.errorCount,
                             record.capturedWallMs,
                             sessionId
                         )
                     )
                     insertSecondaryReceipt(db, record, digest, cycleId)
-                    replaceSecondaryCursor(db, catalogVersionId, record, digest, cycleId)
+                    replaceSecondaryCursor(
+                        db,
+                        recordCatalogVersionId,
+                        record,
+                        digest,
+                        cycleId,
+                        materialized
+                    )
                     committedState = materialized.mapIndexed { ordinal, value ->
-                        candidateIdsByOrdinal[ordinal] to DirectDebugPrevious(
+                        recordCandidateIds[ordinal] to DirectDebugPrevious(
                             value.status,
                             value.rawPresent,
                             value.raw,
@@ -373,14 +426,23 @@ class DirectDebugStore(
         } finally {
             db.endTransaction()
         }
-        if (result is SecondaryImportResult.Committed && !(result as SecondaryImportResult.Committed).duplicate) {
+        if (record.catalogVersion == DirectDebugParameterAsset.SOURCE_VERSION &&
+            result is SecondaryImportResult.Committed && !(result as SecondaryImportResult.Committed).duplicate
+        ) {
             candidateState.clear()
             candidateState.putAll(checkNotNull(committedState))
         }
         return result
     }
 
-    fun dashboardReadingCount(): Long = scalarLong("SELECT COUNT(*) FROM debug_direct_readings")
+    fun dashboardReadingCount(cancellationSignal: CancellationSignal? = null): Long = scalarLong(
+        if (DirectDebugDatabaseHelper.isCompactV2(helper.readableDatabase)) {
+            "SELECT (SELECT COUNT(*) FROM debug_direct_readings) + (SELECT COUNT(*) FROM raw_callback_events)"
+        } else {
+            "SELECT COUNT(*) FROM debug_direct_readings"
+        },
+        cancellationSignal
+    )
 
     fun status(readingCount: Long = UNKNOWN_READING_COUNT): DirectDebugStatus {
         val db = helper.readableDatabase
@@ -430,20 +492,31 @@ class DirectDebugStore(
         }
     }
 
+    fun importCallbackBatch(
+        batch: TelemetryCallbackBatch,
+        digest: String,
+        delivery: CallbackDelivery
+    ): CallbackImportResult {
+        if (batch.stream != CallbackRawStore.SECONDARY_STREAM) {
+            return CallbackImportResult.Rejected("Secondary store requires Secondary callback stream")
+        }
+        return callbackRawStore.importBatch(batch, digest, delivery)
+    }
+
     fun databaseFile() = DirectDebugDatabaseResolver.databaseFile(context)
 
     fun isCompactV2(): Boolean = DirectDebugDatabaseHelper.isCompactV2(helper.readableDatabase)
 
-    private fun ensureCatalogVersion(db: SQLiteDatabase): Pair<Long, Boolean> {
+    private fun ensureCatalogVersion(db: SQLiteDatabase, sourceVersion: String): Pair<Long, Boolean> {
         val sourceVersionChanged = db.insertWithOnConflict(
             "debug_direct_catalog_versions",
             null,
-            ContentValues().apply { put("source_version", DirectDebugParameterAsset.SOURCE_VERSION) },
+            ContentValues().apply { put("source_version", sourceVersion) },
             SQLiteDatabase.CONFLICT_IGNORE
         ) != -1L
         db.rawQuery(
             "SELECT id FROM debug_direct_catalog_versions WHERE source_version = ?",
-            arrayOf(DirectDebugParameterAsset.SOURCE_VERSION)
+            arrayOf(sourceVersion)
         ).use { cursor ->
             check(cursor.moveToFirst()) { "Debug catalog version was not persisted" }
             return cursor.getLong(0) to sourceVersionChanged
@@ -457,6 +530,7 @@ class DirectDebugStore(
     ) {
         candidateIdsByKey.clear()
         candidateIdsByOrdinal.clear()
+        candidateIdsByCatalogVersion.clear()
         val existingIds = HashMap<String, Long>()
         db.rawQuery("SELECT id, dev, fid, tx FROM debug_direct_candidates", emptyArray()).use { cursor ->
             while (cursor.moveToNext()) {
@@ -486,9 +560,11 @@ class DirectDebugStore(
                 }
             }
             candidateIdsByKey[parameter.key] = id
-            candidateIdsByOrdinal += id
         }
     }
+
+    private fun candidateIdsFor(record: SecondaryTelemetrySpool.Record): List<Long>? =
+        candidateIdsByCatalogVersion[record.catalogVersion]?.takeIf { it.size == record.fieldCount }
 
     private fun findSecondaryReceipt(
         db: SQLiteDatabase,
@@ -510,36 +586,51 @@ class DirectDebugStore(
         db: SQLiteDatabase,
         catalogVersionId: Long,
         record: SecondaryTelemetrySpool.Record,
+        recordCandidateIds: List<Long>,
         persistedState: Map<Long, DirectDebugPrevious>
     ): List<SecondaryTelemetrySpool.Value>? {
         if (record.kind == SecondaryTelemetrySpool.Kind.FULL) {
             return record.materialize(null, null)
         }
-        val cursorIdentity = db.rawQuery(
+        val cursorState = db.rawQuery(
             """
-            SELECT boot_id, helper_generation, gap_id, sequence, field_count
-            FROM debug_secondary_replay_cursor
-            WHERE catalog_version_id = ?
+            SELECT c.boot_id, c.helper_generation, c.gap_id, c.sequence, c.field_count,
+                   r.catalog_version, f.field_count, f.cached_bits
+            FROM debug_secondary_replay_cursor c
+            JOIN debug_secondary_receipts r
+              ON r.boot_id = c.boot_id
+             AND r.helper_generation = c.helper_generation
+             AND r.gap_id = c.gap_id
+             AND r.sequence = c.sequence
+            JOIN debug_secondary_replay_cached_flags f
+              ON f.catalog_version_id = c.catalog_version_id
+            WHERE c.catalog_version_id = ?
             """.trimIndent(),
             arrayOf(catalogVersionId.toString())
         ).use { cursor ->
-            if (!cursor.moveToFirst() || cursor.getInt(4) != record.fieldCount) return@use null
+            if (!cursor.moveToFirst() || cursor.getInt(4) != record.fieldCount ||
+                cursor.getString(5) != record.catalogVersion || cursor.getInt(6) != record.fieldCount
+            ) return@use null
+            val cachedBits = cursor.getBlob(7)
+            if (cachedBits.size != (record.fieldCount + 7) / 8) return@use null
             SecondaryTelemetrySpool.CycleIdentity(
                 cursor.getString(0),
                 cursor.getString(1),
                 cursor.getString(2),
                 cursor.getLong(3)
-            )
+            ) to cachedBits
         } ?: return null
+        val cursorIdentity = cursorState.first
         if (record.predecessorIdentity != cursorIdentity) return null
-        val previous = candidateIdsByOrdinal.mapIndexed { ordinal, candidateId ->
+        val previous = recordCandidateIds.mapIndexed { ordinal, candidateId ->
             val state = persistedState[candidateId] ?: return null
             SecondaryTelemetrySpool.Value(
                 ordinal,
                 checkNotNull(state.status),
                 state.rawPresent,
                 state.raw,
-                state.error
+                state.error,
+                callbackCached(cursorState.second, ordinal)
             )
         }
         return runCatching { record.materialize(cursorIdentity, previous) }.getOrNull()
@@ -575,7 +666,8 @@ class DirectDebugStore(
         catalogVersionId: Long,
         record: SecondaryTelemetrySpool.Record,
         digest: String,
-        cycleId: Long
+        cycleId: Long,
+        materialized: List<SecondaryTelemetrySpool.Value>
     ) {
         val identity = record.identity
         check(db.insertWithOnConflict(
@@ -593,7 +685,41 @@ class DirectDebugStore(
             },
             SQLiteDatabase.CONFLICT_REPLACE
         ) != -1L) { "Secondary replay cursor was not persisted" }
+        check(db.insertWithOnConflict(
+            "debug_secondary_replay_cached_flags",
+            null,
+            ContentValues().apply {
+                put("catalog_version_id", catalogVersionId)
+                put("field_count", record.fieldCount)
+                put("cached_bits", cachedBits(record.fieldCount, materialized))
+            },
+            SQLiteDatabase.CONFLICT_REPLACE
+        ) != -1L) { "Secondary replay cached flags were not persisted" }
     }
+
+    private fun deleteSecondaryCursor(
+        db: SQLiteDatabase,
+        where: String? = null,
+        args: Array<String>? = null
+    ) {
+        db.delete("debug_secondary_replay_cached_flags", where, args)
+        db.delete("debug_secondary_replay_cursor", where, args)
+    }
+
+    private fun cachedBits(
+        fieldCount: Int,
+        values: List<SecondaryTelemetrySpool.Value>
+    ): ByteArray = ByteArray((fieldCount + 7) / 8).also { bits ->
+        check(values.size == fieldCount) { "Secondary cached flags require materialized values" }
+        values.forEach { value ->
+            check(value.ordinal in 0 until fieldCount) { "Secondary cached ordinal is out of range" }
+            if (value.cached) bits[value.ordinal / 8] =
+                (bits[value.ordinal / 8].toInt() or (1 shl (value.ordinal % 8))).toByte()
+        }
+    }
+
+    private fun callbackCached(bits: ByteArray, ordinal: Int): Boolean =
+        bits[ordinal / 8].toInt() and (1 shl (ordinal % 8)) != 0
 
     private fun persistSecondaryRejection(
         db: SQLiteDatabase,
@@ -712,24 +838,27 @@ class DirectDebugStore(
         catalogVersionId: Long,
         sampledAtMs: Long,
         transition: DebugTransition,
-        stateExists: Boolean = candidateState.containsKey(transition.candidateId)
+        stateExists: Boolean = candidateState.containsKey(transition.candidateId),
+        recordReading: Boolean = true
     ) {
         val observed = transition.observed
-        db.insertOrThrow(
-            "debug_direct_readings",
-            null,
-            ContentValues().apply {
-                put("session_id", sessionId)
-                put("cycle_id", cycleId)
-                put("candidate_id", transition.candidateId)
-                put("sampled_at_ms", sampledAtMs)
-                put("reason", reasonCode(transition.reason))
-                put("status", observed.status)
-                put("raw_present", if (observed.rawPresent) 1 else 0)
-                put("raw_int", observed.raw)
-                put("error", observed.error)
-            }
-        )
+        if (recordReading) {
+            db.insertOrThrow(
+                "debug_direct_readings",
+                null,
+                ContentValues().apply {
+                    put("session_id", sessionId)
+                    put("cycle_id", cycleId)
+                    put("candidate_id", transition.candidateId)
+                    put("sampled_at_ms", sampledAtMs)
+                    put("reason", reasonCode(transition.reason))
+                    put("status", observed.status)
+                    put("raw_present", if (observed.rawPresent) 1 else 0)
+                    put("raw_int", observed.raw)
+                    put("error", observed.error)
+                }
+            )
+        }
         val values = ContentValues().apply {
             put("catalog_version_id", catalogVersionId)
             put("candidate_id", transition.candidateId)
@@ -751,8 +880,13 @@ class DirectDebugStore(
         }
     }
 
-    private fun scalarLong(sql: String): Long {
-        helper.readableDatabase.rawQuery(sql, emptyArray()).use { cursor ->
+    private fun scalarLong(sql: String, cancellationSignal: CancellationSignal? = null): Long {
+        val query = if (cancellationSignal == null) {
+            helper.readableDatabase.rawQuery(sql, emptyArray())
+        } else {
+            helper.readableDatabase.rawQuery(sql, emptyArray(), cancellationSignal)
+        }
+        query.use { cursor ->
             return if (cursor.moveToFirst()) cursor.getLong(0) else 0L
         }
     }
@@ -871,6 +1005,8 @@ class DirectDebugStore(
         activeSessionId = null
         candidateIdsByKey.clear()
         candidateIdsByOrdinal.clear()
+        candidateIdsByCatalogVersion.clear()
+        catalogVersionIdsBySource.clear()
         candidateState.clear()
         if (helperDelegate.isInitialized()) helper.close()
     }

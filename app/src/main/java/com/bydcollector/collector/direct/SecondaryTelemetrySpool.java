@@ -33,9 +33,10 @@ import java.util.Set;
 public final class SecondaryTelemetrySpool implements AutoCloseable {
     public static final String SPOOL_DIRECTORY_PATH = "/data/local/tmp/bydcollector_secondary_spool";
     public static final long MAX_SPOOL_BYTES = 128L * 1024L * 1024L;
-    public static final int EXPECTED_FIELD_COUNT = 23_083;
+    public static final int EXPECTED_FIELD_COUNT = TelemetryCatalogPolicy.SECONDARY_ACTIVE_COUNT;
     public static final int MAX_SLICE_BYTES = 224 * 1024;
-    public static final int RECORD_VERSION = 1;
+    public static final int RECORD_VERSION = 2;
+    public static final int LEGACY_RECORD_VERSION = 1;
     public static final int MAX_IDENTIFIER_CHARS = 256;
 
     private static final String READY_SUFFIX = ".ready";
@@ -158,6 +159,12 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
 
     /** Append one complete logical cycle. No disk work is performed by another callback/lock. */
     public synchronized AppendResult append(Cycle cycle) {
+        synchronized (CallbackSpool.persistenceLock(directory)) {
+            return appendShared(cycle);
+        }
+    }
+
+    private AppendResult appendShared(Cycle cycle) {
         ensureOpen();
         validateCycle(cycle, expectedFieldCount);
         if (findReady(cycle.identity) != null) return AppendResult.DUPLICATE;
@@ -703,8 +710,14 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
         public final boolean rawPresent;
         public final Integer raw;
         public final String error;
+        public final boolean cached;
 
         public Value(int ordinal, int status, boolean rawPresent, Integer raw, String error) {
+            this(ordinal, status, rawPresent, raw, error, false);
+        }
+
+        public Value(int ordinal, int status, boolean rawPresent, Integer raw, String error,
+                     boolean cached) {
             if (ordinal < 0) throw new IllegalArgumentException("ordinal must be non-negative");
             if (rawPresent != (raw != null)) throw new IllegalArgumentException("rawPresent/raw mismatch");
             this.ordinal = ordinal;
@@ -712,12 +725,16 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
             this.rawPresent = rawPresent;
             this.raw = raw;
             this.error = error;
+            if (cached && (status != CollectorHelperProtocol.STATUS_OK || raw == null)) {
+                throw new IllegalArgumentException("cached value requires usable raw");
+            }
+            this.cached = cached;
         }
 
         boolean sameObservation(Value other) {
             return status == other.status && rawPresent == other.rawPresent &&
                 (raw == null ? other.raw == null : raw.equals(other.raw)) &&
-                (error == null ? other.error == null : error.equals(other.error));
+                (error == null ? other.error == null : error.equals(other.error)) && cached == other.cached;
         }
     }
 
@@ -1020,6 +1037,7 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
                     .put("status", value.status)
                     .put("raw_present", value.rawPresent)
                     .put("raw", value.raw == null ? JSONObject.NULL : value.raw)
+                    .put("callback_cached", value.cached)
                     .put("error", value.error == null ? JSONObject.NULL : value.error));
             }
                 json.put("values", values);
@@ -1033,7 +1051,8 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
             if (bytes == null) throw new IllegalArgumentException("bytes is required");
             try {
                 JSONObject json = new JSONObject(new String(bytes, StandardCharsets.UTF_8));
-            if (exactInt(json, "record_version") != RECORD_VERSION) {
+            int recordVersion = exactInt(json, "record_version");
+            if (recordVersion != RECORD_VERSION && recordVersion != LEGACY_RECORD_VERSION) {
                 throw new IllegalArgumentException("unsupported secondary record version");
             }
             Kind kind = Kind.valueOf(exactString(json, "kind"));
@@ -1052,7 +1071,8 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
                 previous = ordinal;
                 boolean present = exactBoolean(value, "raw_present");
                 Integer raw = value.isNull("raw") ? null : exactInt(value, "raw");
-                values.add(new Value(ordinal, exactInt(value, "status"), present, raw, nullableString(value, "error")));
+                values.add(new Value(ordinal, exactInt(value, "status"), present, raw,
+                    nullableString(value, "error"), recordVersion >= 2 && exactBoolean(value, "callback_cached")));
             }
             if (kind == Kind.FULL && values.size() != fieldCount) {
                 throw new IllegalArgumentException("FULL field count mismatch");
@@ -1159,6 +1179,7 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
                 throw new IllegalArgumentException("invalid " + key, error);
             }
         }
+
     }
 
     private static String identifier(String value, String name) {

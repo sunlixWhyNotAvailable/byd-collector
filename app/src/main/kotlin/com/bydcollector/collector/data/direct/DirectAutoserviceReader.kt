@@ -26,7 +26,8 @@ class DirectAutoserviceReader(
                 status = result.status,
                 raw = raw,
                 decoded = raw?.let { DirectValueDecoders.decode(entry, it) },
-                error = result.error
+                error = result.error,
+                callbackSource = result.callbackSource
             )
         }
         return DirectAutoserviceSnapshot(fields, batch.diagnostics)
@@ -46,7 +47,8 @@ data class DirectAutoserviceSnapshot(
             PollReading(
                 rawKey = field.entry.key,
                 rawValue = DirectValueDecoders.rawString(field.raw!!),
-                descValue = field.decoded
+                descValue = field.decoded,
+                callbackSource = field.callbackSource
             )
         }
 
@@ -140,5 +142,6 @@ data class DirectAutoserviceField(
     val status: Int,
     val raw: Int?,
     val decoded: String?,
-    val error: String?
+    val error: String?,
+    val callbackSource: com.bydcollector.collector.direct.CallbackValueSource? = null
 )

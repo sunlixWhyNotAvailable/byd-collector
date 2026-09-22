@@ -4,6 +4,7 @@ import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import com.bydcollector.collector.BuildConfig
+import com.bydcollector.collector.data.callback.CallbackRawSchema
 
 //creates and upgrades the app-private sqlite database without dropping user telemetry on normal upgrades
 class TelemetryDatabaseHelper(
@@ -17,6 +18,7 @@ class TelemetryDatabaseHelper(
 
     override fun onCreate(db: SQLiteDatabase) {
         executeSqlAsset(db, COMPACT_SCHEMA_ASSET)
+        CallbackRawSchema.create(db)
         createCollectorEvents(db)
     }
 
@@ -24,6 +26,7 @@ class TelemetryDatabaseHelper(
         //legacy databases stay writable until the archive cutover creates a fresh compact database
         val compactV2 = isCompactV2(db)
         executeSqlAsset(db, if (compactV2) COMPACT_SCHEMA_ASSET else LEGACY_SCHEMA_ASSET)
+        CallbackRawSchema.create(db)
         createCollectorEvents(db)
         if (!compactV2) ensureLegacySchemaCompatibility(db)
         ensureNormalizedQualityDetails(db)
@@ -426,7 +429,7 @@ class TelemetryDatabaseHelper(
 
     companion object {
         val DATABASE_NAME: String = BuildConfig.COLLECTOR_DATABASE_NAME
-        const val DATABASE_VERSION = 10
+        const val DATABASE_VERSION = 13
         const val LEGACY_SCHEMA_ASSET = "schema.sql"
         const val COMPACT_SCHEMA_ASSET = "schema_v2.sql"
         const val LEGACY_STORAGE_FORMAT = 1

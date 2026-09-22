@@ -473,13 +473,30 @@ class BydCollectorUiContractTest {
         assertTrue(dialog.contains("TripTableHeader(strings, currentTripOpen = trip.open, includeRoute = false)"))
         assertTrue(dialog.contains("currentTripHasFinish"))
         assertTrue(dialog.contains("preserveViewportOnUpdate = true"))
-        assertTrue(map.contains("(map.tag as? TripMapRenderState)?.viewportKey != viewportKey"))
+        assertTrue(map.contains("render.viewportKey != viewportKey"))
+        assertTrue(map.contains("render.points !== sourcePoints"))
         assertFalse(app.contains("strings.partial}"))
         assertTrue(map.contains("priorRender?.viewportKey != viewportKey"))
         assertTrue(map.contains("if (shouldFitViewport)"))
         assertTrue(map.contains("priorRender?.points === points"))
         assertTrue(map.contains("points.lastOrNull { !it.gap && it.final }"))
+        val viewport = app.substringAfter("private fun fitTripMapViewportWhenLaidOut(")
+            .substringBefore("private data class TripMapRenderState(")
+        assertTrue(map.contains("initialized = if (shouldFitViewport) false"))
+        assertTrue(viewport.contains("if (map.width > 0 && map.height > 0)"))
+        assertTrue(viewport.contains("map.addOnFirstLayoutListener"))
+        assertTrue(viewport.contains("map.tag = render.copy(initialized = true)"))
+        assertInOrder(
+            viewport,
+            "map.controller.setZoom(14.0)",
+            "map.controller.setCenter(GeoPoint(validPoints.first().latitude, validPoints.first().longitude))"
+        )
         assertTrue(activity.contains("selectedCurrentTripId = available.trip.id"))
+        assertTrue(
+            activity.substringAfter("private fun openCurrentTrip()")
+                .substringBefore("private fun dismissCurrentTrip()")
+                .contains("position = null")
+        )
         assertTrue(refresh.contains("trips.forEachRoutePointFrom(tripId, routeFirstSequence"))
         assertTrue(refresh.contains("modal.nextRouteSequence - 1L"))
         assertTrue(refresh.contains("modal.trip.route.lastOrNull { point -> !point.gap }?.sequence ?: 0L"))
@@ -493,6 +510,38 @@ class BydCollectorUiContractTest {
         assertTrue(pause.contains("handler.removeCallbacks(currentTripRefreshTask)"))
         assertTrue(strings.contains("noCurrentTrip = \"Немає поточної поїздки\""))
         assertTrue(strings.contains("noCurrentTrip = \"No current trip\""))
+    }
+
+    @Test
+    fun currentTripReusesExactFinishMarkerForFreshAndLastKnownPosition() {
+        val app = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorApp.kt").readText()
+        val activity = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val actions = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorActions.kt").readText()
+        val strings = sourceFile("com/bydcollector/collector/ui/compose/BydCollectorStrings.kt").readText()
+        val dialog = app.substringAfter("private fun TripRouteDialog(").substringBefore("private fun createTripMap(")
+        val markerUpdate = app.substringAfter("private fun updateCurrentTripPositionMarker(")
+            .substringBefore("private fun tripMapMarker")
+        val refresh = activity.substringAfter("private fun refreshCurrentTrip()")
+            .substringBefore("private fun refresh(force")
+
+        assertTrue(actions.contains("data class CurrentTripPositionUi("))
+        assertTrue(actions.contains("val position: CurrentTripPositionUi? = null"))
+        assertTrue(dialog.contains("R.drawable.ic_trip_finish_marker"))
+        assertTrue(dialog.contains("strings.tripCurrentPosition"))
+        assertTrue(dialog.contains("strings.tripLastKnownPosition"))
+        assertTrue(strings.contains("tripCurrentPosition = \"Поточна позиція\""))
+        assertTrue(strings.contains("tripLastKnownPosition = \"Остання відома позиція\""))
+        assertTrue(strings.contains("tripCurrentPosition = \"Current position\""))
+        assertTrue(strings.contains("tripLastKnownPosition = \"Last known position\""))
+        assertTrue(markerUpdate.contains("existing?.apply"))
+        assertTrue(markerUpdate.contains("this.position = GeoPoint(point.latitude, point.longitude)"))
+        assertTrue(markerUpdate.contains("tripMapMarker(map, point, R.drawable.ic_trip_finish_marker)"))
+        assertFalse(markerUpdate.contains("Offset("))
+        assertTrue(refresh.contains("TripsUiMapper.currentPosition("))
+        assertTrue(refresh.contains("currentBootId = read.currentBootId"))
+        assertInOrder(refresh, "val agedPosition = TripsUiMapper.currentPosition(", "dashboardExecutor.execute")
+        assertInOrder(refresh, "currentTripModal = modal.copy(position = agedPosition)", "dashboardExecutor.execute")
+        assertFalse(refresh.contains("isFinal ="))
     }
 
     @Test
@@ -847,7 +896,7 @@ class BydCollectorUiContractTest {
         assertFalse(app.contains("BydSwitch("), "Screen thumbs must belong to the semantic row/header")
         listOf(
             "SwitchToggle(state?.autoStartEnabled == true, actions::onToggleMainAutoStart)",
-            "SwitchToggle(state?.debugAutoStartEnabled == true, actions::onToggleDebugAutoStart, enabled = state?.autoStartEnabled == true)",
+            "SwitchToggle(state?.debugAutoStartEnabled == true, actions::onToggleDebugAutoStart)",
             "SwitchToggle(state?.haSharedCategoriesEnabled == true, actions::onToggleSharedCategories, enabled = state?.influxEnabled != true)",
             "SwitchToggle(autoStart, onAutoStartChanged)",
             "SwitchToggle(config.enabled, { onConfigChanged(config.copy(enabled = it)) })",

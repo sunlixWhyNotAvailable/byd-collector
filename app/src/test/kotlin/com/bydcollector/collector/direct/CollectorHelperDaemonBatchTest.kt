@@ -286,16 +286,18 @@ class CollectorHelperDaemonBatchTest {
             val orderedSecondary = CollectorHelperDaemon.loadSecondaryRows(apk.absolutePath)
             val known = address(5, 1014, 1145045040)
             val debugRows = assets.flatMap { DirectDebugParameterAsset.parse(it.readText(Charsets.UTF_8)) }
-            val debugAddresses = debugRows.map { address(it.tx, it.dev, it.fid) }
+            val debugAddresses = debugRows.filter(DirectDebugParameterAsset::isRuntimeSelected)
+                .map { address(it.tx, it.dev, it.fid) }
 
             assertEquals(3, assets.size)
-            assertEquals(23177, whitelist.size)
-            assertEquals(23083, debugAddresses.size)
+            assertEquals(23163, whitelist.size)
+            assertEquals(23069, debugAddresses.size)
             assertEquals(debugAddresses, orderedSecondary)
             assertTrue(debugAddresses.size <= CollectorHelperProtocol.MAX_BATCH_SIZE)
             assertNull(CollectorHelperDaemon.validateRows(debugAddresses, whitelist))
             assets.forEach { asset ->
                 val shard = DirectDebugParameterAsset.parse(asset.readText(Charsets.UTF_8))
+                    .filter(DirectDebugParameterAsset::isRuntimeSelected)
                     .map { address(it.tx, it.dev, it.fid) }
                 assertTrue(shard.size <= CollectorHelperProtocol.MAX_BATCH_SIZE)
                 assertNull(CollectorHelperDaemon.validateRows(shard, whitelist))
@@ -349,7 +351,7 @@ class CollectorHelperDaemonBatchTest {
         val daemon = sourceFile("com/bydcollector/collector/direct/CollectorHelperDaemon.java").readText()
         val client = sourceFile("com/bydcollector/collector/data/direct/DirectVehicleHelperClient.kt").readText()
 
-        assertEquals(11, CollectorHelperProtocol.PROTOCOL_VERSION)
+        assertEquals(12, CollectorHelperProtocol.PROTOCOL_VERSION)
         assertTrue(client.contains("protocolVersion != CollectorHelperProtocol.PROTOCOL_VERSION"))
         assertTrue(client.contains("DirectHelperOwnerMode.fromProtocolValue(ownerMode)"))
         assertTrue(client.contains("TX_PING"))

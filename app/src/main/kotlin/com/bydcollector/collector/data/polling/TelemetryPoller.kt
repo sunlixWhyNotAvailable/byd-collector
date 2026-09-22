@@ -10,6 +10,7 @@ class TelemetryPoller(
     private val clock: Clock = SystemClockAdapter(),
     private val intervalMs: Long = DEFAULT_INTERVAL_MS,
     private val onCycleResult: (PollCycleResult) -> Unit = {},
+    private val onRuntimeError: (Throwable) -> Unit = {},
     private val sleeper: (Long) -> Unit = { Thread.sleep(it) }
 ) {
     private val running = AtomicBoolean(false)
@@ -50,10 +51,14 @@ class TelemetryPoller(
                 coordinator.pollOnce(sessionId)?.takeUnless { it.deferred }?.let(onCycleResult)
             } catch (_: InterruptedException) {
                 running.set(false)
-            } catch (_: Exception) {
+            } catch (error: Exception) {
                 //continues polling after one bad cycle because vehicle access can be transiently unavailable
+                runCatching { onRuntimeError(error) }
                 runCatching {
-                    onCycleResult(PollCycleResult(null, ok = false, category = "poller_runtime_error", elapsedMs = 0, requestCount = 0))
+                    onCycleResult(PollCycleResult(
+                        null, ok = false, category = "poller_runtime_error", elapsedMs = 0, requestCount = 0,
+                        errorMessage = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                    ))
                 }
             }
 

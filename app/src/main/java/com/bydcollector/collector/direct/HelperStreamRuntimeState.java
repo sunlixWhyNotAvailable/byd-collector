@@ -122,6 +122,16 @@ final class HelperStreamRuntimeState {
         return CollectorHelperProtocol.STATUS_OK;
     }
 
+    /** Allows credentialed replay while a live-capture pause fence is held for archival. */
+    synchronized int authorizeReplay(long token, int stream, long epoch, long nowMs) {
+        StreamState state = stream(stream);
+        ControlResult invalid = validate(token, state, stream, epoch, nowMs, true);
+        if (invalid != null) return invalid.status;
+        return state.desired && nowMs < state.leaseExpiresMs
+            ? CollectorHelperProtocol.STATUS_OK
+            : CollectorHelperProtocol.STATUS_LEASE_EXPIRED;
+    }
+
     synchronized boolean replayAllowed(int stream, long nowMs) {
         StreamState state = stream(stream);
         if (state == null) return false;
@@ -137,6 +147,15 @@ final class HelperStreamRuntimeState {
             nowMs >= state.leaseExpiresMs;
     }
 
+    /** Holds post-fence callback publication while capture continues into the bounded next-epoch queue. */
+    synchronized boolean callbackPublishingHeld(int stream, long nowMs) {
+        StreamState state = stream(stream);
+        if (state == null) return false;
+        expire(state, nowMs);
+        return controllerToken != 0L && state.desired && nowMs < state.leaseExpiresMs &&
+            (state.paused || state.pausePending);
+    }
+
     synchronized long workGeneration(int stream, long nowMs) {
         StreamState state = stream(stream);
         if (state == null) return -1L;
@@ -146,6 +165,14 @@ final class HelperStreamRuntimeState {
 
     synchronized ControlResult snapshot(int stream, long nowMs) {
         return result(CollectorHelperProtocol.STATUS_OK, stream, nowMs, null);
+    }
+
+    synchronized StreamView streamView(int stream, long nowMs) {
+        StreamState value = stream(stream);
+        if (value == null) throw new IllegalArgumentException("invalid stream");
+        expire(value, nowMs);
+        return new StreamView(value.desired, value.paused || value.pausePending, value.epoch,
+            value.desired && nowMs < value.leaseExpiresMs);
     }
 
     private ControlResult validate(
@@ -242,6 +269,20 @@ final class HelperStreamRuntimeState {
             this.secondaryEpoch = secondaryEpoch;
             this.leaseExpiresElapsedMs = leaseExpiresElapsedMs;
             this.error = error;
+        }
+    }
+
+    static final class StreamView {
+        final boolean desired;
+        final boolean capturePaused;
+        final long epoch;
+        final boolean activeLease;
+
+        StreamView(boolean desired, boolean capturePaused, long epoch, boolean activeLease) {
+            this.desired = desired;
+            this.capturePaused = capturePaused;
+            this.epoch = epoch;
+            this.activeLease = activeLease;
         }
     }
 }

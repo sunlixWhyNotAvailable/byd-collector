@@ -1,6 +1,7 @@
 package com.bydcollector.collector.data.direct
 
 import com.bydcollector.collector.direct.CollectorHelperProtocol
+import com.bydcollector.collector.direct.CallbackValueSource
 import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
 
 interface DirectVehicleHelper {
@@ -41,7 +42,9 @@ enum class DirectHelperOwnerMode(val protocolValue: Int) {
 data class DirectHelperReadResult(
     val status: Int,
     val raw: Int?,
-    val error: String? = null
+    val error: String? = null,
+    val callbackSource: CallbackValueSource? = null,
+    val callbackCached: Boolean = callbackSource != null
 ) {
     val ok: Boolean = status == 0 && raw != null
 }
@@ -111,7 +114,8 @@ data class TelemetryWorkerFieldValue(
     val fid: Int,
     val status: Int,
     val raw: Int?,
-    val error: String?
+    val error: String?,
+    val callbackSource: CallbackValueSource? = null
 )
 
 data class TelemetryWorkerAckResult(

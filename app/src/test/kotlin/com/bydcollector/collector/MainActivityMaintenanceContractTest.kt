@@ -107,10 +107,21 @@ class MainActivityMaintenanceContractTest {
         val preflight = source.substringAfter("private fun openMainArchiveDialog")
             .substringBefore("private fun loadCredentialsAfterFirstFrame")
 
-        assertInOrder(counts, "dashboardCountExecutor.execute", "withTelemetryStoreRead { countStore ->", "countStore.dashboardRowCounts()")
+        assertInOrder(counts, "dashboardCountExecutor.execute", "withTelemetryStoreRead { countStore ->", "countStore.dashboardRowCounts(cancellation)")
         assertInOrder(counts, "withTelemetryStoreRead", "DirectDebugStore(applicationContext)")
         assertInOrder(preflight, "val task = Runnable", "withTelemetryStoreRead { preflightStore ->", "StorageFormatCutoverCoordinator.readMainPreflight")
         assertTrue(preflight.contains("StorageFormatCutoverCoordinator.readMainPreflight(preflightStore.databaseFile())"))
+    }
+
+    @Test
+    fun mainAndSecondaryAutoStartTogglesAreIndependent() {
+        val source = sourceFile("com/bydcollector/collector/MainActivity.kt").readText()
+        val debugToggle = source.substringAfter("override fun onToggleDebugAutoStart")
+            .substringBefore("override fun onToggleSharedCategories")
+
+        assertTrue(debugToggle.contains("settings.setDebugAutoStartEnabled("))
+        assertTrue(debugToggle.contains("CollectorAutoStart.scheduleWatchdog"))
+        assertFalse(debugToggle.contains("settings.isAutoStartEnabled()"))
     }
 
     @Test

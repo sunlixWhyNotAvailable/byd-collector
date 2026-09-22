@@ -51,7 +51,7 @@ object CollectorAutoStart {
             cancelWatchdog(appContext)
             return
         }
-        if (clearsManualStops(action) && demand.main && settings.hasActiveAccessWork()) {
+        if (clearsManualStops(action) && (demand.main || demand.debug) && settings.hasActiveAccessWork()) {
             AdbAuthorizationManager.request(
                 context = appContext,
                 store = store,

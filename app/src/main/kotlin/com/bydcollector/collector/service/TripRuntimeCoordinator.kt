@@ -29,6 +29,7 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import com.bydcollector.collector.util.diagnosticDetail
 
 /** Serializes power-session, route, and normalized-location writes behind one owner. */
 class TripRuntimeCoordinator(
@@ -419,10 +420,13 @@ class TripRuntimeCoordinator(
             executor.execute {
                 ownerThread = Thread.currentThread()
                 runCatching(block).onFailure { error ->
-                    recordEvent("trip_runtime_error", "Trip runtime operation failed", "${error::class.java.simpleName}: ${error.message.orEmpty()}")
+                    recordEvent("trip_runtime_error", "Trip runtime operation failed", error.diagnosticDetail())
                 }
             }
-        }.onFailure { onDropped() }
+        }.onFailure { error ->
+            recordEvent("trip_dispatch_error", "Trip runtime dispatch failed", error.diagnosticDetail())
+            onDropped()
+        }
     }
 
     private fun Map<String, NormalizedObservation>.number(key: String): Double? {

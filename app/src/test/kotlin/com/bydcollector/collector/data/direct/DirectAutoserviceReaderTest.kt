@@ -1,12 +1,42 @@
 package com.bydcollector.collector.data.direct
 
 import com.bydcollector.collector.direct.CollectorHelperProtocol
+import com.bydcollector.collector.direct.CallbackValueSource
+import com.bydcollector.collector.direct.TelemetryCallbackBatch
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class DirectAutoserviceReaderTest {
+    @Test
+    fun cachedCallbackSourceSurvivesHelperSnapshotWithoutMarkingOtherReads() {
+        val entries = DirectFidRegistry.entries.take(2)
+        val callback = CallbackValueSource(
+            "boot-a", "generation-a", 1, 7L, 11L,
+            entries[0].dev, entries[0].fid, TelemetryCallbackBatch.TYPE_INT, 17,
+            1_000L, 900L, null, "usable"
+        )
+        val helper = object : DirectVehicleHelper {
+            override fun isAlive(): Boolean = true
+            override fun read(entry: DirectFidEntry) = error("scalar read must not be used")
+            override fun readBatch(entries: List<DirectFidEntry>) = DirectHelperBatchResult(
+                listOf(
+                    DirectHelperReadResult(0, 17, callbackSource = callback),
+                    DirectHelperReadResult(0, 18)
+                ),
+                testDiagnostics(entries.size)
+            )
+        }
+
+        val readings = DirectAutoserviceReader(helper, entries).readSnapshot().readings
+
+        assertEquals(callback, readings[0].callbackSource)
+        assertEquals(null, readings[1].callbackSource)
+        assertTrue(DirectHelperReadResult(0, 19, callbackCached = true).callbackCached)
+        assertEquals(null, DirectHelperReadResult(0, 19, callbackCached = true).callbackSource)
+    }
+
     @Test
     fun snapshotPollsEveryRegistryEntryAndKeepsPartialErrors() {
         val results = DirectFidRegistry.entries.associate { entry ->

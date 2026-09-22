@@ -4,16 +4,29 @@ import java.io.File
 import java.util.UUID
 
 /** Capture identity/time, independent of Main row IDs and query duration. */
-data class PollSampleSource(val identity: String, val bootId: String, val capturedElapsedMs: Long)
+data class PollSampleSource(
+    val identity: String,
+    val bootId: String,
+    val capturedElapsedMs: Long,
+    val generatorId: String? = null,
+    val sequence: Long? = null
+)
 
 internal class LivePollSource(
     private val bootId: String = liveBootId,
     private val generation: String = UUID.randomUUID().toString()
 ) {
     private var sequence = 0L
-    fun capture(elapsedMs: Long): PollSampleSource = PollSampleSource(
-        "live:$bootId:$generation:${++sequence}", bootId, elapsedMs
-    )
+    fun capture(elapsedMs: Long): PollSampleSource {
+        val nextSequence = ++sequence
+        return PollSampleSource(
+            "live:$bootId:$generation:$nextSequence",
+            bootId,
+            elapsedMs,
+            generation,
+            nextSequence
+        )
+    }
 
     companion object {
         private val liveBootId: String by lazy {

@@ -4,6 +4,7 @@ import android.content.Context
 import com.bydcollector.collector.data.direct.DirectFidEntry
 import com.bydcollector.collector.data.direct.DirectFidRegistry
 import com.bydcollector.collector.data.direct.DirectValueDecoder
+import com.bydcollector.collector.direct.TelemetryCatalogPolicy
 
 data class DirectDebugParameter(
     val key: String,
@@ -47,8 +48,11 @@ object DirectDebugParameterAsset {
     val EXPECTED_SHARD_SIZES = listOf(7_692, 7_693, 7_698)
     const val SHARD_COUNT = 3
     const val MAX_SHARD_SIZE = 7_698
-    const val TOTAL_PARAMETER_COUNT = 23_083
-    const val SOURCE_VERSION = "fid-catalog-20260908-main95-roundrobin23083-both-read-tx-v1"
+    const val DEFINITION_COUNT = TelemetryCatalogPolicy.SECONDARY_DEFINITION_COUNT
+    const val TOTAL_PARAMETER_COUNT = TelemetryCatalogPolicy.SECONDARY_ACTIVE_COUNT
+    const val LEGACY_SOURCE_VERSION = "fid-catalog-20260908-main95-roundrobin23083-both-read-tx-v1"
+    const val SOURCE_VERSION = "fid-catalog-20260922-main95-roundrobin23069-exclusions7-v2"
+    const val ACTIVE_FINGERPRINT = TelemetryCatalogPolicy.SECONDARY_ACTIVE_FINGERPRINT
     val EXPECTED_HEADER = listOf(
         "key",
         "feature_group",
@@ -61,9 +65,34 @@ object DirectDebugParameterAsset {
     )
 
     fun load(context: Context): List<DirectDebugParameter> {
-        return loadShards(context).flatten().also { rows ->
-            require(rows.size == TOTAL_PARAMETER_COUNT) { "Unexpected debug catalog size: ${rows.size}" }
+        return loadDefinitions(context).filter(::isRuntimeSelected).also { rows ->
+            require(rows.size == TOTAL_PARAMETER_COUNT) { "Unexpected active debug catalog size: ${rows.size}" }
+            require(fingerprint(rows) == ACTIVE_FINGERPRINT) { "Unexpected active debug catalog fingerprint" }
         }
+    }
+
+    fun loadDefinitions(context: Context): List<DirectDebugParameter> =
+        loadShards(context).flatten().also { rows ->
+            require(rows.size == DEFINITION_COUNT) { "Unexpected debug definition count: ${rows.size}" }
+        }
+
+    fun isRuntimeSelected(parameter: DirectDebugParameter): Boolean =
+        TelemetryCatalogPolicy.isRuntimeSelected(parameter.dev, parameter.fid)
+
+    fun parametersForCatalog(
+        catalogVersion: String,
+        definitions: List<DirectDebugParameter>,
+        active: List<DirectDebugParameter>
+    ): List<DirectDebugParameter>? = when (catalogVersion) {
+        SOURCE_VERSION -> active
+        LEGACY_SOURCE_VERSION -> definitions
+        else -> null
+    }
+
+    fun fingerprint(parameters: List<DirectDebugParameter>): String {
+        val digest = TelemetryCatalogPolicy.newFingerprint()
+        parameters.forEach { TelemetryCatalogPolicy.addToFingerprint(digest, it.dev, it.fid, it.tx) }
+        return TelemetryCatalogPolicy.finishFingerprint(digest)
     }
 
     fun loadShards(context: Context): List<List<DirectDebugParameter>> {

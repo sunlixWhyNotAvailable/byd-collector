@@ -294,6 +294,7 @@ class SecondaryReplayCoordinatorTest {
                         .put("raw_present", false)
                         .put("raw", JSONObject.NULL)
                         .put("error", error ?: "missing")
+                        .put("callback_cached", false)
                 )
             )
             .toString()

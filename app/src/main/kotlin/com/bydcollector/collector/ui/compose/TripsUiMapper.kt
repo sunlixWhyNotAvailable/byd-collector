@@ -134,7 +134,40 @@ object TripsUiMapper {
             speedKmh = point.speedKmh,
             consumptionKwhPer100Km = point.instantaneousConsumptionKwhPer100Km,
             gap = point.kind != RoutePoint.KIND_VALID,
-            final = point.isFinal
+            final = point.isFinal,
+            sourceObservedAt = point.observedAt,
+            sourceElapsedMs = point.elapsedMs,
+            receiveWallTimeMs = point.receiveWallTimeMs,
+            sourceBootId = point.bootId,
+            quality = point.quality
+        )
+    }
+
+    fun currentPosition(
+        route: List<TripRoutePointUi>,
+        currentBootId: String?,
+        nowElapsedMs: Long,
+        nowWallTimeMs: Long
+    ): CurrentTripPositionUi? {
+        val pointIndex = route.indexOfLast { point ->
+            !point.gap && point.latitude.isFinite() && point.longitude.isFinite()
+        }
+        if (pointIndex < 0) return null
+        val point = route[pointIndex]
+        val monotonicAgeMs = if (!currentBootId.isNullOrBlank() && point.sourceBootId == currentBootId) {
+            point.sourceElapsedMs?.let { source -> (nowElapsedMs - source).takeIf { it >= 0L } }
+        } else {
+            null
+        }
+        val sourceWallAgeMs = point.sourceObservedAt
+            ?.let(TripTime::instant)
+            ?.toEpochMilli()
+            ?.let { source -> (nowWallTimeMs - source).takeIf { it >= 0L } }
+        val ageMs = monotonicAgeMs ?: sourceWallAgeMs
+        val stale = route.drop(pointIndex + 1).any { it.gap } || ageMs == null || ageMs > CURRENT_POSITION_FRESH_MS
+        return CurrentTripPositionUi(
+            sequence = point.sequence,
+            state = if (stale) CurrentTripPositionState.LAST_KNOWN else CurrentTripPositionState.CURRENT
         )
     }
 
@@ -250,4 +283,6 @@ object TripsUiMapper {
         val completeness: TripEnergyCompleteness,
         val netCompleteness: TripEnergyCompleteness
     )
+
+    private const val CURRENT_POSITION_FRESH_MS = 5_000L
 }

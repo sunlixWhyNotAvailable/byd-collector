@@ -1,5 +1,7 @@
 package com.bydcollector.collector.data.normalized
 
+import com.bydcollector.collector.data.local.PollReading
+
 enum class NormalizedCategory(val mqttKey: String, val staleAfterMs: Long) {
     BATTERY("battery", 30_000L),
     MOTION("motion", 5_000L),
@@ -91,3 +93,68 @@ data class NormalizedObservation(
         ).joinToString("|")
     }
 }
+
+enum class NormalizedSourceKind(val storageValue: String) {
+    POLL("poll"),
+    CALLBACK("callback")
+}
+
+data class NormalizedSourceStamp(
+    val kind: NormalizedSourceKind,
+    val identity: String,
+    val bootId: String,
+    val generatorId: String?,
+    val sequence: Long?,
+    val wallMs: Long,
+    val elapsedMs: Long
+)
+
+data class NormalizedSourceInput(
+    val reading: PollReading,
+    val stamp: NormalizedSourceStamp,
+    val sourcePollId: Long?
+)
+
+enum class NormalizedSourceOrder {
+    NEWER,
+    EQUAL,
+    OLDER,
+    INCOMPARABLE
+}
+
+object NormalizedSourceOrdering {
+    fun compare(incoming: NormalizedSourceStamp, previous: NormalizedSourceStamp): NormalizedSourceOrder {
+        if (incoming.identity == previous.identity) return NormalizedSourceOrder.EQUAL
+        if (incoming.bootId == previous.bootId) {
+            compareLong(incoming.elapsedMs, previous.elapsedMs)?.let { return it }
+            if (incoming.generatorId != null && incoming.generatorId == previous.generatorId &&
+                incoming.sequence != null && previous.sequence != null
+            ) {
+                compareLong(incoming.sequence, previous.sequence)?.let { return it }
+            }
+            compareLong(incoming.wallMs, previous.wallMs)?.let { return it }
+            return NormalizedSourceOrder.INCOMPARABLE
+        }
+        return compareLong(incoming.wallMs, previous.wallMs)
+            ?: NormalizedSourceOrder.INCOMPARABLE
+    }
+
+    private fun compareLong(incoming: Long, previous: Long): NormalizedSourceOrder? = when {
+        incoming > previous -> NormalizedSourceOrder.NEWER
+        incoming < previous -> NormalizedSourceOrder.OLDER
+        else -> null
+    }
+}
+
+data class SourceOrderedApplyResult(
+    val appliedObservations: List<NormalizedObservation>,
+    val summary: NormalizedWriteSummary,
+    val acceptedSourceKeys: Set<String>
+)
+
+data class CallbackNormalizationPageResult(
+    val processedCount: Int,
+    val appliedObservations: List<NormalizedObservation>,
+    val summary: NormalizedWriteSummary,
+    val hasMore: Boolean
+)

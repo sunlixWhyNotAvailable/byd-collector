@@ -8,7 +8,13 @@ import com.bydcollector.collector.direct.CollectorHelperProtocol
 import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
 import com.bydcollector.collector.direct.SecondarySpoolBinder
 import com.bydcollector.collector.direct.SecondaryTelemetrySpool
+import com.bydcollector.collector.direct.CallbackSpool
+import com.bydcollector.collector.direct.CallbackSpoolBinder
+import com.bydcollector.collector.direct.CallbackValueSource
+import com.bydcollector.collector.direct.TelemetryCallbackBatch
 import com.bydcollector.collector.data.debug.DirectDebugParameterAsset
+import com.bydcollector.collector.data.callback.CallbackDelivery
+import java.io.ByteArrayOutputStream
 
 //wraps the helper binder so autoservice calls stay behind one read-only app-facing interface
 class DirectVehicleHelperClient : DirectVehicleHelper {
@@ -97,7 +103,7 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                     require(hasRaw == 0 || hasRaw == 1) { "invalid raw marker: $hasRaw" }
                     val raw = if (hasRaw == 1) reply.readInt() else null
                     val error = batchError.takeIf { status != 0 && mode == "rejected" }
-                    DirectHelperReadResult(status, raw, error)
+                    DirectHelperReadResult(status, raw, error, CallbackValueSource.readNullable(reply))
                 }
                 DirectHelperBatchResult(
                     results = results,
@@ -160,9 +166,11 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                 val statuses = reply.createIntArray() ?: error("missing secondary statuses")
                 val presence = reply.createByteArray() ?: error("missing secondary presence")
                 val raws = reply.createIntArray() ?: error("missing secondary raw values")
+                val callbackCached = reply.createByteArray() ?: error("missing secondary callback presence")
                 require(count in 0..entries.size && statuses.size == count && raws.size == count &&
-                    presence.size == (count + 7) / 8 && reply.dataAvail() == 0
+                    presence.size == (count + 7) / 8 && callbackCached.size == (count + 7) / 8
                 ) { "invalid secondary packed payload" }
+                require(reply.dataAvail() == 0) { "unexpected secondary callback payload" }
                 require(catalog == DirectDebugParameterAsset.SOURCE_VERSION) { "secondary catalog mismatch" }
                 require(elapsed >= 0 && listOf(nativeGroups, fallbackGroups, fallbackReads, groupFailures).all { it >= 0 }) {
                     "invalid secondary diagnostics"
@@ -173,7 +181,10 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                 require(count == entries.size) { "incomplete secondary cycle" }
                 DirectHelperBatchResult(
                     List(count) { i ->
-                        DirectHelperReadResult(statuses[i], if ((presence[i / 8].toInt() and (1 shl (i % 8))) != 0) raws[i] else null)
+                        val raw = if ((presence[i / 8].toInt() and (1 shl (i % 8))) != 0) raws[i] else null
+                        val cachedValue = (callbackCached[i / 8].toInt() and (1 shl (i % 8))) != 0
+                        require(!cachedValue || raw != null) { "secondary callback cache marker without raw" }
+                        DirectHelperReadResult(statuses[i], raw, callbackCached = cachedValue)
                     },
                     DirectBatchDiagnostics(mode, native, nativeGroups, fallbackGroups, fallbackReads,
                         groupFailures, elapsed, count, batchError, status)
@@ -254,6 +265,161 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
             data.recycle()
             reply.recycle()
         }
+    }
+
+    fun callbackSpoolStatus(stream: Int): CallbackSpoolStatus = synchronized(lock) {
+        val owner = DirectStreamController.credentials(stream)
+            ?: return@synchronized CallbackSpoolStatus(CollectorHelperProtocol.STATUS_STALE_TOKEN, error = "Callback stream is not claimed")
+        val binder = ensureBinder()
+            ?: return@synchronized CallbackSpoolStatus(STATUS_NO_BINDER, error = "helper binder unavailable")
+        val data = Parcel.obtain(); val reply = Parcel.obtain()
+        try {
+            writeCallbackCredentials(data, owner.controllerToken, stream, owner.epoch)
+            if (!binder.transact(CollectorHelperProtocol.TX_CALLBACK_STATUS, data, reply, 0)) {
+                cached = null
+                return@synchronized CallbackSpoolStatus(STATUS_TRANSACT_FALSE, error = "callback status transact returned false")
+            }
+            require(reply.dataSize() <= 4096) { "oversize callback status" }
+            val status = reply.readInt(); val footprint = reply.readLong(); val ready = reply.readInt(); val bad = reply.readInt()
+            val lossMarker = reply.readInt()
+            require(lossMarker in 0..1) { "invalid callback loss marker" }
+            val loss = if (lossMarker == 1) CallbackLoss(reply.readLong(), reply.readLong(), reply.readLong(), reply.readString() ?: error("missing loss reason")) else null
+            val error = reply.readString()
+            require(footprint >= 0 && ready >= 0 && bad >= 0 && reply.dataAvail() == 0 &&
+                (loss == null || (loss.count > 0 && loss.firstWallMs >= 0 && loss.lastWallMs >= loss.firstWallMs && loss.reason.length <= 128))
+            ) { "invalid callback status reply" }
+            CallbackSpoolStatus(status, footprint, ready, bad, loss, error)
+        } catch (error: DeadObjectException) {
+            cached = null; CallbackSpoolStatus(STATUS_DEAD_OBJECT, error = error.message ?: "dead binder")
+        } catch (error: Exception) {
+            CallbackSpoolStatus(STATUS_CLIENT_ERROR, error = "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+        } finally { data.recycle(); reply.recycle() }
+    }
+
+    fun callbackSpoolPage(
+        stream: Int,
+        descriptor: CallbackSpool.Descriptor? = null,
+        offset: Long = 0,
+        limit: Int = CallbackSpool.MAX_SLICE_BYTES
+    ): CallbackSpoolPage {
+        fun failure(status: Int, error: String) = CallbackSpoolPage(status, error = error)
+        if (stream !in CollectorHelperProtocol.STREAM_MAIN..CollectorHelperProtocol.STREAM_SECONDARY ||
+            offset < 0 || limit !in 1..CallbackSpool.MAX_SLICE_BYTES || (descriptor == null && offset != 0L) ||
+            (descriptor != null && descriptor.stream != stream)) return failure(STATUS_CLIENT_ERROR, "invalid callback page request")
+        return synchronized(lock) {
+            val owner = DirectStreamController.credentials(stream)
+                ?: return@synchronized failure(CollectorHelperProtocol.STATUS_STALE_TOKEN, "Callback stream is not claimed")
+            val binder = ensureBinder() ?: return@synchronized failure(STATUS_NO_BINDER, "helper binder unavailable")
+            val data = Parcel.obtain(); val reply = Parcel.obtain()
+            try {
+                writeCallbackCredentials(data, owner.controllerToken, stream, owner.epoch)
+                CallbackSpoolBinder.writeDescriptor(data, descriptor); data.writeLong(offset); data.writeInt(limit)
+                if (!binder.transact(CollectorHelperProtocol.TX_CALLBACK_PENDING_PAGE, data, reply, 0)) {
+                    cached = null; return@synchronized failure(STATUS_TRANSACT_FALSE, "callback page transact returned false")
+                }
+                require(reply.dataSize() <= CallbackSpoolBinder.MAX_REPLY_BYTES) { "oversize callback page reply" }
+                val status = reply.readInt(); val responseError = reply.readString()
+                val selected = CallbackSpoolBinder.readDescriptor(reply); val returnedOffset = reply.readLong()
+                val bytes = reply.createByteArray() ?: error("missing callback page bytes")
+                require(bytes.size <= limit && reply.dataAvail() == 0) { "invalid callback page payload" }
+                if (status == CollectorHelperProtocol.STATUS_OK) {
+                    require(returnedOffset == offset) { "callback page offset mismatch" }
+                    if (selected == null) require(descriptor == null && bytes.isEmpty()) { "callback batch disappeared" }
+                    else {
+                        require(selected.stream == stream && returnedOffset <= selected.length && bytes.size.toLong() <= selected.length - returnedOffset) {
+                            "callback page exceeds batch"
+                        }
+                        if (descriptor != null) require(selected == descriptor) { "callback descriptor changed during paging" }
+                    }
+                }
+                CallbackSpoolPage(status, selected, returnedOffset, bytes, responseError)
+            } catch (error: DeadObjectException) {
+                cached = null; failure(STATUS_DEAD_OBJECT, error.message ?: "dead binder")
+            } catch (error: Exception) {
+                failure(STATUS_CLIENT_ERROR, "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+            } finally { data.recycle(); reply.recycle() }
+        }
+    }
+
+    /** Downloads and validates one immutable batch. The caller ACKs only after its SQLite commit. */
+    fun drainCallbackBatch(stream: Int): CallbackBatchDownload {
+        var page = callbackSpoolPage(stream)
+        if (!page.ok) return CallbackBatchDownload(page.status, error = page.error)
+        val descriptor = page.descriptor ?: return CallbackBatchDownload(CollectorHelperProtocol.STATUS_OK)
+        val payload = try {
+            require(descriptor.length in 1..TelemetryCallbackBatch.MAX_BYTES.toLong()) { "invalid callback batch length" }
+            val bytes = ByteArrayOutputStream(descriptor.length.toInt())
+            var offset = 0L
+            while (offset < descriptor.length) {
+                if (offset != 0L) page = callbackSpoolPage(stream, descriptor, offset)
+                require(page.ok && page.descriptor == descriptor && page.offset == offset && page.bytes.isNotEmpty()) {
+                    page.error ?: "callback paging failed"
+                }
+                bytes.write(page.bytes)
+                offset += page.bytes.size
+            }
+            bytes.toByteArray()
+        } catch (error: Exception) {
+            return CallbackBatchDownload(STATUS_CLIENT_ERROR, descriptor = descriptor,
+                error = "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+        }
+        return try {
+            require(payload.size.toLong() == descriptor.length && TelemetryCallbackBatch.digest(payload) == descriptor.sha256) {
+                "callback batch digest mismatch"
+            }
+            val batch = TelemetryCallbackBatch.decode(payload)
+            require(batch.identity() == descriptor.identity && batch.stream == stream &&
+                batch.bootId == descriptor.bootId && batch.helperGeneration == descriptor.helperGeneration &&
+                batch.epoch == descriptor.epoch && batch.batchSequence == descriptor.batchSequence
+            ) { "callback batch identity mismatch" }
+            CallbackBatchDownload(CollectorHelperProtocol.STATUS_OK, descriptor, batch,
+                if (descriptor.spoolOrder < 0) CallbackDelivery.LIVE else CallbackDelivery.REPLAY)
+        } catch (error: Exception) {
+            CallbackBatchDownload(STATUS_CLIENT_ERROR, descriptor = descriptor,
+                error = "${error::class.java.simpleName}: ${error.message ?: "no message"}",
+                permanentFormatError = true)
+        }
+    }
+
+    /** Call only after the exact callback batch transaction has committed durably. */
+    fun acknowledgeCallbackSpool(stream: Int, descriptor: CallbackSpool.Descriptor): CallbackSpoolActionResult = synchronized(lock) {
+        callbackSpoolAction(CollectorHelperProtocol.TX_CALLBACK_ACK, stream, descriptor, null)
+    }
+
+    fun quarantineCallbackSpool(stream: Int, descriptor: CallbackSpool.Descriptor, reason: String): CallbackSpoolActionResult = synchronized(lock) {
+        callbackSpoolAction(CollectorHelperProtocol.TX_CALLBACK_QUARANTINE, stream, descriptor, reason.take(512))
+    }
+
+    private fun callbackSpoolAction(
+        transaction: Int, stream: Int, descriptor: CallbackSpool.Descriptor, reason: String?
+    ): CallbackSpoolActionResult = synchronized(lock) {
+        if (descriptor.stream != stream) return@synchronized CallbackSpoolActionResult(STATUS_CLIENT_ERROR, error = "callback stream mismatch")
+        val owner = DirectStreamController.credentials(stream)
+            ?: return@synchronized CallbackSpoolActionResult(CollectorHelperProtocol.STATUS_STALE_TOKEN, error = "Callback stream is not claimed")
+        val binder = ensureBinder()
+            ?: return@synchronized CallbackSpoolActionResult(STATUS_NO_BINDER, error = "helper binder unavailable")
+        val data = Parcel.obtain(); val reply = Parcel.obtain()
+        try {
+            writeCallbackCredentials(data, owner.controllerToken, stream, owner.epoch)
+            CallbackSpoolBinder.writeDescriptor(data, descriptor)
+            if (transaction == CollectorHelperProtocol.TX_CALLBACK_QUARANTINE) data.writeString(reason)
+            if (!binder.transact(transaction, data, reply, 0)) {
+                cached = null
+                return@synchronized CallbackSpoolActionResult(STATUS_TRANSACT_FALSE, error = "callback action transact returned false")
+            }
+            val status = reply.readInt(); val affected = reply.readInt(); val error = reply.readString()
+            require(affected in 0..1 && reply.dataAvail() == 0) { "invalid callback ACK reply" }
+            CallbackSpoolActionResult(status, affected, error)
+        } catch (error: DeadObjectException) {
+            cached = null; CallbackSpoolActionResult(STATUS_DEAD_OBJECT, error = error.message ?: "dead binder")
+        } catch (error: Exception) {
+            CallbackSpoolActionResult(STATUS_CLIENT_ERROR, error = "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+        } finally { data.recycle(); reply.recycle() }
+    }
+
+    private fun writeCallbackCredentials(data: Parcel, token: Long, stream: Int, epoch: Long) {
+        data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
+        data.writeLong(token); data.writeInt(stream); data.writeLong(epoch)
     }
 
     fun secondarySpoolPage(
@@ -515,7 +681,8 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                 fid = fid,
                 status = status,
                 raw = if (hasRaw == 1) reply.readInt() else null,
-                error = reply.readString()
+                error = reply.readString(),
+                callbackSource = CallbackValueSource.readNullable(reply)
             )
         }
         return TelemetryWorkerSample(

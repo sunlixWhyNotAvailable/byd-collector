@@ -4,18 +4,36 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
+import android.os.CancellationSignal
 import android.util.Log
+import com.bydcollector.collector.data.callback.CallbackDelivery
+import com.bydcollector.collector.data.callback.CallbackImportResult
+import com.bydcollector.collector.data.callback.CallbackRawStore
+import com.bydcollector.collector.data.callback.StoredCallbackEvent
+import com.bydcollector.collector.data.direct.DirectFidRegistry
+import com.bydcollector.collector.data.direct.DirectValueDecoders
 import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
+import com.bydcollector.collector.direct.TelemetryCallbackBatch
 import com.bydcollector.collector.diagnostics.OperationalEventJournal
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.data.normalized.NormalizedQuality
+import com.bydcollector.collector.data.normalized.CallbackNormalizationPageResult
+import com.bydcollector.collector.data.normalized.NormalizedSourceInput
+import com.bydcollector.collector.data.normalized.NormalizedSourceKind
+import com.bydcollector.collector.data.normalized.NormalizedSourceOrder
+import com.bydcollector.collector.data.normalized.NormalizedSourceOrdering
+import com.bydcollector.collector.data.normalized.NormalizedSourceStamp
 import com.bydcollector.collector.data.normalized.NormalizedStateStore
 import com.bydcollector.collector.data.normalized.NormalizedWriteSummary
 import com.bydcollector.collector.data.normalized.PollingErrorSummaries
 import com.bydcollector.collector.data.normalized.StoredNormalizedState
+import com.bydcollector.collector.data.normalized.SourceOrderedApplyResult
+import com.bydcollector.collector.data.normalized.VehicleStateNormalizer
 import com.bydcollector.collector.data.normalized.normalizedIsoTime
+import com.bydcollector.collector.data.polling.PollSampleSource
 import com.bydcollector.collector.data.polling.PollStorage
 import com.bydcollector.collector.data.polling.WorkerPollStorage
+import com.bydcollector.collector.direct.CallbackValueSource
 import com.bydcollector.collector.mqtt.HaMqttMessage
 import com.bydcollector.collector.influx.InfluxExportStateSnapshot
 import com.bydcollector.collector.influx.InfluxExportStore
@@ -29,12 +47,17 @@ import com.bydcollector.collector.mqtt.MqttPublishStateRecorder
 import com.bydcollector.collector.mqtt.NormalizedStateProvider
 import com.bydcollector.collector.service.TelegramEventState
 import com.bydcollector.collector.util.sqliteFootprintBytes
+import com.bydcollector.collector.util.dispatchOperationalEvent
+import com.bydcollector.collector.util.sharedOperationalEventExecutor
 import java.io.Closeable
 import java.io.File
 import java.security.MessageDigest
+import java.time.Instant
+import java.time.OffsetDateTime
 import java.util.Collections
 import java.util.LinkedHashMap
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
 internal data class HistoricalMainIdentity(
     val canonicalPath: String,
@@ -66,6 +89,11 @@ internal data class HistoricalPollHeaderPage(
     val polls: List<HistoricalPollEndpoint>
 )
 
+data class CallbackNormalizationCommit(
+    val summary: NormalizedWriteSummary?,
+    val duplicate: Boolean
+)
+
 //central sqlite facade that keeps raw polls, normalized state, mqtt outbox, and influx cursors consistent
 class TelemetryStore(
     private val context: Context,
@@ -84,6 +112,11 @@ class TelemetryStore(
     private val directImporter = DirectCatalogImporter(helper)
     private val ecImporter = EcDatabaseImporter(context, helper, clock)
     private val normalizedStore = NormalizedStateStore(helper, clock)
+    private val mainEntriesByKey = DirectFidRegistry.entries.associateBy { it.key }
+    private val callbackRawStore = CallbackRawStore(
+        database = { helper.writableDatabase },
+        nowMs = { java.time.OffsetDateTime.parse(clock.nowIso()).toInstant().toEpochMilli() }
+    )
     private val influxCursorInitializer = InfluxCursorInitializer()
     private val compactV2 by lazy { helper.isCompactV2() }
     private val decodedValueIds = Collections.synchronizedMap(
@@ -94,8 +127,10 @@ class TelemetryStore(
     )
     @Volatile private var pollValueColumnsEnsuredForCatalogVersionId: Long? = null
     @Volatile private var normalizedCatalogEnsured = false
+    private val closed = AtomicBoolean(false)
 
     override fun close() {
+        if (!closed.compareAndSet(false, true)) return
         influxCursorInitializer.clear()
         helper.close()
     }
@@ -146,15 +181,307 @@ class TelemetryStore(
 
     override fun currentState(categories: Set<String>?): List<StoredNormalizedState> = normalizedCurrentState(categories)
 
-    fun dashboardRowCounts(): TelemetryRowCounts {
+    fun dashboardRowCounts(cancellationSignal: CancellationSignal? = null): TelemetryRowCounts {
         return TelemetryRowCounts(
-            pollCount = scalarLong("SELECT COUNT(*) FROM polls"),
-            valueRowCount = scalarLong("SELECT COUNT(*) FROM poll_values"),
-            ecRowCount = scalarLong("SELECT COUNT(*) FROM ec_energy_consumption"),
-            normalizedCurrentCount = scalarLong("SELECT COUNT(*) FROM vehicle_state_current"),
-            normalizedHistoryCount = scalarLong("SELECT COUNT(*) FROM vehicle_state_history")
+            pollCount = scalarLong("SELECT COUNT(*) FROM polls", cancellationSignal),
+            valueRowCount = scalarLong(
+                "SELECT (SELECT COUNT(*) FROM poll_values) + (SELECT COUNT(*) FROM raw_callback_events)",
+                cancellationSignal
+            ),
+            ecRowCount = scalarLong("SELECT COUNT(*) FROM ec_energy_consumption", cancellationSignal),
+            normalizedCurrentCount = scalarLong("SELECT COUNT(*) FROM vehicle_state_current", cancellationSignal),
+            normalizedHistoryCount = scalarLong("SELECT COUNT(*) FROM vehicle_state_history", cancellationSignal)
         )
     }
+
+    fun importCallbackBatch(
+        batch: TelemetryCallbackBatch,
+        digest: String,
+        delivery: CallbackDelivery
+    ): CallbackImportResult {
+        if (batch.stream != CallbackRawStore.MAIN_STREAM) {
+            return CallbackImportResult.Rejected("Main store requires Main callback stream")
+        }
+        return callbackRawStore.importBatch(batch, digest, delivery)
+    }
+
+    fun pendingCallbackNormalization(limit: Int = CallbackRawStore.MAX_PENDING_PAGE): List<StoredCallbackEvent> =
+        callbackRawStore.pendingNormalization(limit)
+
+    fun applyCallbackNormalization(
+        eventId: Long,
+        observations: List<NormalizedObservation>
+    ): CallbackNormalizationCommit {
+        val db = helper.writableDatabase
+        var result: CallbackNormalizationCommit? = null
+        db.beginTransaction()
+        try {
+            callbackRawStore.requireMainEventInTransaction(db, eventId)
+            result = if (callbackRawStore.isNormalizedInTransaction(db, eventId)) {
+                CallbackNormalizationCommit(summary = null, duplicate = true)
+            } else {
+                val summary = normalizedStore.applyObservationsInTransaction(db, observations)
+                callbackRawStore.markNormalizedInTransaction(db, eventId)
+                CallbackNormalizationCommit(summary, duplicate = false)
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        return checkNotNull(result)
+    }
+
+    fun applySourcePollNormalization(
+        pollId: Long,
+        timestamp: String,
+        source: PollSampleSource,
+        readings: List<PollReading>,
+        normalizer: VehicleStateNormalizer
+    ): SourceOrderedApplyResult {
+        ensureNormalizedCatalogImported()
+        val pollStamp = NormalizedSourceStamp(
+            kind = NormalizedSourceKind.POLL,
+            identity = source.identity,
+            bootId = source.bootId,
+            generatorId = source.generatorId,
+            sequence = source.sequence,
+            wallMs = epochMillis(timestamp),
+            elapsedMs = source.capturedElapsedMs
+        )
+        val db = helper.writableDatabase
+        var result: SourceOrderedApplyResult? = null
+        db.beginTransaction()
+        try {
+            val cached = loadNormalizedSourceInputs(db)
+            val accepted = linkedSetOf<String>()
+            readings.forEach { reading ->
+                val input = sourceInputForPollReading(reading, pollStamp, pollId) ?: return@forEach
+                if (mergeNormalizedSourceInput(db, cached, input)) accepted += reading.rawKey
+            }
+            val observations = normalizer.normalizeSparse(cached, accepted)
+            val summary = normalizedStore.applyObservationsInTransaction(db, observations)
+            result = SourceOrderedApplyResult(observations, summary, accepted)
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        return checkNotNull(result)
+    }
+
+    fun normalizePendingCallbackPage(
+        normalizer: VehicleStateNormalizer,
+        limit: Int = CallbackRawStore.MAX_PENDING_PAGE
+    ): CallbackNormalizationPageResult {
+        require(limit in 1..CallbackRawStore.MAX_PENDING_PAGE) {
+            "callback normalization page must be 1..${CallbackRawStore.MAX_PENDING_PAGE}"
+        }
+        ensureNormalizedCatalogImported()
+        val pending = callbackRawStore.pendingNormalization(limit)
+        if (pending.isEmpty()) {
+            return CallbackNormalizationPageResult(0, emptyList(), emptyNormalizedSummary(), hasMore = false)
+        }
+        val db = helper.writableDatabase
+        val applied = mutableListOf<NormalizedObservation>()
+        var summary = emptyNormalizedSummary()
+        var processed = 0
+        db.beginTransaction()
+        try {
+            val cached = loadNormalizedSourceInputs(db)
+            pending.forEach { event ->
+                callbackRawStore.requireMainEventInTransaction(db, event.id)
+                if (!callbackRawStore.isNormalizedInTransaction(db, event.id)) {
+                    callbackEventInput(event)?.let { input ->
+                        if (mergeNormalizedSourceInput(db, cached, input)) {
+                            val observations = normalizer.normalizeSparse(cached, setOf(input.reading.rawKey))
+                            applied += observations
+                            summary = summary + normalizedStore.applyObservationsInTransaction(db, observations)
+                        }
+                    }
+                    callbackRawStore.markNormalizedInTransaction(db, event.id)
+                    processed += 1
+                }
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        return CallbackNormalizationPageResult(
+            processedCount = processed,
+            appliedObservations = applied,
+            summary = summary,
+            hasMore = pending.size == limit
+        )
+    }
+
+    private fun loadNormalizedSourceInputs(db: SQLiteDatabase): MutableMap<String, NormalizedSourceInput> {
+        return db.rawQuery(
+            """
+            SELECT source_key, raw_value, desc_value, source_kind, source_identity, source_boot_id,
+                   source_generator_id, source_sequence, source_wall_ms, source_elapsed_ms, source_poll_id
+            FROM normalized_source_inputs
+            """.trimIndent(),
+            emptyArray()
+        ).use { cursor ->
+            buildMap {
+                while (cursor.moveToNext()) {
+                    val key = cursor.getString(0)
+                    put(
+                        key,
+                        NormalizedSourceInput(
+                            reading = PollReading(
+                                rawKey = key,
+                                rawValue = cursor.getNullableString(1),
+                                descValue = cursor.getNullableString(2)
+                            ),
+                            stamp = NormalizedSourceStamp(
+                                kind = NormalizedSourceKind.entries.first {
+                                    it.storageValue == cursor.getString(3)
+                                },
+                                identity = cursor.getString(4),
+                                bootId = cursor.getString(5),
+                                generatorId = cursor.getNullableString(6),
+                                sequence = if (cursor.isNull(7)) null else cursor.getLong(7),
+                                wallMs = cursor.getLong(8),
+                                elapsedMs = cursor.getLong(9)
+                            ),
+                            sourcePollId = if (cursor.isNull(10)) null else cursor.getLong(10)
+                        )
+                    )
+                }
+            }.toMutableMap()
+        }
+    }
+
+    private fun mergeNormalizedSourceInput(
+        db: SQLiteDatabase,
+        cached: MutableMap<String, NormalizedSourceInput>,
+        incoming: NormalizedSourceInput
+    ): Boolean {
+        val key = incoming.reading.rawKey
+        val previous = cached[key]
+        if (previous != null) {
+            when (NormalizedSourceOrdering.compare(incoming.stamp, previous.stamp)) {
+                NormalizedSourceOrder.OLDER,
+                NormalizedSourceOrder.INCOMPARABLE -> return false
+                NormalizedSourceOrder.EQUAL -> {
+                    require(incoming.reading.rawValue == previous.reading.rawValue &&
+                        incoming.reading.descValue == previous.reading.descValue
+                    ) { "source identity reused with different value: $key" }
+                    return false
+                }
+                NormalizedSourceOrder.NEWER -> Unit
+            }
+        }
+        db.insertWithOnConflict(
+            "normalized_source_inputs",
+            null,
+            ContentValues().apply {
+                put("source_key", key)
+                putNullable("raw_value", incoming.reading.rawValue)
+                putNullable("desc_value", incoming.reading.descValue)
+                put("source_kind", incoming.stamp.kind.storageValue)
+                put("source_identity", incoming.stamp.identity)
+                put("source_boot_id", incoming.stamp.bootId)
+                putNullable("source_generator_id", incoming.stamp.generatorId)
+                putNullable("source_sequence", incoming.stamp.sequence)
+                put("source_wall_ms", incoming.stamp.wallMs)
+                put("source_elapsed_ms", incoming.stamp.elapsedMs)
+                putNullable("source_poll_id", incoming.sourcePollId)
+                put("updated_at_ms", epochMillis(clock.nowIso()))
+            },
+            SQLiteDatabase.CONFLICT_REPLACE
+        ).also { require(it != -1L) { "failed to persist normalized source input: $key" } }
+        cached[key] = incoming
+        return true
+    }
+
+    private fun callbackEventInput(event: StoredCallbackEvent): NormalizedSourceInput? {
+        if (event.stream != CallbackRawStore.MAIN_STREAM || event.rawBytes != null ||
+            event.quality !in CALLBACK_USABLE_QUALITIES
+        ) {
+            return null
+        }
+        val entry = DirectFidRegistry.entries.singleOrNull {
+            it.dev == event.device && it.fid == event.fid &&
+                ((it.tx == DirectFidRegistry.TX_GET_INT && event.nativeType == TelemetryCallbackBatch.TYPE_INT) ||
+                    (it.tx == DirectFidRegistry.TX_GET_FLOAT && event.nativeType == TelemetryCallbackBatch.TYPE_FLOAT))
+        } ?: return null
+        return NormalizedSourceInput(
+            reading = PollReading(
+                rawKey = entry.key,
+                rawValue = DirectValueDecoders.rawString(event.rawBits),
+                descValue = DirectValueDecoders.decode(entry, event.rawBits)
+            ),
+            stamp = NormalizedSourceStamp(
+                kind = NormalizedSourceKind.CALLBACK,
+                identity = callbackIdentity(event.bootId, event.helperGeneration, event.stream, event.epoch, event.eventSequence),
+                bootId = event.bootId,
+                generatorId = callbackGenerator(event.helperGeneration, event.stream, event.epoch),
+                sequence = event.eventSequence,
+                wallMs = event.receivedWallMs,
+                elapsedMs = event.receivedElapsedMs
+            ),
+            sourcePollId = null
+        )
+    }
+
+    private fun sourceInputForPollReading(
+        reading: PollReading,
+        pollStamp: NormalizedSourceStamp,
+        pollId: Long
+    ): NormalizedSourceInput? {
+        val entry = mainEntriesByKey[reading.rawKey] ?: return null
+        val callback = reading.callbackSource
+            ?: return NormalizedSourceInput(reading, pollStamp, pollId)
+        val raw = reading.rawInt ?: return null
+        if (callback.quality !in CALLBACK_USABLE_QUALITIES ||
+            !callback.matches(entry.tx, entry.dev, entry.fid, raw)
+        ) return null
+        return NormalizedSourceInput(reading.withoutCallbackSource(), callback.toNormalizedStamp(), null)
+    }
+
+    private fun PollReading.withoutCallbackSource(): PollReading =
+        if (callbackSource == null) this else copy(callbackSource = null)
+
+    private fun CallbackValueSource.toNormalizedStamp(): NormalizedSourceStamp = NormalizedSourceStamp(
+        kind = NormalizedSourceKind.CALLBACK,
+        identity = callbackIdentity(bootId, helperGeneration, stream, epoch, eventSequence),
+        bootId = bootId,
+        generatorId = callbackGenerator(helperGeneration, stream, epoch),
+        sequence = eventSequence,
+        wallMs = receivedWallMs,
+        elapsedMs = receivedElapsedMs
+    )
+
+    private fun callbackIdentity(
+        bootId: String,
+        helperGeneration: String,
+        stream: Int,
+        epoch: Long,
+        eventSequence: Long
+    ): String = "callback:${callbackComponent(bootId)}:${callbackComponent(helperGeneration)}:$stream:$epoch:$eventSequence"
+
+    private fun callbackGenerator(helperGeneration: String, stream: Int, epoch: Long): String =
+        "callback:${callbackComponent(helperGeneration)}:$stream:$epoch"
+
+    private fun callbackComponent(value: String): String = "${value.length}:$value"
+
+    private fun epochMillis(value: String): Long = runCatching {
+        OffsetDateTime.parse(value).toInstant().toEpochMilli()
+    }.getOrElse {
+        Instant.parse(value).toEpochMilli()
+    }
+
+    private fun emptyNormalizedSummary(): NormalizedWriteSummary = NormalizedWriteSummary(0, 0, 0)
+
+    private operator fun NormalizedWriteSummary.plus(other: NormalizedWriteSummary): NormalizedWriteSummary =
+        NormalizedWriteSummary(
+            observedCount = observedCount + other.observedCount,
+            changedCount = changedCount + other.changedCount,
+            historyInsertedCount = historyInsertedCount + other.historyInsertedCount,
+            currentInsertedCount = currentInsertedCount + other.currentInsertedCount,
+            changedCategories = changedCategories + other.changedCategories
+        )
 
     private fun catalogParameters(catalogVersionId: Long): List<CatalogParameter> {
         helper.readableDatabase.rawQuery(
@@ -336,6 +663,18 @@ class TelemetryStore(
         } catch (error: Exception) {
             Log.w(TAG, "operational journal write failed: $logLine", error)
         }
+        dispatchOperationalEvent(sharedOperationalEventExecutor) {
+            if (!closed.get()) recordEventInDatabase(timestamp, category, message, detail, logLine)
+        }
+    }
+
+    private fun recordEventInDatabase(
+        timestamp: String,
+        category: String,
+        message: String,
+        detail: String?,
+        logLine: String
+    ) {
         try {
             val db = helper.writableDatabase
             //stores only recent operational events so diagnostics stay useful without growing unbounded
@@ -1074,7 +1413,11 @@ class TelemetryStore(
             lastErrorAt = activePollScope.lastErrorAtSql()?.let { safeScalarString(it) },
             lastPollStatus = activePollScope.lastPollStatusSql()?.let { safeLastPollStatus(it) },
             pollCount = if (includeCounts) safeScalarLong("SELECT COUNT(*) FROM polls") else UNKNOWN_COUNT,
-            valueRowCount = if (includeCounts) safeScalarLong("SELECT COUNT(*) FROM poll_values") else UNKNOWN_COUNT,
+            valueRowCount = if (includeCounts) {
+                safeScalarLong("SELECT (SELECT COUNT(*) FROM poll_values) + (SELECT COUNT(*) FROM raw_callback_events)")
+            } else {
+                UNKNOWN_COUNT
+            },
             ecRowCount = if (includeCounts) safeScalarLong("SELECT COUNT(*) FROM ec_energy_consumption") else UNKNOWN_COUNT,
             normalizedCurrentCount = if (includeCounts) safeScalarLong("SELECT COUNT(*) FROM vehicle_state_current") else UNKNOWN_COUNT,
             normalizedHistoryCount = if (includeCounts) safeScalarLong("SELECT COUNT(*) FROM vehicle_state_history") else UNKNOWN_COUNT,
@@ -1433,6 +1776,31 @@ class TelemetryStore(
                 }
             }
         )
+        readings.forEach { reading ->
+            if (parametersByKey[reading.rawKey] == null) return@forEach
+            val source = reading.callbackSource ?: return@forEach
+            db.insertOrThrow(
+                "poll_callback_sources",
+                null,
+                ContentValues().apply {
+                    put("poll_id", pollId)
+                    put("source_key", reading.rawKey)
+                    put("boot_id", source.bootId)
+                    put("helper_generation", source.helperGeneration)
+                    put("stream", source.stream)
+                    put("epoch", source.epoch)
+                    put("event_sequence", source.eventSequence)
+                    put("device", source.device)
+                    put("fid", source.fid)
+                    put("native_type", source.nativeType)
+                    put("raw_bits", source.rawBits)
+                    put("received_wall_ms", source.receivedWallMs)
+                    put("received_elapsed_ms", source.receivedElapsedMs)
+                    source.sourceWallMs?.let { put("source_wall_ms", it) } ?: putNull("source_wall_ms")
+                    put("quality", source.quality)
+                }
+            )
+        }
         return resolvedDecodedIds
     }
 
@@ -1548,8 +1916,13 @@ class TelemetryStore(
         Log.w(TAG, "scalar string query failed: $sql", error)
     }.getOrNull()
 
-    private fun scalarLong(sql: String): Long {
-        helper.readableDatabase.rawQuery(sql, emptyArray()).use { cursor ->
+    private fun scalarLong(sql: String, cancellationSignal: CancellationSignal? = null): Long {
+        val query = if (cancellationSignal == null) {
+            helper.readableDatabase.rawQuery(sql, emptyArray())
+        } else {
+            helper.readableDatabase.rawQuery(sql, emptyArray(), cancellationSignal)
+        }
+        query.use { cursor ->
             return if (cursor.moveToFirst()) cursor.getLong(0) else 0L
         }
     }
@@ -1587,6 +1960,15 @@ class TelemetryStore(
 
     private fun Cursor.getNullableString(index: Int): String? {
         return if (isNull(index)) null else getString(index)
+    }
+
+    private fun ContentValues.putNullable(key: String, value: Any?) {
+        when (value) {
+            null -> putNull(key)
+            is String -> put(key, value)
+            is Long -> put(key, value)
+            else -> error("Unsupported nullable ContentValues type for $key: ${value::class.java.name}")
+        }
     }
 
     private fun quoteIdentifier(value: String): String {
@@ -1631,6 +2013,7 @@ class TelemetryStore(
         private const val TAG = "BYDCollectorEvent"
         private const val MAX_ERROR_TEXT_LENGTH = 2_048
         private const val MAX_RAW_RESPONSE_BODY_LENGTH = 4_096
+        private val CALLBACK_USABLE_QUALITIES = setOf("callback", "usable")
         private const val UNKNOWN_COUNT = -1L
         private const val DECODED_VALUE_CACHE_SIZE = 2_048
         private const val TELEGRAM_MAX_PENDING = 1_000L

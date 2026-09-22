@@ -7,6 +7,31 @@ import kotlin.test.assertTrue
 
 class CollectorServiceWorkerHandoffContractTest {
     @Test
+    fun callbackDrainSharesMainWriterButCannotRetriggerBusinessConsumers() {
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val cycle = service.substringAfter("val callbacks = callbackDrain(helper, CollectorHelperProtocol.STREAM_MAIN)")
+            .substringBefore("mainPollerOwnerMode = ownerMode")
+        assertTrue(cycle.indexOf("normalizeCallbackPage()") < cycle.indexOf("liveClient.ensureHelperReady(ownerMode)"))
+        assertTrue(cycle.contains("callbacks.drain(maxBatches = 2)"))
+        assertTrue(cycle.indexOf("callbacks.drain") < cycle.indexOf("pollCycles.pollOnce(sessionId)"))
+        val rawPath = service.substringAfter("private fun callbackDrain(").substringBefore("private fun createSuccessfulPollObserver")
+        assertTrue(rawPath.contains("store.importCallbackBatch(batch, digest, delivery)"))
+        assertTrue(rawPath.contains("debugStore.importCallbackBatch(batch, digest, delivery)"))
+        assertTrue(rawPath.contains("store.normalizePendingCallbackPage(vehicleStateNormalizer)"))
+        assertTrue(rawPath.contains("val backlog = helper.callbackSpoolStatus(stream)"))
+        assertTrue(rawPath.contains("loss_first_wall_ms="))
+        assertTrue(rawPath.contains("loss_reason="))
+        assertFalse(rawPath.contains("tripRuntime.onSuccessfulPoll"))
+        assertFalse(rawPath.contains("energy.process"))
+        assertFalse(rawPath.contains("coordinator.onSuccessfulPoll"))
+        val observer = service.substringAfter("override fun onSourcePoll(").substringBefore("override fun onSourceFailure(")
+        assertTrue(observer.contains("vehicleStateNormalizer.normalize("))
+        assertTrue(observer.contains("store.applySourcePollNormalization(pollId, timestamp, source, readings, vehicleStateNormalizer)"))
+        assertTrue(observer.contains("source, timestamp, readings, observations"))
+        assertTrue(observer.contains("coordinator.onSuccessfulPoll(observations, energySnapshot)"))
+    }
+
+    @Test
     fun appMainUsesAuthoritativeLiveWriterWithSpoolReplayBeforeEveryRead() {
         val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
         val runner = sourceFile("com/bydcollector/collector/data/polling/TelemetryWorkerReplayCoordinator.kt").readText()

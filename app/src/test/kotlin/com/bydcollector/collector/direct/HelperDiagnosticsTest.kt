@@ -258,6 +258,30 @@ class HelperDiagnosticsTest {
     }
 
     @Test
+    fun callbackAggregateIsPersistedWithoutPerEventPayloads() {
+        val sink = RecordingSink()
+        val diagnostics = HelperDiagnostics(
+            "boot-a", 1, "generation-a", 1_000,
+            TelemetryWorkerSpool.Footprint(0, 0), sink, FakeClock(), 8
+        )
+        diagnostics.callback(HelperCallbackController.DiagnosticsSnapshot(
+            10, 2, 3, 7, 1, 99, 100, 20, 150,
+            200, -1, 250, 4, "listener_error_-1"
+        ))
+        val snapshot = diagnostics.snapshotForTest()
+        assertEquals(10, snapshot.callbackAcceptedNativeKeys)
+        assertEquals(2, snapshot.callbackFailedNativeKeys)
+        assertEquals(99L, snapshot.callbacksReceived)
+        assertEquals(4L, snapshot.callbackQueueLossCount)
+        diagnostics.close()
+        val stopped = sink.lines.last { it.contains("\"event\":\"helper_stop\"") }
+        assertTrue(stopped.contains("\"callback_main_queue_bytes\":100"))
+        assertTrue(stopped.contains("\"callback_secondary_queue_oldest_age_ms\":null"))
+        assertTrue(stopped.contains("\"callback_retry_reason\":\"listener_error_-1\""))
+        assertTrue(!stopped.contains("rawBits"))
+    }
+
+    @Test
     fun jsonlAndBootstrapRetainOnlyActivePlusThreeBoundedRotations() {
         val root = Files.createTempDirectory("helper-diagnostics-store").toFile()
         try {

@@ -58,7 +58,22 @@ data class TripRoutePointUi(
     val speedKmh: Double? = null,
     val consumptionKwhPer100Km: Double? = null,
     val gap: Boolean = false,
-    val final: Boolean = false
+    val final: Boolean = false,
+    val sourceObservedAt: String? = null,
+    val sourceElapsedMs: Long? = null,
+    val receiveWallTimeMs: Long? = null,
+    val sourceBootId: String? = null,
+    val quality: String = "ok"
+)
+
+enum class CurrentTripPositionState {
+    CURRENT,
+    LAST_KNOWN
+}
+
+data class CurrentTripPositionUi(
+    val sequence: Long,
+    val state: CurrentTripPositionState
 )
 
 enum class TripEnergyCompleteness {
@@ -133,7 +148,8 @@ data class TripYearUi(
 
 data class CurrentTripUi(
     val trip: TripSummaryUi,
-    val nextRouteSequence: Long = 0L
+    val nextRouteSequence: Long = 0L,
+    val position: CurrentTripPositionUi? = null
 )
 
 data class TripsUiState(

@@ -208,11 +208,12 @@ class TelemetryWorkerSpoolContractTest {
                 assertEquals(TelemetryWorkerSpool.AppendResult.SUCCESS, spool.append(first))
             }
             val recordBytes = sizingRoot.listFiles { _, name -> name.endsWith(".ready") }!!.single().length()
-            TelemetryWorkerSpool.openForTest(cappedRoot, recordBytes).use { spool ->
+            val cap = (recordBytes * 8L + 6L) / 7L
+            TelemetryWorkerSpool.openForTest(cappedRoot, cap).use { spool ->
                 assertTrue(spool.canAppend())
                 assertEquals(TelemetryWorkerSpool.AppendResult.SUCCESS, spool.append(first))
-                assertFalse(spool.canAppend())
                 assertEquals(TelemetryWorkerSpool.AppendResult.CAP_REACHED, spool.append(second))
+                assertFalse(spool.canAppend())
                 assertEquals(listOf(1L), spool.pending(100).map { it.identity.pollSequence })
             }
         } finally {

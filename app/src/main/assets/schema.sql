@@ -73,6 +73,41 @@ CREATE TABLE IF NOT EXISTS telemetry_worker_imports (
     FOREIGN KEY (poll_id) REFERENCES polls(id) ON DELETE CASCADE
 ) WITHOUT ROWID;
 
+CREATE TABLE IF NOT EXISTS poll_callback_sources (
+    poll_id INTEGER NOT NULL,
+    source_key TEXT NOT NULL,
+    boot_id TEXT NOT NULL,
+    helper_generation TEXT NOT NULL,
+    stream INTEGER NOT NULL CHECK (stream IN (1, 2)),
+    epoch INTEGER NOT NULL CHECK (epoch >= 0),
+    event_sequence INTEGER NOT NULL CHECK (event_sequence >= 0),
+    device INTEGER NOT NULL,
+    fid INTEGER NOT NULL,
+    native_type INTEGER NOT NULL CHECK (native_type IN (1, 2)),
+    raw_bits INTEGER NOT NULL,
+    received_wall_ms INTEGER NOT NULL CHECK (received_wall_ms >= 0),
+    received_elapsed_ms INTEGER NOT NULL CHECK (received_elapsed_ms >= 0),
+    source_wall_ms INTEGER CHECK (source_wall_ms IS NULL OR source_wall_ms >= 0),
+    quality TEXT NOT NULL,
+    PRIMARY KEY (poll_id, source_key),
+    FOREIGN KEY (poll_id) REFERENCES polls(id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS normalized_source_inputs (
+    source_key TEXT PRIMARY KEY,
+    raw_value TEXT,
+    desc_value TEXT,
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('poll', 'callback')),
+    source_identity TEXT NOT NULL,
+    source_boot_id TEXT NOT NULL,
+    source_generator_id TEXT,
+    source_sequence INTEGER,
+    source_wall_ms INTEGER NOT NULL CHECK (source_wall_ms >= 0),
+    source_elapsed_ms INTEGER NOT NULL CHECK (source_elapsed_ms >= 0),
+    source_poll_id INTEGER,
+    updated_at_ms INTEGER NOT NULL
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS vehicle_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id INTEGER NOT NULL,
@@ -320,3 +355,48 @@ CREATE INDEX IF NOT EXISTS idx_ec_import_runs_session_ts
 
 CREATE INDEX IF NOT EXISTS idx_ec_energy_consumption_start
     ON ec_energy_consumption(start_timestamp);
+
+CREATE TABLE IF NOT EXISTS raw_callback_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    boot_id TEXT NOT NULL,
+    helper_generation TEXT NOT NULL,
+    stream INTEGER NOT NULL CHECK(stream IN (1, 2)),
+    epoch INTEGER NOT NULL,
+    batch_sequence INTEGER NOT NULL,
+    digest TEXT NOT NULL,
+    acquisition TEXT NOT NULL CHECK(acquisition = 'callback'),
+    delivery TEXT NOT NULL CHECK(delivery IN ('live', 'replay')),
+    event_count INTEGER NOT NULL,
+    first_event_sequence INTEGER NOT NULL,
+    last_event_sequence INTEGER NOT NULL,
+    imported_at_ms INTEGER NOT NULL,
+    UNIQUE(boot_id, helper_generation, stream, epoch, batch_sequence)
+);
+
+CREATE TABLE IF NOT EXISTS raw_callback_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL,
+    boot_id TEXT NOT NULL,
+    helper_generation TEXT NOT NULL,
+    stream INTEGER NOT NULL CHECK(stream IN (1, 2)),
+    epoch INTEGER NOT NULL,
+    event_sequence INTEGER NOT NULL,
+    device INTEGER NOT NULL,
+    fid INTEGER NOT NULL,
+    native_type INTEGER NOT NULL,
+    raw_bits INTEGER NOT NULL,
+    raw_bytes BLOB,
+    received_wall_ms INTEGER NOT NULL,
+    received_elapsed_ms INTEGER NOT NULL,
+    source_wall_ms INTEGER,
+    quality TEXT NOT NULL,
+    UNIQUE(boot_id, helper_generation, stream, epoch, event_sequence),
+    UNIQUE(batch_id, event_sequence),
+    FOREIGN KEY(batch_id) REFERENCES raw_callback_batches(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS raw_callback_normalization_receipts (
+    event_id INTEGER PRIMARY KEY,
+    normalized_at_ms INTEGER NOT NULL,
+    FOREIGN KEY(event_id) REFERENCES raw_callback_events(id) ON DELETE CASCADE
+) WITHOUT ROWID;

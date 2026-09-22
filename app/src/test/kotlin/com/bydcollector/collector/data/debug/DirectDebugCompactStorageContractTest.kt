@@ -47,7 +47,8 @@ class DirectDebugCompactStorageContractTest {
 
         assertTrue(source.contains("loadCandidateState(db, catalogVersionId)"))
         assertTrue(source.contains("val transitions = ArrayList<DebugTransition>()"))
-        assertTrue(source.contains("transitions.forEach { transition ->\n                insertTransition"))
+        assertTrue(source.contains("transitions.forEach { transition ->"))
+        assertTrue(source.contains("insertTransition("))
         assertTrue(source.contains("cycle_count = cycle_count + 1"))
         assertTrue(source.contains("attempted_count = attempted_count + ?"))
         assertTrue(source.contains("candidateState[transition.candidateId] = transition.observed.toPrevious()"))
@@ -63,7 +64,7 @@ class DirectDebugCompactStorageContractTest {
 
         assertTrue(source.contains("put(\"feature_names\", parameter.featureNames)"))
         assertTrue(source.contains("put(\"feature_refs\", parameter.featureRefs)"))
-        assertTrue(source.contains("ensureCandidates(db, parameters, sourceVersionChanged)"))
+        assertTrue(source.contains("ensureCandidates(db, definitions, sourceVersionChanged)"))
         assertTrue(source.contains("existingId != null && reconcileMetadata"))
         assertTrue(source.contains("db.update(\"debug_direct_candidates\", values, \"id = ?\""))
         assertTrue(source.contains("WHERE catalog_version_id = ?"))
@@ -83,6 +84,17 @@ class DirectDebugCompactStorageContractTest {
         assertTrue(store.contains("Legacy debug database must be archived before round-robin polling starts"))
         assertFalse(store.contains("fun checkpointForArchive()"))
         assertTrue(store.contains("fun verifyWritableDatabase(): Boolean"))
+    }
+
+    @Test
+    fun dashboardReadingCountIncludesRawCallbacksOnlyForCompactStorage() {
+        val store = sourceFile("DirectDebugStore.kt").readText()
+        val count = store.substringAfter("fun dashboardReadingCount(cancellationSignal: CancellationSignal? = null): Long")
+            .substringBefore("fun status(")
+
+        assertTrue(count.contains("DirectDebugDatabaseHelper.isCompactV2"))
+        assertTrue(count.contains("COUNT(*) FROM debug_direct_readings"))
+        assertTrue(count.contains("COUNT(*) FROM raw_callback_events"))
     }
 
     private fun sourceFile(name: String): File {

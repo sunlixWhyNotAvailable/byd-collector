@@ -75,11 +75,65 @@ class CompactStorageSchemaContractTest {
             assertTrue(imports.contains("poll_id INTEGER NOT NULL UNIQUE"))
             assertTrue(imports.contains("REFERENCES polls(id) ON DELETE CASCADE"))
         }
-        assertTrue(helper.contains("const val DATABASE_VERSION = 10"))
+        assertTrue(helper.contains("const val DATABASE_VERSION = 13"))
         assertTrue(helper.contains("ensureNormalizedQualityDetails(db)"))
         listOf(legacy, compact).forEach { schema ->
             assertEquals(2, Regex("quality_detail TEXT").findAll(schema).count())
         }
+    }
+
+    @Test
+    fun bothMainSchemasPersistOneBoundedSourceOrderingCache() {
+        val schemas = listOf(
+            projectFile("app/src/main/assets/schema.sql", "src/main/assets/schema.sql").readText(),
+            projectFile("app/src/main/assets/schema_v2.sql", "src/main/assets/schema_v2.sql").readText()
+        )
+        schemas.forEach { schema ->
+            val inputs = schema.substringAfter("CREATE TABLE IF NOT EXISTS normalized_source_inputs (")
+                .substringBefore(") WITHOUT ROWID;")
+            assertTrue(inputs.contains("source_key TEXT PRIMARY KEY"))
+            assertTrue(inputs.contains("source_identity TEXT NOT NULL"))
+            assertTrue(inputs.contains("source_elapsed_ms INTEGER NOT NULL"))
+            assertTrue(inputs.contains("source_poll_id INTEGER"))
+            assertFalse(inputs.contains("raw_callback_events"))
+            assertFalse(inputs.contains("FOREIGN KEY"))
+        }
+
+        val store = projectFile(
+            "app/src/main/kotlin/com/bydcollector/collector/data/local/TelemetryStore.kt",
+            "src/main/kotlin/com/bydcollector/collector/data/local/TelemetryStore.kt"
+        ).readText()
+        val input = store.substringAfter("private fun sourceInputForPollReading(")
+            .substringBefore("private fun PollReading.withoutCallbackSource")
+        assertTrue(input.contains("mainEntriesByKey[reading.rawKey] ?: return null"))
+    }
+
+    @Test
+    fun bothMainSchemasPersistOnlyExplicitCachedCallbackProvenance() {
+        val schemas = listOf(
+            projectFile("app/src/main/assets/schema.sql", "src/main/assets/schema.sql").readText(),
+            projectFile("app/src/main/assets/schema_v2.sql", "src/main/assets/schema_v2.sql").readText()
+        )
+        schemas.forEach { schema ->
+            val sources = schema.substringAfter("CREATE TABLE IF NOT EXISTS poll_callback_sources (")
+                .substringBefore(") WITHOUT ROWID;")
+            assertTrue(sources.contains("PRIMARY KEY (poll_id, source_key)"))
+            assertTrue(sources.contains("boot_id TEXT NOT NULL"))
+            assertTrue(sources.contains("received_elapsed_ms INTEGER NOT NULL"))
+            assertTrue(sources.contains("source_wall_ms INTEGER"))
+            assertTrue(sources.contains("FOREIGN KEY (poll_id) REFERENCES polls(id) ON DELETE CASCADE"))
+            assertFalse(sources.contains("raw_callback_events"))
+        }
+
+        val store = projectFile(
+            "app/src/main/kotlin/com/bydcollector/collector/data/local/TelemetryStore.kt",
+            "src/main/kotlin/com/bydcollector/collector/data/local/TelemetryStore.kt"
+        ).readText()
+        val insertion = store.substringAfter("private fun insertPollValues(").substringBefore("private data class PollInsertResult")
+        assertTrue(insertion.contains("val source = reading.callbackSource ?: return@forEach"))
+        assertTrue(insertion.contains("\"poll_callback_sources\""))
+        assertTrue(insertion.indexOf("\"poll_values\"") < insertion.indexOf("\"poll_callback_sources\""))
+        assertFalse(insertion.contains("raw_callback_events"))
     }
 
     @Test

@@ -121,6 +121,32 @@ class RuntimeManualStopContractTest {
         assertFalse(activityStops.contains("setInfluxAutoStartEnabled"))
     }
 
+    @Test
+    fun mainStartFailureDoesNotStopIndependentSecondaryRuntime() {
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val reconcile = service.substringAfter("private fun reconcileCollection(")
+            .substringBefore("private fun reconcileAccessRuntime")
+        val localFailure = service.substringAfter("private fun handleMainStartFailure")
+            .substringBefore("private fun ", missingDelimiterValue = service.substringAfter("private fun handleMainStartFailure"))
+
+        assertTrue(reconcile.contains("handleMainStartFailure(error)"))
+        assertFalse(localFailure.contains("stopSelf()"))
+        assertTrue(localFailure.contains("releaseLease(CollectorHelperProtocol.STREAM_MAIN)"))
+        val sharedFailure = service.substringAfter("private fun handleStartFailure")
+            .substringBefore("private fun stopCollection")
+        assertFalse(sharedFailure.contains("stopMain("))
+        assertFalse(sharedFailure.contains("stopDebug("))
+        assertFalse(sharedFailure.contains("endSession("))
+        assertFalse(sharedFailure.contains("stopSelf()"))
+        assertTrue(sharedFailure.contains("CollectorAutoStart.scheduleWatchdog"))
+        assertTrue(service.contains("if (settings.hasActiveAccessWork())"))
+        assertFalse(service.contains("if (settings.isAutoStartEnabled() && settings.hasActiveAccessWork())"))
+
+        val autoStart = sourceFile("com/bydcollector/collector/system/CollectorAutoStart.kt").readText()
+        assertTrue(autoStart.contains("(demand.main || demand.debug) && settings.hasActiveAccessWork()"))
+        assertFalse(autoStart.contains("demand.main && settings.hasActiveAccessWork()"))
+    }
+
     private fun sourceFile(path: String): File {
         return listOf(
             File("src/main/kotlin/$path"),

@@ -12,6 +12,8 @@ import com.bydcollector.collector.data.local.PersistedPollInput
 import com.bydcollector.collector.data.local.PollReading
 import com.bydcollector.collector.data.local.WorkerPollImportResult
 import com.bydcollector.collector.direct.CollectorHelperProtocol
+import com.bydcollector.collector.direct.CallbackValueSource
+import com.bydcollector.collector.direct.TelemetryCallbackBatch
 import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
 import kotlin.test.Test
 import kotlin.test.assertContains
@@ -145,6 +147,35 @@ class TelemetryWorkerReplayCoordinatorTest {
                 "ack_attempted=1 ack_succeeded=1 ack_failed=0"
         )
         assertContains(storage.events.single().third.orEmpty(), "first=boot-a:generation-a:1 last=boot-a:generation-a:1")
+    }
+
+    @Test
+    fun replayPreservesCachedCallbackIdentityAndLeavesGetterValuesUnlabeled() {
+        val actions = mutableListOf<String>()
+        val storage = FakeWorkerPollStorage(actions)
+        val source = callbackSource()
+        val cached = sample().let { sample ->
+            sample.copy(values = listOf(sample.values.single().copy(callbackSource = source)))
+        }
+        val coordinator = coordinator(
+            storage,
+            cached,
+            actions,
+            object : SuccessfulPollObserver {
+                override fun onSuccessfulPoll(
+                    sessionId: Long,
+                    pollId: Long,
+                    timestamp: String,
+                    readings: List<PollReading>,
+                    origin: PollOrigin
+                ) = Unit
+            }
+        )
+
+        coordinator.replayNextBatch(7L)
+
+        assertEquals(source, storage.input?.readings?.single()?.callbackSource)
+        assertEquals(null, sample().values.single().callbackSource)
     }
 
     @Test
@@ -532,13 +563,16 @@ class TelemetryWorkerReplayCoordinatorTest {
     fun unknownCatalogSampleIsPreservedBeforeAckAndDiskFailureRemainsRetryable() {
         val actions = mutableListOf<String>()
         val storage = FakeWorkerPollStorage(actions)
+        val unknownSample = sample("unknown", listOf(TEST_ENTRY), listOf(72)).let { sample ->
+            sample.copy(values = listOf(sample.values.single().copy(callbackSource = callbackSource())))
+        }
         val coordinator = TelemetryWorkerReplayCoordinator(
             store = storage,
             ensureHelper = { null },
             pendingSamples = {
                 PendingTelemetryWorkerSamples(
                     CollectorHelperProtocol.STATUS_OK,
-                    listOf(sample("unknown", listOf(TEST_ENTRY), listOf(72)))
+                    listOf(unknownSample)
                 )
             },
             acknowledgeSample = { _, _ ->
@@ -555,12 +589,46 @@ class TelemetryWorkerReplayCoordinatorTest {
         val raw = org.json.JSONObject(storage.inputs.single().rawResponseBody!!)
         assertEquals("unknown", raw.getString("catalog_version"))
         assertEquals("boot-a", raw.getJSONObject("identity").getString("boot_id"))
+        assertEquals(
+            "boot-callback",
+            raw.getJSONArray("values").getJSONObject(0).getJSONObject("callback_source").getString("boot_id")
+        )
         assertTrue(actions.indexOf("insert:7") < actions.indexOf("ack"))
 
         storage.failInsertAttempt = 2
         actions.clear()
         assertTrue(coordinator.replayNextBatch(7L).needsReplay)
         assertFalse(actions.contains("ack"))
+    }
+
+    @Test
+    fun mismatchedCallbackSourceIsQuarantinedInsteadOfLabelingPollData() {
+        val actions = mutableListOf<String>()
+        val storage = FakeWorkerPollStorage(actions)
+        val corrupt = sample().let { sample ->
+            sample.copy(values = listOf(sample.values.single().copy(callbackSource = callbackSource(raw = 71))))
+        }
+        val coordinator = coordinator(
+            storage,
+            corrupt,
+            actions,
+            object : SuccessfulPollObserver {
+                override fun onSuccessfulPoll(
+                    sessionId: Long,
+                    pollId: Long,
+                    timestamp: String,
+                    readings: List<PollReading>,
+                    origin: PollOrigin
+                ) = Unit
+            }
+        )
+
+        val result = coordinator.replayNextBatch(7L)
+
+        assertFalse(result.needsReplay)
+        assertEquals("worker_sample_quarantined", storage.input?.errorCategory)
+        assertTrue(storage.input?.readings.orEmpty().isEmpty())
+        assertTrue(actions.any { it.startsWith("ack:") })
     }
 
     private fun coordinator(
@@ -593,6 +661,12 @@ class TelemetryWorkerReplayCoordinatorTest {
 
     private fun sample(sequence: Long = 1L): TelemetryWorkerSample =
         sample(DirectFidRegistry.CATALOG_VERSION, listOf(TEST_ENTRY), listOf(72), sequence)
+
+    private fun callbackSource(raw: Int = 72) = CallbackValueSource(
+        "boot-callback", "generation-callback", 1, 5L, 8L,
+        TEST_ENTRY.dev, TEST_ENTRY.fid, TelemetryCallbackBatch.TYPE_INT, raw,
+        1_000L, 900L, 950L, "usable"
+    )
 
     private fun sample(
         catalogVersion: String,

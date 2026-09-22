@@ -30,6 +30,20 @@ final class HelperDiagnosticSnapshot {
     final long repeatedErrorCount;
     final String collectionMode;
     final boolean capReached;
+    final int callbackAcceptedNativeKeys;
+    final int callbackFailedNativeKeys;
+    final int callbackPromotedKeys;
+    final int callbackPollKeys;
+    final int callbackFallbackKeys;
+    final long callbacksReceived;
+    final long callbackMainQueueBytes;
+    final long callbackMainQueueOldestAgeMs;
+    final long callbackMainQueueHighWaterBytes;
+    final long callbackSecondaryQueueBytes;
+    final long callbackSecondaryQueueOldestAgeMs;
+    final long callbackSecondaryQueueHighWaterBytes;
+    final long callbackQueueLossCount;
+    final String callbackRetryReason;
 
     HelperDiagnosticSnapshot(
         String bootId,
@@ -57,7 +71,21 @@ final class HelperDiagnosticSnapshot {
         String lastError,
         long repeatedErrorCount,
         String collectionMode,
-        boolean capReached
+        boolean capReached,
+        int callbackAcceptedNativeKeys,
+        int callbackFailedNativeKeys,
+        int callbackPromotedKeys,
+        int callbackPollKeys,
+        int callbackFallbackKeys,
+        long callbacksReceived,
+        long callbackMainQueueBytes,
+        long callbackMainQueueOldestAgeMs,
+        long callbackMainQueueHighWaterBytes,
+        long callbackSecondaryQueueBytes,
+        long callbackSecondaryQueueOldestAgeMs,
+        long callbackSecondaryQueueHighWaterBytes,
+        long callbackQueueLossCount,
+        String callbackRetryReason
     ) {
         this.bootId = bootId;
         this.pid = pid;
@@ -85,6 +113,20 @@ final class HelperDiagnosticSnapshot {
         this.repeatedErrorCount = repeatedErrorCount;
         this.collectionMode = collectionMode;
         this.capReached = capReached;
+        this.callbackAcceptedNativeKeys = callbackAcceptedNativeKeys;
+        this.callbackFailedNativeKeys = callbackFailedNativeKeys;
+        this.callbackPromotedKeys = callbackPromotedKeys;
+        this.callbackPollKeys = callbackPollKeys;
+        this.callbackFallbackKeys = callbackFallbackKeys;
+        this.callbacksReceived = callbacksReceived;
+        this.callbackMainQueueBytes = callbackMainQueueBytes;
+        this.callbackMainQueueOldestAgeMs = callbackMainQueueOldestAgeMs;
+        this.callbackMainQueueHighWaterBytes = callbackMainQueueHighWaterBytes;
+        this.callbackSecondaryQueueBytes = callbackSecondaryQueueBytes;
+        this.callbackSecondaryQueueOldestAgeMs = callbackSecondaryQueueOldestAgeMs;
+        this.callbackSecondaryQueueHighWaterBytes = callbackSecondaryQueueHighWaterBytes;
+        this.callbackQueueLossCount = callbackQueueLossCount;
+        this.callbackRetryReason = callbackRetryReason;
     }
 
     JSONObject toJson(long observedWallMs, long observedElapsedMs) throws Exception {
@@ -119,6 +161,22 @@ final class HelperDiagnosticSnapshot {
         json.put("repeated_error_count", repeatedErrorCount);
         json.put("collection_mode", collectionMode);
         json.put("cap_reached", capReached);
+        json.put("callback_accepted_native_keys", callbackAcceptedNativeKeys);
+        json.put("callback_failed_native_keys", callbackFailedNativeKeys);
+        json.put("callback_promoted_keys", callbackPromotedKeys);
+        json.put("callback_poll_keys", callbackPollKeys);
+        json.put("callback_fallback_keys", callbackFallbackKeys);
+        json.put("callbacks_received", callbacksReceived);
+        json.put("callback_main_queue_bytes", callbackMainQueueBytes);
+        json.put("callback_main_queue_oldest_age_ms",
+            callbackMainQueueOldestAgeMs < 0L ? JSONObject.NULL : callbackMainQueueOldestAgeMs);
+        json.put("callback_main_queue_high_water_bytes", callbackMainQueueHighWaterBytes);
+        json.put("callback_secondary_queue_bytes", callbackSecondaryQueueBytes);
+        json.put("callback_secondary_queue_oldest_age_ms",
+            callbackSecondaryQueueOldestAgeMs < 0L ? JSONObject.NULL : callbackSecondaryQueueOldestAgeMs);
+        json.put("callback_secondary_queue_high_water_bytes", callbackSecondaryQueueHighWaterBytes);
+        json.put("callback_queue_loss_count", callbackQueueLossCount);
+        json.put("callback_retry_reason", callbackRetryReason == null ? JSONObject.NULL : callbackRetryReason);
         return json;
     }
 }

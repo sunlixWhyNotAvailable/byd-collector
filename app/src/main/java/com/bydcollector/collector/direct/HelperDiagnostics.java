@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.Objects;
 
 //Nonblocking diagnostic aggregation. Telemetry callers only update memory and offer to a bounded queue.
 final class HelperDiagnostics implements AutoCloseable, TelemetryWorkerSpool.DiagnosticListener {
@@ -65,6 +66,9 @@ final class HelperDiagnostics implements AutoCloseable, TelemetryWorkerSpool.Dia
     private final AtomicBoolean capReached = new AtomicBoolean(false);
     private final AtomicReference<String> lastErrorKey = new AtomicReference<String>();
     private final AtomicLong repeatedErrorCount = new AtomicLong();
+    private HelperCallbackController.DiagnosticsSnapshot callbackSnapshot =
+        new HelperCallbackController.DiagnosticsSnapshot(0, 0, 0, 0, 0, 0L,
+            0L, -1L, 0L, 0L, -1L, 0L, 0L, null);
     private long stateRevision;
 
     static HelperDiagnostics open(
@@ -257,6 +261,30 @@ final class HelperDiagnostics implements AutoCloseable, TelemetryWorkerSpool.Dia
         }
         if (event != null) offer(event);
         else offer(new Signal(SIGNAL_CHANGE, null, (String) null));
+    }
+
+    /** Receives a bounded aggregate snapshot; persistence remains on the diagnostic writer thread. */
+    void callback(HelperCallbackController.DiagnosticsSnapshot value) {
+        if (value == null) return;
+        boolean changed;
+        synchronized (stateLock) {
+            HelperCallbackController.DiagnosticsSnapshot old = callbackSnapshot;
+            changed = old.acceptedNativeKeys != value.acceptedNativeKeys ||
+                old.failedNativeKeys != value.failedNativeKeys || old.promotedKeys != value.promotedKeys ||
+                old.pollKeys != value.pollKeys || old.fallbackKeys != value.fallbackKeys ||
+                old.callbacksReceived != value.callbacksReceived || old.mainQueueBytes != value.mainQueueBytes ||
+                old.mainQueueOldestAgeMs != value.mainQueueOldestAgeMs ||
+                old.mainQueueHighWaterBytes != value.mainQueueHighWaterBytes ||
+                old.secondaryQueueBytes != value.secondaryQueueBytes ||
+                old.secondaryQueueOldestAgeMs != value.secondaryQueueOldestAgeMs ||
+                old.secondaryQueueHighWaterBytes != value.secondaryQueueHighWaterBytes ||
+                old.queueLossCount != value.queueLossCount || !Objects.equals(old.retryReason, value.retryReason);
+            if (changed) {
+                callbackSnapshot = value;
+                markChangedLocked();
+            }
+        }
+        if (changed) offer(new Signal(SIGNAL_CHANGE, null, (String) null));
     }
 
     void enqueueBootstrap(byte[] chunk) {
@@ -464,6 +492,7 @@ final class HelperDiagnostics implements AutoCloseable, TelemetryWorkerSpool.Dia
             long bytes = currentBytes.get();
             int pending = pendingReadyRecords.get();
             long peak = observationPeakBytes.get();
+            HelperCallbackController.DiagnosticsSnapshot callback = callbackSnapshot;
             return new HelperDiagnosticSnapshot(
                 bootId, pid, helperGeneration, intervalStartedWallMs, intervalStartedElapsedMs,
                 bytes < 0L ? null : bytes,
@@ -474,7 +503,12 @@ final class HelperDiagnostics implements AutoCloseable, TelemetryWorkerSpool.Dia
                 successfulAppends.get(), duplicateRefusals.get(), capRefusals.get(), capSkippedPollCycles.get(),
                 persistenceFailures.get(), ackReleasedRecords.get(), ackReleasedBytes.get(), ackNotFound.get(),
                 ackFailures.get(), quarantinedRecords.get(), diagnosticQueueDrops.get(), diagnosticDiskFailures.get(),
-                lastErrorKey.get(), repeatedErrorCount.get(), collectionMode.get(), capReached.get()
+                lastErrorKey.get(), repeatedErrorCount.get(), collectionMode.get(), capReached.get(),
+                callback.acceptedNativeKeys, callback.failedNativeKeys, callback.promotedKeys,
+                callback.pollKeys, callback.fallbackKeys, callback.callbacksReceived,
+                callback.mainQueueBytes, callback.mainQueueOldestAgeMs, callback.mainQueueHighWaterBytes,
+                callback.secondaryQueueBytes, callback.secondaryQueueOldestAgeMs,
+                callback.secondaryQueueHighWaterBytes, callback.queueLossCount, callback.retryReason
             );
     }
 

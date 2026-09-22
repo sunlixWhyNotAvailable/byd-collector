@@ -1,5 +1,6 @@
 package com.bydcollector.collector.direct
 
+import com.bydcollector.collector.data.debug.DirectDebugParameterAsset
 import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
@@ -15,6 +16,98 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class SecondaryTelemetrySpoolTest {
+    @Test
+    fun callbackCachedOriginRoundTripsAndForcesEqualRawDelta() {
+        val root = tempDirectory()
+        try {
+            SecondaryTelemetrySpool.openForTest(root, 1_000_000, 3).use { spool ->
+                val baseline = values(second = value(1, 0, true, 2))
+                assertEquals(SecondaryTelemetrySpool.AppendResult.FULL, spool.append(cycle(1, baseline)))
+                val cached = values(second = SecondaryTelemetrySpool.Value(1, 0, true, 2, null, true))
+                assertEquals(SecondaryTelemetrySpool.AppendResult.DELTA, spool.append(cycle(2, cached)))
+                val full = readAndAck(spool)
+                val delta = readAndAck(spool)
+                assertEquals(1, delta.values.size)
+                assertTrue(delta.values.single().cached)
+                assertTrue(delta.materialize(full.identity, full.values)[1].cached)
+            }
+        } finally { deleteRecursively(root) }
+    }
+
+    @Test
+    fun retainedLegacyFullAndDeltaRemainReadableAfterActiveCountChanges() {
+        val root = tempDirectory()
+        try {
+            SecondaryTelemetrySpool.openForTest(root, 1_000_000, 3).use { spool ->
+                spool.append(cycle(1, values()))
+                spool.append(cycle(2, values(second = value(1, 0, true, 99))))
+            }
+
+            SecondaryTelemetrySpool.openForTest(root, 1_000_000, 2).use { spool ->
+                val full = readAndAck(spool)
+                val delta = readAndAck(spool)
+                assertEquals(3, full.fieldCount)
+                assertEquals(3, delta.fieldCount)
+                assertEquals(99, delta.materialize(full.identity, full.values)[1].raw)
+                val newValues = listOf(value(0, 0, true, 7), value(1, 0, true, 8))
+                assertEquals(SecondaryTelemetrySpool.AppendResult.FULL, spool.append(
+                    SecondaryTelemetrySpool.Cycle(
+                        SecondaryTelemetrySpool.CycleIdentity("boot", "g2", "new", 1),
+                        DirectDebugParameterAsset.SOURCE_VERSION,
+                        5_000,
+                        6_000,
+                        10,
+                        0,
+                        1,
+                        true,
+                        1,
+                        0,
+                        0,
+                        0,
+                        null,
+                        newValues
+                    )
+                ))
+                assertEquals(SecondaryTelemetrySpool.AppendResult.DELTA, spool.append(
+                    SecondaryTelemetrySpool.Cycle(
+                        SecondaryTelemetrySpool.CycleIdentity("boot", "g2", "new", 2),
+                        DirectDebugParameterAsset.SOURCE_VERSION,
+                        5_001,
+                        6_001,
+                        10,
+                        0,
+                        1,
+                        true,
+                        1,
+                        0,
+                        0,
+                        0,
+                        null,
+                        listOf(value(0, 0, true, 9), value(1, 0, true, 8))
+                    )
+                ))
+                val newFull = readAndAck(spool)
+                val newDelta = readAndAck(spool)
+                assertEquals(2, newFull.fieldCount)
+                assertEquals(9, newDelta.materialize(newFull.identity, newFull.values)[0].raw)
+            }
+        } finally { deleteRecursively(root) }
+    }
+
+    @Test
+    fun codecRejectsCorruptOrdinalOrder() {
+        val root = tempDirectory()
+        try {
+            val encoded = SecondaryTelemetrySpool.openForTest(root, 1_000_000, 3).use { spool ->
+                spool.append(cycle(1, values()))
+                readAll(spool, assertNotNull(spool.oldest()))
+            }
+            val corrupt = encoded.toString(Charsets.UTF_8)
+                .replaceFirst("\"ordinal\":1", "\"ordinal\":0")
+                .toByteArray(Charsets.UTF_8)
+            assertFailsWith<IllegalArgumentException> { SecondaryTelemetrySpool.Codec.decode(corrupt) }
+        } finally { deleteRecursively(root) }
+    }
     @Test
     fun initialDeltaNoChangeAndPresenceErrorTransitionsRoundTrip() {
         val root = tempDirectory()

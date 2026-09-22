@@ -37,6 +37,9 @@ internal object SecondaryLiveCycleGate {
         return try {
             check(pause()) { "secondary pause/fence failed" }
             val replay = drain()
+            if (!replay.drained && replay.retryable) {
+                throw SecondaryReplayPendingException(replay.blockedReason ?: "secondary replay pending")
+            }
             check(replay.drained) { replay.blockedReason ?: "secondary replay did not drain" }
             check(resume()) { "secondary resume failed" }
             resumed = true
@@ -46,6 +49,8 @@ internal object SecondaryLiveCycleGate {
         }
     }
 }
+
+internal class SecondaryReplayPendingException(message: String) : RuntimeException(message)
 
 //stores exploratory direct reads separately from main telemetry so noisy candidates do not pollute main db
 class DirectDebugRoundRobinPoller(
@@ -61,6 +66,7 @@ class DirectDebugRoundRobinPoller(
     private val resumeSecondary: () -> Boolean = { true },
     private val onStarted: (Long) -> Unit = {},
     private val onFailure: (String) -> Unit = {},
+    private val onRuntimeError: (Throwable) -> Unit = {},
     private val onTerminalFailure: () -> Unit = {},
     private val onStopped: () -> Unit = {}
 ) {
@@ -95,8 +101,12 @@ class DirectDebugRoundRobinPoller(
                     while (!stopRequested.get()) {
                         val cycleStartedElapsed = clock.elapsedRealtimeMs()
                         val startedAt = clock.nowIso()
-                        val summary = pollOnce(opened, safeBatchSize, startedAt)
-                        onCycle(summary)
+                        try {
+                            val summary = pollOnce(opened, safeBatchSize, startedAt)
+                            onCycle(summary)
+                        } catch (_: SecondaryReplayPendingException) {
+                            // A fenced callback batch is still publishing/persisting. Resume and retry next cycle.
+                        }
                         //backs off when a cycle overruns so wide secondary polling does not peg a core continuously
                         val sleepMs = nextSleepMs(clock.elapsedRealtimeMs() - cycleStartedElapsed)
                         if (sleepMs > 0) Thread.sleep(sleepMs)
@@ -104,6 +114,7 @@ class DirectDebugRoundRobinPoller(
                 } catch (_: InterruptedException) {
                     Thread.currentThread().interrupt()
                 } catch (error: RuntimeException) {
+                    runCatching { onRuntimeError(error) }
                     runCatching {
                         onFailure("${error::class.java.simpleName}: ${error.message ?: "secondary polling failed"}")
                     }

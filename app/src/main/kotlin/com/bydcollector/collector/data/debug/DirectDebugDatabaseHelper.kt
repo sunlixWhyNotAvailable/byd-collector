@@ -3,6 +3,7 @@ package com.bydcollector.collector.data.debug
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import com.bydcollector.collector.data.callback.CallbackRawSchema
 
 class DirectDebugDatabaseHelper(
     context: Context,
@@ -16,7 +17,10 @@ class DirectDebugDatabaseHelper(
         super.onOpen(db)
         // The replay tables are an additive extension of compact-v2. Keep the SQLiteOpenHelper
         // version and the storage marker unchanged so existing compact databases open in place.
-        if (!db.isReadOnly && isCompactV2(db)) createSecondaryReplaySchema(db)
+        if (!db.isReadOnly && isCompactV2(db)) {
+            createSecondaryReplaySchema(db)
+            CallbackRawSchema.create(db)
+        }
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -135,9 +139,11 @@ class DirectDebugDatabaseHelper(
             "CREATE INDEX idx_debug_direct_readings_candidate_id ON debug_direct_readings(candidate_id, id)"
         )
         createSecondaryReplaySchema(db)
+        CallbackRawSchema.create(db)
     }
 
     private fun createSecondaryReplaySchema(db: SQLiteDatabase) {
+        val cachedFlagsTableExisted = tableExists(db, "debug_secondary_replay_cached_flags")
         db.execSQL(
             """
             CREATE TABLE IF NOT EXISTS debug_secondary_receipts (
@@ -202,6 +208,28 @@ class DirectDebugDatabaseHelper(
         )
         db.execSQL(
             """
+            CREATE TABLE IF NOT EXISTS debug_secondary_replay_cached_flags (
+                catalog_version_id INTEGER PRIMARY KEY,
+                field_count INTEGER NOT NULL,
+                cached_bits BLOB NOT NULL
+            ) WITHOUT ROWID
+            """.trimIndent()
+        )
+        if (!cachedFlagsTableExisted) {
+            // Released pre-callback cursors can only contain fresh getter values. Seed their
+            // exact all-false origin once; a later missing v2 row remains corruption/orphan.
+            db.execSQL(
+                """
+                INSERT INTO debug_secondary_replay_cached_flags(
+                    catalog_version_id, field_count, cached_bits
+                )
+                SELECT catalog_version_id, field_count, zeroblob((field_count + 7) / 8)
+                FROM debug_secondary_replay_cursor
+                """.trimIndent()
+            )
+        }
+        db.execSQL(
+            """
             CREATE TABLE IF NOT EXISTS debug_secondary_rejections (
                 boot_id TEXT NOT NULL,
                 helper_generation TEXT NOT NULL,
@@ -217,6 +245,11 @@ class DirectDebugDatabaseHelper(
             """.trimIndent()
         )
     }
+
+    private fun tableExists(db: SQLiteDatabase, tableName: String): Boolean = db.rawQuery(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+        arrayOf(tableName)
+    ).use { it.moveToFirst() }
 
     companion object {
         const val DATABASE_NAME = "bydcollector_secondary.db"

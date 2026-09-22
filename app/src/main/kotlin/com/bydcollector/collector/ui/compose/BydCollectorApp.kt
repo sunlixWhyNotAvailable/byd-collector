@@ -769,7 +769,7 @@ private fun AllParametersTab(
                         )
                     }
                     SwitchControlRow(
-                        SwitchToggle(state?.debugAutoStartEnabled == true, actions::onToggleDebugAutoStart, enabled = state?.autoStartEnabled == true),
+                        SwitchToggle(state?.debugAutoStartEnabled == true, actions::onToggleDebugAutoStart),
                         Modifier.fillMaxWidth().height(42.dp)
                     ) {
                         Text(strings.autoStart, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
@@ -1012,13 +1012,14 @@ private fun TripsTab(
             onDismiss = { selectedTripId = null }
         )
     }
-    state.currentTripModal?.trip?.let { trip ->
+    state.currentTripModal?.let { current ->
         TripRouteDialog(
-            trip = trip,
+            trip = current.trip,
             state = state,
             strings = strings,
             language = language,
             currentTrip = true,
+            currentTripPosition = current.position,
             onDismiss = actions.onCurrentTripDismissed
         )
     }
@@ -1291,6 +1292,7 @@ private fun TripRouteDialog(
     strings: UiStrings,
     language: UiLanguage,
     currentTrip: Boolean = false,
+    currentTripPosition: CurrentTripPositionUi? = null,
     onDismiss: () -> Unit
 ) {
     var metric by rememberSaveable(trip.id) { mutableStateOf(TripMapMetric.SPEED) }
@@ -1335,6 +1337,7 @@ private fun TripRouteDialog(
                     preserveViewportOnUpdate = true,
                     showFinish = !currentTrip || currentTripHasFinish,
                     requireFinalFinish = currentTrip,
+                    currentTripPosition = currentTripPosition.takeIf { currentTrip && trip.open },
                     modifier = Modifier.weight(1f).fillMaxWidth()
                 )
                 Row(Modifier.fillMaxWidth().padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1354,6 +1357,17 @@ private fun TripRouteDialog(
                     if (!currentTrip || currentTripHasFinish) {
                         Spacer(Modifier.width(12.dp))
                         TripEndpointLegend(R.drawable.ic_trip_finish_marker, strings.tripFinish)
+                    }
+                    currentTripPosition?.takeIf { currentTrip && trip.open }?.let { position ->
+                        Spacer(Modifier.width(12.dp))
+                        TripEndpointLegend(
+                            R.drawable.ic_trip_finish_marker,
+                            if (position.state == CurrentTripPositionState.CURRENT) {
+                                strings.tripCurrentPosition
+                            } else {
+                                strings.tripLastKnownPosition
+                            }
+                        )
                     }
                     Spacer(Modifier.width(12.dp))
                     TripNoDataLegend(strings.tripNoData)
@@ -1408,6 +1422,7 @@ private fun TripMapView(
     preserveViewportOnUpdate: Boolean = false,
     showFinish: Boolean = true,
     requireFinalFinish: Boolean = false,
+    currentTripPosition: CurrentTripPositionUi? = null,
     modifier: Modifier = Modifier
 ) {
     val p = LocalBydPalette.current
@@ -1422,7 +1437,7 @@ private fun TripMapView(
                 update = { map ->
                     updateTripMap(
                         map, points, metric, speedGreen, speedYellow, consumptionGreen, consumptionYellow,
-                        viewportKey, preserveViewportOnUpdate, showFinish, requireFinalFinish
+                        viewportKey, preserveViewportOnUpdate, showFinish, requireFinalFinish, currentTripPosition
                     )
                 },
                 onRelease = MapView::onDetach
@@ -1443,15 +1458,31 @@ private fun updateTripMap(
     viewportKey: String,
     preserveViewportOnUpdate: Boolean,
     showFinish: Boolean,
-    requireFinalFinish: Boolean
+    requireFinalFinish: Boolean,
+    currentTripPosition: CurrentTripPositionUi?
 ) {
     val priorRender = map.tag as? TripMapRenderState
-    if (
+    val routeRenderUnchanged =
         priorRender?.points === points && priorRender.metric == metric &&
         priorRender.speedGreen == speedGreen && priorRender.speedYellow == speedYellow &&
         priorRender.consumptionGreen == consumptionGreen && priorRender.consumptionYellow == consumptionYellow &&
         priorRender.showFinish == showFinish && priorRender.requireFinalFinish == requireFinalFinish
-    ) return
+    if (routeRenderUnchanged) {
+        val stableRender = checkNotNull(priorRender)
+        if (stableRender.currentTripPosition == currentTripPosition) return
+        val marker = updateCurrentTripPositionMarker(
+            map = map,
+            points = points,
+            position = currentTripPosition,
+            existing = stableRender.currentTripPositionMarker
+        )
+        map.tag = stableRender.copy(
+            currentTripPosition = currentTripPosition,
+            currentTripPositionMarker = marker
+        )
+        map.invalidate()
+        return
+    }
     map.overlays.clear()
     val runs = buildList {
         var run = mutableListOf<TripRoutePointUi>()
@@ -1469,7 +1500,9 @@ private fun updateTripMap(
     if (p.isEmpty()) {
         map.tag = TripMapRenderState(
             viewportKey, initialized = false, points, metric, speedGreen, speedYellow,
-            consumptionGreen, consumptionYellow, showFinish, requireFinalFinish
+            consumptionGreen, consumptionYellow, showFinish, requireFinalFinish,
+            currentTripPosition = null,
+            currentTripPositionMarker = null
         )
         map.invalidate()
         return
@@ -1507,10 +1540,16 @@ private fun updateTripMap(
             map.overlays += tripMapMarker(map, p.last(), R.drawable.ic_trip_finish_marker)
         }
     }
+    val currentTripPositionMarker = updateCurrentTripPositionMarker(
+        map = map,
+        points = points,
+        position = currentTripPosition,
+        existing = priorRender?.currentTripPositionMarker
+    )
     val shouldFitViewport = !preserveViewportOnUpdate || priorRender?.viewportKey != viewportKey || !priorRender.initialized
     map.tag = TripMapRenderState(
         viewportKey,
-        initialized = shouldFitViewport || priorRender?.initialized == true,
+        initialized = if (shouldFitViewport) false else priorRender?.initialized == true,
         points,
         metric,
         speedGreen,
@@ -1518,27 +1557,50 @@ private fun updateTripMap(
         consumptionGreen,
         consumptionYellow,
         showFinish,
-        requireFinalFinish
+        requireFinalFinish,
+        currentTripPosition,
+        currentTripPositionMarker
     )
     if (shouldFitViewport) {
-        map.post {
-            if ((map.tag as? TripMapRenderState)?.viewportKey != viewportKey) return@post
-            if (p.size == 1) {
-                map.controller.setCenter(GeoPoint(p.first().latitude, p.first().longitude))
-                map.controller.setZoom(14.0)
-            } else {
-                map.zoomToBoundingBox(
-                    BoundingBox.fromGeoPoints(p.map { GeoPoint(it.latitude, it.longitude) }),
-                    true,
-                    64
-                )
-            }
-        }
+        fitTripMapViewportWhenLaidOut(map, viewportKey, points, p)
     }
     map.invalidate()
 }
 
-private class TripMapRenderState(
+private fun fitTripMapViewportWhenLaidOut(
+    map: MapView,
+    viewportKey: String,
+    sourcePoints: List<TripRoutePointUi>,
+    validPoints: List<TripRoutePointUi>
+) {
+    fun applyViewport() {
+        if (map.width <= 0 || map.height <= 0) return
+        val render = map.tag as? TripMapRenderState ?: return
+        if (render.viewportKey != viewportKey || render.points !== sourcePoints || render.initialized) return
+        if (validPoints.size == 1) {
+            map.controller.setZoom(14.0)
+            map.controller.setCenter(GeoPoint(validPoints.first().latitude, validPoints.first().longitude))
+        } else {
+            map.zoomToBoundingBox(
+                BoundingBox.fromGeoPoints(validPoints.map { GeoPoint(it.latitude, it.longitude) }),
+                true,
+                64
+            )
+        }
+        map.tag = render.copy(initialized = true)
+        map.invalidate()
+    }
+
+    if (map.width > 0 && map.height > 0) {
+        map.post(::applyViewport)
+    } else {
+        map.addOnFirstLayoutListener { _, left, top, right, bottom ->
+            if (right > left && bottom > top) applyViewport()
+        }
+    }
+}
+
+private data class TripMapRenderState(
     val viewportKey: String,
     val initialized: Boolean,
     val points: List<TripRoutePointUi>,
@@ -1548,8 +1610,30 @@ private class TripMapRenderState(
     val consumptionGreen: Int,
     val consumptionYellow: Int,
     val showFinish: Boolean,
-    val requireFinalFinish: Boolean
+    val requireFinalFinish: Boolean,
+    val currentTripPosition: CurrentTripPositionUi?,
+    val currentTripPositionMarker: Marker?
 )
+
+private fun updateCurrentTripPositionMarker(
+    map: MapView,
+    points: List<TripRoutePointUi>,
+    position: CurrentTripPositionUi?,
+    existing: Marker?
+): Marker? {
+    val point = position?.let { selected ->
+        points.lastOrNull { it.sequence == selected.sequence && !it.gap }
+    }
+    if (point == null || !point.latitude.isFinite() || !point.longitude.isFinite()) {
+        existing?.let(map.overlays::remove)
+        return null
+    }
+    return existing?.apply {
+        this.position = GeoPoint(point.latitude, point.longitude)
+    }?.also { marker ->
+        if (!map.overlays.contains(marker)) map.overlays.add(marker)
+    } ?: tripMapMarker(map, point, R.drawable.ic_trip_finish_marker).also { map.overlays.add(it) }
+}
 
 private fun tripMapMarker(map: MapView, point: TripRoutePointUi, drawableRes: Int): Marker =
     Marker(map).apply {

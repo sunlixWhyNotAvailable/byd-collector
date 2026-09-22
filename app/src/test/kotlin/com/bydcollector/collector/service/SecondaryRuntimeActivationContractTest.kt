@@ -43,6 +43,10 @@ class SecondaryRuntimeActivationContractTest {
 
         assertTrue(start.contains("ensureReady(CollectorHelperProtocol.STREAM_SECONDARY)"))
         assertTrue(start.contains("SecondaryReplayCoordinator("))
+        assertTrue(start.contains("val callbacks = callbackDrain(helper, CollectorHelperProtocol.STREAM_SECONDARY)"))
+        assertTrue(start.contains("callbacks.drain(maxBatches = Int.MAX_VALUE)"))
+        assertTrue(start.contains("if (!callbackReplay.drained)"))
+        assertTrue(start.contains("retryable = callbackReplay.retryable"))
         assertTrue(start.contains("debugStore.importSecondaryRecord(openedSessionId, record, digest)"))
         assertTrue(start.contains("pauseAndFence(CollectorHelperProtocol.STREAM_SECONDARY)"))
         assertTrue(start.contains("resume(CollectorHelperProtocol.STREAM_SECONDARY)"))
@@ -61,6 +65,9 @@ class SecondaryRuntimeActivationContractTest {
         assertTrue(archive.contains("setDesired(CollectorHelperProtocol.STREAM_SECONDARY, false)"))
         assertTrue(archive.indexOf("setDesired(CollectorHelperProtocol.STREAM_SECONDARY, false)") < archive.indexOf("helper.secondarySpoolStatus()"))
         assertTrue(archive.contains("helper.secondarySpoolStatus()"))
+        assertTrue(archive.contains("helper.callbackSpoolStatus(CollectorHelperProtocol.STREAM_SECONDARY)"))
+        assertTrue(archive.contains("callbackBacklog.readyBatches == 0"))
+        assertTrue(archive.contains("callbackDrain(helper, CollectorHelperProtocol.STREAM_SECONDARY).drain(Int.MAX_VALUE)"))
         assertTrue(archive.contains("check(!backlog.pending)"))
         assertTrue(archive.contains("Start secondary collection to drain it first"))
         assertTrue(archive.contains("pauseAndFence(CollectorHelperProtocol.STREAM_SECONDARY)"))
@@ -70,6 +77,8 @@ class SecondaryRuntimeActivationContractTest {
         assertTrue(archive.indexOf("SecondaryReplayCoordinator") < archive.indexOf("debugStore.endSession"))
         val maintenance = service.substringAfter("private fun stopRuntimeForMaintenance(").substringBefore("private fun resetKeepAliveSupervisorForMaintenance")
         assertFalse(maintenance.contains("stopAppGapSpoolHelper(\"database_maintenance\")"))
+        assertTrue(maintenance.contains("store.normalizePendingCallbackPage(vehicleStateNormalizer)"))
+        assertTrue(maintenance.indexOf("stopAndJoin") < maintenance.indexOf("store.normalizePendingCallbackPage"))
     }
 
     @Test

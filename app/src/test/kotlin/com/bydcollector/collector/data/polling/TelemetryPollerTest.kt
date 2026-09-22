@@ -41,6 +41,7 @@ class TelemetryPollerTest {
     fun runtimeFailureReportsCycleResultBeforeContinuing() {
         val clock = FakeClock()
         val results = Collections.synchronizedList(mutableListOf<PollCycleResult>())
+        val errors = Collections.synchronizedList(mutableListOf<Throwable>())
         val resultReady = CountDownLatch(1)
         val poller = TelemetryPoller(
             coordinator = object : PollCycleRunner {
@@ -54,6 +55,7 @@ class TelemetryPollerTest {
                 results += it
                 resultReady.countDown()
             },
+            onRuntimeError = { errors += it },
             sleeper = { pollerStopSignal() }
         )
 
@@ -64,6 +66,8 @@ class TelemetryPollerTest {
         assertTrue(results.isNotEmpty())
         assertEquals(false, results.first().ok)
         assertEquals("poller_runtime_error", results.first().category)
+        assertTrue(results.first().errorMessage!!.contains("Android checked exception"))
+        assertEquals("Android checked exception", errors.single().message)
     }
 
     @Test

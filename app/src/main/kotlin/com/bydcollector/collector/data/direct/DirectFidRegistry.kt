@@ -1,5 +1,6 @@
 package com.bydcollector.collector.data.direct
 
+import com.bydcollector.collector.direct.TelemetryCatalogPolicy
 import java.util.Locale
 
 data class DirectFidEntry(
@@ -39,6 +40,7 @@ enum class DirectValueDecoder {
 object DirectFidRegistry {
     const val LEGACY_WORKER_CATALOG_VERSION = "autoservice-fid-direct-20260820-curated-82-power-v1"
     const val CATALOG_VERSION = "autoservice-fid-direct-20260908-curated-95-telemetry-v1"
+    const val CATALOG_FINGERPRINT = "EE469CF73CCF1E7FE562FF6F500E4208866D881A580F6212E18525E983798B8D"
     const val TX_GET_INT = 5
     const val TX_GET_FLOAT = 7
 
@@ -127,7 +129,7 @@ object DirectFidRegistry {
         DirectFidEntry("bodywork_power_level", 1001, 315621418, TX_GET_INT, DirectValueDecoder.INT_RAW, groupName = "direct_bodywork", featureNames = "BODYWORK_POWER_LEVEL;Bodywork.BODYWORK_POWER_LEVEL", classification = "curated_power_boundary_20260820", prodCategory = "curated_main", source = "archived_power-transition-evidence-20260817"),
     )
 
-    val entries: List<DirectFidEntry> = legacyWorkerEntries + listOf(
+    private val definitions: List<DirectFidEntry> = legacyWorkerEntries + listOf(
         DirectFidEntry("charging_1009_876609592_5", 1009, 876609592, TX_GET_INT, DirectValueDecoder.INT_ENUM, groupName = "direct_charging", featureNames = "CHARGING_TYPE;Charging.CHARGING_TYPE", classification = "curated_debug_promotion_20260908", prodCategory = "charging_energy", source = "debug-main-promotion-20260908"),
         DirectFidEntry("charging_1009_876609560_5", 1009, 876609560, TX_GET_INT, DirectValueDecoder.INT_ENUM, groupName = "direct_charging", featureNames = "CHARGING_BATTERRY_DEVICE_STATE;Charging.CHARGING_BATTERRY_DEVICE_STATE", classification = "curated_debug_promotion_20260908", prodCategory = "charging_energy", source = "debug-main-promotion-20260908"),
         DirectFidEntry("charging_1009_1146095640_5", 1009, 1146095640, TX_GET_INT, DirectValueDecoder.INT_RAW, groupName = "direct_charging", featureNames = "CHARGING_FULL_REST_HOUR;Charging.CHARGING_FULL_REST_HOUR", classification = "curated_debug_promotion_20260908", prodCategory = "charging_energy", source = "debug-main-promotion-20260908"),
@@ -142,6 +144,15 @@ object DirectFidRegistry {
         DirectFidEntry("charging_1009_1186988040_7", 1009, 1186988040, TX_GET_FLOAT, DirectValueDecoder.FLOAT_SIGNED_RAW, groupName = "direct_charging", featureNames = "CHARGING_DRIVER_MOTOR_CURRENT;Charging.CHARGING_DRIVER_MOTOR_CURRENT", classification = "curated_debug_promotion_20260908", prodCategory = "motion_powertrain", source = "debug-main-promotion-20260908"),
         DirectFidEntry("charging_1009_1186988056_7", 1009, 1186988056, TX_GET_FLOAT, DirectValueDecoder.FLOAT_SIGNED_RAW, groupName = "direct_charging", featureNames = "CHARGING_REAR_DRIVER_MOTOR_CURRENT;Charging.CHARGING_REAR_DRIVER_MOTOR_CURRENT", classification = "curated_debug_promotion_20260908", prodCategory = "motion_powertrain", source = "debug-main-promotion-20260908")
     )
+
+    val entries: List<DirectFidEntry> = definitions
+        .filter { TelemetryCatalogPolicy.isRuntimeSelected(it.dev, it.fid) }
+        .also { require(it.size == 95) { "Unexpected active Main catalog size: ${it.size}" } }
+
+    private val verifiedCatalogFingerprint = TelemetryCatalogPolicy.newFingerprint().let { digest ->
+        entries.forEach { TelemetryCatalogPolicy.addToFingerprint(digest, it.dev, it.fid, it.tx) }
+        TelemetryCatalogPolicy.finishFingerprint(digest)
+    }.also { require(it == CATALOG_FINGERPRINT) { "Unexpected active Main catalog fingerprint: $it" } }
 
     fun workerReplayEntriesForCatalog(catalogVersion: String): List<DirectFidEntry>? =
         workerReplayEntriesForCatalog(catalogVersion, CATALOG_VERSION, entries)

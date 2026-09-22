@@ -1,5 +1,7 @@
 package com.bydcollector.collector.data.local
 
+import com.bydcollector.collector.direct.CallbackValueSource
+
 data class CatalogSeedRow(
     val sourceId: String?,
     val key: String,
@@ -23,7 +25,8 @@ data class CatalogParameter(
 data class PollReading(
     val rawKey: String,
     val rawValue: String?,
-    val descValue: String? = null
+    val descValue: String? = null,
+    val callbackSource: CallbackValueSource? = null
 ) {
     val rawInt: Int? get() = rawValue?.toIntOrNull()
 }

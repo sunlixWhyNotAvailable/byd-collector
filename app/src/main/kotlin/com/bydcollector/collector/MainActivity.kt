@@ -10,6 +10,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
+import android.os.CancellationSignal
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
@@ -87,6 +88,7 @@ import com.bydcollector.collector.update.UpdateDownloader
 import com.bydcollector.collector.update.UpdateInfo
 import com.bydcollector.collector.update.UpdateUiState
 import com.bydcollector.collector.util.dispatchOperationalEvent
+import com.bydcollector.collector.util.diagnosticDetail
 import com.bydcollector.collector.util.namedSingleThreadExecutor
 import com.bydcollector.collector.util.sqliteFootprintBytes
 import java.io.File
@@ -160,6 +162,7 @@ class MainActivity : ComponentActivity() {
     private var currentTripRefreshGeneration = 0L
     private var currentTripRefreshInFlight = false
     private var selectedCurrentTripId: String? = null
+    @Volatile private var currentBootId: String? = null
     @Volatile private var forcedRefreshPending = false
     private var credentialsLoadStarted = false
     private var credentialsLoaded = false
@@ -410,11 +413,16 @@ class MainActivity : ComponentActivity() {
             stateProvider.invalidateArchiveStorageSnapshot()
             runCatching {
                 CollectorServiceController.deleteArchives(this@MainActivity, ids)
-            }.onFailure {
+            }.onFailure { error ->
                 archiveDeleteDispatchStartedAtMs = null
                 actionUiState = actionUiState.copy(archiveDeleteDispatch = false)
                 stateProvider.restoreRetiredArchiveStorageEntries(ids)
                 stateProvider.invalidateArchiveStorageSnapshot()
+                recordOperationalEvent(
+                    "archive_delete_dispatch_error",
+                    "Archive delete command could not be dispatched",
+                    error.diagnosticDetail("archive_ids=${ids.joinToString(",")}")
+                )
             }
             refresh()
         }
@@ -445,9 +453,12 @@ class MainActivity : ComponentActivity() {
             if (settings.isDebugAutoStartEnabled() != enabled) {
                 if (enabled) settings.setDebugManuallyStopped(false)
                 settings.setDebugAutoStartEnabled(
-                    enabled && settings.isAutoStartEnabled(),
+                    enabled,
                     detail = "source=ui control=debug_auto_start tab=$activeTab"
                 )
+                if (enabled) {
+                    CollectorAutoStart.scheduleWatchdog(applicationContext, settings, currentStore())
+                }
                 refresh()
             }
         }
@@ -1035,12 +1046,15 @@ class MainActivity : ComponentActivity() {
         val countGeneration = dashboardUiStateStore.beginCountBootstrap(force) ?: return
         runCatching {
             dashboardCountExecutor.execute {
+                val cancellation = CancellationSignal()
+                val cancel = Runnable(cancellation::cancel)
+                handler.postDelayed(cancel, DASHBOARD_COUNT_BUDGET_MS)
                 runCatching {
                     android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
                     withTelemetryStoreRead { countStore ->
-                        val main = countStore.dashboardRowCounts()
+                        val main = countStore.dashboardRowCounts(cancellation)
                         val debug = if (BydCollectorApplication.isDebugStorageReady(applicationContext)) {
-                            DirectDebugStore(applicationContext).use { it.dashboardReadingCount() }
+                            DirectDebugStore(applicationContext).use { it.dashboardReadingCount(cancellation) }
                         } else {
                             0L
                         }
@@ -1053,7 +1067,7 @@ class MainActivity : ComponentActivity() {
                             debugReadingCount = debug
                         )
                     }
-                }.onSuccess { counts ->
+                }.also { handler.removeCallbacks(cancel) }.onSuccess { counts ->
                     dashboardUiStateStore.publishRowCountBaseline(countGeneration, counts)
                 }
                     .onFailure { error ->
@@ -1225,7 +1239,8 @@ class MainActivity : ComponentActivity() {
         tripsUiState = tripsUiState.copy(
             currentTripModal = available.copy(
                 trip = available.trip.copy(route = emptyList()),
-                nextRouteSequence = 0L
+                nextRouteSequence = 0L,
+                position = null
             )
         )
         scheduleCurrentTripRefresh(0L)
@@ -1252,6 +1267,17 @@ class MainActivity : ComponentActivity() {
         val tripId = selectedCurrentTripId ?: return
         val modal = tripsUiState.currentTripModal ?: return
         if (destroyed || !foreground || activeTab != AppTab.TRIPS || currentTripRefreshInFlight) return
+        if (modal.trip.open) {
+            val agedPosition = TripsUiMapper.currentPosition(
+                route = modal.trip.route,
+                currentBootId = currentBootId,
+                nowElapsedMs = SystemClock.elapsedRealtime(),
+                nowWallTimeMs = System.currentTimeMillis()
+            )
+            if (agedPosition != modal.position) {
+                tripsUiState = tripsUiState.copy(currentTripModal = modal.copy(position = agedPosition))
+            }
+        }
         val generation = currentTripRefreshGeneration
         val requestedLanguage = uiLanguage
         //The final marker rewrites the last persisted point without allocating a new sequence.
@@ -1270,7 +1296,14 @@ class MainActivity : ComponentActivity() {
                             modal.trip.route.lastOrNull { point -> !point.gap }?.sequence ?: 0L
                         }
                         val tail = buildList { trips.forEachRoutePointFrom(tripId, routeFirstSequence, ::add) }
-                        CurrentTripRead(it, routeFirstSequence, tail)
+                        CurrentTripRead(
+                            session = it,
+                            firstSequence = routeFirstSequence,
+                            routeTail = tail,
+                            currentBootId = resolveCurrentBootId(),
+                            readElapsedMs = SystemClock.elapsedRealtime(),
+                            readWallTimeMs = System.currentTimeMillis()
+                        )
                     }
                 }
                 runOnUiThread {
@@ -1302,12 +1335,26 @@ class MainActivity : ComponentActivity() {
                         val refreshed = TripsUiMapper.current(read.session, requestedLanguage)
                         val updated = refreshed.copy(
                             trip = refreshed.trip.copy(route = mergedRoute),
-                            nextRouteSequence = nextSequence
+                            nextRouteSequence = nextSequence,
+                            position = if (refreshed.trip.open) {
+                                TripsUiMapper.currentPosition(
+                                    route = mergedRoute,
+                                    currentBootId = read.currentBootId,
+                                    nowElapsedMs = read.readElapsedMs,
+                                    nowWallTimeMs = read.readWallTimeMs
+                                )
+                            } else {
+                                null
+                            }
                         )
                         tripsUiState = tripsUiState.copy(
                             currentTripModal = updated,
                             availableCurrentTrip = if (updated.trip.open) {
-                                updated.copy(trip = updated.trip.copy(route = emptyList()), nextRouteSequence = 0L)
+                                updated.copy(
+                                    trip = updated.trip.copy(route = emptyList()),
+                                    nextRouteSequence = 0L,
+                                    position = null
+                                )
                             } else {
                                 null
                             }
@@ -1328,6 +1375,13 @@ class MainActivity : ComponentActivity() {
             recordDashboardRefreshFailure("current_trip_dispatch", error)
             scheduleCurrentTripRefresh()
         }
+    }
+
+    private fun resolveCurrentBootId(): String? {
+        currentBootId?.let { return it }
+        return runCatching {
+            File("/proc/sys/kernel/random/boot_id").readText().trim().takeIf { it.isNotEmpty() }
+        }.getOrNull()?.also { currentBootId = it }
     }
 
     private fun refresh(force: Boolean = true) {
@@ -2472,6 +2526,7 @@ class MainActivity : ComponentActivity() {
 }
 
 internal const val DASHBOARD_REFRESH_HEARTBEAT_MS = 1_000L
+internal const val DASHBOARD_COUNT_BUDGET_MS = 2_000L
 internal const val CURRENT_TRIP_REFRESH_MS = 1_000L
 //Chrome/status fields are producer-fed while the service runs. Activity entry, resume, tab changes,
 //and explicit actions still force a reconciliation; the foreground heartbeat does not reread SQLite.
@@ -2562,7 +2617,10 @@ private data class TripsLoadResult(
 private data class CurrentTripRead(
     val session: TripSession,
     val firstSequence: Long,
-    val routeTail: List<RoutePoint>
+    val routeTail: List<RoutePoint>,
+    val currentBootId: String?,
+    val readElapsedMs: Long,
+    val readWallTimeMs: Long
 )
 
 internal fun startupHardFlowBlocked(

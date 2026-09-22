@@ -111,7 +111,9 @@ class TelemetryWorkerReplayCoordinator(
                 val source = PollSampleSource(
                     "helper:${sample.identity}",
                     sample.identity.bootId,
-                    sample.capturedElapsedMs
+                    sample.capturedElapsedMs,
+                    sample.identity.helperGeneration,
+                    sample.identity.pollSequence
                 )
                 if (input.ok) {
                     successfulPollObserver?.onSourcePoll(
@@ -235,12 +237,18 @@ class TelemetryWorkerReplayCoordinator(
                     value.dev == entry.dev &&
                     value.fid == entry.fid
             )) throw WorkerSampleFormatException("worker field mismatch at index=$index")
+            value.callbackSource?.let { source ->
+                if (value.status != CollectorHelperProtocol.STATUS_OK || value.raw == null ||
+                    !source.matches(entry.tx, entry.dev, entry.fid, value.raw)
+                ) throw WorkerSampleFormatException("worker callback source mismatch at index=$index")
+            }
             DirectAutoserviceField(
                 entry = entry,
                 status = value.status,
                 raw = value.raw,
                 decoded = value.raw?.let { DirectValueDecoders.decode(entry, it) },
-                error = value.error
+                error = value.error,
+                callbackSource = value.callbackSource
             )
         }
         val snapshot = DirectAutoserviceSnapshot(
@@ -297,7 +305,25 @@ class TelemetryWorkerReplayCoordinator(
             put("values", JSONArray().apply { sample.values.forEach { field ->
                 put(JSONObject().put("field_index", field.fieldIndex).put("tx", field.tx)
                     .put("dev", field.dev).put("fid", field.fid).put("status", field.status)
-                    .put("raw", field.raw ?: JSONObject.NULL).put("error", field.error ?: JSONObject.NULL))
+                    .put("raw", field.raw ?: JSONObject.NULL).put("error", field.error ?: JSONObject.NULL)
+                    .apply {
+                        field.callbackSource?.let { source ->
+                            put("callback_source", JSONObject()
+                                .put("boot_id", source.bootId)
+                                .put("helper_generation", source.helperGeneration)
+                                .put("stream", source.stream)
+                                .put("epoch", source.epoch)
+                                .put("event_sequence", source.eventSequence)
+                                .put("device", source.device)
+                                .put("fid", source.fid)
+                                .put("native_type", source.nativeType)
+                                .put("raw_bits", source.rawBits)
+                                .put("received_wall_ms", source.receivedWallMs)
+                                .put("received_elapsed_ms", source.receivedElapsedMs)
+                                .put("source_wall_ms", source.sourceWallMs ?: JSONObject.NULL)
+                                .put("quality", source.quality))
+                        }
+                    })
             } })
         }
         return PersistedPollInput(timestamp = Instant.ofEpochMilli(sample.capturedWallMs).toString(),

@@ -2,6 +2,7 @@ package com.bydcollector.collector.data.normalized
 
 import com.bydcollector.collector.data.direct.DirectFidRegistry
 import com.bydcollector.collector.data.local.PollReading
+import java.time.Instant
 import java.util.Locale
 
 //converts raw BYD collector readings into stable semantic fields for dashboard, mqtt, and influx
@@ -195,6 +196,37 @@ class VehicleStateNormalizer(
             0 -> NormalizedQuality.MISSING to emptyValue(NormalizedValueType.BOOLEAN)
             else -> NormalizedQuality.INVALID to emptyValue(NormalizedValueType.BOOLEAN)
         }
+    }
+
+    fun normalizeSparse(
+        inputs: Map<String, NormalizedSourceInput>,
+        affectedSourceKeys: Set<String>
+    ): List<NormalizedObservation> {
+        if (affectedSourceKeys.isEmpty()) return emptyList()
+        val readings = inputs.mapValues { it.value.reading }
+        return catalog.asSequence()
+            .filter { it.category != NormalizedCategory.LOCATION && it.normalizerId != "power_session_energy" }
+            .filter { field -> field.sourceKeys.any(affectedSourceKeys::contains) }
+            .mapNotNull { field ->
+                val composite = field.normalizerId == "charging_time_remaining_hh_mm_ss" ||
+                    field.normalizerId in DERIVED_HV_POWER_NORMALIZERS
+                if (composite && field.sourceKeys.any { it !in inputs }) return@mapNotNull null
+                val provisional = normalizeField(field, readings, 0L, Instant.EPOCH.toString())
+                val contributorKeys = if (composite) {
+                    field.sourceKeys
+                } else {
+                    listOfNotNull(provisional.sourceKey)
+                }
+                val contributors = contributorKeys.mapNotNull(inputs::get)
+                if (contributors.size != contributorKeys.size || contributors.isEmpty()) return@mapNotNull null
+                val pollIds = contributors.mapNotNull { it.sourcePollId }.distinct()
+                provisional.copy(
+                    sourcePollId = pollIds.singleOrNull()
+                        ?.takeIf { contributors.all { input -> input.sourcePollId == it } },
+                    observedAt = Instant.ofEpochMilli(contributors.minOf { it.stamp.wallMs }).toString()
+                )
+            }
+            .toList()
     }
 
     private fun normalizeChargingTimeRemaining(

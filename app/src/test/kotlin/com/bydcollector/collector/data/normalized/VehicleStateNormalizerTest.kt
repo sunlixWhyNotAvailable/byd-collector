@@ -954,6 +954,59 @@ class VehicleStateNormalizerTest {
         assertEquals("raw_float_without_decoded_desc", missingDecodedFloat.reason)
     }
 
+    @Test
+    fun sparseNormalizationUsesSelectedScalarSourceClockAndOmitsUnrelatedFields() {
+        val field = syntheticPercentField()
+        val inputs = mapOf(
+            "soc_primary" to sourceInput("soc_primary", "80", 2_000, pollId = 2),
+            "soc_backup" to sourceInput("soc_backup", "75", 1_000, pollId = 1)
+        )
+
+        val output = VehicleStateNormalizer(catalog = listOf(field, NormalizedFieldCatalog.speedKmh))
+            .normalizeSparse(inputs, setOf("soc_backup"))
+
+        assertEquals(1, output.size)
+        assertEquals(80.0, output.single().value.number)
+        assertEquals("soc_primary", output.single().sourceKey)
+        assertEquals("1970-01-01T00:00:02Z", output.single().observedAt)
+        assertEquals(2L, output.single().sourcePollId)
+    }
+
+    @Test
+    fun sparseCompositeUsesOldestRequiredContributorClockAndNoMixedPollId() {
+        val inputs = mapOf(
+            "charging_1009_1146095640_5" to sourceInput(
+                "charging_1009_1146095640_5", "2", 10_000, pollId = 9
+            ),
+            "charging_1009_1146095648_5" to sourceInput(
+                "charging_1009_1146095648_5", "5", 8_000, pollId = null
+            )
+        )
+
+        val output = VehicleStateNormalizer(catalog = listOf(NormalizedFieldCatalog.chargingTimeRemaining))
+            .normalizeSparse(inputs, setOf("charging_1009_1146095640_5"))
+            .single()
+
+        assertEquals("02:05:00", output.value.text)
+        assertEquals("1970-01-01T00:00:08Z", output.observedAt)
+        assertEquals(null, output.sourcePollId)
+    }
+
+    private fun sourceInput(key: String, value: String, wallMs: Long, pollId: Long?): NormalizedSourceInput =
+        NormalizedSourceInput(
+            reading = PollReading(key, value, value),
+            stamp = NormalizedSourceStamp(
+                kind = if (pollId == null) NormalizedSourceKind.CALLBACK else NormalizedSourceKind.POLL,
+                identity = "source-$key-$wallMs",
+                bootId = "boot",
+                generatorId = "generator",
+                sequence = wallMs,
+                wallMs = wallMs,
+                elapsedMs = wallMs
+            ),
+            sourcePollId = pollId
+        )
+
     private fun syntheticPercentField(): NormalizedFieldDefinition {
         return NormalizedFieldDefinition(
             fieldKey = "synthetic_soc",

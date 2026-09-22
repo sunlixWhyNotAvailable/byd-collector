@@ -37,6 +37,8 @@ final class HelperDualStreamRuntime implements AutoCloseable {
     private final CollectorHelperDaemon.NativeReader nativeReader;
     private final HelperWakeLockController wakeLock;
     private final HelperDiagnostics diagnostics;
+    private final CallbackSpoolBinder callbackTransport;
+    private final HelperCallbackController callbacks;
     private final Object monitor = new Object();
     private final Runnable tick = this::tick;
 
@@ -52,6 +54,7 @@ final class HelperDualStreamRuntime implements AutoCloseable {
     private long secondaryGapGeneration = -1L;
     private volatile long mainNextAt;
     private volatile long secondaryNextAt;
+    private long nextCallbackDiagnosticsAt;
     private long nextErrorLogAt;
     private String lastError;
     private long repeatedErrors;
@@ -68,6 +71,7 @@ final class HelperDualStreamRuntime implements AutoCloseable {
         SecondaryTelemetrySpool secondarySpool,
         CollectorHelperDaemon.ScalarReader scalarReader,
         CollectorHelperDaemon.NativeReader nativeReader,
+        CallbackSpoolBinder callbackTransport,
         HelperWakeLockController wakeLock,
         HelperDiagnostics diagnostics
     ) {
@@ -83,6 +87,7 @@ final class HelperDualStreamRuntime implements AutoCloseable {
         this.secondarySpool = secondarySpool;
         this.scalarReader = scalarReader;
         this.nativeReader = nativeReader;
+        this.callbackTransport = callbackTransport;
         this.wakeLock = wakeLock;
         this.diagnostics = diagnostics;
         this.orchestration = new ThreadPoolExecutor(
@@ -105,9 +110,37 @@ final class HelperDualStreamRuntime implements AutoCloseable {
             },
             new ThreadPoolExecutor.AbortPolicy()
         );
+        HelperCallbackController.Platform callbackPlatform;
+        try {
+            Object manager = nativeReader instanceof CollectorHelperDaemon.NativeArrayReader
+                ? ((CollectorHelperDaemon.NativeArrayReader) nativeReader).manager() : null;
+            callbackPlatform = manager == null
+                ? new HelperCallbackController.Platform()
+                : new HelperCallbackController.Platform(manager, vendor);
+        } catch (Throwable error) {
+            callbackPlatform = new HelperCallbackController.Platform();
+            noteError("callback platform unavailable: " + describe(error));
+        }
+        this.callbacks = new HelperCallbackController(bootId, helperGeneration, mainRows, secondaryRows,
+            callbackPlatform, new HelperCallbackController.Host() {
+                @Override public boolean appOwns(int stream) { return callbackUsesLiveMemory(stream); }
+                @Override public boolean publishingHeld(int stream) {
+                    return state.callbackPublishingHeld(stream, SystemClock.elapsedRealtime());
+                }
+                @Override public long liveBytes(int stream) { return callbackLiveRetainedBytes(callbackTransport, stream); }
+                @Override public CallbackSpool.AppendResult deliver(TelemetryCallbackBatch batch) {
+                    return deliverCallbackBatch(callbackTransport, batch);
+                }
+                @Override public CallbackSpool.AppendResult spill(int stream) { return callbackTransport.spill(stream); }
+                @Override public void recordLoss(int stream, TelemetryCallbackQueue.Loss loss) {
+                    recordCallbackLoss(callbackTransport, stream, loss);
+                }
+                @Override public void noteError(String message) { HelperDualStreamRuntime.this.noteError(message); }
+            });
     }
 
     void start() {
+        refreshCallbackPlan();
         ownerHandler.removeCallbacks(tick);
         ownerHandler.post(tick);
     }
@@ -117,12 +150,21 @@ final class HelperDualStreamRuntime implements AutoCloseable {
     ) {
         long now = SystemClock.elapsedRealtime();
         if (action == CollectorHelperProtocol.CONTROL_CLAIM) {
+            long previousToken = state.snapshot(0, now).controllerToken;
             HelperStreamRuntimeState.ControlResult result = state.claim(nonce, value, now);
+            if (result.status == CollectorHelperProtocol.STATUS_OK) {
+                if (previousToken != 0L && previousToken != result.controllerToken) callbacks.semanticReset();
+                refreshCallbackPlan();
+            }
             signalChanged();
             return result;
         }
         if (action == CollectorHelperProtocol.CONTROL_SET_DESIRED) {
             HelperStreamRuntimeState.ControlResult result = state.setDesired(token, stream, epoch, value, now);
+            if (result.status == CollectorHelperProtocol.STATUS_OK) {
+                refreshCallbackPlan();
+                if (value == 0) callbacks.quiesce(stream, 5_000L);
+            }
             signalChanged();
             return result;
         }
@@ -134,16 +176,28 @@ final class HelperDualStreamRuntime implements AutoCloseable {
         if (action == CollectorHelperProtocol.CONTROL_PAUSE_FENCE) {
             HelperStreamRuntimeState.ControlResult begun = state.beginPause(token, stream, epoch, now);
             if (begun.status != CollectorHelperProtocol.STATUS_OK) return begun;
+            refreshCallbackPlan();
+            if (!callbacks.quiesce(stream, 5_000L)) {
+                state.cancelPause(token, stream, epoch);
+                refreshCallbackPlan();
+                return state.fenceFailure(token, stream, epoch, SystemClock.elapsedRealtime(),
+                    "callback pause fence interrupted");
+            }
             signalChanged();
             if (!awaitSettled(stream, token, epoch)) {
                 state.cancelPause(token, stream, epoch);
+                refreshCallbackPlan();
                 return state.fenceFailure(
                     token, stream, epoch, SystemClock.elapsedRealtime(), "pause fence interrupted");
             }
-            return state.completePause(token, stream, epoch, SystemClock.elapsedRealtime());
+            HelperStreamRuntimeState.ControlResult result =
+                state.completePause(token, stream, epoch, SystemClock.elapsedRealtime());
+            refreshCallbackPlan();
+            return result;
         }
         if (action == CollectorHelperProtocol.CONTROL_RESUME) {
             HelperStreamRuntimeState.ControlResult result = state.resume(token, stream, epoch, now);
+            if (result.status == CollectorHelperProtocol.STATUS_OK) refreshCallbackPlan();
             signalChanged();
             return result;
         }
@@ -188,7 +242,8 @@ final class HelperDualStreamRuntime implements AutoCloseable {
                     return rejected(rows.size(), CollectorHelperProtocol.STATUS_REPLAY_PENDING,
                         "main read canceled");
                 }
-                return CollectorHelperDaemon.BatchEngine.run(rows, scalarReader, nativeReader);
+                return callbacks.readHybrid(rows,
+                    selected -> CollectorHelperDaemon.BatchEngine.run(selected, scalarReader, nativeReader));
             });
         } catch (Throwable error) {
             return rejected(rows.size(), CollectorHelperProtocol.STATUS_READ_ERROR, describe(error));
@@ -248,17 +303,52 @@ final class HelperDualStreamRuntime implements AutoCloseable {
         return state.replayAllowed(stream, SystemClock.elapsedRealtime());
     }
 
+    int authorizeCallbackTransport(long token, int stream, long epoch) {
+        int status = state.authorizeReplay(token, stream, epoch, SystemClock.elapsedRealtime());
+        if (status != CollectorHelperProtocol.STATUS_OK) return status;
+        return barrierPending(stream) ? CollectorHelperProtocol.STATUS_REPLAY_PENDING : CollectorHelperProtocol.STATUS_OK;
+    }
+
+    /** Passive STEP2 ownership seam used by the future callback listener; it performs no capture. */
+    boolean callbackUsesLiveMemory(int stream) {
+        return state.replayAllowed(stream, SystemClock.elapsedRealtime());
+    }
+
+    /** Passive STEP2 ownership seam: an expired APP lease spills through that stream's existing root. */
+    boolean callbackUsesGapSpool(int stream) {
+        return state.fallbackAllowed(stream, SystemClock.elapsedRealtime());
+    }
+
+    CallbackSpool.AppendResult deliverCallbackBatch(CallbackSpoolBinder transport, TelemetryCallbackBatch batch) {
+        if (transport == null || batch == null) throw new IllegalArgumentException("callback delivery is required");
+        return transport.deliver(batch, callbackUsesLiveMemory(batch.stream));
+    }
+
+    void recordCallbackLoss(CallbackSpoolBinder transport, int stream, TelemetryCallbackQueue.Loss loss) {
+        if (transport == null) throw new IllegalArgumentException("callback transport is required");
+        transport.recordLoss(stream, loss);
+    }
+
+    long callbackLiveRetainedBytes(CallbackSpoolBinder transport, int stream) {
+        if (transport == null) throw new IllegalArgumentException("callback transport is required");
+        return transport.liveRetainedBytes(stream);
+    }
+
     boolean barrierPending(int stream) {
         synchronized (monitor) {
             return stream == CollectorHelperProtocol.STREAM_MAIN
-                ? mainInFlight || mainPersisting
-                : secondaryInFlight || secondaryPersisting;
+                ? mainInFlight || mainPersisting || callbacks.busy(stream)
+                : secondaryInFlight || secondaryPersisting || callbacks.busy(stream);
         }
     }
 
     private void tick() {
         if (closed) return;
         long now = SystemClock.elapsedRealtime();
+        if (now >= nextCallbackDiagnosticsAt) {
+            diagnostics.callback(callbacks.diagnosticsSnapshot());
+            nextCallbackDiagnosticsAt = saturatedAdd(now, 1_000L);
+        }
         boolean mainFallback = mainSpool != null && state.fallbackAllowed(CollectorHelperProtocol.STREAM_MAIN, now);
         boolean secondaryFallback = secondarySpool != null &&
             state.fallbackAllowed(CollectorHelperProtocol.STREAM_SECONDARY, now);
@@ -296,7 +386,8 @@ final class HelperDualStreamRuntime implements AutoCloseable {
                 }
                 CollectorHelperDaemon.BatchResult result = vendor.call(true, () -> {
                     if (!fallbackCurrent(stream, generation)) throw new Canceled("main fallback canceled");
-                    return CollectorHelperDaemon.BatchEngine.run(mainRows, scalarReader, nativeReader);
+                    return callbacks.readHybrid(mainRows,
+                        selected -> CollectorHelperDaemon.BatchEngine.run(selected, scalarReader, nativeReader));
                 });
                 if (!fallbackCurrent(stream, generation)) return;
                 setPersisting(stream, true);
@@ -350,10 +441,11 @@ final class HelperDualStreamRuntime implements AutoCloseable {
             int end = Math.min(secondaryRows.size(), offset + CollectorHelperProtocol.SECONDARY_CHUNK_SIZE);
             final int chunkOffset = offset;
             List<CollectorHelperDaemon.Address> chunk = secondaryRows.subList(offset, end);
-            CollectorHelperDaemon.BatchResult result = vendor.call(false, () -> {
-                if (!current.ok()) throw new Canceled("secondary read canceled");
-                return CollectorHelperDaemon.BatchEngine.run(chunk, scalarReader, nativeReader);
-            });
+            CollectorHelperDaemon.BatchResult result = callbacks.readHybrid(chunk, selected ->
+                vendor.call(false, () -> {
+                    if (!current.ok()) throw new Canceled("secondary read canceled");
+                    return CollectorHelperDaemon.BatchEngine.run(selected, scalarReader, nativeReader);
+                }));
             System.arraycopy(result.values, 0, values, chunkOffset, result.values.length);
             nativeGroups += result.nativeGroupCount;
             fallbackGroups += result.fallbackGroupCount;
@@ -379,7 +471,7 @@ final class HelperDualStreamRuntime implements AutoCloseable {
         for (int ordinal = 0; ordinal < result.values.length; ordinal++) {
             CollectorHelperDaemon.ReadValue value = result.values[ordinal];
             values.add(new SecondaryTelemetrySpool.Value(
-                ordinal, value.status, value.raw != null, value.raw, value.error));
+                ordinal, value.status, value.raw != null, value.raw, value.error, value.callbackSource != null));
         }
         return new SecondaryTelemetrySpool.Cycle(
             new SecondaryTelemetrySpool.CycleIdentity(
@@ -412,6 +504,7 @@ final class HelperDualStreamRuntime implements AutoCloseable {
                     access == CollectorHelperProtocol.STATUS_STALE_TOKEN) return false;
                 boolean busy = stream == CollectorHelperProtocol.STREAM_MAIN
                     ? mainInFlight || mainPersisting : secondaryInFlight || secondaryPersisting;
+                busy = busy || callbacks.busy(stream);
                 if (!busy && !vendor.hasQueued(stream == CollectorHelperProtocol.STREAM_MAIN)) return true;
                 try {
                     monitor.wait(100L);
@@ -427,6 +520,13 @@ final class HelperDualStreamRuntime implements AutoCloseable {
         synchronized (monitor) { monitor.notifyAll(); }
         ownerHandler.removeCallbacks(tick);
         ownerHandler.post(tick);
+    }
+
+    private void refreshCallbackPlan() {
+        long now = SystemClock.elapsedRealtime();
+        callbacks.updatePlan(
+            state.streamView(CollectorHelperProtocol.STREAM_MAIN, now),
+            state.streamView(CollectorHelperProtocol.STREAM_SECONDARY, now));
     }
 
     private void finish(int stream, boolean persistenceOnly) {
@@ -451,13 +551,19 @@ final class HelperDualStreamRuntime implements AutoCloseable {
     private boolean hasMainBacklog() {
         if (mainSpool == null) return false;
         try { return !mainSpool.pending(1, sample -> { }).isEmpty(); }
-        catch (Throwable error) { return true; }
+        catch (Throwable error) {
+            noteError("main callback backlog check failed: " + android.util.Log.getStackTraceString(error));
+            return true;
+        }
     }
 
     private boolean hasSecondaryBacklog() {
         if (secondarySpool == null) return false;
         try { return secondarySpool.oldest() != null; }
-        catch (Throwable error) { return true; }
+        catch (Throwable error) {
+            noteError("secondary callback backlog check failed: " + android.util.Log.getStackTraceString(error));
+            return true;
+        }
     }
 
     private void maintainWakeLock(boolean autonomous) {
@@ -525,6 +631,7 @@ final class HelperDualStreamRuntime implements AutoCloseable {
     @Override public void close() {
         closed = true;
         ownerHandler.removeCallbacks(tick);
+        callbacks.close();
         vendor.close();
         orchestration.shutdownNow();
         persistence.shutdownNow();
@@ -533,7 +640,7 @@ final class HelperDualStreamRuntime implements AutoCloseable {
     }
 
     private interface CheckCurrent { boolean ok(); }
-    private interface VendorCall<T> { T run() throws Throwable; }
+    interface VendorCall<T> { T run() throws Throwable; }
     private interface PersistenceCall { void run() throws Throwable; }
     private static final class Canceled extends Exception { Canceled(String message) { super(message); } }
 

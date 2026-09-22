@@ -38,6 +38,10 @@ internal class AppStreamController(
     private val epochs = longArrayOf(0, 0)
     private var scheduler: ScheduledExecutorService? = null
     private var appReleased = false
+    private val renewalFailed = booleanArrayOf(false, false)
+    @Volatile private var diagnostic: ((String, String) -> Unit)? = null
+
+    fun setDiagnostic(callback: ((String, String) -> Unit)?) { diagnostic = callback }
 
     fun configureDesired(main: Boolean, secondary: Boolean) {
         synchronized(stateLock) {
@@ -178,9 +182,33 @@ internal class AppStreamController(
                 executor.scheduleWithFixedDelay({
                     try {
                         val request = credentials(stream) ?: return@scheduleWithFixedDelay
-                        exchange(P.CONTROL_RENEW, nonce, request.controllerToken, stream, request.epoch, 0)
-                    } catch (_: Exception) {
-                        // Renewal never claims/re-enables: helper fallback is the safe failure mode.
+                        val result = exchange(P.CONTROL_RENEW, nonce, request.controllerToken, stream, request.epoch, 0)
+                        val wasFailed = synchronized(stateLock) {
+                            val index = index(stream)
+                            val previous = renewalFailed[index]
+                            renewalFailed[index] = !result.ok
+                            previous
+                        }
+                        if (!result.ok && !wasFailed) {
+                            runCatching {
+                                diagnostic?.invoke(
+                                    "stream_lease_renewal_error",
+                                    "stream=$stream status=${result.status} error=${result.error.orEmpty()}"
+                                )
+                            }
+                        } else if (result.ok && wasFailed) {
+                            runCatching { diagnostic?.invoke("stream_lease_renewal_recovered", "stream=$stream") }
+                        }
+                    } catch (error: Exception) {
+                        val firstFailure = synchronized(stateLock) {
+                            val index = index(stream)
+                            val first = !renewalFailed[index]
+                            renewalFailed[index] = true
+                            first
+                        }
+                        if (firstFailure) runCatching {
+                            diagnostic?.invoke("stream_lease_renewal_error", "stream=$stream\n${error.stackTraceToString()}")
+                        }
                     }
                 }, 0, 500, TimeUnit.MILLISECONDS)
             }
@@ -196,6 +224,7 @@ internal class AppStreamController(
 
 object DirectStreamController {
     private val controller = AppStreamController()
+    fun setDiagnostic(callback: ((String, String) -> Unit)?) = controller.setDiagnostic(callback)
     fun configureDesired(main: Boolean, secondary: Boolean) = controller.configureDesired(main, secondary)
     fun ensureReady(stream: Int = 0): Boolean = controller.ensureReady(stream)
     fun setDesired(stream: Int, enabled: Boolean): Boolean = controller.setDesired(stream, enabled)

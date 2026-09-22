@@ -34,31 +34,41 @@ class NormalizedStateStore(
 
     fun applyObservations(observations: List<NormalizedObservation>): NormalizedWriteSummary {
         val db = helper.writableDatabase
+        var result: NormalizedWriteSummary? = null
+        db.beginTransaction()
+        try {
+            result = applyObservationsInTransaction(db, observations)
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        return checkNotNull(result)
+    }
+
+    internal fun applyObservationsInTransaction(
+        db: SQLiteDatabase,
+        observations: List<NormalizedObservation>
+    ): NormalizedWriteSummary {
+        check(db.inTransaction()) { "normalized callback writes require an active transaction" }
         var changedCount = 0
         var historyInsertedCount = 0
         var currentInsertedCount = 0
         val changedCategories = mutableSetOf<String>()
 
-        db.beginTransaction()
-        try {
-            observations.forEach { observation ->
-                val next = observation.toStoredState()
-                val previous = currentStateForField(db, next.fieldKey)
-                if (previous == null) currentInsertedCount += 1
-                //dedupes unchanged semantic values so history represents changes instead of every poll tick
-                val decision = NormalizedStateReducer.decide(previous, next)
+        observations.forEach { observation ->
+            val next = observation.toStoredState()
+            val previous = currentStateForField(db, next.fieldKey)
+            if (previous == null) currentInsertedCount += 1
+            //dedupes unchanged semantic values so history represents changes instead of every poll tick
+            val decision = NormalizedStateReducer.decide(previous, next)
 
-                if (decision.insertHistory) {
-                    changedCount += 1
-                    insertHistory(db, decision.current)
-                    historyInsertedCount += 1
-                    changedCategories += decision.current.category
-                }
-                upsertCurrent(db, decision.current)
+            if (decision.insertHistory) {
+                changedCount += 1
+                insertHistory(db, decision.current)
+                historyInsertedCount += 1
+                changedCategories += decision.current.category
             }
-            db.setTransactionSuccessful()
-        } finally {
-            db.endTransaction()
+            upsertCurrent(db, decision.current)
         }
 
         return NormalizedWriteSummary(

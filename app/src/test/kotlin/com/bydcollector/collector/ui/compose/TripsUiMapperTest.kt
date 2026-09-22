@@ -7,6 +7,7 @@ import com.bydcollector.collector.data.trips.TripSession
 import com.bydcollector.collector.data.trips.TripTime
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.test.assertSame
 
@@ -102,6 +103,101 @@ class TripsUiMapperTest {
         ).single().months.single().days.single().trips.single()
 
         assertTrue(mapped.route.single().gap)
+    }
+
+    @Test
+    fun routeMappingCarriesSourceClockAndQualityWithoutChangingTripStorage() {
+        val mapped = TripsUiMapper.routePoints(listOf(
+            RoutePoint(
+                tripId = "trip-1",
+                sequence = 7L,
+                observedAt = "2026-08-17T12:00:00Z",
+                elapsedMs = 12_000L,
+                receiveWallTimeMs = 123_456L,
+                bootId = "boot-a",
+                latitude = 50.45,
+                longitude = 30.52,
+                quality = "degraded:accuracy"
+            )
+        )).single()
+
+        assertEquals("2026-08-17T12:00:00Z", mapped.sourceObservedAt)
+        assertEquals(12_000L, mapped.sourceElapsedMs)
+        assertEquals(123_456L, mapped.receiveWallTimeMs)
+        assertEquals("boot-a", mapped.sourceBootId)
+        assertEquals("degraded:accuracy", mapped.quality)
+    }
+
+    @Test
+    fun currentPositionUsesLatestTrustedPointAndFiveSecondSourceAgeBoundary() {
+        val trusted = TripRoutePointUi(
+            sequence = 1L,
+            latitude = 50.45,
+            longitude = 30.52,
+            sourceObservedAt = "2026-08-17T12:00:00Z",
+            sourceElapsedMs = 10_000L,
+            sourceBootId = "boot-a"
+        )
+
+        assertEquals(
+            CurrentTripPositionUi(1L, CurrentTripPositionState.CURRENT),
+            TripsUiMapper.currentPosition(listOf(trusted), "boot-a", 15_000L, 0L)
+        )
+        assertEquals(
+            CurrentTripPositionUi(1L, CurrentTripPositionState.LAST_KNOWN),
+            TripsUiMapper.currentPosition(listOf(trusted), "boot-a", 15_001L, 0L)
+        )
+    }
+
+    @Test
+    fun currentPositionBecomesLastKnownForLaterGapOrUnknownAge() {
+        val trusted = TripRoutePointUi(
+            sequence = 1L,
+            latitude = 50.45,
+            longitude = 30.52,
+            sourceObservedAt = "not-a-time"
+        )
+        val gap = TripRoutePointUi(sequence = 2L, latitude = 0.0, longitude = 0.0, gap = true)
+
+        assertEquals(
+            CurrentTripPositionState.LAST_KNOWN,
+            TripsUiMapper.currentPosition(listOf(trusted), null, 0L, 0L)?.state
+        )
+        assertEquals(
+            CurrentTripPositionState.LAST_KNOWN,
+            TripsUiMapper.currentPosition(
+                listOf(trusted.copy(sourceElapsedMs = 9_900L, sourceBootId = "boot-a"), gap),
+                "boot-a",
+                10_000L,
+                0L
+            )?.state
+        )
+        assertEquals(1L, TripsUiMapper.currentPosition(
+            listOf(trusted.copy(sourceElapsedMs = 9_900L, sourceBootId = "boot-a"), gap),
+            "boot-a",
+            10_000L,
+            0L
+        )?.sequence)
+    }
+
+    @Test
+    fun currentPositionFallsBackToSourceWallClockAndRequiresTrustedCoordinates() {
+        val trusted = TripRoutePointUi(
+            sequence = 3L,
+            latitude = 50.45,
+            longitude = 30.52,
+            sourceObservedAt = "2026-08-17T12:00:00Z",
+            sourceElapsedMs = 1L,
+            sourceBootId = "old-boot"
+        )
+        val now = requireNotNull(TripTime.instant("2026-08-17T12:00:04Z")).toEpochMilli()
+
+        assertEquals(
+            CurrentTripPositionState.CURRENT,
+            TripsUiMapper.currentPosition(listOf(trusted), "new-boot", 99_999L, now)?.state
+        )
+        assertNull(TripsUiMapper.currentPosition(listOf(trusted.copy(gap = true)), "new-boot", 99_999L, now))
+        assertNull(TripsUiMapper.currentPosition(emptyList(), "new-boot", 99_999L, now))
     }
 
     @Test
