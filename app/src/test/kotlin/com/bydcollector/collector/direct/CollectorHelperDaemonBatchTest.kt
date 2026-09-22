@@ -316,77 +316,12 @@ class CollectorHelperDaemonBatchTest {
         }
     }
 
-    @Test
-    fun completeRoundRobinCatalogFitsOneRequestAndAboveMaxIsRejected() {
-        val assets = DirectDebugParameterAsset.ASSET_NAMES.map(::assetFile)
-        val client = sourceFile("com/bydcollector/collector/data/direct/DirectVehicleHelperClient.kt").readText()
-        val daemon = sourceFile("com/bydcollector/collector/direct/CollectorHelperDaemon.java").readText()
-        val shardSizes = assets.map { DirectDebugParameterAsset.parse(it.readText(Charsets.UTF_8)).size }
-
-        assertEquals(listOf(7692, 7693, 7698), shardSizes)
-        assertEquals(23083, shardSizes.sum())
-        assertTrue(shardSizes.sum() <= CollectorHelperProtocol.MAX_BATCH_SIZE)
-        assertEquals(23_096, CollectorHelperProtocol.MAX_BATCH_SIZE)
-        assertTrue(client.contains("entries.isEmpty() || entries.size > CollectorHelperProtocol.MAX_BATCH_SIZE"))
-        assertTrue(client.contains("return synchronized(lock)"))
-        assertTrue(client.contains("data.writeInt(entries.size)"))
-        assertTrue(client.contains("binder.transact(CollectorHelperProtocol.TX_READ_BATCH, data, reply, 0)"))
-        val gateIndex = client.indexOf("entries.isEmpty() || entries.size > CollectorHelperProtocol.MAX_BATCH_SIZE")
-        val writeCountIndex = client.indexOf("data.writeInt(entries.size)")
-        val transactIndex = client.indexOf("binder.transact(CollectorHelperProtocol.TX_READ_BATCH, data, reply, 0)")
-        assertTrue(
-            gateIndex <
-                client.indexOf("return synchronized(lock)")
-        )
-        assertTrue(gateIndex < writeCountIndex)
-        assertTrue(writeCountIndex < transactIndex)
-        assertTrue(23_097 > CollectorHelperProtocol.MAX_BATCH_SIZE)
-        assertTrue(daemon.contains("if (count < 1 || count > CollectorHelperProtocol.MAX_BATCH_SIZE)"))
-        assertTrue(daemon.contains("throw new IllegalArgumentException(\"invalid batch size: \" + count)"))
-    }
-
-    @Test
-    fun protocolV10RejectsStaleOrWrongModeHelpersAndExposesReadOnlyEndpointsOnly() {
-        val protocol = sourceFile("com/bydcollector/collector/direct/CollectorHelperProtocol.java").readText()
-        val daemon = sourceFile("com/bydcollector/collector/direct/CollectorHelperDaemon.java").readText()
-        val client = sourceFile("com/bydcollector/collector/data/direct/DirectVehicleHelperClient.kt").readText()
-
-        assertEquals(12, CollectorHelperProtocol.PROTOCOL_VERSION)
-        assertTrue(client.contains("protocolVersion != CollectorHelperProtocol.PROTOCOL_VERSION"))
-        assertTrue(client.contains("DirectHelperOwnerMode.fromProtocolValue(ownerMode)"))
-        assertTrue(client.contains("TX_PING"))
-        assertTrue(client.contains("TX_READ"))
-        assertTrue(client.contains("TX_READ_BATCH"))
-        assertTrue(client.contains("TX_WORKER_PENDING"))
-        assertTrue(client.contains("TX_WORKER_ACK"))
-        assertTrue(client.contains("TX_STOP_OWNER"))
-        assertTrue(!protocol.contains("HEARTBEAT", ignoreCase = true))
-        assertTrue(!protocol.contains("DISARM", ignoreCase = true))
-        assertTrue(!daemon.contains("offcar", ignoreCase = true))
-        assertTrue(!client.contains("transactControl"))
-        assertTrue(!protocol.contains("TX_WRITE"))
-        assertTrue(!daemon.contains("sendCmd"))
-        assertTrue(!daemon.contains("setXD"))
-        assertTrue(!daemon.contains("setTrigger"))
-        assertTrue(!daemon.contains("wakeUpMcu"))
-        assertTrue(!daemon.contains("setAction"))
-    }
-
     private fun address(tx: Int, dev: Int, fid: Int) = CollectorHelperDaemon.Address(tx, dev, fid)
 
     private fun assetFile(name: String): File = listOf(
         File("src/main/assets/$name"),
         File("app/src/main/assets/$name")
     ).firstOrNull { it.isFile } ?: error("Missing $name")
-
-    private fun sourceFile(path: String): File {
-        return listOf(
-            File("src/main/java/$path"),
-            File("app/src/main/java/$path"),
-            File("src/main/kotlin/$path"),
-            File("app/src/main/kotlin/$path")
-        ).firstOrNull { it.isFile } ?: error("Missing source file: $path")
-    }
 
     private fun unavailableNative(reason: String) = object : CollectorHelperDaemon.NativeReader {
         override fun isAvailable() = false

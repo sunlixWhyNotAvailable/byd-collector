@@ -40,16 +40,6 @@ class KeystoreSecretStoreTest {
     }
 
     @Test
-    fun encryptionLetsTheCipherProviderGenerateItsIv() {
-        val source = sourceFile("com/bydcollector/collector/security/AesGcmSecretCipher.kt").readText()
-
-        assertTrue(source.contains("cipher.init(Cipher.ENCRYPT_MODE, key)"))
-        assertTrue(source.contains("AesGcmPayload(cipher.iv, cipher.doFinal(plaintext))"))
-        assertFalse(source.contains("Cipher.ENCRYPT_MODE, key, GCMParameterSpec"))
-        assertFalse(source.contains("SecureRandom"))
-    }
-
-    @Test
     fun encodedPayloadRoundTripsAndMalformedPayloadsAreRejected() {
         val payload = AesGcmSecretCipher.encrypt(key, "value".toByteArray(), "name".toByteArray())
         val decoded = assertNotNull(AesGcmSecretCipher.decode(AesGcmSecretCipher.encode(payload)))

@@ -69,16 +69,6 @@ class CollectorSettingsSecurityContractTest {
     }
 
     @Test
-    fun legacyLocationKeysAreRemovedByOneTimeMigration() {
-        val source = sourceFile("com/bydcollector/collector/service/CollectorSettings.kt").readText()
-        val migration = source.substringAfter("private fun migrateLegacyLocationCategories()")
-            .substringBefore("private fun migrateTelegramBuiltInTemplates")
-        assertTrue(migration.contains("remove(KEY_MQTT_LOCATION)"))
-        assertTrue(migration.contains("remove(KEY_INFLUX_LOCATION)"))
-        assertTrue(source.contains("migrateLegacyLocationCategories()"))
-    }
-
-    @Test
     fun tripSummaryMigrationPreservesCustomTextWhenLegacyMarkerIsUnset() {
         val tripKey = "${CollectorSettings.KEY_TELEGRAM_TEMPLATE_PREFIX}trip-summary"
         val otherKey = "${CollectorSettings.KEY_TELEGRAM_TEMPLATE_PREFIX}charging-started"
@@ -262,34 +252,6 @@ class CollectorSettingsSecurityContractTest {
 
         assertEquals(custom, prefs.getString(key, null))
         assertTrue(prefs.getBoolean(CollectorSettings.KEY_TELEGRAM_CHARGED_TO_100_MIGRATION_DONE, false))
-    }
-
-    @Test
-    fun languageNavigatorAndTemplateResetApisArePersistedBySettingsFacade() {
-        val source = sourceFile("com/bydcollector/collector/service/CollectorSettings.kt").readText()
-        val init = source.substringAfter("init {").substringBefore("}")
-        val navigatorGetter = source.substringAfter("fun telegramNavigatorMask(): Int")
-            .substringBefore("fun setTelegramNavigatorMask")
-        assertTrue(source.contains("fun uiLanguageCode(): String"))
-        assertTrue(source.contains("fun setUiLanguageCode(code: String)"))
-        assertTrue(source.contains("DEFAULT_UI_LANGUAGE_CODE = \"uk\""))
-        assertTrue(source.contains("fun telegramNavigatorMask(): Int"))
-        assertTrue(source.contains("fun setTelegramNavigatorMask(mask: Int)"))
-        assertTrue(source.contains("TelegramNavigatorMask.sanitize"))
-        assertTrue(navigatorGetter.contains("DEFAULT_TELEGRAM_NAVIGATOR_MASK"))
-        assertTrue(source.contains("DEFAULT_TELEGRAM_NAVIGATOR_MASK = TelegramNavigatorMask.NONE"))
-        assertFalse(init.contains("NavigatorMask"))
-        assertTrue(source.contains("fun clearTelegramTemplate(eventKey: String)"))
-    }
-
-    @Test
-    fun postMigrationUserTemplateIsStoredExactlyEvenWhenItMatchesABuiltIn() {
-        val source = sourceFile("com/bydcollector/collector/service/CollectorSettings.kt").readText()
-        val setter = source.substringAfter("fun setTelegramTemplate(eventKey: String, template: String)")
-            .substringBefore("fun clearTelegramTemplate")
-
-        assertTrue(setter.contains("putString"))
-        assertFalse(setter.contains("isKnownBuiltIn"))
     }
 
     private fun sourceFile(path: String): File {

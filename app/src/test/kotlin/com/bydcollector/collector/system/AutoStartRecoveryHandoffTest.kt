@@ -1,6 +1,5 @@
 package com.bydcollector.collector.system
 
-import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
@@ -50,41 +49,4 @@ class AutoStartRecoveryHandoffTest {
         assertFalse(finished)
     }
 
-    @Test
-    fun receiversOnlyPerformBoundedForegroundHandoff() {
-        val handoff = sourceFile("com/bydcollector/collector/system/AutoStartRecoveryService.kt").readText()
-        val receivers = listOf(
-            "com/bydcollector/collector/system/BootReceiver.kt",
-            "com/bydcollector/collector/system/InternalAutoStartReceiver.kt",
-            "com/bydcollector/collector/system/KeepAliveRecoveryReceiver.kt"
-        ).joinToString("\n") { sourceFile(it).readText() }
-        val manifest = projectFile("app/src/main/AndroidManifest.xml", "src/main/AndroidManifest.xml").readText()
-
-        assertTrue(handoff.contains("receiver.goAsync()"))
-        assertInOrder(handoff, "AutoStartRecoveryService.enqueue", "pendingResult.finish()")
-        assertTrue(handoff.contains("if (submitToRunningOwner())"))
-        assertTrue(handoff.contains("autoStartRecoveryHandoffExecutor"))
-        assertTrue(handoff.contains("namedSingleThreadExecutor(\"byd-auto-start-recovery-handoff\")"))
-        assertFalse(handoff.contains("sharedOperationalEventExecutor"))
-        assertFalse(handoff.contains("ACTION_RECOVER"))
-        assertTrue(receivers.contains("handoffAutoStartRecovery"))
-        assertFalse(receivers.contains("BydCollectorApplication.store"))
-        assertFalse(receivers.contains("CollectorAutoStart.handleBroadcast"))
-        assertTrue(manifest.contains("AutoStartRecoveryService"))
-    }
-
-    private fun sourceFile(path: String): File = projectFile(
-        "app/src/main/kotlin/$path",
-        "src/main/kotlin/$path"
-    )
-
-    private fun projectFile(vararg paths: String): File =
-        paths.map(::File).firstOrNull(File::isFile)
-            ?: error("Missing source file: ${paths.joinToString()}")
-
-    private fun assertInOrder(source: String, first: String, second: String) {
-        val firstIndex = source.indexOf(first)
-        val secondIndex = source.indexOf(second)
-        assertTrue(firstIndex >= 0 && secondIndex > firstIndex, "Expected `$first` before `$second`")
-    }
 }

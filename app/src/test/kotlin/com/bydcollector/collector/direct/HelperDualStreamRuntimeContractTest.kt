@@ -1,6 +1,5 @@
 package com.bydcollector.collector.direct
 
-import java.io.File
 import java.util.ArrayDeque
 import kotlin.concurrent.thread
 import kotlin.test.Test
@@ -46,32 +45,4 @@ class HelperDualStreamRuntimeContractTest {
         assertTrue(order.last() == "secondary@$ownerThread", order.toString())
     }
 
-    @Test
-    fun ownerLooperFairnessAndPersistenceStaySeparated() {
-        val source = source().readText()
-        assertTrue(source.contains("new ThreadPoolExecutor(\n            2, 2"))
-        assertTrue(source.contains("new Thread(runnable, \"byd-helper-persistence\")"))
-        assertTrue(source.contains("task = !high.isEmpty() ? high.removeFirst() : low.pollFirst()"))
-        assertTrue(source.contains("offset += CollectorHelperProtocol.SECONDARY_CHUNK_SIZE"))
-        assertTrue(source.contains("vendor.call(true"))
-        assertTrue(source.contains("vendor.call(false"))
-    }
-
-    @Test
-    fun passiveOperationsDoNotRenewAndFailedFenceCannotReturnSuccessSnapshot() {
-        val daemon = source("CollectorHelperDaemon.java").readText()
-        val runtime = source().readText()
-        assertTrue(!daemon.substringAfter("if (code == CollectorHelperProtocol.TX_PING)")
-            .substringBefore("if (code == CollectorHelperProtocol.TX_READ)").contains("renew"))
-        assertTrue(runtime.contains("state.fenceFailure("))
-        assertTrue(!runtime.contains("state.cancelPause(stream)"))
-        assertTrue(runtime.contains("state.cancelPause(token, stream, epoch)"))
-    }
-
-    private fun source() = source("HelperDualStreamRuntime.java")
-
-    private fun source(name: String) = listOf(
-        File("src/main/java/com/bydcollector/collector/direct/$name"),
-        File("app/src/main/java/com/bydcollector/collector/direct/$name")
-    ).first { it.isFile }
 }

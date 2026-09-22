@@ -11,13 +11,23 @@ import kotlin.test.assertTrue
 
 class DiagnosticZipWriterTest {
     @Test
-    fun writerDoesNotDeleteUnrelatedFixedNameTempFile() {
-        val source = listOf(
-            File("app/src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticZipWriter.kt"),
-            File("src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticZipWriter.kt")
-        ).firstOrNull(File::isFile)?.readText() ?: error("Missing DiagnosticZipWriter.kt")
-        assertFalse(source.contains("File(parent, \"\${zipFile.name}.tmp\").delete()"))
+    fun publishingPreservesUnrelatedTempFiles() {
+        val root = Files.createTempDirectory("diagnostic-zip-ownership").toFile()
+        try {
+            val zip = File(root, "latest.zip")
+            val unrelated = File(root, "latest.zip.tmp").apply { writeText("other writer") }
+            File(root, "events.txt").writeText("evidence")
+
+            DiagnosticZipWriter.writeLatestZip(zip, root)
+
+            assertContentEquals("other writer".toByteArray(), unrelated.readBytes())
+            assertTrue("events.txt" in zipEntries(zip))
+            assertFalse(unrelated.name in zipEntries(zip))
+        } finally {
+            root.deleteRecursively()
+        }
     }
+
 
     @Test
     fun latestZipSkipsExistingArchiveAndTempOutputWhenRunDirIsDiagnosticsRoot() {

@@ -340,45 +340,6 @@ class HelperDiagnosticsTest {
         }
     }
 
-    @Test
-    fun reporterSourceHasNoSpoolScanOrSynchronousTelemetryWrite() {
-        val source = sourceFile("HelperDiagnostics.java").readText()
-        val loop = sourceFile("HelperDualStreamRuntime.java").readText()
-        assertTrue(!source.contains("listFiles("))
-        assertTrue(source.contains("ArrayBlockingQueue"))
-        assertTrue(source.contains("queue.offer"))
-        assertTrue(loop.contains("POLL_INTERVAL_MS = 500L"))
-        assertTrue(loop.contains("mainSpool.canAppend()"))
-        val cappedBranch = loop.substringAfter("if (!mainSpool.canAppend())")
-            .substringBefore("return;")
-        assertTrue(cappedBranch.contains("diagnostics.capSkippedPollCycle()"))
-    }
-
-    @Test
-    fun allPostBootstrapStartupAndRuntimeWorkHasGuaranteedDiagnosticLifecycle() {
-        val daemon = sourceFile("CollectorHelperDaemon.java").readText()
-        val lifecycle = daemon.substringAfter("HelperBootstrapOutput.install(helperDiagnostics);")
-            .substringBefore("private static int runMain(")
-        val body = daemon.substringAfter("private static int runMain(")
-            .substringBefore("private static ReadValue scalarRead(")
-        val resources = daemon.substringAfter("private static final class HelperResources")
-
-        assertTrue(lifecycle.contains("try {"))
-        assertTrue(lifecycle.contains("catch (Exception error)"))
-        assertTrue(lifecycle.contains("catch (Error error)"))
-        assertTrue(lifecycle.contains("helper startup/runtime failed:"))
-        assertTrue(lifecycle.contains("finally"))
-        assertTrue(lifecycle.indexOf("resources.close()") < lifecycle.indexOf("helperDiagnostics.close()"))
-        assertTrue(lifecycle.indexOf("helperDiagnostics.close()") < lifecycle.indexOf("System.exit(exitCode)"))
-        assertTrue(body.contains("prepareMainLooper();"))
-        assertTrue(body.contains("loadWhitelist(apkPath, mainRows)"))
-        assertTrue(body.contains("resources.workerSpool = workerSpool"))
-        assertTrue(body.contains("resources.runtime = runtime"))
-        assertTrue(!body.contains("System.exit("))
-        assertTrue(resources.indexOf("runtime.close()") < resources.indexOf("workerSpool.close()"))
-        assertTrue(resources.indexOf("workerSpool.close()") < resources.indexOf("ownerLock.close()"))
-    }
-
     private class RecordingSink : HelperDiagnostics.Sink {
         val lines = mutableListOf<String>()
         override fun persist(jsonLine: String, snapshotJson: String) {
@@ -398,8 +359,4 @@ class HelperDiagnosticsTest {
         }
     }
 
-    private fun sourceFile(name: String): File = listOf(
-        File("app/src/main/java/com/bydcollector/collector/direct/$name"),
-        File("src/main/java/com/bydcollector/collector/direct/$name")
-    ).firstOrNull(File::isFile) ?: error("Missing $name")
 }

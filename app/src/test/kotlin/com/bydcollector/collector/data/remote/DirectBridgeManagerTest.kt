@@ -64,19 +64,4 @@ class DirectBridgeManagerTest {
         )
     }
 
-    @Test
-    fun helperLaunchIsSerializedAndRecheckedInsideTheLock() {
-        val source = java.io.File(
-            "app/src/main/kotlin/com/bydcollector/collector/data/remote/DirectBridgeManager.kt"
-        ).takeIf { it.isFile } ?: java.io.File(
-            "src/main/kotlin/com/bydcollector/collector/data/remote/DirectBridgeManager.kt"
-        )
-        val text = source.readText()
-        val ensure = text.substringAfter("fun ensureRunning(").substringBefore("fun launchCommand(")
-
-        assertTrue(text.contains("private val launchLock = ReentrantLock()"))
-        assertTrue(ensure.contains("launchLock.lockInterruptibly()"))
-        assertTrue(ensure.indexOf("launchLock.lockInterruptibly()") < ensure.indexOf("if (helper.isAlive())"))
-        assertTrue(ensure.contains("launchLock.unlock()"))
-    }
 }

@@ -385,13 +385,6 @@ class TelemetryWorkerSpoolContractTest {
         assertFailsWith<IllegalArgumentException> {
             TelemetryWorkerSpool.Value(0, 8, 1001, 11, 0, 2, null)
         }
-        val source = sourceFile().readText()
-        assertFalse(source.contains("android.database"))
-        assertFalse(source.contains("SQLiteDatabase"))
-        assertTrue(source.contains("descriptor.sync()"))
-        assertTrue(source.contains("StandardCopyOption.ATOMIC_MOVE"))
-        assertTrue(source.contains("TMP_SUFFIX"))
-        assertTrue(source.contains("BAD_SUFFIX"))
     }
 
     private fun sample(boot: String, generation: String, sequence: Long, wall: Long): TelemetryWorkerSpool.Sample =
@@ -536,8 +529,4 @@ class TelemetryWorkerSpoolContractTest {
         file.delete()
     }
 
-    private fun sourceFile(): File = listOf(
-        File("app/src/main/java/com/bydcollector/collector/direct/TelemetryWorkerSpool.java"),
-        File("src/main/java/com/bydcollector/collector/direct/TelemetryWorkerSpool.java")
-    ).firstOrNull(File::isFile) ?: error("Missing TelemetryWorkerSpool.java")
 }

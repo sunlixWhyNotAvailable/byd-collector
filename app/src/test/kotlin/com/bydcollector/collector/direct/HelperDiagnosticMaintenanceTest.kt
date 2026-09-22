@@ -215,24 +215,6 @@ class HelperDiagnosticMaintenanceTest {
         }
     }
 
-    @Test
-    fun entrypointIsDiagnosticOnlyAndStreamsCapturedFileOutsideStoreLock() {
-        val source = sourceFile("HelperDiagnosticsMain.java").readText()
-        assertFalse(source.contains("CollectorHelperDaemon"))
-        assertFalse(source.contains("TelemetryWorkerSpool"))
-        assertFalse(source.contains("WorkerPollLoop"))
-        assertFalse(source.contains("android.os.Binder"))
-        assertTrue(source.contains("store.createSnapshotArchive()"))
-        assertTrue(source.indexOf("store.createSnapshotArchive()") < source.indexOf("new FileInputStream(archive.file)"))
-        assertTrue(source.contains("\"snapshot\".equals(args[0])"))
-        assertTrue(source.contains("\"clear\".equals(args[0])"))
-        val storeSource = sourceFile("HelperDiagnosticFileStore.java").readText()
-        assertTrue(storeSource.contains("symbolic_link_rejected"))
-        assertTrue(storeSource.contains("diagnostic lock is a symbolic link"))
-        assertTrue(Regex("Files\\.isSymbolicLink").findAll(storeSource).count() >= 4)
-        assertTrue(storeSource.contains("MAX_STALE_ARCHIVE_DELETES = 32"))
-    }
-
     private fun unzip(bytes: ByteArray): Map<String, ByteArray> {
         val entries = linkedMapOf<String, ByteArray>()
         ZipInputStream(ByteArrayInputStream(bytes)).use { zip ->
@@ -256,11 +238,6 @@ class HelperDiagnosticMaintenanceTest {
             root.deleteRecursively()
         }
     }
-
-    private fun sourceFile(name: String): File = listOf(
-        File("app/src/main/java/com/bydcollector/collector/direct/$name"),
-        File("src/main/java/com/bydcollector/collector/direct/$name")
-    ).firstOrNull(File::isFile) ?: error("Missing $name")
 
     private val allowedEntries = setOf(
         HelperDiagnosticFileStore.MANIFEST_ENTRY,

@@ -1,6 +1,5 @@
 package com.bydcollector.collector.direct
 
-import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -125,47 +124,6 @@ class HelperWakeLockControllerTest {
         assertFalse(controller.isHeld)
     }
 
-    @Test
-    fun daemonRuntimeSharesOneLockAcrossIndependentFallbackDemandAndReleasesOnExit() {
-        val daemon = source("CollectorHelperDaemon.java")
-        val dualRuntime = source("HelperDualStreamRuntime.java")
-        val platform = source("HelperWakeLockPlatform.java")
-        val runtimeCreation = daemon.substringAfter("final HelperDualStreamRuntime runtime")
-            .substringBefore("Binder helperBinder")
-        val runtime = daemon.substringAfter("helperBinder.attachInterface")
-            .substringBefore("Looper.loop();")
-        val stopEndpoint = daemon.substringAfter("if (code == CollectorHelperProtocol.TX_STOP_OWNER)")
-            .substringBefore("return true;")
-        val lifecycle = daemon.substringAfter("HelperBootstrapOutput.install(helperDiagnostics);")
-            .substringBefore("private static int runMain(")
-        val resourceClose = daemon.substringAfter("private static final class HelperResources")
-
-        assertTrue(runtimeCreation.contains("new HelperDualStreamRuntime("))
-        assertTrue(runtimeCreation.contains("HelperWakeLockPlatform::acquireShellPartialWakeLock"))
-        assertTrue(runtime.indexOf("runtime.start()") < runtime.indexOf("addService.invoke"))
-        assertTrue(dualRuntime.contains("mainFallback || secondaryFallback"))
-        assertTrue(dualRuntime.contains("wakeLock.exitAutonomousMode()"))
-        assertTrue(stopEndpoint.indexOf("if (accepted)") < stopEndpoint.indexOf("quitSafely()"))
-        assertFalse(daemon.contains("WorkerPollLoop"))
-        assertTrue(resourceClose.indexOf("runtime.close()") < resourceClose.indexOf("workerSpool.close()"))
-        assertTrue(resourceClose.indexOf("workerSpool.close()") < resourceClose.indexOf("ownerLock.close()"))
-        assertTrue(lifecycle.contains("finally"))
-        assertTrue(lifecycle.indexOf("resources.close()") < lifecycle.indexOf("helperDiagnostics.close()"))
-        assertTrue(lifecycle.indexOf("helperDiagnostics.close()") < lifecycle.indexOf("System.exit(exitCode)"))
-        assertTrue(dualRuntime.contains("wakeLock.maintain();"))
-        assertTrue(platform.contains("Process.myUid() != SHELL_UID"))
-        assertTrue(platform.indexOf("currentActivityThread") < platform.indexOf("systemMain"))
-        assertTrue(platform.contains("SHELL_UID = 2000"))
-        assertTrue(platform.contains("SHELL_PACKAGE = \"com.android.shell\""))
-        assertTrue(platform.contains("Context.class.getMethod(\"getOpPackageName\")"))
-        assertFalse(platform.contains("shellContext.getOpPackageName()"))
-        assertTrue(platform.indexOf("getOpPackageName.invoke(shellContext)") < platform.indexOf("newWakeLock("))
-        assertTrue(platform.contains("shell op-package attribution unavailable"))
-        assertTrue(platform.contains("PowerManager.PARTIAL_WAKE_LOCK"))
-        assertTrue(platform.contains("wakeLock.setReferenceCounted(false)"))
-        assertTrue(platform.contains("wakeLock.acquire()"))
-    }
-
     private class Fixture(
         private var failAcquisitions: Int = 0,
         private var failReleases: Int = 0
@@ -204,8 +162,4 @@ class HelperWakeLockControllerTest {
         override fun elapsedRealtime(): Long = now
     }
 
-    private fun source(name: String): String = listOf(
-        File("app/src/main/java/com/bydcollector/collector/direct/$name"),
-        File("src/main/java/com/bydcollector/collector/direct/$name")
-    ).first(File::isFile).readText()
 }

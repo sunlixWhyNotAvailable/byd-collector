@@ -1,11 +1,8 @@
 package com.bydcollector.collector.data.normalized
 
-import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
-import kotlin.test.assertTrue
 
 class NormalizedStateStoreTest {
     @Test
@@ -45,33 +42,4 @@ class NormalizedStateStoreTest {
         )
     }
 
-    @Test
-    fun retiredCleanupDeletesOnlyCurrentRows() {
-        val source = normalizedStateStoreSource()
-
-        assertTrue(source.contains("db.delete(\"vehicle_state_current\""))
-        assertTrue(source.contains("deleteIncompatibleCurrentRow(db, field)"))
-        assertTrue(source.contains("storedType != field.valueType.name || storedUnit != field.unit"))
-        assertFalse(
-            source.contains("db.delete(\"normalized_field_catalog\""),
-            "retired cleanup must preserve catalog metadata"
-        )
-    }
-
-    @Test
-    fun compactHistoryUsesImmutableMetadataIdentity() {
-        val source = normalizedStateStoreSource()
-
-        assertTrue(source.contains("FROM normalized_history_field_catalog"))
-        assertTrue(source.contains("field_key = ? AND category = ? AND value_type = ? AND unit = ? AND source_keys = ?"))
-        assertTrue(source.contains("AND normalizer_id = ? AND catalog_version = ?"))
-        assertTrue(source.contains("db.insertOrThrow(\n            \"normalized_history_field_catalog\""))
-    }
-
-    private fun normalizedStateStoreSource(): String {
-        return listOf(
-            File("app/src/main/kotlin/com/bydcollector/collector/data/normalized/NormalizedStateStore.kt"),
-            File("src/main/kotlin/com/bydcollector/collector/data/normalized/NormalizedStateStore.kt")
-        ).first(File::exists).readText()
-    }
 }

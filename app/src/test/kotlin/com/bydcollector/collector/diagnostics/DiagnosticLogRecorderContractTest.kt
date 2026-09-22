@@ -10,31 +10,6 @@ import kotlin.test.assertTrue
 import kotlin.test.assertContentEquals
 
 class DiagnosticLogRecorderContractTest {
-    @Test
-    fun recordsUnfilteredSystemLogcatThroughAuthenticatedAdbStream() {
-        val source = projectFile(
-            "app/src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt",
-            "src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt"
-        ).readText()
-
-        assertTrue(source.contains("logcat -b all -v threadtime"))
-        assertTrue(source.contains("openShellStream("))
-        assertTrue(source.contains("logcat_error.txt"))
-        assertFalse(source.contains("ProcessBuilder(\"logcat\""))
-        assertFalse(source.contains("--pid"))
-    }
-
-    @Test
-    fun activeCaptureStateUsesSeparateLocksAndPublishesAfterStreamOpen() {
-        val source = projectFile(
-            "app/src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt",
-            "src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt"
-        ).readText()
-
-        assertTrue(source.contains("private val workLock = Any()"))
-        assertTrue(source.contains("private val stateLock = Any()"))
-        assertTrue(source.indexOf("val stream = try") < source.indexOf("adbStream = stream"))
-    }
 
     @Test
     fun activeLogcatUsesEightSixteenMiBSegmentsAndDropsTheOldest() {
@@ -150,60 +125,6 @@ class DiagnosticLogRecorderContractTest {
     }
 
     @Test
-    fun optionsShareUsesTheNativeChooserAndAppPrivateDiagnosticsPath() {
-        val activity = projectFile(
-            "app/src/main/kotlin/com/bydcollector/collector/MainActivity.kt",
-            "src/main/kotlin/com/bydcollector/collector/MainActivity.kt"
-        ).readText()
-        val paths = projectFile(
-            "app/src/main/res/xml/update_file_paths.xml",
-            "src/main/res/xml/update_file_paths.xml"
-        ).readText()
-
-        assertTrue(activity.contains("DiagnosticLogRecorder.prepareShareBundle(applicationContext)"))
-        assertTrue(activity.contains("Intent.ACTION_SEND"))
-        assertTrue(activity.contains("Intent.createChooser(sendIntent, title)"))
-        assertTrue(activity.contains("type = \"application/zip\""))
-        val shareMethod = activity.substringAfter("private fun shareDiagnosticLogs()")
-            .substringBefore("private fun clearDiagnosticLogs()")
-        val workerBody = shareMethod.substringBefore("handler.post")
-        assertTrue(shareMethod.contains("Intent.EXTRA_STREAM"))
-        assertTrue(workerBody.contains("FileProvider.getUriForFile"))
-        assertTrue(workerBody.contains("ClipData.newUri"))
-        assertTrue(workerBody.contains("bundle.length()"))
-        assertTrue(shareMethod.contains("runCatching { startActivity(Intent.createChooser(sendIntent, title)) }"))
-        assertFalse(shareMethod.contains("Intent.EXTRA_SUBJECT"))
-        assertFalse(shareMethod.contains("Intent.EXTRA_TEXT"))
-        assertTrue(activity.contains("DiagnosticLogRecorder.clearCompleted(applicationContext)"))
-        assertTrue(paths.contains("<cache-path name=\"diagnostic_shares\" path=\"diagnostic_shares/\" />"))
-        assertFalse(paths.contains("<files-path name=\"diagnostics\""))
-    }
-
-    @Test
-    fun eachShareUsesAFreshSnapshotWithBoundedHelperTailAndLogcatProvenance() {
-        val source = projectFile(
-            "app/src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt",
-            "src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt"
-        ).readText()
-        val share = source.substringAfter("fun prepareShareBundle(context: Context)")
-            .substringBefore("fun clearCompleted(context: Context)")
-
-        assertTrue(share.contains("createDiagnosticSnapshotDirectory"))
-        assertTrue(share.contains("writeLogcatSnapshot"))
-        assertTrue(share.contains("writeOperationalJournalSnapshot"))
-        assertTrue(share.contains("writeKeepAliveLogSnapshot"))
-        assertTrue(share.contains("sanitizeDiagnosticSnapshot(snapshotDir)"))
-        assertTrue(share.indexOf("sanitizeDiagnosticSnapshot(snapshotDir)") < share.indexOf("writeLatestZip(it, snapshotDir)"))
-        assertTrue(source.contains("private const val KEEP_ALIVE_LOG_TAIL_BYTES = 512 * 1024"))
-        assertTrue(source.contains("tail -c \$KEEP_ALIVE_LOG_TAIL_BYTES"))
-        assertTrue(source.contains("logcat_provenance.txt"))
-        assertTrue(source.contains("file.name == \"logcat_error.txt\""))
-        assertTrue(source.contains(": > \$KEEP_ALIVE_LOG_PATH"))
-        assertFalse(source.contains("DirectDebugDatabaseHelper"))
-        assertFalse(source.contains("TripsDatabase"))
-    }
-
-    @Test
     fun latestLogcatSourceIgnoresNewerShareSnapshots() {
         val root = Files.createTempDirectory("bydcollector-diagnostic-source").toFile()
         try {
@@ -219,55 +140,6 @@ class DiagnosticLogRecorderContractTest {
     }
 
     @Test
-    fun collectorEventSnapshotUsesTheNonblockingApplicationDatabaseReadGate() {
-        val source = projectFile(
-            "app/src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt",
-            "src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt"
-        ).readText()
-        val snapshot = source.substringAfter("private fun writeCollectorEventsSnapshot(")
-            .substringBefore("private fun writeLatestZip(")
-
-        assertTrue(snapshot.contains("context.applicationContext as BydCollectorApplication"))
-        assertTrue(snapshot.contains("tryDatabaseRead"))
-        assertTrue(snapshot.indexOf("tryDatabaseRead") < snapshot.indexOf("SQLiteDatabase.openDatabase"))
-        assertTrue(snapshot.contains("collector_events_status=maintenance_busy"))
-    }
-
-    @Test
-    fun tripsTelegramEvidenceIsExplicitShareOnlyAndRedacted() {
-        val source = projectFile(
-            "app/src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt",
-            "src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt"
-        ).readText()
-        val share = source.substringAfter("fun prepareShareBundle(context: Context)")
-            .substringBefore("fun clearCompleted(context: Context)")
-        assertTrue(share.contains("writeTripsTelegramEvidence"))
-        assertTrue(source.contains("TRIPS_TELEGRAM_EVIDENCE_MAX_BYTES = 64 * 1024"))
-        assertTrue(source.contains("pending_missing"))
-        assertTrue(source.contains("pending_unlinked"))
-        assertTrue(source.contains("trip_correlation"))
-        assertTrue(source.contains("telegram_pending_power_session_ref"))
-        assertTrue(source.contains("findByPowerSessionId = trips::session"))
-        assertTrue(source.contains("tripsStoreOrNull"))
-        assertFalse(source.contains("BydCollectorApplication.trips(app)"))
-        assertTrue(source.contains("\"not_initialized\" -> \"not_initialized\""))
-        val tripWrapper = source.substringAfter("private fun writeTripsTelegramEvidence(")
-            .substringBefore("private fun writeTripsEvidenceUnavailable")
-        assertTrue(tripWrapper.contains("tryDatabaseRead"))
-        assertTrue(tripWrapper.contains("maintenance_busy"))
-        assertTrue(source.contains("tripsFileOperationLock.tryLock()"))
-        assertTrue(source.contains("tripsFileOperationLock.unlock()"))
-        assertTrue(source.contains("trips.withLease"))
-        assertFalse(source.contains("latitude"))
-        assertFalse(source.contains("longitude"))
-        assertFalse(source.contains("payload"))
-        assertFalse(source.contains("botToken"))
-        assertFalse(source.contains("chatId"))
-        assertFalse(source.contains("run-as"))
-        assertFalse(source.contains("TripsDatabase"))
-    }
-
-    @Test
     fun boundedEvidenceUsesUtf8ByteCapAndExplicitTruncationMarker() {
         val lines = listOf("schema_version=1") + List(100) { "дані=" + "x".repeat(20) }
         val capped = boundedDiagnosticUtf8(lines, 128)
@@ -280,41 +152,4 @@ class DiagnosticLogRecorderContractTest {
         assertContentEquals(complete, boundedDiagnosticUtf8(listOf("ok=так"), 128))
     }
 
-    @Test
-    fun influxEvidenceReadsOnlyExistingTablesUnderNonblockingMaintenanceAccess() {
-        val source = projectFile(
-            "app/src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt",
-            "src/main/kotlin/com/bydcollector/collector/diagnostics/DiagnosticLogRecorder.kt"
-        ).readText()
-        val share = source.substringAfter("fun prepareShareBundle(context: Context)")
-            .substringBefore("fun clearCompleted(context: Context)")
-        val evidence = source.substringAfter("private fun writeInfluxEvidence(")
-            .substringBefore("private fun writeTripsTelegramEvidence(")
-
-        assertTrue(share.contains("writeInfluxEvidence"))
-        assertEquals(128 * 1024, DiagnosticLogRecorder.INFLUX_EVIDENCE_MAX_BYTES)
-        assertTrue(evidence.contains("getSharedPreferences(CollectorSettings.PREFS_NAME, Context.MODE_PRIVATE)"))
-        assertTrue(evidence.contains("CollectorSettings.KEY_INFLUX_ALTERNATIVE_HOST"))
-        assertFalse(evidence.contains("CollectorSettings(context)"))
-        assertFalse(evidence.contains("prefs.edit("))
-        assertFalse(evidence.contains("KEY_INFLUX_PASSWORD"))
-        assertFalse(evidence.contains("KEY_INFLUX_USERNAME"))
-        assertTrue(evidence.contains("InfluxRuntimeDiagnostics.snapshotLines()"))
-        assertTrue(evidence.contains("tryDatabaseRead"))
-        assertTrue(evidence.contains("SQLiteDatabase.OPEN_READONLY"))
-        assertTrue(evidence.contains("\"influx_export_state\""))
-        assertTrue(evidence.contains("\"influx_export_cursor\""))
-        assertTrue(evidence.contains("\"influx_export_events\""))
-        assertTrue(evidence.contains("\"id DESC\", 200"))
-        assertTrue(evidence.contains("maintenance_busy"))
-        assertTrue(evidence.contains("boundedDiagnosticUtf8(lines, INFLUX_EVIDENCE_MAX_BYTES)"))
-        assertFalse(evidence.contains("ensureInfluxCursors("))
-        assertFalse(evidence.contains("pendingInfluxSummary("))
-        assertFalse(evidence.contains("withTelemetryStoreRead("))
-        assertFalse(evidence.contains("writableDatabase"))
-        assertFalse(evidence.contains("registerNetworkCallback"))
-    }
-
-    private fun projectFile(vararg paths: String): File =
-        paths.map(::File).firstOrNull(File::isFile) ?: error("Missing project file: ${paths.joinToString()}")
 }

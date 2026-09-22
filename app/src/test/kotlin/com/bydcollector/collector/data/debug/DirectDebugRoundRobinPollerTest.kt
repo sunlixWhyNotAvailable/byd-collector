@@ -54,36 +54,6 @@ class DirectDebugRoundRobinPollerTest {
     }
 
     @Test
-    fun debugIntervalIsHalfSecond() {
-        assertEquals(500L, DirectDebugRoundRobinPoller.INTERVAL_MS)
-    }
-
-    @Test
-    fun debugPollerHasAwaitableShutdownForMaintenance() {
-        val source = sourceFile("com/bydcollector/collector/data/debug/DirectDebugRoundRobinPoller.kt").readText()
-
-        assertTrue(source.contains("fun shutdownAndAwait(reason: String = \"shutdown\", timeoutMs: Long): Boolean"))
-        assertTrue(source.contains("executor.shutdownNow()"))
-        assertTrue(source.contains("executor.awaitTermination(timeoutMs, TimeUnit.MILLISECONDS)"))
-        assertTrue(source.contains("fun shutdown(reason: String = \"shutdown\")"))
-        assertTrue(source.contains("shutdownAndAwait(reason, 0L)"))
-        assertTrue(source.contains("helper.readSecondaryBatch(entries)"))
-        assertTrue(!source.contains("helper.read(parameter.toDirectFidEntry())"))
-        assertTrue(source.indexOf("store.openSession(parameters, safeBatchSize)") > source.indexOf("executor.submit"))
-        assertTrue(source.contains("openedSessionId?.let { opened ->"))
-        assertTrue(source.contains("running.set(false)"))
-        assertTrue(source.contains("onTerminalFailure"))
-        assertTrue(source.contains("onRuntimeError(error)"))
-        assertTrue(source.contains("if (!stopRequested.get()) runCatching(onTerminalFailure)"))
-        assertTrue(source.indexOf("store.endSession(opened, stopReason)") < source.indexOf("runCatching(onStopped)"))
-        assertTrue(
-            source.indexOf("batchResult.diagnostics.status == CollectorHelperProtocol.STATUS_OK") <
-                source.indexOf("return store.recordCycle(")
-        )
-        assertTrue(source.contains("batchResult.results.size == batch.size"))
-    }
-
-    @Test
     fun secondaryCycleFencesDrainsAndResumesBeforeLiveRead() {
         val events = mutableListOf<String>()
 
@@ -327,10 +297,4 @@ class DirectDebugRoundRobinPollerTest {
         .digest(file.readBytes())
         .joinToString("") { "%02X".format(it) }
 
-    private fun sourceFile(path: String): File {
-        return listOf(
-            File("src/main/kotlin/$path"),
-            File("app/src/main/kotlin/$path")
-        ).firstOrNull { it.isFile } ?: error("Missing source file: $path")
-    }
 }

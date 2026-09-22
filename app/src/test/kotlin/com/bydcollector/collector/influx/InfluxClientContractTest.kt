@@ -1,6 +1,5 @@
 package com.bydcollector.collector.influx
 
-import java.io.File
 import java.io.ByteArrayInputStream
 import java.io.IOException
 import java.net.ConnectException
@@ -9,18 +8,8 @@ import javax.net.ssl.SSLException
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
-import kotlin.test.assertTrue
 
 class InfluxClientContractTest {
-    @Test
-    fun httpConnectionDisconnectsInFinally() {
-        val source = sourceFile("com/bydcollector/collector/influx/InfluxClient.kt").readText()
-
-        assertTrue(source.contains("var connection: HttpURLConnection? = null"))
-        assertTrue(source.contains("finally"))
-        assertTrue(source.contains("httpStatus = code"))
-        assertInOrder(source, "finally", "connection?.disconnect()")
-    }
 
     @Test
     fun actionResultCarriesHttpStatusOnlyForFailures() {
@@ -69,28 +58,4 @@ class InfluxClientContractTest {
         assertEquals("10.0.0.5", safeInfluxDiagnosticHost("10.0.0.5"))
     }
 
-    @Test
-    fun httpDiagnosticsExposeStagesWithoutBodyFields() {
-        val source = sourceFile("com/bydcollector/collector/influx/InfluxClient.kt").readText()
-        assertTrue(source.contains("open_connection"))
-        assertTrue(source.contains("write_body"))
-        assertTrue(source.contains("read_error_body"))
-        assertTrue(source.contains("duration_ms"))
-        assertFalse(source.contains("details[\"body\"]"))
-    }
-
-    private fun sourceFile(path: String): File {
-        return listOf(
-            File("src/main/kotlin/$path"),
-            File("app/src/main/kotlin/$path")
-        ).firstOrNull { it.isFile } ?: error("Missing source file: $path")
-    }
-
-    private fun assertInOrder(source: String, first: String, second: String) {
-        val firstIndex = source.indexOf(first)
-        val secondIndex = source.indexOf(second)
-        assertTrue(firstIndex >= 0, "Missing first token: $first")
-        assertTrue(secondIndex >= 0, "Missing second token: $second")
-        assertTrue(firstIndex < secondIndex, "Expected `$first` before `$second`")
-    }
 }

@@ -31,7 +31,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.UUID
 
-/** Isolated SQLite gates plus an opt-in, emulator-only synthetic route for visual QA. */
+/** Emulator-only behavioral gates plus an opt-in synthetic route for visual QA. */
 class NativeSqliteInstrumentation : Instrumentation() {
     private val prefix = "callback_gate_${UUID.randomUUID()}"
     private val completed = mutableListOf<String>()
@@ -46,6 +46,10 @@ class NativeSqliteInstrumentation : Instrumentation() {
     }
 
     override fun onStart() {
+        if (!isEmulator()) {
+            finish(Activity.RESULT_CANCELED, Bundle().apply { putString("stream", "Tests require an emulator") })
+            return
+        }
         routeFixture?.let { fixture ->
             try {
                 seedRouteFixture(fixture)
@@ -55,7 +59,8 @@ class NativeSqliteInstrumentation : Instrumentation() {
             }
             return
         }
-        val tests = listOf(
+        val tests = SettingsBehaviorGate.cases(targetContext, prefix) +
+            StorageBehaviorGate.cases(targetContext, prefix) + listOf(
             "main_compact_callback_transactions" to { mainCallbackTransactions(false) },
             "main_legacy_additive_upgrade" to { mainCallbackTransactions(true) },
             "secondary_callback_transactions" to ::secondaryCallbackTransactions,
@@ -67,6 +72,7 @@ class NativeSqliteInstrumentation : Instrumentation() {
                 CallbackParcelGate.run(File(targetContext.cacheDir, "${prefix}_parcel"))
             }
         )
+        var failure: Throwable? = null
         try {
             tests.forEachIndexed { index, (name, body) ->
                 val status = Bundle().apply {
@@ -81,19 +87,40 @@ class NativeSqliteInstrumentation : Instrumentation() {
                 completed += name
                 sendStatus(0, status)
             }
-            finish(Activity.RESULT_OK, Bundle().apply {
-                putString("stream", "CALLBACK_ANDROID_GATE_PASS ${completed.size}/${tests.size}\n" + completed.joinToString("\n"))
-            })
-        } catch (failure: Throwable) {
-            finish(Activity.RESULT_CANCELED, Bundle().apply {
-                putString("stream", "CALLBACK_ANDROID_GATE_FAIL after ${completed.size}: ${failure.stackTraceToString()}")
-            })
+        } catch (error: Throwable) {
+            failure = error
+        } finally {
+            runCatching { cleanupTestFiles() }.onFailure { cleanupError ->
+                if (failure == null) failure = cleanupError else failure!!.addSuppressed(cleanupError)
+            }
+        }
+        val result = failure
+        finish(if (result == null) Activity.RESULT_OK else Activity.RESULT_CANCELED, Bundle().apply {
+            putString("stream", if (result == null)
+                "CALLBACK_ANDROID_GATE_PASS ${completed.size}/${tests.size}\n" + completed.joinToString("\n")
+            else "CALLBACK_ANDROID_GATE_FAIL after ${completed.size}: ${result.stackTraceToString()}")
+        })
+    }
+
+    private fun isEmulator(): Boolean = android.os.Build.MODEL.startsWith("sdk_gphone") ||
+        android.os.Build.FINGERPRINT.contains("generic")
+
+    private fun cleanupTestFiles() {
+        val drained = java.util.concurrent.CountDownLatch(1)
+        com.bydcollector.collector.util.sharedOperationalEventExecutor.execute { drained.countDown() }
+        check(drained.await(5, java.util.concurrent.TimeUnit.SECONDS)) { "Event writer did not drain before cleanup" }
+        targetContext.databaseList().filter { it.startsWith("${prefix}_") && it.endsWith(".db") }
+            .forEach { check(targetContext.deleteDatabase(it)) { "Could not remove test database: $it" } }
+        val root = targetContext.cacheDir.canonicalFile
+        root.listFiles().orEmpty().filter { it.name.startsWith("${prefix}_") }.forEach { file ->
+            check(file.canonicalFile.parentFile == root)
+            check(file.deleteRecursively()) { "Could not remove test cache: $file" }
         }
     }
 
     /** Test-APK-only fixture; never available in the shipped app or on a vehicle. */
     private fun seedRouteFixture(fixture: String) {
-        check(android.os.Build.MODEL.startsWith("sdk_gphone") || android.os.Build.FINGERPRINT.contains("generic")) {
+        check(isEmulator()) {
             "Route fixture is restricted to an Android emulator"
         }
         require(fixture in setOf("fresh", "stale", "none", "first", "closed", "cleanup"))

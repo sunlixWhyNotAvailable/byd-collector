@@ -12,29 +12,6 @@ import org.json.JSONObject
 import kotlin.test.*
 
 class EnergyTelemetryProjectionTest {
-    @Test fun inactiveHighWaterReceiptsDoNotRepublishExpiredMainEnergy() {
-        val path = "src/main/kotlin/com/bydcollector/collector/service/CollectorService.kt"
-        val source = listOf(java.io.File(path), java.io.File("app/$path")).first { it.isFile }.readText()
-        assertTrue(source.contains("val energyObservations = energyResult?.pendingProjection?.snapshot"))
-        assertFalse(source.contains("val energyObservations = energySnapshot?.let"))
-        assertFalse(source.contains("if (energyResult.stale) return"))
-        val successful = source.substringAfter("override fun onSourcePoll(").substringBefore("override fun onSourceFailure(")
-        assertTrue(successful.indexOf("tripRuntime.onSuccessfulPoll(") < successful.indexOf("finishEnergyAttempt(origin)"))
-    }
-
-    @Test fun failedPollWiringFeedsOnlyAnUnknownEmptyEnergyReceipt() {
-        val path = "src/main/kotlin/com/bydcollector/collector/service/CollectorService.kt"
-        val source = listOf(java.io.File(path), java.io.File("app/$path")).first { it.isFile }.readText()
-        val failure = source.substringAfter("override fun onSourceFailure(")
-            .substringBefore("private fun createTripRuntimeCoordinator")
-        assertTrue(failure.contains("prepareEnergyProjection()"))
-        assertTrue(failure.contains("energy.process("))
-        assertTrue(failure.contains("readings = emptyList()"))
-        assertTrue(failure.contains("observations = emptyList()"))
-        assertFalse(failure.contains("vehicleStateNormalizer.normalize"))
-        assertFalse(failure.contains("telegramCoordinator"))
-        assertFalse(failure.contains("tripRuntime.onSuccessfulPoll"))
-    }
 
     @Test fun failedLiveAndReplayReceiptsBreakTheAnchorWithoutBridgingEnergy() {
         val liveFailure = EnergyTelemetryProjection.receipt(

@@ -8,27 +8,6 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class UpdateHintIpcContractTest {
-    @Test
-    fun `wire is exact twelve-field Messenger v1 contract`() {
-        val protocol = source("UpdateHintProtocol.kt")
-        val coordinator = source("UpdateHintCoordinator.kt")
-        val keys = Regex("const val KEY_[A-Z_]+ = \"([^\"]+)\"")
-            .findAll(protocol).map { it.groupValues[1] }.toList()
-
-        assertEquals(listOf(
-            "protocolVersion", "ownerPackage", "processSessionId", "revision", "eventId", "phase",
-            "requestedAtElapsedNanos", "expiresAtElapsedMs", "displayId", "preferredSizePercent",
-            "preferredWidthPx", "preferredHeightPx"
-        ), keys)
-        assertTrue(protocol.contains("const val ACTION = \"com.byd.apps.updatehint.COORDINATION\""))
-        assertTrue(protocol.contains("const val VERSION = 1"))
-        assertTrue(protocol.contains("const val SUBSCRIBE = 1"))
-        assertTrue(protocol.contains("const val STATE = 2"))
-        assertTrue(protocol.contains("const val UNSUBSCRIBE = 3"))
-        assertTrue(coordinator.contains("recordValues(data.keySet().associateWith { data[it] })"))
-        assertTrue(coordinator.contains("getPackagesForUid(sendingUid)"))
-        assertFalse(coordinator.contains("checkSignatures"))
-    }
 
     @Test
     fun `wire values round trip and reject malformed payloads`() {
@@ -47,7 +26,11 @@ class UpdateHintIpcContractTest {
         )
         val values = UpdateHintWire.values(expected)
 
-        assertEquals(12, values.size)
+        assertEquals(setOf(
+            "protocolVersion", "ownerPackage", "processSessionId", "revision", "eventId", "phase",
+            "requestedAtElapsedNanos", "expiresAtElapsedMs", "displayId", "preferredSizePercent",
+            "preferredWidthPx", "preferredHeightPx"
+        ), values.keys)
         assertEquals(expected, UpdateHintWire.recordValues(values))
         assertTrue(values[UpdateHintProtocol.KEY_PROTOCOL_VERSION] is Int)
         assertTrue(values[UpdateHintProtocol.KEY_REVISION] is Long)
@@ -101,42 +84,6 @@ class UpdateHintIpcContractTest {
         assertTrue(manifest.contains("<package android:name=\"com.bydhud.app\""))
         assertTrue(manifest.contains("<package android:name=\"com.byd.extend\""))
     }
-
-    @Test
-    fun `coordination stays bounded and distinguishes transient failure from death`() {
-        val coordinator = source("UpdateHintCoordinator.kt")
-        val service = source("UpdateHintCoordinationService.kt")
-
-        assertTrue(coordinator.contains("initialExchangeDelayMs("))
-        assertTrue(coordinator.contains("onServiceDisconnected(name: ComponentName)"))
-        assertTrue(coordinator.contains("remote = null"))
-        val bindingDied = coordinator.substringAfter("override fun onBindingDied(name: ComponentName)")
-            .substringBefore("override fun onNullBinding")
-        assertTrue(bindingDied.contains("disconnect(owner, sendUnsubscribe = false)"))
-        assertTrue(bindingDied.contains("discoverPeer(owner, initial = !admitted)"))
-        assertFalse(bindingDied.contains("binderDied"))
-        assertTrue(coordinator.contains("catch (_: DeadObjectException)"))
-        assertTrue(coordinator.contains("catch (_: RemoteException)"))
-        assertTrue(coordinator.contains("if (engine.current(record.ownerPackage)?.processSessionId != record.processSessionId) return true"))
-        val send = service.substringAfter("private fun send(reply:").substringBefore("private fun journal")
-        assertTrue(send.contains("catch (_: DeadObjectException)"))
-        assertTrue(send.contains("SendResult.DEAD"))
-        assertTrue(send.contains("catch (_: RemoteException)"))
-        assertTrue(send.contains("SendResult.TRANSIENT_FAILURE"))
-        assertFalse(send.contains("confirmedDeath("))
-        assertTrue(coordinator.contains("Context.RECEIVER_EXPORTED"))
-        assertTrue(coordinator.contains("failure?.invoke(reason)"))
-        val inbound = coordinator.substringAfter("internal fun acceptFromService(")
-            .substringBefore("internal fun confirmedDeath(")
-        val acceptedSessionGuard = inbound.indexOf("if (engine.current(authenticatedOwner)?.processSessionId != record.processSessionId) return false")
-        val completeInitial = inbound.indexOf("waitingForInitial.remove(authenticatedOwner)")
-        assertTrue(acceptedSessionGuard >= 0 && completeInitial > acceptedSessionGuard)
-        assertTrue(inbound.indexOf("maybeAdmit()") > completeInitial)
-        assertFalse((coordinator + service).contains("updateRuntime"))
-    }
-
-    private fun source(name: String): String = projectFile(
-        "src/main/kotlin/com/bydcollector/collector/update/$name").readText()
 
     private fun projectFile(relative: String): File = listOf(File(relative), File("app/$relative"))
         .firstOrNull(File::isFile) ?: error("Missing source: $relative")

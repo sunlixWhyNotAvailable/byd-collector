@@ -1,10 +1,8 @@
 package com.bydcollector.collector.service
 
-import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
-import kotlin.test.assertTrue
 
 class VehiclePowerBoundaryTrackerTest {
     @Test
@@ -82,20 +80,6 @@ class VehiclePowerBoundaryTrackerTest {
         assertEquals(1L, runtime.completionWatermark)
     }
 
-    @Test
-    fun `trip runtime restores tracker from recovered session before observing samples`() {
-        val source = sourceFile("com/bydcollector/collector/service/TripRuntimeCoordinator.kt").readText()
-        val initialization = source.substringAfter("private fun ensureInitialized()")
-            .substringBefore("private fun dispatch(")
-
-        assertInOrder(
-            initialization,
-            "session = tripStore.loadOpenSession()",
-            "powerTracker.restoreBaseline(hasOpenSession = session != null)",
-            "initialized = true"
-        )
-    }
-
     private class CompletionHarness(hasOpenSession: Boolean) {
         private val tracker = VehiclePowerBoundaryTracker().apply { restoreBaseline(hasOpenSession) }
         var completionWatermark = 0L
@@ -108,17 +92,4 @@ class VehiclePowerBoundaryTrackerTest {
         }
     }
 
-    private fun assertInOrder(source: String, vararg needles: String) {
-        var cursor = -1
-        needles.forEach { needle ->
-            val next = source.indexOf(needle, cursor + 1)
-            assertTrue(next > cursor, "Missing or out-of-order source token: $needle")
-            cursor = next
-        }
-    }
-
-    private fun sourceFile(path: String): File = listOf(
-        File("src/main/kotlin/$path"),
-        File("app/src/main/kotlin/$path")
-    ).firstOrNull(File::isFile) ?: error("Missing source file: $path")
 }

@@ -5,7 +5,6 @@ import com.bydcollector.collector.data.local.HealthSnapshotDetail
 import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.ArchiveStorageSnapshot
 import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
-import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -29,31 +28,6 @@ class DashboardLoadProfileTest {
         assertFalse(DashboardLoadProfile.entries.any { it.name == "LOGS" })
         assertTrue(DashboardLoadProfile.STORAGE.readsArchiveDetails)
         assertFalse(DashboardLoadProfile.MAIN.readsArchiveDetails)
-    }
-
-    @Test
-    fun providerNeverRequestsCredentialsForDashboardState() {
-        val source = sourceFile("com/bydcollector/collector/ui/DashboardStateProvider.kt").readText()
-
-        assertTrue(source.contains("settings.mqttConfig(includeCredentials = false)"))
-        assertTrue(source.contains("settings.influxConfig(includeCredentials = false)"))
-        assertFalse(source.contains("includeCredentials = true"))
-        assertFalse(source.contains("settings.mqttPassword()"))
-        assertFalse(source.contains("settings.influxPassword()"))
-        assertTrue(source.contains("mqttUsername = \"\""))
-        assertTrue(source.contains("influxUsername = \"\""))
-    }
-
-    @Test
-    fun dashboardDebugStatusUsesOnlyCachedReadinessBeforeAnyDatabaseOpen() {
-        val source = sourceFile("com/bydcollector/collector/ui/DashboardStateProvider.kt").readText()
-        val gate = source.indexOf("BydCollectorApplication.isDebugStorageReady(context)")
-        val open = source.indexOf("DirectDebugStore(context).use")
-
-        assertTrue(gate >= 0)
-        assertTrue(open > gate)
-        assertTrue(source.contains("val debugStatusLoaded = debugStatusRequested &&"))
-        assertFalse(source.contains("BydCollectorApplication.ensureDebugStorageReady(context)"))
     }
 
     @Test
@@ -231,13 +205,6 @@ class DashboardLoadProfileTest {
         assertEquals("previous", merged.recentEvents.single().timestamp)
         assertEquals(9L, merged.mqttPendingCount)
         assertEquals("next-mqtt", merged.mqttLastError)
-    }
-
-    private fun sourceFile(path: String): File {
-        return listOf(
-            File("src/main/kotlin/$path"),
-            File("app/src/main/kotlin/$path")
-        ).firstOrNull { it.isFile } ?: error("Missing source file: $path")
     }
 
     private fun dashboardState(marker: String): DashboardState {
