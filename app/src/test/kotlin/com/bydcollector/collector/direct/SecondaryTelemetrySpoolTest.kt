@@ -17,6 +17,39 @@ import kotlin.test.assertTrue
 
 class SecondaryTelemetrySpoolTest {
     @Test
+    fun callbackRootAccountingTracksSecondaryAckAndPoisonChainQuarantine() {
+        val root = tempDirectory()
+        try {
+            CallbackSpool.openForTest(root, 1_000_000).use { callbacks ->
+                SecondaryTelemetrySpool.openForTest(root, 1_000_000, 3).use { spool ->
+                    assertEquals(0L, callbacks.status().footprintBytes)
+                    fun verifyBytes() {
+                        val bytes = root.listFiles()!!.filter { it.isFile }.sumOf { it.length() }
+                        assertEquals(bytes, callbacks.status().footprintBytes)
+                        assertEquals(bytes, spool.status().bytes)
+                    }
+                    spool.append(cycle(1, values()))
+                    verifyBytes()
+                    assertEquals(SecondaryTelemetrySpool.AckResult.RELEASED,
+                        spool.acknowledge(assertNotNull(spool.oldest())))
+                    verifyBytes()
+                    assertEquals(0L, callbacks.status().footprintBytes)
+                    spool.append(cycle(3, values())) // skipped sequence forces a fresh FULL
+                    spool.append(cycle(4, values(second = value(1, 0, true, 99))))
+                    verifyBytes()
+                    assertEquals(2, spool.quarantine(assertNotNull(spool.oldest()), "test rejection"))
+                    verifyBytes()
+                    assertNull(spool.oldest())
+                    assertTrue(callbacks.status().footprintBytes > 0)
+                    spool.append(cycle(5, values()))
+                    assertNotNull(spool.oldest()) // resolves poison markers before the new FULL
+                    verifyBytes()
+                }
+            }
+        } finally { deleteRecursively(root) }
+    }
+
+    @Test
     fun callbackCachedOriginRoundTripsAndForcesEqualRawDelta() {
         val root = tempDirectory()
         try {
@@ -205,6 +238,7 @@ class SecondaryTelemetrySpoolTest {
                 assertEquals(SecondaryTelemetrySpool.AppendResult.CAP_REACHED, spool.append(cycle(3, values())))
                 assertEquals(firstDescriptor.identity, spool.oldest()!!.identity)
                 assertEquals(2L, assertNotNull(spool.status().loss).count)
+                assertEquals(root.listFiles()!!.filter { it.isFile }.sumOf { it.length() }, spool.status().bytes)
                 assertEquals(SecondaryTelemetrySpool.AckResult.RELEASED, spool.acknowledge(firstDescriptor))
                 assertTrue(filler.delete())
 
@@ -215,6 +249,7 @@ class SecondaryTelemetrySpoolTest {
                 assertEquals(2L, recovery.lossBefore!!.firstIdentity.sequence)
                 assertEquals(3L, recovery.lossBefore!!.lastIdentity.sequence)
                 assertNull(spool.status().loss)
+                assertEquals(root.listFiles()!!.filter { it.isFile }.sumOf { it.length() }, spool.status().bytes)
             }
         } finally { deleteRecursively(root) }
     }
@@ -237,6 +272,7 @@ class SecondaryTelemetrySpoolTest {
                 RandomAccessFile(filler, "rw").use { it.setLength(50_000 - first.length) }
                 failLoss = true
                 assertFailsWith<IllegalStateException> { spool.append(cycle(2, values())) }
+                assertEquals(root.listFiles()!!.filter { it.isFile }.sumOf { it.length() }, spool.status().bytes)
                 assertTrue(filler.delete())
                 assertEquals(SecondaryTelemetrySpool.AppendResult.FULL, spool.append(cycle(3, values())))
                 assertEquals(

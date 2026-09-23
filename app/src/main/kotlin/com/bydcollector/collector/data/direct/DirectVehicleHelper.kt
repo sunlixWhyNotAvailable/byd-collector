@@ -7,6 +7,8 @@ import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
 interface DirectVehicleHelper {
     fun isAlive(): Boolean
     fun ownerMode(): DirectHelperOwnerMode? = if (isAlive()) DirectHelperOwnerMode.APP else null
+    fun requestStop(ownerMode: DirectHelperOwnerMode): DirectHelperStopResult =
+        DirectHelperStopResult(CollectorHelperProtocol.STATUS_INVALID_REQUEST, false, "helper stop is unavailable")
     fun read(entry: DirectFidEntry): DirectHelperReadResult
 
     fun readBatch(entries: List<DirectFidEntry>): DirectHelperBatchResult {

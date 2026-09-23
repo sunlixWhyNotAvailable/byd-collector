@@ -29,18 +29,18 @@ object CollectorAutoStart {
     const val TASK_REMOVED_RETRY_DELAY_MS = 5_000L
     const val KEEP_ALIVE_MAINTENANCE_DEFER_MS = 60_000L
     const val MAX_RETRY_ATTEMPTS = 20
+    private val keepAliveStopRetryAlarmLock = Any()
 
     fun handleBroadcast(context: Context, action: String, retryAttempt: Int = 0) {
         val appContext = context.applicationContext
+        val preflightSettings = CollectorSettings(appContext)
+        if (preflightSettings.isUserShutdownRequested()) {
+            cancelRuntimeRecovery(appContext)
+            return
+        }
         if (CollectorSettings.isDbMaintenanceRunning(appContext)) return
         val store = BydCollectorApplication.store(appContext)
         val settings = CollectorSettings(appContext, store)
-        if (settings.isUserShutdownRequested()) {
-            store.recordEvent("boot_auto_start_skipped", "User shutdown blocks runtime recovery", action)
-            cancelRetry(appContext)
-            cancelWatchdog(appContext)
-            return
-        }
         if (clearsManualStops(action)) {
             settings.clearRuntimeManualStops(includeCollection = false)
         }
@@ -84,6 +84,10 @@ object CollectorAutoStart {
 
     fun handleKeepAliveRecovery(context: Context, action: String) {
         val appContext = context.applicationContext
+        if (CollectorSettings(appContext).isUserShutdownRequested()) {
+            cancelRuntimeRecovery(appContext)
+            return
+        }
         if (CollectorSettings.isDbMaintenanceRunning(appContext)) return
         val store = BydCollectorApplication.store(appContext)
         val settings = CollectorSettings(appContext, store)
@@ -96,10 +100,14 @@ object CollectorAutoStart {
     }
 
     fun handleRecoveryRequest(context: Context, action: String, retryAttempt: Int = 0) {
+        val appContext = context.applicationContext
+        if (CollectorSettings(appContext).isUserShutdownRequested()) {
+            cancelRuntimeRecovery(appContext)
+            return
+        }
         if (action == ACTION_KEEP_ALIVE_RECOVERY) {
-            handleKeepAliveRecovery(context, action)
+            handleKeepAliveRecovery(appContext, action)
         } else if (action == ACTION_KEEP_ALIVE_STOP_RETRY) {
-            val appContext = context.applicationContext
             if (
                 CollectorSettings.isDbMaintenanceRunning(appContext) ||
                 CollectorService.isMaintenanceRunningInProcess()
@@ -109,7 +117,7 @@ object CollectorAutoStart {
                 CollectorServiceController.retryKeepAliveStop(appContext, retryAttempt)
             }
         } else {
-            handleBroadcast(context, action, retryAttempt)
+            handleBroadcast(appContext, action, retryAttempt)
         }
     }
 
@@ -126,19 +134,27 @@ object CollectorAutoStart {
         }
         val appContext = context.applicationContext
         val nextAttempt = retryAttempt + 1
-        runCatching {
-            appContext.getSystemService(AlarmManager::class.java).set(
-                AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                SystemClock.elapsedRealtime() + delayMs,
-                keepAliveStopRetryIntent(appContext, nextAttempt)
-            )
-        }.onSuccess {
+        val scheduled = synchronized(keepAliveStopRetryAlarmLock) {
+            if (CollectorSettings(appContext).isUserShutdownRequested()) {
+                cancelKeepAliveStopRetryLocked(appContext)
+                null
+            } else {
+                runCatching {
+                    appContext.getSystemService(AlarmManager::class.java).set(
+                        AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                        SystemClock.elapsedRealtime() + delayMs,
+                        keepAliveStopRetryIntent(appContext, nextAttempt)
+                    )
+                }
+            }
+        }
+        scheduled?.onSuccess {
             store.recordEvent(
                 "keep_alive_stop_retry_scheduled",
                 "Scheduled keep-alive stop retry",
                 "attempt=$nextAttempt delay_ms=$delayMs"
             )
-        }.onFailure { error ->
+        }?.onFailure { error ->
             store.recordEvent(
                 "keep_alive_stop_retry_schedule_failed",
                 "Keep-alive stop retry scheduling failed",
@@ -149,24 +165,38 @@ object CollectorAutoStart {
 
     fun cancelKeepAliveStopRetry(context: Context) {
         val appContext = context.applicationContext
-        appContext.getSystemService(AlarmManager::class.java).cancel(keepAliveStopRetryIntent(appContext, 0))
+        synchronized(keepAliveStopRetryAlarmLock) { cancelKeepAliveStopRetryLocked(appContext) }
     }
 
     fun deferKeepAliveStopRetry(context: Context, retryAttempt: Int) {
         val appContext = context.applicationContext
-        runCatching {
-            appContext.getSystemService(AlarmManager::class.java).set(
-                AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                SystemClock.elapsedRealtime() + KEEP_ALIVE_MAINTENANCE_DEFER_MS,
-                keepAliveStopRetryIntent(appContext, retryAttempt)
-            )
-        }.onFailure { error ->
-            android.util.Log.e("CollectorAutoStart", "Failed to defer keep-alive stop retry", error)
+        synchronized(keepAliveStopRetryAlarmLock) {
+            if (CollectorSettings(appContext).isUserShutdownRequested()) {
+                cancelKeepAliveStopRetryLocked(appContext)
+                return
+            }
+            runCatching {
+                appContext.getSystemService(AlarmManager::class.java).set(
+                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    SystemClock.elapsedRealtime() + KEEP_ALIVE_MAINTENANCE_DEFER_MS,
+                    keepAliveStopRetryIntent(appContext, retryAttempt)
+                )
+            }.onFailure { error ->
+                android.util.Log.e("CollectorAutoStart", "Failed to defer keep-alive stop retry", error)
+            }
         }
+    }
+
+    private fun cancelKeepAliveStopRetryLocked(context: Context) {
+        context.getSystemService(AlarmManager::class.java).cancel(keepAliveStopRetryIntent(context, 0))
     }
 
     fun recoverFromForeground(context: Context, settings: CollectorSettings, store: TelemetryStore) {
         val appContext = context.applicationContext
+        if (settings.isUserShutdownRequested()) {
+            cancelRuntimeRecovery(appContext)
+            return
+        }
         if (CollectorSettings.isDbMaintenanceRunning(appContext)) return
         val demand = prepareRuntimeDemand(settings)
         if (!demand.any) return
@@ -193,6 +223,10 @@ object CollectorAutoStart {
         store: TelemetryStore
     ) {
         val appContext = context.applicationContext
+        if (settings.isUserShutdownRequested()) {
+            cancelRuntimeRecovery(appContext)
+            return
+        }
         if (CollectorSettings.isDbMaintenanceRunning(appContext)) return
         val demand = prepareRuntimeDemand(settings)
         if (!demand.any) {
@@ -217,6 +251,10 @@ object CollectorAutoStart {
         store: TelemetryStore
     ) {
         val appContext = context.applicationContext
+        if (settings.isUserShutdownRequested()) {
+            cancelRuntimeRecovery(appContext)
+            return
+        }
         if (CollectorSettings.isDbMaintenanceRunning(appContext)) return
         val demand = prepareRuntimeDemand(settings)
         if (!demand.any) return
@@ -237,6 +275,10 @@ object CollectorAutoStart {
 
     fun scheduleWatchdog(context: Context, settings: CollectorSettings, store: TelemetryStore) {
         val appContext = context.applicationContext
+        if (settings.isUserShutdownRequested()) {
+            cancelRuntimeRecovery(appContext)
+            return
+        }
         if (CollectorSettings.isDbMaintenanceRunning(appContext)) return
         if (!shouldRunService(settings)) {
             cancelWatchdog(appContext)
@@ -393,6 +435,7 @@ object CollectorAutoStart {
         delayMs: Long,
         category: String
     ) {
+        if (CollectorSettings(context.applicationContext).isUserShutdownRequested()) return
         val nextAttempt = retryAttempt + 1
         val alarmManager = context.getSystemService(AlarmManager::class.java)
         alarmManager.set(

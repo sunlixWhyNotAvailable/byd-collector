@@ -1,5 +1,14 @@
 package com.bydcollector.collector.direct
 
+import com.bydcollector.collector.data.direct.DirectFidRegistry
+import com.bydcollector.collector.data.direct.DirectValueDecoders
+import com.bydcollector.collector.data.local.PollReading
+import com.bydcollector.collector.data.normalized.NormalizedSourceInput
+import com.bydcollector.collector.data.normalized.NormalizedSourceKind
+import com.bydcollector.collector.data.normalized.NormalizedSourceStamp
+import com.bydcollector.collector.data.normalized.VehicleStateNormalizer
+import com.bydcollector.collector.service.KpiFreshness
+import com.bydcollector.collector.ui.VehicleKpiMapper
 import org.junit.Assert.*
 import org.junit.Test
 import java.util.Collections
@@ -10,6 +19,34 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 class HelperCallbackControllerTest {
+    @Test fun stuckVendorCleanupCannotExtendCloseDeadlineOrBlockRawDrain() {
+        val closeEntered = CountDownLatch(1)
+        val releaseClose = CountDownLatch(1)
+        val platform = object : HelperCallbackController.Platform() {
+            override fun close() {
+                closeEntered.countDown()
+                check(releaseClose.await(5, TimeUnit.SECONDS))
+            }
+        }
+        val host = FakeHost().apply { holdPublishing = true }
+        val row = CollectorHelperDaemon.Address(CollectorHelperProtocol.AUTO_TX_INT, 1002, 99)
+        val controller = HelperCallbackController("boot", "generation", listOf(row), emptyList(),
+            platform, host, { 1_000L }, { 2_000L })
+        try {
+            controller.updatePlan(view(true, 1), view(false, 1))
+            controller.callbackForTest(row.dev, row.fid, TelemetryCallbackBatch.TYPE_INT, 42, null)
+            val started = System.nanoTime()
+            assertTrue("raw writers should drain independently", controller.closeAndAwait(100))
+            assertTrue("close exceeded its shared budget", System.nanoTime() - started < TimeUnit.SECONDS.toNanos(1))
+            assertTrue(closeEntered.await(1, TimeUnit.SECONDS))
+            assertEquals(1L, releaseClose.count)
+            assertEquals(listOf(42), host.batches.flatMap { it.events }.map { it.rawBits })
+        } finally {
+            releaseClose.countDown()
+            controller.closeAndAwait(2_000)
+        }
+    }
+
     @Test fun batchCapturedBeforeStopCannotRepopulateCacheAfterRestart() {
         val row = CollectorHelperDaemon.Address(CollectorHelperProtocol.AUTO_TX_INT, 1002, 99)
         val entered = CountDownLatch(1)
@@ -109,7 +146,7 @@ class HelperCallbackControllerTest {
         }
     }
 
-    @Test fun mainOwnsSharedRawAndMatchingSeedEnablesCachedReads() {
+    @Test fun mainOwnsSharedRawAndSuccessfulInitialGetterSeedRemainsFresh() {
         val main = CollectorHelperDaemon.Address(CollectorHelperProtocol.AUTO_TX_INT, 1001, 42)
         val secondary = CollectorHelperDaemon.Address(CollectorHelperProtocol.AUTO_TX_INT, 1001, 42)
         val host = FakeHost()
@@ -127,7 +164,8 @@ class HelperCallbackControllerTest {
                 result(rows, 123)
             }
             assertEquals(1, polls)
-            assertNotNull(seeded.values.single().callbackSource)
+            assertNull("successful initial getter seed is a fresh poll, even when unchanged",
+                seeded.values.single().callbackSource)
 
             val cached = controller.readHybrid(listOf(main)) { throw AssertionError("fresh getter should be suppressed") }
             assertEquals(123, cached.values.single().raw)
@@ -171,7 +209,10 @@ class HelperCallbackControllerTest {
             assertEquals(listOf(1, 3), host.batches[0].events.map { it.rawBits })
             assertEquals(listOf(2), host.batches[1].events.map { it.rawBits })
 
-            val cached = controller.readHybrid(listOf(shared)) { rows -> result(rows, 3) }
+            val seeded = controller.readHybrid(listOf(shared)) { rows -> result(rows, 3) }
+            assertNull("successful matching getter is fresh even on the initial seed",
+                seeded.values.single().callbackSource)
+            val cached = controller.readHybrid(listOf(shared)) { error("matching seed should enable callback cache") }
             assertEquals(CollectorHelperProtocol.STREAM_MAIN, cached.values.single().callbackSource!!.stream)
             assertEquals(3, cached.values.single().callbackSource!!.rawBits)
         } finally { controller.close() }
@@ -218,7 +259,7 @@ class HelperCallbackControllerTest {
             controller.callbackForTest(1002, 78, TelemetryCallbackBatch.TYPE_INT, 10, null)
             controller.flushForTest(CollectorHelperProtocol.STREAM_MAIN)
             val seed = controller.readHybrid(listOf(row)) { rows -> result(rows, 10) }
-            assertNotNull(seed.values.single().callbackSource)
+            assertNull("matching initial seed is the successful getter result", seed.values.single().callbackSource)
 
             elapsed.set(6_000L)
             controller.forceReconcileForTest(row)
@@ -227,6 +268,152 @@ class HelperCallbackControllerTest {
 
             val cached = controller.readHybrid(listOf(row)) { throw AssertionError("callback-first should resume") }
             assertEquals(1_000L, cached.values.single().callbackSource!!.receivedElapsedMs)
+        } finally { controller.close() }
+    }
+
+    @Test fun compositeKpiStaysVisibleAcrossReconcilePeriodsAndExpiresAfterGetterFailure() {
+        val elapsed = AtomicLong(1_000L)
+        val entries = listOf(
+            DirectFidRegistry.entries.single { it.key == "charging_charge_battery_volt" },
+            DirectFidRegistry.entries.single { it.key == "charging_charge_current" }
+        )
+        val ordinaryEntry = DirectFidRegistry.entries.single { it.key == "statistic_total_elec_consumption" }
+        val allEntries = entries + ordinaryEntry
+        val rows = allEntries.map { CollectorHelperDaemon.Address(it.tx, it.dev, it.fid) }
+        val currentRaw = mapOf(
+            rows[0] to 400,
+            rows[1] to java.lang.Float.floatToRawIntBits(100.0f),
+            rows[2] to java.lang.Float.floatToRawIntBits(20.0f)
+        )
+        val host = FakeHost()
+        val controller = HelperCallbackController("boot", "generation", rows, emptyList(),
+            HelperCallbackController.Platform(), host, elapsed::get, { 100_000L + elapsed.get() })
+        val freshness = KpiFreshness("boot", 3_000L)
+        val normalizer = VehicleStateNormalizer()
+        val getterCalls = mutableListOf<List<CollectorHelperDaemon.Address>>()
+
+        fun poll(): CollectorHelperDaemon.BatchResult = controller.readHybrid(rows) { selected ->
+            getterCalls += selected.toList()
+            result(selected, *selected.map { currentRaw.getValue(it) }.toIntArray())
+        }
+
+        fun inputs(batch: CollectorHelperDaemon.BatchResult, now: Long): Map<String, NormalizedSourceInput> =
+            entries.indices.mapNotNull { index ->
+                val entry = entries[index]
+                val value = batch.values[index]
+                val raw = value.raw ?: return@mapNotNull null
+                if (value.status != CollectorHelperProtocol.STATUS_OK) return@mapNotNull null
+                val callback = value.callbackSource
+                val stamp = if (callback == null) {
+                    NormalizedSourceStamp(NormalizedSourceKind.POLL, "poll:$now:${entry.key}",
+                        "boot", "app", now, 100_000L + now, now)
+                } else {
+                    val identity = "${callback.bootId}:${callback.helperGeneration}:" +
+                        "${callback.stream}:${callback.epoch}:${callback.eventSequence}"
+                    NormalizedSourceStamp(NormalizedSourceKind.CALLBACK,
+                        identity,
+                        callback.bootId, callback.helperGeneration, callback.eventSequence,
+                        callback.receivedWallMs, callback.receivedElapsedMs)
+                }
+                entry.key to NormalizedSourceInput(
+                    PollReading(entry.key, raw.toString(), DirectValueDecoders.decode(entry, raw), callback),
+                    stamp,
+                    null
+                )
+            }.toMap()
+
+        fun normalize(batch: CollectorHelperDaemon.BatchResult, now: Long) = inputs(batch, now).let { sourceInputs ->
+            normalizer.normalizeSparse(sourceInputs, sourceInputs.keys)
+        }
+
+        fun publish(now: Long) =
+            VehicleKpiMapper.fromObservations(freshness.freshObservations(now))
+
+        try {
+            controller.updatePlan(view(true, 7), view(false, 1))
+            allEntries.forEachIndexed { index, entry ->
+                val raw = currentRaw.getValue(rows[index])
+                val type = if (entry.tx == DirectFidRegistry.TX_GET_FLOAT)
+                    TelemetryCallbackBatch.TYPE_FLOAT else TelemetryCallbackBatch.TYPE_INT
+                controller.callbackForTest(entry.dev, entry.fid, type, raw, null)
+            }
+            controller.flushForTest(CollectorHelperProtocol.STREAM_MAIN)
+
+            val seed = poll()
+            assertEquals(rows, getterCalls.single())
+            assertTrue("matching initial getters must be fresh polls", seed.values.all { it.callbackSource == null })
+            val seededObservations = normalize(seed, elapsed.get())
+            assertTrue(freshness.accept(seededObservations, elapsed.get()))
+            assertEquals("-40.0 кВт", publish(elapsed.get()).batteryPowerKw)
+
+            elapsed.set(2_000L)
+            val cached = controller.readHybrid(rows) { error("KPI source should wait for its 2s reconcile") }
+            assertTrue(cached.values.all { it.callbackSource?.receivedElapsedMs == 1_000L })
+            val replay = normalize(cached, elapsed.get())
+            assertEquals(1_000L, replay.single { it.field.fieldKey == "battery_discharge_power_kw" }
+                .sourceStamp?.elapsedMs)
+            assertTrue(freshness.accept(replay, elapsed.get()))
+            assertEquals("cached callback clocks do not extend the 3s KPI age", 2_000L,
+                freshness.remainingMs(elapsed.get()))
+
+            for (now in listOf(3_000L, 5_000L)) {
+                elapsed.set(now)
+                val refreshed = poll()
+                assertEquals("KPI sources are due every 2s; ordinary sources stay on 5s", rows.take(2),
+                    getterCalls.last())
+                assertTrue(refreshed.values.take(2).all { it.callbackSource == null })
+                val observations = normalize(refreshed, now)
+                assertTrue(freshness.accept(observations, now))
+                assertEquals(now, observations.single { it.field.fieldKey == "battery_discharge_power_kw" }
+                    .sourceStamp?.elapsedMs)
+                assertEquals("-40.0 кВт", publish(now).batteryPowerKw)
+            }
+
+            elapsed.set(6_000L)
+            val ordinaryRefresh = poll()
+            assertEquals("non-KPI source retains 5s reconciliation", listOf(rows[2]), getterCalls.last())
+            assertEquals(1_000L, ordinaryRefresh.values.take(2).first().callbackSource?.receivedElapsedMs)
+            assertFalse(freshness.accept(normalize(ordinaryRefresh, elapsed.get()), elapsed.get()))
+
+            elapsed.set(7_000L)
+            val refreshed = poll()
+            assertEquals(rows.take(2), getterCalls.last())
+            assertTrue(refreshed.values.take(2).all { it.callbackSource == null })
+            val latestObservations = normalize(refreshed, elapsed.get())
+            assertTrue(freshness.accept(latestObservations, elapsed.get()))
+            assertEquals(7_000L, latestObservations.single { it.field.fieldKey == "battery_discharge_power_kw" }
+                .sourceStamp?.elapsedMs)
+            assertEquals("-40.0 кВт", publish(elapsed.get()).batteryPowerKw)
+
+            elapsed.set(8_000L)
+            assertFalse("older callback replay cannot replace a later getter", freshness.accept(replay, 8_000L))
+            assertEquals(7_000L, freshness.freshObservations(8_000L)
+                .single { it.field.fieldKey == "battery_discharge_power_kw" }.sourceStamp?.elapsedMs)
+            assertEquals("-40.0 кВт", publish(8_000L).batteryPowerKw)
+
+            elapsed.set(9_000L)
+            val unavailable = controller.readHybrid(rows) { selected ->
+                getterCalls += selected.toList()
+                CollectorHelperDaemon.BatchResult(
+                    CollectorHelperProtocol.STATUS_READ_ERROR,
+                    CollectorHelperProtocol.MODE_NATIVE,
+                    true, 0, 0, selected.size, selected.size, 0L,
+                    Array(selected.size) {
+                        CollectorHelperDaemon.ReadValue.error(CollectorHelperProtocol.STATUS_READ_ERROR, "unavailable")
+                    },
+                    "unavailable"
+                )
+            }
+            assertTrue(unavailable.values.take(2).all { it.status != CollectorHelperProtocol.STATUS_OK })
+            val failedObservations = normalize(unavailable, elapsed.get())
+            assertTrue(failedObservations.isEmpty())
+            assertFalse(freshness.accept(failedObservations, elapsed.get()))
+            assertEquals(1_000L, freshness.remainingMs(elapsed.get()))
+            assertEquals("-40.0 кВт", publish(elapsed.get()).batteryPowerKw)
+
+            elapsed.set(10_000L)
+            assertEquals(0L, freshness.remainingMs(elapsed.get()))
+            assertEquals("-", publish(elapsed.get()).batteryPowerKw)
         } finally { controller.close() }
     }
 

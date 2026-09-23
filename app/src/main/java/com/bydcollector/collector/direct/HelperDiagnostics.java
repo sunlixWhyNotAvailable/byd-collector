@@ -1,5 +1,7 @@
 package com.bydcollector.collector.direct;
 
+import com.bydcollector.collector.diagnostics.BoundedProcessWindow;
+
 import org.json.JSONObject;
 
 import java.io.File;
@@ -28,6 +30,7 @@ final class HelperDiagnostics implements AutoCloseable, TelemetryWorkerSpool.Dia
     interface Clock {
         long wallTimeMs();
         long elapsedTimeMs();
+        default long processCpuTimeMs() { return -1L; }
     }
 
     private static final int SIGNAL_CHANGE = 1;
@@ -42,6 +45,7 @@ final class HelperDiagnostics implements AutoCloseable, TelemetryWorkerSpool.Dia
     private final long capBytes;
     private final Sink sink;
     private final Clock clock;
+    private final BoundedProcessWindow processWindow;
     private final long summaryIntervalMs;
     private final ArrayBlockingQueue<Signal> queue;
     private final Thread writer;
@@ -66,9 +70,14 @@ final class HelperDiagnostics implements AutoCloseable, TelemetryWorkerSpool.Dia
     private final AtomicBoolean capReached = new AtomicBoolean(false);
     private final AtomicReference<String> lastErrorKey = new AtomicReference<String>();
     private final AtomicLong repeatedErrorCount = new AtomicLong();
+    private volatile CallbackSpoolBinder callbackTransport;
+    private CallbackSpoolBinder.Footprint callbackFootprint;
+    private String callbackFootprintError;
+    private Long callbackFootprintSampleElapsedMs;
     private HelperCallbackController.DiagnosticsSnapshot callbackSnapshot =
         new HelperCallbackController.DiagnosticsSnapshot(0, 0, 0, 0, 0, 0L,
             0L, -1L, 0L, 0L, -1L, 0L, 0L, null);
+    private BoundedProcessWindow.Snapshot performanceWindowSnapshot;
     private long stateRevision;
 
     static HelperDiagnostics open(
@@ -88,6 +97,7 @@ final class HelperDiagnostics implements AutoCloseable, TelemetryWorkerSpool.Dia
             new Clock() {
                 @Override public long wallTimeMs() { return System.currentTimeMillis(); }
                 @Override public long elapsedTimeMs() { return android.os.SystemClock.elapsedRealtime(); }
+                @Override public long processCpuTimeMs() { return android.os.Process.getElapsedCpuTime(); }
             },
             QUEUE_CAPACITY
         );
@@ -128,6 +138,7 @@ final class HelperDiagnostics implements AutoCloseable, TelemetryWorkerSpool.Dia
         this.capBytes = capBytes;
         this.sink = sink;
         this.clock = clock;
+        this.processWindow = new BoundedProcessWindow(clock::elapsedTimeMs, clock::processCpuTimeMs);
         this.summaryIntervalMs = summaryIntervalMs;
         this.queue = new ArrayBlockingQueue<Signal>(queueCapacity);
         this.intervalStartedWallMs = clock.wallTimeMs();
@@ -230,6 +241,16 @@ final class HelperDiagnostics implements AutoCloseable, TelemetryWorkerSpool.Dia
         offer(new Signal(SIGNAL_CHANGE, null, (String) null));
     }
 
+    void pollDuration(int stream, long durationMs) {
+        if (!processWindow.recordPollDuration(stream, durationMs)) return;
+        synchronized (stateLock) { markChangedLocked(); }
+        offer(new Signal(SIGNAL_CHANGE, null, (String) null));
+    }
+
+    void callbackTransport(CallbackSpoolBinder transport) {
+        callbackTransport = transport;
+    }
+
     void mode(String mode) {
         String boundedMode = bound(mode, MAX_EVENT_CHARS);
         String previous;
@@ -308,6 +329,7 @@ final class HelperDiagnostics implements AutoCloseable, TelemetryWorkerSpool.Dia
         Signal stop;
         synchronized (stateLock) {
             collectionMode.set("stopped");
+            performanceWindowSnapshot = processWindow.finishWindow();
             markChangedLocked();
             stop = immediateSignalLocked("helper_stop", null);
         }
@@ -380,7 +402,8 @@ final class HelperDiagnostics implements AutoCloseable, TelemetryWorkerSpool.Dia
                     continue;
                 }
                 boolean dirty = currentRevision() != lastPersistedRevision;
-                long untilSummary = dirty
+                boolean windowDue = processWindow.isDue();
+                long untilSummary = dirty || windowDue
                     ? Math.max(1L, summaryIntervalMs - (nowElapsed - lastSummaryElapsedMs))
                     : 1_000L;
                 Signal signal;
@@ -400,10 +423,21 @@ final class HelperDiagnostics implements AutoCloseable, TelemetryWorkerSpool.Dia
                 }
                 nowElapsed = clock.elapsedTimeMs();
                 dirty = currentRevision() != lastPersistedRevision;
+                windowDue = processWindow.isDue();
                 if (
-                    dirty &&
+                    (dirty || windowDue) &&
                     nowElapsed - lastSummaryElapsedMs >= summaryIntervalMs
                 ) {
+                    BoundedProcessWindow.Snapshot completed = processWindow.snapshotIfDue();
+                    if (completed != null) {
+                        synchronized (stateLock) {
+                            if (!"stopped".equals(collectionMode.get())) {
+                                performanceWindowSnapshot = completed;
+                                markChangedLocked();
+                            }
+                        }
+                    }
+                    refreshCallbackFootprint();
                     lastPersistedRevision = persist("summary", null);
                     lastSummaryElapsedMs = nowElapsed;
                 }
@@ -508,8 +542,30 @@ final class HelperDiagnostics implements AutoCloseable, TelemetryWorkerSpool.Dia
                 callback.pollKeys, callback.fallbackKeys, callback.callbacksReceived,
                 callback.mainQueueBytes, callback.mainQueueOldestAgeMs, callback.mainQueueHighWaterBytes,
                 callback.secondaryQueueBytes, callback.secondaryQueueOldestAgeMs,
-                callback.secondaryQueueHighWaterBytes, callback.queueLossCount, callback.retryReason
+                callback.secondaryQueueHighWaterBytes, callback.queueLossCount, callback.retryReason,
+                performanceWindowSnapshot,
+                callbackFootprint,
+                callbackFootprintError,
+                callbackFootprintSampleElapsedMs
             );
+    }
+
+    private void refreshCallbackFootprint() {
+        CallbackSpoolBinder transport = callbackTransport;
+        if (transport == null) return;
+        CallbackSpoolBinder.Footprint footprint = null;
+        String error = null;
+        try {
+            footprint = transport.diagnosticsFootprint();
+        } catch (Throwable failure) {
+            error = failure.getClass().getSimpleName();
+        }
+        long sampleElapsedMs = clock.elapsedTimeMs();
+        synchronized (stateLock) {
+            callbackFootprint = footprint;
+            callbackFootprintError = error;
+            callbackFootprintSampleElapsedMs = sampleElapsedMs;
+        }
     }
 
     private void offerImmediate(String event, String message) {

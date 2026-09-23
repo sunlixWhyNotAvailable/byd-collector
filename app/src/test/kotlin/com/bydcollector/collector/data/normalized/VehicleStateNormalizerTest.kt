@@ -994,6 +994,27 @@ class VehicleStateNormalizerTest {
         assertEquals(8_000L, output.sourceStamp?.elapsedMs)
     }
 
+    @Test
+    fun sparseIndexPreservesCatalogOrderAndFallbacksWithoutTraversingUnrelatedInputs() {
+        val first = syntheticPercentField().copy(fieldKey = "first")
+        val second = first.copy(fieldKey = "second", sourceKeys = listOf("soc_backup"))
+        val backing = mapOf(
+            "soc_primary" to sourceInput("soc_primary", "bad", 2_000, 2),
+            "soc_backup" to sourceInput("soc_backup", "75", 1_000, 1)
+        )
+        val inputs = object : Map<String, NormalizedSourceInput> by backing {
+            override val entries: Set<Map.Entry<String, NormalizedSourceInput>>
+                get() = error("sparse normalization must not traverse the full input cache")
+        }
+        val normalizer = VehicleStateNormalizer(listOf(second, NormalizedFieldCatalog.speedKmh, first))
+        val result = normalizer.normalizeSparse(inputs, linkedSetOf("soc_primary", "soc_backup", "unknown"))
+        assertEquals(listOf("second", "first"), result.map { it.field.fieldKey })
+        assertEquals(listOf(75.0, 75.0), result.map { it.value.number })
+        assertEquals(listOf("soc_backup", "soc_backup"), result.map { it.sourceKey })
+        assertEquals(listOf(1_000L, 1_000L), result.map { it.sourceStamp?.elapsedMs })
+        assertEquals(emptyList<NormalizedObservation>(), normalizer.normalizeSparse(inputs, setOf("unknown")))
+    }
+
     private fun sourceInput(key: String, value: String, wallMs: Long, pollId: Long?): NormalizedSourceInput =
         NormalizedSourceInput(
             reading = PollReading(key, value, value),

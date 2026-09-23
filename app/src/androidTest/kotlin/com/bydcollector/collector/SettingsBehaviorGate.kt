@@ -3,9 +3,18 @@ package com.bydcollector.collector
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.SharedPreferences
+import com.bydcollector.collector.adb.AdbLocalClient
+import com.bydcollector.collector.adb.AdbShellResult
+import com.bydcollector.collector.data.direct.DirectFidEntry
+import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
+import com.bydcollector.collector.data.direct.DirectHelperReadResult
+import com.bydcollector.collector.data.direct.DirectHelperStopResult
+import com.bydcollector.collector.data.direct.DirectVehicleHelper
+import com.bydcollector.collector.data.remote.DirectBridgeManager
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.service.RuntimeDemand
 import com.bydcollector.collector.telegram.TelegramNavigatorMask
+import java.io.File
 
 /** Exercises the production settings facade against isolated Android preferences. */
 internal object SettingsBehaviorGate {
@@ -77,10 +86,21 @@ internal object SettingsBehaviorGate {
                 settings.setTelegramEnabled(true)
                 settings.setConnectivityRecoveryEnabled(true)
                 settings.setUserShutdownRequested(true)
+                check(settings.setUserShutdownPhase(CollectorSettings.SHUTDOWN_PHASE_STOPPING, "test-token", "in progress"))
+                check(settings.rememberShutdownListenerStateIfAbsent(0))
+                check(settings.rememberShutdownListenerStateIfAbsent(2))
+                check(CollectorSettings(scoped).shutdownListenerPreviousState() == 0) {
+                    "repeated Shutdown must not overwrite the pre-shutdown listener state"
+                }
                 check(CollectorSettings(scoped).runtimeDemand() == RuntimeDemand())
                 check(settings.clearUserShutdownRequestIfSet())
                 check(settings.runtimeDemand() == all.copy(telegram = true, keepAlive = true))
-                check(!settings.clearUserShutdownRequestIfSet())
+                check(settings.userShutdownPhase() == CollectorSettings.SHUTDOWN_PHASE_IDLE)
+                check(settings.userShutdownToken() == null && settings.userShutdownDetail() == null)
+                check(settings.shutdownListenerPreviousState() == 0) { "saved state belongs to actual component restoration" }
+                check(settings.clearShutdownListenerPreviousState())
+                // The result now means durable clear succeeded, including idempotent explicit reopen.
+                check(settings.clearUserShutdownRequestIfSet())
             }
         },
         "settings_enabled_exports_recover_independently" to {
@@ -95,6 +115,45 @@ internal object SettingsBehaviorGate {
                 settings.setInfluxManuallyStopped(true)
                 check(!settings.runtimeDemand(includeEnabledExports = true).any)
                 check(!settings.isAutoStartEnabled() && !settings.isDebugAutoStartEnabled())
+            }
+        },
+        "helper_update_marker_is_durable_and_demand_gated" to {
+            isolated(context, prefix) { scoped ->
+                val settings = CollectorSettings(scoped)
+                check(settings.helperReplacementPending(500L)) { "missing confirmed stamp must be stale" }
+                check(settings.markHelperReplacementPending())
+                check(CollectorSettings(scoped).helperReplacementPending(500L)) {
+                    "pending marker did not survive settings recreation"
+                }
+                check(!settings.helperReplacementAllowed()) { "no collection demand must defer replacement" }
+
+                settings.setPollingEnabled(true)
+                check(settings.helperReplacementAllowed())
+                settings.setMainManuallyStopped(true)
+                check(!settings.helperReplacementAllowed())
+                settings.setDebugPollingEnabled(true)
+                check(settings.helperReplacementAllowed())
+                settings.setUserShutdownRequested(true)
+                check(!settings.helperReplacementAllowed()) { "Shutdown must block replacement" }
+                settings.setUserShutdownRequested(false)
+
+                check(settings.confirmHelperReplacement(500L))
+                check(!settings.helperReplacementPending(500L))
+                check(settings.helperReplacementPending(501L)) { "same-version package update timestamp was ignored" }
+                check(settings.helperReplacementPending(null)) { "missing installed timestamp must be stale" }
+            }
+        },
+        "helper_update_replacement_stops_absent_launches_pings_then_confirms" to {
+            isolated(context, prefix) { scoped ->
+                runHelperReplacementSequence(scoped, failLaunch = false, collectionDemand = true)
+            }
+        },
+        "helper_update_replacement_failure_and_no_demand_remain_pending" to {
+            isolated(context, prefix) { scoped ->
+                runHelperReplacementSequence(scoped, failLaunch = true, collectionDemand = true)
+            }
+            isolated(context, "${prefix}_no_demand") { scoped ->
+                runHelperReplacementSequence(scoped, failLaunch = false, collectionDemand = false)
             }
         },
         "settings_connectivity_and_discovery" to {
@@ -155,5 +214,86 @@ internal object SettingsBehaviorGate {
         } finally {
             names.forEach { check(base.deleteSharedPreferences(it)) { "Could not remove test preferences: $it" } }
         }
+    }
+
+    private fun runHelperReplacementSequence(context: Context, failLaunch: Boolean, collectionDemand: Boolean) {
+        @Suppress("DEPRECATION")
+        val updateTime = context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime
+        check(updateTime > 0L) { "installed package update timestamp is unavailable" }
+        val settings = CollectorSettings(context)
+        settings.setPollingEnabled(collectionDemand)
+        check(settings.markHelperReplacementPending())
+
+        val events = mutableListOf<String>()
+        val helper = ReplacementSequenceHelper(events)
+        val result = DirectBridgeManager.ensureRunning(
+            context = context,
+            adbClient = AdbLocalClient(File(context.filesDir, "unused_helper_update_test_keys")),
+            helper = helper,
+            ownerMode = DirectHelperOwnerMode.APP,
+            shellRunner = { command, _ ->
+                when {
+                    command == DirectBridgeManager.helperAbsenceCommand() -> {
+                        events += "absence"
+                        AdbShellResult(ok = true, output = "", error = null, elapsedMs = 0L)
+                    }
+                    command.contains("setsid app_process") -> {
+                        events += "launch"
+                        if (!failLaunch) helper.alive = true
+                        AdbShellResult(
+                            ok = !failLaunch,
+                            output = "",
+                            error = if (failLaunch) "launch failed" else null,
+                            elapsedMs = 0L
+                        )
+                    }
+                    else -> error("unexpected shell command during helper replacement")
+                }
+            }
+        )
+
+        if (!collectionDemand) {
+            check(!result.ok)
+            check(events == listOf("initial_ping")) { "replacement performed work without collection demand: $events" }
+            check(settings.helperReplacementPending(updateTime))
+            return
+        }
+        check(helper.stopMode == DirectHelperOwnerMode.APP_GAP_SPOOL) {
+            "replacement did not use the helper's actual owner mode"
+        }
+
+        if (failLaunch) {
+            check(!result.ok)
+            check(events == listOf("initial_ping", "stop", "absence", "launch")) { "unexpected failed replacement order: $events" }
+            check(settings.helperReplacementPending(updateTime)) { "failed launch cleared the pending marker" }
+        } else {
+            check(result.ok) { result.message }
+            check(events == listOf("initial_ping", "stop", "absence", "launch", "launch_ping")) {
+                "replacement did not follow stop→absence→launch→ping order: $events"
+            }
+            check(!settings.helperReplacementPending(updateTime)) { "successful ping did not confirm the installed update" }
+        }
+    }
+
+    private class ReplacementSequenceHelper(private val events: MutableList<String>) : DirectVehicleHelper {
+        var alive = true
+        var stopMode: DirectHelperOwnerMode? = null
+        private var pingCount = 0
+
+        override fun isAlive(): Boolean {
+            events += if (pingCount++ == 0) "initial_ping" else "launch_ping"
+            return alive
+        }
+
+        override fun ownerMode(): DirectHelperOwnerMode? = if (alive) DirectHelperOwnerMode.APP_GAP_SPOOL else null
+
+        override fun requestStop(ownerMode: DirectHelperOwnerMode): DirectHelperStopResult {
+            events += "stop"
+            stopMode = ownerMode
+            alive = false
+            return DirectHelperStopResult(status = 0, accepted = true)
+        }
+
+        override fun read(entry: DirectFidEntry): DirectHelperReadResult = error("read is not used by replacement")
     }
 }

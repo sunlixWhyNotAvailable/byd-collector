@@ -160,5 +160,7 @@ data class CallbackNormalizationPageResult(
     val appliedObservations: List<NormalizedObservation>,
     val summary: NormalizedWriteSummary,
     val hasMore: Boolean,
-    val latestAppliedSource: NormalizedSourceStamp? = null
+    val latestAppliedSource: NormalizedSourceStamp? = null,
+    // Age of this already-loaded page, not an extra query for the global backlog head.
+    val oldestPageReceivedWallMs: Long? = null
 )

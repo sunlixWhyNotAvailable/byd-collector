@@ -8,8 +8,27 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 import kotlin.test.assertContentEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertNull
 
 class DiagnosticLogRecorderContractTest {
+
+    @Test
+    fun logcatOwnershipTokenRejectsShellInput() {
+        for (invalid in listOf("", "a".repeat(31), "a".repeat(33), "x".repeat(32), "a; kill -9 1", "a\nlogcat")) {
+            assertFailsWith<IllegalArgumentException> { ownedLogcatCommand(invalid) }
+        }
+        assertTrue(ownedLogcatCommand("a".repeat(32)).endsWith("exec logcat -b all -v threadtime"))
+    }
+
+    @Test
+    fun shutdownWithoutRecordingIsRepeatableAndDoesNotCreateABundle() {
+        repeat(2) {
+            val result = DiagnosticLogRecorder.stopForShutdown()
+            assertNull(result.runToken)
+            assertNull(result.closeError)
+        }
+    }
 
     @Test
     fun activeLogcatUsesEightSixteenMiBSegmentsAndDropsTheOldest() {

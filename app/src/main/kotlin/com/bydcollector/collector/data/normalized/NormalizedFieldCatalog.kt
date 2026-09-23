@@ -261,6 +261,14 @@ object NormalizedFieldCatalog {
         locationQuality
     )
 
+    /** Dashboard fields share one source definition for display freshness and helper validation. */
+    val kpiFields = listOf(soc, odometerKm, insideTemp,
+        perfume1RemainingPercent, perfume2RemainingPercent, perfume3RemainingPercent,
+        batterySoh, batteryChargePower, batteryDischargePower, remainingRangeKm,
+        batteryAverageTemp, batteryHighestCellVoltage, batteryLowestCellVoltage)
+    val kpiKeys: Set<String> = kpiFields.map { it.fieldKey }.toSet()
+    val kpiSourceKeys: Set<String> = kpiFields.flatMap { it.sourceKeys }.toSet()
+
     private fun textEnum(
         fieldKey: String,
         category: NormalizedCategory,

@@ -1,6 +1,9 @@
 package com.bydcollector.collector.direct;
 
 import android.os.SystemClock;
+import com.bydcollector.collector.data.direct.DirectFidEntry;
+import com.bydcollector.collector.data.direct.DirectFidRegistry;
+import com.bydcollector.collector.data.normalized.NormalizedFieldCatalog;
 
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
@@ -18,11 +21,14 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongSupplier;
 
 /** Owns BYDAuto callback registration, bounded raw batching, and callback-first scalar caching. */
 final class HelperCallbackController implements AutoCloseable {
     static final long RECONCILE_MS = 5_000L;
+    static final long KPI_RECONCILE_MS = 2_000L;
+    private static final Set<CollectorHelperDaemon.Address> KPI_SOURCES = kpiSources();
     static final int MAX_ADDITION = 128;
     static final int MAX_DEVICE_FIDS = 4_096;
     static final int PERMISSION_DENIED = -2147482644;
@@ -49,7 +55,7 @@ final class HelperCallbackController implements AutoCloseable {
     private final LongSupplier wallClock;
     private final ScheduledExecutorService[] streamWorkers = new ScheduledExecutorService[3];
     private final ScheduledExecutorService registrationWorker;
-    private final Object closeLock = new Object();
+    private final ReentrantLock closeLock = new ReentrantLock();
     private final TelemetryCallbackQueue[] queues = new TelemetryCallbackQueue[3];
     private final long[] eventSequence = new long[3];
     private final long[] minPromotableSequence = new long[3];
@@ -211,7 +217,7 @@ final class HelperCallbackController implements AutoCloseable {
                 CollectorHelperDaemon.Address row = rows.get(i);
                 CacheEntry entry = cache.get(row);
                 if (entry != null && entry.promoted && !entry.needsSeed && !fastPoll(row) &&
-                    now - entry.lastReconcileMs < RECONCILE_MS) {
+                    now - entry.lastReconcileMs < (KPI_SOURCES.contains(row) ? KPI_RECONCILE_MS : RECONCILE_MS)) {
                     merged[i] = CollectorHelperDaemon.ReadValue.cached(entry.source.rawBits, entry.source);
                 } else {
                     polls.add(row);
@@ -237,15 +243,13 @@ final class HelperCallbackController implements AutoCloseable {
                 entry.lastReconcileMs = now;
                 if (fresh != null && fresh.status == CollectorHelperProtocol.STATUS_OK && fresh.raw != null &&
                     fresh.raw == entry.source.rawBits) {
-                    boolean initialSeed = entry.needsSeed;
                     entry.mismatches = 0;
                     if (!entry.promoted && entry.recoveryPending) entry.promoted = true;
                     entry.recoveryPending = false;
                     entry.needsSeed = false;
                     //This cycle performed a real getter read, so its value remains a fresh poll.
                     //The retained callback source is used again only by later callback-first cycles.
-                    merged[i] = initialSeed && entry.promoted
-                        ? CollectorHelperDaemon.ReadValue.cached(entry.source.rawBits, entry.source) : fresh;
+                    merged[i] = fresh;
                 } else {
                     entry.mismatches++;
                     if (entry.mismatches >= 2) entry.promoted = false;
@@ -256,6 +260,17 @@ final class HelperCallbackController implements AutoCloseable {
         return new CollectorHelperDaemon.BatchResult(polled.batchStatus, polled.mode, polled.nativeAvailable,
             polled.nativeGroupCount, polled.fallbackGroupCount, polled.fallbackReadCount,
             polled.groupFailureCount, polled.elapsedMs, merged, polled.error);
+    }
+
+    private static Set<CollectorHelperDaemon.Address> kpiSources() {
+        Set<String> keys = NormalizedFieldCatalog.INSTANCE.getKpiSourceKeys();
+        Set<CollectorHelperDaemon.Address> rows = new LinkedHashSet<>();
+        for (DirectFidEntry entry : DirectFidRegistry.INSTANCE.getEntries()) {
+            if (keys.contains(entry.getKey())) {
+                rows.add(new CollectorHelperDaemon.Address(entry.getTx(), entry.getDev(), entry.getFid()));
+            }
+        }
+        return Collections.unmodifiableSet(rows);
     }
 
     private void updateStream(int stream, HelperStreamRuntimeState.StreamView view,
@@ -623,16 +638,29 @@ final class HelperCallbackController implements AutoCloseable {
     }
 
     boolean closeAndAwait(long timeoutMs) {
-        synchronized (closeLock) {
+        long budget = TimeUnit.MILLISECONDS.toNanos(Math.max(0L, timeoutMs));
+        long started = System.nanoTime();
+        try {
+            if (!closeLock.tryLock(budget, TimeUnit.NANOSECONDS)) return false;
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        try {
             boolean interrupted = false;
             if (!streamWorkersShutdown) {
                 closed = true;
                 synchronized (registrationLock) {
-                    if (registrationFuture != null) registrationFuture.cancel(false);
+                    if (registrationFuture != null) registrationFuture.cancel(true);
                 }
-                registrationWorker.shutdownNow();
-                try { registrationWorker.awaitTermination(5L, TimeUnit.SECONDS); }
-                catch (InterruptedException error) { interrupted = true; }
+                // Serialize vendor cleanup behind any in-flight registration. A
+                // stuck vendor call must not keep the caller past its deadline or
+                // prevent independent raw writers from draining.
+                registrationWorker.execute(() -> {
+                    try { platform.close(); }
+                    catch (Throwable error) { host.noteError("callback close failed: " + describe(error)); }
+                });
+                registrationWorker.shutdown();
 
                 List<TelemetryCallbackBatch> pending = new ArrayList<>();
                 synchronized (lock) {
@@ -644,8 +672,6 @@ final class HelperCallbackController implements AutoCloseable {
                     pending.addAll(drainAllLocked(CollectorHelperProtocol.STREAM_SECONDARY));
                 }
                 for (TelemetryCallbackBatch batch : pending) submitBatch(batch);
-                try { platform.close(); }
-                catch (Throwable error) { host.noteError("callback close failed: " + describe(error)); }
                 for (int stream = CollectorHelperProtocol.STREAM_MAIN;
                      stream <= CollectorHelperProtocol.STREAM_SECONDARY; stream++) {
                     streamWorkers[stream].shutdown();
@@ -653,11 +679,10 @@ final class HelperCallbackController implements AutoCloseable {
                 streamWorkersShutdown = true;
             }
 
-            long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(Math.max(0L, timeoutMs));
             for (int stream = CollectorHelperProtocol.STREAM_MAIN;
                  stream <= CollectorHelperProtocol.STREAM_SECONDARY; stream++) {
                 while (!streamWorkers[stream].isTerminated()) {
-                    long remaining = deadline - System.nanoTime();
+                    long remaining = budget - (System.nanoTime() - started);
                     if (remaining <= 0L) break;
                     try { streamWorkers[stream].awaitTermination(remaining, TimeUnit.NANOSECONDS); }
                     catch (InterruptedException error) { interrupted = true; }
@@ -665,8 +690,18 @@ final class HelperCallbackController implements AutoCloseable {
             }
             streamWorkersTerminated = streamWorkers[CollectorHelperProtocol.STREAM_MAIN].isTerminated() &&
                 streamWorkers[CollectorHelperProtocol.STREAM_SECONDARY].isTerminated();
+            long remaining = budget - (System.nanoTime() - started);
+            if (remaining > 0L && !registrationWorker.isTerminated()) {
+                try { registrationWorker.awaitTermination(remaining, TimeUnit.NANOSECONDS); }
+                catch (InterruptedException error) { interrupted = true; }
+            }
             if (interrupted) Thread.currentThread().interrupt();
+            // The return value is the transport-close safety gate: a stalled
+            // vendor unregistration must not prevent persisting already-drained
+            // raw memory slots. Process termination remains the outer gate.
             return streamWorkersTerminated;
+        } finally {
+            closeLock.unlock();
         }
     }
 

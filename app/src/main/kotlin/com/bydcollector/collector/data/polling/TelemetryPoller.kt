@@ -12,6 +12,8 @@ class TelemetryPoller(
     private val onCycleResult: (PollCycleResult) -> Unit = {},
     private val onRuntimeError: (Throwable) -> Unit = {},
     private val onStopped: () -> Unit = {},
+    private val onStarted: () -> Unit = {},
+    private val onCycleDuration: (Long) -> Unit = {},
     private val sleeper: (Long) -> Unit = { Thread.sleep(it) }
 ) {
     private val running = AtomicBoolean(false)
@@ -37,6 +39,24 @@ class TelemetryPoller(
         stopAndJoin(0L)
     }
 
+    /** Stops after the current poll cycle without interrupting a SQLite write in progress. */
+    fun requestStopAfterCurrentCycle() {
+        running.set(false)
+    }
+
+    fun awaitStopped(timeoutMs: Long): Boolean {
+        require(timeoutMs >= 0)
+        val currentWorker = worker
+        if (timeoutMs > 0 && currentWorker != null && currentWorker !== Thread.currentThread()) {
+            currentWorker.join(timeoutMs)
+        }
+        val stopped = currentWorker?.isAlive != true
+        if (stopped) synchronized(this) {
+            if (worker === currentWorker && currentWorker?.isAlive != true) worker = null
+        }
+        return stopped
+    }
+
     @Synchronized
     fun stopAndJoin(timeoutMs: Long): Boolean {
         running.set(false)
@@ -52,6 +72,7 @@ class TelemetryPoller(
 
     private fun loop(sessionId: Long) {
         try {
+            runCatching(onStarted)
             while (running.get()) {
                 val startedAt = clock.elapsedRealtimeMs()
                 try {
@@ -72,6 +93,7 @@ class TelemetryPoller(
                 }
 
                 val elapsed = clock.elapsedRealtimeMs() - startedAt
+                runCatching { onCycleDuration(elapsed.coerceAtLeast(0L)) }
                 val sleepMs = intervalMs - elapsed
                 //keeps the period close to intervalMs without overlapping poll cycles
                 if (running.get() && sleepMs > 0) {

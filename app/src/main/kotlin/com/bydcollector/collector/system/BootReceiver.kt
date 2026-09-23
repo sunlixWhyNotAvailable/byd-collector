@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import com.bydcollector.collector.BydCollectorApplication
+import com.bydcollector.collector.service.CollectorSettings
 
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
@@ -17,6 +18,9 @@ class BootReceiver : BroadcastReceiver() {
         }
         if (action == Intent.ACTION_BOOT_COMPLETED || action == ACTION_QUICKBOOT_POWERON) {
             (context.applicationContext as BydCollectorApplication).updateRuntime.onSystemWake(action)
+        }
+        if (action == Intent.ACTION_MY_PACKAGE_REPLACED) {
+            CollectorSettings(context.applicationContext).markHelperReplacementPending()
         }
         handoffAutoStartRecovery(
             receiver = this,

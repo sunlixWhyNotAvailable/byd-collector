@@ -52,6 +52,23 @@ class CallbackNormalizationWorker(
         return stopped
     }
 
+    /** Stops after the current normalized page completes without interrupting its DB transaction. */
+    fun requestStopAfterCurrentPage() {
+        synchronized(lock) {
+            running.set(false)
+            lock.notifyAll()
+        }
+    }
+
+    fun awaitStopped(timeoutMs: Long): Boolean {
+        require(timeoutMs >= 0)
+        val current = synchronized(lock) { worker }
+        if (timeoutMs > 0 && current != null && current !== Thread.currentThread()) current.join(timeoutMs)
+        val stopped = current?.isAlive != true
+        if (stopped) synchronized(lock) { if (worker === current) worker = null }
+        return stopped
+    }
+
     private fun runLoop() {
         var backoffIndex = 0
         try {

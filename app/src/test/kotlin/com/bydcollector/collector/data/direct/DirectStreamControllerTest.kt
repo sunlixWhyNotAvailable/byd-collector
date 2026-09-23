@@ -14,7 +14,7 @@ import kotlin.test.assertTrue
 class DirectStreamControllerTest {
     @Test fun failedSecondaryConsumerReleasesOnlyItsLeaseUntilExplicitReentry() {
         val wire = FakeWire()
-        val controller = AppStreamController(wire::call)
+        val controller = AppStreamController(elapsedMs = { 0L }, exchange = wire::call)
         try {
             controller.configureDesired(true, true)
             assertTrue(controller.ensureReady())
@@ -37,7 +37,7 @@ class DirectStreamControllerTest {
 
     @Test fun secondaryOnlyAndSeparateStopPreserveOtherStream() {
         val wire = FakeWire()
-        val controller = AppStreamController(wire::call)
+        val controller = AppStreamController(elapsedMs = { 0L }, exchange = wire::call)
         try {
             controller.configureDesired(false, true)
             assertTrue(controller.ensureReady())
@@ -59,7 +59,7 @@ class DirectStreamControllerTest {
 
     @Test fun readinessDoesNotResetEpochOrEnableStoppedStream() {
         val wire = FakeWire()
-        val controller = AppStreamController(wire::call)
+        val controller = AppStreamController(elapsedMs = { 0L }, exchange = wire::call)
         try {
             controller.configureDesired(true, true)
             assertTrue(controller.ensureReady())
@@ -75,7 +75,7 @@ class DirectStreamControllerTest {
 
     @Test fun serviceReleaseLeavesDesiredFallbackAndRecreationReconcilesSettings() {
         val wire = FakeWire()
-        val controller = AppStreamController(wire::call)
+        val controller = AppStreamController(elapsedMs = { 0L }, exchange = wire::call)
         controller.configureDesired(true, true, mainAutonomous = true, secondaryAutonomous = true)
         assertTrue(controller.ensureReady())
         assertEquals(3, wire.autonomyMask)
@@ -98,7 +98,7 @@ class DirectStreamControllerTest {
 
     @Test fun desiredAndAutonomyReconcileWithoutFabricatingAnAppLease() {
         val wire = FakeWire()
-        val controller = AppStreamController(wire::call)
+        val controller = AppStreamController(elapsedMs = { 0L }, exchange = wire::call)
         try {
             controller.configureDesired(true, true, mainAutonomous = true)
             assertEquals(0, wire.claimCount)
@@ -123,7 +123,7 @@ class DirectStreamControllerTest {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         val executor = Executors.newSingleThreadExecutor()
-        val controller = AppStreamController { action, nonce, token, stream, epoch, value ->
+        val controller = AppStreamController(elapsedMs = { 0L }) { action, nonce, token, stream, epoch, value ->
             if (action == P.CONTROL_CLAIM) {
                 entered.countDown()
                 check(release.await(3, TimeUnit.SECONDS))
@@ -153,7 +153,7 @@ class DirectStreamControllerTest {
         val release = CountDownLatch(1)
         val renewed = CountDownLatch(1)
         val executor = Executors.newSingleThreadExecutor()
-        val controller = AppStreamController { action, nonce, token, stream, epoch, value ->
+        val controller = AppStreamController(elapsedMs = { 0L }) { action, nonce, token, stream, epoch, value ->
             if (action == P.CONTROL_PAUSE_FENCE) {
                 entered.countDown()
                 check(release.await(3, TimeUnit.SECONDS))
@@ -186,7 +186,7 @@ class DirectStreamControllerTest {
         val blockFirst = java.util.concurrent.atomic.AtomicBoolean(true)
         val oldOwnerActive = java.util.concurrent.atomic.AtomicBoolean(true)
         val executor = Executors.newSingleThreadExecutor()
-        val controller = AppStreamController { action, nonce, token, stream, epoch, value ->
+        val controller = AppStreamController(elapsedMs = { 0L }) { action, nonce, token, stream, epoch, value ->
             if (action == P.CONTROL_RENEW && blockFirst.compareAndSet(true, false)) {
                 entered.countDown()
                 check(release.await(3, TimeUnit.SECONDS))
@@ -216,7 +216,137 @@ class DirectStreamControllerTest {
         }
     }
 
+    @Test fun repeatedReadinessIsIpcFreeAndOldOwnerCannotReleaseSuccessor() {
+        val wire = FakeWire()
+        val controller = AppStreamController(elapsedMs = { 0L }, exchange = wire::call)
+        val oldOwner = Any()
+        val successor = Any()
+        try {
+            controller.configureDesired(true, true)
+            assertTrue(controller.setConsumerReady(P.STREAM_MAIN, true, oldOwner))
+            val calls = wire.calls
+            repeat(20) {
+                assertTrue(controller.ensureReady(P.STREAM_MAIN))
+                assertTrue(controller.setConsumerReady(P.STREAM_MAIN, true, oldOwner))
+            }
+            assertEquals(calls, wire.calls)
+            assertTrue(controller.setConsumerReady(P.STREAM_MAIN, true, successor))
+            controller.releaseLease(P.STREAM_MAIN, oldOwner)
+            assertNotNull(controller.credentials(P.STREAM_MAIN))
+            controller.releaseLease(P.STREAM_MAIN, successor)
+            assertNull(controller.credentials(P.STREAM_MAIN))
+        } finally { controller.releaseApp() }
+    }
+
+    @Test fun failedRenewalReclaimsRestartedEpochsEvenWhenNumericTokenRepeats() {
+        val wire = FakeWire()
+        val controller = AppStreamController(elapsedMs = { 0L }, exchange = wire::call)
+        val owner = Any()
+        try {
+            controller.configureDesired(true, false)
+            assertTrue(controller.setConsumerReady(P.STREAM_MAIN, true, owner))
+            assertTrue(controller.pauseAndFence(P.STREAM_MAIN))
+            assertTrue(controller.resume(P.STREAM_MAIN))
+            val old = assertNotNull(controller.credentials(P.STREAM_MAIN))
+            wire.restart()
+            controller.renewOnce(P.STREAM_MAIN)
+            assertNull(controller.credentials(P.STREAM_MAIN))
+            assertTrue(controller.setConsumerReady(P.STREAM_MAIN, true, owner))
+            val current = assertNotNull(controller.credentials(P.STREAM_MAIN))
+            assertEquals(old.controllerToken, current.controllerToken)
+            assertTrue(current.generation > old.generation)
+            assertTrue(current.epoch < old.epoch)
+            assertEquals(2, wire.claimCount)
+        } finally { controller.releaseApp() }
+    }
+
+    @Test fun expiredLocalLeaseIsHiddenAndHeartbeatRenewsWithoutAClaim() {
+        val wire = FakeWire()
+        var now = 0L
+        val controller = AppStreamController(elapsedMs = { now }, exchange = wire::call)
+        try {
+            controller.configureDesired(false, true)
+            assertTrue(controller.setConsumerReady(P.STREAM_SECONDARY, true))
+            now = 2_000L
+            assertNull(controller.credentials(P.STREAM_SECONDARY))
+            controller.renewOnce(P.STREAM_SECONDARY)
+            assertNotNull(controller.credentials(P.STREAM_SECONDARY))
+            assertEquals(1, wire.claimCount)
+            assertEquals(2, wire.renewCount)
+        } finally { controller.releaseApp() }
+    }
+
+    @Test fun lateOldHelperReplyCannotOverwriteNewGenerationWithSameToken() {
+        val wire = FakeWire()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val block = java.util.concurrent.atomic.AtomicBoolean(false)
+        val executor = Executors.newSingleThreadExecutor()
+        val controller = AppStreamController(elapsedMs = { 0L }) { action, nonce, token, stream, epoch, value ->
+            val reply = wire.call(action, nonce, token, stream, epoch, value)
+            if (action == P.CONTROL_RENEW && block.compareAndSet(true, false)) {
+                entered.countDown()
+                check(release.await(3, TimeUnit.SECONDS))
+                reply.copy(mainEpoch = 999L)
+            } else reply
+        }
+        try {
+            controller.configureDesired(true, false)
+            assertTrue(controller.setConsumerReady(P.STREAM_MAIN, true))
+            block.set(true)
+            val oldRenew = executor.submit { controller.renewOnce(P.STREAM_MAIN) }
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            controller.invalidateHelper()
+            wire.restart()
+            assertTrue(controller.setConsumerReady(P.STREAM_MAIN, true))
+            val expected = controller.credentials(P.STREAM_MAIN)
+            release.countDown()
+            oldRenew.get(2, TimeUnit.SECONDS)
+            assertEquals(expected, controller.credentials(P.STREAM_MAIN))
+        } finally {
+            release.countDown()
+            controller.releaseApp()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test fun renewalRacingAFenceCannotInvalidateTheNewEpoch() {
+        val wire = FakeWire()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val block = java.util.concurrent.atomic.AtomicBoolean(false)
+        val executor = Executors.newSingleThreadExecutor()
+        val controller = AppStreamController(elapsedMs = { 0L }) { action, nonce, token, stream, epoch, value ->
+            if (action == P.CONTROL_RENEW && block.compareAndSet(true, false)) {
+                entered.countDown()
+                check(release.await(3, TimeUnit.SECONDS))
+            }
+            wire.call(action, nonce, token, stream, epoch, value)
+        }
+        try {
+            controller.configureDesired(false, true)
+            assertTrue(controller.setConsumerReady(P.STREAM_SECONDARY, true))
+            block.set(true)
+            val oldRenew = executor.submit { controller.renewOnce(P.STREAM_SECONDARY) }
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            assertTrue(controller.pauseAndFence(P.STREAM_SECONDARY))
+            assertTrue(controller.resume(P.STREAM_SECONDARY))
+            val expected = controller.credentials(P.STREAM_SECONDARY)
+            release.countDown()
+            oldRenew.get(2, TimeUnit.SECONDS)
+            assertEquals(expected, controller.credentials(P.STREAM_SECONDARY))
+            assertNotNull(expected)
+            assertTrue(controller.ensureReady(P.STREAM_SECONDARY))
+            assertEquals(1, wire.claimCount)
+        } finally {
+            release.countDown()
+            controller.releaseApp()
+            executor.shutdownNow()
+        }
+    }
+
     private class FakeWire {
+        var calls = 0
         var mask = 0
         var autonomyMask = 0
         var claimCount = 0
@@ -225,7 +355,15 @@ class DirectStreamControllerTest {
         private var nonce: String? = null
         private var mainEpoch = 1L
         var secondaryEpoch = 1L
+        @Synchronized fun restart() {
+            nonce = null
+            mainEpoch = 1L
+            secondaryEpoch = 1L
+            mask = 0
+            leaseExpires.fill(0)
+        }
         @Synchronized fun call(action: Int, session: String, token: Long, stream: Int, epoch: Long, value: Int): DirectStreamControlResult {
+            calls++
             if (action == P.CONTROL_CLAIM) {
                 claimCount++
                 if (nonce == null) {
@@ -240,12 +378,15 @@ class DirectStreamControllerTest {
                 if (current != epoch) return DirectStreamControlResult(P.STATUS_STALE_TOKEN, 42, mainEpoch, secondaryEpoch)
                 when (action) {
                     P.CONTROL_SET_DESIRED -> {
+                        val changed = (mask and stream != 0) != (value == 1)
                         mask = if (value == 1) mask or stream else mask and stream.inv()
                         if (value == 0) {
                             autonomyMask = autonomyMask and stream.inv()
                             leaseExpires[stream] = 0L
                         }
-                        if (stream == P.STREAM_MAIN) mainEpoch++ else secondaryEpoch++
+                        if (changed) {
+                            if (stream == P.STREAM_MAIN) mainEpoch++ else secondaryEpoch++
+                        }
                     }
                     P.CONTROL_PAUSE_FENCE, P.CONTROL_RESUME -> {
                         if (stream == P.STREAM_MAIN) mainEpoch++ else secondaryEpoch++

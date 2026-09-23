@@ -39,11 +39,19 @@ class NativeSqliteInstrumentation : Instrumentation() {
     private val prefix = "callback_gate_${UUID.randomUUID()}"
     private val completed = mutableListOf<String>()
     private var routeFixture: String? = null
+    private var listenerFixture: String? = null
+    private var hintFixture = false
+    private var shutdownShellFixture = false
+    private var shutdownLifecycleFixture = false
     private var fixtureLanguage = "uk"
 
     override fun onCreate(arguments: Bundle?) {
         super.onCreate(arguments)
         routeFixture = arguments?.getString("routeFixture")
+        listenerFixture = arguments?.getString("listenerFixture")
+        hintFixture = arguments?.getString("hintFixture") == "true"
+        shutdownShellFixture = arguments?.getString("shutdownShellFixture") == "true"
+        shutdownLifecycleFixture = arguments?.getString("shutdownLifecycleFixture") == "true"
         fixtureLanguage = arguments?.getString("language") ?: "uk"
         start()
     }
@@ -51,6 +59,45 @@ class NativeSqliteInstrumentation : Instrumentation() {
     override fun onStart() {
         if (!isEmulator()) {
             finish(Activity.RESULT_CANCELED, Bundle().apply { putString("stream", "Tests require an emulator") })
+            return
+        }
+        if (hintFixture || shutdownShellFixture || shutdownLifecycleFixture) {
+            val result = runCatching {
+                when {
+                    shutdownLifecycleFixture -> ShutdownShellBehaviorGate.startLifecycle(this)
+                    shutdownShellFixture -> ShutdownShellBehaviorGate.run(this)
+                    else -> HintWindowBehaviorGate.run(this)
+                }
+            }
+            finish(if (result.isSuccess) Activity.RESULT_OK else Activity.RESULT_CANCELED,
+                Bundle().apply { putString("stream", result.getOrElse { it.stackTraceToString() }) })
+            return
+        }
+        listenerFixture?.let { action ->
+            try {
+                val component = android.content.ComponentName(targetContext,
+                    com.bydcollector.collector.system.CollectorNotificationListenerService::class.java)
+                val manager = targetContext.packageManager
+                val prefs = targetContext.getSharedPreferences("shutdown_listener_fixture", 0)
+                val desired = when (action) {
+                    "disable" -> {
+                        if (!prefs.contains("previous")) check(prefs.edit().putInt("previous",
+                            manager.getComponentEnabledSetting(component)).commit())
+                        android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+                    }
+                    "restore" -> {
+                        check(prefs.contains("previous")) { "No saved listener state" }
+                        prefs.getInt("previous", android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DEFAULT)
+                    }
+                    else -> error("Unknown listener fixture action")
+                }
+                manager.setComponentEnabledSetting(component, desired, android.content.pm.PackageManager.DONT_KILL_APP)
+                check(manager.getComponentEnabledSetting(component) == desired)
+                if (action == "restore") check(prefs.edit().remove("previous").commit())
+                finish(Activity.RESULT_OK, Bundle().apply { putString("stream", "LISTENER_FIXTURE $action state=$desired") })
+            } catch (failure: Throwable) {
+                finish(Activity.RESULT_CANCELED, Bundle().apply { putString("stream", failure.stackTraceToString()) })
+            }
             return
         }
         routeFixture?.let { fixture ->
@@ -352,10 +399,12 @@ class NativeSqliteInstrumentation : Instrumentation() {
             db.execSQL("DROP TRIGGER gate_fail_order")
             val initialCallback = store.normalizePendingCallbackPage(normalizer)
             check(initialCallback.processedCount == 1)
+            check(initialCallback.oldestPageReceivedWallMs == baseWall + 5_000)
             assertAppliedSource(initialCallback.latestAppliedSource, NormalizedSourceKind.CALLBACK, 5_000)
             check(text(db, "SELECT value_number FROM vehicle_state_current WHERE field_key='speed_kmh'").toDouble() == 40.0)
             val emptyCallbackPage = store.normalizePendingCallbackPage(normalizer)
             check(emptyCallbackPage.processedCount == 0)
+            check(emptyCallbackPage.oldestPageReceivedWallMs == null)
             assertNoAppliedSource(emptyCallbackPage.latestAppliedSource)
 
             val session = store.openSession("source_order_gate")

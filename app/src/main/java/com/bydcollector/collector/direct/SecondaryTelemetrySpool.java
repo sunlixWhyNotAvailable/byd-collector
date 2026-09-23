@@ -52,6 +52,7 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
 
     private final File directory;
     private final long maxBytes;
+    private final CallbackSpool.RootState rootState;
     private final int expectedFieldCount;
     private final long lossReserveBytes;
     private final FailureInjector failures;
@@ -98,11 +99,15 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
     private SecondaryTelemetrySpool(File directory, long maxBytes, int expectedFieldCount, FailureInjector failures) {
         this.directory = directory;
         this.maxBytes = maxBytes;
+        this.rootState = CallbackSpool.rootState(directory);
         this.expectedFieldCount = expectedFieldCount;
         this.failures = failures;
         this.lossReserveBytes = Math.min(LOSS_RESERVE_BYTES, Math.max(512L, maxBytes / 8L));
-        recoverTemporaries();
-        this.nextOrder = findNextOrder(directory);
+        synchronized (rootState.lock) {
+            rootState.ensureFresh();
+            recoverTemporaries();
+            this.nextOrder = findNextOrder(directory);
+        }
     }
 
     /** Called before use, while the daemon holds its exclusive process-owner lock. */
@@ -120,8 +125,10 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
                         quarantineFile(temporary, "incomplete loss temporary", false);
                         continue;
                     }
-                    Files.move(temporary.toPath(), new File(directory, LOSS_FILE).toPath(),
+                    File target = new File(directory, LOSS_FILE);
+                    Files.move(temporary.toPath(), target.toPath(),
                         StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                    rootState.noteRename(temporary, target);
                     continue;
                 }
                 Record record;
@@ -140,12 +147,15 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
                 File ready = new File(directory, fileStem(record.spoolOrder, record.identity) + READY_SUFFIX);
                 if (!ready.exists()) {
                     Files.move(temporary.toPath(), ready.toPath(), StandardCopyOption.ATOMIC_MOVE);
+                    rootState.noteRename(temporary, ready);
                 } else if (sha256(ready).equals(sha256(temporary))) {
                     Files.delete(temporary.toPath());
+                    rootState.noteDelete(temporary);
                 } else {
                     quarantineFile(temporary, "temporary conflicts with ready record", true);
                 }
             } catch (IOException error) {
+                rootState.invalidate();
                 throw new IllegalStateException("cannot recover secondary temporary: " + temporary.getName(), error);
             }
         }
@@ -159,7 +169,11 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
 
     /** Append one complete logical cycle. No disk work is performed by another callback/lock. */
     public synchronized AppendResult append(Cycle cycle) {
-        synchronized (CallbackSpool.persistenceLock(directory)) {
+        synchronized (rootState.lock) {
+            // Preserve the legacy cycle writer's full quota audit. Directory timestamps alone
+            // can miss rapid external fixture/evidence changes on some filesystems.
+            rootState.invalidate();
+            rootState.ensureFresh();
             return appendShared(cycle);
         }
     }
@@ -221,20 +235,25 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
         try {
             failures.before("append", temporary);
             writeDurably(temporary, bytes);
+            rootState.noteFile(temporary);
             failures.before("append_publish", temporary);
             Files.move(temporary.toPath(), ready.toPath(), StandardCopyOption.ATOMIC_MOVE);
+            rootState.noteRename(temporary, ready);
             baseline = copyValues(cycle.values);
             baselineIdentity = cycle.identity;
             baselineCatalogVersion = cycle.catalogVersion;
             forceFull = false;
             nextOrder++;
-            if (loss != null && !new File(directory, LOSS_FILE).delete()) {
-                notifyPersistenceFailure("clear_loss", new IOException("cannot delete persisted loss summary"));
+            if (loss != null) {
+                File lossFile = new File(directory, LOSS_FILE);
+                if (lossFile.delete()) rootState.noteDelete(lossFile);
+                else notifyPersistenceFailure("clear_loss", new IOException("cannot delete persisted loss summary"));
             }
             notifyAppend(record, bytes.length);
             return full ? AppendResult.FULL : AppendResult.DELTA;
         } catch (IOException error) {
             if (temporary.isFile()) temporary.delete();
+            rootState.invalidate();
             baseline = null;
             baselineIdentity = null;
             baselineCatalogVersion = null;
@@ -253,6 +272,13 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
 
     /** Returns the oldest valid immutable record descriptor, quarantining corrupt evidence. */
     public synchronized Descriptor oldest() {
+        synchronized (rootState.lock) {
+            rootState.ensureFresh();
+            return oldestShared();
+        }
+    }
+
+    private Descriptor oldestShared() {
         ensureOpen();
         File[] files = replayChainFiles();
         java.util.Arrays.sort(files, Comparator.comparing(File::getName));
@@ -298,6 +324,13 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
     }
 
     public synchronized byte[] readSlice(Descriptor descriptor, long offset, int limit) {
+        synchronized (rootState.lock) {
+            rootState.ensureFresh();
+            return readSliceShared(descriptor, offset, limit);
+        }
+    }
+
+    private byte[] readSliceShared(Descriptor descriptor, long offset, int limit) {
         ensureOpen();
         validateDescriptorRequest(descriptor);
         if (offset < 0 || offset > descriptor.length) throw new IllegalArgumentException("invalid offset");
@@ -317,6 +350,13 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
     }
 
     public synchronized AckResult acknowledge(Descriptor descriptor) {
+        synchronized (rootState.lock) {
+            rootState.ensureFresh();
+            return acknowledgeShared(descriptor);
+        }
+    }
+
+    private AckResult acknowledgeShared(Descriptor descriptor) {
         ensureOpen();
         validateDescriptorRequest(descriptor);
         File ready = exactReady(descriptor);
@@ -327,7 +367,9 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
             if (!record.identity.equals(descriptor.identity) || record.spoolOrder != descriptor.spoolOrder) {
                 return AckResult.REJECTED;
             }
-            return ready.delete() ? AckResult.RELEASED : AckResult.REJECTED;
+            if (!ready.delete()) return AckResult.REJECTED;
+            rootState.noteDelete(ready);
+            return AckResult.RELEASED;
         } catch (Exception error) {
             notifyPersistenceFailure("acknowledge", error);
             return AckResult.REJECTED;
@@ -339,6 +381,13 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
      * until the next FULL, preventing a later consumer from silently applying an orphan chain.
      */
     public synchronized int quarantine(Descriptor descriptor, String reason) {
+        synchronized (rootState.lock) {
+            rootState.ensureFresh();
+            return quarantineShared(descriptor, reason);
+        }
+    }
+
+    private int quarantineShared(Descriptor descriptor, String reason) {
         ensureOpen();
         validateDescriptorRequest(descriptor);
         File exact = exactReady(descriptor);
@@ -365,6 +414,13 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
     }
 
     public synchronized Status status() {
+        synchronized (rootState.lock) {
+            rootState.ensureFresh();
+            return statusShared();
+        }
+    }
+
+    private Status statusShared() {
         ensureOpen();
         long bytes = footprintBytes();
         File[] ready = directory.listFiles((dir, name) -> name.endsWith(READY_SUFFIX));
@@ -460,10 +516,12 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
             throw new IllegalStateException("cannot retain rejected secondary record", error);
         }
         if (!file.renameTo(bad)) {
+            rootState.invalidate();
             IOException error = new IOException("cannot quarantine " + file.getName());
             notifyPersistenceFailure("quarantine", error);
             throw new IllegalStateException("cannot retain corrupt secondary record", error);
         }
+        rootState.noteRename(file, bad);
         notifyQuarantine(file.getName(), bytes, safeText(reason));
         return bad;
     }
@@ -477,10 +535,12 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
                 path.substring(0, poisonIndex) + BAD_SUFFIX + path.substring(poisonIndex + POISON_SUFFIX.length())
             );
             if (!marker.renameTo(retained)) {
+                rootState.invalidate();
                 IOException error = new IOException("cannot resolve poison marker " + marker.getName());
                 notifyPersistenceFailure("resolve_poison", error);
                 throw new IllegalStateException("cannot resolve secondary poison marker", error);
             }
+            rootState.noteRename(marker, retained);
         }
     }
 
@@ -496,6 +556,7 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
     }
 
     private void persistLoss(LossSummary loss) {
+        rootState.ensureFresh();
         byte[] bytes = loss.encode().toString().getBytes(StandardCharsets.UTF_8);
         if (bytes.length > lossReserveBytes) throw new IllegalStateException("secondary loss summary exceeds reserve");
         File temporary = new File(directory, LOSS_TMP);
@@ -503,24 +564,21 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
         try {
             failures.before("loss", temporary);
             writeDurably(temporary, bytes);
+            rootState.noteFile(temporary);
             failures.before("loss_publish", temporary);
             Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            rootState.noteRename(temporary, target);
         } catch (IOException error) {
             if (temporary.isFile()) temporary.delete();
+            rootState.invalidate();
             notifyPersistenceFailure("persist_loss", error);
             throw new IllegalStateException("cannot persist secondary loss summary", error);
         }
     }
 
     private long footprintBytes() {
-        File[] files = directory.listFiles();
-        if (files == null) throw new IllegalStateException("cannot list secondary spool: " + directory);
-        long total = 0L;
-        for (File file : files) {
-            if (!file.isFile()) continue;
-            total = Long.MAX_VALUE - total < file.length() ? Long.MAX_VALUE : total + file.length();
-        }
-        return total;
+        rootState.ensureFresh();
+        return rootState.footprintBytes();
     }
 
     private static List<Value> changes(List<Value> before, List<Value> after) {

@@ -15,6 +15,7 @@ import com.bydcollector.collector.util.sharedOperationalEventExecutor
 class CollectorNotificationListenerService : NotificationListenerService() {
     override fun onCreate() {
         super.onCreate()
+        if (CollectorSettings(applicationContext).isUserShutdownRequested()) return
         (applicationContext as BydCollectorApplication).updateRuntime.start("notification_listener")
         AccessHealthRefreshMonitor.start(applicationContext)
         requestRuntimeRecovery("notification_listener_create")
@@ -22,6 +23,10 @@ class CollectorNotificationListenerService : NotificationListenerService() {
 
     override fun onListenerConnected() {
         super.onListenerConnected()
+        if (CollectorSettings(applicationContext).isUserShutdownRequested()) {
+            AccessHealthRefreshMonitor.pause()
+            return
+        }
         AccessHealthRefreshMonitor.start(applicationContext)
         requestRuntimeRecovery("notification_listener_connected")
     }
@@ -39,6 +44,7 @@ class CollectorNotificationListenerService : NotificationListenerService() {
     private fun requestRuntimeRecovery(trigger: String) {
         val appContext = applicationContext
         dispatchOperationalEvent(sharedOperationalEventExecutor) {
+            if (CollectorSettings(appContext).isUserShutdownRequested()) return@dispatchOperationalEvent
             if (CollectorSettings.isDbMaintenanceRunning(appContext)) return@dispatchOperationalEvent
             val store = BydCollectorApplication.store(appContext)
             store.recordEvent(

@@ -10,6 +10,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
+import android.provider.Settings
 import android.view.Display
 import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.service.CollectorSettings
@@ -24,6 +25,24 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
     private var lastProcessedCompletionToken = 0L
     private val presentation = UpdateResultPresentation()
     private val wakePolicy = UpdateWakePolicy()
+    private val hintCreationRetry: UpdateHintCreationRetry by lazy {
+        UpdateHintCreationRetry(
+            nowElapsedMs = { SystemClock.elapsedRealtime() },
+            postDelayed = { task, delayMs -> handler.postDelayed(task, delayMs) },
+            removeCallbacks = { task -> handler.removeCallbacks(task) },
+            isEligible = ::canCreateHint,
+            onEvent = { name, detail -> app.recordUpdateEvent(name, detail) },
+            startAttempt = { resultId, attemptToken ->
+                val snapshot = app.updateChecks.snapshot()
+                val info = (snapshot.uiState as? UpdateUiState.Available)?.info
+                if (snapshot.availableResultId == resultId && info != null) {
+                    app.updateHints.show(resultId, attemptToken, info)
+                } else {
+                    hintCreationRetry.onSkippedBeforeCreation(resultId, attemptToken, "result_unavailable")
+                }
+            }
+        )
+    }
     private var wakeReceiver: BroadcastReceiver? = null
     var ownUiVisible = false
         private set
@@ -32,7 +51,7 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
         handler.post {
             val snapshot = app.updateChecks.snapshot()
             if (app.updateHints.activeResultId != null && app.updateHints.activeResultId != snapshot.availableResultId) {
-                app.updateHints.dismiss("stale_result")
+                cancelHintPresentation("stale_result")
             }
             presentPendingHint()
             processCompletions()
@@ -107,14 +126,14 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
         handler.removeCallbacks(timer)
         UpdateAutoCheckRuntime.onAutoCheckEnabledChanged(enabled = false)
         app.updateChecks.invalidateAutomatic()
-        app.updateHints.dismiss("screen_off")
+        cancelHintPresentation("screen_off")
         app.recordUpdateEvent("auto_check_sleep")
     }
 
     private fun restartAfterWake(source: String) {
         handler.removeCallbacks(timer)
         app.updateChecks.invalidateAutomatic()
-        app.updateHints.dismiss("wake")
+        cancelHintPresentation("wake")
         UpdateAutoCheckRuntime.reset()
         val action = UpdateAutoCheckRuntime.onRuntimeStarted(enabled())
         val manualInFlight = app.updateChecks.hasCurrentManualRequest()
@@ -126,7 +145,7 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
 
     fun onUiVisible() {
         ownUiVisible = true
-        app.updateHints.dismiss("own_ui_visible")
+        cancelHintPresentation("own_ui_visible")
         start("activity")
         applyAction(UpdateAutoCheckRuntime.onForeground(enabled()))
     }
@@ -155,27 +174,51 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
         }
     }
 
-    fun onHintPresented(resultId: Long): Boolean {
-        if (mainDisplayForUpdateHintIfReady(app) == null) {
-            app.updateHints.dismiss("display_not_ready")
+    fun onHintPresented(resultId: Long, attemptToken: Long): Boolean {
+        if (!hintCreationRetry.isCurrentAttachedAttempt(resultId, attemptToken) ||
+            !canCreateHint(resultId)) {
+            hintCreationRetry.cancelAttempt(resultId, attemptToken, "presentation_rejected")
             return false
         }
-        if (ownUiVisible || !started || installing || wakePolicy.sleeping || settings.isUserShutdownRequested()) return false
         return presentation.markPresented(app.updateChecks.snapshot(), resultId)
+    }
+
+    fun canAttachHint(resultId: Long, attemptToken: Long): Boolean =
+        hintCreationRetry.isCurrentCreationAttempt(resultId, attemptToken) && canCreateHint(resultId)
+
+    fun canMaintainHint(resultId: Long, attemptToken: Long): Boolean =
+        hintCreationRetry.isCurrentAttachedAttempt(resultId, attemptToken) && hintEnvironmentReady(resultId)
+
+    fun onHintCreationFailed(resultId: Long, attemptToken: Long, phase: String, errorClass: String): Boolean =
+        hintCreationRetry.onTechnicalFailure(resultId, attemptToken, phase, errorClass)
+
+    fun onHintCreationSkipped(resultId: Long, attemptToken: Long, reason: String): Boolean =
+        hintCreationRetry.onSkippedBeforeCreation(resultId, attemptToken, reason)
+
+    fun onHintCreationAttached(resultId: Long, attemptToken: Long): Boolean =
+        hintCreationRetry.onAttached(resultId, attemptToken)
+
+    fun onHintCreationUnavailable(resultId: Long, attemptToken: Long, reason: String) {
+        hintCreationRetry.cancelAttempt(resultId, attemptToken, reason)
     }
 
     private fun presentPendingHint() {
         val snapshot = app.updateChecks.snapshot()
+        val resultId = snapshot.availableResultId.takeIf { snapshot.uiState is UpdateUiState.Available }
+        hintCreationRetry.offer(resultId)
+        if (resultId == null) {
+            if (app.updateHints.activeResultId != null) cancelHintPresentation("stale_result")
+            return
+        }
         if (mainDisplayForUpdateHintIfReady(app) == null) {
-            app.updateHints.dismiss("display_not_ready")
+            cancelHintPresentation("display_not_ready")
             if (snapshot.uiState is UpdateUiState.Available) {
                 app.recordUpdateEvent("hint_unavailable", "reason=display_not_ready phase=show")
             }
             return
         }
-        if (presentation.canPresentHint(snapshot, ownUiVisible,
-                started && !installing && !wakePolicy.sleeping && !settings.isUserShutdownRequested() && settings.isUpdateHintEnabled())) {
-            app.updateHints.show(checkNotNull(snapshot.availableResultId), (snapshot.uiState as UpdateUiState.Available).info)
+        if (!settings.isUpdateHintEnabled() || !canDrawUpdateHints()) {
+            cancelHintPresentation(if (settings.isUpdateHintEnabled()) "permission_lost" else "disabled")
         }
     }
 
@@ -222,6 +265,7 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
         ownUiVisible = false
         handler.removeCallbacks(timer)
         UpdateAutoCheckRuntime.reset()
+        hintCreationRetry.offer(null)
         app.updateChecks.reset()
         presentation.reset()
         app.updateHints.shutdown()
@@ -238,7 +282,7 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
         awaitingInstallerReturn = false
         handler.removeCallbacks(timer)
         app.updateChecks.invalidateAutomatic()
-        app.updateHints.dismiss("install_started")
+        cancelHintPresentation("install_started")
     }
 
     fun onInstallerLaunched() {
@@ -283,6 +327,30 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
     }
 
     private fun enabled() = started && !wakePolicy.sleeping && settings.isUpdateAutoCheckEnabled() && !settings.isUserShutdownRequested()
+
+    private fun canCreateHint(resultId: Long): Boolean {
+        val snapshot = app.updateChecks.snapshot()
+        return hintEnvironmentReady(resultId) && presentation.canPresentHint(
+            snapshot,
+            ownUiVisible = ownUiVisible,
+            hintEnabled = true
+        )
+    }
+
+    private fun hintEnvironmentReady(resultId: Long): Boolean {
+        val snapshot = app.updateChecks.snapshot()
+        return snapshot.availableResultId == resultId && snapshot.uiState is UpdateUiState.Available &&
+            !ownUiVisible && started && !installing && !wakePolicy.sleeping &&
+            !settings.isUserShutdownRequested() && settings.isUpdateHintEnabled() &&
+            canDrawUpdateHints() && mainDisplayForUpdateHintIfReady(app) != null
+    }
+
+    private fun canDrawUpdateHints(): Boolean = runCatching { Settings.canDrawOverlays(app) }.getOrDefault(false)
+
+    private fun cancelHintPresentation(reason: String) {
+        hintCreationRetry.cancelPending(reason)
+        app.updateHints.dismiss(reason)
+    }
 
     private fun applyAction(action: UpdateAutoCheckAction) {
         if (!started || installing || wakePolicy.sleeping) return

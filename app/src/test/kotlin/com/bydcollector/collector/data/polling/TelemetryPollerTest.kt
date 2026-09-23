@@ -12,6 +12,63 @@ import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 class TelemetryPollerTest {
+    @Test fun diagnosticCycleDurationExcludesSleepAndIncludesFailedWork() {
+        val clock = FakeClock()
+        val durations = Collections.synchronizedList(mutableListOf<Long>())
+        val ended = CountDownLatch(1)
+        val poller = TelemetryPoller(
+            coordinator = object : PollCycleRunner {
+                override fun pollOnce(sessionId: Long): PollCycleResult? {
+                    clock.elapsed += 125
+                    throw IOException("unavailable")
+                }
+            }, clock = clock,
+            onCycleDuration = { durations += it },
+            onStopped = { ended.countDown() },
+            sleeper = { clock.elapsed += it; throw InterruptedException() }
+        )
+        try {
+            assertTrue(poller.start(1))
+            assertTrue(ended.await(2, TimeUnit.SECONDS))
+            assertEquals(listOf(125L), durations)
+        } finally { poller.stopAndJoin(2_000) }
+    }
+
+    @Test
+    fun gracefulStopFinishesCurrentCycleWithoutInterruptingWriteOrStartingAnother() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val committed = java.util.concurrent.atomic.AtomicInteger()
+        val delivered = java.util.concurrent.atomic.AtomicInteger()
+        val poller = TelemetryPoller(
+            coordinator = object : PollCycleRunner {
+                override fun pollOnce(sessionId: Long): PollCycleResult {
+                    entered.countDown()
+                    release.await()
+                    committed.incrementAndGet()
+                    return PollCycleResult(1L, true, null, 1, 1)
+                }
+            },
+            clock = FakeClock(),
+            onCycleResult = { delivered.incrementAndGet() }
+        )
+        try {
+            assertTrue(poller.start(1))
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            poller.requestStopAfterCurrentCycle()
+            assertFalse(poller.awaitStopped(10))
+            assertFalse(poller.start(2))
+            assertEquals(0, committed.get())
+            release.countDown()
+            assertTrue(poller.awaitStopped(2_000))
+            assertEquals(1, committed.get())
+            assertEquals(1, delivered.get())
+        } finally {
+            release.countDown()
+            poller.stopAndJoin(2_000)
+        }
+    }
+
     @Test
     fun stoppedWorkerReleasesOwnershipBeforeAnotherWorkerCanStart() {
         val entered = CountDownLatch(1)

@@ -46,11 +46,12 @@ class AdbLocalClient(
     fun execShell(
         command: String,
         timeoutMs: Int = SHELL_TIMEOUT_MS,
-        allowAuthorizationPrompt: Boolean = false
+        allowAuthorizationPrompt: Boolean = false,
+        authLockTimeoutMs: Long = AUTH_LOCK_TIMEOUT_MS
     ): AdbShellResult {
         cancellation.throwIfCancelled()
         //keeps shell calls serialized with auth so one adb socket owns the rsa prompt/handshake sequence
-        if (!tryAcquireAuthLock()) {
+        if (!tryAcquireAuthLock(authLockTimeoutMs)) {
             return AdbShellResult(
                 ok = false,
                 output = "",
@@ -316,9 +317,9 @@ class AdbLocalClient(
         }
     }
 
-    private fun tryAcquireAuthLock(): Boolean {
+    private fun tryAcquireAuthLock(timeoutMs: Long = AUTH_LOCK_TIMEOUT_MS): Boolean {
         return try {
-            AUTH_LOCK.tryLock(AUTH_LOCK_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            AUTH_LOCK.tryLock(timeoutMs.coerceAtLeast(0L), TimeUnit.MILLISECONDS)
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
             throw AdbOperationCancelledException()

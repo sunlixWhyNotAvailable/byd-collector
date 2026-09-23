@@ -13,13 +13,22 @@ class VehicleStateNormalizer(
         .map { it.key }
         .toSet()
 ) {
+    private val telemetryFields = catalog.filter {
+        it.category != NormalizedCategory.LOCATION && it.normalizerId != "power_session_energy"
+    }
+    private val fieldIndicesBySource = buildMap<String, MutableList<Int>> {
+        telemetryFields.forEachIndexed { index, field ->
+            field.sourceKeys.forEach { source -> getOrPut(source) { mutableListOf() }.add(index) }
+        }
+    }
+
     fun normalize(
         pollId: Long,
         observedAt: String,
         readings: List<PollReading>
     ): List<NormalizedObservation> {
         val byKey = readings.associateBy { it.rawKey }
-        return catalog.filter { it.category != NormalizedCategory.LOCATION && it.normalizerId != "power_session_energy" }.map { field ->
+        return telemetryFields.map { field ->
             normalizeField(field, byKey, pollId, observedAt)
         }
     }
@@ -203,10 +212,15 @@ class VehicleStateNormalizer(
         affectedSourceKeys: Set<String>
     ): List<NormalizedObservation> {
         if (affectedSourceKeys.isEmpty()) return emptyList()
-        val readings = inputs.mapValues { it.value.reading }
-        return catalog.asSequence()
-            .filter { it.category != NormalizedCategory.LOCATION && it.normalizerId != "power_session_energy" }
-            .filter { field -> field.sourceKeys.any(affectedSourceKeys::contains) }
+        val affectedFields = affectedSourceKeys.asSequence()
+            .flatMap { fieldIndicesBySource[it].orEmpty().asSequence() }
+            .distinct().sorted().map(telemetryFields::get).toList()
+        val readings = buildMap {
+            affectedFields.forEach { field -> field.sourceKeys.forEach { key ->
+                inputs[key]?.let { put(key, it.reading) }
+            } }
+        }
+        return affectedFields.asSequence()
             .mapNotNull { field ->
                 val composite = field.normalizerId == "charging_time_remaining_hh_mm_ss" ||
                     field.normalizerId in DERIVED_HV_POWER_NORMALIZERS

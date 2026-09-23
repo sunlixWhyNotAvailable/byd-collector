@@ -72,29 +72,30 @@ class KeepAliveSupervisor(
         return try {
             val nowMs = clockMs()
             val userShutdown = CollectorSettings(context.applicationContext, store).isUserShutdownRequested()
-            val configChanged = reconcileState.configChanged(config, userShutdown)
+            val effectiveConfig = if (userShutdown) KeepAliveConfig(false, false, false, false) else config
+            val configChanged = reconcileState.configChanged(effectiveConfig, userShutdown)
             val shouldStopDisabledDaemon = forceStatusCheck ||
                 reconcileState.shouldStopDaemonForDisabledConfig(configChanged)
-            if (config.keepBluetooth) reconcileState.markBluetoothProfilesMayBeOverridden()
-            val shouldRestoreBluetoothProfiles = reconcileState.shouldRestoreBluetoothProfiles(config)
+            if (effectiveConfig.keepBluetooth) reconcileState.markBluetoothProfilesMayBeOverridden()
+            val shouldRestoreBluetoothProfiles = reconcileState.shouldRestoreBluetoothProfiles(effectiveConfig)
             if (
                 canReuseKeepAliveStatus(
-                    anyEnabled = config.anyEnabled,
+                    anyEnabled = effectiveConfig.anyEnabled,
                     forceStatusCheck = forceStatusCheck,
                     configChanged = configChanged,
                     shouldRestoreBluetoothProfiles = shouldRestoreBluetoothProfiles,
                     aliveFresh = reconcileState.aliveFresh(nowMs)
                 )
             ) return true
-            if (!config.anyEnabled && !shouldStopDisabledDaemon && !shouldRestoreBluetoothProfiles) return true
+            if (!effectiveConfig.anyEnabled && !shouldStopDisabledDaemon && !shouldRestoreBluetoothProfiles) return true
 
             val shell = shellFactory()
             if (configChanged) {
                 //writes every flag before launch/stop so the daemon loop observes a complete desired state
-                for (command in KeepAliveShellPlanner.mirrorSettingsCommands(config, userShutdown)) {
+                for (command in KeepAliveShellPlanner.mirrorSettingsCommands(effectiveConfig, userShutdown)) {
                     if (!runCommand(shell, command, "keep_alive_setting_sync").ok) return false
                 }
-                if (config.anyEnabled) reconcileState.markConfigApplied(config, userShutdown)
+                if (effectiveConfig.anyEnabled) reconcileState.markConfigApplied(effectiveConfig, userShutdown)
             }
             if (shouldRestoreBluetoothProfiles) {
                 val rollback = runCommand(
@@ -106,7 +107,7 @@ class KeepAliveSupervisor(
                 reconcileState.markBluetoothProfilesRestored()
             }
 
-            if (config.anyEnabled) {
+            if (effectiveConfig.anyEnabled) {
                 val status = runCommand(shell, KeepAliveShellPlanner.daemonStatusCommand(), "keep_alive_daemon_status")
                 if (status.ok) {
                     reconcileState.markAlive(clockMs())
@@ -137,7 +138,7 @@ class KeepAliveSupervisor(
                 //The stop command exits successfully only after the detached daemon is confirmed absent.
                 val stopped = !shouldStopDisabledDaemon ||
                     runCommand(shell, KeepAliveShellPlanner.daemonStopCommand(), "keep_alive_daemon_stop").ok
-                if (stopped && configChanged) reconcileState.markConfigApplied(config, userShutdown)
+                if (stopped && configChanged) reconcileState.markConfigApplied(effectiveConfig, userShutdown)
                 stopped
             }
         } catch (error: RuntimeException) {
@@ -163,6 +164,11 @@ class KeepAliveSupervisor(
             false
         }
     }
+
+    /** Cancels queued reconciles and proves any already-running shell writer has exited. */
+    fun quiesceForUserShutdown(timeoutMs: Long): Boolean = shutdownAndAwait(timeoutMs)
+
+    fun isShutdown(): Boolean = executor.isShutdown
 
     private fun runCommand(shell: KeepAliveShell, command: String, category: String): KeepAliveShellResult {
         val result = shell.exec(command, timeoutMs = 10_000)

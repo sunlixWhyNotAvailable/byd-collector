@@ -1,5 +1,8 @@
 package com.bydcollector.collector.adb
 
+import com.bydcollector.collector.data.direct.DirectFidEntry
+import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
+import com.bydcollector.collector.data.direct.DirectVehicleHelper
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -11,6 +14,36 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class AdbPipelineCoordinatorTest {
+    @Test
+    fun helperReadinessAcceptsBothOwnerModesWithoutRepairDelay() {
+        for (mode in DirectHelperOwnerMode.entries) {
+            var pings = 0
+            val helper = object : DirectVehicleHelper {
+                override fun isAlive(): Boolean { pings++; return true }
+                override fun ownerMode() = mode
+                override fun read(entry: DirectFidEntry) =
+                    error("readiness must not read telemetry")
+            }
+            assertTrue(AdbAuthorizationManager.helperReadyAfterRebind(AdbCancellation(), helper) {
+                error("a live helper must not wait for a mode change")
+            })
+            assertEquals(1, pings)
+        }
+    }
+
+    @Test
+    fun unavailableHelperGetsOneRebindWaitAndAFreshProbe() {
+        var alive = false
+        var pings = 0
+        val helper = object : DirectVehicleHelper {
+            override fun isAlive(): Boolean { pings++; return alive }
+            override fun read(entry: DirectFidEntry) =
+                error("readiness must not read telemetry")
+        }
+        assertTrue(AdbAuthorizationManager.helperReadyAfterRebind(AdbCancellation(), helper) { alive = true })
+        assertEquals(2, pings)
+    }
+
     @Test
     fun successfulObservationDeliversTerminalExactlyOnce() {
         val coordinator = AdbPipelineCoordinator()

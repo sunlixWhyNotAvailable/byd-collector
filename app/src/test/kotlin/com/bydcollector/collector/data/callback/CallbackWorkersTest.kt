@@ -11,6 +11,63 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlin.test.*
 
 class CallbackWorkersTest {
+    @Test fun `graceful intake stop finishes active commit and ACK without draining backlog`() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val operations = CopyOnWriteArrayList<String>()
+        val statuses = CopyOnWriteArrayList<CallbackIntakeStatus>()
+        val worker = CallbackIntakeWorker("test-graceful-intake", drain = {
+            operations += "begin"
+            entered.countDown()
+            release.await() // interruption here would lose the active transaction
+            operations += "commit"
+            operations += "ack"
+            progressResult() // more backlog exists; Shutdown must not drain it all
+        }, onStatus = { statuses += it })
+        try {
+            assertTrue(worker.start())
+            await(entered, "No active intake batch")
+            worker.requestStopAfterCurrentBatch()
+            assertFalse(worker.awaitStopped(10), "Blocked batch is not finished")
+            assertFalse(worker.start(), "Must not overlap a closing batch")
+            assertEquals(listOf("begin"), operations.toList())
+            release.countDown()
+            assertTrue(worker.awaitStopped(2_000))
+            assertEquals(listOf("begin", "commit", "ack"), operations.toList())
+            assertEquals(1L, statuses.last().persistedEvents)
+            assertEquals(CallbackIntakeCondition.STOPPED, statuses.last().condition)
+        } finally {
+            release.countDown()
+            worker.stopAndJoin(2_000)
+        }
+    }
+
+    @Test fun `graceful normalization stop completes one active page without another page`() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val committed = AtomicInteger()
+        val worker = CallbackNormalizationWorker("test-graceful-normalization", drainPage = {
+            entered.countDown()
+            release.await()
+            committed.incrementAndGet()
+            true
+        })
+        try {
+            assertTrue(worker.start())
+            await(entered, "No active normalization page")
+            worker.requestStopAfterCurrentPage()
+            worker.signal() // late producer must not restart normalization during shutdown
+            assertFalse(worker.awaitStopped(10))
+            assertEquals(0, committed.get())
+            release.countDown()
+            assertTrue(worker.awaitStopped(2_000))
+            assertEquals(1, committed.get())
+        } finally {
+            release.countDown()
+            worker.stopAndJoin(2_000)
+        }
+    }
+
     @Test fun `intake gates helper access and uses bounded pending backoff reset by progress`() {
         val ready = AtomicBoolean(false)
         val calls = AtomicInteger()

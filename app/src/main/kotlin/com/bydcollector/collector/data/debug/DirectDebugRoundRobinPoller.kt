@@ -70,6 +70,7 @@ internal class SecondaryOwnershipHandover(
             // A previously interrupted handover can leave the stream already paused, making this fence idempotent.
             val expectedPausedEpoch = nextEpoch(initialIdentity.epoch)
             if (pausedIdentity.controllerToken != initialIdentity.controllerToken ||
+                pausedIdentity.generation != initialIdentity.generation ||
                 (pausedIdentity.epoch != initialIdentity.epoch && pausedIdentity.epoch != expectedPausedEpoch)
             ) {
                 pending("secondary ownership changed during pause/fence")
@@ -89,6 +90,7 @@ internal class SecondaryOwnershipHandover(
                 val afterFailedResume = currentIdentity()
                 if (afterFailedResume == null ||
                     afterFailedResume.controllerToken != pausedIdentity.controllerToken ||
+                    afterFailedResume.generation != pausedIdentity.generation ||
                     afterFailedResume.epoch != pausedIdentity.epoch
                 ) {
                     pending("secondary ownership changed during resume")
@@ -99,6 +101,7 @@ internal class SecondaryOwnershipHandover(
 
             val resumedIdentity = currentIdentity() ?: pending("secondary ownership is not ready after resume")
             if (resumedIdentity.controllerToken != pausedIdentity.controllerToken ||
+                resumedIdentity.generation != pausedIdentity.generation ||
                 resumedIdentity.epoch != nextEpoch(pausedIdentity.epoch)
             ) {
                 pending("secondary ownership changed during resume")
@@ -166,7 +169,8 @@ class DirectDebugRoundRobinPoller(
     private val onStopped: () -> Unit = {},
     private val handoverIdentity: () -> DirectStreamCredentials?,
     private val databaseMaintenanceGate: DatabaseMaintenanceGate? = null,
-    private val ownerActive: () -> Boolean = { true }
+    private val ownerActive: () -> Boolean = { true },
+    private val onCycleDuration: (Long) -> Unit = {}
 ) {
     private val running = AtomicBoolean(false)
     private val stopRequested = AtomicBoolean(false)
@@ -210,7 +214,11 @@ class DirectDebugRoundRobinPoller(
                         val cycleStartedElapsed = clock.elapsedRealtimeMs()
                         val startedAt = clock.nowIso()
                         val summary = try {
-                            pollOnce(opened, safeBatchSize, startedAt)
+                            try {
+                                pollOnce(opened, safeBatchSize, startedAt)
+                            } finally {
+                                runCatching { onCycleDuration((clock.elapsedRealtimeMs() - cycleStartedElapsed).coerceAtLeast(0L)) }
+                            }
                         } catch (_: SecondaryReplayPendingException) {
                             if (!stopRequested.get() && !Thread.currentThread().isInterrupted) {
                                 Thread.sleep(handoverRetryDelayMs(handoverRetryAttempt))
@@ -276,8 +284,20 @@ class DirectDebugRoundRobinPoller(
 
     fun shutdownAndAwait(reason: String = "shutdown", timeoutMs: Long): Boolean {
         stop(reason)
+        return awaitTermination(timeoutMs)
+    }
+
+    /** Lets the current read/write cycle finish without interrupting an in-flight SQLite transaction. */
+    fun requestStopAfterCurrentCycle(reason: String) {
+        stopReason = reason
+        stopRequested.set(true)
+        future?.cancel(false)
+        executor.shutdown()
+    }
+
+    fun awaitTermination(timeoutMs: Long): Boolean {
         return try {
-            executor.awaitTermination(timeoutMs, TimeUnit.MILLISECONDS)
+            executor.awaitTermination(timeoutMs.coerceAtLeast(0L), TimeUnit.MILLISECONDS)
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
             false

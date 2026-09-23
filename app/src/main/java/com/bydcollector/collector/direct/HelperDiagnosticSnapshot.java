@@ -1,5 +1,7 @@
 package com.bydcollector.collector.direct;
 
+import com.bydcollector.collector.diagnostics.BoundedProcessWindow;
+
 import org.json.JSONObject;
 
 //Immutable helper/spool diagnostic state. Raw telemetry stays in its own spool.
@@ -44,6 +46,10 @@ final class HelperDiagnosticSnapshot {
     final long callbackSecondaryQueueHighWaterBytes;
     final long callbackQueueLossCount;
     final String callbackRetryReason;
+    final BoundedProcessWindow.Snapshot performanceWindow;
+    final CallbackSpoolBinder.Footprint callbackFootprint;
+    final String callbackFootprintError;
+    final Long callbackFootprintSampleElapsedMs;
 
     HelperDiagnosticSnapshot(
         String bootId,
@@ -85,7 +91,11 @@ final class HelperDiagnosticSnapshot {
         long callbackSecondaryQueueOldestAgeMs,
         long callbackSecondaryQueueHighWaterBytes,
         long callbackQueueLossCount,
-        String callbackRetryReason
+        String callbackRetryReason,
+        BoundedProcessWindow.Snapshot performanceWindow,
+        CallbackSpoolBinder.Footprint callbackFootprint,
+        String callbackFootprintError,
+        Long callbackFootprintSampleElapsedMs
     ) {
         this.bootId = bootId;
         this.pid = pid;
@@ -127,6 +137,10 @@ final class HelperDiagnosticSnapshot {
         this.callbackSecondaryQueueHighWaterBytes = callbackSecondaryQueueHighWaterBytes;
         this.callbackQueueLossCount = callbackQueueLossCount;
         this.callbackRetryReason = callbackRetryReason;
+        this.performanceWindow = performanceWindow;
+        this.callbackFootprint = callbackFootprint;
+        this.callbackFootprintError = callbackFootprintError;
+        this.callbackFootprintSampleElapsedMs = callbackFootprintSampleElapsedMs;
     }
 
     JSONObject toJson(long observedWallMs, long observedElapsedMs) throws Exception {
@@ -140,6 +154,8 @@ final class HelperDiagnosticSnapshot {
         json.put("observed_wall_ms", observedWallMs);
         json.put("observed_elapsed_ms", observedElapsedMs);
         json.put("current_bytes", currentBytes == null ? JSONObject.NULL : currentBytes);
+        json.put("current_bytes_scope", "legacy_main_worker_spool");
+        json.put("main_worker_spool_bytes", currentBytes == null ? JSONObject.NULL : currentBytes);
         json.put("pending_ready_records", pendingReadyRecords == null ? JSONObject.NULL : pendingReadyRecords);
         json.put("cap_bytes", capBytes);
         json.put("observation_peak_bytes", observationPeakBytes == null ? JSONObject.NULL : observationPeakBytes);
@@ -177,6 +193,34 @@ final class HelperDiagnosticSnapshot {
         json.put("callback_secondary_queue_high_water_bytes", callbackSecondaryQueueHighWaterBytes);
         json.put("callback_queue_loss_count", callbackQueueLossCount);
         json.put("callback_retry_reason", callbackRetryReason == null ? JSONObject.NULL : callbackRetryReason);
+        json.put("performance_window",
+            performanceWindow == null ? JSONObject.NULL : performanceWindow.toJson());
+        json.put("performance_window_scope", "vendor_read_batch");
+        json.put("callback_spool_disk_footprint_status",
+            callbackFootprint != null ? "available" : callbackFootprintError != null ? "unavailable" : "not_sampled");
+        json.put("callback_spool_status_error",
+            callbackFootprintError == null ? JSONObject.NULL : callbackFootprintError);
+        json.put("callback_spool_status_sample_elapsed_ms",
+            callbackFootprintSampleElapsedMs == null ? JSONObject.NULL : callbackFootprintSampleElapsedMs);
+        json.put("callback_spool_status_age_ms",
+            callbackFootprintSampleElapsedMs == null ? JSONObject.NULL
+                : Math.max(0L, observedElapsedMs - callbackFootprintSampleElapsedMs));
+        json.put("callback_main_spool_disk_bytes",
+            callbackFootprint == null ? JSONObject.NULL : callbackFootprint.mainDiskBytes);
+        json.put("callback_main_spool_ready_batches",
+            callbackFootprint == null ? JSONObject.NULL : callbackFootprint.mainReadyBatches);
+        json.put("callback_main_spool_quarantined_files",
+            callbackFootprint == null ? JSONObject.NULL : callbackFootprint.mainQuarantinedFiles);
+        json.put("callback_secondary_spool_disk_bytes",
+            callbackFootprint == null ? JSONObject.NULL : callbackFootprint.secondaryDiskBytes);
+        json.put("callback_secondary_spool_ready_batches",
+            callbackFootprint == null ? JSONObject.NULL : callbackFootprint.secondaryReadyBatches);
+        json.put("callback_secondary_spool_quarantined_files",
+            callbackFootprint == null ? JSONObject.NULL : callbackFootprint.secondaryQuarantinedFiles);
+        json.put("callback_main_live_retained_bytes",
+            callbackFootprint == null ? JSONObject.NULL : callbackFootprint.mainLiveRetainedBytes);
+        json.put("callback_secondary_live_retained_bytes",
+            callbackFootprint == null ? JSONObject.NULL : callbackFootprint.secondaryLiveRetainedBytes);
         return json;
     }
 }

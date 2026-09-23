@@ -101,6 +101,33 @@ class AdbLocalClientTest {
     }
 
     @Test
+    fun shutdownShellHasABoundedWaitForAnOccupiedAuthorizationLock() {
+        BlockingAdbServer().use { server ->
+            val cancellation = AdbCancellation()
+            val client = AdbLocalClient(
+                keyDir = Files.createTempDirectory("bydcollector-adb-shutdown").toFile(),
+                endpoints = listOf(AdbEndpoint("127.0.0.1", server.port)),
+                cancellation = cancellation
+            )
+            val busy = thread(name = "adb-busy-before-shutdown") {
+                runCatching { client.checkAuthorization() }
+            }
+            try {
+                assertTrue(server.awaitAccepted())
+                val started = System.nanoTime()
+                val result = client.execShell("must-not-execute", authLockTimeoutMs = 25)
+                assertFalse(result.ok)
+                assertTrue(result.error.orEmpty().contains("auth lock timeout"))
+                assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started) < 1_000)
+            } finally {
+                cancellation.cancel()
+                busy.join(2_000)
+                assertFalse(busy.isAlive)
+            }
+        }
+    }
+
+    @Test
     fun invalidPersistentKeyIsNotAutomaticallyReplaced() {
         val keyDir = Files.createTempDirectory("bydcollector-adb-test").toFile()
         val privateFile = keyDir.resolve("adb_key.priv")

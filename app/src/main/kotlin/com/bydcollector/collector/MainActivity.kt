@@ -130,6 +130,8 @@ class MainActivity : ComponentActivity() {
     @Volatile private var refreshInFlight = false
     @Volatile private var foreground = false
     @Volatile private var destroyed = false
+    private var shutdownUiRequested = false
+    private var shutdownReopenInFlight = false
     private val archiveShareInFlight = AtomicBoolean(false)
 
     private val navigationSession: UiSessionState
@@ -198,6 +200,9 @@ class MainActivity : ComponentActivity() {
     }
     private val currentTripRefreshTask = Runnable { refreshCurrentTrip() }
     private val settingsChangeListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == CollectorSettings.KEY_USER_SHUTDOWN_PHASE) {
+            handler.post { if (!destroyed && shutdownUiRequested) observeShutdownPhase() }
+        }
         if (
             key == CollectorSettings.KEY_TELEGRAM_CONNECTION_STATUS ||
             key == CollectorSettings.KEY_TELEGRAM_CONNECTION_MESSAGE ||
@@ -637,15 +642,27 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onShutdownApp() {
-            refreshStoreBackedState()
-            settings.setUserShutdownRequested(true)
+            if (shutdownReopenInFlight || CollectorService.isUserShutdownInProgress()) return
+            if (!settings.setUserShutdownRequested(true)) {
+                showShutdownFailure("Could not save Shutdown request")
+                return
+            }
+            shutdownUiRequested = true
+            handler.removeCallbacks(startupAdbSelfCheckTask)
+            startupAdbSelfCheckPosted = false
+            handler.removeCallbacks(telegramReconcileTask)
             CollectorAutoStart.cancelScheduled(applicationContext)
-            navigationSession.clear()
             updateRuntime.shutdown()
             updateUiGeneration += 1L
             updateUiState = UpdateUiState.Hidden
-            CollectorServiceController.shutdown(this@MainActivity)
-            finishAndRemoveTask()
+            try {
+                CollectorServiceController.shutdown(this@MainActivity)
+            } catch (error: RuntimeException) {
+                shutdownUiRequested = false
+                settings.setUserShutdownPhase(CollectorSettings.SHUTDOWN_PHASE_ERROR,
+                    detail = "${error::class.java.simpleName}: ${error.message}")
+                showShutdownFailure(settings.userShutdownDetail().orEmpty())
+            }
         }
 
         override fun onStartLogcat() {
@@ -670,6 +687,9 @@ class MainActivity : ComponentActivity() {
         CollectorService.influxRuntimeDiagnostics.attachJournal(applicationContext)
         navigationSessionGeneration = navigationSession.captureGeneration()
         settings = CollectorSettings(applicationContext)
+        val restoredShutdownInThisProcess = savedInstanceState?.getInt("shutdownOwnerPid") == android.os.Process.myPid()
+        shutdownUiRequested = restoredShutdownInThisProcess &&
+            savedInstanceState?.getBoolean("shutdownUiRequested", false) == true && settings.isUserShutdownRequested()
         uiLanguage = UiLanguage.fromCode(settings.uiLanguageCode())
         updateHintEnabled = settings.isUpdateHintEnabled()
         updateHintAppearance = settings.updateHintAppearance()
@@ -677,11 +697,6 @@ class MainActivity : ComponentActivity() {
         settingsPreferences.registerOnSharedPreferenceChangeListener(settingsChangeListener)
         if (!CollectorService.isMaintenanceRunningInProcess() && !DatabaseMaintenanceService.isRunning()) {
             settings.recoverInterruptedDbMaintenanceIfNeeded("activity_start")
-        }
-        val clearedUserShutdown = settings.clearUserShutdownRequestIfSet()
-        if (clearedUserShutdown) {
-            settings.clearRuntimeManualStops()
-            updateRuntime.shutdown()
         }
         updateChecks.addListener(updateCheckListener)
         stateProvider = DashboardStateProvider(applicationContext, { BydCollectorApplication.store(applicationContext) }, settings)
@@ -774,13 +789,19 @@ class MainActivity : ComponentActivity() {
                     runtimeStore,
                     eventExecutor = dashboardExecutor
                 )
-                if (clearedUserShutdown) {
-                    CollectorAutoStart.recoverFromForeground(applicationContext, settings, runtimeStore)
-                }
                 reconcileCutoverArchiveStorageIfNeeded()
                 hydrateDashboardTabsOnce()
             }
         }
+        // Recreation or a service-driven entry is not consent to undo explicit Shutdown.
+        if (shutdownUiRequested) observeShutdownPhase()
+        else if (savedInstanceState == null || !restoredShutdownInThisProcess) reopenAfterExplicitLauncherEntry(intent)
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("shutdownUiRequested", shutdownUiRequested)
+        outState.putInt("shutdownOwnerPid", android.os.Process.myPid())
+        super.onSaveInstanceState(outState)
     }
 
     override fun onStart() {
@@ -817,8 +838,99 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        reopenAfterExplicitLauncherEntry(intent)
         consumeUpdateHintOpen()
         syncUpdateCheckUi()
+    }
+
+    private fun observeShutdownPhase() {
+        if (!settings.isUserShutdownRequested()) return
+        when (settings.userShutdownPhase()) {
+            CollectorSettings.SHUTDOWN_PHASE_HANDOFF -> {
+                shutdownUiRequested = false
+                navigationSession.clear()
+                finishAndRemoveTask()
+            }
+            CollectorSettings.SHUTDOWN_PHASE_ERROR -> {
+                shutdownUiRequested = false
+                showShutdownFailure(settings.userShutdownDetail().orEmpty())
+            }
+        }
+    }
+
+    private fun showShutdownFailure(detail: String) {
+        val label = if (uiLanguage == UiLanguage.UK) "Завершення роботи не виконане" else "Shutdown did not complete"
+        Toast.makeText(this, "$label: $detail", Toast.LENGTH_LONG).show()
+    }
+
+    private fun reopenAfterExplicitLauncherEntry(entry: Intent?) {
+        if (entry?.action != Intent.ACTION_MAIN || !entry.hasCategory(Intent.CATEGORY_LAUNCHER)) return
+        if (!settings.isUserShutdownRequested() && settings.shutdownListenerPreviousState() == null &&
+            settings.userShutdownPhase() == CollectorSettings.SHUTDOWN_PHASE_IDLE) return
+        if (shutdownReopenInFlight) return
+        if (CollectorService.isUserShutdownInProgress()) {
+            shutdownUiRequested = true
+            observeShutdownPhase()
+            return
+        }
+        shutdownReopenInFlight = true
+        // Cancelling the detached finalizer needs local ADB; never block Activity creation on it.
+        diagnosticsExecutor.execute {
+            var previousShutdownFailure: String? = null
+            val result = runCatching {
+                CollectorService.clearShutdownForExplicitReopen(applicationContext) { previousShutdownFailure = it }
+            }
+            runOnUiThread {
+                shutdownReopenInFlight = false
+                if (destroyed) return@runOnUiThread
+                if (result.getOrDefault(false)) {
+                    shutdownUiRequested = false
+                    previousShutdownFailure?.let { showShutdownFailure(it) }
+                    updateRuntime.shutdown()
+                    updateRuntime.start("explicit_reopen")
+                    if (foreground) updateRuntime.onUiVisible()
+                    dashboardExecutor.execute {
+                        if (settings.isUserShutdownRequested()) return@execute
+                        val pendingCutover = settings.storageCutoverJournal()
+                        runCatching {
+                            if (pendingCutover?.family == DirectDebugDatabaseHelper.SCHEMA_FAMILY) {
+                                check(BydCollectorApplication.ensureDebugStorageReady(applicationContext)) {
+                                    "Secondary storage recovery did not complete"
+                                }
+                            }
+                            val runtimeStore = currentStore() // existing Main recovery runs before open
+                            check(settings.storageCutoverJournal() == null) {
+                                "Storage cutover remains pending after explicit reopening"
+                            }
+                            if (pendingCutover != null) runtimeStore.recordEvent(
+                                "shutdown_cutover_recovery_verified", "Interrupted storage cutover recovered",
+                                "family=${pendingCutover.family} previous_phase=${pendingCutover.phase}"
+                            )
+                            if (!settings.isUserShutdownRequested()) {
+                                CollectorAutoStart.recoverFromForeground(applicationContext, settings, runtimeStore)
+                            }
+                        }.onFailure { error ->
+                            Log.e("BYDCollectorShutdown", "Explicit reopen storage/runtime recovery failed", error)
+                            runOnUiThread {
+                                if (!destroyed && !settings.isUserShutdownRequested()) {
+                                    settings.setUserShutdownPhase(CollectorSettings.SHUTDOWN_PHASE_ERROR,
+                                        detail = "Reopen storage/runtime recovery failed: ${error::class.java.simpleName}: ${error.message}")
+                                    val label = if (uiLanguage == UiLanguage.UK) "Відновлення після Shutdown не завершене"
+                                        else "Recovery after Shutdown did not complete"
+                                    Toast.makeText(this, "$label: ${error.message}", Toast.LENGTH_LONG).show()
+                                }
+                            }
+                        }
+                    }
+                    startupAccessFlowCompleted = false
+                    maybeContinueStartupAccessFlow()
+                    refresh()
+                } else {
+                    showShutdownFailure(result.exceptionOrNull()?.message
+                        ?: settings.userShutdownDetail() ?: "Could not restore runtime after explicit opening")
+                }
+            }
+        }
     }
 
     private fun consumeUpdateHintOpen() {
@@ -852,6 +964,7 @@ class MainActivity : ComponentActivity() {
         //asks the watchdog path to recover service work if the user closes only the activity
         if (
             ::settings.isInitialized &&
+            !settings.isUserShutdownRequested() &&
             !CollectorSettings.isDbMaintenanceRunning(applicationContext)
         ) {
             refreshStoreBackedState()
@@ -1740,6 +1853,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startupHardFlowBlocked(): Boolean {
+        if (settings.isUserShutdownRequested() || shutdownReopenInFlight) return true
         return startupHardFlowBlocked(
             foreground = foreground,
             windowFocused = mainWindowHasFocus,

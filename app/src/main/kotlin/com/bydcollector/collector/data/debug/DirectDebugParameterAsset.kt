@@ -20,13 +20,13 @@ data class DirectDebugParameter(
         require(isAllowedReadTx(tx)) { "Unsupported debug tx: $tx" }
     }
 
-    fun toDirectFidEntry(): DirectFidEntry {
+    private val directEntry: DirectFidEntry by lazy {
         val decoder = when (tx) {
             DirectFidRegistry.TX_GET_FLOAT -> DirectValueDecoder.FLOAT_RAW
             DirectFidRegistry.TX_GET_INT -> DirectValueDecoder.INT_RAW
             else -> error("Unsupported debug tx: $tx")
         }
-        return DirectFidEntry(
+        DirectFidEntry(
             key = key,
             dev = dev,
             fid = fid,
@@ -37,6 +37,8 @@ data class DirectDebugParameter(
             classification = "debug_leftover"
         )
     }
+
+    fun toDirectFidEntry(): DirectFidEntry = directEntry
 }
 
 object DirectDebugParameterAsset {

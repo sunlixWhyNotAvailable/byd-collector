@@ -88,6 +88,49 @@ public final class CallbackSpoolBinder implements AutoCloseable {
         return retainedLiveBytes.get(stream);
     }
 
+    /** Indexed root-disk state plus separately reported in-memory retained batches. */
+    Footprint diagnosticsFootprint() {
+        CallbackSpool.Status mainStatus = main.status();
+        CallbackSpool.Status secondaryStatus = secondary.status();
+        return new Footprint(
+            mainStatus.footprintBytes, mainStatus.readyBatches, mainStatus.quarantinedFiles,
+            secondaryStatus.footprintBytes, secondaryStatus.readyBatches, secondaryStatus.quarantinedFiles,
+            retainedLiveBytes.get(CollectorHelperProtocol.STREAM_MAIN),
+            retainedLiveBytes.get(CollectorHelperProtocol.STREAM_SECONDARY)
+        );
+    }
+
+    static final class Footprint {
+        final long mainDiskBytes;
+        final int mainReadyBatches;
+        final int mainQuarantinedFiles;
+        final long secondaryDiskBytes;
+        final int secondaryReadyBatches;
+        final int secondaryQuarantinedFiles;
+        final long mainLiveRetainedBytes;
+        final long secondaryLiveRetainedBytes;
+
+        Footprint(
+            long mainDiskBytes,
+            int mainReadyBatches,
+            int mainQuarantinedFiles,
+            long secondaryDiskBytes,
+            int secondaryReadyBatches,
+            int secondaryQuarantinedFiles,
+            long mainLiveRetainedBytes,
+            long secondaryLiveRetainedBytes
+        ) {
+            this.mainDiskBytes = mainDiskBytes;
+            this.mainReadyBatches = mainReadyBatches;
+            this.mainQuarantinedFiles = mainQuarantinedFiles;
+            this.secondaryDiskBytes = secondaryDiskBytes;
+            this.secondaryReadyBatches = secondaryReadyBatches;
+            this.secondaryQuarantinedFiles = secondaryQuarantinedFiles;
+            this.mainLiveRetainedBytes = mainLiveRetainedBytes;
+            this.secondaryLiveRetainedBytes = secondaryLiveRetainedBytes;
+        }
+    }
+
     void recordLoss(int stream, TelemetryCallbackQueue.Loss loss) {
         // The spool itself serializes its files and shared per-root quota, independently per stream.
         if (loss != null) spool(stream).recordLoss(loss.count, loss.firstWallMs, loss.lastWallMs, loss.reason);
@@ -244,24 +287,37 @@ public final class CallbackSpoolBinder implements AutoCloseable {
     }
 
     @Override public void close() {
-        for (int stream = 1; stream <= 2; stream++) {
-            synchronized (streamLock(stream)) {
-                closeStream(stream);
-                spool(stream).close();
-            }
-        }
+        closeAndReport();
     }
 
-    private void closeStream(int stream) {
+    /** False reports a retained memory tail that could not be persisted before exit. */
+    boolean closeAndReport() {
+        boolean persisted = true;
+        RuntimeException failure = null;
+        for (int stream = 1; stream <= 2; stream++) {
+            synchronized (streamLock(stream)) {
+                try { persisted &= closeStream(stream); }
+                catch (RuntimeException error) {
+                    if (failure == null) failure = error;
+                    else failure.addSuppressed(error);
+                } finally { spool(stream).close(); }
+            }
+        }
+        if (failure != null) throw failure;
+        return persisted;
+    }
+
+    private boolean closeStream(int stream) {
         LiveRecord retained = live[stream];
-        if (retained == null) return;
+        if (retained == null) return true;
         CallbackSpool.AppendResult result = spill(stream);
-        if (result == CallbackSpool.AppendResult.SUCCESS || result == CallbackSpool.AppendResult.DUPLICATE) return;
+        if (result == CallbackSpool.AppendResult.SUCCESS || result == CallbackSpool.AppendResult.DUPLICATE) return true;
         try {
             TelemetryCallbackBatch batch = TelemetryCallbackBatch.decode(retained.bytes);
             TelemetryCallbackBatch.Event first = batch.events.get(0);
             TelemetryCallbackBatch.Event last = batch.events.get(batch.events.size() - 1);
             spool(stream).recordLoss(batch.events.size(), first.receivedWallMs, last.receivedWallMs, "shutdown_spill");
         } catch (Exception ignored) { }
+        return false;
     }
 }

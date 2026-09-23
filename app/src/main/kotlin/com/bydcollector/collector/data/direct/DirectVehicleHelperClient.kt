@@ -601,7 +601,7 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
         }
     }
 
-    fun requestStop(ownerMode: DirectHelperOwnerMode): DirectHelperStopResult {
+    override fun requestStop(ownerMode: DirectHelperOwnerMode): DirectHelperStopResult {
         return synchronized(lock) {
             val binder = ensureBinder()
                 ?: return@synchronized stopFailure(STATUS_NO_BINDER, "helper binder unavailable")

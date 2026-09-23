@@ -5,10 +5,13 @@ import android.os.Process
 import com.bydcollector.collector.adb.AdbCancellation
 import com.bydcollector.collector.adb.AdbLocalClient
 import com.bydcollector.collector.adb.AdbOperationCancelledException
+import com.bydcollector.collector.adb.AdbShellResult
 import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
+import com.bydcollector.collector.data.direct.DirectStreamController
 import com.bydcollector.collector.data.direct.DirectVehicleHelper
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.direct.CollectorHelperProtocol
+import com.bydcollector.collector.service.CollectorSettings
 import java.util.concurrent.locks.ReentrantLock
 
 //starts and verifies the shell-owned binder helper that reads autoservice for the app uid
@@ -22,7 +25,8 @@ object DirectBridgeManager {
         adbClient: AdbLocalClient,
         helper: DirectVehicleHelper = DirectVehicleHelperClient(),
         ownerMode: DirectHelperOwnerMode = DirectHelperOwnerMode.APP,
-        cancellation: AdbCancellation = AdbCancellation()
+        cancellation: AdbCancellation = AdbCancellation(),
+        shellRunner: ((command: String, timeoutMs: Int) -> AdbShellResult)? = null
     ): DirectBridgeResult {
         cancellation.throwIfCancelled()
         try {
@@ -33,13 +37,54 @@ object DirectBridgeManager {
         }
         try {
             cancellation.throwIfCancelled()
-            // Stream desire is reconciled through DirectStreamController. A live protocol helper
-            // must not be killed merely because its legacy owner-mode label differs.
-            if (helper.isAlive()) {
+            val appContext = context.applicationContext
+            val settings = CollectorSettings(appContext)
+            val updateTime = installedUpdateTime(appContext)
+            val replacementPending = settings.helperReplacementPending(updateTime)
+            if (replacementPending && !settings.markHelperReplacementPending()) {
+                return DirectBridgeResult(false, "Could not persist pending helper replacement")
+            }
+            val helperAlive = helper.isAlive()
+            // Stream desire is reconciled through DirectStreamController. Owner mode is used only
+            // for the helper's guarded stop request, never as a readiness requirement.
+            if (helperAlive && !replacementPending) {
                 return DirectBridgeResult(ok = true, message = "Direct helper already running")
             }
+            val actualOwnerMode = if (helperAlive && replacementPending) helper.ownerMode() else null
+            fun execShell(command: String, timeoutMs: Int): AdbShellResult =
+                shellRunner?.invoke(command, timeoutMs)
+                    ?: adbClient.execShell(command, timeoutMs = timeoutMs)
 
-            val launch = adbClient.execShell(launchCommand(context, ownerMode), timeoutMs = 15_000)
+            if (replacementPending) {
+                if (!settings.helperReplacementAllowed()) {
+                    return DirectBridgeResult(false, "Helper replacement is pending until collection is eligible")
+                }
+                if (updateTime == null) {
+                    return DirectBridgeResult(false, "Installed package update time is unavailable")
+                }
+                if (actualOwnerMode != null) {
+                    val stop = helper.requestStop(actualOwnerMode)
+                    if (!stop.ok) {
+                        return DirectBridgeResult(false, "Direct helper stop failed: ${stop.error ?: stop.status}")
+                    }
+                    cancellation.throwIfCancelled()
+                }
+                val absence = execShell(helperAbsenceCommand(), 10_000)
+                if (!absence.ok) {
+                    return DirectBridgeResult(
+                        false,
+                        absence.error ?: absence.output.ifBlank { "Direct helper did not stop before replacement" }
+                    )
+                }
+                cancellation.throwIfCancelled()
+                if (!settings.helperReplacementAllowed()) {
+                    return DirectBridgeResult(false, "Helper replacement deferred by Shutdown or stopped collection")
+                }
+            }
+
+            cancellation.throwIfCancelled()
+            DirectStreamController.invalidateHelper()
+            val launch = execShell(launchCommand(appContext, ownerMode), 15_000)
             if (!launch.ok) {
                 return DirectBridgeResult(
                     ok = false,
@@ -56,6 +101,15 @@ object DirectBridgeManager {
                 }
                 cancellation.throwIfCancelled()
                 if (helper.isAlive()) {
+                    if (replacementPending) {
+                        if (!settings.helperReplacementAllowed()) {
+                            helper.ownerMode()?.let(helper::requestStop)
+                            return DirectBridgeResult(false, "Helper replacement interrupted by Shutdown or stopped collection")
+                        }
+                        if (!settings.confirmHelperReplacement(updateTime!!)) {
+                            return DirectBridgeResult(false, "Could not confirm the installed helper version")
+                        }
+                    }
                     return DirectBridgeResult(ok = true, message = "Direct helper started")
                 }
             }
@@ -116,6 +170,18 @@ object DirectBridgeManager {
         append("if [ \"${'$'}bootstrap_history_ok\" = 1 ]; then : >$log; ")
         append("else echo HELPER_BOOTSTRAP_HISTORY_PARTIAL >&2; fi; fi; ")
     }
+
+    internal fun helperAbsenceCommand(): String = buildString {
+        append("for i in 1 2 3 4 5; do ")
+        append("pidof ${CollectorHelperProtocol.PROCESS_NAME} >/dev/null 2>&1 || exit 0; sleep 1; done; ")
+        append("if pidof ${CollectorHelperProtocol.PROCESS_NAME} >/dev/null 2>&1; then ")
+        append("echo HELPER_STOP_TIMEOUT >&2; exit 73; fi")
+    }
+
+    @Suppress("DEPRECATION")
+    private fun installedUpdateTime(context: Context): Long? = runCatching {
+        context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime.takeIf { it > 0L }
+    }.getOrNull()
 
     private fun shellQuote(value: String): String {
         return "'" + value.replace("'", "'\\''") + "'"

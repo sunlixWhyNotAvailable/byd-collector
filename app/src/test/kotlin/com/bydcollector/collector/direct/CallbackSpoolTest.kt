@@ -6,6 +6,56 @@ import java.nio.file.Files
 import java.io.RandomAccessFile
 
 class CallbackSpoolTest {
+    @Test fun shutdownPersistsBothUnacknowledgedLiveSlotsBeforeClosingSpools() {
+        val mainRoot = Files.createTempDirectory("callback-shutdown-main").toFile()
+        val secondaryRoot = Files.createTempDirectory("callback-shutdown-secondary").toFile()
+        try {
+            val mainBatch = batch(3, 3)
+            val secondaryBatch = TelemetryCallbackBatch("boot-old", "generation-old", 2, 3, 4,
+                mainBatch.events)
+            val transport = CallbackSpoolBinder(CallbackSpool.openForTest(mainRoot, 128 * 1024L),
+                CallbackSpool.openForTest(secondaryRoot, 128 * 1024L))
+            assertEquals(CallbackSpool.AppendResult.SUCCESS, transport.deliver(mainBatch, true))
+            assertEquals(CallbackSpool.AppendResult.SUCCESS, transport.deliver(secondaryBatch, true))
+            assertTrue(transport.liveRetainedBytes(1) > 0)
+            assertTrue(transport.liveRetainedBytes(2) > 0)
+            assertTrue(transport.closeAndReport())
+            for ((root, expected) in listOf(mainRoot to mainBatch, secondaryRoot to secondaryBatch)) {
+                CallbackSpool.openForTest(root, 128 * 1024L).use { spool ->
+                    val descriptor = spool.oldest()!!
+                    assertArrayEquals(expected.encode(), spool.readSlice(descriptor, 0, CallbackSpool.MAX_SLICE_BYTES))
+                }
+            }
+        } finally {
+            mainRoot.deleteRecursively()
+            secondaryRoot.deleteRecursively()
+        }
+    }
+
+    @Test fun shutdownReportsUnpersistedTailWhenCapacityPreventsSpill() {
+        val mainRoot = Files.createTempDirectory("callback-shutdown-full-main").toFile()
+        val secondaryRoot = Files.createTempDirectory("callback-shutdown-full-secondary").toFile()
+        try {
+            val transport = CallbackSpoolBinder(CallbackSpool.openForTest(mainRoot, 12 * 1024L),
+                CallbackSpool.openForTest(secondaryRoot, 12 * 1024L))
+            assertEquals(CallbackSpool.AppendResult.SUCCESS, transport.deliver(batch(1, 1, 5_000), true))
+            val secondary = TelemetryCallbackBatch("boot", "gen", 2, 1, 1, batch(1, 1).events)
+            assertEquals(CallbackSpool.AppendResult.SUCCESS, transport.deliver(secondary, true))
+            assertFalse(transport.closeAndReport())
+            assertTrue(transport.liveRetainedBytes(1) > 0)
+            CallbackSpool.openForTest(mainRoot, 12 * 1024L).use { spool ->
+                assertEquals("shutdown_spill", spool.status().loss!!.reason)
+                assertNull(spool.oldest())
+            }
+            CallbackSpool.openForTest(secondaryRoot, 12 * 1024L).use { spool ->
+                assertEquals(secondary.identity(), spool.oldest()!!.identity)
+            }
+        } finally {
+            mainRoot.deleteRecursively()
+            secondaryRoot.deleteRecursively()
+        }
+    }
+
     @Test fun pagesExactImmutableBatchAndAckIsIdempotent() {
         val root = Files.createTempDirectory("callback-spool").toFile()
         CallbackSpool.openForTest(root, 128 * 1024L).use { spool ->
@@ -118,6 +168,117 @@ class CallbackSpoolTest {
             assertEquals(older.identity(), main.oldest()!!.identity)
             main.acknowledge(main.oldest()!!)
             assertEquals(newer.identity(), main.oldest()!!.identity)
+        }
+    }
+
+    @Test fun canonicalRootInstancesShareIndexedOrderAndIntegrityAcrossLargeBacklog() {
+        val root = Files.createTempDirectory("callback-index-backlog").toFile()
+        val count = 2_048
+        try {
+            for (order in 0 until count) {
+                val sequence = order.toLong() + 1L
+                val record = batch(sequence, sequence)
+                val bytes = record.encode()
+                val identityDigest = TelemetryCallbackBatch.digest(record.identity().toByteArray(Charsets.UTF_8))
+                val digest = TelemetryCallbackBatch.digest(bytes)
+                val name = String.format(java.util.Locale.US, "cb_%020d_%d_%020d_%s_%s.cbready",
+                    order.toLong(), record.stream, record.batchSequence, identityDigest, digest)
+                root.resolve(name).writeBytes(bytes)
+            }
+
+            val first = CallbackSpool.openForTest(root, 128 * 1024L * 1024L)
+            val second = CallbackSpool.openForTest(java.io.File(root, "."), 128 * 1024L * 1024L)
+            try {
+                assertSame(CallbackSpool.rootState(root), CallbackSpool.rootState(java.io.File(root, ".")))
+                assertSame(CallbackSpool.persistenceLock(root), CallbackSpool.persistenceLock(java.io.File(root, ".")))
+                assertEquals(CallbackSpool.AppendResult.DUPLICATE,
+                    second.append(batch(count.toLong(), count.toLong())))
+
+                for (sequence in 1L..count.toLong()) {
+                    val reader = if (sequence % 2L == 1L) first else second
+                    val acknowledger = if (sequence % 2L == 1L) second else first
+                    val descriptor = reader.oldest()!!
+                    assertEquals(sequence, descriptor.batchSequence)
+                    val raw = reader.readSlice(descriptor, 0L, CallbackSpool.MAX_SLICE_BYTES)
+                    assertEquals(descriptor.length, raw.size.toLong())
+                    assertEquals(descriptor.sha256, TelemetryCallbackBatch.digest(raw))
+                    assertEquals(CallbackSpool.AckResult.RELEASED, acknowledger.acknowledge(descriptor))
+                }
+
+                assertNull(first.oldest())
+                assertEquals(CallbackSpool.AppendResult.SUCCESS, first.append(batch(5_001, 5_001)))
+                assertEquals(CallbackSpool.AppendResult.SUCCESS, second.append(batch(5_002, 5_002)))
+                val appendedFirst = second.oldest()!!
+                assertEquals(count.toLong(), appendedFirst.spoolOrder)
+                assertEquals(5_001L, appendedFirst.batchSequence)
+                assertEquals(CallbackSpool.AckResult.RELEASED, first.acknowledge(appendedFirst))
+                val appendedSecond = first.oldest()!!
+                assertEquals(count.toLong() + 1L, appendedSecond.spoolOrder)
+                assertEquals(5_002L, appendedSecond.batchSequence)
+                assertEquals(CallbackSpool.AckResult.RELEASED, second.acknowledge(appendedSecond))
+            } finally {
+                first.close()
+                second.close()
+            }
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun sameInstanceSelectedCorruptionFailsExactAckThenQuarantinesBeforeRetry() {
+        val root = Files.createTempDirectory("callback-index-corruption").toFile()
+        try {
+            CallbackSpool.openForTest(root, 128 * 1024L).use { spool ->
+                val record = batch(41, 41)
+                assertEquals(CallbackSpool.AppendResult.SUCCESS, spool.append(record))
+                val original = spool.oldest()!!
+                assertEquals(CallbackSpool.AppendResult.DUPLICATE, spool.append(record))
+
+                val stored = root.resolve(original.fileName)
+                val changed = stored.readBytes()
+                changed[changed.lastIndex] = (changed.last().toInt() xor 1).toByte()
+                stored.writeBytes(changed)
+
+                var exactAckRejected = false
+                try { spool.acknowledge(original) }
+                catch (_: IllegalArgumentException) { exactAckRejected = true }
+                assertTrue("modified bytes must not satisfy the saved SHA descriptor", exactAckRejected)
+
+                assertEquals(CallbackSpool.AppendResult.SUCCESS, spool.append(record))
+                val replacement = spool.oldest()!!
+                val raw = spool.readSlice(replacement, 0L, CallbackSpool.MAX_SLICE_BYTES)
+                assertArrayEquals(record.encode(), raw)
+                assertEquals(TelemetryCallbackBatch.digest(raw), replacement.sha256)
+                assertEquals(1, spool.status().readyBatches)
+                assertTrue(spool.status().quarantinedFiles >= 1)
+                assertNotNull(spool.status().loss)
+                assertEquals(CallbackSpool.AckResult.RELEASED, spool.acknowledge(replacement))
+                assertEquals(CallbackSpool.AckResult.NOT_FOUND, spool.acknowledge(replacement))
+            }
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun deletedCachedHeadIsRescannedAndNextBatchRemainsReadable() {
+        val root = Files.createTempDirectory("callback-index-missing-head").toFile()
+        try {
+            CallbackSpool.openForTest(root, 128 * 1024L).use { spool ->
+                val first = batch(71, 71)
+                val second = batch(72, 72)
+                assertEquals(CallbackSpool.AppendResult.SUCCESS, spool.append(first))
+                assertEquals(CallbackSpool.AppendResult.SUCCESS, spool.append(second))
+                val missing = spool.oldest()!!
+                assertTrue(root.resolve(missing.fileName).delete())
+
+                val next = spool.oldest()!!
+                assertEquals(second.identity(), next.identity)
+                assertEquals(1, spool.status().readyBatches)
+                assertTrue(spool.status().loss!!.count > 0L)
+                assertArrayEquals(second.encode(), spool.readSlice(next, 0L, CallbackSpool.MAX_SLICE_BYTES))
+            }
+        } finally {
+            root.deleteRecursively()
         }
     }
 

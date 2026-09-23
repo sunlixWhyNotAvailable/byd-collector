@@ -207,6 +207,82 @@ class HelperDiagnosticsTest {
     }
 
     @Test
+    fun processWindowStillSummarizesAfterImmediateEventConsumesDirtyRevision() {
+        val immediatePersisted = CountDownLatch(1)
+        val firstSummaryPersisted = CountDownLatch(1)
+        val secondSummaryPersisted = CountDownLatch(1)
+        val summaryCount = AtomicLong()
+        val lines = mutableListOf<String>()
+        val sink = object : HelperDiagnostics.Sink {
+            override fun persist(jsonLine: String, snapshotJson: String) {
+                synchronized(lines) { lines += jsonLine }
+                if (jsonLine.contains("\"event\":\"window_marker\"")) immediatePersisted.countDown()
+                if (jsonLine.contains("\"event\":\"summary\"")) {
+                    if (summaryCount.incrementAndGet() == 1L) firstSummaryPersisted.countDown()
+                    else secondSummaryPersisted.countDown()
+                }
+            }
+            override fun persistBootstrap(chunk: ByteArray) = Unit
+        }
+        val clock = FakeClock(wall = 1_000, elapsed = 100, cpu = 100)
+        val diagnostics = HelperDiagnostics(
+            "boot-a", 1, "generation-a", 1_000,
+            TelemetryWorkerSpool.Footprint(0, 0), sink, clock, 8
+        )
+        try {
+            diagnostics.pollDuration(CollectorHelperProtocol.STREAM_MAIN, 5)
+            diagnostics.context("window_marker", null)
+            assertTrue(immediatePersisted.await(1, TimeUnit.SECONDS))
+
+            clock.set(wallMs = 31_000, elapsedMs = 30_100, cpuMs = 1_100)
+            assertTrue(firstSummaryPersisted.await(2, TimeUnit.SECONDS), "first completed process window was not summarized")
+            val firstSummary = synchronized(lines) { lines.first { it.contains("\"event\":\"summary\"") } }
+            assertTrue(firstSummary.contains("\"process_cpu_delta_ms\":1000"), firstSummary)
+            assertTrue(firstSummary.contains("\"window_terminal\":false"), firstSummary)
+            assertTrue(firstSummary.contains("\"total_samples\":1"), firstSummary)
+            assertTrue(firstSummary.contains("\"retained_samples\":1"), firstSummary)
+
+            diagnostics.pollDuration(CollectorHelperProtocol.STREAM_MAIN, 9)
+            clock.set(wallMs = 61_000, elapsedMs = 60_100, cpuMs = 2_600)
+            assertTrue(secondSummaryPersisted.await(2, TimeUnit.SECONDS), "next process window was not summarized")
+        } finally {
+            diagnostics.close()
+        }
+
+        val stop = synchronized(lines) { lines.last { it.contains("\"event\":\"helper_stop\"") } }
+        assertTrue(stop.contains("\"window_terminal\":true"), stop)
+        assertTrue(stop.contains("\"window_short\":true"), stop)
+    }
+
+    @Test
+    fun processCpuWindowSummarizesEvenWhenNoGetterCompleted() {
+        val summaryPersisted = CountDownLatch(1)
+        val lines = mutableListOf<String>()
+        val sink = object : HelperDiagnostics.Sink {
+            override fun persist(jsonLine: String, snapshotJson: String) {
+                synchronized(lines) { lines += jsonLine }
+                if (jsonLine.contains("\"event\":\"summary\"")) summaryPersisted.countDown()
+            }
+            override fun persistBootstrap(chunk: ByteArray) = Unit
+        }
+        val clock = FakeClock(wall = 1_000, elapsed = 100, cpu = 100)
+        val diagnostics = HelperDiagnostics(
+            "boot-a", 1, "generation-a", 1_000,
+            null, sink, clock, 8
+        )
+        try {
+            clock.set(wallMs = 31_000, elapsedMs = 30_100, cpuMs = 700)
+            assertTrue(summaryPersisted.await(2, TimeUnit.SECONDS), "idle process CPU window was not summarized")
+            val summary = synchronized(lines) { lines.first { it.contains("\"event\":\"summary\"") } }
+            assertTrue(summary.contains("\"process_cpu_delta_ms\":600"), summary)
+            assertTrue(summary.contains("\"total_samples\":0"), summary)
+            assertTrue(summary.contains("\"p50_ms\":null"), summary)
+        } finally {
+            diagnostics.close()
+        }
+    }
+
+    @Test
     fun failedBootstrapWriteIsRetriedAndItsFailureReachesCurrentSnapshot() {
         val startPersisted = CountDownLatch(1)
         val bootstrapPersisted = CountDownLatch(1)
@@ -348,14 +424,17 @@ class HelperDiagnosticsTest {
         override fun persistBootstrap(chunk: ByteArray) = Unit
     }
 
-    private class FakeClock(wall: Long = 1_000, elapsed: Long = 100) : HelperDiagnostics.Clock {
+    private class FakeClock(wall: Long = 1_000, elapsed: Long = 100, cpu: Long = -1) : HelperDiagnostics.Clock {
         private val wall = AtomicLong(wall)
         private val elapsed = AtomicLong(elapsed)
+        private val cpu = AtomicLong(cpu)
         override fun wallTimeMs(): Long = wall.get()
         override fun elapsedTimeMs(): Long = elapsed.get()
-        fun set(wallMs: Long, elapsedMs: Long) {
+        override fun processCpuTimeMs(): Long = cpu.get()
+        fun set(wallMs: Long, elapsedMs: Long, cpuMs: Long = cpu.get()) {
             wall.set(wallMs)
             elapsed.set(elapsedMs)
+            cpu.set(cpuMs)
         }
     }
 

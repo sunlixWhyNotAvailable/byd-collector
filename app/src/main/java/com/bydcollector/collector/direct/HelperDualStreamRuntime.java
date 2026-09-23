@@ -92,6 +92,7 @@ final class HelperDualStreamRuntime implements AutoCloseable {
         this.callbackTransport = callbackTransport;
         this.wakeLock = wakeLock;
         this.diagnostics = diagnostics;
+        this.diagnostics.callbackTransport(callbackTransport);
         this.orchestration = new ThreadPoolExecutor(
             2, 2, 0L, TimeUnit.MILLISECONDS,
             new ArrayBlockingQueue<Runnable>(4),
@@ -254,7 +255,7 @@ final class HelperDualStreamRuntime implements AutoCloseable {
                         "main read canceled");
                 }
                 return callbacks.readHybrid(rows,
-                    selected -> CollectorHelperDaemon.BatchEngine.run(selected, scalarReader, nativeReader));
+                    selected -> runMeasuredRead(CollectorHelperProtocol.STREAM_MAIN, selected));
             });
         } catch (Throwable error) {
             return rejected(rows.size(), CollectorHelperProtocol.STATUS_READ_ERROR, describe(error));
@@ -397,7 +398,7 @@ final class HelperDualStreamRuntime implements AutoCloseable {
                 CollectorHelperDaemon.BatchResult result = vendor.call(true, () -> {
                     if (!fallbackCurrent(stream, generation)) throw new Canceled("main fallback canceled");
                     return callbacks.readHybrid(mainRows,
-                        selected -> CollectorHelperDaemon.BatchEngine.run(selected, scalarReader, nativeReader));
+                        selected -> runMeasuredRead(CollectorHelperProtocol.STREAM_MAIN, selected));
                 });
                 if (!fallbackCurrent(stream, generation)) return;
                 setPersisting(stream, true);
@@ -454,7 +455,7 @@ final class HelperDualStreamRuntime implements AutoCloseable {
             CollectorHelperDaemon.BatchResult result = callbacks.readHybrid(chunk, selected ->
                 vendor.call(false, () -> {
                     if (!current.ok()) throw new Canceled("secondary read canceled");
-                    return CollectorHelperDaemon.BatchEngine.run(selected, scalarReader, nativeReader);
+                    return runMeasuredRead(CollectorHelperProtocol.STREAM_SECONDARY, selected);
                 }));
             System.arraycopy(result.values, 0, values, chunkOffset, result.values.length);
             nativeGroups += result.nativeGroupCount;
@@ -472,6 +473,17 @@ final class HelperDualStreamRuntime implements AutoCloseable {
             fallbackGroups, fallbackReads, groupFailures,
             (System.nanoTime() - startedNanos) / 1_000_000L, values,
             nativeAvailable ? firstError : nativeReader.unavailableReason());
+    }
+
+    private CollectorHelperDaemon.BatchResult runMeasuredRead(
+        int stream, List<CollectorHelperDaemon.Address> selected
+    ) {
+        CollectorHelperDaemon.BatchResult result =
+            CollectorHelperDaemon.BatchEngine.run(selected, scalarReader, nativeReader);
+        if (result.nativeGroupCount > 0 || result.fallbackGroupCount > 0 || result.fallbackReadCount > 0) {
+            diagnostics.pollDuration(stream, result.elapsedMs);
+        }
+        return result;
     }
 
     private SecondaryTelemetrySpool.Cycle secondaryCycle(

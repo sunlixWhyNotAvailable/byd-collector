@@ -18,6 +18,36 @@ import kotlin.test.assertTrue
 
 class TelemetryWorkerSpoolContractTest {
     @Test
+    fun callbackRootAccountingTracksLegacyAppendAckAndQuarantine() {
+        val root = tempDirectory()
+        try {
+            CallbackSpool.openForTest(root, TelemetryWorkerSpool.MAX_SPOOL_BYTES).use { callbacks ->
+                TelemetryWorkerSpool.openForTest(root, TelemetryWorkerSpool.MAX_SPOOL_BYTES).use { worker ->
+                    assertEquals(0L, callbacks.status().footprintBytes)
+                    val first = sample("boot", "generation", 1, 100)
+                    worker.append(first)
+                    fun verifyBytes() {
+                        val bytes = root.listFiles()!!.filter { it.isFile }.sumOf { it.length() }
+                        assertEquals(bytes, callbacks.status().footprintBytes)
+                        assertEquals(bytes, worker.observe().bytes)
+                    }
+                    verifyBytes()
+                    assertEquals(1, worker.observe().pendingReadyRecords)
+                    assertEquals(TelemetryWorkerSpool.AckStatus.RELEASED, worker.acknowledge(first.identity, 200).status)
+                    verifyBytes()
+                    assertEquals(0L, callbacks.status().footprintBytes)
+                    worker.append(sample("boot", "generation", 2, 200))
+                    root.listFiles()!!.single { it.name.endsWith(".ready") }.writeText("corrupt")
+                    assertTrue(worker.pending(10).isEmpty())
+                    verifyBytes()
+                    assertEquals(0, worker.observe().pendingReadyRecords)
+                    assertTrue(callbacks.status().footprintBytes > 0)
+                }
+            }
+        } finally { deleteRecursively(root) }
+    }
+
+    @Test
     fun sampleRoundTripsAcrossReopenInCapturedOrder() {
         val root = tempDirectory()
         try {

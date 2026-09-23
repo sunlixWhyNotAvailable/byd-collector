@@ -11,6 +11,7 @@ import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.direct.CollectorHelperProtocol
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
+import com.bydcollector.collector.service.CollectorSettings
 import java.io.File
 
 class DirectTelemetryClient(
@@ -26,7 +27,9 @@ class DirectTelemetryClient(
     }
 ) : TelemetryClient {
     private val appContext = context.applicationContext
+    private val helperPreferences = appContext.getSharedPreferences(CollectorSettings.PREFS_NAME, Context.MODE_PRIVATE)
     @Volatile private var nextLaunchAttemptAtMs: Long = 0
+    private val bridgeCheckPending = java.util.concurrent.atomic.AtomicBoolean(true)
 
     override fun read(): TelemetryReadResult {
         val startedAt = clock.elapsedRealtimeMs()
@@ -46,7 +49,9 @@ class DirectTelemetryClient(
         startedAt: Long,
         ownerMode: DirectHelperOwnerMode
     ): TelemetryReadResult.Failure? {
-        if (!helper.isAlive()) {
+        val helperAlive = helper.isAlive()
+        val updatePending = helperPreferences.getBoolean(CollectorSettings.KEY_HELPER_REPLACEMENT_PENDING, false)
+        if (!helperAlive || bridgeCheckPending.get() || updatePending) {
             val now = clock.elapsedRealtimeMs()
             //backs off helper launch failures because adb/app_process startup can block for seconds
             if (now < nextLaunchAttemptAtMs) {
@@ -62,6 +67,7 @@ class DirectTelemetryClient(
                 nextLaunchAttemptAtMs = clock.elapsedRealtimeMs() + LAUNCH_FAILURE_BACKOFF_MS
                 return launchFailure(launch, startedAt)
             }
+            bridgeCheckPending.set(false)
             if (!waitForHelper()) {
                 nextLaunchAttemptAtMs = clock.elapsedRealtimeMs() + LAUNCH_FAILURE_BACKOFF_MS
                 return failure("helper_unavailable", "Direct helper did not answer Binder ping", startedAt)

@@ -24,6 +24,15 @@ import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
+
+data class DiagnosticShutdownLogcatResult(val runToken: String?, val closeError: String?)
+
+internal fun ownedLogcatCommand(runToken: String): String {
+    require(runToken.matches(Regex("[a-f0-9]{32}"))) { "Invalid logcat ownership token" }
+    return "export ${DiagnosticLogRecorder.LOGCAT_OWNER_ENV} BYDCOLLECTOR_LOGCAT_RUN=$runToken; " +
+        "exec logcat -b all -v threadtime"
+}
 
 internal data class DiagnosticTripSelection(
     val selection: String,
@@ -64,6 +73,7 @@ object DiagnosticLogRecorder {
     private const val KEEP_ALIVE_LOG_TAIL_BYTES = 512 * 1024
     private const val SHARE_PREPARE_HEADROOM_BYTES = 16L * 1024L * 1024L
     private const val LOGCAT_COMMAND = "logcat -b all -v threadtime"
+    val LOGCAT_OWNER_ENV = "BYDCOLLECTOR_LOGCAT_OWNER=${BuildConfig.APPLICATION_ID}"
     internal const val LOGCAT_SEGMENT_BYTES = 16L * 1024L * 1024L
     internal const val LOGCAT_SEGMENT_COUNT = 8
     internal const val SHARE_HANDOFF_RETENTION_MS = ArchiveShareLeaseRegistry.LEASE_TTL_MS
@@ -73,6 +83,8 @@ object DiagnosticLogRecorder {
     @Volatile private var adbStream: AdbLocalClient.AdbShellStream? = null
     @Volatile private var activeRunDir: File? = null
     @Volatile private var activeContext: Context? = null
+    private var activeRunToken: String? = null
+    private var captureGeneration = 0L
 
     fun isRecording(): Boolean {
         synchronized(stateLock) {
@@ -82,6 +94,7 @@ object DiagnosticLogRecorder {
                 adbStream = null
                 activeRunDir = null
                 activeContext = null
+                activeRunToken = null
             }
             return false
         }
@@ -89,10 +102,14 @@ object DiagnosticLogRecorder {
 
     fun start(context: Context): File {
         synchronized(workLock) {
+            val settings = CollectorSettings(context.applicationContext)
+            check(!settings.isUserShutdownRequested()) { "Collector is shutting down" }
             val current = captureState()
             if (current.stream?.isAlive == true) return current.runDir ?: logRoot(context)
 
             val appContext = context.applicationContext
+            val generation = synchronized(stateLock) { ++captureGeneration }
+            val runToken = UUID.randomUUID().toString().replace("-", "")
             //creates one run directory per recording so logs, events, and notes describe the same incident window
             val runDir = createDiagnosticRunDirectory(logRoot(appContext), timestamp())
             try {
@@ -101,6 +118,7 @@ object DiagnosticLogRecorder {
                         appendLine("started_at=${timestamp()}")
                         appendLine("package=${BuildConfig.APPLICATION_ID}")
                         appendLine("log_dir=${runDir.absolutePath}")
+                        appendLine("logcat_run=$runToken")
                     },
                     Charsets.UTF_8
                 )
@@ -109,20 +127,29 @@ object DiagnosticLogRecorder {
                 //updates latest zip only at explicit diagnostics lifecycle points, never from passive ui state loading
                 writeLatestZip(appContext, runDir)
 
+                check(!settings.isUserShutdownRequested()) { "Collector is shutting down" }
                 val output = DiagnosticLogcatOutputStream(runDir)
                 val stream = try {
                     AdbLocalClient(File(appContext.filesDir, "adb_keys")).openShellStream(
-                        command = LOGCAT_COMMAND,
+                        command = ownedLogcatCommand(runToken),
                         output = output
                     )
                 } catch (error: Throwable) {
                     runCatching { output.close() }
                     throw error
                 }
-                synchronized(stateLock) {
-                    adbStream = stream
-                    activeRunDir = runDir
-                    activeContext = appContext
+                val accepted = synchronized(stateLock) {
+                    if (generation != captureGeneration || settings.isUserShutdownRequested()) false else {
+                        adbStream = stream
+                        activeRunDir = runDir
+                        activeContext = appContext
+                        activeRunToken = runToken
+                        true
+                    }
+                }
+                if (!accepted) {
+                    stream.close()
+                    error("Logcat start cancelled by Shutdown")
                 }
             } catch (error: Throwable) {
                 File(runDir, "logcat_error.txt").writeText(
@@ -130,7 +157,7 @@ object DiagnosticLogRecorder {
                         "command=$LOGCAT_COMMAND\n",
                     Charsets.UTF_8
                 )
-                writeLatestZip(context, runDir)
+                if (!settings.isUserShutdownRequested()) writeLatestZip(context, runDir)
                 throw IllegalStateException("Full system logcat unavailable: ${error.message ?: error::class.java.simpleName}", error)
             }
             return runDir
@@ -155,10 +182,30 @@ object DiagnosticLogRecorder {
                         adbStream = null
                         activeRunDir = null
                         activeContext = null
+                        activeRunToken = null
                     }
                 }
             }
         }
+    }
+
+    // Local close is not proof of remote exit. The shutdown finalizer checks the
+    // exact ownership environment and process start time before stopping logcat.
+    // Do not wait for workLock: Share/Stop may currently be building a large ZIP.
+    fun stopForShutdown(): DiagnosticShutdownLogcatResult {
+        val state = synchronized(stateLock) {
+            captureGeneration++
+            val state = CaptureState(adbStream, activeRunDir, activeContext, activeRunToken)
+            adbStream = null
+            activeRunDir = null
+            activeContext = null
+            activeRunToken = null
+            state
+        }
+        val closeError = runCatching { state.stream?.close() }.exceptionOrNull()?.let {
+            "${it::class.java.simpleName}: ${diagnosticSafeText(it.message)}"
+        }
+        return DiagnosticShutdownLogcatResult(state.runToken, closeError)
     }
 
     fun prepareShareBundle(context: Context): File {
@@ -260,11 +307,12 @@ object DiagnosticLogRecorder {
     private data class CaptureState(
         val stream: AdbLocalClient.AdbShellStream?,
         val runDir: File?,
-        val context: Context?
+        val context: Context?,
+        val runToken: String?
     )
 
     private fun captureState(): CaptureState = synchronized(stateLock) {
-        CaptureState(adbStream, activeRunDir, activeContext)
+        CaptureState(adbStream, activeRunDir, activeContext, activeRunToken)
     }
 
     private fun logRoot(context: Context): File {

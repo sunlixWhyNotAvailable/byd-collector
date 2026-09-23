@@ -20,6 +20,22 @@ import kotlin.test.assertTrue
 
 class DirectDebugRoundRobinPollerTest {
     @Test
+    fun immutableParameterReusesEntryWithoutSharingCopiedMetadata() {
+        val parameter = DirectDebugParameter("sample", "BODY", 1001, 42, 5,
+            "中文名称", "reference", "source")
+        val entry = parameter.toDirectFidEntry()
+        assertTrue(entry === parameter.toDirectFidEntry())
+        assertEquals("中文名称", entry.featureNames)
+        assertEquals("debug_body", entry.groupName)
+        val copied = parameter.copy(key = "changed", fid = 43, featureNames = "新名称")
+            .toDirectFidEntry()
+        assertEquals("changed", copied.key)
+        assertEquals(43, copied.fid)
+        assertEquals("新名称", copied.featureNames)
+        assertEquals(42, entry.fid)
+    }
+
+    @Test
     fun oldOwnerWaitingForMaintenanceCannotWriteIntoTheReplacementDatabase() {
         val gate = DatabaseMaintenanceGate()
         val executor = Executors.newFixedThreadPool(2)
@@ -188,6 +204,27 @@ class DirectDebugRoundRobinPollerTest {
             events
         )
         assertEquals(3L, identity.epoch)
+    }
+
+    @Test
+    fun helperGenerationChangeWithRepeatedTokenAndEpochRejectsHandover() {
+        val events = mutableListOf<String>()
+        var identity = DirectStreamCredentials(controllerToken = 17L, epoch = 10L, generation = 4L)
+        val handover = SecondaryOwnershipHandover(
+            currentIdentity = { identity },
+            pause = { events += "pause"; identity = identity.copy(generation = 5L); true },
+            drain = { events += "drain"; SecondaryReplayDrainResult(true, 1, 0, 0) },
+            resume = { events += "resume"; true }
+        )
+
+        assertFailsWith<SecondaryReplayPendingException> {
+            handover.run(5L) { events += "live" }
+        }
+
+        assertEquals(17L, identity.controllerToken)
+        assertEquals(10L, identity.epoch)
+        assertEquals(5L, identity.generation)
+        assertEquals(listOf("pause", "resume"), events)
     }
 
     @Test

@@ -68,6 +68,7 @@ class CollectorSettings(
     }
 
     fun hasActiveAccessWork(): Boolean {
+        if (isUserShutdownRequested()) return false
         return (isPollingEnabled() && !isMainManuallyStopped()) ||
             (isDebugPollingEnabled() && !isDebugManuallyStopped()) ||
             (isMqttEnabled() && !isMqttManuallyStopped()) ||
@@ -85,17 +86,52 @@ class CollectorSettings(
 
     fun isUserShutdownRequested(): Boolean = prefs.getBoolean(KEY_USER_SHUTDOWN, false)
 
-    fun setUserShutdownRequested(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_USER_SHUTDOWN, enabled).commit()
+    fun setUserShutdownRequested(enabled: Boolean): Boolean {
+        val persisted = prefs.edit().putBoolean(KEY_USER_SHUTDOWN, enabled).commit()
+        if (!persisted) return false
         recordEvent(
             category = if (enabled) "user_shutdown_enabled" else "user_shutdown_cleared",
             message = if (enabled) "User shutdown requested" else "User shutdown cleared"
         )
+        return true
     }
 
+    fun userShutdownPhase(): String = prefs.getString(KEY_USER_SHUTDOWN_PHASE, SHUTDOWN_PHASE_IDLE) ?: SHUTDOWN_PHASE_IDLE
+
+    fun setUserShutdownPhase(phase: String, token: String? = null, detail: String? = null): Boolean {
+        require(phase in setOf(SHUTDOWN_PHASE_IDLE, SHUTDOWN_PHASE_STOPPING, SHUTDOWN_PHASE_HANDOFF, SHUTDOWN_PHASE_ERROR))
+        val editor = prefs.edit().putString(KEY_USER_SHUTDOWN_PHASE, phase)
+        if (token == null) editor.remove(KEY_USER_SHUTDOWN_TOKEN) else editor.putString(KEY_USER_SHUTDOWN_TOKEN, token)
+        if (detail == null) editor.remove(KEY_USER_SHUTDOWN_DETAIL) else editor.putString(
+            KEY_USER_SHUTDOWN_DETAIL, detail.replace('\n', ' ').take(512)
+        )
+        return editor.commit()
+    }
+
+    fun userShutdownToken(): String? = prefs.getString(KEY_USER_SHUTDOWN_TOKEN, null)
+
+    fun userShutdownDetail(): String? = prefs.getString(KEY_USER_SHUTDOWN_DETAIL, null)
+
+    fun rememberShutdownListenerStateIfAbsent(state: Int): Boolean = if (
+        prefs.contains(KEY_SHUTDOWN_LISTENER_PREVIOUS_STATE)
+    ) true else prefs.edit().putInt(KEY_SHUTDOWN_LISTENER_PREVIOUS_STATE, state).commit()
+
+    fun shutdownListenerPreviousState(): Int? = if (prefs.contains(KEY_SHUTDOWN_LISTENER_PREVIOUS_STATE)) {
+        prefs.getInt(KEY_SHUTDOWN_LISTENER_PREVIOUS_STATE, Int.MIN_VALUE).takeIf { it != Int.MIN_VALUE }
+    } else null
+
+    fun clearShutdownListenerPreviousState(): Boolean = prefs.edit().remove(KEY_SHUTDOWN_LISTENER_PREVIOUS_STATE).commit()
+
+    /** Returns true only when the complete suppression state is durably cleared. */
     fun clearUserShutdownRequestIfSet(): Boolean {
-        if (!isUserShutdownRequested()) return false
-        setUserShutdownRequested(false)
+        val persisted = prefs.edit()
+            .putBoolean(KEY_USER_SHUTDOWN, false)
+            .putString(KEY_USER_SHUTDOWN_PHASE, SHUTDOWN_PHASE_IDLE)
+            .remove(KEY_USER_SHUTDOWN_TOKEN)
+            .remove(KEY_USER_SHUTDOWN_DETAIL)
+            .commit()
+        if (!persisted) return false
+        recordEvent(category = "user_shutdown_cleared", message = "User shutdown cleared")
         return true
     }
 
@@ -155,6 +191,28 @@ class CollectorSettings(
             DirectHelperOwnerMode.APP
         }
     }
+
+    fun markHelperReplacementPending(): Boolean = prefs.edit()
+        .putBoolean(KEY_HELPER_REPLACEMENT_PENDING, true)
+        .commit()
+
+    fun helperReplacementPending(installedUpdateTimeMs: Long?): Boolean =
+        prefs.getBoolean(KEY_HELPER_REPLACEMENT_PENDING, false) ||
+            installedUpdateTimeMs == null || installedUpdateTimeMs <= 0L ||
+            prefs.getLong(KEY_HELPER_CONFIRMED_UPDATE_TIME_MS, 0L) != installedUpdateTimeMs
+
+    fun confirmHelperReplacement(installedUpdateTimeMs: Long): Boolean {
+        if (installedUpdateTimeMs <= 0L) return false
+        return prefs.edit()
+            .putLong(KEY_HELPER_CONFIRMED_UPDATE_TIME_MS, installedUpdateTimeMs)
+            .putBoolean(KEY_HELPER_REPLACEMENT_PENDING, false)
+            .commit()
+    }
+
+    fun helperReplacementAllowed(): Boolean = !isUserShutdownRequested() && (
+        isPollingEnabled() && !isMainManuallyStopped() ||
+            isDebugPollingEnabled() && !isDebugManuallyStopped()
+        )
 
     fun isDebugPollingEnabled(): Boolean = prefs.getBoolean(KEY_DEBUG_POLLING_ENABLED, false)
 
@@ -1191,12 +1249,22 @@ class CollectorSettings(
         const val PREFS_NAME = "collector_settings"
         const val KEY_AUTO_START = "autoStart"
         const val KEY_USER_SHUTDOWN = "userShutdown"
+        const val KEY_USER_SHUTDOWN_PHASE = "userShutdownPhase"
+        const val KEY_USER_SHUTDOWN_TOKEN = "userShutdownToken"
+        const val KEY_USER_SHUTDOWN_DETAIL = "userShutdownDetail"
+        const val KEY_SHUTDOWN_LISTENER_PREVIOUS_STATE = "shutdownListenerPreviousState"
+        const val SHUTDOWN_PHASE_IDLE = "idle"
+        const val SHUTDOWN_PHASE_STOPPING = "stopping"
+        const val SHUTDOWN_PHASE_HANDOFF = "handoff"
+        const val SHUTDOWN_PHASE_ERROR = "error"
         const val KEY_MAIN_MANUAL_STOP = "mainManualStop"
         const val KEY_DEBUG_MANUAL_STOP = "debugManualStop"
         const val KEY_MQTT_MANUAL_STOP = "mqttManualStop"
         const val KEY_INFLUX_MANUAL_STOP = "influxManualStop"
         const val KEY_POLLING_ENABLED = "pollingEnabled"
         const val KEY_DEBUG_POLLING_ENABLED = "debugPollingEnabled"
+        const val KEY_HELPER_REPLACEMENT_PENDING = "helperReplacementPending"
+        const val KEY_HELPER_CONFIRMED_UPDATE_TIME_MS = "helperConfirmedUpdateTimeMs"
         const val KEY_DEBUG_AUTO_START = "debugAutoStart"
         const val KEY_KEEP_WIFI = "keepWifi"
         const val KEY_KEEP_MOBILE_DATA = "keepMobileData"

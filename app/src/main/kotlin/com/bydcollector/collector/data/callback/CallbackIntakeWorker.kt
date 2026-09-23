@@ -76,6 +76,20 @@ class CallbackIntakeWorker(
         return stopped
     }
 
+    /** Stops after the active callback batch has committed and been acknowledged. */
+    fun requestStopAfterCurrentBatch() {
+        synchronized(lock) { running.set(false) }
+    }
+
+    fun awaitStopped(timeoutMs: Long): Boolean {
+        require(timeoutMs >= 0)
+        val current = synchronized(lock) { worker }
+        if (timeoutMs > 0 && current != null && current !== Thread.currentThread()) current.join(timeoutMs)
+        val stopped = current?.isAlive != true
+        if (stopped) synchronized(lock) { if (worker === current) worker = null }
+        return stopped
+    }
+
     private fun runLoop() {
         var backoffIndex = 0
         var latestResult = emptyResult()

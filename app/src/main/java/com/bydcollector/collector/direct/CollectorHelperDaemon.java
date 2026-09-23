@@ -1375,7 +1375,10 @@ public final class CollectorHelperDaemon {
             }
             if (callbackTransportSafeToClose) {
                 try {
-                    if (callbackSpoolBinder != null) callbackSpoolBinder.close();
+                    if (callbackSpoolBinder != null && !callbackSpoolBinder.closeAndReport()) {
+                        recordDiagnosticError(diagnostics,
+                            "callback shutdown tail could not be durably persisted; loss was recorded as shutdown_spill");
+                    }
                 } catch (Throwable error) {
                     recordDiagnosticError(diagnostics, "callback spool teardown failed: " + describe(error));
                 }

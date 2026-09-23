@@ -5,6 +5,7 @@ import android.os.SystemClock
 import android.util.Log
 import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
+import com.bydcollector.collector.data.direct.DirectVehicleHelper
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.remote.DirectBridgeManager
@@ -101,7 +102,7 @@ object AdbAuthorizationManager {
         try {
             val cancellation = lease.cancellation
             var permissionsGranted = !RequiredAccessChecker.hasMissingRequiredAccess(appContext)
-            var helperReady = helperReadyAfterRebind(cancellation, helperOwnerMode)
+            var helperReady = helperReadyAfterRebind(cancellation)
             var adbAuthorized = runtimeSnapshot.adbAuthorized
             val repairNeeded = !permissionsGranted || !helperReady
             val repairAllowed = repairNeeded && (
@@ -130,7 +131,7 @@ object AdbAuthorizationManager {
                         cancellation = cancellation
                     )
                     permissionsGranted = !RequiredAccessChecker.hasMissingRequiredAccess(appContext)
-                    helperReady = DirectVehicleHelperClient().ownerMode() == helperOwnerMode
+                    helperReady = DirectVehicleHelperClient().isAlive()
                 } else if (repairNeeded && !repairAllowed) {
                     store.recordEvent(
                         "adb_repair_rate_limited",
@@ -337,19 +338,22 @@ object AdbAuthorizationManager {
         }
     }
 
-    private fun helperReadyAfterRebind(
+    internal fun helperReadyAfterRebind(
         cancellation: AdbCancellation,
-        helperOwnerMode: DirectHelperOwnerMode
+        helper: DirectVehicleHelper = DirectVehicleHelperClient(),
+        pause: (Long) -> Unit = Thread::sleep
     ): Boolean {
-        if (DirectVehicleHelperClient().ownerMode() == helperOwnerMode) return true
+        cancellation.throwIfCancelled()
+        // isAlive includes the current protocol handshake. APP/GAP is a policy label, not readiness.
+        if (helper.isAlive()) return true
         try {
-            Thread.sleep(HELPER_REBIND_WAIT_MS)
+            pause(HELPER_REBIND_WAIT_MS)
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
             throw AdbOperationCancelledException()
         }
         cancellation.throwIfCancelled()
-        return DirectVehicleHelperClient().ownerMode() == helperOwnerMode
+        return helper.isAlive()
     }
 
     private fun adbClient(

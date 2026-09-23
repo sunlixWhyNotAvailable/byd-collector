@@ -19,10 +19,11 @@ data class DirectStreamControlResult(
     val ok: Boolean get() = status == P.STATUS_OK
 }
 
-data class DirectStreamCredentials(val controllerToken: Long, val epoch: Long)
+data class DirectStreamCredentials(val controllerToken: Long, val epoch: Long, val generation: Long = 0)
 
 /** One APP-process controller; heartbeat IO never shares a lock/client with replay or a fence. */
 internal class AppStreamController(
+    private val elapsedMs: () -> Long = android.os.SystemClock::elapsedRealtime,
     private val exchange: (Int, String, Long, Int, Long, Int) -> DirectStreamControlResult = { action, nonce, token, stream, epoch, value ->
         DirectVehicleHelperClient().streamControl(action, nonce, token, stream, epoch, value)
     }
@@ -39,6 +40,12 @@ internal class AppStreamController(
     private var token = 0L
     private val epochs = longArrayOf(0, 0)
     private val readinessGeneration = longArrayOf(0L, 0L)
+    private val consumerOwners = arrayOfNulls<Any>(2)
+    private val defaultOwners = arrayOf(Any(), Any())
+    private val leaseExpiry = longArrayOf(0L, 0L)
+    private var validLeaseMask = 0
+    private var claimRequired = true
+    private var controlGeneration = 0L
     private var scheduler: ScheduledExecutorService? = null
     private var appReleased = false
     private val renewalFailed = booleanArrayOf(false, false)
@@ -60,6 +67,13 @@ internal class AppStreamController(
             wantedMask = nextMask
             autonomyMask = nextAutonomyMask
             consumerMask = consumerMask and nextMask
+            validLeaseMask = validLeaseMask and nextMask
+            for (stream in listOf(P.STREAM_MAIN, P.STREAM_SECONDARY)) {
+                if (nextMask and stream == 0) {
+                    consumerOwners[index(stream)] = null
+                    readinessGeneration[index(stream)]++
+                }
+            }
             if (consumerMask == 0) stopHeartbeatLocked()
             appReleased = false
         }
@@ -69,21 +83,24 @@ internal class AppStreamController(
         if (stream != 0) index(stream)
         if (Thread.currentThread().isInterrupted) return false
         val claimed = claimLock.withLock {
-            val wanted = synchronized(stateLock) { if (appReleased) return false else wantedMask }
+            val (wanted, generation) = synchronized(stateLock) {
+                if (appReleased) return false
+                if (!claimRequired && token > 0) return@withLock true
+                validLeaseMask = 0
+                wantedMask to ++controlGeneration
+            }
             val result = exchange(P.CONTROL_CLAIM, nonce, 0, 0, 0, wanted)
             if (!result.ok || result.controllerToken <= 0) return@withLock false
             synchronized(stateLock) {
-                if (token != result.controllerToken || appliedMask == -1) {
-                    token = result.controllerToken
-                    epochs[0] = result.mainEpoch
-                    epochs[1] = result.secondaryEpoch
-                    appliedMask = wanted
-                    appliedAutonomyMask = 0
-                } else {
-                    // A concurrent fence reply may already have advanced one stream.
-                    epochs[0] = maxOf(epochs[0], result.mainEpoch)
-                    epochs[1] = maxOf(epochs[1], result.secondaryEpoch)
-                }
+                if (appReleased || controlGeneration != generation) return@withLock false
+                token = result.controllerToken
+                // A recovered helper may restart epochs, even if its numeric token repeats.
+                epochs[0] = result.mainEpoch
+                epochs[1] = result.secondaryEpoch
+                claimRequired = false
+                // An idempotent CLAIM need not apply new intent; explicitly reconcile both policies.
+                appliedMask = wantedMask.inv()
+                appliedAutonomyMask = autonomyMask.inv()
             }
             true
         }
@@ -101,6 +118,8 @@ internal class AppStreamController(
             wantedMask = if (enabled) wantedMask or stream else wantedMask and stream.inv()
             if (!enabled) {
                 consumerMask = consumerMask and stream.inv()
+                validLeaseMask = validLeaseMask and stream.inv()
+                consumerOwners[index(stream)] = null
                 autonomyMask = autonomyMask and stream.inv()
                 readinessGeneration[index(stream)]++
                 if (consumerMask == 0) stopHeartbeatLocked()
@@ -112,48 +131,62 @@ internal class AppStreamController(
 
     /** Marks an actual poller/callback consumer ready and only then starts or renews its APP lease. */
     fun setConsumerReady(stream: Int, ready: Boolean, isCurrent: () -> Boolean = { true }): Boolean {
+        return setConsumerReady(stream, ready, defaultOwners[index(stream)], isCurrent)
+    }
+
+    fun setConsumerReady(stream: Int, ready: Boolean, owner: Any, isCurrent: () -> Boolean = { true }): Boolean {
         val position = index(stream)
         if (!ready) {
-            synchronized(stateLock) {
-                consumerMask = consumerMask and stream.inv()
-                readinessGeneration[position]++
-                if (consumerMask == 0) stopHeartbeatLocked()
-            }
+            releaseLease(stream, owner)
             return true
         }
 
         val generation = synchronized(stateLock) {
             if (appReleased || wantedMask and stream == 0 || !isCurrent()) return false
+            if (consumerOwners[position] === owner && !claimRequired &&
+                credentialsLocked(stream) != null &&
+                (wantedMask and stream) == (appliedMask and stream) &&
+                (autonomyMask and stream) == (appliedAutonomyMask and stream)) return true
             consumerMask = consumerMask or stream
+            validLeaseMask = validLeaseMask and stream.inv()
+            consumerOwners[position] = owner
             ++readinessGeneration[position]
         }
         if (!ensureReady(stream)) {
             releaseReadiness(stream, generation)
             return false
         }
-        val owner = synchronized(stateLock) {
+        val request = synchronized(stateLock) {
             if (appReleased || readinessGeneration[position] != generation || consumerMask and stream == 0 ||
                 wantedMask and stream == 0 || !isCurrent()
             ) {
                 releaseReadinessLocked(stream, generation)
                 return false
             }
-            credentialsLocked(stream)
+            controlCredentialsLocked(stream)
         } ?: run {
             releaseReadiness(stream, generation)
             return false
         }
-        val result = exchange(P.CONTROL_RENEW, nonce, owner.controllerToken, stream, owner.epoch, 0)
+        val result = exchange(P.CONTROL_RENEW, nonce, request.controllerToken, stream, request.epoch, 0)
         return synchronized(stateLock) {
             val current = isCurrent()
             if (!result.ok || appReleased || readinessGeneration[position] != generation ||
-                consumerMask and stream == 0 || token != owner.controllerToken ||
+                consumerMask and stream == 0 || token != request.controllerToken ||
+                controlGeneration != request.generation ||
                 result.controllerToken != token || !current
             ) {
+                if (controlGeneration == request.generation && readinessGeneration[position] == generation &&
+                    (!result.ok || result.controllerToken != token)) {
+                    claimRequired = true
+                }
                 if (!result.ok || !current) releaseReadinessLocked(stream, generation)
                 return false
             }
             acceptEpochs(result)
+            validLeaseMask = validLeaseMask or stream
+            leaseExpiry[position] = result.leaseExpiresElapsedMs
+            renewalFailed[position] = false
             startHeartbeatLocked()
             true
         }
@@ -175,13 +208,32 @@ internal class AppStreamController(
         synchronized(stateLock) {
             appReleased = true
             consumerMask = 0
+            validLeaseMask = 0
+            consumerOwners.fill(null)
+            controlGeneration++
+            claimRequired = true
             for (position in readinessGeneration.indices) readinessGeneration[position]++
             stopHeartbeatLocked()
         }
     }
 
     fun releaseLease(stream: Int) {
-        setConsumerReady(stream, false)
+        synchronized(stateLock) { releaseReadinessLocked(stream, readinessGeneration[index(stream)]) }
+    }
+
+    fun releaseLease(stream: Int, owner: Any) {
+        synchronized(stateLock) {
+            if (consumerOwners[index(stream)] === owner) {
+                releaseReadinessLocked(stream, readinessGeneration[index(stream)])
+            }
+        }
+    }
+
+    fun invalidateHelper() = synchronized(stateLock) {
+        claimRequired = true
+        controlGeneration++
+        validLeaseMask = 0
+        token = 0L
     }
 
     private fun reconcilePolicy(stream: Int): Boolean = reconcile(stream) && reconcileAutonomy(stream)
@@ -189,24 +241,24 @@ internal class AppStreamController(
     private fun reconcile(stream: Int): Boolean {
         // Main readiness must not wait on a secondary archive fence when no intent changed.
         synchronized(stateLock) {
-            if (!appReleased && token > 0 && (wantedMask and stream) == (appliedMask and stream)) return true
+            if (!appReleased && !claimRequired && token > 0 && (wantedMask and stream) == (appliedMask and stream)) return true
         }
         return streamLocks[index(stream)].withLock {
         while (true) {
             if (Thread.currentThread().isInterrupted) return false
             val request = synchronized(stateLock) {
-                if (appReleased || token <= 0) return false
+                if (appReleased || claimRequired || token <= 0) return false
                 val enabled = wantedMask and stream != 0
                 if (enabled == (appliedMask and stream != 0)) return true
-                Triple(token, epochs[index(stream)], enabled)
+                DirectStreamCredentials(token, epochs[index(stream)], controlGeneration) to enabled
             }
             val result = exchange(
-                P.CONTROL_SET_DESIRED, nonce, request.first, stream, request.second, if (request.third) 1 else 0
+                P.CONTROL_SET_DESIRED, nonce, request.first.controllerToken, stream, request.first.epoch, if (request.second) 1 else 0
             )
             synchronized(stateLock) {
-                if (!result.ok || token != request.first || result.controllerToken != token) return false
+                if (!acceptControlReply(request.first, result)) return false
                 acceptEpochs(result)
-                appliedMask = if (request.third) appliedMask or stream else appliedMask and stream.inv()
+                appliedMask = if (request.second) appliedMask or stream else appliedMask and stream.inv()
             }
         }
         @Suppress("UNREACHABLE_CODE") false
@@ -215,7 +267,7 @@ internal class AppStreamController(
 
     private fun reconcileAutonomy(stream: Int): Boolean {
         synchronized(stateLock) {
-            if (!appReleased && token > 0 &&
+            if (!appReleased && !claimRequired && token > 0 &&
                 (autonomyMask and stream) == (appliedAutonomyMask and stream)
             ) return true
         }
@@ -223,18 +275,18 @@ internal class AppStreamController(
         while (true) {
             if (Thread.currentThread().isInterrupted) return false
             val request = synchronized(stateLock) {
-                if (appReleased || token <= 0) return false
+                if (appReleased || claimRequired || token <= 0) return false
                 val allowed = autonomyMask and stream != 0
                 if (allowed == (appliedAutonomyMask and stream != 0)) return true
-                Triple(token, epochs[index(stream)], allowed)
+                DirectStreamCredentials(token, epochs[index(stream)], controlGeneration) to allowed
             }
             val result = exchange(
-                P.CONTROL_SET_AUTONOMY, nonce, request.first, stream, request.second, if (request.third) 1 else 0
+                P.CONTROL_SET_AUTONOMY, nonce, request.first.controllerToken, stream, request.first.epoch, if (request.second) 1 else 0
             )
             synchronized(stateLock) {
-                if (!result.ok || token != request.first || result.controllerToken != token) return false
+                if (!acceptControlReply(request.first, result)) return false
                 acceptEpochs(result)
-                appliedAutonomyMask = if (request.third) appliedAutonomyMask or stream
+                appliedAutonomyMask = if (request.second) appliedAutonomyMask or stream
                     else appliedAutonomyMask and stream.inv()
             }
         }
@@ -246,9 +298,7 @@ internal class AppStreamController(
         val request = credentials(stream) ?: return false
         val result = exchange(action, nonce, request.controllerToken, stream, request.epoch, 0)
         synchronized(stateLock) {
-            if (!result.ok || token != request.controllerToken || result.controllerToken != token ||
-                appReleased || wantedMask and stream == 0
-            ) return false
+            if (!acceptControlReply(request, result) || wantedMask and stream == 0) return false
             acceptEpochs(result)
             true
         }
@@ -259,6 +309,49 @@ internal class AppStreamController(
         epochs[1] = maxOf(epochs[1], result.secondaryEpoch)
     }
 
+    private fun acceptControlReply(request: DirectStreamCredentials, result: DirectStreamControlResult): Boolean {
+        if (appReleased || controlGeneration != request.generation || token != request.controllerToken) return false
+        if (!result.ok || result.controllerToken != token) {
+            claimRequired = true
+            validLeaseMask = 0
+            return false
+        }
+        return true
+    }
+
+    internal fun renewOnce(stream: Int) {
+        val position = index(stream)
+        val (request, generation) = synchronized(stateLock) {
+            (controlCredentialsLocked(stream) ?: return) to readinessGeneration[position]
+        }
+        val result = try {
+            exchange(P.CONTROL_RENEW, nonce, request.controllerToken, stream, request.epoch, 0)
+        } catch (error: Exception) {
+            DirectStreamControlResult(-1, error = error.stackTraceToString())
+        }
+        val transition = synchronized(stateLock) {
+            if (readinessGeneration[position] != generation || controlGeneration != request.generation ||
+                appReleased || consumerMask and stream == 0 || token != request.controllerToken ||
+                epochs[position] != request.epoch) return
+            val wasFailed = renewalFailed[position]
+            val accepted = acceptControlReply(request, result)
+            renewalFailed[position] = !accepted
+            if (accepted) {
+                acceptEpochs(result)
+                validLeaseMask = validLeaseMask or stream
+                leaseExpiry[position] = result.leaseExpiresElapsedMs
+            }
+            when {
+                !accepted && !wasFailed -> "stream_lease_renewal_error"
+                accepted && wasFailed -> "stream_lease_renewal_recovered"
+                else -> null
+            }
+        }
+        if (transition != null) runCatching {
+            diagnostic?.invoke(transition, "stream=$stream status=${result.status} error=${result.error.orEmpty()}")
+        }
+    }
+
     private fun startHeartbeatLocked() {
         if (appReleased || consumerMask == 0 || scheduler != null) return
         scheduler = Executors.newScheduledThreadPool(2) { task ->
@@ -266,38 +359,7 @@ internal class AppStreamController(
         }.also { executor ->
             listOf(P.STREAM_MAIN, P.STREAM_SECONDARY).forEach { stream ->
                 // A blocked secondary Binder operation must not starve Main's heartbeat.
-                executor.scheduleWithFixedDelay({
-                    try {
-                        val request = credentials(stream) ?: return@scheduleWithFixedDelay
-                        val result = exchange(P.CONTROL_RENEW, nonce, request.controllerToken, stream, request.epoch, 0)
-                        val wasFailed = synchronized(stateLock) {
-                            val index = index(stream)
-                            val previous = renewalFailed[index]
-                            renewalFailed[index] = !result.ok
-                            previous
-                        }
-                        if (!result.ok && !wasFailed) {
-                            runCatching {
-                                diagnostic?.invoke(
-                                    "stream_lease_renewal_error",
-                                    "stream=$stream status=${result.status} error=${result.error.orEmpty()}"
-                                )
-                            }
-                        } else if (result.ok && wasFailed) {
-                            runCatching { diagnostic?.invoke("stream_lease_renewal_recovered", "stream=$stream") }
-                        }
-                    } catch (error: Exception) {
-                        val firstFailure = synchronized(stateLock) {
-                            val index = index(stream)
-                            val first = !renewalFailed[index]
-                            renewalFailed[index] = true
-                            first
-                        }
-                        if (firstFailure) runCatching {
-                            diagnostic?.invoke("stream_lease_renewal_error", "stream=$stream\n${error.stackTraceToString()}")
-                        }
-                    }
-                }, 0, 500, TimeUnit.MILLISECONDS)
+                executor.scheduleWithFixedDelay({ renewOnce(stream) }, 500, 500, TimeUnit.MILLISECONDS)
             }
         }
     }
@@ -308,10 +370,15 @@ internal class AppStreamController(
     }
 
     private fun credentialsLocked(stream: Int): DirectStreamCredentials? {
+        if (validLeaseMask and stream == 0 || elapsedMs() >= leaseExpiry[index(stream)]) return null
+        return controlCredentialsLocked(stream)
+    }
+
+    private fun controlCredentialsLocked(stream: Int): DirectStreamCredentials? {
         val position = index(stream)
-        return if (appReleased || token <= 0 || wantedMask and stream == 0 || appliedMask and stream == 0 ||
+        return if (appReleased || claimRequired || token <= 0 || wantedMask and stream == 0 || appliedMask and stream == 0 ||
             consumerMask and stream == 0
-        ) null else DirectStreamCredentials(token, epochs[position])
+        ) null else DirectStreamCredentials(token, epochs[position], controlGeneration)
     }
 
     private fun releaseReadiness(stream: Int, generation: Long) {
@@ -322,6 +389,9 @@ internal class AppStreamController(
         val position = index(stream)
         if (readinessGeneration[position] != generation) return
         consumerMask = consumerMask and stream.inv()
+        validLeaseMask = validLeaseMask and stream.inv()
+        consumerOwners[position] = null
+        leaseExpiry[position] = 0
         readinessGeneration[position]++
         if (consumerMask == 0) stopHeartbeatLocked()
     }
@@ -351,4 +421,8 @@ object DirectStreamController {
         controller.setConsumerReady(stream, ready, isCurrent)
     fun releaseApp() = controller.releaseApp()
     fun releaseLease(stream: Int) = controller.releaseLease(stream)
+    fun setConsumerReady(stream: Int, ready: Boolean, owner: Any, isCurrent: () -> Boolean = { true }): Boolean =
+        controller.setConsumerReady(stream, ready, owner, isCurrent)
+    fun releaseLease(stream: Int, owner: Any) = controller.releaseLease(stream, owner)
+    fun invalidateHelper() = controller.invalidateHelper()
 }

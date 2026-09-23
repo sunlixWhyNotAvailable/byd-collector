@@ -5,8 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
+import android.content.ComponentName
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.database.sqlite.SQLiteException
 import android.net.ConnectivityManager
 import android.net.LinkProperties
@@ -19,6 +21,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
+import android.service.notification.NotificationListenerService
 import android.util.Log
 import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.BuildConfig
@@ -34,6 +37,8 @@ import com.bydcollector.collector.data.debug.DirectDebugParameterAsset
 import com.bydcollector.collector.data.debug.DirectDebugRoundRobinPoller
 import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.data.debug.SecondaryReplayCoordinator
+import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
+import com.bydcollector.collector.diagnostics.BoundedProcessWindow
 import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
 import com.bydcollector.collector.data.direct.DirectStreamController
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
@@ -105,6 +110,7 @@ import java.io.File
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.FutureTask
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
@@ -113,6 +119,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import java.util.UUID
 
 //owns the runtime lifecycle so collection, exports, and keep-alive can continue without an open activity
 class CollectorService : Service() {
@@ -142,6 +149,7 @@ class CollectorService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var sessionId: Long? = null
     private var debugPoller: DirectDebugRoundRobinPoller? = null
+    @Volatile private var shutdownDebugPoller: DirectDebugRoundRobinPoller? = null
     private val debugPollerLock = Any()
     private var normalizedStateChangedCallback: ((Set<String>) -> Unit)? = null
     private val debugStartExecutor = namedSingleThreadExecutor("byd-debug-start")
@@ -155,6 +163,10 @@ class CollectorService : Service() {
     private lateinit var callbackNormalizer: CallbackNormalizationWorker
     private val secondaryCallbackFinished = AtomicBoolean(true)
     private val callbackDiagnosticQueued = arrayOf(AtomicBoolean(false), AtomicBoolean(false))
+    private val appProcessWindow = BoundedProcessWindow(SystemClock::elapsedRealtime, android.os.Process::getElapsedCpuTime)
+    private val diagnosticOwners = mutableMapOf<Int, Any>() // guarded by appProcessWindow
+    private data class NormalizationProgress(val processed: Int, val oldestWallMs: Long?, val completedWallMs: Long, val hasMore: Boolean)
+    @Volatile private var normalizationProgress: NormalizationProgress? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private val collectionPolicyListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         if (key == CollectorSettings.KEY_AUTO_START || key == CollectorSettings.KEY_DEBUG_AUTO_START) {
@@ -206,7 +218,6 @@ class CollectorService : Service() {
     private val mqttOfflineQueued = AtomicBoolean(false)
     private val maintenanceActive = AtomicBoolean(false)
     private val maintenanceRuntimeRestoreAllowed = AtomicBoolean(true)
-    private val userShutdownFinalizationStarted = AtomicBoolean(false)
     private val keepAliveStopGeneration = AtomicLong(0L)
     @Volatile
     private var activeMaintenanceOperation: DbMaintenanceOperation? = null
@@ -247,7 +258,7 @@ class CollectorService : Service() {
         override fun run() {
             mqttRetryScheduled = false
             mqttRetryAtElapsedMs = null
-            if (!running.get() || !settings.isMqttEnabled() || maintenanceBlocksRuntimeStart()) return
+            if (!running.get() || settings.isUserShutdownRequested() || !settings.isMqttEnabled() || maintenanceBlocksRuntimeStart()) return
             flushPendingMqttAsync(force = false)
         }
     }
@@ -277,6 +288,10 @@ class CollectorService : Service() {
                 recordInfluxGate("stopped")
                 return
             }
+            if (settings.isUserShutdownRequested()) {
+                recordInfluxGate("user_shutdown")
+                return
+            }
             if (!settings.isInfluxEnabled()) {
                 recordInfluxGate("disabled")
                 return
@@ -292,7 +307,7 @@ class CollectorService : Service() {
         override fun run() {
             telegramTickScheduled = false
             telegramTickAtMs = null
-            if (!running.get() || !settings.isTelegramEnabled() || maintenanceBlocksRuntimeStart()) return
+            if (!running.get() || settings.isUserShutdownRequested() || !settings.isTelegramEnabled() || maintenanceBlocksRuntimeStart()) return
             val coordinator = telegramCoordinator ?: return
             scheduleTelegramTick()
             executeOrderedTelegram(
@@ -334,8 +349,8 @@ class CollectorService : Service() {
     override fun onCreate() {
         super.onCreate()
         val application = applicationContext as BydCollectorApplication
-        historicalEnergyGeneration = application.beginHistoricalEnergyBackfillOwner()
-        application.updateRuntime.start("collector_service")
+        val startupShutdownSuppressed = CollectorSettings(applicationContext).isUserShutdownRequested()
+        if (!startupShutdownSuppressed) application.updateRuntime.start("collector_service")
         influxRuntimeDiagnostics.attachJournal(applicationContext)
         running.set(true)
         mainRuntimeStatus = RuntimeActionStatus.STOPPED
@@ -364,6 +379,9 @@ class CollectorService : Service() {
         )
         store = BydCollectorApplication.store(applicationContext)
         settings = CollectorSettings(applicationContext, store)
+        if (!settings.isUserShutdownRequested()) {
+            historicalEnergyGeneration = application.beginHistoricalEnergyBackfillOwner()
+        }
         getSharedPreferences(CollectorSettings.PREFS_NAME, Context.MODE_PRIVATE)
             .registerOnSharedPreferenceChangeListener(collectionPolicyListener)
         configureDesiredStreams()
@@ -424,11 +442,13 @@ class CollectorService : Service() {
         )
         createNotificationChannel()
         publishDashboardRuntimeFlags()
-        scheduleDashboardCountBootstrap(force = false)
-        scheduleIntegrationDashboardRefresh()
-        scheduleDatabaseFootprintRefresh(force = true)
-        mainHandler.postDelayed(dashboardHeartbeatTask, DASHBOARD_RUNTIME_HEARTBEAT_MS)
-        registerTelegramNetworkCallback()
+        if (!startupShutdownSuppressed) {
+            scheduleDashboardCountBootstrap(force = false)
+            scheduleIntegrationDashboardRefresh()
+            scheduleDatabaseFootprintRefresh(force = true)
+            mainHandler.postDelayed(dashboardHeartbeatTask, DASHBOARD_RUNTIME_HEARTBEAT_MS)
+            registerTelegramNetworkCallback()
+        }
         DirectStreamController.setDiagnostic { category, detail ->
             store.recordEvent(category, "Direct stream controller state changed", detail)
         }
@@ -441,6 +461,20 @@ class CollectorService : Service() {
         val stickyRestart = intent?.action == null
         val action = intent?.action ?: "sticky_restart"
         val forceKeepAliveStatusCheck = intent?.getBooleanExtra(EXTRA_FORCE_KEEP_ALIVE_STATUS_CHECK, false) == true
+        if (action == ACTION_SHUTDOWN) {
+            shutdownByUser()
+            return START_NOT_STICKY
+        }
+        if (settings.isUserShutdownRequested()) {
+            if (action == CollectorAutoStart.ACTION_KEEP_ALIVE_STOP_RETRY) {
+                CollectorAutoStart.cancelKeepAliveStopRetry(applicationContext)
+            }
+            suppressStartAfterUserShutdown(action)
+            return START_NOT_STICKY
+        }
+        if (keepAliveSupervisor.isShutdown()) {
+            keepAliveSupervisor = KeepAliveSupervisor(applicationContext, store)
+        }
         if (action == CollectorAutoStart.ACTION_KEEP_ALIVE_STOP_RETRY) {
             val retryAttempt =
                 intent?.getIntExtra(CollectorAutoStart.EXTRA_KEEP_ALIVE_STOP_RETRY_ATTEMPT, 0) ?: 0
@@ -450,14 +484,6 @@ class CollectorService : Service() {
                 reconcileKeepAliveStopRetry(retryAttempt)
             }
             return START_STICKY
-        }
-        if (action == ACTION_SHUTDOWN) {
-            shutdownByUser()
-            return START_NOT_STICKY
-        }
-        if (settings.isUserShutdownRequested()) {
-            suppressStartAfterUserShutdown(action)
-            return START_NOT_STICKY
         }
         recoverInterruptedMaintenanceIfNeeded(action)
         recoverInterruptedArchiveDeleteIfNeeded(action)
@@ -598,6 +624,10 @@ class CollectorService : Service() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         store.recordEvent("task_removed", "Collector task removed from recents")
+        if (settings.isUserShutdownRequested()) {
+            super.onTaskRemoved(rootIntent)
+            return
+        }
         val demand = settings.runtimeDemand()
         if (!demand.main) {
             settings.setPollingEnabled(false)
@@ -625,6 +655,16 @@ class CollectorService : Service() {
     private fun createTelemetryPoller(
         ownerMode: DirectHelperOwnerMode = DirectHelperOwnerMode.APP_GAP_SPOOL
     ): TelemetryPoller {
+        val mainConsumerOwner = Any()
+        var ownedPoller: TelemetryPoller? = null
+        val ownsCurrentPollerSlot = {
+            val current = ownedPoller
+            current != null && running.get() && poller === current
+        }
+        val isOwnedPollerCurrent = {
+            val current = ownedPoller
+            current != null && running.get() && poller === current && current.isRunning()
+        }
         val helper = DirectVehicleHelperClient()
         val adbClient = AdbLocalClient(File(applicationContext.filesDir, "adb_keys"))
         val observer = createSuccessfulPollObserver()
@@ -634,8 +674,12 @@ class CollectorService : Service() {
             helper = helper,
             expectedOwnerMode = ownerMode,
             ensureStreamReady = {
-                DirectStreamController.setConsumerReady(CollectorHelperProtocol.STREAM_MAIN, true) {
-                    running.get() && !Thread.currentThread().isInterrupted && poller.isRunning() &&
+                DirectStreamController.setConsumerReady(
+                    CollectorHelperProtocol.STREAM_MAIN,
+                    true,
+                    mainConsumerOwner
+                ) {
+                    isOwnedPollerCurrent() && !Thread.currentThread().isInterrupted &&
                         settings.isPollingEnabled() && !settings.isMainManuallyStopped() &&
                         !maintenanceBlocksRuntimeStart()
                 }
@@ -645,7 +689,7 @@ class CollectorService : Service() {
             store = store,
             client = liveClient,
             successfulPollObserver = observer,
-            isActive = { running.get() && poller.isRunning() }
+            isActive = isOwnedPollerCurrent
         )
         val replay = TelemetryWorkerReplayCoordinator(
             store = store,
@@ -657,29 +701,40 @@ class CollectorService : Service() {
             pendingSamples = helper::pendingWorkerSamples,
             acknowledgeSample = helper::acknowledgeWorkerSample,
             successfulPollObserver = observer,
-            isActive = { running.get() && poller.isRunning() }
+            isActive = isOwnedPollerCurrent
         )
         val pollCycles = TelemetryWorkerReplayPollCycleRunner(replay = replay, live = live)
         val nextPoller = TelemetryPoller(
             object : PollCycleRunner {
                 override fun pollOnce(sessionId: Long): PollCycleResult? =
                     (applicationContext as BydCollectorApplication).withDatabaseRead {
-                        if (!running.get() || !poller.isRunning() || Thread.currentThread().isInterrupted)
+                        if (!isOwnedPollerCurrent() || Thread.currentThread().isInterrupted)
                             throw InterruptedException("Main collection owner stopped")
                         pollCycles.pollOnce(sessionId)
                     }
             },
-            onCycleResult = { result -> handlePollCycleResult(result) },
+            onCycleResult = { result ->
+                if (isOwnedPollerCurrent()) handlePollCycleResult(result)
+            },
             onRuntimeError = { error ->
-                store.recordEvent("poller_runtime_error", "Main poller cycle failed", error.diagnosticDetail())
+                if (ownsCurrentPollerSlot()) {
+                    store.recordEvent("poller_runtime_error", "Main poller cycle failed", error.diagnosticDetail())
+                }
+            },
+            onStarted = { beginAppDiagnostics(CollectorHelperProtocol.STREAM_MAIN, mainConsumerOwner) },
+            onCycleDuration = { duration ->
+                recordAppPollDuration(CollectorHelperProtocol.STREAM_MAIN, mainConsumerOwner, duration)
             },
             onStopped = {
-                mainCallbackIntake.stopAndJoin(0L)
-                callbackNormalizer.stopAndJoin(0L)
-                // onDestroy already released this service; a late old worker must not release its successor.
-                if (running.get()) DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_MAIN)
+                endAppDiagnostics(CollectorHelperProtocol.STREAM_MAIN, mainConsumerOwner)
+                if (ownsCurrentPollerSlot()) {
+                    mainCallbackIntake.stopAndJoin(0L)
+                    callbackNormalizer.stopAndJoin(0L)
+                }
+                DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_MAIN, mainConsumerOwner)
             }
         )
+        ownedPoller = nextPoller
         mainPollerOwnerMode = ownerMode
         return nextPoller
     }
@@ -705,6 +760,7 @@ class CollectorService : Service() {
     }
 
     private fun queueCallbackDiagnostic(stream: Int, detail: String) {
+        reportAppDiagnostics()
         val main = stream == CollectorHelperProtocol.STREAM_MAIN
         val desired = if (main) settings.isPollingEnabled() else settings.isDebugPollingEnabled()
         val automatic = if (main) settings.isAutoStartEnabled() else settings.isDebugAutoStartEnabled()
@@ -731,6 +787,59 @@ class CollectorService : Service() {
                 } finally { queued.set(false) }
             }
         } catch (_: RejectedExecutionException) { queued.set(false) }
+    }
+
+    private fun beginAppDiagnostics(stream: Int, owner: Any) = synchronized(appProcessWindow) {
+        if (diagnosticOwners.isEmpty()) appProcessWindow.reset()
+        diagnosticOwners[stream] = owner
+    }
+
+    private fun recordAppPollDuration(stream: Int, owner: Any, durationMs: Long) {
+        synchronized(appProcessWindow) {
+            if (diagnosticOwners[stream] !== owner) return
+            appProcessWindow.recordPollDuration(stream, durationMs)
+        }
+        reportAppDiagnostics()
+    }
+
+    private fun endAppDiagnostics(stream: Int, owner: Any) {
+        val snapshot = synchronized(appProcessWindow) {
+            if (diagnosticOwners[stream] !== owner) return
+            diagnosticOwners.remove(stream)
+            if (diagnosticOwners.isEmpty()) appProcessWindow.finishWindow() else null
+        }
+        snapshot?.let {
+            runCatching { recordAppDiagnosticWindow(it) }
+                .onFailure { error -> Log.w("BydCollector", "Terminal process diagnostic failed", error) }
+        }
+    }
+
+    private fun reportAppDiagnostics() {
+        val snapshot = synchronized(appProcessWindow) {
+            if (diagnosticOwners.isEmpty()) return
+            appProcessWindow.snapshotIfDue()
+        }
+        snapshot?.let {
+            runCatching { recordAppDiagnosticWindow(it) }
+                .onFailure { error -> Log.w("BydCollector", "Process diagnostic failed", error) }
+        }
+    }
+
+    private fun recordAppDiagnosticWindow(snapshot: BoundedProcessWindow.Snapshot) {
+        val progress = normalizationProgress
+        val now = System.currentTimeMillis()
+        store.recordEvent("app_process_window", "APP CPU and poll-cycle summary",
+            "process=app duration_scope=app_poll_cycle ${snapshot.toJson()} normalization_page_processed=${progress?.processed} " +
+                "normalization_page_oldest_age_ms=${progress?.oldestWallMs?.let { (now - it).coerceAtLeast(0L) }} " +
+                "normalization_last_completion_wall_ms=${progress?.completedWallMs} " +
+                "normalization_page_may_have_more=${progress?.hasMore}")
+        val ownerSession = sessionId
+        mainHandler.post {
+            if (!running.get() || !mainPollingRunning.get() || ownerSession != sessionId) return@post
+            kpiFreshness.expiryDiagnostics(SystemClock.elapsedRealtime())?.let {
+                store.recordEvent("kpi_expiry_summary", "KPI source freshness evidence", it)
+            }
+        }
     }
 
     private fun callbackDrain(helper: DirectVehicleHelperClient, stream: Int): CallbackBatchDrainCoordinator =
@@ -762,6 +871,8 @@ class CollectorService : Service() {
             throw InterruptedException("Callback normalization owner stopped")
         // Bound each SQLite writer transaction; raw intake does not wait behind an entire backlog.
         val result = store.normalizePendingCallbackPage(vehicleStateNormalizer, limit = 64)
+        normalizationProgress = NormalizationProgress(result.processedCount, result.oldestPageReceivedWallMs,
+            System.currentTimeMillis(), result.hasMore)
         if (result.summary.observedCount > 0) publishNormalizedWrite(result.summary, result.appliedObservations)
         result.hasMore
     }
@@ -1203,8 +1314,10 @@ class CollectorService : Service() {
     }
 
     private fun reconcilePersistedHelperStateAsync() {
+        if (settings.isUserShutdownRequested()) return
         try {
             debugStartExecutor.execute {
+                if (settings.isUserShutdownRequested()) return@execute
                 val helper = DirectVehicleHelperClient()
                 if (helper.isAlive() && !DirectStreamController.ensureReady()) {
                     store.recordEvent(
@@ -1249,11 +1362,8 @@ class CollectorService : Service() {
                 if (reconciled) {
                     CollectorAutoStart.cancelKeepAliveStopRetry(applicationContext)
                     if (settings.isUserShutdownRequested()) {
-                        lastNotificationText = null
-                        userShutdownFinalizationStarted.set(false)
-                        releaseWakeLock()
-                        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
-                        stopSelf()
+                        // Explicit Shutdown coordinator owns final teardown and UI handoff.
+                        return@post
                     } else {
                         reconcilePersistedRuntime(forceKeepAliveStatusCheck = true)
                         restoreNotificationAfterKeepAliveStop()
@@ -1274,16 +1384,12 @@ class CollectorService : Service() {
                 "attempt=$retryAttempt"
             )
         }
+        if (settings.isUserShutdownRequested()) {
+            CollectorAutoStart.cancelKeepAliveStopRetry(applicationContext)
+            return
+        }
         runCatching {
             CollectorAutoStart.scheduleKeepAliveStopRetry(applicationContext, store, retryAttempt)
-        }
-        if (settings.isUserShutdownRequested()) {
-            lastNotificationText = null
-            releaseWakeLock()
-            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
-            userShutdownFinalizationStarted.set(false)
-            stopSelf()
-            return
         }
         if (hasRuntimeOwner()) {
             reconcilePersistedRuntime(forceKeepAliveStatusCheck = true)
@@ -1297,6 +1403,7 @@ class CollectorService : Service() {
     }
 
     private fun startMainIfNeeded() {
+        if (settings.isUserShutdownRequested()) return
         if (maintenanceBlocksRuntimeStart()) return
         if (poller.isStopping() || mainCallbackIntake.isStopping() || callbackNormalizer.isStopping()) {
             setMainRuntime(RuntimeActionStatus.STARTING)
@@ -1355,6 +1462,7 @@ class CollectorService : Service() {
     }
 
     private fun startDebugIfNeeded(reason: String) {
+        if (settings.isUserShutdownRequested()) return
         if (!settings.isDebugPollingEnabled() || settings.isDebugManuallyStopped()) {
             setDebugRuntime(DebugRuntimeStatus.STOPPED)
             return
@@ -1373,6 +1481,7 @@ class CollectorService : Service() {
             return
         }
         val startGeneration = debugWorkGeneration.incrementAndGet()
+        val secondaryConsumerOwner = Any()
         if (!debugStartInProgress.compareAndSet(false, true)) {
             //A start requested while an older worker is unwinding must run after that worker clears.
             debugStartQueued.set(true)
@@ -1430,10 +1539,14 @@ class CollectorService : Service() {
                         helper = helper,
                         store = debugStore,
                         databaseMaintenanceGate = (applicationContext as BydCollectorApplication).databaseMaintenanceGate,
-                        ownerActive = { running.get() },
+                        ownerActive = { running.get() && debugStartStillCurrent(startGeneration) },
                         handoverIdentity = {
                             if (debugStartStillCurrent(startGeneration) && !Thread.currentThread().isInterrupted &&
-                                DirectStreamController.setConsumerReady(CollectorHelperProtocol.STREAM_SECONDARY, true) {
+                                DirectStreamController.setConsumerReady(
+                                    CollectorHelperProtocol.STREAM_SECONDARY,
+                                    true,
+                                    secondaryConsumerOwner
+                                ) {
                                     debugStartStillCurrent(startGeneration) && !Thread.currentThread().isInterrupted
                                 }
                             ) DirectStreamController.credentials(CollectorHelperProtocol.STREAM_SECONDARY) else null
@@ -1460,9 +1573,12 @@ class CollectorService : Service() {
                     },
                     onStarted = started@{ openedSessionId ->
                         if (!debugStartStillCurrent(startGeneration)) throw InterruptedException()
-                        check(DirectStreamController.setConsumerReady(CollectorHelperProtocol.STREAM_SECONDARY, true) {
-                            debugStartStillCurrent(startGeneration)
-                        }) {
+                        beginAppDiagnostics(CollectorHelperProtocol.STREAM_SECONDARY, secondaryConsumerOwner)
+                        check(DirectStreamController.setConsumerReady(
+                            CollectorHelperProtocol.STREAM_SECONDARY,
+                            true,
+                            secondaryConsumerOwner
+                        ) { debugStartStillCurrent(startGeneration) }) {
                             "Secondary consumer readiness failed"
                         }
                         mainHandler.post {
@@ -1495,16 +1611,24 @@ class CollectorService : Service() {
                         )
                     },
                     onTerminalFailure = {
-                        if (startGeneration == debugWorkGeneration.get()) {
-                            DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_SECONDARY)
-                        }
+                        DirectStreamController.releaseLease(
+                            CollectorHelperProtocol.STREAM_SECONDARY,
+                            secondaryConsumerOwner
+                        )
                     },
                     onStopped = {
+                        endAppDiagnostics(CollectorHelperProtocol.STREAM_SECONDARY, secondaryConsumerOwner)
                         if (startGeneration == debugWorkGeneration.get()) {
                             secondaryCallbackIntake.stopAndJoin(0L)
-                            DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_SECONDARY)
                         }
+                        DirectStreamController.releaseLease(
+                            CollectorHelperProtocol.STREAM_SECONDARY,
+                            secondaryConsumerOwner
+                        )
                         onDebugPollerStopped()
+                    },
+                    onCycleDuration = { duration ->
+                        recordAppPollDuration(CollectorHelperProtocol.STREAM_SECONDARY, secondaryConsumerOwner, duration)
                     },
                     onCycle = cycle@{ summary ->
                         if (!debugStartStillCurrent(startGeneration)) return@cycle
@@ -1601,7 +1725,10 @@ class CollectorService : Service() {
                 } finally {
                     if (!streamLeaseHandedToPoller) {
                         secondaryCallbackIntake.stopAndJoin(0L)
-                        DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_SECONDARY)
+                        DirectStreamController.releaseLease(
+                            CollectorHelperProtocol.STREAM_SECONDARY,
+                            secondaryConsumerOwner
+                        )
                     }
                     debugStartInProgress.set(false)
                     closeDebugStoreAfterLocalWorkers()
@@ -1652,10 +1779,7 @@ class CollectorService : Service() {
     }
 
     private fun shutdownByUser() {
-        settings.setUserShutdownRequested(true)
-        if (deferStopForActiveMaintenance("user_shutdown")) return
-        stopRuntimeForUserShutdown()
-        finishUserShutdown()
+        beginUserShutdown("user_request", UUID.randomUUID().toString().replace("-", ""))
     }
 
     private fun suppressStartAfterUserShutdown(action: String) {
@@ -1664,156 +1788,372 @@ class CollectorService : Service() {
             "Service start suppressed after user shutdown",
             "action=$action"
         )
-        if (deferStopForActiveMaintenance("suppressed_action=$action")) return
-        stopRuntimeForUserShutdown()
-        finishUserShutdown()
+        if (userShutdownCoordinatorActive.get()) return
+        beginUserShutdown("suppressed_action=$action", UUID.randomUUID().toString().replace("-", ""))
     }
 
-    private fun deferStopForActiveMaintenance(reason: String): Boolean {
-        if (!maintenanceActive.get()) return false
+    private fun beginUserShutdown(reason: String, token: String) {
+        if (!userShutdownCoordinatorActive.compareAndSet(false, true)) return
+        val previousToken = settings.userShutdownToken()
+        val deadlineElapsedMs = SystemClock.elapsedRealtime() + USER_SHUTDOWN_STOP_TIMEOUT_MS
+        if (!settings.setUserShutdownRequested(true) ||
+            !settings.setUserShutdownPhase(CollectorSettings.SHUTDOWN_PHASE_STOPPING, previousToken ?: token, "reason=$reason")
+        ) {
+            failUserShutdown(token, "Could not durably persist the user Shutdown request")
+            return
+        }
+        maintenanceRuntimeRestoreAllowed.set(false)
         CollectorAutoStart.cancelScheduled(applicationContext)
-        settings.setPollingEnabled(false)
-        settings.setDebugPollingEnabled(false)
-        settings.setMqttEnabled(false)
-        settings.setInfluxEnabled(false)
-        configureDesiredStreams()
-        cancelMqttRetry()
-        cancelInfluxRetry("maintenance")
-        cancelTelegramTick()
-        store.recordEvent(
-            "user_shutdown_deferred_for_maintenance",
-            "User shutdown deferred until database maintenance completes",
-            reason
-        )
-        return true
+        val listenerError = disableRecoveryListenerForShutdown()
+        stopRuntimeForUserShutdown()
+        finishUserShutdown(token, previousToken, deadlineElapsedMs, listenerError)
     }
 
     private fun stopRuntimeForUserShutdown() {
         CollectorAutoStart.cancelScheduled(applicationContext)
-        settings.setPollingEnabled(false)
-        settings.setDebugPollingEnabled(false)
-        settings.setMqttEnabled(false)
-        settings.setInfluxEnabled(false)
-        configureDesiredStreams()
-        if (DirectVehicleHelperClient().isAlive()) DirectStreamController.ensureReady()
-        stopMain("user_shutdown")
-        stopDebug("user_shutdown")
+        mainHandler.removeCallbacks(accessSelfCheckTask)
+        accessSelfCheckScheduled = false
+        mainHandler.removeCallbacks(dashboardHeartbeatTask)
         cancelMqttRetry()
-        disconnectOfflineAsync()
         cancelInfluxRetry("user_shutdown")
         cancelTelegramTick()
         telegramRecoveryCoalescer.invalidate()
+        telegramWorkGeneration.incrementAndGet()
+        mqttWorkGeneration.incrementAndGet()
+        advanceInfluxGeneration()
+        unregisterTelegramNetworkCallback()
+        runCatching { (applicationContext as BydCollectorApplication).updateRuntime.shutdown() }
+        runCatching { (applicationContext as BydCollectorApplication).updateHints.shutdown() }
+        stopMain("user_shutdown")
+        stopDebug("user_shutdown")
     }
 
-    private fun finishUserShutdown() {
-        if (!userShutdownFinalizationStarted.compareAndSet(false, true)) return
+    private fun finishUserShutdown(token: String, previousToken: String?, deadlineElapsedMs: Long, listenerError: String?) {
+        Thread({ performUserShutdown(token, previousToken, deadlineElapsedMs, listenerError) }, "byd-user-shutdown").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun performUserShutdown(token: String, previousToken: String?, deadlineElapsedMs: Long, listenerError: String?) {
+        val workers = Executors.newFixedThreadPool(14) { runnable ->
+            Thread(runnable, "byd-user-shutdown-worker").apply { isDaemon = true }
+        }
         try {
-            maintenanceExecutor.execute {
-                val mqttWorker = shutdownMqttExecutor()
-                val telegramStopped = quiesceTelegramForUserShutdown()
-                val influxWorker = synchronized(influxExecutorLock) { influxExecutor }
-                val influxStopped = awaitSerializedExecutorAction(
-                    executor = influxWorker,
-                    executorThreadName = "byd-influx",
-                    timeoutMs = USER_SHUTDOWN_STOP_TIMEOUT_MS
-                ) {
-                    check(influxCoordinator.stopExport().ok) { "Influx stop failed" }
+            val adb = AdbLocalClient(File(applicationContext.filesDir, "adb_keys"))
+            if (previousToken != null) {
+                val retired = adb.execShell(
+                    UserShutdownShellPlanner.awaitFinalizerCommand(previousToken, cancel = true),
+                    timeoutMs = UserShutdownShellPlanner.FINALIZER_WAIT_MS,
+                    authLockTimeoutMs = SHUTDOWN_ADB_AUTH_LOCK_TIMEOUT_MS
+                )
+                if (!retired.ok || !retired.output.contains(UserShutdownShellPlanner.RETIRED_MARKER)) {
+                    failUserShutdown(previousToken, "Previous shutdown finalizer did not retire: ${retired.error ?: retired.output.take(256)}")
+                    return
                 }
-                val mqttStopped = awaitMqttWorkerTermination(mqttWorker, USER_SHUTDOWN_STOP_TIMEOUT_MS)
-                if (!mqttStopped || !influxStopped || !telegramStopped) {
-                    userShutdownFinalizationStarted.set(false)
-                    store.recordEvent(
-                        "user_shutdown_worker_stop_timeout",
-                        "User shutdown left the service stopped but alive",
-                        "mqtt_stopped=$mqttStopped influx_stopped=$influxStopped telegram_stopped=$telegramStopped"
-                    )
-                    if (!mqttStopped && influxStopped && telegramStopped) {
-                        mainHandler.post {
-                            if (settings.isUserShutdownRequested()) finishUserShutdown()
-                        }
-                    }
-                    return@execute
-                }
-                mainHandler.post { stopServiceAfterUserShutdown() }
             }
-        } catch (error: RejectedExecutionException) {
-            userShutdownFinalizationStarted.set(false)
+            check(settings.setUserShutdownPhase(CollectorSettings.SHUTDOWN_PHASE_STOPPING, token, "previous_finalizer_retired"))
+            val helperStop = workers.submit<Boolean> { requestCurrentHelperOwnerStop() }
+            val keepAliveQuiesced = workers.submit<Boolean> {
+                keepAliveSupervisor.quiesceForUserShutdown(remainingShutdownMs(deadlineElapsedMs))
+            }
+            val logcatClose = workers.submit<com.bydcollector.collector.diagnostics.DiagnosticShutdownLogcatResult> {
+                DiagnosticLogRecorder.stopForShutdown()
+            }
+            val mqttStop = enqueueMqttShutdownDisconnect()
+            val influxStop = enqueueInfluxShutdownStop()
+            val telegramStop = workers.submit<Boolean> {
+                runCatching { telegramDeliveryRuntime.quiesceAndAwait(remainingShutdownMs(deadlineElapsedMs)) }
+                    .getOrDefault(false)
+            }
+            val pollerStop = workers.submit<Boolean> {
+                val stopped = runCatching { poller.awaitStopped(remainingShutdownMs(deadlineElapsedMs)) }.getOrDefault(false)
+                if (stopped) runCatching { finishMainSessionAfterUserShutdown() }
+                stopped
+            }
+            val mainIntakeStop = workers.submit<Boolean> {
+                runCatching { mainCallbackIntake.awaitStopped(remainingShutdownMs(deadlineElapsedMs)) }.getOrDefault(false)
+            }
+            val secondaryIntakeStop = workers.submit<Boolean> {
+                runCatching { secondaryCallbackIntake.awaitStopped(remainingShutdownMs(deadlineElapsedMs)) }.getOrDefault(false)
+            }
+            val normalizerStop = workers.submit<Boolean> {
+                runCatching { callbackNormalizer.awaitStopped(remainingShutdownMs(deadlineElapsedMs)) }.getOrDefault(false)
+            }
+            val debugStop = workers.submit<Boolean> {
+                val stopped = runCatching {
+                    shutdownDebugPoller?.awaitTermination(remainingShutdownMs(deadlineElapsedMs)) ?: true
+                }.getOrDefault(false)
+                if (stopped) {
+                    DirectStreamController.setDesired(CollectorHelperProtocol.STREAM_SECONDARY, false)
+                    if (shutdownDebugPoller != null) detachDebugPoller()
+                    shutdownDebugPoller = null
+                    debugPollerShutdownInProgress.set(false)
+                    setDebugRuntime(DebugRuntimeStatus.STOPPED)
+                }
+                stopped
+            }
+
+            val keepAliveStopped = awaitShutdownFuture(keepAliveQuiesced, deadlineElapsedMs, false)
+            if (!keepAliveStopped) {
+                failUserShutdown(token, "Keep-alive reconcile worker did not quiesce before the shared shutdown deadline")
+                return
+            }
+            val gracefulSignal = adb.execShell(
+                UserShutdownShellPlanner.beginGracefulStopCommand(
+                    DiagnosticLogRecorder.LOGCAT_OWNER_ENV,
+                    BuildConfig.APPLICATION_ID,
+                    applicationInfo.sourceDir,
+                    token
+                ),
+                timeoutMs = SHUTDOWN_SIGNAL_ADB_TIMEOUT_MS,
+                authLockTimeoutMs = SHUTDOWN_ADB_AUTH_LOCK_TIMEOUT_MS
+            )
+            val gracefulStopSent = gracefulSignal.ok &&
+                gracefulSignal.output.contains("BYDCOLLECTOR_SHUTDOWN_GRACEFUL_SIGNAL_SENT")
+            if (!gracefulStopSent) {
+                failUserShutdown(token, "Local ADB could not confirm the initial shutdown suppression/signal command: ${gracefulSignal.error ?: gracefulSignal.output.take(192)}")
+                return
+            }
+            if (listenerError != null) {
+                failUserShutdown(token, "Could not disable the notification-listener recovery entrypoint: $listenerError")
+                return
+            }
+
+            val remainingForGracefulMs = remainingShutdownMs(deadlineElapsedMs)
+            val command = UserShutdownShellPlanner.detachedFinalizerCommand(
+                packageName = BuildConfig.APPLICATION_ID,
+                token = token,
+                logcatOwnerEnv = DiagnosticLogRecorder.LOGCAT_OWNER_ENV,
+                apkPath = applicationInfo.sourceDir,
+                gracefulWaitMs = remainingForGracefulMs
+            )
+            val result = adb.execShell(
+                command = command,
+                timeoutMs = remainingForGracefulMs.toInt().coerceAtLeast(1) + SHUTDOWN_FINALIZER_HANDOFF_OVERHEAD_MS,
+                authLockTimeoutMs = SHUTDOWN_ADB_AUTH_LOCK_TIMEOUT_MS
+            )
+            val handoffMarker = "SHUTDOWN_FINALIZER_HANDOFF=$token"
+            if (!result.ok || !result.output.contains(handoffMarker)) {
+                failUserShutdown(
+                    token,
+                    "Detached shutdown finalizer handoff was not confirmed: ${result.error ?: result.output.take(256)}"
+                )
+                return
+            }
+
+            val helperStopAccepted = completedFutureValue(helperStop, false)
+            val mqttStopped = completedFutureValue(mqttStop, false)
+            val influxStopped = completedFutureValue(influxStop, false)
+            val telegramStopped = completedFutureValue(telegramStop, false)
+            val pollerStopped = completedFutureValue(pollerStop, false)
+            val mainIntakeStopped = completedFutureValue(mainIntakeStop, false)
+            val secondaryIntakeStopped = completedFutureValue(secondaryIntakeStop, false)
+            val normalizerStopped = completedFutureValue(normalizerStop, false)
+            val debugStopped = completedFutureValue(debugStop, false)
+            val recorderResult = completedFutureValue(logcatClose, null)
+
+            val cutoverJournal = settings.storageCutoverJournal()
+            val workerSummary = "poller=$pollerStopped main_callback=$mainIntakeStopped secondary_callback=$secondaryIntakeStopped " +
+                "normalizer=$normalizerStopped debug=$debugStopped mqtt=$mqttStopped influx=$influxStopped telegram=$telegramStopped " +
+                "helper_stop_accepted=$helperStopAccepted helper_graceful_exit=${result.output.contains("helper_forced=0")} " +
+                "raw_tail=unknown_if_helper_forced_or_shutdown_spill logcat_close_pending=${!logcatClose.isDone} " +
+                "cutover_journal_present=${cutoverJournal != null} cutover_phase=${cutoverJournal?.phase ?: "none"}"
+            runCatching {
+                store.recordEvent(
+                    "user_shutdown_graceful_stop_result",
+                    "User shutdown graceful stop window finished",
+                    "$workerSummary logcat_run=${recorderResult?.runToken ?: "none"} logcat_close_error=${recorderResult?.closeError ?: "none"}"
+                )
+            }
+
+            if (!settings.isUserShutdownRequested()) {
+                userShutdownCoordinatorActive.set(false)
+                return
+            }
+            val handoffDetails = "$workerSummary ${result.output.lineSequence().firstOrNull { it.contains(handoffMarker) } ?: handoffMarker}"
+            if (!settings.setUserShutdownPhase(CollectorSettings.SHUTDOWN_PHASE_HANDOFF, token, handoffDetails)) {
+                failUserShutdown(token, "Finalizer started but handoff evidence could not be persisted; $handoffDetails")
+                return
+            }
+            // HANDOFF is not completion: do not revive this service's stopped workers while shell work is live.
+            val terminal = adb.execShell(
+                UserShutdownShellPlanner.awaitFinalizerCommand(token, cancel = false),
+                timeoutMs = UserShutdownShellPlanner.FINALIZER_WAIT_MS,
+                authLockTimeoutMs = SHUTDOWN_ADB_AUTH_LOCK_TIMEOUT_MS
+            )
+            // A successful force-stop kills this coordinator. Reaching here means APP survived.
+            failUserShutdown(token, "APP survived shutdown finalization: ${terminal.error ?: terminal.output.takeLast(512)}")
+        } catch (error: Throwable) {
+            failUserShutdown(token, "${error::class.java.simpleName}: ${error.message ?: "shutdown coordinator failed"}")
+        } finally {
+            workers.shutdownNow()
+        }
+    }
+
+    private fun enqueueMqttShutdownDisconnect(): java.util.concurrent.Future<Boolean>? {
+        return synchronized(mqttExecutorLock) {
+            val executor = mqttExecutor
+            try {
+                executor.submit<Boolean> { runCatching { mqttCoordinator.disconnectForMaintenance().ok }.getOrDefault(false) }
+                    .also { executor.shutdown() }
+            } catch (_: RejectedExecutionException) {
+                null
+            }
+        }
+    }
+
+    private fun enqueueInfluxShutdownStop(): java.util.concurrent.Future<Boolean>? {
+        return synchronized(influxExecutorLock) {
+            val executor = influxExecutor
+            try {
+                executor.submit<Boolean> { runCatching { influxCoordinator.stopExport().ok }.getOrDefault(false) }
+                    .also { executor.shutdown() }
+            } catch (_: RejectedExecutionException) {
+                null
+            }
+        }
+    }
+
+    private fun requestCurrentHelperOwnerStop(): Boolean {
+        val helper = DirectVehicleHelperClient()
+        val ownerMode = helper.ownerMode() ?: return false
+        val result = helper.requestStop(ownerMode)
+        runCatching {
             store.recordEvent(
-                "user_shutdown_finalize_rejected",
-                "User shutdown finalization was rejected",
-                error::class.java.name
+                if (result.ok) "telemetry_helper_stop_requested" else "telemetry_helper_stop_failed",
+                if (result.ok) "Current telemetry helper owner stop requested" else "Current telemetry helper owner stop failed",
+                "owner_mode=${ownerMode.name} accepted=${result.accepted} ${result.error.orEmpty()}".trim()
             )
         }
+        return result.ok && result.accepted
+    }
+
+    private fun finishMainSessionAfterUserShutdown() {
+        DirectStreamController.setDesired(CollectorHelperProtocol.STREAM_MAIN, false)
+        DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_MAIN)
+        if (::tripRuntime.isInitialized) runCatching { tripRuntime.pause("user_shutdown") }
+        sessionId?.let { openedSessionId ->
+            runCatching { store.endSession(openedSessionId, "user_shutdown") }
+                .onFailure { error ->
+                    runCatching {
+                        store.recordEvent(
+                            "session_end_error",
+                            "Failed to close collection session",
+                            "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                        )
+                    }
+                }
+        }
+        sessionId = null
+    }
+
+    private fun remainingShutdownMs(deadlineElapsedMs: Long): Long =
+        (deadlineElapsedMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+
+    private fun <T> awaitShutdownFuture(future: java.util.concurrent.Future<T>?, deadlineElapsedMs: Long, fallback: T): T {
+        if (future == null) return fallback
+        val remaining = remainingShutdownMs(deadlineElapsedMs)
+        if (remaining <= 0L && !future.isDone) return fallback
+        return try {
+            future.get(remaining, TimeUnit.MILLISECONDS)
+        } catch (_: Exception) {
+            fallback
+        }
+    }
+
+    private fun <T> completedFutureValue(future: java.util.concurrent.Future<T>?, fallback: T): T {
+        if (future == null || !future.isDone) return fallback
+        return try {
+            future.get(0, TimeUnit.MILLISECONDS)
+        } catch (_: Exception) {
+            fallback
+        }
+    }
+
+    private fun disableRecoveryListenerForShutdown(): String? {
+        val component = ComponentName(applicationContext, com.bydcollector.collector.system.CollectorNotificationListenerService::class.java)
+        return try {
+            val packageManager = packageManager
+            val previous = packageManager.getComponentEnabledSetting(component)
+            if (!settings.rememberShutdownListenerStateIfAbsent(previous)) return "could not persist prior component state"
+            if (previous != PackageManager.COMPONENT_ENABLED_STATE_DISABLED) {
+                packageManager.setComponentEnabledSetting(
+                    component,
+                    PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                    PackageManager.DONT_KILL_APP
+                )
+            }
+            if (packageManager.getComponentEnabledSetting(component) != PackageManager.COMPONENT_ENABLED_STATE_DISABLED) {
+                "component disable state did not persist"
+            } else null
+        } catch (error: RuntimeException) {
+            "${error::class.java.simpleName}: ${error.message ?: "PackageManager failed"}"
+        }
+    }
+
+    private fun failUserShutdown(token: String, detail: String) {
+        runCatching { settings.setUserShutdownPhase(CollectorSettings.SHUTDOWN_PHASE_ERROR, token, detail) }
+        runCatching { store.recordEvent("user_shutdown_error", "User shutdown did not complete", detail) }
+        userShutdownCoordinatorActive.set(false)
     }
 
     private fun debugStartStillCurrent(generation: Long): Boolean {
         return generation == debugWorkGeneration.get() &&
+            !settings.isUserShutdownRequested() &&
             settings.isDebugPollingEnabled() &&
             !settings.isDebugManuallyStopped() &&
             !maintenanceBlocksRuntimeStart(debugRuntime = true)
     }
 
-    private fun stopServiceAfterUserShutdown() {
-        val generation = keepAliveStopGeneration.incrementAndGet()
-        keepAliveSupervisor.reconcileThen(KeepAliveConfig(false, false, false, false)) { reconciled ->
-            mainHandler.post {
-                if (generation != keepAliveStopGeneration.get()) return@post
-                if (!settings.isUserShutdownRequested()) {
-                    CollectorAutoStart.cancelKeepAliveStopRetry(applicationContext)
-                    userShutdownFinalizationStarted.set(false)
-                    return@post
-                }
-                if (!reconciled) {
-                    userShutdownFinalizationStarted.set(false)
-                    finishKeepAliveStopAfterFailure(retryAttempt = 0, "user_shutdown_keep_alive_failed")
-                    return@post
-                }
-                CollectorAutoStart.cancelKeepAliveStopRetry(applicationContext)
-                lastNotificationText = null
-                releaseWakeLock()
-                runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
-                stopSelf()
-            }
-        }
-    }
-
     private fun stopMain(reason: String) {
         mainHandler.removeCallbacks(mainStartRetryTask)
         mainStartRetryScheduled = false
-        mainCallbackIntake.stopAndJoin(0L)
-        callbackNormalizer.stopAndJoin(0L)
-        if (reason != "service_destroyed" && reason != "database_maintenance" &&
-            (!settings.isPollingEnabled() || settings.isMainManuallyStopped() || reason == "user_shutdown")
+        if (reason == "user_shutdown") {
+            mainCallbackIntake.requestStopAfterCurrentBatch()
+            callbackNormalizer.requestStopAfterCurrentPage()
+        } else {
+            mainCallbackIntake.stopAndJoin(0L)
+            callbackNormalizer.stopAndJoin(0L)
+        }
+        if (reason != "service_destroyed" && reason != "database_maintenance" && reason != "user_shutdown" &&
+            (!settings.isPollingEnabled() || settings.isMainManuallyStopped())
         ) {
             DirectStreamController.setDesired(CollectorHelperProtocol.STREAM_MAIN, false)
         }
         val wasActive = mainRuntimeStatus != RuntimeActionStatus.STOPPED
         if (wasActive) setMainRuntime(RuntimeActionStatus.STOPPING)
         val wasPolling = poller.isRunning()
-        if (wasPolling) poller.stop()
-        DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_MAIN)
-        if (::tripRuntime.isInitialized && reason != "service_destroyed") tripRuntime.pause(reason)
-        if (reason == "user_shutdown") stopAppGapSpoolHelper(reason)
-        mainPollingRunning.set(false)
-        sessionId?.let { openedSessionId ->
-            runCatching { store.endSession(openedSessionId, reason) }
-                .onFailure { error ->
-                    store.recordEvent(
-                        "session_end_error",
-                        "Failed to close collection session",
-                        "${error::class.java.simpleName}: ${error.message ?: "no message"}"
-                    )
-                }
+        if (wasPolling) {
+            if (reason == "user_shutdown") poller.requestStopAfterCurrentCycle()
+            else poller.stop()
         }
-        sessionId = null
-        if (wasPolling || reason == "service_destroyed") {
+        if (reason != "user_shutdown") DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_MAIN)
+        if (::tripRuntime.isInitialized && reason != "service_destroyed" && reason != "user_shutdown") {
+            tripRuntime.pause(reason)
+        }
+        mainPollingRunning.set(false)
+        if (reason != "user_shutdown") {
+            sessionId?.let { openedSessionId ->
+                runCatching { store.endSession(openedSessionId, reason) }
+                    .onFailure { error ->
+                        store.recordEvent(
+                            "session_end_error",
+                            "Failed to close collection session",
+                            "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                        )
+                    }
+            }
+            sessionId = null
+        }
+        if (reason != "user_shutdown" && (wasPolling || reason == "service_destroyed")) {
             //publishes retained offline only after there was a real live mqtt runtime to retire
             disconnectOfflineAsync()
         }
         clearDashboardVehicleKpis()
         if (!settings.isPollingEnabled() || settings.isMainManuallyStopped() || reason == "service_destroyed") {
             setMainRuntime(RuntimeActionStatus.STOPPED)
-        } else if (poller.isRunning()) {
+        } else if (poller.isRunning() && reason != "user_shutdown") {
             setMainRuntime(RuntimeActionStatus.RUNNING)
         }
         publishDashboardRuntimeFlags()
@@ -1822,23 +2162,24 @@ class CollectorService : Service() {
     private fun stopAppGapSpoolHelper(reason: String) {
         if (reason == "service_destroyed") return
         val helper = DirectVehicleHelperClient()
-        if (!helper.isAlive()) return
-        val result = helper.requestStop(DirectHelperOwnerMode.APP_GAP_SPOOL)
+        val ownerMode = helper.ownerMode() ?: return
+        val result = helper.requestStop(ownerMode)
         store.recordEvent(
-            if (result.ok) "telemetry_spool_helper_stop_requested" else "telemetry_spool_helper_stop_failed",
-            if (result.ok) "App-gap spool helper stop requested" else "App-gap spool helper stop failed",
-            "reason=$reason ${result.error.orEmpty()}".trim()
+            if (result.ok) "telemetry_helper_stop_requested" else "telemetry_helper_stop_failed",
+            if (result.ok) "Current helper owner stop requested" else "Current helper owner stop failed",
+            "reason=$reason owner_mode=${ownerMode.name} ${result.error.orEmpty()}".trim()
         )
     }
 
     private fun exportInfluxAfterNormalizedWrite(summary: NormalizedWriteSummary) {
         //exports history after normalized changes because influx is the long-term time-series channel
         if (summary.historyInsertedCount <= 0) return
-        if (!settings.isInfluxEnabled()) return
+        if (settings.isUserShutdownRequested() || !settings.isInfluxEnabled()) return
         requestInfluxCycle(newData = true)
     }
 
     private fun requestInfluxCycle(newData: Boolean = false) {
+        if (settings.isUserShutdownRequested()) return
         if (!settings.isInfluxEnabled()) {
             recordInfluxGate("disabled")
             return
@@ -2006,7 +2347,8 @@ class CollectorService : Service() {
     }
 
     private fun scheduleInfluxRetry(delayMs: Long?) {
-        if (delayMs == null || !running.get() || !settings.isInfluxEnabled() || maintenanceBlocksRuntimeStart()) {
+        if (delayMs == null || !running.get() || settings.isUserShutdownRequested() ||
+            !settings.isInfluxEnabled() || maintenanceBlocksRuntimeStart()) {
             cancelInfluxRetry("no_deadline_or_gate")
             return
         }
@@ -2052,15 +2394,28 @@ class CollectorService : Service() {
     private fun stopDebug(reason: String) {
         mainHandler.removeCallbacks(debugStartRetryTask)
         debugStartRetryScheduled = false
-        secondaryCallbackIntake.stopAndJoin(0L)
-        if (reason != "service_destroyed" && reason != "debug_database_maintenance" &&
-            (!settings.isDebugPollingEnabled() || settings.isDebugManuallyStopped() || reason == "user_shutdown")
+        if (reason == "user_shutdown") secondaryCallbackIntake.requestStopAfterCurrentBatch()
+        else secondaryCallbackIntake.stopAndJoin(0L)
+        if (reason != "service_destroyed" && reason != "debug_database_maintenance" && reason != "user_shutdown" &&
+            (!settings.isDebugPollingEnabled() || settings.isDebugManuallyStopped())
         ) {
             DirectStreamController.setDesired(CollectorHelperProtocol.STREAM_SECONDARY, false)
         }
         val stopGeneration = debugWorkGeneration.incrementAndGet()
         debugStartQueued.set(false)
         setDebugRuntime(DebugRuntimeStatus.STOPPING, generation = stopGeneration)
+        if (reason == "user_shutdown") {
+            val current = synchronized(debugPollerLock) { debugPoller }
+            shutdownDebugPoller = current
+            if (current != null) {
+                debugPollerShutdownInProgress.set(true)
+                current.requestStopAfterCurrentCycle(reason)
+            } else {
+                debugPollerShutdownInProgress.set(false)
+                setDebugRuntime(DebugRuntimeStatus.STOPPED)
+            }
+            return
+        }
         val detached = detachDebugPoller()
         if (detached != null) {
             debugPollerShutdownInProgress.set(true)
@@ -2547,12 +2902,7 @@ class CollectorService : Service() {
         restoringRuntime.set(true)
         try {
             if (settings.isUserShutdownRequested()) {
-                settings.setPollingEnabled(false)
-                settings.setDebugPollingEnabled(false)
-                settings.setMqttEnabled(false)
-                settings.setInfluxEnabled(false)
-                stopRuntimeForUserShutdown()
-                finishUserShutdown()
+                // Keep the user's configured behavior intact; the shutdown coordinator owns teardown.
                 return
             }
             if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
@@ -2688,7 +3038,7 @@ class CollectorService : Service() {
 
     private fun publishChangedCategoriesAsync(categories: Set<String>) {
         if (categories.isEmpty()) return
-        if (!settings.isMqttEnabled()) return
+        if (settings.isUserShutdownRequested() || !settings.isMqttEnabled()) return
         mqttRuntimeActive.set(true)
         //queues latest state for mqtt so transient broker outages do not lose the newest ha value
         executeMqtt("mqtt_changed_publish_error") {
@@ -2697,6 +3047,7 @@ class CollectorService : Service() {
     }
 
     private fun startMqttExport(clearManualStop: Boolean = true) {
+        if (settings.isUserShutdownRequested()) return
         if (mqttConnection.stopping || mqttOfflineQueued.get()) return
         if (maintenanceBlocksRuntimeStart() ||
             (clearManualStop && (!settings.isMqttEnabled() || settings.isMqttManuallyStopped()))) {
@@ -2717,6 +3068,7 @@ class CollectorService : Service() {
     }
 
     private fun stopMqttExport(manualStop: Boolean = true) {
+        if (settings.isUserShutdownRequested()) return
         if (manualStop && settings.isMqttEnabled() && !settings.isMqttManuallyStopped()) return
         mqttConnection.beginStop()
         mqttWorkGeneration.incrementAndGet()
@@ -2738,6 +3090,7 @@ class CollectorService : Service() {
     }
 
     private fun startInfluxExport(clearManualStop: Boolean = true) {
+        if (settings.isUserShutdownRequested()) return
         if (influxConnection.stopping) return
         if (maintenanceBlocksRuntimeStart() ||
             (clearManualStop && (!settings.isInfluxEnabled() || settings.isInfluxManuallyStopped()))) {
@@ -3147,6 +3500,7 @@ class CollectorService : Service() {
     private fun scheduleTelegramTick(deadlineAtMs: Long? = null) {
         if (
             !running.get() ||
+            settings.isUserShutdownRequested() ||
             !settings.isTelegramEnabled() ||
             telegramCoordinator == null ||
             maintenanceBlocksRuntimeStart()
@@ -3207,7 +3561,7 @@ class CollectorService : Service() {
     }
 
     private fun stopIfNoActiveRuntime() {
-        if (settings.isUserShutdownRequested() || userShutdownFinalizationStarted.get()) return
+        if (settings.isUserShutdownRequested() || userShutdownCoordinatorActive.get()) return
         val liveness = currentRuntimeLiveness()
         if (liveness.active) return
         if (!settings.runtimeDemand().requiresPersistentOwner) {
@@ -3248,7 +3602,8 @@ class CollectorService : Service() {
     }
 
     private fun scheduleMqttRetry(delayMs: Long?) {
-        if (delayMs == null || !running.get() || !settings.isMqttEnabled() || maintenanceBlocksRuntimeStart()) {
+        if (delayMs == null || !running.get() || settings.isUserShutdownRequested() ||
+            !settings.isMqttEnabled() || maintenanceBlocksRuntimeStart()) {
             cancelMqttRetry()
             return
         }
@@ -3267,7 +3622,7 @@ class CollectorService : Service() {
     }
 
     private fun flushPendingMqttAsync(force: Boolean) {
-        if (!settings.isMqttEnabled()) return
+        if (settings.isUserShutdownRequested() || !settings.isMqttEnabled()) return
         mqttRuntimeActive.set(true)
         executeMqtt("mqtt_flush_error") {
             mqttCoordinator.flushPending(force = force)
@@ -3278,7 +3633,7 @@ class CollectorService : Service() {
         result: com.bydcollector.collector.data.polling.PollCycleResult,
         force: Boolean
     ) {
-        if (!settings.isMqttEnabled()) return
+        if (settings.isUserShutdownRequested() || !settings.isMqttEnabled()) return
         val now = SystemClock.elapsedRealtime()
         //throttles status chatter while still forcing immediate error visibility
         if (!force && now - lastStatusHeartbeatAtMs < STATUS_HEARTBEAT_INTERVAL_MS) return
@@ -3315,6 +3670,7 @@ class CollectorService : Service() {
     }
 
     private fun disconnectOfflineAsync() {
+        if (settings.isUserShutdownRequested()) return
         if (!mqttRuntimeActive.get() && !settings.isMqttEnabled() && !mqttConnection.owned) return
         if (!mqttOfflineQueued.compareAndSet(false, true)) return
         try {
@@ -3387,7 +3743,10 @@ class CollectorService : Service() {
             executorLock = mqttExecutorLock,
             executor = { mqttExecutor },
             generation = mqttWorkGeneration,
-            canExecute = { settings.isMqttEnabled() && !mqttConnection.stopping && !maintenanceBlocksRuntimeStart() },
+            canExecute = {
+                !settings.isUserShutdownRequested() && settings.isMqttEnabled() &&
+                    !mqttConnection.stopping && !maintenanceBlocksRuntimeStart()
+            },
             action = action,
             onSuccess = { result, submittedGeneration ->
                 if (submittedGeneration == mqttWorkGeneration.get()) {
@@ -3495,7 +3854,8 @@ class CollectorService : Service() {
             generation = influxWorkGeneration,
             lowPriority = true,
             canExecute = {
-                isInfluxSubmissionCurrent(expectedGeneration, influxWorkGeneration.get()) &&
+                !settings.isUserShutdownRequested() &&
+                    isInfluxSubmissionCurrent(expectedGeneration, influxWorkGeneration.get()) &&
                     !maintenanceBlocksRuntimeStart() &&
                     (if (isStop) !settings.isInfluxEnabled() else settings.isInfluxEnabled() && !influxConnection.stopping)
             },
@@ -3598,7 +3958,7 @@ class CollectorService : Service() {
         executorLock = telegramExecutorLock,
         executor = { telegramExecutor },
         generation = telegramWorkGeneration,
-        canExecute = { !maintenanceBlocksRuntimeStart() },
+        canExecute = { !settings.isUserShutdownRequested() && !maintenanceBlocksRuntimeStart() },
         action = action,
         onFailedAction = onFailedAction,
         onException = ::handleTelegramExecutionFailure,
@@ -4383,10 +4743,16 @@ class CollectorService : Service() {
         private const val TELEGRAM_MAINTENANCE_STOP_TIMEOUT_MS = 16_000L
         private const val RUNTIME_OWNER_HANDOFF_TIMEOUT_MS = 30_000L
         private const val USER_SHUTDOWN_STOP_TIMEOUT_MS = 16_000L
+        private const val SHUTDOWN_SIGNAL_ADB_TIMEOUT_MS = 5_000
+        private const val SHUTDOWN_ADB_AUTH_LOCK_TIMEOUT_MS = 3_000L
+        private const val SHUTDOWN_FINALIZER_HANDOFF_OVERHEAD_MS = 10_000
+        private const val USER_REOPEN_ADB_TIMEOUT_MS = UserShutdownShellPlanner.FINALIZER_WAIT_MS
+        private const val USER_REOPEN_AUTH_LOCK_TIMEOUT_MS = 1_000L
         private const val TAG = "BYDCollectorService"
         private const val DEBUG_REASON_AUTOSTART = "autostart"
         private const val DEBUG_REASON_MANUAL = "manual"
         private val running = AtomicBoolean(false)
+        private val userShutdownCoordinatorActive = AtomicBoolean(false)
         private val mainPollingRunning = AtomicBoolean(false)
         private val debugRunning = AtomicBoolean(false)
         private val mainRuntimeStatusRef = AtomicReference(RuntimeActionStatus.STOPPED)
@@ -4404,6 +4770,100 @@ class CollectorService : Service() {
         )
 
         fun isRunning(): Boolean = running.get()
+        fun isUserShutdownInProgress(): Boolean = userShutdownCoordinatorActive.get()
+
+        /** Clears stale shutdown suppression only after an explicit launcher open cancels shell finalization. */
+        fun clearShutdownForExplicitReopen(context: Context, onPreviousFailure: (String) -> Unit = {}): Boolean {
+            val appContext = context.applicationContext
+            val settings = CollectorSettings(appContext)
+            val hadShutdownState = settings.isUserShutdownRequested() ||
+                settings.userShutdownPhase() != CollectorSettings.SHUTDOWN_PHASE_IDLE ||
+                settings.shutdownListenerPreviousState() != null
+            if (!hadShutdownState) return true
+            if (!userShutdownCoordinatorActive.compareAndSet(false, true)) return false
+            try {
+                val adbResult = AdbLocalClient(File(appContext.filesDir, "adb_keys")).execShell(
+                    command = UserShutdownShellPlanner.awaitFinalizerCommand(settings.userShutdownToken(), cancel = true),
+                    timeoutMs = USER_REOPEN_ADB_TIMEOUT_MS,
+                    authLockTimeoutMs = USER_REOPEN_AUTH_LOCK_TIMEOUT_MS
+                )
+                if (!adbResult.ok || !adbResult.output.contains(UserShutdownShellPlanner.RETIRED_MARKER)) {
+                    settings.setUserShutdownPhase(
+                        CollectorSettings.SHUTDOWN_PHASE_ERROR,
+                        settings.userShutdownToken(),
+                        "Explicit reopen could not cancel the pending shell finalizer: ${adbResult.error ?: adbResult.output.take(192)}"
+                    )
+                    return false
+                }
+                // Retirement permits reopening; it does not turn a failed cleanup into verified Shutdown.
+                adbResult.output.lineSequence().filter { it.startsWith("result=error ") }.lastOrNull()?.let { failure ->
+                    val detail = "token=${settings.userShutdownToken()} $failure"
+                    runCatching {
+                        (appContext as BydCollectorApplication).operationalEventJournal.append(
+                            Instant.now().toString(), SystemClock.elapsedRealtime(),
+                            "user_shutdown_previous_finalizer_error", "Previous shutdown cleanup failed", detail
+                        )
+                    }.onFailure { Log.e(TAG, "Could not persist previous shutdown error: $detail", it) }
+                    onPreviousFailure(failure)
+                }
+
+                val component = ComponentName(
+                    appContext,
+                    com.bydcollector.collector.system.CollectorNotificationListenerService::class.java
+                )
+                val previousListenerState = settings.shutdownListenerPreviousState()
+                if (previousListenerState != null) {
+                    try {
+                        val packageManager = appContext.packageManager
+                        packageManager.setComponentEnabledSetting(
+                            component,
+                            previousListenerState,
+                            PackageManager.DONT_KILL_APP
+                        )
+                        if (packageManager.getComponentEnabledSetting(component) != previousListenerState) {
+                            settings.setUserShutdownPhase(
+                                CollectorSettings.SHUTDOWN_PHASE_ERROR,
+                                settings.userShutdownToken(),
+                                "Could not restore the notification-listener component state"
+                            )
+                            return false
+                        }
+                    } catch (error: RuntimeException) {
+                        settings.setUserShutdownPhase(
+                            CollectorSettings.SHUTDOWN_PHASE_ERROR,
+                            settings.userShutdownToken(),
+                            "Could not restore the notification-listener component: ${error.message ?: error.javaClass.simpleName}"
+                        )
+                        return false
+                    }
+                    if (!settings.clearShutdownListenerPreviousState()) {
+                        settings.setUserShutdownPhase(
+                            CollectorSettings.SHUTDOWN_PHASE_ERROR,
+                            settings.userShutdownToken(),
+                            "Could not clear the saved notification-listener state"
+                        )
+                        return false
+                    }
+                }
+                if (!settings.clearUserShutdownRequestIfSet()) return false
+                settings.clearRuntimeManualStops()
+                if (previousListenerState != null && previousListenerState != PackageManager.COMPONENT_ENABLED_STATE_DISABLED) {
+                    val rebind = runCatching { NotificationListenerService.requestRebind(component) }
+                    if (rebind.isFailure) {
+                        val error = rebind.exceptionOrNull()
+                        settings.setUserShutdownPhase(
+                            CollectorSettings.SHUTDOWN_PHASE_ERROR,
+                            null,
+                            "Shutdown suppression cleared but notification-listener rebind failed: ${error?.message ?: error?.javaClass?.simpleName}"
+                        )
+                        return false
+                    }
+                }
+                return !settings.isUserShutdownRequested()
+            } finally {
+                userShutdownCoordinatorActive.set(false)
+            }
+        }
         fun isMainPollingRunning(): Boolean = mainPollingRunning.get()
         fun isDebugRunning(): Boolean = debugRunning.get()
         fun mainRuntimeStatus(): RuntimeActionStatus = mainRuntimeStatusRef.get()

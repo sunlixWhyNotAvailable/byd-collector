@@ -113,6 +113,9 @@ class TelemetryStore(
     private val ecImporter = EcDatabaseImporter(context, helper, clock)
     private val normalizedStore = NormalizedStateStore(helper, clock)
     private val mainEntriesByKey = DirectFidRegistry.entries.associateBy { it.key }
+    private val mainEntriesByAddress = DirectFidRegistry.entries
+        .groupBy { Triple(it.dev, it.fid, it.tx) }
+        .mapValues { (_, entries) -> entries.singleOrNull() }
     private val callbackRawStore = CallbackRawStore(
         database = { helper.writableDatabase },
         nowMs = { java.time.OffsetDateTime.parse(clock.nowIso()).toInstant().toEpochMilli() }
@@ -315,7 +318,8 @@ class TelemetryStore(
             appliedObservations = applied,
             summary = summary,
             hasMore = pending.size == limit,
-            latestAppliedSource = latestAppliedSource
+            latestAppliedSource = latestAppliedSource,
+            oldestPageReceivedWallMs = pending.minOf { it.receivedWallMs }
         )
     }
 
@@ -410,11 +414,12 @@ class TelemetryStore(
         ) {
             return null
         }
-        val entry = DirectFidRegistry.entries.singleOrNull {
-            it.dev == event.device && it.fid == event.fid &&
-                ((it.tx == DirectFidRegistry.TX_GET_INT && event.nativeType == TelemetryCallbackBatch.TYPE_INT) ||
-                    (it.tx == DirectFidRegistry.TX_GET_FLOAT && event.nativeType == TelemetryCallbackBatch.TYPE_FLOAT))
-        } ?: return null
+        val tx = when (event.nativeType) {
+            TelemetryCallbackBatch.TYPE_INT -> DirectFidRegistry.TX_GET_INT
+            TelemetryCallbackBatch.TYPE_FLOAT -> DirectFidRegistry.TX_GET_FLOAT
+            else -> return null
+        }
+        val entry = mainEntriesByAddress[Triple(event.device, event.fid, tx)] ?: return null
         return NormalizedSourceInput(
             reading = PollReading(
                 rawKey = entry.key,

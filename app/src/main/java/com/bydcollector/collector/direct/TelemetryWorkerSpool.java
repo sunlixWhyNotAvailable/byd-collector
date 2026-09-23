@@ -43,6 +43,7 @@ final class TelemetryWorkerSpool implements AutoCloseable {
 
     private final File directory;
     private final long maxBytes;
+    private final CallbackSpool.RootState rootState;
     private DiagnosticListener diagnostics = NO_DIAGNOSTICS;
     private Footprint capacityBlockedFootprint;
     private String pendingBootId;
@@ -68,6 +69,7 @@ final class TelemetryWorkerSpool implements AutoCloseable {
     private TelemetryWorkerSpool(File directory, long maxBytes) {
         this.directory = directory;
         this.maxBytes = maxBytes;
+        this.rootState = CallbackSpool.rootState(directory);
     }
 
     synchronized void setDiagnosticListener(DiagnosticListener diagnostics) {
@@ -83,7 +85,11 @@ final class TelemetryWorkerSpool implements AutoCloseable {
     }
 
     synchronized AppendResult append(Sample sample) {
-        synchronized (CallbackSpool.persistenceLock(directory)) {
+        synchronized (rootState.lock) {
+            // Keep the legacy writer's authoritative quota check (including external retained
+            // evidence). Callback append/drain uses the shared incremental index directly.
+            rootState.invalidate();
+            refreshRoot("observe");
             return appendShared(sample);
         }
     }
@@ -113,7 +119,9 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         }
         try {
             writeDurably(temporary, payload);
+            rootState.noteFile(temporary);
             Files.move(temporary.toPath(), ready.toPath(), StandardCopyOption.ATOMIC_MOVE);
+            rootState.noteRename(temporary, ready);
             capacityBlockedFootprint = null;
             Footprint appended = footprint.plus(payload.length, 1);
             notifyAppend(AppendResult.SUCCESS, appended);
@@ -121,6 +129,7 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         } catch (IOException error) {
             //A .tmp is never visible to pending(); remove only this failed write.
             if (temporary.isFile()) temporary.delete();
+            rootState.invalidate();
             if (temporary.isFile()) notifyObservation(footprint.plus(temporary.length(), 0), false);
             notifyPersistenceFailure("append", error);
             throw new IllegalStateException("cannot persist telemetry worker sample", error);
@@ -129,14 +138,17 @@ final class TelemetryWorkerSpool implements AutoCloseable {
 
     synchronized boolean canAppend() {
         ensureOpen();
-        //The disk listing remains authoritative. The remembered footprint only prevents
+        //Shared root accounting remains authoritative. The remembered footprint only prevents
         //repeating a payload-size rejection while the real on-disk state is unchanged.
-        Footprint footprint = footprint();
-        if (
-            capacityBlockedFootprint != null &&
-            !sameFootprint(capacityBlockedFootprint, footprint)
-        ) {
-            capacityBlockedFootprint = null;
+        Footprint footprint;
+        synchronized (rootState.lock) {
+            // Refusal recovery, not the ordinary append path. Some filesystems coalesce
+            // directory timestamps across a rapid external cleanup/replacement.
+            if (capacityBlockedFootprint != null) rootState.invalidate();
+            footprint = footprint();
+            if (capacityBlockedFootprint != null && !sameFootprint(capacityBlockedFootprint, footprint)) {
+                capacityBlockedFootprint = null;
+            }
         }
         boolean blocked = footprint.bytes >= maxBytes || isCapacityBlockedAt(footprint);
         if (blocked) capacityBlockedFootprint = footprint;
@@ -149,6 +161,13 @@ final class TelemetryWorkerSpool implements AutoCloseable {
     }
 
     synchronized List<Sample> pending(int limit, SampleValidator validator) {
+        synchronized (rootState.lock) {
+            refreshRoot("pending");
+            return pendingShared(limit, validator);
+        }
+    }
+
+    private List<Sample> pendingShared(int limit, SampleValidator validator) {
         ensureOpen();
         if (validator == null) throw new IllegalArgumentException("sample validator is required");
         if (limit < 1 || limit > CollectorHelperProtocol.MAX_PENDING_WORKER_SAMPLES) {
@@ -222,6 +241,13 @@ final class TelemetryWorkerSpool implements AutoCloseable {
     }
 
     synchronized AckResult acknowledge(TelemetryWorkerSampleIdentity identity, long acknowledgedAtMs) {
+        synchronized (rootState.lock) {
+            refreshRoot("acknowledge");
+            return acknowledgeShared(identity, acknowledgedAtMs);
+        }
+    }
+
+    private AckResult acknowledgeShared(TelemetryWorkerSampleIdentity identity, long acknowledgedAtMs) {
         ensureOpen();
         if (identity == null) throw new IllegalArgumentException("identity is required");
         if (acknowledgedAtMs < 0) throw new IllegalArgumentException("acknowledgedAtMs must be non-negative");
@@ -247,6 +273,7 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         }
         AckResult result;
         if (ready.delete()) {
+            rootState.noteDelete(ready);
             capacityBlockedFootprint = null;
             result = AckResult.released(recordBytes);
         } else {
@@ -287,22 +314,20 @@ final class TelemetryWorkerSpool implements AutoCloseable {
     }
 
     private Footprint footprint() {
-        File[] files = directory.listFiles();
-        if (files == null) {
-            IllegalStateException error = new IllegalStateException("cannot list telemetry worker spool: " + directory);
-            notifyPersistenceFailure("observe", error);
+        synchronized (rootState.lock) {
+            refreshRoot("observe");
+            return new Footprint(rootState.footprintBytes(), rootState.readyRecordCount());
+        }
+    }
+
+    private void refreshRoot(String operation) {
+        try {
+            rootState.ensureFresh();
+        } catch (RuntimeException error) {
+            rootState.invalidate();
+            notifyPersistenceFailure(operation, error);
             throw error;
         }
-        long total = 0L;
-        int pendingReadyRecords = 0;
-        for (File file : files) {
-            if (!file.isFile()) continue;
-            long length = file.length();
-            if (Long.MAX_VALUE - total < length) total = Long.MAX_VALUE;
-            else total += length;
-            if (file.getName().endsWith(READY_SUFFIX)) pendingReadyRecords++;
-        }
-        return new Footprint(total, pendingReadyRecords);
     }
 
     private static void writeDurably(File file, byte[] payload) throws IOException {
@@ -440,9 +465,11 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         int suffix = 1;
         while (bad.exists()) bad = new File(file.getPath() + BAD_SUFFIX + "." + suffix++);
         if (!file.renameTo(bad)) {
+            rootState.invalidate();
             System.err.println("WARN: cannot quarantine malformed telemetry worker record: " + file);
             notifyPersistenceFailure("quarantine", new IOException("rename failed: " + file));
         } else {
+            rootState.noteRename(file, bad);
             notifyQuarantine(recordBytes);
         }
     }

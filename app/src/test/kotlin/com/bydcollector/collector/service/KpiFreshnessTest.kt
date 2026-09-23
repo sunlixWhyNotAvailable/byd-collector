@@ -7,6 +7,25 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class KpiFreshnessTest {
+    @Test fun `expiry evidence is source specific rate limited and cannot revive stale values`() {
+        val state = KpiFreshness("boot", 3_000)
+        state.accept(listOf(observation("soc", 80.0, 10_000)), 10_100)
+        assertFalse(state.expiryDiagnostics(10_100)!!.contains("field=soc "))
+        assertNull(state.expiryDiagnostics(13_100))
+        assertTrue(state.freshObservations(13_100).isEmpty())
+        state.accept(listOf(observation("soc", 10.0, 9_000)), 40_100)
+        val detail = state.expiryDiagnostics(40_100)!!
+        assertTrue(detail.contains("field=soc "))
+        assertTrue(detail.contains("reason=source_age age_ms=30100 last_rejection=source_age"))
+        state.accept(listOf(observation("soc", 79.0, 40_200)), 40_200)
+        state.freshObservations(43_200)
+        state.freshObservations(43_201) // Same expired source is counted once.
+        state.accept(listOf(observation("soc", 78.0, 70_000)), 70_000)
+        assertTrue(state.expiryDiagnostics(70_100)!!.contains("reason=recovered_after_source_age age_ms=100 last_rejection=null expiries=1"))
+        state.clear()
+        assertTrue(state.expiryDiagnostics(70_101)!!.contains("reason=not_observed"))
+    }
+
     @Test fun `pending and old replay cannot extend a real observation deadline`() {
         val state = KpiFreshness("boot", 3_000)
         assertTrue(state.accept(listOf(observation("soc", 80.0, 10_000)), 10_100))
