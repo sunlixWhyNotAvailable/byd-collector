@@ -19,7 +19,6 @@ class CallbackBatchDrainCoordinatorTest {
     @Test fun `commits raw before exact ack and accumulates replay without event logs`() {
         val calls = mutableListOf<String>()
         var offered = true
-        val diagnostics = mutableListOf<String>()
         val coordinator = CallbackBatchDrainCoordinator(
             download = { if (offered) payload else CallbackBatchDownload(ok) },
             importBatch = { received, digest, delivery ->
@@ -29,23 +28,21 @@ class CallbackBatchDrainCoordinatorTest {
                 CallbackImportResult.Committed(1, 1, false)
             },
             acknowledge = { assertEquals(descriptor, it); calls += "ack"; offered = false; action() },
-            quarantine = { _, _ -> error("no quarantine") },
-            diagnostic = diagnostics::add,
-            monotonicNanos = { 0 }
+            quarantine = { _, _ -> error("no quarantine") }
         )
         val result = coordinator.drain()
         assertTrue(result.drained)
+        assertEquals(CallbackDrainKind.PROGRESS, result.kind)
         assertEquals(listOf("commit", "ack"), calls)
         assertEquals(1, result.persistedEvents)
         assertEquals(1, result.replayedEvents)
-        coordinator.drain()
-        assertEquals(1, diagnostics.size)
     }
 
     @Test fun `database rollback cannot acknowledge or quarantine`() {
+        val diskFull = IllegalStateException("disk full")
         val coordinator = CallbackBatchDrainCoordinator(
             download = { payload },
-            importBatch = { _, _, _ -> error("disk full") },
+            importBatch = { _, _, _ -> throw diskFull },
             acknowledge = { error("must not acknowledge") },
             quarantine = { _, _ -> error("must not discard retryable error") }
         )
@@ -53,27 +50,36 @@ class CallbackBatchDrainCoordinatorTest {
         assertFalse(result.drained)
         assertTrue(result.retryable)
         assertTrue(result.blockedReason!!.contains("disk full"))
+        assertEquals(CallbackDrainKind.FAULT, result.kind)
+        assertSame(diskFull, result.fault)
         assertEquals(0, result.persistedEvents)
     }
 
-    @Test fun `temporary helper barrier remains retryable without touching storage`() {
-        val coordinator = CallbackBatchDrainCoordinator(
-            download = {
-                CallbackBatchDownload(
-                    CollectorHelperProtocol.STATUS_REPLAY_PENDING,
-                    error = "callback persistence or archive fence pending"
-                )
-            },
+    @Test fun `only replay pending and stale token statuses are classified as pending`() {
+        for (status in listOf(
+            CollectorHelperProtocol.STATUS_REPLAY_PENDING,
+            CollectorHelperProtocol.STATUS_STALE_TOKEN
+        )) {
+            val coordinator = CallbackBatchDrainCoordinator(
+                download = { CallbackBatchDownload(status, error = "temporary helper barrier") },
+                importBatch = { _, _, _ -> error("must not import") },
+                acknowledge = { error("must not acknowledge") },
+                quarantine = { _, _ -> error("must not quarantine") }
+            )
+            val result = coordinator.drain()
+            assertFalse(result.drained)
+            assertTrue(result.retryable)
+            assertEquals(status, result.status)
+            assertEquals(CallbackDrainKind.PENDING, result.kind)
+        }
+
+        val otherStatus = CallbackBatchDrainCoordinator(
+            download = { CallbackBatchDownload(CollectorHelperProtocol.STATUS_READ_ERROR, error = "read failed") },
             importBatch = { _, _, _ -> error("must not import") },
             acknowledge = { error("must not acknowledge") },
             quarantine = { _, _ -> error("must not quarantine") }
-        )
-
-        val result = coordinator.drain()
-
-        assertFalse(result.drained)
-        assertTrue(result.retryable)
-        assertTrue(result.blockedReason!!.contains("status=${CollectorHelperProtocol.STATUS_REPLAY_PENDING}"))
+        ).drain()
+        assertEquals(CallbackDrainKind.FAULT, otherStatus.kind)
     }
 
     @Test fun `failed ack retries already committed batch idempotently`() {
@@ -91,9 +97,13 @@ class CallbackBatchDrainCoordinatorTest {
             },
             quarantine = { _, _ -> error("no quarantine") }
         )
-        assertFalse(coordinator.drain().drained)
+        val failedAck = coordinator.drain()
+        assertFalse(failedAck.drained)
+        assertEquals(CallbackDrainKind.FAULT, failedAck.kind)
+        assertEquals(-1, failedAck.status)
         val retried = coordinator.drain()
         assertTrue(retried.drained)
+        assertEquals(CallbackDrainKind.PROGRESS, retried.kind)
         assertEquals(0, retried.persistedEvents)
         assertEquals(1, retried.duplicateBatches)
     }
@@ -113,7 +123,9 @@ class CallbackBatchDrainCoordinatorTest {
                     assertEquals(descriptor, selected); quarantineCount++; offered = false; action()
                 }
             )
-            assertEquals(permanent, coordinator.drain().drained)
+            val result = coordinator.drain()
+            assertEquals(permanent, result.drained)
+            if (permanent) assertEquals(CallbackDrainKind.PROGRESS, result.kind)
             assertEquals(if (permanent) 1 else 0, quarantineCount)
         }
     }
@@ -129,6 +141,58 @@ class CallbackBatchDrainCoordinatorTest {
         assertEquals(2, imports)
         assertFalse(result.drained)
         assertNull(result.blockedReason)
+        assertEquals(CallbackDrainKind.PROGRESS, result.kind)
+        assertFalse(result.retryable)
+    }
+
+    @Test fun `empty polls after a successful packet remain progress and the next empty slice is empty`() {
+        var available = true
+        val coordinator = CallbackBatchDrainCoordinator(
+            download = { if (available) payload else CallbackBatchDownload(ok) },
+            importBatch = { _, _, _ -> CallbackImportResult.Committed(1, 1, false) },
+            acknowledge = { available = false; action() },
+            quarantine = { _, _ -> error("no quarantine") }
+        )
+
+        val progress = coordinator.drain(maxBatches = 1)
+        val empty = coordinator.drain(maxBatches = 1)
+
+        assertFalse(progress.drained)
+        assertEquals(CallbackDrainKind.PROGRESS, progress.kind)
+        assertTrue(empty.drained)
+        assertEquals(CallbackDrainKind.EMPTY, empty.kind)
+        assertNull(progress.blockedReason)
+        assertFalse(progress.retryable)
+    }
+
+    @Test fun `result reports the actual downloaded head and durable progress times`() {
+        val observedBatch = TelemetryCallbackBatch("boot", "helper", 1, 1, 2, listOf(
+            TelemetryCallbackBatch.Event(1, 1001, 315621418, TelemetryCallbackBatch.TYPE_INT,
+                2, null, 2_000, 500, null, "usable"),
+            TelemetryCallbackBatch.Event(2, 1001, 315621418, TelemetryCallbackBatch.TYPE_INT,
+                3, null, 700, 600, null, "usable")
+        ))
+        val bytes = observedBatch.encode()
+        val selectedDescriptor = CallbackSpool.Descriptor(
+            1, 1, observedBatch.identity(), "sample.cbready", bytes.size.toLong(),
+            TelemetryCallbackBatch.digest(bytes), "boot", "helper", 1, 2
+        )
+        val coordinator = CallbackBatchDrainCoordinator(
+            download = { CallbackBatchDownload(ok, selectedDescriptor, observedBatch, CallbackDelivery.REPLAY) },
+            importBatch = { received, _, _ ->
+                assertSame(observedBatch, received)
+                CallbackImportResult.Committed(1, 2, false)
+            },
+            acknowledge = { action() },
+            quarantine = { _, _ -> error("no quarantine") },
+            wallTimeMs = { 5_000L }
+        )
+
+        val result = coordinator.drain(maxBatches = 1)
+
+        assertEquals(700L, result.oldestObservedWallMs)
+        assertEquals(5_000L, result.lastRawCommitWallMs)
+        assertEquals(5_000L, result.lastProgressWallMs)
     }
 
     @Test fun `interruption after durable commit leaves exact batch for retry`() {

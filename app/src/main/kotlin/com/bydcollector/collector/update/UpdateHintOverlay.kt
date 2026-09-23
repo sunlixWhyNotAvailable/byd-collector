@@ -3,13 +3,11 @@ package com.bydcollector.collector.update
 import android.animation.ValueAnimator
 import android.content.Intent
 import android.graphics.PixelFormat
-import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
-import android.view.Display
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
@@ -47,23 +45,30 @@ internal class UpdateHintOverlay(private val app: BydCollectorApplication) {
         if (lifetime.isExpired(SystemClock.elapsedRealtime())) dismiss("expired")
     }
     private val drawTimeout = Runnable {
-        if (lifetime.expiresAtElapsedMs == 0L) dismiss("not_drawn")
+        if (lifetime.expiresAtElapsedMs == 0L) {
+            if (dismissIfDisplayNotReady("first_draw_timeout")) return@Runnable
+            dismiss("not_drawn")
+        }
     }
 
     val activeResultId: Long? get() = lifetime.activeResultId
 
     fun show(resultId: Long, available: UpdateInfo) {
         check(Looper.myLooper() == Looper.getMainLooper())
-        if (lifetime.activeResultId == resultId) return
+        if (lifetime.activeResultId == resultId) {
+            if (mainDisplayForUpdateHintIfReady(app) != null) return
+            dismissIfDisplayNotReady("show")
+            return
+        }
         dismiss("replaced")
         try {
             if (!settings.isUpdateHintEnabled() || !Settings.canDrawOverlays(app)) {
                 app.recordUpdateEvent("hint_unavailable", "overlay_allowed=${Settings.canDrawOverlays(app)}")
                 return
             }
-            val display = app.getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY)
+            val display = mainDisplayForUpdateHintIfReady(app)
             if (display == null) {
-                app.recordUpdateEvent("hint_unavailable", "reason=no_main_display")
+                dismissIfDisplayNotReady("show")
                 return
             }
             val requestedAt = SystemClock.elapsedRealtimeNanos()
@@ -101,8 +106,14 @@ internal class UpdateHintOverlay(private val app: BydCollectorApplication) {
             lifetime.begin(resultId)
             view.doOnPreDraw {
                 if (card !== view || activeResultId != resultId || !attached) return@doOnPreDraw
+                if (!app.updateRuntime.onHintPresented(resultId)) {
+                    if (card === view && activeResultId == resultId && attached) {
+                        dismiss("presentation_rejected")
+                    }
+                    return@doOnPreDraw
+                }
+                if (card !== view || activeResultId != resultId || !attached) return@doOnPreDraw
                 lifetime.shown(SystemClock.elapsedRealtime())
-                app.updateRuntime.onHintPresented(resultId)
                 handler.removeCallbacks(drawTimeout)
                 handler.postDelayed(expire, (lifetime.expiresAtElapsedMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L))
                 UpdateHintCoordinator.markVisible(id, lifetime.expiresAtElapsedMs)
@@ -117,8 +128,10 @@ internal class UpdateHintOverlay(private val app: BydCollectorApplication) {
                 onUnavailable = { reason -> if (eventId == id) dismiss(reason) }
             )
         } catch (error: RuntimeException) {
-            app.recordUpdateEvent("hint_window_failed", error::class.java.simpleName)
-            dismiss("window_failed")
+            if (!dismissIfDisplayNotReady("preparation")) {
+                app.recordUpdateEvent("hint_window_failed", error::class.java.simpleName)
+                dismiss("window_failed")
+            }
         }
     }
 
@@ -129,6 +142,7 @@ internal class UpdateHintOverlay(private val app: BydCollectorApplication) {
             return
         }
         val view = card ?: return
+        if (dismissIfDisplayNotReady("refresh")) return
         val layout = params ?: return
         val available = info ?: return
         val id = eventId ?: return
@@ -158,8 +172,10 @@ internal class UpdateHintOverlay(private val app: BydCollectorApplication) {
                 previousTarget?.let(::applyPlacement)
             }
         } catch (error: RuntimeException) {
-            app.recordUpdateEvent("hint_window_failed", error::class.java.simpleName)
-            dismiss("refresh_failed")
+            if (!dismissIfDisplayNotReady("refresh")) {
+                app.recordUpdateEvent("hint_window_failed", error::class.java.simpleName)
+                dismiss("refresh_failed")
+            }
         }
     }
 
@@ -180,6 +196,7 @@ internal class UpdateHintOverlay(private val app: BydCollectorApplication) {
         val view = card ?: return
         val layout = params ?: return
         val windows = manager ?: return
+        if (dismissIfDisplayNotReady("placement")) return
         targetPlacement = placement
         val scale = placement.effectiveSizePercent / preferredSize
         try {
@@ -191,6 +208,7 @@ internal class UpdateHintOverlay(private val app: BydCollectorApplication) {
                 layout.height = placement.heightPx
                 view.scaleX = scale
                 view.scaleY = scale
+                if (dismissIfDisplayNotReady("attachment")) return
                 windows.addView(host, layout)
                 attached = true
                 view.translationX = -preferredWidth.toFloat()
@@ -217,8 +235,10 @@ internal class UpdateHintOverlay(private val app: BydCollectorApplication) {
                 start()
             }
         } catch (error: RuntimeException) {
-            app.recordUpdateEvent("hint_window_failed", error::class.java.simpleName)
-            dismiss("placement_failed")
+            if (!dismissIfDisplayNotReady("attachment")) {
+                app.recordUpdateEvent("hint_window_failed", error::class.java.simpleName)
+                dismiss("placement_failed")
+            }
         }
     }
 
@@ -236,8 +256,10 @@ internal class UpdateHintOverlay(private val app: BydCollectorApplication) {
         try {
             manager?.updateViewLayout(host, layout)
         } catch (error: RuntimeException) {
-            app.recordUpdateEvent("hint_window_failed", error::class.java.simpleName)
-            dismiss("relayout_failed")
+            if (!dismissIfDisplayNotReady("relayout")) {
+                app.recordUpdateEvent("hint_window_failed", error::class.java.simpleName)
+                dismiss("relayout_failed")
+            }
         }
     }
 
@@ -269,6 +291,13 @@ internal class UpdateHintOverlay(private val app: BydCollectorApplication) {
                 .onFailure { app.recordUpdateEvent("hint_release_failed", it::class.java.simpleName) }
         }
         if (resultId != null) app.recordUpdateEvent("hint_removed", "result_id=$resultId reason=$reason")
+    }
+
+    private fun dismissIfDisplayNotReady(phase: String): Boolean {
+        if (mainDisplayForUpdateHintIfReady(app) != null) return false
+        app.recordUpdateEvent("hint_unavailable", "reason=display_not_ready phase=$phase")
+        dismiss("display_not_ready")
+        return true
     }
 
     fun consumeOpenRequest(): Boolean {

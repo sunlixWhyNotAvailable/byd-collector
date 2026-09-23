@@ -22,8 +22,8 @@ final class HelperStreamRuntimeState {
         }
         sessionNonce = nonce;
         controllerToken = newToken();
-        replace(main, (desiredMask & DESIRED_MAIN) != 0, nowMs);
-        replace(secondary, (desiredMask & DESIRED_SECONDARY) != 0, nowMs);
+        replace(main, (desiredMask & DESIRED_MAIN) != 0);
+        replace(secondary, (desiredMask & DESIRED_SECONDARY) != 0);
         return result(CollectorHelperProtocol.STATUS_OK, 0, nowMs, null);
     }
 
@@ -36,13 +36,38 @@ final class HelperStreamRuntimeState {
         if (value != 0 && value != 1) return result(
             CollectorHelperProtocol.STATUS_INVALID_REQUEST, stream, nowMs, "desired must be 0 or 1");
         boolean desired = value == 1;
-        if (state.desired == desired) return result(CollectorHelperProtocol.STATUS_OK, stream, nowMs, null);
+        if (state.desired == desired) {
+            if (!desired && state.autonomyAllowed) {
+                state.autonomyAllowed = false;
+                state.workGeneration = nextEpoch(state.workGeneration);
+            }
+            return result(CollectorHelperProtocol.STATUS_OK, stream, nowMs, null);
+        }
         state.desired = desired;
+        state.autonomyAllowed = false;
         state.paused = false;
         state.pausePending = false;
         state.epoch = nextEpoch(state.epoch);
         state.workGeneration = nextEpoch(state.workGeneration);
-        state.leaseExpiresMs = desired ? saturatedAdd(nowMs, LEASE_MS) : 0L;
+        state.leaseExpiresMs = 0L;
+        return result(CollectorHelperProtocol.STATUS_OK, stream, nowMs, null);
+    }
+
+    synchronized ControlResult setAutonomyAllowed(
+        long token, int stream, long expectedEpoch, int value, long nowMs
+    ) {
+        StreamState state = stream(stream);
+        ControlResult invalid = validate(token, state, stream, expectedEpoch, nowMs, false);
+        if (invalid != null) return invalid;
+        if (value != 0 && value != 1) return result(
+            CollectorHelperProtocol.STATUS_INVALID_REQUEST, stream, nowMs, "autonomy must be 0 or 1");
+        boolean allowed = value == 1;
+        if (allowed && !state.desired) return result(
+            CollectorHelperProtocol.STATUS_INVALID_REQUEST, stream, nowMs, "stream is stopped");
+        if (state.autonomyAllowed != allowed) {
+            state.autonomyAllowed = allowed;
+            state.workGeneration = nextEpoch(state.workGeneration);
+        }
         return result(CollectorHelperProtocol.STATUS_OK, stream, nowMs, null);
     }
 
@@ -143,8 +168,17 @@ final class HelperStreamRuntimeState {
         StreamState state = stream(stream);
         if (state == null) return false;
         expire(state, nowMs);
-        return controllerToken != 0L && state.desired && !state.paused && !state.pausePending &&
+        return controllerToken != 0L && state.desired && state.autonomyAllowed &&
+            !state.paused && !state.pausePending &&
             nowMs >= state.leaseExpiresMs;
+    }
+
+    synchronized boolean callbackCaptureAllowed(int stream, long nowMs) {
+        StreamState state = stream(stream);
+        if (state == null) return false;
+        expire(state, nowMs);
+        return controllerToken != 0L && state.desired &&
+            (state.autonomyAllowed || nowMs < state.leaseExpiresMs);
     }
 
     /** Holds post-fence callback publication while capture continues into the bounded next-epoch queue. */
@@ -171,8 +205,18 @@ final class HelperStreamRuntimeState {
         StreamState value = stream(stream);
         if (value == null) throw new IllegalArgumentException("invalid stream");
         expire(value, nowMs);
+        return streamView(value, nowMs);
+    }
+
+    synchronized StreamView[] streamViews(long nowMs) {
+        expire(main, nowMs);
+        expire(secondary, nowMs);
+        return new StreamView[] { streamView(main, nowMs), streamView(secondary, nowMs) };
+    }
+
+    private StreamView streamView(StreamState value, long nowMs) {
         return new StreamView(value.desired, value.paused || value.pausePending, value.epoch,
-            value.desired && nowMs < value.leaseExpiresMs);
+            value.desired && nowMs < value.leaseExpiresMs, value.autonomyAllowed);
     }
 
     private ControlResult validate(
@@ -190,13 +234,14 @@ final class HelperStreamRuntimeState {
         return null;
     }
 
-    private void replace(StreamState state, boolean desired, long nowMs) {
+    private void replace(StreamState state, boolean desired) {
         state.desired = desired;
+        state.autonomyAllowed = false;
         state.paused = false;
         state.pausePending = false;
         state.epoch = nextEpoch(state.epoch);
         state.workGeneration = nextEpoch(state.workGeneration);
-        state.leaseExpiresMs = desired ? saturatedAdd(nowMs, LEASE_MS) : 0L;
+        state.leaseExpiresMs = 0L;
     }
 
     private void expire(StreamState state, long nowMs) {
@@ -244,6 +289,7 @@ final class HelperStreamRuntimeState {
 
     private static final class StreamState {
         boolean desired;
+        boolean autonomyAllowed;
         boolean paused;
         boolean pausePending;
         long epoch = 1L;
@@ -277,12 +323,15 @@ final class HelperStreamRuntimeState {
         final boolean capturePaused;
         final long epoch;
         final boolean activeLease;
+        final boolean autonomyAllowed;
 
-        StreamView(boolean desired, boolean capturePaused, long epoch, boolean activeLease) {
+        StreamView(boolean desired, boolean capturePaused, long epoch, boolean activeLease,
+                   boolean autonomyAllowed) {
             this.desired = desired;
             this.capturePaused = capturePaused;
             this.epoch = epoch;
             this.activeLease = activeLease;
+            this.autonomyAllowed = autonomyAllowed;
         }
     }
 }

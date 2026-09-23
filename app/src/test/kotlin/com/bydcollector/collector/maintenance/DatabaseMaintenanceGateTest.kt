@@ -42,6 +42,41 @@ class DatabaseMaintenanceGateTest {
     }
 
     @Test
+    fun exclusiveFileMaintenanceTimeoutDoesNotRunTheFileOperation() {
+        val gate = DatabaseMaintenanceGate()
+        val executor = Executors.newFixedThreadPool(2)
+        val readerEntered = CountDownLatch(1)
+        val releaseReader = CountDownLatch(1)
+        val fileOperations = AtomicInteger()
+        try {
+            val reader = executor.submit {
+                gate.withRead {
+                    readerEntered.countDown()
+                    check(releaseReader.await(2, TimeUnit.SECONDS))
+                }
+            }
+            assertTrue(readerEntered.await(1, TimeUnit.SECONDS))
+
+            assertNull(gate.tryWithExclusive(50L) {
+                fileOperations.incrementAndGet()
+                "archived"
+            })
+            assertEquals(0, fileOperations.get())
+
+            releaseReader.countDown()
+            reader.get(1, TimeUnit.SECONDS)
+            assertEquals("archived", gate.tryWithExclusive(1_000L) {
+                fileOperations.incrementAndGet()
+                "archived"
+            })
+            assertEquals(1, fileOperations.get())
+        } finally {
+            releaseReader.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
     fun queuedMainAndDebugReadersOpenOnlyAfterExclusiveMaintenanceCompletes() {
         val gate = DatabaseMaintenanceGate()
         val executor = Executors.newFixedThreadPool(3)

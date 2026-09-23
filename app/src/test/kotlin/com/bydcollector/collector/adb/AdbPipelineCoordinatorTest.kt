@@ -12,6 +12,20 @@ import kotlin.test.assertTrue
 
 class AdbPipelineCoordinatorTest {
     @Test
+    fun successfulObservationDeliversTerminalExactlyOnce() {
+        val coordinator = AdbPipelineCoordinator()
+        val terminal = CountDownLatch(1)
+        val calls = AtomicInteger()
+        assertTrue(coordinator.submit(AccessCheckMode.OBSERVE, onTerminal = {
+            calls.incrementAndGet()
+            terminal.countDown()
+        }) {})
+        assertTrue(terminal.await(1, TimeUnit.SECONDS))
+        coordinator.cancel(AccessCheckMode.OBSERVE)
+        assertEquals(1, calls.get())
+    }
+
+    @Test
     fun normalRequestsAreSingleFlight() {
         val coordinator = AdbPipelineCoordinator()
         val started = CountDownLatch(1)
@@ -164,5 +178,67 @@ class AdbPipelineCoordinatorTest {
         assertTrue(coordinator.submit(AccessCheckMode.FORCE) {})
         assertTrue(terminal.await(1, TimeUnit.SECONDS))
         assertEquals(1, terminals.get())
+    }
+
+    @Test
+    fun observationIsSingleFlightAndColdStartPreemptsIt() {
+        val coordinator = AdbPipelineCoordinator()
+        val observationStarted = CountDownLatch(1)
+        val coldStarted = CountDownLatch(1)
+        val observationTerminal = CountDownLatch(1)
+        val terminals = AtomicInteger(0)
+
+        assertTrue(coordinator.submit(AccessCheckMode.OBSERVE, onTerminal = {
+            terminals.incrementAndGet()
+            observationTerminal.countDown()
+        }) { lease ->
+            observationStarted.countDown()
+            while (!lease.cancellation.isCancelled) Thread.sleep(10)
+        })
+        assertTrue(observationStarted.await(1, TimeUnit.SECONDS))
+        assertFalse(coordinator.submit(AccessCheckMode.OBSERVE) { error("must remain single-flight") })
+
+        assertTrue(coordinator.submit(AccessCheckMode.COLD_START) { coldStarted.countDown() })
+        assertTrue(coldStarted.await(2, TimeUnit.SECONDS))
+        assertTrue(observationTerminal.await(1, TimeUnit.SECONDS))
+        assertEquals(1, terminals.get())
+    }
+
+    @Test
+    fun cancelledQueuedObservationDeliversTerminalOnceAndReleasesCoordinator() {
+        val coordinator = AdbPipelineCoordinator()
+        val firstStarted = CountDownLatch(1)
+        val firstCleanup = CountDownLatch(1)
+        val releaseFirst = CountDownLatch(1)
+        val queuedStarted = AtomicBoolean(false)
+        val queuedTerminal = CountDownLatch(1)
+        val terminals = AtomicInteger(0)
+
+        assertTrue(coordinator.submit(AccessCheckMode.OBSERVE) {
+            firstStarted.countDown()
+            try {
+                while (true) Thread.sleep(5_000)
+            } catch (_: InterruptedException) {
+                firstCleanup.countDown()
+                releaseFirst.await(2, TimeUnit.SECONDS)
+            }
+        })
+        assertTrue(firstStarted.await(1, TimeUnit.SECONDS))
+        coordinator.cancel(AccessCheckMode.OBSERVE)
+        assertTrue(firstCleanup.await(1, TimeUnit.SECONDS))
+
+        assertTrue(coordinator.submit(AccessCheckMode.OBSERVE, onTerminal = {
+            terminals.incrementAndGet()
+            queuedTerminal.countDown()
+        }) { queuedStarted.set(true) })
+        coordinator.cancel(AccessCheckMode.OBSERVE)
+        assertTrue(queuedTerminal.await(1, TimeUnit.SECONDS))
+        assertEquals(1, terminals.get())
+
+        releaseFirst.countDown()
+        assertTrue(coordinator.submit(AccessCheckMode.OBSERVE) { queuedStarted.set(true) })
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+        while (!queuedStarted.get() && System.nanoTime() < deadline) Thread.sleep(5)
+        assertTrue(queuedStarted.get(), "a cancelled queued observation must not leave the coordinator occupied")
     }
 }

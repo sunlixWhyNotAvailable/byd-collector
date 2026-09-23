@@ -129,6 +129,7 @@ class TelemetryStore(
     @Volatile private var normalizedCatalogEnsured = false
     private val closed = AtomicBoolean(false)
 
+    @Synchronized
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         influxCursorInitializer.clear()
@@ -260,7 +261,8 @@ class TelemetryStore(
             }
             val observations = normalizer.normalizeSparse(cached, accepted)
             val summary = normalizedStore.applyObservationsInTransaction(db, observations)
-            result = SourceOrderedApplyResult(observations, summary, accepted)
+            result = SourceOrderedApplyResult(observations, summary, accepted,
+                accepted.mapNotNull { cached[it]?.stamp }.reduceOrNull(::newerSource))
             db.setTransactionSuccessful()
         } finally {
             db.endTransaction()
@@ -284,6 +286,7 @@ class TelemetryStore(
         val applied = mutableListOf<NormalizedObservation>()
         var summary = emptyNormalizedSummary()
         var processed = 0
+        var latestAppliedSource: NormalizedSourceStamp? = null
         db.beginTransaction()
         try {
             val cached = loadNormalizedSourceInputs(db)
@@ -295,6 +298,8 @@ class TelemetryStore(
                             val observations = normalizer.normalizeSparse(cached, setOf(input.reading.rawKey))
                             applied += observations
                             summary = summary + normalizedStore.applyObservationsInTransaction(db, observations)
+                            if (observations.isNotEmpty()) latestAppliedSource =
+                                latestAppliedSource?.let { newerSource(it, input.stamp) } ?: input.stamp
                         }
                     }
                     callbackRawStore.markNormalizedInTransaction(db, event.id)
@@ -309,9 +314,13 @@ class TelemetryStore(
             processedCount = processed,
             appliedObservations = applied,
             summary = summary,
-            hasMore = pending.size == limit
+            hasMore = pending.size == limit,
+            latestAppliedSource = latestAppliedSource
         )
     }
+
+    private fun newerSource(a: NormalizedSourceStamp, b: NormalizedSourceStamp): NormalizedSourceStamp =
+        if (NormalizedSourceOrdering.compare(b, a) == NormalizedSourceOrder.NEWER) b else a
 
     private fun loadNormalizedSourceInputs(db: SQLiteDatabase): MutableMap<String, NormalizedSourceInput> {
         return db.rawQuery(
@@ -664,7 +673,10 @@ class TelemetryStore(
             Log.w(TAG, "operational journal write failed: $logLine", error)
         }
         dispatchOperationalEvent(sharedOperationalEventExecutor) {
-            if (!closed.get()) recordEventInDatabase(timestamp, category, message, detail, logLine)
+            synchronized(this) {
+                // Closing/archive and an already queued diagnostic must not reopen the old file.
+                if (!closed.get()) recordEventInDatabase(timestamp, category, message, detail, logLine)
+            }
         }
     }
 

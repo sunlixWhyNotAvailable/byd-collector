@@ -40,9 +40,11 @@ final class HelperDualStreamRuntime implements AutoCloseable {
     private final CallbackSpoolBinder callbackTransport;
     private final HelperCallbackController callbacks;
     private final Object monitor = new Object();
+    private final Object callbackPlanLock = new Object();
     private final Runnable tick = this::tick;
 
     private volatile boolean closed;
+    private volatile boolean callbackWorkersStopped;
     private boolean wakeAutonomous;
     private boolean mainInFlight;
     private boolean secondaryInFlight;
@@ -124,6 +126,9 @@ final class HelperDualStreamRuntime implements AutoCloseable {
         this.callbacks = new HelperCallbackController(bootId, helperGeneration, mainRows, secondaryRows,
             callbackPlatform, new HelperCallbackController.Host() {
                 @Override public boolean appOwns(int stream) { return callbackUsesLiveMemory(stream); }
+                @Override public boolean captureAllowed(int stream) {
+                    return state.callbackCaptureAllowed(stream, SystemClock.elapsedRealtime());
+                }
                 @Override public boolean publishingHeld(int stream) {
                     return state.callbackPublishingHeld(stream, SystemClock.elapsedRealtime());
                 }
@@ -170,6 +175,12 @@ final class HelperDualStreamRuntime implements AutoCloseable {
         }
         if (action == CollectorHelperProtocol.CONTROL_RENEW) {
             HelperStreamRuntimeState.ControlResult result = state.renew(token, stream, epoch, now);
+            signalChanged();
+            return result;
+        }
+        if (action == CollectorHelperProtocol.CONTROL_SET_AUTONOMY) {
+            HelperStreamRuntimeState.ControlResult result = state.setAutonomyAllowed(token, stream, epoch, value, now);
+            if (result.status == CollectorHelperProtocol.STATUS_OK) refreshCallbackPlan();
             signalChanged();
             return result;
         }
@@ -304,9 +315,7 @@ final class HelperDualStreamRuntime implements AutoCloseable {
     }
 
     int authorizeCallbackTransport(long token, int stream, long epoch) {
-        int status = state.authorizeReplay(token, stream, epoch, SystemClock.elapsedRealtime());
-        if (status != CollectorHelperProtocol.STATUS_OK) return status;
-        return barrierPending(stream) ? CollectorHelperProtocol.STATUS_REPLAY_PENDING : CollectorHelperProtocol.STATUS_OK;
+        return state.authorizeReplay(token, stream, epoch, SystemClock.elapsedRealtime());
     }
 
     /** Passive STEP2 ownership seam used by the future callback listener; it performs no capture. */
@@ -337,14 +346,15 @@ final class HelperDualStreamRuntime implements AutoCloseable {
     boolean barrierPending(int stream) {
         synchronized (monitor) {
             return stream == CollectorHelperProtocol.STREAM_MAIN
-                ? mainInFlight || mainPersisting || callbacks.busy(stream)
-                : secondaryInFlight || secondaryPersisting || callbacks.busy(stream);
+                ? mainInFlight || mainPersisting
+                : secondaryInFlight || secondaryPersisting;
         }
     }
 
     private void tick() {
         if (closed) return;
         long now = SystemClock.elapsedRealtime();
+        refreshCallbackPlan();
         if (now >= nextCallbackDiagnosticsAt) {
             diagnostics.callback(callbacks.diagnosticsSnapshot());
             nextCallbackDiagnosticsAt = saturatedAdd(now, 1_000L);
@@ -523,10 +533,10 @@ final class HelperDualStreamRuntime implements AutoCloseable {
     }
 
     private void refreshCallbackPlan() {
-        long now = SystemClock.elapsedRealtime();
-        callbacks.updatePlan(
-            state.streamView(CollectorHelperProtocol.STREAM_MAIN, now),
-            state.streamView(CollectorHelperProtocol.STREAM_SECONDARY, now));
+        synchronized (callbackPlanLock) {
+            HelperStreamRuntimeState.StreamView[] views = state.streamViews(SystemClock.elapsedRealtime());
+            callbacks.updatePlan(views[0], views[1]);
+        }
     }
 
     private void finish(int stream, boolean persistenceOnly) {
@@ -631,13 +641,15 @@ final class HelperDualStreamRuntime implements AutoCloseable {
     @Override public void close() {
         closed = true;
         ownerHandler.removeCallbacks(tick);
-        callbacks.close();
+        callbackWorkersStopped = callbacks.closeAndAwait(5_000L);
         vendor.close();
         orchestration.shutdownNow();
         persistence.shutdownNow();
         maintainWakeLock(false);
         synchronized (monitor) { monitor.notifyAll(); }
     }
+
+    boolean callbackWorkersStopped() { return callbackWorkersStopped; }
 
     private interface CheckCurrent { boolean ok(); }
     interface VendorCall<T> { T run() throws Throwable; }

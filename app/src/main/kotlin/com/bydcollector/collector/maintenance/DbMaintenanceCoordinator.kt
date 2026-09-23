@@ -54,9 +54,9 @@ class DbMaintenanceCoordinator(
             application.tripsFileOperationLock.withLock { stopRuntime(operation) }
             closeCancelWindowAndCheck(operation)
             publish(operation, 1, cancelAvailable = false)
-            val result = application.withExclusiveDatabaseMaintenance {
+            val result = application.tryWithExclusiveDatabaseMaintenance(FILE_MAINTENANCE_GATE_TIMEOUT_MS) {
                 archive(operation)
-            }
+            } ?: throw TerminalArchiveFailure("Database writers did not quiesce; refusing file maintenance")
             publish(operation, operation.stepsUk.size)
             restoreRuntime()
             restored = true
@@ -522,6 +522,7 @@ class DbMaintenanceCoordinator(
     }
 
     companion object {
+        private const val FILE_MAINTENANCE_GATE_TIMEOUT_MS = 2_000L
         private const val PHASE_ARCHIVING = "ARCHIVING"
         private const val PHASE_CREATING = "CREATING"
         private const val PHASE_VERIFYING = "VERIFYING"

@@ -123,10 +123,13 @@ class CollectorSettings(
         prefs.edit().putBoolean(KEY_INFLUX_MANUAL_STOP, stopped).apply()
     }
 
-    fun clearRuntimeManualStops() {
-        prefs.edit()
-            .putBoolean(KEY_MAIN_MANUAL_STOP, false)
-            .putBoolean(KEY_DEBUG_MANUAL_STOP, false)
+    fun clearRuntimeManualStops(includeCollection: Boolean = true) {
+        prefs.edit().apply {
+            if (includeCollection) {
+                putBoolean(KEY_MAIN_MANUAL_STOP, false)
+                putBoolean(KEY_DEBUG_MANUAL_STOP, false)
+            }
+        }
             .putBoolean(KEY_MQTT_MANUAL_STOP, false)
             .putBoolean(KEY_INFLUX_MANUAL_STOP, false)
             .apply()
@@ -1125,6 +1128,25 @@ class CollectorSettings(
     private fun migrateTelegramBuiltInTemplates() = migrateTelegramBuiltInTemplates(prefs)
 
     companion object {
+        /** Process start precedes any new Activity Start intent; do not reuse a dead manual owner. */
+        fun resetCollectionAfterProcessDeath(context: Context) {
+            resetCollectionAfterProcessDeath(context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE))
+        }
+
+        internal fun resetCollectionAfterProcessDeath(prefs: SharedPreferences) {
+            val allowed = !prefs.getBoolean(KEY_USER_SHUTDOWN, false)
+            val main = allowed && prefs.getBoolean(KEY_AUTO_START, false) &&
+                !prefs.getBoolean(KEY_MAIN_MANUAL_STOP, false)
+            val secondary = allowed && prefs.getBoolean(KEY_DEBUG_AUTO_START, false) &&
+                !prefs.getBoolean(KEY_DEBUG_MANUAL_STOP, false)
+            if (prefs.getBoolean(KEY_POLLING_ENABLED, false) != main ||
+                prefs.getBoolean(KEY_DEBUG_POLLING_ENABLED, false) != secondary
+            ) {
+                prefs.edit().putBoolean(KEY_POLLING_ENABLED, main)
+                    .putBoolean(KEY_DEBUG_POLLING_ENABLED, secondary).apply()
+            }
+        }
+
         internal fun migrateTelegramBuiltInTemplates(prefs: SharedPreferences) {
             val editor = prefs.edit()
             var changed = false

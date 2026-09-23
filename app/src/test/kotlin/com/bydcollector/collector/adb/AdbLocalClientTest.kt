@@ -7,6 +7,7 @@ import java.net.ServerSocket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.file.Files
+import java.security.KeyPairGenerator
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -110,6 +111,42 @@ class AdbLocalClientTest {
 
         assertFailsWith<IllegalStateException> { client.keyFingerprint() }
         assertTrue(privateFile.readBytes().contentEquals(invalidKey))
+    }
+
+    @Test
+    fun readOnlyAuthorizationWithoutAnExistingKeyDoesNotCreateKeyStorage() {
+        val root = Files.createTempDirectory("bydcollector-adb-read-only-test").toFile()
+        val keyDir = root.resolve("not-created/adb_keys")
+        val client = AdbLocalClient(keyDir = keyDir)
+
+        val result = client.checkAuthorizationReadOnly()
+
+        assertEquals("adb_authorization_required", result.category)
+        assertFalse(keyDir.exists(), "observation must not create ADB key storage")
+    }
+
+    @Test
+    fun readOnlyAuthorizationUsesExistingKeyWithoutPromptOrKeyFileWrites() {
+        ReadOnlyAuthAdbServer().use { server ->
+            val keyDir = Files.createTempDirectory("bydcollector-adb-read-only-test").toFile()
+            val privateFile = keyDir.resolve("adb_key.priv")
+            val publicFile = keyDir.resolve("adb_key.pub")
+            val keyPair = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
+            privateFile.writeBytes(keyPair.private.encoded)
+            val originalPrivateBytes = privateFile.readBytes()
+            val client = AdbLocalClient(
+                keyDir = keyDir,
+                endpoints = listOf(AdbEndpoint("127.0.0.1", server.port))
+            )
+
+            val result = client.checkAuthorizationReadOnly()
+
+            assertEquals("adb_authorization_required", result.category)
+            assertTrue(server.awaitFollowup(), "server should receive the existing-key signature challenge")
+            assertEquals(0, server.followupPacketSize, "read-only checks must not send an RSA public-key prompt")
+            assertTrue(privateFile.readBytes().contentEquals(originalPrivateBytes))
+            assertFalse(publicFile.exists(), "deriving a missing public key must remain in memory only")
+        }
     }
 
     @Test
@@ -223,6 +260,38 @@ class AdbLocalClientTest {
         }
 
         fun awaitPublicKey(): Boolean = publicKeySent.await(3, TimeUnit.SECONDS)
+
+        override fun close() {
+            server.close()
+        }
+    }
+
+    private class ReadOnlyAuthAdbServer : AutoCloseable {
+        private val server = ServerSocket(0)
+        private val followupRead = CountDownLatch(1)
+        @Volatile
+        var followupPacketSize: Int = -1
+            private set
+        val port: Int = server.localPort
+
+        init {
+            thread(name = "read-only-auth-adb-test-server", isDaemon = true) {
+                runCatching {
+                    server.accept().use { socket ->
+                        val input = socket.getInputStream()
+                        val output = socket.getOutputStream()
+                        readAdbPacket(input)
+                        writeAdbPacket(output, COMMAND_AUTH, AUTH_TOKEN, 0, ByteArray(20) { 7 })
+                        readAdbPacket(input) // Signature generated from the existing private key.
+                        writeAdbPacket(output, COMMAND_AUTH, AUTH_TOKEN, 0, ByteArray(20) { 9 })
+                        followupPacketSize = readAdbPacket(input).size
+                        followupRead.countDown()
+                    }
+                }
+            }
+        }
+
+        fun awaitFollowup(): Boolean = followupRead.await(3, TimeUnit.SECONDS)
 
         override fun close() {
             server.close()

@@ -16,5 +16,19 @@ class DatabaseMaintenanceGate {
         return try { action() } finally { read.unlock() }
     }
 
+    /** File maintenance fails closed instead of moving a database beneath a stuck writer. */
+    fun <T : Any> tryWithExclusive(timeoutMs: Long, action: () -> T): T? {
+        require(timeoutMs >= 0)
+        val write = lock.writeLock()
+        val acquired = try {
+            write.tryLock(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        if (!acquired) return null
+        return try { action() } finally { write.unlock() }
+    }
+
     fun <T> withExclusive(action: () -> T): T = lock.writeLock().withLock(action)
 }

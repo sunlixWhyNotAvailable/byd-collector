@@ -15,6 +15,39 @@ import kotlin.test.assertTrue
 
 class PollPersistenceCoordinatorTest {
     @Test
+    fun stoppedOwnerCannotPersistALateSuccessfulReadEvenIfInterruptWasCleared() {
+        val store = FakePollStorage()
+        var active = true
+        val coordinator = PollPersistenceCoordinator(store, object : TelemetryClient {
+            override fun read(): TelemetryReadResult {
+                active = false
+                Thread.interrupted()
+                return TelemetryReadResult.Success("{}", 1, emptyList())
+            }
+        }, FakeClock("2026-09-23T10:00:00Z"), isActive = { active })
+        assertFailsWith<InterruptedException> { coordinator.pollOnce(7L) }
+        assertEquals(null, store.insertedInput)
+        assertTrue(store.events.isEmpty())
+    }
+
+    @Test
+    fun storageFailureRetainsCauseStackAndVisibleError() {
+        val store = FakePollStorage(onInsert = {
+            throw IllegalStateException("insert failed", java.io.IOException("disk offline"))
+        })
+        val result = PollPersistenceCoordinator(store,
+            FakeTelemetryClient(TelemetryReadResult.Success("{}", 1, emptyList())),
+            FakeClock("2026-09-23T10:00:00Z")).pollOnce(7L)
+        assertFalse(result.ok)
+        assertEquals("db_write_error", result.category)
+        assertEquals("IllegalStateException: insert failed", result.errorMessage)
+        val diagnostic = store.events.single()
+        assertEquals("db_write_error", diagnostic.category)
+        assertTrue(diagnostic.detail!!.contains("Caused by: java.io.IOException: disk offline"))
+        assertTrue(diagnostic.detail.contains("PollPersistenceCoordinatorTest"))
+    }
+
+    @Test
     fun replayBarrierDoesNotPersistOrNotifyAMeasurement() {
         val store = FakePollStorage()
         val coordinator = PollPersistenceCoordinator(store,
@@ -187,16 +220,11 @@ class PollPersistenceCoordinatorTest {
 
         assertTrue(result.ok)
         assertEquals(99L, result.pollId)
-        assertEquals(
-            listOf(
-                FakeEvent(
-                    category = "normalized_write_error",
-                    message = "Normalized state write failed",
-                    detail = "IllegalStateException: normalizer unavailable"
-                )
-            ),
-            store.events
-        )
+        val event = store.events.single()
+        assertEquals("normalized_write_error", event.category)
+        assertEquals("Normalized state write failed", event.message)
+        assertTrue(event.detail!!.contains("IllegalStateException: normalizer unavailable"))
+        assertTrue(event.detail.contains("PollPersistenceCoordinatorTest"))
     }
 
     @Test

@@ -42,7 +42,7 @@ object CollectorAutoStart {
             return
         }
         if (clearsManualStops(action)) {
-            settings.clearRuntimeManualStops()
+            settings.clearRuntimeManualStops(includeCollection = false)
         }
         val demand = prepareRuntimeDemand(settings)
         if (!demand.any) {
@@ -285,8 +285,11 @@ object CollectorAutoStart {
         if (demand.main) {
             ensurePollingEnabled(settings)
         }
-        // Cold recovery follows auto-start demand; a live manual All-data owner keeps its explicit flag.
-        if (!CollectorService.isRunning()) settings.setDebugPollingEnabled(demand.debug)
+        // Cold recovery follows AutoStart for both streams; live manual collection is unchanged.
+        if (!CollectorService.isRunning()) {
+            settings.setPollingEnabled(demand.main)
+            settings.setDebugPollingEnabled(demand.debug)
+        }
         return demand
     }
 

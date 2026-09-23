@@ -8,6 +8,7 @@ import com.bydcollector.collector.data.local.PollReading
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import com.bydcollector.collector.data.remote.TelemetryClient
 import com.bydcollector.collector.data.remote.TelemetryReadResult
+import com.bydcollector.collector.util.diagnosticDetail
 
 data class PollCycleResult(
     val pollId: Long?,
@@ -65,7 +66,8 @@ class PollPersistenceCoordinator(
     private val store: PollStorage,
     private val client: TelemetryClient,
     private val clock: Clock = SystemClockAdapter(),
-    private val successfulPollObserver: SuccessfulPollObserver? = null
+    private val successfulPollObserver: SuccessfulPollObserver? = null,
+    private val isActive: () -> Boolean = { true }
 ) : PollCycleRunner {
     private var lastPersistedFailureKey: String? = null
     private var lastPersistedFailureAtMs: Long = Long.MIN_VALUE
@@ -74,8 +76,10 @@ class PollPersistenceCoordinator(
     private val liveSource = LivePollSource()
 
     override fun pollOnce(sessionId: Long): PollCycleResult {
+        checkActive()
         val parameters = store.getActiveCatalogParameters()
         val result = client.read()
+        checkActive()
         if (result !is TelemetryReadResult.ReplayPending) replayPendingLogged = false
 
         return try {
@@ -189,7 +193,8 @@ class PollPersistenceCoordinator(
             }
         } catch (error: Exception) {
             if (error is InterruptedException) throw error
-            val detail = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+            checkActive()
+            val detail = error.diagnosticDetail("Main poll persistence")
             runCatching { Log.e(TAG, "Database write failed", error) }
             try {
                 store.recordEvent("db_write_error", "Database write failed", detail)
@@ -197,7 +202,9 @@ class PollPersistenceCoordinator(
                 if (eventError is InterruptedException) throw eventError
                 logError("Failed to record database write failure", eventError)
             }
-            PollCycleResult(null, ok = false, category = "db_write_error", elapsedMs = 0, requestCount = DIRECT_REQUEST_COUNT)
+            PollCycleResult(null, ok = false, category = "db_write_error", elapsedMs = 0,
+                requestCount = DIRECT_REQUEST_COUNT,
+                errorMessage = "${error::class.java.simpleName}: ${error.message ?: "no message"}")
         }
     }
 
@@ -227,10 +234,16 @@ class PollPersistenceCoordinator(
             action()
         } catch (error: Exception) {
             if (error is InterruptedException) throw error
+            checkActive()
             logError("Normalized state write failed", error)
             recordEventSafely("normalized_write_error", "Normalized state write failed",
-                "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+                error.diagnosticDetail("Main normalization"))
         }
+    }
+
+    private fun checkActive() {
+        if (!isActive() || Thread.currentThread().isInterrupted)
+            throw InterruptedException("Main poll owner stopped")
     }
 
     private fun recordEventSafely(category: String, message: String, detail: String?) {

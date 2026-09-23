@@ -76,6 +76,7 @@ class DashboardUiStateStore(
     private var countBootstrapGeneration = 0L
     private var initialHydrationStarted = false
     private var runtimeFlags: DashboardRuntimeFlags? = null
+    private var accessStatus: Pair<Boolean, Boolean>? = null
     private var mainPollState: DashboardMainPollState? = null
     private var debugPollState: DashboardDebugPollState? = null
     private var integrationRuntimeState: DashboardState? = null
@@ -258,6 +259,14 @@ class DashboardUiStateStore(
     fun publishRuntimeFlags(flags: DashboardRuntimeFlags) {
         synchronized(lock) {
             runtimeFlags = flags
+            updateAllLocked(::applyRuntimeOverlays)
+        }
+    }
+
+    /** The access checker remains authoritative even when the collection service is stopped. */
+    fun publishAccessStatus(permissionsGranted: Boolean, adbAuthorized: Boolean) {
+        synchronized(lock) {
+            accessStatus = permissionsGranted to adbAuthorized
             updateAllLocked(::applyRuntimeOverlays)
         }
     }
@@ -458,6 +467,9 @@ class DashboardUiStateStore(
                 dbMaintenanceStatus = flags.dbMaintenanceStatus,
                 archiveStorageJobStatus = flags.archiveStorageJobStatus
             )
+        }
+        accessStatus?.let { (permissionsGranted, adbAuthorized) ->
+            state = state.copy(permissionsGranted = permissionsGranted, adbAuthorized = adbAuthorized)
         }
         mainDatabaseSizeBytes?.let { state = state.copy(databaseSizeBytes = it) }
         debugDatabaseSizeBytes?.let { state = state.copy(debugDatabaseSizeBytes = it) }

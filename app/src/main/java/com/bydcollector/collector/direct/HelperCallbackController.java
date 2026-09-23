@@ -31,6 +31,7 @@ final class HelperCallbackController implements AutoCloseable {
     interface Poller { CollectorHelperDaemon.BatchResult poll(List<CollectorHelperDaemon.Address> rows) throws Throwable; }
     interface Host {
         boolean appOwns(int stream);
+        boolean captureAllowed(int stream);
         boolean publishingHeld(int stream);
         long liveBytes(int stream);
         CallbackSpool.AppendResult deliver(TelemetryCallbackBatch batch);
@@ -46,16 +47,19 @@ final class HelperCallbackController implements AutoCloseable {
     private final Host host;
     private final LongSupplier elapsedClock;
     private final LongSupplier wallClock;
-    private final ScheduledExecutorService worker;
+    private final ScheduledExecutorService[] streamWorkers = new ScheduledExecutorService[3];
     private final ScheduledExecutorService registrationWorker;
+    private final Object closeLock = new Object();
     private final TelemetryCallbackQueue[] queues = new TelemetryCallbackQueue[3];
     private final long[] eventSequence = new long[3];
     private final long[] minPromotableSequence = new long[3];
     private final long[] inFlightBytes = new long[3];
     private final boolean[] desired = new boolean[3];
+    private final boolean[] capturePermitted = new boolean[3];
     private final boolean[] captureEnabled = new boolean[3];
     private final boolean[] fenceActive = new boolean[3];
     private final long[] epochs = new long[3];
+    private final long[] plannedEpochs = new long[3];
     private final Set<NativeKey> mainKeys;
     private final Set<NativeKey> secondaryKeys;
     private final Map<NativeKey, List<CollectorHelperDaemon.Address>> scalarAddresses;
@@ -63,11 +67,15 @@ final class HelperCallbackController implements AutoCloseable {
     private final Object registrationLock = new Object();
     private ScheduledFuture<?> registrationFuture;
     private volatile boolean closed;
+    private volatile boolean streamWorkersShutdown;
+    private volatile boolean streamWorkersTerminated;
     private volatile boolean restartListener;
     private volatile String retryReason;
     private int retryIndex;
     private long callbacksReceived;
     private long queueLossCount;
+    private HelperStreamRuntimeState.StreamView lastMainView;
+    private HelperStreamRuntimeState.StreamView lastSecondaryView;
 
     HelperCallbackController(String bootId, String generation,
         List<CollectorHelperDaemon.Address> mainRows, List<CollectorHelperDaemon.Address> secondaryRows,
@@ -92,11 +100,8 @@ final class HelperCallbackController implements AutoCloseable {
             CollectorHelperProtocol.STREAM_MAIN, bootId, generation);
         queues[CollectorHelperProtocol.STREAM_SECONDARY] = new TelemetryCallbackQueue(
             CollectorHelperProtocol.STREAM_SECONDARY, bootId, generation);
-        worker = Executors.newSingleThreadScheduledExecutor(runnable -> {
-            Thread thread = new Thread(runnable, "byd-helper-callback-control");
-            thread.setDaemon(true);
-            return thread;
-        });
+        streamWorkers[CollectorHelperProtocol.STREAM_MAIN] = newStreamWorker("main");
+        streamWorkers[CollectorHelperProtocol.STREAM_SECONDARY] = newStreamWorker("secondary");
         registrationWorker = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "byd-helper-callback-registration");
             thread.setDaemon(true);
@@ -108,29 +113,45 @@ final class HelperCallbackController implements AutoCloseable {
             }
             @Override public void error(int code, String message) { onListenerError(code, message); }
         });
-        worker.scheduleWithFixedDelay(this::maintenance, 100L, 100L, TimeUnit.MILLISECONDS);
+        for (int stream = CollectorHelperProtocol.STREAM_MAIN;
+             stream <= CollectorHelperProtocol.STREAM_SECONDARY; stream++) {
+            final int selectedStream = stream;
+            streamWorkers[stream].scheduleWithFixedDelay(
+                () -> maintenance(selectedStream), 100L, 100L, TimeUnit.MILLISECONDS);
+        }
     }
 
     void updatePlan(HelperStreamRuntimeState.StreamView main, HelperStreamRuntimeState.StreamView secondary) {
-        List<TelemetryCallbackBatch> displaced = new ArrayList<>();
+        List<TelemetryCallbackBatch> displaced;
         boolean unionChanged;
         synchronized (lock) {
+            if (sameView(lastMainView, main) && sameView(lastSecondaryView, secondary)) return;
+            displaced = new ArrayList<>();
             boolean oldMain = desired[CollectorHelperProtocol.STREAM_MAIN];
             boolean oldSecondary = desired[CollectorHelperProtocol.STREAM_SECONDARY];
+            boolean oldMainCapture = capturePermitted[CollectorHelperProtocol.STREAM_MAIN];
+            boolean oldSecondaryCapture = capturePermitted[CollectorHelperProtocol.STREAM_SECONDARY];
             updateStream(CollectorHelperProtocol.STREAM_MAIN, main, displaced);
             updateStream(CollectorHelperProtocol.STREAM_SECONDARY, secondary, displaced);
-            clearOwnerChanges(oldMain, oldSecondary,
-                desired[CollectorHelperProtocol.STREAM_MAIN], desired[CollectorHelperProtocol.STREAM_SECONDARY]);
-            if (oldMain != desired[CollectorHelperProtocol.STREAM_MAIN] ||
-                oldSecondary != desired[CollectorHelperProtocol.STREAM_SECONDARY]) {
+            boolean desiredChanged = oldMain != desired[CollectorHelperProtocol.STREAM_MAIN] ||
+                oldSecondary != desired[CollectorHelperProtocol.STREAM_SECONDARY];
+            boolean mainCaptureChanged = oldMainCapture != capturePermitted[CollectorHelperProtocol.STREAM_MAIN];
+            boolean secondaryCaptureChanged = oldSecondaryCapture != capturePermitted[CollectorHelperProtocol.STREAM_SECONDARY];
+            if (mainCaptureChanged || secondaryCaptureChanged) {
+                clearOwnerChanges(oldMainCapture, oldSecondaryCapture,
+                    capturePermitted[CollectorHelperProtocol.STREAM_MAIN],
+                    capturePermitted[CollectorHelperProtocol.STREAM_SECONDARY]);
+            }
+            if (mainCaptureChanged || secondaryCaptureChanged) {
                 minPromotableSequence[CollectorHelperProtocol.STREAM_MAIN] =
                     eventSequence[CollectorHelperProtocol.STREAM_MAIN];
                 minPromotableSequence[CollectorHelperProtocol.STREAM_SECONDARY] =
                     eventSequence[CollectorHelperProtocol.STREAM_SECONDARY];
             }
-            unionChanged = !desiredUnion(oldMain, oldSecondary).equals(
-                desiredUnion(desired[CollectorHelperProtocol.STREAM_MAIN],
-                    desired[CollectorHelperProtocol.STREAM_SECONDARY]));
+            unionChanged = desiredChanged && !desiredUnion(oldMain, oldSecondary).equals(
+                desiredUnion(desired[CollectorHelperProtocol.STREAM_MAIN], desired[CollectorHelperProtocol.STREAM_SECONDARY]));
+            lastMainView = main;
+            lastSecondaryView = secondary;
         }
         for (TelemetryCallbackBatch batch : displaced) submitBatch(batch);
         if (unionChanged) scheduleRegistration(0L, true);
@@ -145,7 +166,7 @@ final class HelperCallbackController implements AutoCloseable {
             batches = drainAllLocked(stream);
             if (desired[stream]) {
                 epochs[stream] = nextEpoch(epochs[stream]);
-                captureEnabled[stream] = true;
+                captureEnabled[stream] = capturePermitted[stream];
             }
         }
         for (TelemetryCallbackBatch batch : batches) submitBatch(batch);
@@ -239,14 +260,31 @@ final class HelperCallbackController implements AutoCloseable {
 
     private void updateStream(int stream, HelperStreamRuntimeState.StreamView view,
                               List<TelemetryCallbackBatch> displaced) {
-        boolean identityChanged = desired[stream] != view.desired || epochs[stream] != view.epoch;
+        boolean desiredChanged = desired[stream] != view.desired;
+        boolean plannedEpochChanged = plannedEpochs[stream] != view.epoch;
+        boolean identityChanged = desiredChanged || (plannedEpochChanged && epochs[stream] != view.epoch);
         if (identityChanged) {
             captureEnabled[stream] = false;
             displaced.addAll(drainAllLocked(stream));
+            epochs[stream] = view.epoch;
         }
         desired[stream] = view.desired;
-        epochs[stream] = view.epoch;
-        captureEnabled[stream] = view.desired;
+        plannedEpochs[stream] = view.epoch;
+        capturePermitted[stream] = view.desired && (view.activeLease || view.autonomyAllowed);
+        captureEnabled[stream] = capturePermitted[stream];
+    }
+
+    private static boolean sameView(HelperStreamRuntimeState.StreamView left,
+                                    HelperStreamRuntimeState.StreamView right) {
+        return left != null && right != null && left.desired == right.desired &&
+            left.capturePaused == right.capturePaused && left.epoch == right.epoch &&
+            left.activeLease == right.activeLease && left.autonomyAllowed == right.autonomyAllowed;
+    }
+
+    private boolean canCapture(int stream, NativeKey key) {
+        if (!captureEnabled[stream] || !host.captureAllowed(stream)) return false;
+        return stream == CollectorHelperProtocol.STREAM_MAIN
+            ? mainKeys.contains(key) : secondaryKeys.contains(key);
     }
 
     private void onCallback(int dev, int fid, int type, int rawBits, byte[] bytes) {
@@ -256,11 +294,11 @@ final class HelperCallbackController implements AutoCloseable {
             if (closed) return;
             callbacksReceived++;
             NativeKey key = new NativeKey(dev, fid);
-            int stream = desired[CollectorHelperProtocol.STREAM_MAIN] && mainKeys.contains(key)
+            int stream = canCapture(CollectorHelperProtocol.STREAM_MAIN, key)
                 ? CollectorHelperProtocol.STREAM_MAIN
-                : desired[CollectorHelperProtocol.STREAM_SECONDARY] && secondaryKeys.contains(key)
+                : canCapture(CollectorHelperProtocol.STREAM_SECONDARY, key)
                     ? CollectorHelperProtocol.STREAM_SECONDARY : 0;
-            if (stream == 0 || !captureEnabled[stream]) return;
+            if (stream == 0) return;
             long sequence = eventSequence[stream]++;
             if (bytes != null && bytes.length > TelemetryCallbackBatch.MAX_BYTES - 2048) {
                 queues[stream].noteLoss(wall, "oversize_callback");
@@ -281,6 +319,7 @@ final class HelperCallbackController implements AutoCloseable {
     }
 
     private void onListenerError(int code, String message) {
+        if (closed) return;
         synchronized (lock) {
             for (CacheEntry value : cache.values()) { value.promoted = false; value.recoveryPending = false; }
             minPromotableSequence[CollectorHelperProtocol.STREAM_MAIN] =
@@ -288,7 +327,7 @@ final class HelperCallbackController implements AutoCloseable {
             minPromotableSequence[CollectorHelperProtocol.STREAM_SECONDARY] =
                 eventSequence[CollectorHelperProtocol.STREAM_SECONDARY];
         }
-        try { worker.execute(() -> host.noteError(
+        try { streamWorkers[CollectorHelperProtocol.STREAM_MAIN].execute(() -> host.noteError(
             "BYDAuto listener error " + code + ": " + String.valueOf(message))); }
         catch (Throwable ignored) { }
         restartListener = true;
@@ -296,23 +335,23 @@ final class HelperCallbackController implements AutoCloseable {
         scheduleRegistration(RETRY_MS[Math.min(retryIndex++, RETRY_MS.length - 1)], false);
     }
 
-    private void maintenance() {
+    private void maintenance(int stream) {
         if (closed) return;
         try {
-            for (int stream = 1; stream <= 2; stream++) {
-                TelemetryCallbackBatch batch;
-                TelemetryCallbackQueue.Loss loss;
-                synchronized (lock) {
-                    batch = fenceActive[stream] || host.publishingHeld(stream)
-                        ? null : drainLocked(stream, true);
-                    loss = queues[stream].takeLoss();
-                    if (loss != null) queueLossCount += loss.count;
-                }
-                if (loss != null) host.recordLoss(stream, loss);
-                if (batch != null) deliverBatch(batch);
-                if (!host.appOwns(stream) && host.liveBytes(stream) > 0L) host.spill(stream);
+            TelemetryCallbackBatch batch;
+            TelemetryCallbackQueue.Loss loss;
+            synchronized (lock) {
+                batch = fenceActive[stream] || host.publishingHeld(stream)
+                    ? null : drainLocked(stream, true);
+                loss = queues[stream].takeLoss();
+                if (loss != null) queueLossCount += loss.count;
             }
-        } catch (Throwable error) { host.noteError("callback maintenance failed: " + describe(error)); }
+            if (loss != null) host.recordLoss(stream, loss);
+            if (batch != null) deliverBatch(batch);
+            if (!host.appOwns(stream) && host.liveBytes(stream) > 0L) host.spill(stream);
+        } catch (Throwable error) {
+            if (!closed) host.noteError("callback maintenance failed: " + describe(error));
+        }
     }
 
     private TelemetryCallbackBatch drainLocked(int stream, boolean dueOnly) {
@@ -330,7 +369,7 @@ final class HelperCallbackController implements AutoCloseable {
     }
 
     private void submitBatch(TelemetryCallbackBatch batch) {
-        try { worker.execute(() -> deliverBatch(batch)); }
+        try { streamWorkers[batch.stream].execute(() -> deliverBatch(batch)); }
         catch (Throwable error) {
             synchronized (lock) { inFlightBytes[batch.stream] -= retainedBytes(batch); lock.notifyAll(); }
             synchronized (lock) { queueLossCount += batch.events.size(); }
@@ -368,7 +407,10 @@ final class HelperCallbackController implements AutoCloseable {
 
     void listenerErrorForTest() { onListenerError(-1, "test"); }
 
-    void maintenanceForTest() { maintenance(); }
+    void maintenanceForTest() {
+        maintenance(CollectorHelperProtocol.STREAM_MAIN);
+        maintenance(CollectorHelperProtocol.STREAM_SECONDARY);
+    }
 
     DiagnosticsSnapshot diagnosticsSnapshot() {
         long now = nowElapsed();
@@ -577,19 +619,65 @@ final class HelperCallbackController implements AutoCloseable {
     }
 
     @Override public void close() {
-        closed = true;
-        synchronized (registrationLock) {
-            if (registrationFuture != null) registrationFuture.cancel(false);
+        closeAndAwait(5_000L);
+    }
+
+    boolean closeAndAwait(long timeoutMs) {
+        synchronized (closeLock) {
+            boolean interrupted = false;
+            if (!streamWorkersShutdown) {
+                closed = true;
+                synchronized (registrationLock) {
+                    if (registrationFuture != null) registrationFuture.cancel(false);
+                }
+                registrationWorker.shutdownNow();
+                try { registrationWorker.awaitTermination(5L, TimeUnit.SECONDS); }
+                catch (InterruptedException error) { interrupted = true; }
+
+                List<TelemetryCallbackBatch> pending = new ArrayList<>();
+                synchronized (lock) {
+                    captureEnabled[CollectorHelperProtocol.STREAM_MAIN] = false;
+                    captureEnabled[CollectorHelperProtocol.STREAM_SECONDARY] = false;
+                    fenceActive[CollectorHelperProtocol.STREAM_MAIN] = true;
+                    fenceActive[CollectorHelperProtocol.STREAM_SECONDARY] = true;
+                    pending.addAll(drainAllLocked(CollectorHelperProtocol.STREAM_MAIN));
+                    pending.addAll(drainAllLocked(CollectorHelperProtocol.STREAM_SECONDARY));
+                }
+                for (TelemetryCallbackBatch batch : pending) submitBatch(batch);
+                try { platform.close(); }
+                catch (Throwable error) { host.noteError("callback close failed: " + describe(error)); }
+                for (int stream = CollectorHelperProtocol.STREAM_MAIN;
+                     stream <= CollectorHelperProtocol.STREAM_SECONDARY; stream++) {
+                    streamWorkers[stream].shutdown();
+                }
+                streamWorkersShutdown = true;
+            }
+
+            long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(Math.max(0L, timeoutMs));
+            for (int stream = CollectorHelperProtocol.STREAM_MAIN;
+                 stream <= CollectorHelperProtocol.STREAM_SECONDARY; stream++) {
+                while (!streamWorkers[stream].isTerminated()) {
+                    long remaining = deadline - System.nanoTime();
+                    if (remaining <= 0L) break;
+                    try { streamWorkers[stream].awaitTermination(remaining, TimeUnit.NANOSECONDS); }
+                    catch (InterruptedException error) { interrupted = true; }
+                }
+            }
+            streamWorkersTerminated = streamWorkers[CollectorHelperProtocol.STREAM_MAIN].isTerminated() &&
+                streamWorkers[CollectorHelperProtocol.STREAM_SECONDARY].isTerminated();
+            if (interrupted) Thread.currentThread().interrupt();
+            return streamWorkersTerminated;
         }
-        registrationWorker.shutdownNow();
-        try { registrationWorker.awaitTermination(5L, TimeUnit.SECONDS); }
-        catch (InterruptedException error) { Thread.currentThread().interrupt(); }
-        synchronized (lock) {
-            captureEnabled[1] = false; captureEnabled[2] = false;
-        }
-        quiesce(1, 5_000L); quiesce(2, 5_000L);
-        try { platform.close(); } catch (Throwable error) { host.noteError("callback close failed: " + describe(error)); }
-        worker.shutdownNow();
+    }
+
+    boolean streamWorkersTerminated() { return streamWorkersTerminated; }
+
+    private static ScheduledExecutorService newStreamWorker(String streamName) {
+        return Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "byd-helper-callback-" + streamName);
+            thread.setDaemon(true);
+            return thread;
+        });
     }
 
     interface Listener {

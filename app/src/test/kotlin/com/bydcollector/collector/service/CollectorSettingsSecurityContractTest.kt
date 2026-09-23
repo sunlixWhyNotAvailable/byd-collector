@@ -14,6 +14,35 @@ import kotlin.test.assertTrue
 
 class CollectorSettingsSecurityContractTest {
     @Test
+    fun processDeathReconcilesBothStreamsWithoutRevivingManualOrStoppedCollection() {
+        for (autoMain in listOf(false, true)) for (autoSecondary in listOf(false, true)) {
+            for (stopMain in listOf(false, true)) for (stopSecondary in listOf(false, true)) {
+                for (shutdown in listOf(false, true)) for (oldRunning in listOf(false, true)) {
+                    val prefs = InMemorySharedPreferences(mapOf(
+                        CollectorSettings.KEY_AUTO_START to autoMain,
+                        CollectorSettings.KEY_DEBUG_AUTO_START to autoSecondary,
+                        CollectorSettings.KEY_MAIN_MANUAL_STOP to stopMain,
+                        CollectorSettings.KEY_DEBUG_MANUAL_STOP to stopSecondary,
+                        CollectorSettings.KEY_USER_SHUTDOWN to shutdown,
+                        CollectorSettings.KEY_POLLING_ENABLED to oldRunning,
+                        CollectorSettings.KEY_DEBUG_POLLING_ENABLED to oldRunning
+                    ))
+                    CollectorSettings.resetCollectionAfterProcessDeath(prefs)
+                    assertEquals(autoMain && !stopMain && !shutdown,
+                        prefs.getBoolean(CollectorSettings.KEY_POLLING_ENABLED, false))
+                    assertEquals(autoSecondary && !stopSecondary && !shutdown,
+                        prefs.getBoolean(CollectorSettings.KEY_DEBUG_POLLING_ENABLED, false))
+                    assertEquals(stopMain, prefs.getBoolean(CollectorSettings.KEY_MAIN_MANUAL_STOP, false))
+                    assertEquals(stopSecondary, prefs.getBoolean(CollectorSettings.KEY_DEBUG_MANUAL_STOP, false))
+                    val writes = prefs.applyCount
+                    CollectorSettings.resetCollectionAfterProcessDeath(prefs)
+                    assertEquals(writes, prefs.applyCount, "unchanged recovery must not rewrite preferences")
+                }
+            }
+        }
+    }
+
+    @Test
     fun legacyTripDelayMigratesToBoundedSeconds() {
         assertEquals(120, CollectorSettings.legacyTripDelaySeconds(2))
         assertEquals(300, CollectorSettings.legacyTripDelaySeconds(60))

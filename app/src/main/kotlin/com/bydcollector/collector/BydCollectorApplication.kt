@@ -50,7 +50,7 @@ class BydCollectorApplication : Application() {
     private var tripsStore: TripStore? = null
     private var cutoverCoordinator: StorageFormatCutoverCoordinator? = null
     private var debugStorageReady: Boolean? = null
-    private val databaseMaintenanceGate = DatabaseMaintenanceGate()
+    internal val databaseMaintenanceGate = DatabaseMaintenanceGate()
     // Only file barriers and archive's runtime-stop boundary share this lock, not ongoing collection.
     internal val tripsFileOperationLock = ReentrantLock(true)
     internal val operationalEventJournal by lazy { OperationalEventJournal(applicationContext) }
@@ -95,6 +95,7 @@ class BydCollectorApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        CollectorSettings.resetCollectionAfterProcessDeath(this)
         // A Messenger bind can create only this Application. Normal runtime entry
         // points start update timing explicitly; IPC must not start checks or collection.
     }
@@ -339,6 +340,9 @@ class BydCollectorApplication : Application() {
 
     fun <T> withExclusiveDatabaseMaintenance(action: () -> T): T =
         databaseMaintenanceGate.withExclusive(action)
+
+    internal fun <T : Any> tryWithExclusiveDatabaseMaintenance(timeoutMs: Long, action: () -> T): T? =
+        databaseMaintenanceGate.tryWithExclusive(timeoutMs, action)
 
     @Synchronized
     fun telegramStoreOrNull(): TelegramStore? = telegramStore.takeIf { telegramStorageError == null }

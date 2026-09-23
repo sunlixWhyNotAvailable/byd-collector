@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.database.sqlite.SQLiteException
 import android.net.ConnectivityManager
 import android.net.LinkProperties
@@ -25,13 +26,14 @@ import com.bydcollector.collector.adb.AdbAuthorizationManager
 import com.bydcollector.collector.adb.AccessCheckMode
 import com.bydcollector.collector.adb.AdbLocalClient
 import com.bydcollector.collector.data.callback.CallbackBatchDrainCoordinator
+import com.bydcollector.collector.data.callback.CallbackIntakeWorker
+import com.bydcollector.collector.data.callback.CallbackNormalizationWorker
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseResolver
 import com.bydcollector.collector.data.debug.DirectDebugParameterAsset
 import com.bydcollector.collector.data.debug.DirectDebugRoundRobinPoller
 import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.data.debug.SecondaryReplayCoordinator
-import com.bydcollector.collector.data.debug.SecondaryReplayDrainResult
 import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
 import com.bydcollector.collector.data.direct.DirectStreamController
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
@@ -41,8 +43,8 @@ import com.bydcollector.collector.data.normalized.NormalizedWriteSummary
 import com.bydcollector.collector.data.normalized.PollingErrorSummaries
 import com.bydcollector.collector.data.normalized.VehicleStateNormalizer
 import com.bydcollector.collector.data.polling.PollOrigin
-import com.bydcollector.collector.data.polling.PollCycleRunner
 import com.bydcollector.collector.data.polling.PollCycleResult
+import com.bydcollector.collector.data.polling.PollCycleRunner
 import com.bydcollector.collector.data.polling.PollPersistenceCoordinator
 import com.bydcollector.collector.data.polling.SuccessfulPollObserver
 import com.bydcollector.collector.data.polling.TelemetryPoller
@@ -95,7 +97,6 @@ import com.bydcollector.collector.ui.DisplayTimeFormatter
 import com.bydcollector.collector.ui.RuntimeActionStatus
 import com.bydcollector.collector.ui.VehicleKpiLanguage
 import com.bydcollector.collector.ui.VehicleKpiMapper
-import com.bydcollector.collector.ui.VehicleKpis
 import com.bydcollector.collector.ui.compose.AppTab
 import com.bydcollector.collector.util.namedSingleThreadExecutor
 import com.bydcollector.collector.util.diagnosticDetail
@@ -149,7 +150,22 @@ class CollectorService : Service() {
     private val tailscaleExecutor = namedSingleThreadExecutor("byd-tailscale")
     private val dashboardMetricsExecutor = namedSingleThreadExecutor("byd-dashboard-metrics")
     private val dashboardCountExecutor = namedSingleThreadExecutor("byd-dashboard-counts")
+    private lateinit var mainCallbackIntake: CallbackIntakeWorker
+    private lateinit var secondaryCallbackIntake: CallbackIntakeWorker
+    private lateinit var callbackNormalizer: CallbackNormalizationWorker
+    private val secondaryCallbackFinished = AtomicBoolean(true)
+    private val callbackDiagnosticQueued = arrayOf(AtomicBoolean(false), AtomicBoolean(false))
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val collectionPolicyListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == CollectorSettings.KEY_AUTO_START || key == CollectorSettings.KEY_DEBUG_AUTO_START) {
+            mainHandler.post {
+                if (running.get()) {
+                    configureDesiredStreams()
+                    reconcilePersistedHelperStateAsync()
+                }
+            }
+        }
+    }
     private val mqttExecutorLock = Any()
     private var mqttExecutor: ExecutorService = namedSingleThreadExecutor("byd-mqtt")
     private var mqttRetryScheduled = false
@@ -199,6 +215,22 @@ class CollectorService : Service() {
     private var lastStatusHeartbeatAtMs: Long = -STATUS_HEARTBEAT_INTERVAL_MS
     private var lastNotificationText: String? = null
     private var accessSelfCheckScheduled = false
+    private var mainStartRetryScheduled = false
+    private var debugStartRetryScheduled = false
+    private val debugStartRetryTask = Runnable {
+        debugStartRetryScheduled = false
+        if (running.get() && !settings.isUserShutdownRequested() && settings.isDebugPollingEnabled() &&
+            !settings.isDebugManuallyStopped() && !maintenanceBlocksRuntimeStart(debugRuntime = true)
+        ) startDebugIfNeeded(DEBUG_REASON_MANUAL)
+    }
+    private val mainStartRetryTask = Runnable {
+        mainStartRetryScheduled = false
+        if (running.get() && !settings.isUserShutdownRequested() && settings.isPollingEnabled() &&
+            !settings.isMainManuallyStopped() && !maintenanceBlocksRuntimeStart()
+        ) {
+            try { startMainIfNeeded() } catch (error: RuntimeException) { handleMainStartFailure(error) }
+        }
+    }
     @Volatile private var lastTelegramPollError: String? = null
     private var telegramTickScheduled = false
     private var telegramTickAtMs: Long? = null
@@ -208,8 +240,8 @@ class CollectorService : Service() {
     private val integrationDashboardRefreshPending = AtomicBoolean(false)
     @Volatile private var lastDatabaseFootprintAtMs = Long.MIN_VALUE
     private var lastKpiPublishAtMs = Long.MIN_VALUE
-    private var lastKpiObservationAtMs = Long.MIN_VALUE
-    private var pendingVehicleKpis: LocalizedVehicleKpis? = null
+    private val kpiFreshness = KpiFreshness(
+        com.bydcollector.collector.data.polling.LivePollSource.liveBootId, KPI_STALE_AFTER_MS)
     private var kpiPublishScheduled = false
     private val mqttRetryTask = object : Runnable {
         override fun run() {
@@ -293,14 +325,10 @@ class CollectorService : Service() {
     }
     private val kpiPublishTask = Runnable {
         kpiPublishScheduled = false
-        pendingVehicleKpis?.let { kpis ->
-            pendingVehicleKpis = null
-            publishVehicleKpisNow(kpis)
-        }
+        publishVehicleKpisNow()
     }
     private val kpiStaleTask = Runnable {
-        val nowMs = SystemClock.elapsedRealtime()
-        if (nowMs - lastKpiObservationAtMs >= KPI_STALE_AFTER_MS) clearDashboardVehicleKpis()
+        publishVehicleKpisNow()
     }
 
     override fun onCreate() {
@@ -336,6 +364,8 @@ class CollectorService : Service() {
         )
         store = BydCollectorApplication.store(applicationContext)
         settings = CollectorSettings(applicationContext, store)
+        getSharedPreferences(CollectorSettings.PREFS_NAME, Context.MODE_PRIVATE)
+            .registerOnSharedPreferenceChangeListener(collectionPolicyListener)
         configureDesiredStreams()
         reconcilePersistedHelperStateAsync()
         debugStorageReady = BydCollectorApplication.isDebugStorageReady(applicationContext)
@@ -357,6 +387,15 @@ class CollectorService : Service() {
             activate = { scheduleTailscaleActivation() }
         )
         vehicleStateNormalizer = VehicleStateNormalizer()
+        callbackNormalizer = CallbackNormalizationWorker(
+            threadName = "byd-callback-normalizer",
+            drainPage = ::normalizeCallbackPage,
+            onFault = { error ->
+                store.recordEvent("callback_normalization_error", "Main callback normalization failed", error.diagnosticDetail())
+            }
+        )
+        mainCallbackIntake = createCallbackIntake(CollectorHelperProtocol.STREAM_MAIN)
+        secondaryCallbackIntake = createCallbackIntake(CollectorHelperProtocol.STREAM_SECONDARY)
         mqttCoordinator = createMqttCoordinator(processMqttClientFacade)
         influxCoordinator = createInfluxCoordinator()
         telegramCoordinator = createTelegramCoordinator()
@@ -431,7 +470,7 @@ class CollectorService : Service() {
         }
         if (stickyRestart) reconcilePendingCutoverArchiveStorage(action)
         if (stickyRestart) {
-            reconcilePersistedRuntime(resetDebugToAutoStartDemand = true)
+            reconcilePersistedRuntime(resetCollectionToAutoStartDemand = true)
         } else when (action) {
             ACTION_STOP -> {
                 //MainActivity commits the desired/manual flags before dispatching this action.
@@ -481,6 +520,8 @@ class CollectorService : Service() {
             ACTION_START -> reconcileCollection(forceKeepAliveStatusCheck = forceKeepAliveStatusCheck)
         }
         if (!stickyRestart) reconcilePendingCutoverArchiveStorage(action)
+        configureDesiredStreams()
+        reconcilePersistedHelperStateAsync()
         reconcileAccessSelfCheckSchedule()
         return START_STICKY
     }
@@ -488,6 +529,8 @@ class CollectorService : Service() {
     override fun onDestroy() {
         requireRuntimeOwner()
         running.set(false)
+        getSharedPreferences(CollectorSettings.PREFS_NAME, Context.MODE_PRIVATE)
+            .unregisterOnSharedPreferenceChangeListener(collectionPolicyListener)
         debugStoreCloseRequested.set(true)
         (applicationContext as BydCollectorApplication).cancelHistoricalEnergyBackfill()
         maintenanceRuntimeRestoreAllowed.set(false)
@@ -555,7 +598,17 @@ class CollectorService : Service() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         store.recordEvent("task_removed", "Collector task removed from recents")
+        val demand = settings.runtimeDemand()
+        if (!demand.main) {
+            settings.setPollingEnabled(false)
+            stopMain("task_removed")
+        }
+        if (!demand.debug) {
+            settings.setDebugPollingEnabled(false)
+            stopDebug("task_removed")
+        }
         CollectorAutoStart.scheduleRestartAfterTaskRemoved(applicationContext, settings, store)
+        stopIfNoActiveRuntime()
         super.onTaskRemoved(rootIntent)
     }
 
@@ -579,12 +632,20 @@ class CollectorService : Service() {
             context = applicationContext,
             adbClient = adbClient,
             helper = helper,
-            expectedOwnerMode = ownerMode
+            expectedOwnerMode = ownerMode,
+            ensureStreamReady = {
+                DirectStreamController.setConsumerReady(CollectorHelperProtocol.STREAM_MAIN, true) {
+                    running.get() && !Thread.currentThread().isInterrupted && poller.isRunning() &&
+                        settings.isPollingEnabled() && !settings.isMainManuallyStopped() &&
+                        !maintenanceBlocksRuntimeStart()
+                }
+            }
         )
         val live = PollPersistenceCoordinator(
             store = store,
             client = liveClient,
-            successfulPollObserver = observer
+            successfulPollObserver = observer,
+            isActive = { running.get() && poller.isRunning() }
         )
         val replay = TelemetryWorkerReplayCoordinator(
             store = store,
@@ -595,77 +656,123 @@ class CollectorService : Service() {
             },
             pendingSamples = helper::pendingWorkerSamples,
             acknowledgeSample = helper::acknowledgeWorkerSample,
-            successfulPollObserver = observer
+            successfulPollObserver = observer,
+            isActive = { running.get() && poller.isRunning() }
         )
-        val callbacks = callbackDrain(helper, CollectorHelperProtocol.STREAM_MAIN)
         val pollCycles = TelemetryWorkerReplayPollCycleRunner(replay = replay, live = live)
         val nextPoller = TelemetryPoller(
             object : PollCycleRunner {
-                override fun pollOnce(sessionId: Long): PollCycleResult? {
-                    // A previous process may have committed raw before dying during normalization.
-                    normalizeCallbackPage()
-                    if (liveClient.ensureHelperReady(ownerMode) == null) {
-                        callbacks.drain(maxBatches = 2)
-                        repeat(2) { normalizeCallbackPage() }
+                override fun pollOnce(sessionId: Long): PollCycleResult? =
+                    (applicationContext as BydCollectorApplication).withDatabaseRead {
+                        if (!running.get() || !poller.isRunning() || Thread.currentThread().isInterrupted)
+                            throw InterruptedException("Main collection owner stopped")
+                        pollCycles.pollOnce(sessionId)
                     }
-                    return pollCycles.pollOnce(sessionId)
-                }
             },
             onCycleResult = { result -> handlePollCycleResult(result) },
             onRuntimeError = { error ->
                 store.recordEvent("poller_runtime_error", "Main poller cycle failed", error.diagnosticDetail())
+            },
+            onStopped = {
+                mainCallbackIntake.stopAndJoin(0L)
+                callbackNormalizer.stopAndJoin(0L)
+                // onDestroy already released this service; a late old worker must not release its successor.
+                if (running.get()) DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_MAIN)
             }
         )
         mainPollerOwnerMode = ownerMode
         return nextPoller
     }
 
+    private fun createCallbackIntake(stream: Int): CallbackIntakeWorker {
+        // Each intake owns its Binder client: a slow getter or the other stream cannot hold its lock.
+        val drain = callbackDrain(DirectVehicleHelperClient(), stream)
+        return CallbackIntakeWorker(
+            threadName = "byd-callback-intake-$stream",
+            ready = { DirectStreamController.credentials(stream) != null },
+            drain = { drain.drain(maxBatches = 1) },
+            onStatus = { summary ->
+                queueCallbackDiagnostic(stream, summary.detail +
+                    (summary.fault?.let { "\n${it.diagnosticDetail()}" } ?: ""))
+            },
+            onStopped = {
+                if (stream == CollectorHelperProtocol.STREAM_SECONDARY) {
+                    secondaryCallbackFinished.set(true)
+                    mainHandler.post { closeDebugStoreAfterLocalWorkers() }
+                }
+            }
+        )
+    }
+
+    private fun queueCallbackDiagnostic(stream: Int, detail: String) {
+        val main = stream == CollectorHelperProtocol.STREAM_MAIN
+        val desired = if (main) settings.isPollingEnabled() else settings.isDebugPollingEnabled()
+        val automatic = if (main) settings.isAutoStartEnabled() else settings.isDebugAutoStartEnabled()
+        val stopped = if (main) settings.isMainManuallyStopped() else settings.isDebugManuallyStopped()
+        val stateDetail = "stream=$stream desired=$desired " +
+            "consumer_ready=${DirectStreamController.credentials(stream) != null} " +
+            "policy_autonomy=${desired && automatic && !stopped && !settings.isUserShutdownRequested()} $detail"
+        // Worker reports transitions immediately and aggregates counters every 30 seconds.
+        // Record evidence before the coalesced/possibly slow Binder status lookup.
+        store.recordEvent("callback_intake_state", "Callback consumer state", stateDetail)
+        val queued = callbackDiagnosticQueued[stream - 1]
+        if (!queued.compareAndSet(false, true)) return
+        try {
+            dashboardMetricsExecutor.execute {
+                try {
+                    val backlog = DirectVehicleHelperClient().callbackSpoolStatus(stream)
+                    val loss = backlog.loss
+                    store.recordEvent("callback_drain_summary", "Callback raw persistence summary",
+                        "$stateDetail spool_status=${backlog.status} " +
+                            "spool_bytes=${backlog.footprintBytes} ready_batches=${backlog.readyBatches} " +
+                            "quarantined_files=${backlog.quarantinedFiles} loss_count=${loss?.count ?: 0} " +
+                            "loss_first_wall_ms=${loss?.firstWallMs} loss_last_wall_ms=${loss?.lastWallMs} " +
+                            "loss_reason=${loss?.reason.orEmpty()} spool_error=${backlog.error.orEmpty()}")
+                } finally { queued.set(false) }
+            }
+        } catch (_: RejectedExecutionException) { queued.set(false) }
+    }
+
     private fun callbackDrain(helper: DirectVehicleHelperClient, stream: Int): CallbackBatchDrainCoordinator =
         CallbackBatchDrainCoordinator(
             download = { helper.drainCallbackBatch(stream) },
             importBatch = { batch, digest, delivery ->
-                val imported = if (stream == CollectorHelperProtocol.STREAM_MAIN) store.importCallbackBatch(batch, digest, delivery)
-                else debugStore.importCallbackBatch(batch, digest, delivery)
+                val imported = (applicationContext as BydCollectorApplication).withDatabaseRead {
+                    if (!running.get() || Thread.currentThread().isInterrupted)
+                        throw InterruptedException("Callback owner stopped")
+                    if (stream == CollectorHelperProtocol.STREAM_MAIN) store.importCallbackBatch(batch, digest, delivery)
+                    else debugStore.importCallbackBatch(batch, digest, delivery)
+                }
                 if (imported is com.bydcollector.collector.data.callback.CallbackImportResult.Committed && !imported.duplicate) {
                     if (stream == CollectorHelperProtocol.STREAM_MAIN) {
+                        // O(1) cached counters only; these methods do not publish UI or query SQLite.
                         dashboardUiStateStore.incrementMainRowCounts(valueRows = imported.eventCount.toLong())
+                        callbackNormalizer.signal()
                     } else dashboardUiStateStore.incrementDebugReadingCount(imported.eventCount.toLong())
                 }
                 imported
             },
             acknowledge = { helper.acknowledgeCallbackSpool(stream, it) },
-            quarantine = { descriptor, reason -> helper.quarantineCallbackSpool(stream, descriptor, reason) },
-            diagnostic = { detail ->
-                // Called by the drain's 30-second aggregate gate, never by the callback thread.
-                val backlog = helper.callbackSpoolStatus(stream)
-                val loss = backlog.loss
-                store.recordEvent("callback_drain_summary", "Callback raw persistence summary",
-                    "stream=$stream $detail spool_status=${backlog.status} " +
-                        "spool_bytes=${backlog.footprintBytes} ready_batches=${backlog.readyBatches} " +
-                        "quarantined_files=${backlog.quarantinedFiles} loss_count=${loss?.count ?: 0} " +
-                        "loss_first_wall_ms=${loss?.firstWallMs} loss_last_wall_ms=${loss?.lastWallMs} " +
-                        "loss_reason=${loss?.reason.orEmpty()} spool_error=${backlog.error.orEmpty()}")
-            }
+            quarantine = { descriptor, reason -> helper.quarantineCallbackSpool(stream, descriptor, reason) }
         )
 
-    private fun normalizeCallbackPage() {
-        val result = store.normalizePendingCallbackPage(vehicleStateNormalizer)
-        if (result.summary.observedCount > 0) publishNormalizedWrite(result.summary, refreshKpis = true)
+    private fun normalizeCallbackPage(): Boolean =
+        (applicationContext as BydCollectorApplication).withDatabaseRead {
+        if (!running.get() || Thread.currentThread().isInterrupted)
+            throw InterruptedException("Callback normalization owner stopped")
+        // Bound each SQLite writer transaction; raw intake does not wait behind an entire backlog.
+        val result = store.normalizePendingCallbackPage(vehicleStateNormalizer, limit = 64)
+        if (result.summary.observedCount > 0) publishNormalizedWrite(result.summary, result.appliedObservations)
+        result.hasMore
     }
 
-    private fun publishNormalizedWrite(summary: NormalizedWriteSummary, refreshKpis: Boolean = false) {
+    private fun publishNormalizedWrite(summary: NormalizedWriteSummary,
+        observations: List<NormalizedObservation> = emptyList()) {
         dashboardUiStateStore.incrementMainRowCounts(
             normalizedCurrentRows = summary.currentInsertedCount.toLong(),
             normalizedHistoryRows = summary.historyInsertedCount.toLong()
         )
-        if (refreshKpis) {
-            // Never populate a complete KPI card from a sparse event or an older replay envelope.
-            val current = store.normalizedCurrentState()
-            queueDashboardVehicleKpis(LocalizedVehicleKpis(
-                uk = VehicleKpiMapper.from(current, VehicleKpiLanguage.UK),
-                en = VehicleKpiMapper.from(current, VehicleKpiLanguage.EN)
-            ))
-        }
+        if (observations.isNotEmpty()) queueDashboardVehicleKpis(observations)
         scheduleDatabaseFootprintRefresh(force = false)
         if (summary.changedCategories.isNotEmpty()) normalizedStateChangedCallback?.invoke(summary.changedCategories)
         exportInfluxAfterNormalizedWrite(summary)
@@ -808,7 +915,7 @@ class CollectorService : Service() {
                         }
                     }
                 )
-                publishNormalizedWrite(summary, refreshKpis = true)
+                publishNormalizedWrite(summary, sourceResult.appliedObservations)
                 finishEnergyAttempt(origin)
             }
 
@@ -916,11 +1023,15 @@ class CollectorService : Service() {
     private fun reconcilePersistedRuntime(
         reconcileKeepAliveState: Boolean = false,
         forceKeepAliveStatusCheck: Boolean = false,
-        resetDebugToAutoStartDemand: Boolean = false
+        resetCollectionToAutoStartDemand: Boolean = false
     ) {
         val demand = settings.runtimeDemand(includeEnabledExports = true)
-        // Sticky recovery follows auto-start demand, never a stale manual debug flag.
-        if (resetDebugToAutoStartDemand) settings.setDebugPollingEnabled(demand.debug)
+        // A dead APP cannot retain manual ownership through a sticky restart.
+        if (resetCollectionToAutoStartDemand) {
+            settings.setPollingEnabled(demand.main)
+            settings.setDebugPollingEnabled(demand.debug)
+            configureDesiredStreams()
+        }
         demand.recoveryActions().forEach { recoveryAction ->
             when (recoveryAction) {
                 RuntimeRecoveryAction.MAIN -> reconcileCollection(
@@ -1085,7 +1196,9 @@ class CollectorService : Service() {
         val userShutdown = settings.isUserShutdownRequested()
         DirectStreamController.configureDesired(
             main = !userShutdown && settings.isPollingEnabled() && !settings.isMainManuallyStopped(),
-            secondary = !userShutdown && settings.isDebugPollingEnabled() && !settings.isDebugManuallyStopped()
+            secondary = !userShutdown && settings.isDebugPollingEnabled() && !settings.isDebugManuallyStopped(),
+            mainAutonomous = !userShutdown && settings.isAutoStartEnabled() && !settings.isMainManuallyStopped(),
+            secondaryAutonomous = !userShutdown && settings.isDebugAutoStartEnabled() && !settings.isDebugManuallyStopped()
         )
     }
 
@@ -1185,6 +1298,14 @@ class CollectorService : Service() {
 
     private fun startMainIfNeeded() {
         if (maintenanceBlocksRuntimeStart()) return
+        if (poller.isStopping() || mainCallbackIntake.isStopping() || callbackNormalizer.isStopping()) {
+            setMainRuntime(RuntimeActionStatus.STARTING)
+            if (!mainStartRetryScheduled) {
+                mainStartRetryScheduled = true
+                mainHandler.postDelayed(mainStartRetryTask, 250L)
+            }
+            return
+        }
         if (poller.isRunning()) {
             mainPollingRunning.set(true)
             setMainRuntime(RuntimeActionStatus.RUNNING)
@@ -1224,7 +1345,9 @@ class CollectorService : Service() {
             setMainRuntime(RuntimeActionStatus.STOPPED)
             return
         }
-        poller.start(openedSessionId)
+        check(callbackNormalizer.start()) { "Main previous normalizer has not stopped" }
+        check(mainCallbackIntake.start()) { "Main previous callback consumer has not stopped" }
+        check(poller.start(openedSessionId)) { "Main previous worker has not stopped" }
         mainPollingRunning.set(true)
         setMainRuntime(RuntimeActionStatus.RUNNING)
         publishDashboardRuntimeFlags()
@@ -1237,6 +1360,14 @@ class CollectorService : Service() {
             return
         }
         if (maintenanceBlocksRuntimeStart(debugRuntime = true)) return
+        if (secondaryCallbackIntake.isStopping() || debugPollerShutdownInProgress.get()) {
+            setDebugRuntime(DebugRuntimeStatus.STARTING)
+            if (!debugStartRetryScheduled) {
+                debugStartRetryScheduled = true
+                mainHandler.postDelayed(debugStartRetryTask, 250L)
+            }
+            return
+        }
         if (isDebugPollerRunning()) {
             setDebugRuntime(DebugRuntimeStatus.RUNNING)
             return
@@ -1294,32 +1425,33 @@ class CollectorService : Service() {
                     if (!debugStartStillCurrent(startGeneration)) return@execute
                     val batchSize = DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT
                     var lastDebugReadModeKey: String? = null
-                    val callbacks = callbackDrain(helper, CollectorHelperProtocol.STREAM_SECONDARY)
                     val nextPoller = DirectDebugRoundRobinPoller(
                         parameters = parameters,
                         helper = helper,
                         store = debugStore,
+                        databaseMaintenanceGate = (applicationContext as BydCollectorApplication).databaseMaintenanceGate,
+                        ownerActive = { running.get() },
+                        handoverIdentity = {
+                            if (debugStartStillCurrent(startGeneration) && !Thread.currentThread().isInterrupted &&
+                                DirectStreamController.setConsumerReady(CollectorHelperProtocol.STREAM_SECONDARY, true) {
+                                    debugStartStillCurrent(startGeneration) && !Thread.currentThread().isInterrupted
+                                }
+                            ) DirectStreamController.credentials(CollectorHelperProtocol.STREAM_SECONDARY) else null
+                        },
                         pauseSecondary = {
                             DirectStreamController.pauseAndFence(CollectorHelperProtocol.STREAM_SECONDARY)
                         },
-                    drainSecondaryReplay = replay@{ openedSessionId ->
-                        val callbackReplay = callbacks.drain(maxBatches = Int.MAX_VALUE)
-                        if (!callbackReplay.drained) {
-                            return@replay SecondaryReplayDrainResult(
-                                drained = false,
-                                committedRecords = 0,
-                                duplicateRecords = callbackReplay.duplicateBatches,
-                                quarantinedFiles = callbackReplay.quarantinedBatches,
-                                blockedReason = callbackReplay.blockedReason ?: "Secondary callback replay did not drain",
-                                retryable = callbackReplay.retryable
-                            )
-                        }
+                    drainSecondaryReplay = { openedSessionId ->
                         SecondaryReplayCoordinator(
                             fetchPage = helper::secondarySpoolPage,
                             acknowledge = helper::acknowledgeSecondarySpool,
                             quarantine = helper::quarantineSecondarySpool,
                             importRecord = { record, digest ->
-                                debugStore.importSecondaryRecord(openedSessionId, record, digest)
+                                (applicationContext as BydCollectorApplication).withDatabaseRead {
+                                    if (!debugStartStillCurrent(startGeneration) || Thread.currentThread().isInterrupted)
+                                        throw InterruptedException("Secondary replay owner stopped")
+                                    debugStore.importSecondaryRecord(openedSessionId, record, digest)
+                                }
                             }
                         ).drain()
                     },
@@ -1327,6 +1459,12 @@ class CollectorService : Service() {
                         DirectStreamController.resume(CollectorHelperProtocol.STREAM_SECONDARY)
                     },
                     onStarted = started@{ openedSessionId ->
+                        if (!debugStartStillCurrent(startGeneration)) throw InterruptedException()
+                        check(DirectStreamController.setConsumerReady(CollectorHelperProtocol.STREAM_SECONDARY, true) {
+                            debugStartStillCurrent(startGeneration)
+                        }) {
+                            "Secondary consumer readiness failed"
+                        }
                         mainHandler.post {
                             if (!debugStartStillCurrent(startGeneration)) return@post
                             setDebugRuntime(DebugRuntimeStatus.RUNNING, generation = startGeneration)
@@ -1361,7 +1499,13 @@ class CollectorService : Service() {
                             DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_SECONDARY)
                         }
                     },
-                    onStopped = ::onDebugPollerStopped,
+                    onStopped = {
+                        if (startGeneration == debugWorkGeneration.get()) {
+                            secondaryCallbackIntake.stopAndJoin(0L)
+                            DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_SECONDARY)
+                        }
+                        onDebugPollerStopped()
+                    },
                     onCycle = cycle@{ summary ->
                         if (!debugStartStillCurrent(startGeneration)) return@cycle
                         dashboardUiStateStore.incrementDebugReadingCount(summary.changedCount.toLong())
@@ -1419,6 +1563,12 @@ class CollectorService : Service() {
                             ) {
                                 false
                             } else {
+                                secondaryCallbackFinished.set(false)
+                                if (!secondaryCallbackIntake.start()) {
+                                    secondaryCallbackFinished.set(!secondaryCallbackIntake.isRunning() &&
+                                        !secondaryCallbackIntake.isStopping())
+                                    error("Secondary previous callback consumer has not stopped")
+                                }
                                 nextPoller.start(batchSize)
                                 debugPoller = nextPoller
                                 true
@@ -1450,6 +1600,7 @@ class CollectorService : Service() {
                     }
                 } finally {
                     if (!streamLeaseHandedToPoller) {
+                        secondaryCallbackIntake.stopAndJoin(0L)
                         DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_SECONDARY)
                     }
                     debugStartInProgress.set(false)
@@ -1627,6 +1778,10 @@ class CollectorService : Service() {
     }
 
     private fun stopMain(reason: String) {
+        mainHandler.removeCallbacks(mainStartRetryTask)
+        mainStartRetryScheduled = false
+        mainCallbackIntake.stopAndJoin(0L)
+        callbackNormalizer.stopAndJoin(0L)
         if (reason != "service_destroyed" && reason != "database_maintenance" &&
             (!settings.isPollingEnabled() || settings.isMainManuallyStopped() || reason == "user_shutdown")
         ) {
@@ -1636,6 +1791,7 @@ class CollectorService : Service() {
         if (wasActive) setMainRuntime(RuntimeActionStatus.STOPPING)
         val wasPolling = poller.isRunning()
         if (wasPolling) poller.stop()
+        DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_MAIN)
         if (::tripRuntime.isInitialized && reason != "service_destroyed") tripRuntime.pause(reason)
         if (reason == "user_shutdown") stopAppGapSpoolHelper(reason)
         mainPollingRunning.set(false)
@@ -1894,6 +2050,9 @@ class CollectorService : Service() {
     }
 
     private fun stopDebug(reason: String) {
+        mainHandler.removeCallbacks(debugStartRetryTask)
+        debugStartRetryScheduled = false
+        secondaryCallbackIntake.stopAndJoin(0L)
         if (reason != "service_destroyed" && reason != "debug_database_maintenance" &&
             (!settings.isDebugPollingEnabled() || settings.isDebugManuallyStopped() || reason == "user_shutdown")
         ) {
@@ -1903,7 +2062,7 @@ class CollectorService : Service() {
         debugStartQueued.set(false)
         setDebugRuntime(DebugRuntimeStatus.STOPPING, generation = stopGeneration)
         val detached = detachDebugPoller()
-        if (reason == "service_destroyed" && detached != null) {
+        if (detached != null) {
             debugPollerShutdownInProgress.set(true)
             if (!detached.isRunning()) debugPollerShutdownInProgress.set(false)
         }
@@ -1950,6 +2109,9 @@ class CollectorService : Service() {
 
     private fun detachDebugPoller(): DirectDebugRoundRobinPoller? {
         return synchronized(debugPollerLock) {
+            // Revoke on the runtime owner before any fallible join, not in a late callback
+            // that could release a successor's consumer lease after the generation changes.
+            DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_SECONDARY)
             val current = debugPoller
             debugPoller = null
             current
@@ -1963,11 +2125,6 @@ class CollectorService : Service() {
         val influxEnabled: Boolean,
         val telegramEnabled: Boolean,
         val debugRunning: Boolean
-    )
-
-    private data class LocalizedVehicleKpis(
-        val uk: VehicleKpis,
-        val en: VehicleKpis
     )
 
     private fun runtimeSnapshot(): RuntimeSnapshot {
@@ -2003,7 +2160,8 @@ class CollectorService : Service() {
 
     private fun closeDebugStoreAfterLocalWorkers() {
         if (!debugStoreCloseRequested.get() || debugStartInProgress.get() ||
-            debugPollerShutdownInProgress.get() || isDebugPollerRunning()
+            debugPollerShutdownInProgress.get() || isDebugPollerRunning() ||
+            !secondaryCallbackFinished.get()
         ) return
         if (debugStoreCloseRequested.compareAndSet(true, false) && ::debugStore.isInitialized) {
             debugStore.close()
@@ -2037,20 +2195,19 @@ class CollectorService : Service() {
         )
     }
 
-    private fun queueDashboardVehicleKpis(kpis: LocalizedVehicleKpis) {
+    private fun queueDashboardVehicleKpis(observations: List<NormalizedObservation>) {
+        val ownerSession = sessionId
         mainHandler.post {
-            if (!running.get() || !mainPollingRunning.get()) return@post
+            if (!running.get() || !mainPollingRunning.get() || ownerSession != sessionId) return@post
             val nowMs = SystemClock.elapsedRealtime()
-            lastKpiObservationAtMs = nowMs
+            if (!kpiFreshness.accept(observations, nowMs)) return@post
             mainHandler.removeCallbacks(kpiStaleTask)
-            mainHandler.postDelayed(kpiStaleTask, KPI_STALE_AFTER_MS)
+            mainHandler.postDelayed(kpiStaleTask, kpiFreshness.remainingMs(nowMs))
             if (lastKpiPublishAtMs == Long.MIN_VALUE || nowMs - lastKpiPublishAtMs >= KPI_PUBLISH_INTERVAL_MS) {
-                pendingVehicleKpis = null
                 mainHandler.removeCallbacks(kpiPublishTask)
                 kpiPublishScheduled = false
-                publishVehicleKpisNow(kpis)
+                publishVehicleKpisNow()
             } else {
-                pendingVehicleKpis = kpis
                 if (!kpiPublishScheduled) {
                     kpiPublishScheduled = true
                     mainHandler.postDelayed(
@@ -2062,9 +2219,17 @@ class CollectorService : Service() {
         }
     }
 
-    private fun publishVehicleKpisNow(kpis: LocalizedVehicleKpis) {
-        lastKpiPublishAtMs = SystemClock.elapsedRealtime()
-        dashboardUiStateStore.publishVehicleKpis(kpis.uk, kpis.en)
+    private fun publishVehicleKpisNow() {
+        val nowMs = SystemClock.elapsedRealtime()
+        val observations = kpiFreshness.freshObservations(nowMs)
+        lastKpiPublishAtMs = nowMs
+        dashboardUiStateStore.publishVehicleKpis(
+            VehicleKpiMapper.fromObservations(observations, VehicleKpiLanguage.UK),
+            VehicleKpiMapper.fromObservations(observations, VehicleKpiLanguage.EN)
+        )
+        mainHandler.removeCallbacks(kpiStaleTask)
+        val remainingMs = kpiFreshness.remainingMs(nowMs)
+        if (remainingMs > 0L) mainHandler.postDelayed(kpiStaleTask, remainingMs)
     }
 
     private fun clearDashboardVehicleKpis() {
@@ -2072,9 +2237,8 @@ class CollectorService : Service() {
         mainHandler.removeCallbacks(kpiPublishTask)
         mainHandler.removeCallbacks(kpiStaleTask)
         kpiPublishScheduled = false
-        pendingVehicleKpis = null
         lastKpiPublishAtMs = Long.MIN_VALUE
-        lastKpiObservationAtMs = Long.MIN_VALUE
+        kpiFreshness.clear()
         dashboardUiStateStore.clearVehicleKpis()
     }
 
@@ -2235,6 +2399,13 @@ class CollectorService : Service() {
             maintenanceRuntimeRestoreAllowed.set(false)
             error("Debug poller did not stop for database maintenance")
         }
+        if (!secondaryCallbackIntake.stopAndJoin(2_000L) ||
+            (operation != DbMaintenanceOperation.DEBUG_ARCHIVE &&
+                (!mainCallbackIntake.stopAndJoin(2_000L) || !callbackNormalizer.stopAndJoin(2_000L)))
+        ) {
+            maintenanceRuntimeRestoreAllowed.set(false)
+            error("Callback workers did not stop for database maintenance")
+        }
         if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
             prepareSecondaryArchive(detached.secondaryWasRunning)
             return
@@ -2278,6 +2449,9 @@ class CollectorService : Service() {
 
     private fun prepareRuntimeStopForMaintenance(operation: DbMaintenanceOperation): DetachedMaintenanceRuntime {
         requireRuntimeOwner()
+        mainHandler.removeCallbacks(debugStartRetryTask)
+        debugStartRetryScheduled = false
+        secondaryCallbackIntake.stopAndJoin(0L)
         if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
             val stopGeneration = debugWorkGeneration.incrementAndGet()
             val detachedDebugPoller = detachDebugPoller()
@@ -2292,14 +2466,19 @@ class CollectorService : Service() {
         cancelMqttRetry()
         cancelInfluxRetry("maintenance")
         cancelTelegramTick()
+        mainHandler.removeCallbacks(mainStartRetryTask)
+        mainStartRetryScheduled = false
+        mainCallbackIntake.stopAndJoin(0L)
+        callbackNormalizer.stopAndJoin(0L)
+        DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_MAIN)
         if (mainRuntimeStatus != RuntimeActionStatus.STOPPED) setMainRuntime(RuntimeActionStatus.STOPPING)
         poller.stop()
+        val stopGeneration = debugWorkGeneration.incrementAndGet()
         val detachedDebugPoller = detachDebugPoller()
         val openedSessionId = sessionId
         sessionId = null
         mainPollingRunning.set(false)
         setMainRuntime(RuntimeActionStatus.STOPPED)
-        val stopGeneration = debugWorkGeneration.incrementAndGet()
         setDebugRuntime(DebugRuntimeStatus.STOPPING, generation = stopGeneration)
         setDebugRuntime(DebugRuntimeStatus.STOPPED)
         mqttRuntimeActive.set(false)
@@ -2334,6 +2513,12 @@ class CollectorService : Service() {
             return
         }
 
+        // Local consumers are joined. The archive now owns a temporary real replay consumer.
+        check(DirectStreamController.setConsumerReady(CollectorHelperProtocol.STREAM_SECONDARY, true) {
+            running.get() && !Thread.currentThread().isInterrupted
+        }) {
+            "Secondary archive consumer readiness failed"
+        }
         check(DirectStreamController.pauseAndFence(CollectorHelperProtocol.STREAM_SECONDARY)) {
             "Secondary archive pause/fence failed"
         }
@@ -2460,11 +2645,14 @@ class CollectorService : Service() {
     }
 
     private fun handlePollCycleResult(result: com.bydcollector.collector.data.polling.PollCycleResult) {
-        lastTelegramPollError = if (result.ok) null else result.category
         dashboardUiStateStore.incrementMainRowCounts(
             pollRows = result.pollRowsPersisted,
             valueRows = result.valueRowsPersisted
         )
+        if (result.pollRowsPersisted > 0L) scheduleDatabaseFootprintRefresh(force = false)
+        // Busy transport is neither a fresh sample nor a collection failure.
+        if (result.deferred) return
+        lastTelegramPollError = if (result.ok) null else result.category
         val completedAt = DisplayTimeFormatter.formatNullable(result.timestamp ?: java.time.Instant.now().toString())
         val errorSummary = if (result.ok) null else PollingErrorSummaries.summary(result.category, result.errorMessage)
         dashboardUiStateStore.publishMainPollState(
@@ -2482,8 +2670,7 @@ class CollectorService : Service() {
                 requestCount = result.requestCount
             )
         )
-        if (!result.ok) clearDashboardVehicleKpis()
-        if (result.pollRowsPersisted > 0L) scheduleDatabaseFootprintRefresh(force = false)
+        // A failed/pending cycle leaves the last valid KPI until its source-age deadline.
         val text = if (result.ok) {
             notificationText(
                 mainEnabled = true,
@@ -3035,6 +3222,8 @@ class CollectorService : Service() {
         Log.e(TAG, "Main collector start failed", error)
         store.recordEvent("main_start_error", "Main collector start failed", error.diagnosticDetail())
         if (::poller.isInitialized) poller.stop()
+        if (::mainCallbackIntake.isInitialized) mainCallbackIntake.stopAndJoin(0L)
+        if (::callbackNormalizer.isInitialized) callbackNormalizer.stopAndJoin(0L)
         mainPollingRunning.set(false)
         sessionId?.let { openedSessionId ->
             runCatching { store.endSession(openedSessionId, "main_start_error") }
@@ -3683,6 +3872,9 @@ class CollectorService : Service() {
                     "Secondary helper stream did not resume after archive"
                 )
             }
+        }
+        if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
+            DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_SECONDARY)
         }
         activeMaintenanceOperation = null
         maintenanceActive.set(false)

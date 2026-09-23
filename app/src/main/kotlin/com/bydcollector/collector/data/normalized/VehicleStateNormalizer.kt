@@ -223,7 +223,10 @@ class VehicleStateNormalizer(
                 provisional.copy(
                     sourcePollId = pollIds.singleOrNull()
                         ?.takeIf { contributors.all { input -> input.sourcePollId == it } },
-                    observedAt = Instant.ofEpochMilli(contributors.minOf { it.stamp.wallMs }).toString()
+                    observedAt = Instant.ofEpochMilli(contributors.minOf { it.stamp.wallMs }).toString(),
+                    sourceStamp = contributors.takeIf { sources ->
+                        sources.all { it.stamp.bootId == sources.first().stamp.bootId }
+                    }?.minByOrNull { it.stamp.elapsedMs }?.stamp
                 )
             }
             .toList()

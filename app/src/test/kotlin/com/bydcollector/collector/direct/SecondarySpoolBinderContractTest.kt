@@ -7,7 +7,7 @@ import kotlin.test.assertTrue
 class SecondarySpoolBinderContractTest {
     @Test
     fun secondaryTransactionsAreDistinctAndPagesLeaveRoomForBoundedMetadata() {
-        assertEquals(12, CollectorHelperProtocol.PROTOCOL_VERSION)
+        assertEquals(13, CollectorHelperProtocol.PROTOCOL_VERSION)
         assertEquals(listOf(7, 8, 9), listOf(
             CollectorHelperProtocol.TX_SECONDARY_PENDING_PAGE,
             CollectorHelperProtocol.TX_SECONDARY_ACK,

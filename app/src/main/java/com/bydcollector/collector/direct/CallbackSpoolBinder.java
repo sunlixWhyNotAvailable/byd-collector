@@ -10,6 +10,7 @@ public final class CallbackSpoolBinder implements AutoCloseable {
     private final CallbackSpool secondary;
     private final LiveRecord[] live = new LiveRecord[3];
     private final AtomicLongArray retainedLiveBytes = new AtomicLongArray(3);
+    private final Object[] streamLocks = { null, new Object(), new Object() };
 
     CallbackSpoolBinder() {
         main = CallbackSpool.openMain();
@@ -28,7 +29,13 @@ public final class CallbackSpoolBinder implements AutoCloseable {
     }
 
     /** Called off the vendor callback thread after queue batching. */
-    synchronized CallbackSpool.AppendResult deliver(TelemetryCallbackBatch batch, boolean appOwnsStream) {
+    CallbackSpool.AppendResult deliver(TelemetryCallbackBatch batch, boolean appOwnsStream) {
+        synchronized (streamLock(batch.stream)) {
+            return deliverLocked(batch, appOwnsStream);
+        }
+    }
+
+    private CallbackSpool.AppendResult deliverLocked(TelemetryCallbackBatch batch, boolean appOwnsStream) {
         try {
             CallbackSpool target = spool(batch.stream);
             if (live[batch.stream] != null) {
@@ -57,7 +64,13 @@ public final class CallbackSpoolBinder implements AutoCloseable {
         }
     }
 
-    synchronized CallbackSpool.AppendResult spill(int stream) {
+    CallbackSpool.AppendResult spill(int stream) {
+        synchronized (streamLock(stream)) {
+            return spillLocked(stream);
+        }
+    }
+
+    private CallbackSpool.AppendResult spillLocked(int stream) {
         if (live[stream] == null) return CallbackSpool.AppendResult.SUCCESS;
         TelemetryCallbackBatch batch;
         try { batch = TelemetryCallbackBatch.decode(live[stream].bytes); }
@@ -75,13 +88,26 @@ public final class CallbackSpoolBinder implements AutoCloseable {
         return retainedLiveBytes.get(stream);
     }
 
-    synchronized void recordLoss(int stream, TelemetryCallbackQueue.Loss loss) {
+    void recordLoss(int stream, TelemetryCallbackQueue.Loss loss) {
+        // The spool itself serializes its files and shared per-root quota, independently per stream.
         if (loss != null) spool(stream).recordLoss(loss.count, loss.firstWallMs, loss.lastWallMs, loss.reason);
     }
 
-    synchronized boolean onTransact(int code, int stream, Parcel data, Parcel reply) {
+    boolean onTransact(int code, int stream, Parcel data, Parcel reply) {
         if (reply == null) return true;
         try {
+            synchronized (streamLock(stream)) {
+                return transactLocked(code, stream, data, reply);
+            }
+        } catch (Exception error) {
+            writeUnavailable(code, reply, error instanceof IllegalArgumentException
+                ? CollectorHelperProtocol.STATUS_INVALID_REQUEST : CollectorHelperProtocol.STATUS_SPOOL_UNAVAILABLE,
+                errorText(error));
+            return true;
+        }
+    }
+
+    private boolean transactLocked(int code, int stream, Parcel data, Parcel reply) throws Exception {
             CallbackSpool spool = spool(stream);
             if (code == CollectorHelperProtocol.TX_CALLBACK_STATUS) {
                 CallbackSpool.Status status = spool.status();
@@ -144,12 +170,11 @@ public final class CallbackSpoolBinder implements AutoCloseable {
                 return true;
             }
             return false;
-        } catch (Exception error) {
-            writeUnavailable(code, reply, error instanceof IllegalArgumentException
-                ? CollectorHelperProtocol.STATUS_INVALID_REQUEST : CollectorHelperProtocol.STATUS_SPOOL_UNAVAILABLE,
-                errorText(error));
-            return true;
-        }
+    }
+
+    private Object streamLock(int stream) {
+        spool(stream); // Validate before array access; protocol failures remain typed.
+        return streamLocks[stream];
     }
 
     static void writeUnavailable(int code, Parcel reply, int status, String error) {
@@ -218,10 +243,13 @@ public final class CallbackSpoolBinder implements AutoCloseable {
         }
     }
 
-    @Override public synchronized void close() {
-        closeStream(CollectorHelperProtocol.STREAM_MAIN);
-        closeStream(CollectorHelperProtocol.STREAM_SECONDARY);
-        main.close(); secondary.close();
+    @Override public void close() {
+        for (int stream = 1; stream <= 2; stream++) {
+            synchronized (streamLock(stream)) {
+                closeStream(stream);
+                spool(stream).close();
+            }
+        }
     }
 
     private void closeStream(int stream) {

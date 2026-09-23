@@ -1,7 +1,16 @@
 package com.bydcollector.collector.data.debug
 
+import com.bydcollector.collector.data.direct.DirectStreamCredentials
+import com.bydcollector.collector.direct.CollectorHelperProtocol
+import com.bydcollector.collector.maintenance.DatabaseMaintenanceGate
 import java.io.File
 import java.security.MessageDigest
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -10,6 +19,88 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class DirectDebugRoundRobinPollerTest {
+    @Test
+    fun oldOwnerWaitingForMaintenanceCannotWriteIntoTheReplacementDatabase() {
+        val gate = DatabaseMaintenanceGate()
+        val executor = Executors.newFixedThreadPool(2)
+        val maintenanceEntered = CountDownLatch(1)
+        val releaseMaintenance = CountDownLatch(1)
+        val writerAttempted = CountDownLatch(1)
+        val writerFinished = CountDownLatch(1)
+        val ownerActive = AtomicBoolean(true)
+        val writes = AtomicInteger()
+        val failure = AtomicReference<Throwable?>()
+        try {
+            val maintenance = executor.submit {
+                gate.withExclusive {
+                    maintenanceEntered.countDown()
+                    check(releaseMaintenance.await(2, TimeUnit.SECONDS))
+                }
+            }
+            assertTrue(maintenanceEntered.await(1, TimeUnit.SECONDS))
+            executor.execute {
+                writerAttempted.countDown()
+                try {
+                    withSecondaryDatabaseRead(gate, { ownerActive.get() }, { true }) {
+                        writes.incrementAndGet()
+                    }
+                } catch (error: Throwable) {
+                    failure.set(error)
+                } finally {
+                    writerFinished.countDown()
+                }
+            }
+            assertTrue(writerAttempted.await(1, TimeUnit.SECONDS))
+            assertFalse(writerFinished.await(50, TimeUnit.MILLISECONDS))
+            ownerActive.set(false)
+            releaseMaintenance.countDown()
+            assertTrue(writerFinished.await(1, TimeUnit.SECONDS))
+            maintenance.get(1, TimeUnit.SECONDS)
+
+            assertTrue(failure.get() is InterruptedException)
+            assertEquals(0, writes.get())
+        } finally {
+            releaseMaintenance.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun secondaryReadReturningAfterStopCannotCommit() {
+        val executor = Executors.newSingleThreadExecutor()
+        val readStarted = CountDownLatch(1)
+        val releaseRead = CountDownLatch(1)
+        val writerFinished = CountDownLatch(1)
+        val workerActive = AtomicBoolean(true)
+        val writes = AtomicInteger()
+        val failure = AtomicReference<Throwable?>()
+        try {
+            executor.execute {
+                readStarted.countDown()
+                try {
+                    check(releaseRead.await(2, TimeUnit.SECONDS))
+                    withSecondaryDatabaseRead(null, { true }, { workerActive.get() }) {
+                        writes.incrementAndGet()
+                    }
+                } catch (error: Throwable) {
+                    failure.set(error)
+                } finally {
+                    writerFinished.countDown()
+                }
+            }
+            assertTrue(readStarted.await(1, TimeUnit.SECONDS))
+            workerActive.set(false)
+            releaseRead.countDown()
+            assertTrue(writerFinished.await(1, TimeUnit.SECONDS))
+
+            assertTrue(failure.get() is InterruptedException)
+            assertEquals(0, writes.get())
+        } finally {
+            releaseRead.countDown()
+            executor.shutdownNow()
+        }
+    }
+
     @Test
     fun cursorEndsAtCatalogTailWithoutWrappingInsideBatch() {
         val parameters = (1..12).map { index ->
@@ -54,64 +145,211 @@ class DirectDebugRoundRobinPollerTest {
     }
 
     @Test
-    fun secondaryCycleFencesDrainsAndResumesBeforeLiveRead() {
+    fun secondaryHandoverFencesOnceForAnOwnershipAndSkipsLaterCycles() {
         val events = mutableListOf<String>()
+        var identity = DirectStreamCredentials(controllerToken = 17L, epoch = 10L)
 
-        val value = SecondaryLiveCycleGate.run(
-            pause = { events += "pause"; true },
-            drain = {
-                events += "drain"
-                SecondaryReplayDrainResult(true, 1, 0, 0)
-            },
-            resume = { events += "resume"; true },
-            live = { events += "live"; 42 }
+        val handover = SecondaryOwnershipHandover(
+            currentIdentity = { identity },
+            pause = { events += "pause"; identity = identity.nextEpoch(); true },
+            drain = { sessionId -> events += "drain:$sessionId"; SecondaryReplayDrainResult(true, 1, 0, 0) },
+            resume = { events += "resume"; identity = identity.nextEpoch(); true }
         )
 
-        assertEquals(42, value)
-        assertEquals(listOf("pause", "drain", "resume", "live"), events)
+        assertEquals(42, handover.run(7L) { events += "live"; 42 })
+        assertEquals(12L, identity.epoch)
+        assertEquals(43, handover.run(8L) { events += "live"; 43 })
+        assertEquals(listOf("pause", "drain:7", "resume", "live", "live"), events)
     }
 
     @Test
-    fun replayFailureNeverPerformsLiveReadAndRestoresFallback() {
+    fun changedControllerTokenOrEpochRequiresANewHandover() {
         val events = mutableListOf<String>()
-        var live = false
+        var identity = DirectStreamCredentials(controllerToken = 17L, epoch = 10L)
+        val handover = SecondaryOwnershipHandover(
+            currentIdentity = { identity },
+            pause = { events += "pause"; identity = identity.nextEpoch(); true },
+            drain = { events += "drain"; SecondaryReplayDrainResult(true, 1, 0, 0) },
+            resume = { events += "resume"; identity = identity.nextEpoch(); true }
+        )
+
+        handover.run(1L) { events += "live" }
+        identity = identity.copy(epoch = 20L)
+        handover.run(2L) { events += "live" }
+        identity = DirectStreamCredentials(controllerToken = 99L, epoch = 1L)
+        handover.run(3L) { events += "live" }
+
+        assertEquals(
+            listOf(
+                "pause", "drain", "resume", "live",
+                "pause", "drain", "resume", "live",
+                "pause", "drain", "resume", "live"
+            ),
+            events
+        )
+        assertEquals(3L, identity.epoch)
+    }
+
+    @Test
+    fun nonRetryableReplayFailureRemainsAnErrorAndNeverPerformsLiveRead() {
+        val events = mutableListOf<String>()
+        var identity = DirectStreamCredentials(controllerToken = 17L, epoch = 10L)
+        val handover = SecondaryOwnershipHandover(
+            currentIdentity = { identity },
+            pause = { events += "pause"; identity = identity.nextEpoch(); true },
+            drain = {
+                events += "drain"
+                SecondaryReplayDrainResult(false, 0, 0, 0, "archive receipt rejected")
+            },
+            resume = { events += "resume"; identity = identity.nextEpoch(); true }
+        )
 
         val error = assertFailsWith<IllegalStateException> {
-            SecondaryLiveCycleGate.run(
-                pause = { events += "pause"; true },
-                drain = {
-                    events += "drain"
-                    SecondaryReplayDrainResult(false, 0, 0, 0, "receipt commit failed")
-                },
-                resume = { events += "resume"; true },
-                live = { live = true }
-            )
+            handover.run(9L) { events += "live" }
         }
 
-        assertTrue(error.message!!.contains("receipt commit failed"))
-        assertFalse(live)
+        assertTrue(error.message!!.contains("archive receipt rejected"))
         assertEquals(listOf("pause", "drain", "resume"), events)
     }
 
     @Test
-    fun retryableReplayPendingNeverPerformsLiveReadAndRestoresFallback() {
+    fun retryableReplayPendingResumesAndNeverPerformsLiveReadUntilDrainCompletes() {
         val events = mutableListOf<String>()
-        var live = false
+        var identity = DirectStreamCredentials(controllerToken = 17L, epoch = 10L)
+        var drainAttempts = 0
+        val handover = SecondaryOwnershipHandover(
+            currentIdentity = { identity },
+            pause = { events += "pause"; identity = identity.nextEpoch(); true },
+            drain = {
+                events += "drain"
+                drainAttempts++
+                if (drainAttempts == 1) {
+                    SecondaryReplayDrainResult(false, 0, 0, 0, "archive receipt pending", retryable = true)
+                } else {
+                    SecondaryReplayDrainResult(true, 1, 0, 0)
+                }
+            },
+            resume = { events += "resume"; identity = identity.nextEpoch(); true }
+        )
 
         assertFailsWith<SecondaryReplayPendingException> {
-            SecondaryLiveCycleGate.run(
-                pause = { events += "pause"; true },
-                drain = {
-                    events += "drain"
-                    SecondaryReplayDrainResult(false, 0, 0, 0, "callback pending", retryable = true)
-                },
-                resume = { events += "resume"; true },
-                live = { live = true }
-            )
+            handover.run(3L) { events += "live" }
+        }
+        assertEquals(listOf("pause", "drain", "resume"), events)
+        assertEquals(12L, identity.epoch)
+
+        handover.run(3L) { events += "live" }
+        assertEquals(14L, identity.epoch)
+        assertEquals(listOf("pause", "drain", "resume", "pause", "drain", "resume", "live"), events)
+    }
+
+    @Test
+    fun ownershipChangeDuringPauseDoesNotDrainOrReadUnderTheNewToken() {
+        val events = mutableListOf<String>()
+        var identity = DirectStreamCredentials(controllerToken = 17L, epoch = 10L)
+        var firstPause = true
+        val handover = SecondaryOwnershipHandover(
+            currentIdentity = { identity },
+            pause = {
+                events += "pause"
+                if (firstPause) {
+                    firstPause = false
+                    identity = DirectStreamCredentials(controllerToken = 99L, epoch = 1L)
+                } else {
+                    identity = identity.nextEpoch()
+                }
+                true
+            },
+            drain = { events += "drain"; SecondaryReplayDrainResult(true, 1, 0, 0) },
+            resume = {
+                events += "resume"
+                if (!firstPause && identity.controllerToken == 99L && identity.epoch > 1L) {
+                    identity = identity.nextEpoch()
+                }
+                true
+            }
+        )
+
+        assertFailsWith<SecondaryReplayPendingException> {
+            handover.run(4L) { events += "live" }
+        }
+        assertEquals(listOf("pause", "resume"), events)
+
+        handover.run(4L) { events += "live" }
+        assertEquals(listOf("pause", "resume", "pause", "drain", "resume", "live"), events)
+        assertEquals(3L, identity.epoch)
+    }
+
+    @Test
+    fun pendingHandoverUsesShortBoundedRetryScheduleWithoutChangingLiveCadence() {
+        assertEquals(listOf(100L, 250L, 500L, 1_000L, 1_000L), (0..4).map {
+            DirectDebugRoundRobinPoller.handoverRetryDelayMs(it)
+        })
+        assertEquals(100L, DirectDebugRoundRobinPoller.nextSleepMs(cycleElapsedMs = 400L))
+        assertEquals(1_500L, DirectDebugRoundRobinPoller.nextSleepMs(cycleElapsedMs = 1_500L))
+    }
+
+    @Test
+    fun stopOrInterruptSuppressesBothFailureCallbacks() {
+        assertFalse(DirectDebugRoundRobinPoller.shouldReportFailureCallbacks(stopRequested = true, interrupted = false))
+        assertFalse(DirectDebugRoundRobinPoller.shouldReportFailureCallbacks(stopRequested = false, interrupted = true))
+        assertTrue(DirectDebugRoundRobinPoller.shouldReportFailureCallbacks(stopRequested = false, interrupted = false))
+    }
+
+    @Test
+    fun staleOrReplayPendingLiveStatusRetriesHandoverInsteadOfStoppingPoller() {
+        assertTrue(DirectDebugRoundRobinPoller.isOwnershipRetryStatus(CollectorHelperProtocol.STATUS_REPLAY_PENDING))
+        assertTrue(DirectDebugRoundRobinPoller.isOwnershipRetryStatus(CollectorHelperProtocol.STATUS_STALE_TOKEN))
+        assertFalse(DirectDebugRoundRobinPoller.isOwnershipRetryStatus(CollectorHelperProtocol.STATUS_OK))
+        assertFalse(DirectDebugRoundRobinPoller.isOwnershipRetryStatus(-900))
+    }
+
+    @Test
+    fun executorTerminationCleanupCoversCancelledBeforeStartAfterActiveWorkEnds() {
+        val activeTaskStarted = CountDownLatch(1)
+        val releaseActiveTask = CountDownLatch(1)
+        val activeTaskFinished = AtomicBoolean(false)
+        val queuedTaskStarted = AtomicBoolean(false)
+        val terminatedTooEarly = AtomicBoolean(false)
+        val terminatedCount = AtomicInteger(0)
+        val terminated = CountDownLatch(1)
+        val executor = newRoundRobinPollerExecutor {
+            terminatedTooEarly.set(!activeTaskFinished.get())
+            terminatedCount.incrementAndGet()
+            terminated.countDown()
         }
 
-        assertFalse(live)
-        assertEquals(listOf("pause", "drain", "resume"), events)
+        executor.execute {
+            activeTaskStarted.countDown()
+            try {
+                while (true) {
+                    try {
+                        if (releaseActiveTask.await(10L, TimeUnit.MILLISECONDS)) break
+                    } catch (_: InterruptedException) {
+                        // Keep the active task alive until its simulated write section is released.
+                    }
+                }
+            } finally {
+                activeTaskFinished.set(true)
+            }
+        }
+        try {
+            assertTrue(activeTaskStarted.await(1L, TimeUnit.SECONDS))
+            val queued = executor.submit { queuedTaskStarted.set(true) }
+            assertTrue(queued.cancel(false))
+            executor.shutdownNow()
+            assertFalse(terminated.await(50L, TimeUnit.MILLISECONDS))
+            assertFalse(activeTaskFinished.get())
+        } finally {
+            releaseActiveTask.countDown()
+            executor.shutdownNow()
+        }
+
+        assertTrue(terminated.await(1L, TimeUnit.SECONDS))
+        assertTrue(executor.awaitTermination(1L, TimeUnit.SECONDS))
+        assertFalse(terminatedTooEarly.get())
+        assertFalse(queuedTaskStarted.get())
+        assertEquals(1, terminatedCount.get())
     }
 
     @Test
@@ -296,5 +534,7 @@ class DirectDebugRoundRobinPollerTest {
     private fun sha256(file: File): String = MessageDigest.getInstance("SHA-256")
         .digest(file.readBytes())
         .joinToString("") { "%02X".format(it) }
+
+    private fun DirectStreamCredentials.nextEpoch(): DirectStreamCredentials = copy(epoch = epoch + 1L)
 
 }

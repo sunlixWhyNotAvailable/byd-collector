@@ -2,12 +2,19 @@ package com.bydcollector.collector.adb
 
 import android.content.Context
 import android.os.SystemClock
+import android.util.Log
+import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.remote.DirectBridgeManager
+import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.system.RequiredAccessChecker
+import com.bydcollector.collector.util.dispatchOperationalEvent
+import com.bydcollector.collector.util.sharedOperationalEventExecutor
+import com.bydcollector.collector.util.diagnosticDetail
 import java.io.File
+import java.time.Instant
 import java.util.concurrent.Executors
 import java.util.concurrent.FutureTask
 import java.util.concurrent.atomic.AtomicBoolean
@@ -15,7 +22,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 enum class AccessCheckMode {
     NORMAL,
     COLD_START,
-    FORCE
+    FORCE,
+    OBSERVE
 }
 
 data class AccessRuntimeSnapshot(
@@ -60,6 +68,19 @@ object AdbAuthorizationManager {
             )
         }
         return submitted
+    }
+
+    /** Refreshes only current OS permissions and the existing local ADB identity. */
+    fun requestObservation(context: Context): Boolean {
+        val appContext = context.applicationContext
+        if (isUserShutdownRequested(appContext)) return false
+        return coordinator.submit(AccessCheckMode.OBSERVE) { lease ->
+            runObservation(appContext, lease)
+        }
+    }
+
+    fun cancelObservation() {
+        coordinator.cancel(AccessCheckMode.OBSERVE)
     }
 
     private fun runCheck(
@@ -124,8 +145,7 @@ object AdbAuthorizationManager {
                 permissionsGranted = permissionsGranted,
                 adbAuthorized = adbAuthorized
             )
-            if (!coordinator.publishIfCurrent(lease) {
-                    runtimeSnapshot = completed
+            if (!publishSnapshot(appContext, lease, completed) {
                     onComplete?.invoke(completed)
                 }
             ) return
@@ -155,8 +175,7 @@ object AdbAuthorizationManager {
                 }.getOrDefault(false),
                 adbAuthorized = false
             )
-            if (coordinator.publishIfCurrent(lease) {
-                    runtimeSnapshot = failed
+            if (publishSnapshot(appContext, lease, failed) {
                     onComplete?.invoke(failed)
                 }
             ) {
@@ -168,6 +187,85 @@ object AdbAuthorizationManager {
             }
         }
     }
+
+    private fun runObservation(appContext: Context, lease: AdbPipelineLease) {
+        try {
+            if (isUserShutdownRequested(appContext)) return
+            lease.cancellation.throwIfCancelled()
+            val permissionsGranted = !RequiredAccessChecker.hasMissingRequiredAccess(appContext)
+            val adbAuthorized = adbClient(appContext, null, lease.cancellation)
+                .checkAuthorizationReadOnly()
+            lease.cancellation.throwIfCancelled()
+            val completed = AccessRuntimeSnapshot(
+                permissionsGranted,
+                adbAuthorized.category == "adb_authorization_connected"
+            )
+            if (publishSnapshot(
+                appContext,
+                lease,
+                completed
+            )) {
+                recordObservation(
+                    appContext,
+                    "completed",
+                    "permissions=${completed.permissionsGranted} adb=${completed.adbAuthorized} category=${adbAuthorized.category}"
+                )
+            }
+        } catch (_: AdbOperationCancelledException) {
+            // Cancellation is expected when an interactive check takes ownership.
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } catch (error: Exception) {
+            val permissionsGranted = runCatching {
+                !RequiredAccessChecker.hasMissingRequiredAccess(appContext)
+            }.getOrDefault(false)
+            val failed = AccessRuntimeSnapshot(permissionsGranted, false)
+            if (publishSnapshot(appContext, lease, failed)) {
+                recordObservation(
+                    appContext,
+                    "error",
+                    error.diagnosticDetail("permissions=${failed.permissionsGranted}")
+                )
+            }
+        }
+    }
+
+    private fun publishSnapshot(
+        appContext: Context,
+        lease: AdbPipelineLease,
+        snapshot: AccessRuntimeSnapshot,
+        onPublished: (() -> Unit)? = null
+    ): Boolean = coordinator.publishIfCurrent(lease) {
+        runtimeSnapshot = snapshot
+        BydCollectorApplication.dashboardUiStateStore(appContext).publishAccessStatus(
+            permissionsGranted = snapshot.permissionsGranted,
+            adbAuthorized = snapshot.adbAuthorized
+        )
+        try {
+            onPublished?.invoke()
+        } catch (error: RuntimeException) {
+            Log.w(TAG, "Access status callback failed", error)
+        }
+    }
+
+    private fun recordObservation(context: Context, result: String, detail: String) {
+        val app = context.applicationContext as BydCollectorApplication
+        dispatchOperationalEvent(sharedOperationalEventExecutor) {
+            app.operationalEventJournal.append(
+                Instant.now().toString(),
+                SystemClock.elapsedRealtime(),
+                "adb_access_observation",
+                result,
+            detail.take(32_768)
+            )
+        }
+    }
+
+    private fun isUserShutdownRequested(context: Context): Boolean = context
+        .getSharedPreferences(CollectorSettings.PREFS_NAME, Context.MODE_PRIVATE)
+        .getBoolean(CollectorSettings.KEY_USER_SHUTDOWN, false)
+
+    private const val TAG = "AdbAuthorization"
 
     private fun authorize(
         store: TelemetryStore,
@@ -256,12 +354,12 @@ object AdbAuthorizationManager {
 
     private fun adbClient(
         appContext: Context,
-        store: TelemetryStore,
+        store: TelemetryStore?,
         cancellation: AdbCancellation
     ): AdbLocalClient {
         return AdbLocalClient(
             keyDir = File(appContext.filesDir, "adb_keys"),
-            eventSink = { category, message, detail -> store.recordEvent(category, message, detail) },
+            eventSink = store?.let { sink -> { category, message, detail -> sink.recordEvent(category, message, detail) } },
             cancellation = cancellation
         )
     }
@@ -301,6 +399,7 @@ internal class AdbPipelineCoordinator {
         synchronized(lock) {
             val previous = active
             val replace = mode == AccessCheckMode.FORCE ||
+                (mode != AccessCheckMode.OBSERVE && previous?.mode == AccessCheckMode.OBSERVE) ||
                 (mode == AccessCheckMode.COLD_START && previous?.mode == AccessCheckMode.NORMAL)
             if (previous != null && !replace) return false
 
@@ -315,6 +414,7 @@ internal class AdbPipelineCoordinator {
                     synchronized(lock) {
                         if (active === lease) active = null
                     }
+                    lease.terminal()
                 }
             }
             lease.task = task
@@ -359,6 +459,13 @@ internal class AdbPipelineCoordinator {
             return true
         }
     }
+
+    fun cancel(mode: AccessCheckMode) {
+        val lease = synchronized(lock) {
+            active?.takeIf { it.mode == mode }?.also { active = null }
+        }
+        lease?.cancel()
+    }
 }
 
 internal class AdbPipelineLease(
@@ -379,4 +486,5 @@ internal class AdbPipelineLease(
         task.cancel(true)
         terminal()
     }
+
 }

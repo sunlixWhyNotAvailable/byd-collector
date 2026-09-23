@@ -4,11 +4,13 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
+import android.view.Display
 import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.service.CollectorSettings
 
@@ -153,13 +155,24 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
         }
     }
 
-    fun onHintPresented(resultId: Long) {
-        if (ownUiVisible || !started || installing || wakePolicy.sleeping || settings.isUserShutdownRequested()) return
-        presentation.markPresented(app.updateChecks.snapshot(), resultId)
+    fun onHintPresented(resultId: Long): Boolean {
+        if (mainDisplayForUpdateHintIfReady(app) == null) {
+            app.updateHints.dismiss("display_not_ready")
+            return false
+        }
+        if (ownUiVisible || !started || installing || wakePolicy.sleeping || settings.isUserShutdownRequested()) return false
+        return presentation.markPresented(app.updateChecks.snapshot(), resultId)
     }
 
     private fun presentPendingHint() {
         val snapshot = app.updateChecks.snapshot()
+        if (mainDisplayForUpdateHintIfReady(app) == null) {
+            app.updateHints.dismiss("display_not_ready")
+            if (snapshot.uiState is UpdateUiState.Available) {
+                app.recordUpdateEvent("hint_unavailable", "reason=display_not_ready phase=show")
+            }
+            return
+        }
         if (presentation.canPresentHint(snapshot, ownUiVisible,
                 started && !installing && !wakePolicy.sleeping && !settings.isUserShutdownRequested() && settings.isUpdateHintEnabled())) {
             app.updateHints.show(checkNotNull(snapshot.availableResultId), (snapshot.uiState as UpdateUiState.Available).info)
@@ -288,3 +301,17 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
         }
     }
 }
+
+internal fun mainDisplayForUpdateHintIfReady(context: Context): Display? {
+    return try {
+        val powerManager = context.getSystemService(PowerManager::class.java) ?: return null
+        val displayManager = context.getSystemService(DisplayManager::class.java) ?: return null
+        val display = displayManager.getDisplay(Display.DEFAULT_DISPLAY) ?: return null
+        display.takeIf { isUpdateHintDisplayReady(powerManager.isInteractive, it.state) }
+    } catch (_: RuntimeException) {
+        null
+    }
+}
+
+internal fun isUpdateHintDisplayReady(isInteractive: Boolean, mainDisplayState: Int?): Boolean =
+    isInteractive && mainDisplayState == Display.STATE_ON

@@ -1353,10 +1353,15 @@ public final class CollectorHelperDaemon {
         @Override public synchronized void close() {
             if (closed) return;
             closed = true;
+            boolean callbackTransportSafeToClose = true;
             try {
-                if (runtime != null) runtime.close();
+                if (runtime != null) {
+                    runtime.close();
+                    callbackTransportSafeToClose = runtime.callbackWorkersStopped();
+                }
             } catch (Throwable error) {
                 recordDiagnosticError(diagnostics, "helper runtime teardown failed: " + describe(error));
+                callbackTransportSafeToClose = runtime == null || runtime.callbackWorkersStopped();
             }
             try {
                 if (workerSpool != null) workerSpool.close();
@@ -1368,15 +1373,22 @@ public final class CollectorHelperDaemon {
             } catch (Throwable error) {
                 recordDiagnosticError(diagnostics, "secondary spool teardown failed: " + describe(error));
             }
-            try {
-                if (callbackSpoolBinder != null) callbackSpoolBinder.close();
-            } catch (Throwable error) {
-                recordDiagnosticError(diagnostics, "callback spool teardown failed: " + describe(error));
+            if (callbackTransportSafeToClose) {
+                try {
+                    if (callbackSpoolBinder != null) callbackSpoolBinder.close();
+                } catch (Throwable error) {
+                    recordDiagnosticError(diagnostics, "callback spool teardown failed: " + describe(error));
+                }
+            } else {
+                recordDiagnosticError(diagnostics,
+                    "callback workers exceeded shutdown wait; callback spool and owner lock retained until helper process exit");
             }
-            try {
-                ownerLock.close();
-            } catch (Throwable error) {
-                recordDiagnosticError(diagnostics, "helper owner teardown failed: " + describe(error));
+            if (callbackTransportSafeToClose) {
+                try {
+                    ownerLock.close();
+                } catch (Throwable error) {
+                    recordDiagnosticError(diagnostics, "helper owner teardown failed: " + describe(error));
+                }
             }
         }
     }

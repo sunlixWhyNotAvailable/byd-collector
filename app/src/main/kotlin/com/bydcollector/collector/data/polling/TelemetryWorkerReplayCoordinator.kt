@@ -14,6 +14,7 @@ import com.bydcollector.collector.data.local.PersistedPollInput
 import com.bydcollector.collector.data.local.WorkerPollImportResult
 import com.bydcollector.collector.direct.CollectorHelperProtocol
 import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
+import com.bydcollector.collector.util.diagnosticDetail
 import java.time.Instant
 import org.json.JSONArray
 import org.json.JSONObject
@@ -46,7 +47,8 @@ class TelemetryWorkerReplayCoordinator(
     private val replayEntriesForCatalog: (String) -> List<DirectFidEntry>? =
         DirectFidRegistry::workerReplayEntriesForCatalog,
     private val acknowledgedAtMs: () -> Long = { System.currentTimeMillis() },
-    private val monotonicNanos: () -> Long = { System.nanoTime() }
+    private val monotonicNanos: () -> Long = { System.nanoTime() },
+    private val isActive: () -> Boolean = { true }
 ) {
     private var lastFailureKey: String? = null
     private var lastFailureLoggedAtNanos = 0L
@@ -67,15 +69,20 @@ class TelemetryWorkerReplayCoordinator(
         var lastTimestamp: String? = null
         var lastElapsedMs = 0L
         try {
+            checkActive()
             ensureHelper()?.let { error ->
                 return failure("worker_helper_unavailable", error, needsReplay = true)
             }
             val pending = pendingSamples(CollectorHelperProtocol.MAX_PENDING_WORKER_SAMPLES)
+            checkActive()
             if (!pending.ok) {
+                if (isDeferredStatus(pending.status)) {
+                    return deferred()
+                }
                 val unavailable = pending.status == CollectorHelperProtocol.STATUS_SPOOL_UNAVAILABLE
                 return failure(
                     category = if (unavailable) "worker_spool_unavailable" else "worker_spool_read_error",
-                    message = pending.error ?: "status=${pending.status}",
+                    message = "status=${pending.status}" + pending.error?.let { " $it" }.orEmpty(),
                     needsReplay = !unavailable
                 )
             }
@@ -87,7 +94,7 @@ class TelemetryWorkerReplayCoordinator(
             firstIdentity = pending.samples.first().identity
             val parametersByKey = store.getActiveCatalogParameters().associateBy { it.key }
             for (sample in pending.samples) {
-                if (Thread.currentThread().isInterrupted) throw InterruptedException()
+                checkActive()
                 lastIdentity = sample.identity
                 val entries = replayEntriesForCatalog(sample.catalogVersion)
                 val input = try {
@@ -136,15 +143,24 @@ class TelemetryWorkerReplayCoordinator(
                 ackAttempts += 1L
                 val ack = try {
                     acknowledgeSample(sample.identity, acknowledgedAtMs())
-                } catch (error: Exception) {
-                    failedAcks += 1L
+                } catch (error: Throwable) {
+                    if (error !is InterruptedException && !Thread.currentThread().isInterrupted) failedAcks += 1L
                     throw error
                 }
+                checkActive()
                 if (!ack.ok) {
+                    if (isDeferredStatus(ack.status)) {
+                        return deferred(
+                            pollId = lastPollId,
+                            timestamp = lastTimestamp,
+                            elapsedMs = lastElapsedMs,
+                            insertedPolls = insertedPolls
+                        )
+                    }
                     failedAcks += 1L
                     return failure(
                         category = "worker_spool_ack_error",
-                        message = "identity=${sample.identity} ${ack.error ?: "status=${ack.status}"}",
+                        message = "identity=${sample.identity} status=${ack.status}" + ack.error?.let { " $it" }.orEmpty(),
                         needsReplay = true,
                         pollId = lastPollId,
                         timestamp = lastTimestamp,
@@ -200,8 +216,11 @@ class TelemetryWorkerReplayCoordinator(
                     valueRowsPersisted = insertedPolls
                 )
             )
-        } catch (error: Exception) {
+        } catch (error: Throwable) {
             if (error is InterruptedException) throw error
+            if (!isActive() || Thread.currentThread().isInterrupted) {
+                throw InterruptedException("Worker replay interrupted").apply { initCause(error) }
+            }
             return failure(
                 category = "worker_replay_error",
                 message = "${error::class.java.simpleName}: ${error.message ?: "no message"}",
@@ -221,7 +240,7 @@ class TelemetryWorkerReplayCoordinator(
                     failedAcks,
                     firstIdentity,
                     lastIdentity
-                )
+                ) + "\n" + error.diagnosticDetail("worker replay")
             )
         }
     }
@@ -334,6 +353,10 @@ class TelemetryWorkerReplayCoordinator(
 
     private class WorkerSampleFormatException(message: String) : IllegalArgumentException(message)
 
+    private fun checkActive() {
+        if (!isActive() || Thread.currentThread().isInterrupted) throw InterruptedException("Worker replay stopped")
+    }
+
     private fun failure(
         category: String,
         message: String,
@@ -344,6 +367,7 @@ class TelemetryWorkerReplayCoordinator(
         insertedPolls: Long = 0L,
         diagnosticDetail: String? = null
     ): WorkerReplayBatchResult {
+        checkActive()
         val key = "$category:$message"
         val nowNanos = monotonicNanos()
         val sameFailure = key == lastFailureKey
@@ -376,6 +400,33 @@ class TelemetryWorkerReplayCoordinator(
             )
         )
     }
+
+    private fun deferred(
+        pollId: Long? = null,
+        timestamp: String? = null,
+        elapsedMs: Long = 0L,
+        insertedPolls: Long = 0L
+    ): WorkerReplayBatchResult {
+        clearFailureAggregation()
+        return WorkerReplayBatchResult(
+            needsReplay = true,
+            cycleResult = PollCycleResult(
+                pollId = pollId,
+                ok = true,
+                category = null,
+                elapsedMs = elapsedMs,
+                requestCount = 0,
+                timestamp = timestamp,
+                pollRowsPersisted = insertedPolls,
+                valueRowsPersisted = insertedPolls,
+                deferred = true
+            )
+        )
+    }
+
+    private fun isDeferredStatus(status: Int): Boolean =
+        status == CollectorHelperProtocol.STATUS_REPLAY_PENDING ||
+            status == CollectorHelperProtocol.STATUS_STALE_TOKEN
 
     private fun clearFailureAggregation() {
         lastFailureKey = null

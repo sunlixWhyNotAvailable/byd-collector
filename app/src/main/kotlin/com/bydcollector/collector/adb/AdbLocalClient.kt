@@ -117,6 +117,20 @@ class AdbLocalClient(
         )
     }
 
+    /** Checks the existing ADB identity without creating, migrating, or prompting for a key. */
+    fun checkAuthorizationReadOnly(): AdbAuthorizationResult {
+        val keyPair = loadExistingKeyPairReadOnly() ?: return AdbAuthorizationResult(
+            category = "adb_authorization_required",
+            message = "ADB key is not available; request authorization from the app UI first",
+            detail = "no existing ADB private key"
+        )
+        return authorizeAcrossEndpoints(
+            allowAuthorizationPrompt = false,
+            timeoutMessage = "ADB authorization check timed out",
+            keyPair = keyPair
+        )
+    }
+
     fun requestAuthorization(): AdbAuthorizationResult {
         return authorizeAcrossEndpoints(
             allowAuthorizationPrompt = true,
@@ -126,7 +140,8 @@ class AdbLocalClient(
 
     private fun authorizeAcrossEndpoints(
         allowAuthorizationPrompt: Boolean,
-        timeoutMessage: String
+        timeoutMessage: String,
+        keyPair: KeyPair? = null
     ): AdbAuthorizationResult {
         cancellation.throwIfCancelled()
         if (!tryAcquireAuthLock()) {
@@ -139,7 +154,7 @@ class AdbLocalClient(
         return try {
             var lastResult: AdbAuthorizationResult? = null
             for (endpoint in endpoints) {
-                val result = checkAuthorization(endpoint, allowAuthorizationPrompt, timeoutMessage)
+                val result = checkAuthorization(endpoint, allowAuthorizationPrompt, timeoutMessage, keyPair)
                 if (!shouldTryNextEndpoint(result.category) || endpoint == endpoints.last()) return result
                 lastResult = result
             }
@@ -156,13 +171,14 @@ class AdbLocalClient(
     private fun checkAuthorization(
         endpoint: AdbEndpoint,
         allowAuthorizationPrompt: Boolean,
-        timeoutMessage: String
+        timeoutMessage: String,
+        keyPair: KeyPair? = null
     ): AdbAuthorizationResult {
         return try {
             useLocalAdbSocket(endpoint) { socket ->
                 val input = socket.getInputStream()
                 val output = socket.getOutputStream()
-                connectAuthorized(socket, input, output, allowAuthorizationPrompt)
+                connectAuthorized(socket, input, output, allowAuthorizationPrompt, keyPair)
             }
         } catch (error: AdbOperationCancelledException) {
             throw error
@@ -319,10 +335,11 @@ class AdbLocalClient(
         socket: Socket,
         input: InputStream,
         output: OutputStream,
-        allowAuthorizationPrompt: Boolean
+        allowAuthorizationPrompt: Boolean,
+        existingKeyPair: KeyPair? = null
     ): AdbAuthorizationResult {
         cancellation.throwIfCancelled()
-        val keyPair = loadOrCreateKeyPair()
+        val keyPair = existingKeyPair ?: loadOrCreateKeyPair()
         writePacket(output, COMMAND_CNXN, ADB_VERSION, ADB_MAX_DATA, ADB_BANNER.toByteArray())
         eventSink?.invoke(
             "adb_cnxn_sent",
@@ -596,6 +613,30 @@ class AdbLocalClient(
         return generator.generateKeyPair().also { keyPair ->
             privateFile.writeBytes(keyPair.private.encoded)
             publicFile.writeBytes(keyPair.public.encoded)
+        }
+    }
+
+    private fun loadExistingKeyPairReadOnly(): KeyPair? {
+        val privateFile = File(keyDir, "adb_key.priv")
+        val parent = keyDir.parentFile ?: return null
+        val legacyPrivateFile = File(parent, "bydhud_adb_private.pk8")
+        val privateSource = when {
+            privateFile.isFile -> privateFile
+            legacyPrivateFile.isFile -> legacyPrivateFile
+            else -> return null
+        }
+        return try {
+            val keyFactory = KeyFactory.getInstance("RSA")
+            val privateKey = keyFactory.generatePrivate(PKCS8EncodedKeySpec(privateSource.readBytes()))
+            val publicFile = File(keyDir, "adb_key.pub")
+            val publicKey = if (privateSource == privateFile && publicFile.isFile) {
+                keyFactory.generatePublic(X509EncodedKeySpec(publicFile.readBytes()))
+            } else {
+                derivePublicKey(keyFactory, privateKey)
+            }
+            KeyPair(publicKey, privateKey)
+        } catch (error: Exception) {
+            throw IllegalStateException("Stored ADB key is invalid; refusing automatic replacement", error)
         }
     }
 

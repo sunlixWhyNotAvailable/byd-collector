@@ -82,7 +82,9 @@ data class NormalizedObservation(
     val sourcePollId: Long?,
     val sourceKey: String?,
     val observedAt: String,
-    val reason: String? = null
+    val reason: String? = null,
+    // Transient UI freshness metadata; no storage/export schema change.
+    val sourceStamp: NormalizedSourceStamp? = null
 ) {
     fun semanticKey(): String {
         return listOf(
@@ -149,12 +151,14 @@ object NormalizedSourceOrdering {
 data class SourceOrderedApplyResult(
     val appliedObservations: List<NormalizedObservation>,
     val summary: NormalizedWriteSummary,
-    val acceptedSourceKeys: Set<String>
+    val acceptedSourceKeys: Set<String>,
+    val latestAppliedSource: NormalizedSourceStamp? = null
 )
 
 data class CallbackNormalizationPageResult(
     val processedCount: Int,
     val appliedObservations: List<NormalizedObservation>,
     val summary: NormalizedWriteSummary,
-    val hasMore: Boolean
+    val hasMore: Boolean,
+    val latestAppliedSource: NormalizedSourceStamp? = null
 )

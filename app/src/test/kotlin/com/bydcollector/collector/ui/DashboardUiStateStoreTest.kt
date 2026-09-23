@@ -14,6 +14,41 @@ import kotlin.test.assertTrue
 
 class DashboardUiStateStoreTest {
     @Test
+    fun backgroundAccessCheckSurvivesReopeningAndStaleServiceFlags() {
+        val store = DashboardUiStateStore { 1L }
+        // The notification listener may finish a check before the first Activity is opened.
+        store.publishAccessStatus(permissionsGranted = true, adbAuthorized = true)
+        store.seed(dashboardState("old snapshot"))
+        store.publishRuntimeFlags(
+            DashboardRuntimeFlags(
+                serviceRunning = false, mainPollingRunning = false, debugPollingRunning = false,
+                pollingEnabled = false, debugPollingEnabled = false,
+                mqttEnabled = false, influxEnabled = false,
+                permissionsGranted = false, adbAuthorized = false,
+                dbMaintenanceStatus = DbMaintenanceRuntimeStatus(),
+                archiveStorageJobStatus = ArchiveStorageJobStatus()
+            )
+        )
+        val refresh = store.beginChromeRefresh()
+        assertTrue(store.publishChrome(refresh, dashboardState("stale provider")))
+        assertTrue(store.currentChrome()!!.permissionsGranted)
+        assertTrue(store.currentChrome()!!.adbAuthorized)
+        assertFalse(store.currentChrome()!!.serviceRunning)
+        assertFalse(store.currentChrome()!!.pollingEnabled)
+        assertFalse(store.currentChrome()!!.debugPollingEnabled)
+
+        // A genuine later failure replaces the completed pair; a refresh cannot restore old success.
+        store.publishAccessStatus(permissionsGranted = false, adbAuthorized = false)
+        val next = store.beginTabRefresh(AppTab.EXTRA)
+        store.publishTab(AppTab.EXTRA, next,
+            dashboardState("old success").copy(permissionsGranted = true, adbAuthorized = true))
+        assertFalse(store.currentChrome()!!.permissionsGranted)
+        assertFalse(store.currentChrome()!!.adbAuthorized)
+        assertFalse(store.currentTab(AppTab.EXTRA)!!.permissionsGranted)
+        assertFalse(store.currentTab(AppTab.EXTRA)!!.adbAuthorized)
+    }
+
+    @Test
     fun seedPopulatesChromeAndEveryEmptyTab() {
         val initial = dashboardState("initial")
         val store = DashboardUiStateStore { 100L }

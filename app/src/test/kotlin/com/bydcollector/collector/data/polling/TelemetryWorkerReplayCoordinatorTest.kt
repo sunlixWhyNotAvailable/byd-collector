@@ -15,10 +15,13 @@ import com.bydcollector.collector.direct.CollectorHelperProtocol
 import com.bydcollector.collector.direct.CallbackValueSource
 import com.bydcollector.collector.direct.TelemetryCallbackBatch
 import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
+import java.io.IOException
 import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class TelemetryWorkerReplayCoordinatorTest {
@@ -388,6 +391,132 @@ class TelemetryWorkerReplayCoordinatorTest {
             storage.events[1].third.orEmpty(),
             "inserted=0 duplicates=1 ack_attempted=1 ack_succeeded=1 ack_failed=0"
         )
+    }
+
+    @Test
+    fun replayPendingReadStatusesDeferWithoutFailureOrStorageWrites() {
+        for (status in listOf(
+            CollectorHelperProtocol.STATUS_REPLAY_PENDING,
+            CollectorHelperProtocol.STATUS_STALE_TOKEN
+        )) {
+            val storage = FakeWorkerPollStorage(mutableListOf())
+            val coordinator = TelemetryWorkerReplayCoordinator(
+                store = storage,
+                ensureHelper = { null },
+                pendingSamples = { PendingTelemetryWorkerSamples(status, emptyList(), "busy") },
+                acknowledgeSample = { _, _ -> error("no sample to acknowledge") },
+                replayEntriesForCatalog = ::testCatalogEntries
+            )
+
+            val result = coordinator.replayNextBatch(7L)
+            val deferred = requireNotNull(result.cycleResult)
+
+            assertTrue(result.needsReplay)
+            assertTrue(deferred.deferred)
+            assertTrue(deferred.ok)
+            assertNull(deferred.category)
+            assertNull(deferred.errorMessage)
+            assertEquals(0L, deferred.pollRowsPersisted)
+            assertTrue(storage.inputs.isEmpty())
+            assertTrue(storage.events.isEmpty())
+        }
+    }
+
+    @Test
+    fun pendingAckPreservesCommittedCountsAndRetriesIdempotently() {
+        for (status in listOf(
+            CollectorHelperProtocol.STATUS_REPLAY_PENDING,
+            CollectorHelperProtocol.STATUS_STALE_TOKEN
+        )) {
+            val storage = FakeWorkerPollStorage(mutableListOf())
+            var ackCalls = 0
+            val coordinator = TelemetryWorkerReplayCoordinator(
+                store = storage,
+                ensureHelper = { null },
+                pendingSamples = { PendingTelemetryWorkerSamples(CollectorHelperProtocol.STATUS_OK, listOf(sample())) },
+                acknowledgeSample = { _, _ ->
+                    ackCalls++
+                    if (ackCalls == 1) TelemetryWorkerAckResult(status, updated = false, error = "busy")
+                    else TelemetryWorkerAckResult(CollectorHelperProtocol.STATUS_OK, updated = true)
+                },
+                replayEntriesForCatalog = ::testCatalogEntries
+            )
+
+            val pending = coordinator.replayNextBatch(7L)
+            val deferred = requireNotNull(pending.cycleResult)
+
+            assertTrue(pending.needsReplay)
+            assertTrue(deferred.deferred)
+            assertTrue(deferred.ok)
+            assertNull(deferred.category)
+            assertNull(deferred.errorMessage)
+            assertEquals(1L, deferred.pollRowsPersisted)
+            assertEquals(1L, deferred.valueRowsPersisted)
+            assertTrue(storage.events.isEmpty())
+
+            val retried = coordinator.replayNextBatch(7L)
+            assertFalse(retried.needsReplay)
+            assertEquals(listOf(true, false), storage.inserted)
+            assertEquals(0L, retried.cycleResult?.pollRowsPersisted)
+            assertEquals(listOf("worker_spool_replayed"), storage.events.map { it.first })
+        }
+    }
+
+    @Test
+    fun thrownReplayFailureRetainsCausalStackInDiagnosticEvent() {
+        val storage = FakeWorkerPollStorage(mutableListOf())
+        val readFailure = IllegalStateException("worker read failed", IOException("socket closed"))
+        val coordinator = TelemetryWorkerReplayCoordinator(
+            store = storage,
+            ensureHelper = { null },
+            pendingSamples = { throw readFailure },
+            acknowledgeSample = { _, _ -> error("ack must not run") },
+            replayEntriesForCatalog = ::testCatalogEntries
+        )
+
+        val result = coordinator.replayNextBatch(7L)
+
+        assertEquals("worker_replay_error", result.cycleResult?.category)
+        val detail = storage.events.single().third.orEmpty()
+        assertContains(detail, "IllegalStateException: worker read failed")
+        assertContains(detail, "Caused by: java.io.IOException: socket closed")
+        assertContains(detail, "TelemetryWorkerReplayCoordinatorTest")
+    }
+
+    @Test
+    fun stopInterruptedSpoolReadDoesNotLogLateIOException() {
+        val storage = FakeWorkerPollStorage(mutableListOf())
+        val readFailure = IOException("transport closed during Stop")
+        val coordinator = TelemetryWorkerReplayCoordinator(
+            store = storage,
+            ensureHelper = { null },
+            pendingSamples = { throw readFailure },
+            acknowledgeSample = { _, _ -> error("ack must not run") },
+            replayEntriesForCatalog = ::testCatalogEntries
+        )
+
+        try {
+            Thread.currentThread().interrupt()
+            assertFailsWith<InterruptedException> { coordinator.replayNextBatch(7L) }
+        } finally {
+            Thread.interrupted()
+        }
+
+        assertTrue(storage.events.isEmpty())
+    }
+
+    @Test
+    fun stopAfterPlatformClearsInterruptDoesNotLogFailure() {
+        val storage = FakeWorkerPollStorage(mutableListOf())
+        var active = true
+        val coordinator = TelemetryWorkerReplayCoordinator(
+            store = storage, ensureHelper = { null },
+            pendingSamples = { active = false; throw IOException("closed after Stop") },
+            acknowledgeSample = { _, _ -> error("no ACK") },
+            isActive = { active }
+        )
+        assertFailsWith<InterruptedException> { coordinator.replayNextBatch(7L) }
+        assertTrue(storage.events.isEmpty())
     }
 
     @Test

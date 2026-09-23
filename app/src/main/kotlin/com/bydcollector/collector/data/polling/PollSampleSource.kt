@@ -29,7 +29,7 @@ internal class LivePollSource(
     }
 
     companion object {
-        private val liveBootId: String by lazy {
+        val liveBootId: String by lazy {
             runCatching { File("/proc/sys/kernel/random/boot_id").readText().trim() }
                 .getOrNull()?.takeIf { it.isNotBlank() }
                 ?: "unavailable-${UUID.randomUUID()}"

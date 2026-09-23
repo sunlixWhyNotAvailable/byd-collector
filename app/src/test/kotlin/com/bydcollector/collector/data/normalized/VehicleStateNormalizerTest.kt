@@ -970,6 +970,7 @@ class VehicleStateNormalizerTest {
         assertEquals("soc_primary", output.single().sourceKey)
         assertEquals("1970-01-01T00:00:02Z", output.single().observedAt)
         assertEquals(2L, output.single().sourcePollId)
+        assertEquals(inputs.getValue("soc_primary").stamp, output.single().sourceStamp)
     }
 
     @Test
@@ -990,6 +991,7 @@ class VehicleStateNormalizerTest {
         assertEquals("02:05:00", output.value.text)
         assertEquals("1970-01-01T00:00:08Z", output.observedAt)
         assertEquals(null, output.sourcePollId)
+        assertEquals(8_000L, output.sourceStamp?.elapsedMs)
     }
 
     private fun sourceInput(key: String, value: String, wallMs: Long, pollId: Long?): NormalizedSourceInput =

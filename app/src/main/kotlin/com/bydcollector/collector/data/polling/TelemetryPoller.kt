@@ -11,6 +11,7 @@ class TelemetryPoller(
     private val intervalMs: Long = DEFAULT_INTERVAL_MS,
     private val onCycleResult: (PollCycleResult) -> Unit = {},
     private val onRuntimeError: (Throwable) -> Unit = {},
+    private val onStopped: () -> Unit = {},
     private val sleeper: (Long) -> Unit = { Thread.sleep(it) }
 ) {
     private val running = AtomicBoolean(false)
@@ -18,7 +19,11 @@ class TelemetryPoller(
 
     fun isRunning(): Boolean = running.get()
 
+    fun isStopping(): Boolean = !running.get() && worker?.isAlive == true
+
+    @Synchronized
     fun start(sessionId: Long): Boolean {
+        if (worker?.isAlive == true) return false
         if (!running.compareAndSet(false, true)) return false
         //names the thread for live top/thread-dump diagnosis on the car tablet
         worker = Thread({ loop(sessionId) }, "bydcollector-telemetry-poller").apply {
@@ -32,6 +37,7 @@ class TelemetryPoller(
         stopAndJoin(0L)
     }
 
+    @Synchronized
     fun stopAndJoin(timeoutMs: Long): Boolean {
         running.set(false)
         val currentWorker = worker
@@ -45,33 +51,39 @@ class TelemetryPoller(
     }
 
     private fun loop(sessionId: Long) {
-        while (running.get()) {
-            val startedAt = clock.elapsedRealtimeMs()
-            try {
-                coordinator.pollOnce(sessionId)?.takeUnless { it.deferred }?.let(onCycleResult)
-            } catch (_: InterruptedException) {
-                running.set(false)
-            } catch (error: Exception) {
-                //continues polling after one bad cycle because vehicle access can be transiently unavailable
-                runCatching { onRuntimeError(error) }
-                runCatching {
-                    onCycleResult(PollCycleResult(
-                        null, ok = false, category = "poller_runtime_error", elapsedMs = 0, requestCount = 0,
-                        errorMessage = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
-                    ))
-                }
-            }
-
-            val elapsed = clock.elapsedRealtimeMs() - startedAt
-            val sleepMs = intervalMs - elapsed
-            //keeps the period close to intervalMs without overlapping poll cycles
-            if (running.get() && sleepMs > 0) {
+        try {
+            while (running.get()) {
+                val startedAt = clock.elapsedRealtimeMs()
                 try {
-                    sleeper(sleepMs)
-                } catch (_: InterruptedException) {
-                    running.set(false)
+                    coordinator.pollOnce(sessionId)?.let(onCycleResult)
+                } catch (error: Throwable) {
+                    if (error is InterruptedException || !running.get() || Thread.currentThread().isInterrupted) {
+                        running.set(false)
+                    } else {
+                        //continues polling after one bad cycle because vehicle access can be transiently unavailable
+                        runCatching { onRuntimeError(error) }
+                        runCatching {
+                            onCycleResult(PollCycleResult(
+                                null, ok = false, category = "poller_runtime_error", elapsedMs = 0, requestCount = 0,
+                                errorMessage = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                            ))
+                        }
+                    }
+                }
+
+                val elapsed = clock.elapsedRealtimeMs() - startedAt
+                val sleepMs = intervalMs - elapsed
+                //keeps the period close to intervalMs without overlapping poll cycles
+                if (running.get() && sleepMs > 0) {
+                    try {
+                        sleeper(sleepMs)
+                    } catch (_: InterruptedException) {
+                        running.set(false)
+                    }
                 }
             }
+        } finally {
+            runCatching(onStopped)
         }
     }
 

@@ -19,6 +19,7 @@ internal object StorageBehaviorGate {
     fun cases(context: Context, prefix: String): List<Pair<String, () -> Unit>> = listOf(
         "main_worker_import_rollback_and_reopen" to { workerImport(context, prefix) },
         "diagnostic_event_does_not_wait_for_sqlite" to { eventDuringWriteLock(context, prefix) },
+        "diagnostic_close_serializes_active_and_queued_writers" to { diagnosticClose(context, prefix) },
         "trip_completion_atomic_close_and_exact_ack" to { tripCompletion(context, prefix) },
         "telegram_atomic_outbox_state_and_delivery" to { telegramTransactions(context, prefix) }
     )
@@ -84,6 +85,108 @@ internal object StorageBehaviorGate {
             awaitEventWriter()
             check(count(db, "collector_events") == 1L)
         }
+    }
+
+    private fun diagnosticClose(context: Context, prefix: String) {
+        val name = "${prefix}_diagnostic_close.db"
+        val journal = journal(context, "${prefix}_diagnostic_close")
+        val helper = TelemetryDatabaseHelper(context, name)
+        val store = TelemetryStore(context, helper, operationalEventJournal = journal)
+        val db = helper.writableDatabase
+        val closeStarted = CountDownLatch(1)
+        val closeReturned = CountDownLatch(1)
+        val closeFailure = AtomicReference<Throwable?>()
+        var transactionOpen = false
+        var closer: Thread? = null
+        var monitorProbe: Thread? = null
+        try {
+            db.beginTransaction()
+            transactionOpen = true
+            store.recordEvent("diagnostic_close_active", "active writer", "active detail")
+            // The async event writer holds the store monitor while SQLite is blocked;
+            // closing must wait for that committed write, not close the helper under it.
+            val activeWriterProbe = awaitStoreMonitorContention(store, 5_000L)
+            monitorProbe = activeWriterProbe
+            val closeThread = thread(name = "diagnostic-store-close") {
+                closeStarted.countDown()
+                try { store.close() }
+                catch (error: Throwable) { closeFailure.set(error) }
+                finally { closeReturned.countDown() }
+            }
+            closer = closeThread
+            check(closeStarted.await(1, TimeUnit.SECONDS)) { "Store closer did not start" }
+            check(!closeReturned.await(100, TimeUnit.MILLISECONDS)) {
+                "Store closed while an event writer held its monitor"
+            }
+            db.endTransaction()
+            transactionOpen = false
+            check(closeReturned.await(5, TimeUnit.SECONDS)) { "Store close did not finish after event writer" }
+            closeThread.join(5_000)
+            activeWriterProbe.join(5_000)
+            check(!closeThread.isAlive && !activeWriterProbe.isAlive) { "Store close or monitor probe did not finish" }
+            check(closeFailure.get() == null) { "Store close failed: ${closeFailure.get()}" }
+            awaitEventWriter()
+            val reopened = TelemetryDatabaseHelper(context, name)
+            try {
+                val detail = reopened.readableDatabase.rawQuery(
+                    "SELECT detail FROM collector_events WHERE category = ?",
+                    arrayOf("diagnostic_close_active")
+                ).use { cursor -> check(cursor.moveToFirst()); cursor.getString(0) }
+                check(detail == "active detail") { "Active event writer was not persisted before close" }
+            } finally { reopened.close() }
+            val snapshot = File(context.cacheDir, "${prefix}_diagnostic_close_snapshot")
+            check(journal.snapshotTo(snapshot) > 0)
+            check(snapshot.listFiles().orEmpty().any { it.readText().contains("active detail") })
+        } finally {
+            if (transactionOpen) runCatching { db.endTransaction() }
+            closer?.join(5_000)
+            monitorProbe?.join(5_000)
+            runCatching { store.close() }
+        }
+
+        val queuedName = "${prefix}_diagnostic_queued_close.db"
+        val queuedJournal = journal(context, "${prefix}_diagnostic_queued_close")
+        val queuedHelper = TelemetryDatabaseHelper(context, queuedName)
+        val queuedStore = TelemetryStore(context, queuedHelper, operationalEventJournal = queuedJournal)
+        queuedHelper.writableDatabase
+        // Hold the exact monitor used by event SQL so close wins before this queued write.
+        synchronized(queuedStore) {
+            queuedStore.recordEvent("diagnostic_close_queued", "queued after close", "journal only")
+            queuedStore.close()
+        }
+        awaitEventWriter()
+        val reopenedQueued = TelemetryDatabaseHelper(context, queuedName)
+        try {
+            check(count(reopenedQueued.readableDatabase, "collector_events") == 0L) {
+                "Queued event SQL reopened or mutated the archived database"
+            }
+            val snapshot = File(context.cacheDir, "${prefix}_diagnostic_queued_snapshot")
+            check(queuedJournal.snapshotTo(snapshot) > 0)
+            check(snapshot.listFiles().orEmpty().any { it.readText().contains("journal only") }) {
+                "Synchronous diagnostic journal did not retain the event"
+            }
+        } finally { reopenedQueued.close() }
+    }
+
+    private fun awaitStoreMonitorContention(store: TelemetryStore, timeoutMs: Long): Thread {
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        while (System.nanoTime() < deadline) {
+            val attempted = CountDownLatch(1)
+            val acquired = CountDownLatch(1)
+            val probe = thread(name = "diagnostic-store-monitor-probe", isDaemon = true) {
+                attempted.countDown()
+                synchronized(store) { Unit }
+                acquired.countDown()
+            }
+            check(attempted.await(1, TimeUnit.SECONDS)) { "Store monitor probe did not start" }
+            while (probe.isAlive && System.nanoTime() < deadline) {
+                if (probe.state == Thread.State.BLOCKED) return probe
+                if (acquired.count == 0L) break
+                Thread.yield()
+            }
+            probe.join(20)
+        }
+        error("Event SQL writer did not hold the store monitor while SQLite was locked")
     }
 
     private fun tripCompletion(context: Context, prefix: String) {

@@ -10,6 +10,32 @@ import com.bydcollector.collector.telegram.TelegramNavigatorMask
 /** Exercises the production settings facade against isolated Android preferences. */
 internal object SettingsBehaviorGate {
     fun cases(context: Context, prefix: String): List<Pair<String, () -> Unit>> = listOf(
+        "settings_process_death_and_boot_policy" to {
+            isolated(context, prefix) { scoped ->
+                val settings = CollectorSettings(scoped)
+                for (autoMain in listOf(false, true)) for (autoSecondary in listOf(false, true)) {
+                    for (stopMain in listOf(false, true)) for (stopSecondary in listOf(false, true)) {
+                        settings.setUserShutdownRequested(false)
+                        settings.setAutoStartEnabled(autoMain)
+                        settings.setDebugAutoStartEnabled(autoSecondary)
+                        settings.setMainManuallyStopped(stopMain)
+                        settings.setDebugManuallyStopped(stopSecondary)
+                        settings.setPollingEnabled(true)
+                        settings.setDebugPollingEnabled(true)
+                        settings.clearRuntimeManualStops(includeCollection = false)
+                        CollectorSettings.resetCollectionAfterProcessDeath(scoped)
+                        val reopened = CollectorSettings(scoped)
+                        check(reopened.isPollingEnabled() == (autoMain && !stopMain))
+                        check(reopened.isDebugPollingEnabled() == (autoSecondary && !stopSecondary))
+                        check(reopened.isMainManuallyStopped() == stopMain)
+                        check(reopened.isDebugManuallyStopped() == stopSecondary)
+                    }
+                }
+                settings.setUserShutdownRequested(true)
+                CollectorSettings.resetCollectionAfterProcessDeath(scoped)
+                check(!settings.isPollingEnabled() && !settings.isDebugPollingEnabled())
+            }
+        },
         "settings_independent_collection_matrix" to {
             isolated(context, prefix) { scoped ->
                 val settings = CollectorSettings(scoped)

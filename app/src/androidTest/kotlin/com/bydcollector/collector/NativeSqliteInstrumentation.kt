@@ -18,6 +18,9 @@ import com.bydcollector.collector.data.local.PollReading
 import com.bydcollector.collector.data.normalized.NormalizedFieldCatalog
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.data.normalized.NormalizedQuality
+import com.bydcollector.collector.data.normalized.NormalizedSourceKind
+import com.bydcollector.collector.data.normalized.NormalizedSourceStamp
+import com.bydcollector.collector.data.normalized.SourceOrderedApplyResult
 import com.bydcollector.collector.data.normalized.NormalizedValue
 import com.bydcollector.collector.data.normalized.NormalizedValueType
 import com.bydcollector.collector.data.normalized.VehicleStateNormalizer
@@ -318,6 +321,13 @@ class NativeSqliteInstrumentation : Instrumentation() {
         val baseWall = 1_790_000_000_000L
         val normalizer = VehicleStateNormalizer()
         val key = "speed_1013_-1807745016_7"
+        fun assertAppliedSource(stamp: NormalizedSourceStamp?, kind: NormalizedSourceKind, elapsed: Long) {
+            check(stamp?.let {
+                it.kind == kind && it.bootId == "source_boot" && it.elapsedMs == elapsed &&
+                    it.wallMs == baseWall + elapsed
+            } == true)
+        }
+        fun assertNoAppliedSource(stamp: NormalizedSourceStamp?) = check(stamp == null)
         fun rawBatch(sequence: Long, elapsed: Long, speed: Float) = TelemetryCallbackBatch(
             "source_boot", "source_helper", 1, 1, sequence,
             listOf(TelemetryCallbackBatch.Event(sequence, 1013, -1807745016,
@@ -340,29 +350,40 @@ class NativeSqliteInstrumentation : Instrumentation() {
             check(count(db, "raw_callback_normalization_receipts") == 0L)
             check(count(db, "raw_callback_events") == 1L)
             db.execSQL("DROP TRIGGER gate_fail_order")
-            check(store.normalizePendingCallbackPage(normalizer).processedCount == 1)
+            val initialCallback = store.normalizePendingCallbackPage(normalizer)
+            check(initialCallback.processedCount == 1)
+            assertAppliedSource(initialCallback.latestAppliedSource, NormalizedSourceKind.CALLBACK, 5_000)
             check(text(db, "SELECT value_number FROM vehicle_state_current WHERE field_key='speed_kmh'").toDouble() == 40.0)
-            check(store.normalizePendingCallbackPage(normalizer).processedCount == 0)
+            val emptyCallbackPage = store.normalizePendingCallbackPage(normalizer)
+            check(emptyCallbackPage.processedCount == 0)
+            assertNoAppliedSource(emptyCallbackPage.latestAppliedSource)
 
             val session = store.openSession("source_order_gate")
             val parameters = store.getActiveCatalogParameters()
-            fun poll(elapsed: Long, value: Float) {
+            fun poll(elapsed: Long, value: Float): SourceOrderedApplyResult {
                 val timestamp = java.time.Instant.ofEpochMilli(baseWall + elapsed).toString()
                 val readings = listOf(PollReading(key, value.toRawBits().toString(), value.toString()))
                 val id = store.insertPoll(session, PersistedPollInput(timestamp, true, 0, 1, null,
                     rawResponseBody = null, readings = readings), parameters)
-                store.applySourcePollNormalization(id, timestamp,
+                return store.applySourcePollNormalization(id, timestamp,
                     PollSampleSource("live:$elapsed", "source_boot", elapsed, "app_generator", elapsed), readings, normalizer)
             }
-            poll(3_000, 10f)
+            val olderPoll = poll(3_000, 10f)
+            assertNoAppliedSource(olderPoll.latestAppliedSource)
             check(text(db, "SELECT value_number FROM vehicle_state_current WHERE field_key='speed_kmh'").toDouble() == 40.0)
-            poll(6_000, 45f)
+            val acceptedPoll = poll(6_000, 45f)
+            assertAppliedSource(acceptedPoll.latestAppliedSource, NormalizedSourceKind.POLL, 6_000)
             check(text(db, "SELECT value_number FROM vehicle_state_current WHERE field_key='speed_kmh'").toDouble() == 45.0)
+            val equalPollReplay = poll(6_000, 45f)
+            assertNoAppliedSource(equalPollReplay.latestAppliedSource)
             import(store, rawBatch(2, 4_000, 20f))
-            check(store.normalizePendingCallbackPage(normalizer).processedCount == 1)
+            val olderCallback = store.normalizePendingCallbackPage(normalizer)
+            check(olderCallback.processedCount == 1)
+            assertNoAppliedSource(olderCallback.latestAppliedSource)
             check(text(db, "SELECT value_number FROM vehicle_state_current WHERE field_key='speed_kmh'").toDouble() == 45.0)
             import(store, rawBatch(3, 7_000, 50f))
-            store.normalizePendingCallbackPage(normalizer)
+            val acceptedCallback = store.normalizePendingCallbackPage(normalizer)
+            assertAppliedSource(acceptedCallback.latestAppliedSource, NormalizedSourceKind.CALLBACK, 7_000)
             check(text(db, "SELECT value_number FROM vehicle_state_current WHERE field_key='speed_kmh'").toDouble() == 50.0)
             check(count(db, "raw_callback_normalization_receipts") == 3L)
             check(count(db, "normalized_source_inputs") == 1L)
@@ -370,7 +391,9 @@ class NativeSqliteInstrumentation : Instrumentation() {
         val reopened = TelemetryDatabaseHelper(targetContext, name)
         TelemetryStore(targetContext, reopened, operationalEventJournal = OperationalEventJournal(targetContext)).use { store ->
             import(store, rawBatch(4, 2_000, 70f))
-            check(store.normalizePendingCallbackPage(normalizer).processedCount == 1)
+            val oldAfterReopen = store.normalizePendingCallbackPage(normalizer)
+            check(oldAfterReopen.processedCount == 1)
+            assertNoAppliedSource(oldAfterReopen.latestAppliedSource)
             check(text(reopened.readableDatabase, "SELECT value_number FROM vehicle_state_current WHERE field_key='speed_kmh'").toDouble() == 50.0)
             check(count(reopened.readableDatabase, "raw_callback_normalization_receipts") == 4L)
             check(count(reopened.readableDatabase, "raw_callback_events") == 4L)
