@@ -2,6 +2,7 @@ package com.bydcollector.collector.direct
 
 import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
 import com.bydcollector.collector.data.direct.DirectHelperStopResult
+import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -9,6 +10,22 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class TelemetryWorkerBinderContractTest {
+    @Test
+    fun oldHelperIsNotReadyButItsVerifiedOwnerCanBeStopped() {
+        for (protocol in 13..CollectorHelperProtocol.PROTOCOL_VERSION) {
+            for (owner in DirectHelperOwnerMode.entries) {
+                assertEquals(owner, DirectVehicleHelperClient.ownerFromPing(0, protocol, owner.protocolValue, true))
+                assertEquals(if (protocol == CollectorHelperProtocol.PROTOCOL_VERSION) owner else null,
+                    DirectVehicleHelperClient.ownerFromPing(0, protocol, owner.protocolValue, false))
+            }
+        }
+        for (protocol in listOf(0, 12, CollectorHelperProtocol.PROTOCOL_VERSION + 1)) {
+            assertNull(DirectVehicleHelperClient.ownerFromPing(0, protocol, 0, true))
+        }
+        assertNull(DirectVehicleHelperClient.ownerFromPing(-1, 13, 0, true))
+        assertNull(DirectVehicleHelperClient.ownerFromPing(0, 13, -1, true))
+    }
+
     @Test
     fun unknownOwnerCannotBecomeAnAppOrSpoolOwner() {
         assertEquals(DirectHelperOwnerMode.APP,

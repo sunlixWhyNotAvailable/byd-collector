@@ -50,7 +50,6 @@ object DirectBridgeManager {
             if (helperAlive && !replacementPending) {
                 return DirectBridgeResult(ok = true, message = "Direct helper already running")
             }
-            val actualOwnerMode = if (helperAlive && replacementPending) helper.ownerMode() else null
             fun execShell(command: String, timeoutMs: Int): AdbShellResult =
                 shellRunner?.invoke(command, timeoutMs)
                     ?: adbClient.execShell(command, timeoutMs = timeoutMs)
@@ -62,6 +61,8 @@ object DirectBridgeManager {
                 if (updateTime == null) {
                     return DirectBridgeResult(false, "Installed package update time is unavailable")
                 }
+                // Read the stable lifecycle handshake even when old telemetry protocol fails isAlive().
+                val actualOwnerMode = helper.ownerModeForStop()
                 if (actualOwnerMode != null) {
                     val stop = helper.requestStop(actualOwnerMode)
                     if (!stop.ok) {
@@ -103,7 +104,7 @@ object DirectBridgeManager {
                 if (helper.isAlive()) {
                     if (replacementPending) {
                         if (!settings.helperReplacementAllowed()) {
-                            helper.ownerMode()?.let(helper::requestStop)
+                            helper.ownerModeForStop()?.let(helper::requestStop)
                             return DirectBridgeResult(false, "Helper replacement interrupted by Shutdown or stopped collection")
                         }
                         if (!settings.confirmHelperReplacement(updateTime!!)) {

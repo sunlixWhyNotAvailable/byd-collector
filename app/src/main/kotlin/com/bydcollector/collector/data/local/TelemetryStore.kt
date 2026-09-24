@@ -2074,6 +2074,7 @@ class TelemetryStore(
             null -> putNull(key)
             is String -> put(key, value)
             is Long -> put(key, value)
+            is Double -> put(key, value)
             else -> error("Unsupported nullable ContentValues type for $key: ${value::class.java.name}")
         }
     }

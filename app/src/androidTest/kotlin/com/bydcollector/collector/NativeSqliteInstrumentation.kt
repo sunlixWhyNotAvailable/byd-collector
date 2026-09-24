@@ -31,6 +31,7 @@ import com.bydcollector.collector.diagnostics.OperationalEventJournal
 import com.bydcollector.collector.direct.SecondaryTelemetrySpool
 import com.bydcollector.collector.direct.TelemetryCallbackBatch
 import com.bydcollector.collector.direct.CallbackParcelGate
+import com.bydcollector.collector.direct.WorkerReplayParcelGate
 import com.bydcollector.collector.direct.CallbackValueSource
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -46,6 +47,7 @@ class NativeSqliteInstrumentation : Instrumentation() {
     private var shutdownShellFixture = false
     private var shutdownLifecycleFixture = false
     private var fixtureLanguage = "uk"
+    private var workerReplayFixture: String? = null
 
     override fun onCreate(arguments: Bundle?) {
         super.onCreate(arguments)
@@ -55,12 +57,23 @@ class NativeSqliteInstrumentation : Instrumentation() {
         shutdownShellFixture = arguments?.getString("shutdownShellFixture") == "true"
         shutdownLifecycleFixture = arguments?.getString("shutdownLifecycleFixture") == "true"
         fixtureLanguage = arguments?.getString("language") ?: "uk"
+        workerReplayFixture = arguments?.getString("workerReplayFixture")
         start()
     }
 
     override fun onStart() {
         if (!isEmulator()) {
             finish(Activity.RESULT_CANCELED, Bundle().apply { putString("stream", "Tests require an emulator") })
+            return
+        }
+        workerReplayFixture?.let { path ->
+            val result = runCatching {
+                try {
+                    WorkerReplayParcelGate.run(File(targetContext.cacheDir, "${prefix}_worker_replay"), File(path))
+                } finally { cleanupTestFiles() }
+            }
+            finish(if (result.isSuccess) Activity.RESULT_OK else Activity.RESULT_CANCELED,
+                Bundle().apply { putString("stream", result.getOrElse { it.stackTraceToString() }) })
             return
         }
         if (hintFixture || shutdownShellFixture || shutdownLifecycleFixture) {
@@ -123,6 +136,9 @@ class NativeSqliteInstrumentation : Instrumentation() {
             "deferred_energy_survives_reopen" to ::deferredEnergySurvivesReopen,
             "callback_android_parcel_paging_ack" to {
                 CallbackParcelGate.run(File(targetContext.cacheDir, "${prefix}_parcel"))
+            },
+            "legacy_worker_android_parcel_paging" to {
+                WorkerReplayParcelGate.run(File(targetContext.cacheDir, "${prefix}_worker_replay"), null)
             }
         )
         var failure: Throwable? = null

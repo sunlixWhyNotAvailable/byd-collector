@@ -631,7 +631,7 @@ public final class CollectorHelperDaemon {
         return error.substring(0, 512);
     }
 
-    private static void writeWorkerPendingReply(
+    static void writeWorkerPendingReply(
             Parcel reply,
             int status,
             String error,
@@ -639,8 +639,11 @@ public final class CollectorHelperDaemon {
     ) {
         reply.writeInt(status);
         reply.writeString(error);
-        reply.writeInt(samples.size());
+        int countPosition = reply.dataPosition();
+        reply.writeInt(0);
+        int written = 0;
         for (TelemetryWorkerSpool.Sample sample : samples) {
+            int samplePosition = reply.dataPosition();
             reply.writeString(sample.identity.bootId);
             reply.writeString(sample.identity.helperGeneration);
             reply.writeLong(sample.identity.pollSequence);
@@ -665,7 +668,26 @@ public final class CollectorHelperDaemon {
                 reply.writeString(value.error);
                 CallbackValueSource.writeNullable(reply, value.callbackSource);
             }
+            if (reply.dataSize() > SecondarySpoolBinder.MAX_REPLY_BYTES) {
+                reply.setDataSize(samplePosition);
+                reply.setDataPosition(samplePosition);
+                if (written == 0) {
+                    // Keep the durable record unacknowledged; never truncate raw/provenance.
+                    reply.setDataSize(0);
+                    reply.setDataPosition(0);
+                    reply.writeInt(CollectorHelperProtocol.STATUS_SPOOL_UNAVAILABLE);
+                    reply.writeString("Worker sample exceeds bounded Binder reply; record retained");
+                    reply.writeInt(0);
+                    return;
+                }
+                break;
+            }
+            written++;
         }
+        int endPosition = reply.dataPosition();
+        reply.setDataPosition(countPosition);
+        reply.writeInt(written);
+        reply.setDataPosition(endPosition);
     }
 
     private static void writeWorkerAckReply(Parcel reply, int status, int updated, String error) {

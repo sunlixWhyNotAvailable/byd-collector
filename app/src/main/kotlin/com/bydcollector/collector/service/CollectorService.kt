@@ -2078,7 +2078,7 @@ class CollectorService : Service() {
 
     private fun requestCurrentHelperOwnerStop(): Boolean {
         val helper = DirectVehicleHelperClient()
-        val ownerMode = helper.ownerMode() ?: return false
+        val ownerMode = helper.ownerModeForStop() ?: return false
         val result = helper.requestStop(ownerMode)
         runCatching {
             store.recordEvent(

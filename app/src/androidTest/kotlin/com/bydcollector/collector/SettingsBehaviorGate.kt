@@ -148,6 +148,11 @@ internal object SettingsBehaviorGate {
                 runHelperReplacementSequence(scoped, failLaunch = false, collectionDemand = true)
             }
         },
+        "helper_update_incompatible_protocol_is_stopped_before_replacement" to {
+            isolated(context, prefix) { scoped ->
+                runHelperReplacementSequence(scoped, failLaunch = false, collectionDemand = true, incompatible = true)
+            }
+        },
         "helper_update_replacement_failure_and_no_demand_remain_pending" to {
             isolated(context, prefix) { scoped ->
                 runHelperReplacementSequence(scoped, failLaunch = true, collectionDemand = true)
@@ -216,7 +221,7 @@ internal object SettingsBehaviorGate {
         }
     }
 
-    private fun runHelperReplacementSequence(context: Context, failLaunch: Boolean, collectionDemand: Boolean) {
+    private fun runHelperReplacementSequence(context: Context, failLaunch: Boolean, collectionDemand: Boolean, incompatible: Boolean = false) {
         @Suppress("DEPRECATION")
         val updateTime = context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime
         check(updateTime > 0L) { "installed package update timestamp is unavailable" }
@@ -225,7 +230,7 @@ internal object SettingsBehaviorGate {
         check(settings.markHelperReplacementPending())
 
         val events = mutableListOf<String>()
-        val helper = ReplacementSequenceHelper(events)
+        val helper = ReplacementSequenceHelper(events, incompatible)
         val result = DirectBridgeManager.ensureRunning(
             context = context,
             adbClient = AdbLocalClient(File(context.filesDir, "unused_helper_update_test_keys")),
@@ -239,7 +244,7 @@ internal object SettingsBehaviorGate {
                     }
                     command.contains("setsid app_process") -> {
                         events += "launch"
-                        if (!failLaunch) helper.alive = true
+                        if (!failLaunch) { helper.alive = true; helper.incompatible = false }
                         AdbShellResult(
                             ok = !failLaunch,
                             output = "",
@@ -275,17 +280,19 @@ internal object SettingsBehaviorGate {
         }
     }
 
-    private class ReplacementSequenceHelper(private val events: MutableList<String>) : DirectVehicleHelper {
+    private class ReplacementSequenceHelper(private val events: MutableList<String>, var incompatible: Boolean) : DirectVehicleHelper {
         var alive = true
         var stopMode: DirectHelperOwnerMode? = null
         private var pingCount = 0
 
         override fun isAlive(): Boolean {
             events += if (pingCount++ == 0) "initial_ping" else "launch_ping"
-            return alive
+            return alive && !incompatible
         }
 
-        override fun ownerMode(): DirectHelperOwnerMode? = if (alive) DirectHelperOwnerMode.APP_GAP_SPOOL else null
+        override fun ownerMode(): DirectHelperOwnerMode? = if (alive && !incompatible) DirectHelperOwnerMode.APP_GAP_SPOOL else null
+
+        override fun ownerModeForStop(): DirectHelperOwnerMode? = if (alive) DirectHelperOwnerMode.APP_GAP_SPOOL else null
 
         override fun requestStop(ownerMode: DirectHelperOwnerMode): DirectHelperStopResult {
             events += "stop"

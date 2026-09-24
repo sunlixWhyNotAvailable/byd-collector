@@ -25,7 +25,11 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
 
     override fun isAlive(): Boolean = ownerMode() != null
 
-    override fun ownerMode(): DirectHelperOwnerMode? = synchronized(lock) {
+    override fun ownerMode(): DirectHelperOwnerMode? = readOwnerMode(stopOnly = false)
+
+    override fun ownerModeForStop(): DirectHelperOwnerMode? = readOwnerMode(stopOnly = true)
+
+    private fun readOwnerMode(stopOnly: Boolean): DirectHelperOwnerMode? = synchronized(lock) {
         val binder = ensureBinder() ?: return@synchronized null
         val data = Parcel.obtain()
         val reply = Parcel.obtain()
@@ -35,13 +39,11 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                 cached = null
                 return@synchronized null
             }
+            if (reply.dataAvail() < 12) return@synchronized null
             val status = reply.readInt()
             val protocolVersion = reply.readInt()
             val ownerMode = reply.readInt()
-            if (status != CollectorHelperProtocol.STATUS_OK || protocolVersion != CollectorHelperProtocol.PROTOCOL_VERSION) {
-                return@synchronized null
-            }
-            DirectHelperOwnerMode.fromProtocolValue(ownerMode)
+            ownerFromPing(status, protocolVersion, ownerMode, stopOnly)
         } catch (_: Exception) {
             cached = null
             null
@@ -790,6 +792,13 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
     }
 
     companion object {
+        internal fun ownerFromPing(status: Int, protocol: Int, mode: Int, stopOnly: Boolean): DirectHelperOwnerMode? {
+            val supported = if (stopOnly) {
+                protocol in CollectorHelperProtocol.MIN_STOP_PROTOCOL_VERSION..CollectorHelperProtocol.PROTOCOL_VERSION
+            } else protocol == CollectorHelperProtocol.PROTOCOL_VERSION
+            return if (status == CollectorHelperProtocol.STATUS_OK && supported) DirectHelperOwnerMode.fromProtocolValue(mode) else null
+        }
+
         private const val TAG = "BYDCollectorHelper"
         private const val STATUS_NO_BINDER = -900
         private const val STATUS_TRANSACT_FALSE = -901
