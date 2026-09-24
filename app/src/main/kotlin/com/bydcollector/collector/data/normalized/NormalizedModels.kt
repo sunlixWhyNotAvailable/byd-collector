@@ -125,7 +125,11 @@ enum class NormalizedSourceOrder {
 }
 
 object NormalizedSourceOrdering {
-    fun compare(incoming: NormalizedSourceStamp, previous: NormalizedSourceStamp): NormalizedSourceOrder {
+    fun compare(
+        incoming: NormalizedSourceStamp,
+        previous: NormalizedSourceStamp,
+        currentBootId: String? = null
+    ): NormalizedSourceOrder {
         if (incoming.identity == previous.identity) return NormalizedSourceOrder.EQUAL
         if (incoming.bootId == previous.bootId) {
             compareLong(incoming.elapsedMs, previous.elapsedMs)?.let { return it }
@@ -136,6 +140,10 @@ object NormalizedSourceOrdering {
             }
             compareLong(incoming.wallMs, previous.wallMs)?.let { return it }
             return NormalizedSourceOrder.INCOMPARABLE
+        }
+        if (!currentBootId.isNullOrBlank()) {
+            if (incoming.bootId == currentBootId) return NormalizedSourceOrder.NEWER
+            if (previous.bootId == currentBootId) return NormalizedSourceOrder.OLDER
         }
         return compareLong(incoming.wallMs, previous.wallMs)
             ?: NormalizedSourceOrder.INCOMPARABLE

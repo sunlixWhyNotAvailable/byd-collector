@@ -1,6 +1,10 @@
 package com.bydcollector.collector.direct;
 
 import android.os.Parcel;
+import java.util.ArrayDeque;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLongArray;
 
 /** Paged callback transport; daemon ownership checks run before dispatch here. */
@@ -8,18 +12,38 @@ public final class CallbackSpoolBinder implements AutoCloseable {
     public static final int MAX_REPLY_BYTES = 256 * 1024;
     private final CallbackSpool main;
     private final CallbackSpool secondary;
-    private final LiveRecord[] live = new LiveRecord[3];
+    @SuppressWarnings("unchecked")
+    private final ArrayDeque<LiveRecord>[] live = new ArrayDeque[] {
+        new ArrayDeque<>(), new ArrayDeque<>(), new ArrayDeque<>()
+    };
     private final AtomicLongArray retainedLiveBytes = new AtomicLongArray(3);
     private final Object[] streamLocks = { null, new Object(), new Object() };
+    private final ScheduledExecutorService ageFlush = Executors.newSingleThreadScheduledExecutor(task -> {
+        Thread thread = new Thread(task, "byd-callback-memory-flush");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private volatile boolean closed;
 
     CallbackSpoolBinder() {
         main = CallbackSpool.openMain();
         secondary = CallbackSpool.openSecondary();
+        startAgeFlush();
     }
 
     CallbackSpoolBinder(CallbackSpool main, CallbackSpool secondary) {
         if (main == null || secondary == null) throw new IllegalArgumentException("callback spools are required");
         this.main = main; this.secondary = secondary;
+        startAgeFlush();
+    }
+
+    private void startAgeFlush() {
+        ageFlush.scheduleWithFixedDelay(() -> {
+            if (closed) return;
+            try {
+                for (int stream = 1; stream <= 2; stream++) spillExpired(stream, System.nanoTime() / 1_000_000L);
+            } catch (Exception ignored) { /* Retained data remains available for the next retry or shutdown spill. */ }
+        }, 1L, 1L, TimeUnit.SECONDS);
     }
 
     CallbackSpool spool(int stream) {
@@ -38,20 +62,24 @@ public final class CallbackSpoolBinder implements AutoCloseable {
     private CallbackSpool.AppendResult deliverLocked(TelemetryCallbackBatch batch, boolean appOwnsStream) {
         try {
             CallbackSpool target = spool(batch.stream);
-            if (live[batch.stream] != null) {
-                CallbackSpool.AppendResult spilled = spill(batch.stream);
+            long now = System.nanoTime() / 1_000_000L;
+            if (appOwnsStream && target.oldest() == null &&
+                (live[batch.stream].isEmpty() || now - live[batch.stream].peekFirst().enqueuedAtMs < MAX_LIVE_AGE_MS)) {
+                byte[] bytes = batch.encode();
+                if (retainedLiveBytes.get(batch.stream) + bytes.length <= MAX_LIVE_BYTES) {
+                    live[batch.stream].addLast(new LiveRecord(bytes, memoryDescriptor(batch, bytes), now));
+                    retainedLiveBytes.addAndGet(batch.stream, bytes.length);
+                    return CallbackSpool.AppendResult.SUCCESS;
+                }
+            }
+            while (!live[batch.stream].isEmpty()) {
+                CallbackSpool.AppendResult spilled = spillLocked(batch.stream);
                 if (spilled != CallbackSpool.AppendResult.SUCCESS && spilled != CallbackSpool.AppendResult.DUPLICATE) {
                     TelemetryCallbackBatch.Event first = batch.events.get(0);
                     TelemetryCallbackBatch.Event last = batch.events.get(batch.events.size() - 1);
                     target.recordLoss(batch.events.size(), first.receivedWallMs, last.receivedWallMs, "blocked_behind_live");
                     return CallbackSpool.AppendResult.REJECTED;
                 }
-            }
-            if (appOwnsStream && live[batch.stream] == null && target.oldest() == null) {
-                byte[] bytes = batch.encode();
-                live[batch.stream] = new LiveRecord(bytes, memoryDescriptor(batch, bytes));
-                retainedLiveBytes.set(batch.stream, bytes.length);
-                return CallbackSpool.AppendResult.SUCCESS;
             }
             return target.append(batch);
         } catch (Exception error) {
@@ -71,16 +99,27 @@ public final class CallbackSpoolBinder implements AutoCloseable {
     }
 
     private CallbackSpool.AppendResult spillLocked(int stream) {
-        if (live[stream] == null) return CallbackSpool.AppendResult.SUCCESS;
+        LiveRecord retained = live[stream].peekFirst();
+        if (retained == null) return CallbackSpool.AppendResult.SUCCESS;
         TelemetryCallbackBatch batch;
-        try { batch = TelemetryCallbackBatch.decode(live[stream].bytes); }
+        try { batch = TelemetryCallbackBatch.decode(retained.bytes); }
         catch (Exception error) { return CallbackSpool.AppendResult.REJECTED; }
         CallbackSpool.AppendResult result = spool(stream).appendRetained(batch);
         if (result == CallbackSpool.AppendResult.SUCCESS || result == CallbackSpool.AppendResult.DUPLICATE) {
-            live[stream] = null;
-            retainedLiveBytes.set(stream, 0L);
+            live[stream].removeFirst();
+            retainedLiveBytes.addAndGet(stream, -retained.bytes.length);
         }
         return result;
+    }
+
+    void spillExpired(int stream, long nowMs) {
+        synchronized (streamLock(stream)) {
+            if (closed) return;
+            while (!live[stream].isEmpty() && nowMs - live[stream].peekFirst().enqueuedAtMs >= MAX_LIVE_AGE_MS) {
+                CallbackSpool.AppendResult result = spillLocked(stream);
+                if (result != CallbackSpool.AppendResult.SUCCESS && result != CallbackSpool.AppendResult.DUPLICATE) break;
+            }
+        }
     }
 
     long liveRetainedBytes(int stream) {
@@ -156,10 +195,11 @@ public final class CallbackSpoolBinder implements AutoCloseable {
                 CallbackSpool.Status status = spool.status();
                 reply.writeInt(CollectorHelperProtocol.STATUS_OK);
                 reply.writeLong(status.footprintBytes);
-                reply.writeInt(status.readyBatches + (live[stream] == null ? 0 : 1));
+                reply.writeInt(status.readyBatches + live[stream].size());
                 reply.writeInt(status.quarantinedFiles);
                 writeLoss(reply, status.loss);
                 reply.writeString(null);
+                reply.writeLong(retainedLiveBytes.get(stream));
                 return true;
             }
             CallbackSpool.Descriptor descriptor = readDescriptor(data);
@@ -171,9 +211,12 @@ public final class CallbackSpoolBinder implements AutoCloseable {
                 int limit = data.readInt();
                 if (offset < 0 || limit < 1 || limit > CallbackSpool.MAX_SLICE_BYTES ||
                     (descriptor == null && offset != 0L)) throw new IllegalArgumentException("invalid callback page");
-                if (descriptor == null) descriptor = live[stream] == null ? spool.oldest() : live[stream].descriptor;
+                if (descriptor == null) {
+                    descriptor = spool.oldest();
+                    if (descriptor == null && !live[stream].isEmpty()) descriptor = live[stream].peekFirst().descriptor;
+                }
                 byte[] bytes = descriptor == null ? new byte[0] : isLive(stream, descriptor)
-                    ? liveSlice(live[stream], offset, limit) : spool.readSlice(descriptor, offset, limit);
+                    ? liveSlice(live[stream].peekFirst(), offset, limit) : spool.readSlice(descriptor, offset, limit);
                 reply.writeInt(CollectorHelperProtocol.STATUS_OK);
                 reply.writeString(null);
                 writeDescriptor(reply, descriptor);
@@ -185,8 +228,8 @@ public final class CallbackSpoolBinder implements AutoCloseable {
                 if (descriptor == null) throw new IllegalArgumentException("callback descriptor required");
                 CallbackSpool.AckResult result;
                 if (isLive(stream, descriptor)) {
-                    live[stream] = null;
-                    retainedLiveBytes.set(stream, 0L);
+                    LiveRecord record = live[stream].removeFirst();
+                    retainedLiveBytes.addAndGet(stream, -record.bytes.length);
                     result = CallbackSpool.AckResult.RELEASED;
                 }
                 else result = spool.acknowledge(descriptor);
@@ -202,11 +245,11 @@ public final class CallbackSpoolBinder implements AutoCloseable {
                 if (reason == null || reason.isEmpty() || reason.length() > 512) throw new IllegalArgumentException("invalid callback quarantine reason");
                 int affected;
                 if (isLive(stream, descriptor)) {
-                    LiveRecord record = live[stream];
+                    LiveRecord record = live[stream].peekFirst();
                     TelemetryCallbackBatch batch = TelemetryCallbackBatch.decode(record.bytes);
                     spool.quarantineMemory(record.bytes, batch);
-                    live[stream] = null;
-                    retainedLiveBytes.set(stream, 0L);
+                    live[stream].removeFirst();
+                    retainedLiveBytes.addAndGet(stream, -record.bytes.length);
                     affected = 1;
                 } else affected = spool.quarantine(descriptor, reason);
                 reply.writeInt(CollectorHelperProtocol.STATUS_OK); reply.writeInt(affected); reply.writeString(null);
@@ -229,7 +272,7 @@ public final class CallbackSpoolBinder implements AutoCloseable {
             reply.writeInt(status); reply.writeInt(0); reply.writeString(error);
         } else {
             reply.writeInt(status); reply.writeLong(0L); reply.writeInt(0); reply.writeInt(0);
-            writeLoss(reply, null); reply.writeString(error);
+            writeLoss(reply, null); reply.writeString(error); reply.writeLong(0L);
         }
     }
 
@@ -265,7 +308,7 @@ public final class CallbackSpoolBinder implements AutoCloseable {
     }
 
     private boolean isLive(int stream, CallbackSpool.Descriptor descriptor) {
-        return live[stream] != null && live[stream].descriptor.equals(descriptor);
+        return !live[stream].isEmpty() && live[stream].peekFirst().descriptor.equals(descriptor);
     }
 
     private static byte[] liveSlice(LiveRecord record, long offset, int limit) {
@@ -280,11 +323,14 @@ public final class CallbackSpoolBinder implements AutoCloseable {
     }
 
     private static final class LiveRecord {
-        final byte[] bytes; final CallbackSpool.Descriptor descriptor;
-        LiveRecord(byte[] bytes, CallbackSpool.Descriptor descriptor) {
-            this.bytes = bytes; this.descriptor = descriptor;
+        final byte[] bytes; final CallbackSpool.Descriptor descriptor; final long enqueuedAtMs;
+        LiveRecord(byte[] bytes, CallbackSpool.Descriptor descriptor, long enqueuedAtMs) {
+            this.bytes = bytes; this.descriptor = descriptor; this.enqueuedAtMs = enqueuedAtMs;
         }
     }
+
+    private static final long MAX_LIVE_AGE_MS = 5_000L;
+    private static final long MAX_LIVE_BYTES = 12L * 1024L * 1024L;
 
     @Override public void close() {
         closeAndReport();
@@ -292,6 +338,8 @@ public final class CallbackSpoolBinder implements AutoCloseable {
 
     /** False reports a retained memory tail that could not be persisted before exit. */
     boolean closeAndReport() {
+        closed = true;
+        ageFlush.shutdown();
         boolean persisted = true;
         RuntimeException failure = null;
         for (int stream = 1; stream <= 2; stream++) {
@@ -308,16 +356,18 @@ public final class CallbackSpoolBinder implements AutoCloseable {
     }
 
     private boolean closeStream(int stream) {
-        LiveRecord retained = live[stream];
-        if (retained == null) return true;
-        CallbackSpool.AppendResult result = spill(stream);
-        if (result == CallbackSpool.AppendResult.SUCCESS || result == CallbackSpool.AppendResult.DUPLICATE) return true;
-        try {
-            TelemetryCallbackBatch batch = TelemetryCallbackBatch.decode(retained.bytes);
-            TelemetryCallbackBatch.Event first = batch.events.get(0);
-            TelemetryCallbackBatch.Event last = batch.events.get(batch.events.size() - 1);
-            spool(stream).recordLoss(batch.events.size(), first.receivedWallMs, last.receivedWallMs, "shutdown_spill");
-        } catch (Exception ignored) { }
-        return false;
+        while (!live[stream].isEmpty()) {
+            LiveRecord retained = live[stream].peekFirst();
+            CallbackSpool.AppendResult result = spillLocked(stream);
+            if (result == CallbackSpool.AppendResult.SUCCESS || result == CallbackSpool.AppendResult.DUPLICATE) continue;
+            try {
+                TelemetryCallbackBatch batch = TelemetryCallbackBatch.decode(retained.bytes);
+                TelemetryCallbackBatch.Event first = batch.events.get(0);
+                TelemetryCallbackBatch.Event last = batch.events.get(batch.events.size() - 1);
+                spool(stream).recordLoss(batch.events.size(), first.receivedWallMs, last.receivedWallMs, "shutdown_spill");
+            } catch (Exception ignored) { }
+            return false;
+        }
+        return true;
     }
 }

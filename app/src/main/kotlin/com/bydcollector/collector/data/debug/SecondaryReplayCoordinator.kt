@@ -1,5 +1,6 @@
 package com.bydcollector.collector.data.debug
 
+import android.database.sqlite.SQLiteDatabaseLockedException
 import com.bydcollector.collector.data.direct.SecondarySpoolActionResult
 import com.bydcollector.collector.data.direct.SecondarySpoolPage
 import com.bydcollector.collector.direct.SecondaryTelemetrySpool
@@ -46,7 +47,7 @@ class SecondaryReplayCoordinator(
             } catch (error: InterruptedException) {
                 throw error
             } catch (error: Exception) {
-                return blocked("secondary page failed: ${safe(error.message)}", committed, duplicates, quarantined)
+                return blocked("secondary page failed: ${safe(error.message)}", committed, duplicates, quarantined, retryable = true)
             }
             ensureNotInterrupted()
             if (!first.ok) {
@@ -54,7 +55,8 @@ class SecondaryReplayCoordinator(
                     "secondary page status=${first.status}: ${safe(first.error)}",
                     committed,
                     duplicates,
-                    quarantined
+                    quarantined,
+                    retryable = retryableStatus(first.status)
                 )
             }
             val descriptor = first.descriptor
@@ -68,16 +70,16 @@ class SecondaryReplayCoordinator(
             } catch (error: InterruptedException) {
                 throw error
             } catch (error: Exception) {
-                return blocked("secondary paging rejected: ${safe(error.message)}", committed, duplicates, quarantined)
+                return blocked("secondary paging rejected: ${safe(error.message)}", committed, duplicates, quarantined, retryable = true)
             }
             val digest = sha256(bytes)
             if (digest != descriptor.sha256) {
-                return blocked("secondary content digest mismatch", committed, duplicates, quarantined)
+                return blocked("secondary content digest mismatch", committed, duplicates, quarantined, retryable = true)
             }
             val record = try {
                 SecondaryTelemetrySpool.Codec.decode(bytes).also { validateDescriptor(descriptor, it) }
             } catch (error: Exception) {
-                return blocked("secondary record rejected: ${safe(error.message)}", committed, duplicates, quarantined)
+                return blocked("secondary record rejected: ${safe(error.message)}", committed, duplicates, quarantined, retryable = true)
             }
             when (val imported = try {
                 ensureNotInterrupted()
@@ -85,7 +87,10 @@ class SecondaryReplayCoordinator(
             } catch (error: InterruptedException) {
                 throw error
             } catch (error: Exception) {
-                return blocked("secondary import failed: ${safe(error.message)}", committed, duplicates, quarantined)
+                return blocked(
+                    "secondary import failed: ${safe(error.message)}", committed, duplicates, quarantined,
+                    retryable = error is SQLiteDatabaseLockedException
+                )
             }) {
                 is SecondaryImportResult.Committed -> {
                     if (imported.duplicate) duplicates++ else committed++
@@ -95,7 +100,7 @@ class SecondaryReplayCoordinator(
                     } catch (error: InterruptedException) {
                         throw error
                     } catch (error: Exception) {
-                        return blocked("secondary ACK failed: ${safe(error.message)}", committed, duplicates, quarantined)
+                        return blocked("secondary ACK failed: ${safe(error.message)}", committed, duplicates, quarantined, retryable = true)
                     }
                     ensureNotInterrupted()
                     if (!action.ok) {
@@ -103,7 +108,8 @@ class SecondaryReplayCoordinator(
                             "secondary ACK status=${action.status}: ${safe(action.error)}",
                             committed,
                             duplicates,
-                            quarantined
+                            quarantined,
+                            retryable = retryableStatus(action.status)
                         )
                     }
                 }
@@ -118,7 +124,8 @@ class SecondaryReplayCoordinator(
                             "secondary quarantine failed: ${safe(error.message)}",
                             committed,
                             duplicates,
-                            quarantined
+                            quarantined,
+                            retryable = true
                         )
                     }
                     ensureNotInterrupted()
@@ -127,7 +134,8 @@ class SecondaryReplayCoordinator(
                             "secondary quarantine status=${action.status}: ${safe(action.error)}",
                             committed,
                             duplicates,
-                            quarantined
+                            quarantined,
+                            retryable = retryableStatus(action.status)
                         )
                     }
                     quarantined += action.affected
@@ -184,7 +192,8 @@ class SecondaryReplayCoordinator(
         reason: String,
         committed: Int,
         duplicates: Int,
-        quarantined: Int
+        quarantined: Int,
+        retryable: Boolean = false
     ): SecondaryReplayDrainResult {
         val bounded = reason.take(MAX_DIAGNOSTIC_CHARS)
         val now = System.nanoTime()
@@ -193,8 +202,11 @@ class SecondaryReplayCoordinator(
             lastDiagnosticAtNanos = now
             runCatching { diagnostic?.invoke(bounded) }
         }
-        return SecondaryReplayDrainResult(false, committed, duplicates, quarantined, bounded)
+        return SecondaryReplayDrainResult(false, committed, duplicates, quarantined, bounded, retryable)
     }
+
+    private fun retryableStatus(status: Int): Boolean = status !=
+        com.bydcollector.collector.direct.CollectorHelperProtocol.STATUS_INVALID_REQUEST
 
     private fun ensureNotInterrupted() {
         if (Thread.currentThread().isInterrupted) throw InterruptedException("secondary replay interrupted")

@@ -12,6 +12,8 @@ import com.bydcollector.collector.data.callback.CallbackRawStore
 import com.bydcollector.collector.data.callback.StoredCallbackEvent
 import com.bydcollector.collector.data.direct.DirectFidRegistry
 import com.bydcollector.collector.data.direct.DirectValueDecoders
+import com.bydcollector.collector.data.energy.EnergyInput
+import com.bydcollector.collector.data.energy.EnergyReceipt
 import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
 import com.bydcollector.collector.direct.TelemetryCallbackBatch
 import com.bydcollector.collector.diagnostics.OperationalEventJournal
@@ -71,6 +73,8 @@ internal data class HistoricalMainIdentity(
 
 internal data class HistoricalPollEndpoint(val pollId: Long, val sessionId: Long, val timestamp: String)
 
+data class DeferredEnergyReceipt(val id: Long, val receipt: EnergyReceipt, val retryCount: Int, val nextRetryAtMs: Long)
+
 internal data class HistoricalEnergyPoll(
     val pollId: Long,
     val sessionId: Long,
@@ -116,6 +120,10 @@ class TelemetryStore(
     private val mainEntriesByAddress = DirectFidRegistry.entries
         .groupBy { Triple(it.dev, it.fid, it.tx) }
         .mapValues { (_, entries) -> entries.singleOrNull() }
+    private val currentBootId: String? by lazy {
+        runCatching { File("/proc/sys/kernel/random/boot_id").readText().trim() }
+            .getOrNull()?.takeIf { it.isNotBlank() }
+    }
     private val callbackRawStore = CallbackRawStore(
         database = { helper.writableDatabase },
         nowMs = { java.time.OffsetDateTime.parse(clock.nowIso()).toInstant().toEpochMilli() }
@@ -131,6 +139,88 @@ class TelemetryStore(
     @Volatile private var pollValueColumnsEnsuredForCatalogVersionId: Long? = null
     @Volatile private var normalizedCatalogEnsured = false
     private val closed = AtomicBoolean(false)
+
+    fun enqueueDeferredEnergy(receipt: EnergyReceipt): Boolean {
+        val db = helper.writableDatabase
+        val input = receipt.input
+        val values = ContentValues().apply {
+            put("source_identity", receipt.sourceIdentity)
+            put("observed_at", receipt.observedAt)
+            put("boot_id", input.bootId)
+            put("elapsed_ms", input.elapsedMs)
+            putNullable("voltage", input.voltage)
+            putNullable("current_a", input.current)
+            putNullableBoolean("power_on", input.powerOn)
+            putNullableBoolean("gun_disconnected", input.gunDisconnected)
+            putNullableBoolean("external_charging", input.externalCharging)
+            put("created_at_ms", System.currentTimeMillis())
+        }
+        val inserted = db.insertWithOnConflict(
+            "energy_deferred_receipts", null, values, SQLiteDatabase.CONFLICT_IGNORE
+        ) != -1L
+        if (!inserted) {
+            val existing = deferredEnergyByIdentity(receipt.sourceIdentity)
+            check(existing?.receipt == receipt) { "energy receipt identity reused with different input" }
+        }
+        return inserted
+    }
+
+    fun hasDeferredEnergy(): Boolean = helper.readableDatabase.rawQuery(
+        "SELECT 1 FROM energy_deferred_receipts LIMIT 1", emptyArray()
+    ).use { it.moveToFirst() }
+
+    fun oldestDeferredEnergy(nowMs: Long): DeferredEnergyReceipt? = helper.readableDatabase.rawQuery(
+        "SELECT id, source_identity, observed_at, boot_id, elapsed_ms, voltage, current_a, " +
+            "power_on, gun_disconnected, external_charging, retry_count, next_retry_at_ms, created_at_ms " +
+            "FROM energy_deferred_receipts ORDER BY id LIMIT 1", emptyArray()
+    ).use { cursor ->
+        if (!cursor.moveToFirst()) return@use null
+        if (cursor.getLong(11) > nowMs && cursor.getLong(12) <= nowMs) return@use null
+        cursor.toDeferredEnergyReceipt()
+    }
+
+    fun deferEnergyRetry(id: Long, retryCount: Int, error: Throwable, nowMs: Long) {
+        val delays = longArrayOf(1_000L, 5_000L, 30_000L, 60_000L)
+        val next = nowMs + delays[retryCount.coerceAtMost(delays.lastIndex)]
+        check(helper.writableDatabase.update(
+            "energy_deferred_receipts",
+            ContentValues().apply {
+                put("retry_count", retryCount + 1)
+                put("next_retry_at_ms", next)
+                put("last_error", "${error::class.java.simpleName}: ${error.message.orEmpty()}".take(512))
+            },
+            "id = ?", arrayOf(id.toString())
+        ) == 1) { "deferred energy receipt disappeared" }
+    }
+
+    fun completeDeferredEnergy(id: Long) {
+        check(helper.writableDatabase.delete(
+            "energy_deferred_receipts", "id = ?", arrayOf(id.toString())
+        ) == 1) { "deferred energy receipt disappeared" }
+    }
+
+    private fun deferredEnergyByIdentity(identity: String): DeferredEnergyReceipt? = helper.readableDatabase.rawQuery(
+        "SELECT id, source_identity, observed_at, boot_id, elapsed_ms, voltage, current_a, " +
+            "power_on, gun_disconnected, external_charging, retry_count, next_retry_at_ms, created_at_ms " +
+            "FROM energy_deferred_receipts WHERE source_identity = ?", arrayOf(identity)
+    ).use { cursor -> if (cursor.moveToFirst()) cursor.toDeferredEnergyReceipt() else null }
+
+    private fun Cursor.toDeferredEnergyReceipt(): DeferredEnergyReceipt = DeferredEnergyReceipt(
+        id = getLong(0),
+        receipt = EnergyReceipt(getString(1), getString(2), EnergyInput(
+            bootId = getString(3), elapsedMs = getLong(4),
+            voltage = if (isNull(5)) null else getDouble(5),
+            current = if (isNull(6)) null else getDouble(6),
+            powerOn = if (isNull(7)) null else getInt(7) != 0,
+            gunDisconnected = if (isNull(8)) null else getInt(8) != 0,
+            externalCharging = if (isNull(9)) null else getInt(9) != 0
+        )),
+        retryCount = getInt(10), nextRetryAtMs = getLong(11)
+    )
+
+    private fun ContentValues.putNullableBoolean(key: String, value: Boolean?) {
+        if (value == null) putNull(key) else put(key, if (value) 1 else 0)
+    }
 
     @Synchronized
     override fun close() {
@@ -324,7 +414,7 @@ class TelemetryStore(
     }
 
     private fun newerSource(a: NormalizedSourceStamp, b: NormalizedSourceStamp): NormalizedSourceStamp =
-        if (NormalizedSourceOrdering.compare(b, a) == NormalizedSourceOrder.NEWER) b else a
+        if (NormalizedSourceOrdering.compare(b, a, currentBootId) == NormalizedSourceOrder.NEWER) b else a
 
     private fun loadNormalizedSourceInputs(db: SQLiteDatabase): MutableMap<String, NormalizedSourceInput> {
         return db.rawQuery(
@@ -373,7 +463,7 @@ class TelemetryStore(
         val key = incoming.reading.rawKey
         val previous = cached[key]
         if (previous != null) {
-            when (NormalizedSourceOrdering.compare(incoming.stamp, previous.stamp)) {
+            when (NormalizedSourceOrdering.compare(incoming.stamp, previous.stamp, currentBootId)) {
                 NormalizedSourceOrder.OLDER,
                 NormalizedSourceOrder.INCOMPARABLE -> return false
                 NormalizedSourceOrder.EQUAL -> {

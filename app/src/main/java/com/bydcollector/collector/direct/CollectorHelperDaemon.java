@@ -325,6 +325,23 @@ public final class CollectorHelperDaemon {
                     if (reply != null) writeBatchReply(reply, result);
                     return true;
                 }
+                if (code == CollectorHelperProtocol.TX_KPI_READ_BATCH) {
+                    BatchResult result;
+                    try {
+                        List<Address> rows = readBatchRequest(data);
+                        String validationError = rows.size() > 24 ? "KPI batch exceeds 24 fields" : validateRows(rows, whitelist);
+                        if (validationError == null && rows.stream().anyMatch(row -> !HelperCallbackController.isKpiSource(row))) {
+                            validationError = "KPI batch contains a non-KPI address";
+                        }
+                        result = validationError == null
+                            ? runtime.readKpi(rows)
+                            : BatchResult.rejected(rows.size(), validationError);
+                    } catch (Throwable error) {
+                        result = BatchResult.rejected(0, describe(error));
+                    }
+                    if (reply != null) writeBatchReply(reply, result);
+                    return true;
+                }
                 if (code == CollectorHelperProtocol.TX_WORKER_PENDING) {
                     if (reply != null) {
                         if (!runtime.replayAllowed(CollectorHelperProtocol.STREAM_MAIN)) {

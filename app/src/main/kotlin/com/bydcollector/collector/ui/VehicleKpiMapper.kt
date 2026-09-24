@@ -25,6 +25,7 @@ object VehicleKpiMapper {
         val power = if (charging) chargePower else dischargePower
         return VehicleKpis(
             socPercent = byKey.percent("soc"),
+            remainingEnergyKwh = formatKwh(byKey.number("battery_remaining_energy_kwh"), language),
             odometerKm = byKey.km("odometer_km", language),
             cabinTempC = byKey.temp("inside_temp_c_raw"),
             perfume1RemainingPercent = byKey.boundedPercent("perfume_1_remaining_percent"),
@@ -60,6 +61,7 @@ object VehicleKpiMapper {
         val power = if (charging) chargePower else dischargePower
         return VehicleKpis(
             socPercent = numbers.percentValue("soc"),
+            remainingEnergyKwh = formatKwh(numbers["battery_remaining_energy_kwh"], language),
             odometerKm = numbers.kmValue("odometer_km", language),
             cabinTempC = numbers.tempValue("inside_temp_c_raw"),
             perfume1RemainingPercent = numbers.boundedPercentValue("perfume_1_remaining_percent"),
@@ -127,6 +129,13 @@ object VehicleKpiMapper {
         val unit = if (language == VehicleKpiLanguage.UK) "кВт" else "kW"
         return "$rounded $unit"
     }
+
+    private fun formatKwh(value: Double?, language: VehicleKpiLanguage): String = value
+        ?.takeIf { it.isFinite() && it >= 0.0 }
+        ?.let { String.format(Locale.US, "%.1f", it).let { text ->
+            if (language == VehicleKpiLanguage.UK) text.replace('.', ',') else text
+        } + " kWh" }
+        ?: "-"
 
     private fun formatMv(value: Int, language: VehicleKpiLanguage): String {
         val unit = if (language == VehicleKpiLanguage.UK) "мВ" else "mV"

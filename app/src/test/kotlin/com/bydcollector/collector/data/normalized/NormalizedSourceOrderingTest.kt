@@ -52,6 +52,20 @@ class NormalizedSourceOrderingTest {
         )
     }
 
+    @Test
+    fun trustedCurrentBootWinsEvenWhenItsWallClockMovedBackward() {
+        val old = stamp("old", "old-boot", null, null, wall = 9_000, elapsed = 800)
+        val current = stamp("current", "current-boot", null, null, wall = 1_000, elapsed = 20)
+
+        assertEquals(NormalizedSourceOrder.NEWER, NormalizedSourceOrdering.compare(current, old, "current-boot"))
+        assertEquals(NormalizedSourceOrder.OLDER, NormalizedSourceOrdering.compare(old, current, "current-boot"))
+        assertEquals(NormalizedSourceOrder.OLDER, NormalizedSourceOrdering.compare(
+            stamp("old-replay", "old-boot", null, null, wall = 50_000, elapsed = 900),
+            current,
+            "current-boot"
+        ))
+    }
+
     private fun stamp(
         identity: String,
         boot: String,

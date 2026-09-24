@@ -807,6 +807,7 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         updateRuntime.onUiVisible()
+        if (!settings.isUserShutdownRequested()) CollectorServiceController.start(this)
     }
 
     override fun onResume() {

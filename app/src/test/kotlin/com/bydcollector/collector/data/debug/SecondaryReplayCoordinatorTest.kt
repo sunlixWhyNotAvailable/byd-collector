@@ -203,6 +203,73 @@ class SecondaryReplayCoordinatorTest {
         assertEquals(1, diagnostics)
     }
 
+    @Test
+    fun temporaryPageFailureRemainsRetryableAndPreservesManualCollection() {
+        var attempts = 0
+        val coordinator = SecondaryReplayCoordinator(
+            fetchPage = { _, _, _ ->
+                attempts++
+                if (attempts == 1) SecondarySpoolPage(
+                    CollectorHelperProtocol.STATUS_SPOOL_UNAVAILABLE, null, 0L, byteArrayOf(), "temporarily unavailable"
+                ) else emptyPage()
+            },
+            acknowledge = { error("unexpected ACK") },
+            quarantine = { _, _ -> error("unexpected quarantine") },
+            importRecord = { _, _ -> error("unexpected import") }
+        )
+
+        val first = coordinator.drain()
+        assertFalse(first.drained)
+        assertTrue(first.retryable)
+        assertTrue(coordinator.drain().drained)
+        assertEquals(2, attempts)
+    }
+
+    @Test
+    fun invalidRequestDoesNotEnterTransportRetry() {
+        val coordinator = SecondaryReplayCoordinator(
+            fetchPage = { _, _, _ -> SecondarySpoolPage(
+                CollectorHelperProtocol.STATUS_INVALID_REQUEST, null, 0L, byteArrayOf(), "invalid"
+            ) },
+            acknowledge = { error("unexpected ACK") },
+            quarantine = { _, _ -> error("unexpected quarantine") },
+            importRecord = { _, _ -> error("unexpected import") }
+        )
+
+        assertFalse(coordinator.drain().retryable)
+    }
+
+    @Test
+    fun changedDigestRetriesWithoutAcknowledgingOrDiscardingEvidence() {
+        val fixture = fixture()
+        var offered = true
+        var stale = true
+        var imports = 0
+        var acks = 0
+        val coordinator = SecondaryReplayCoordinator(
+            fetchPage = { requested, offset, limit ->
+                if (!offered) emptyPage() else page(fixture, requested, offset, limit).let { page ->
+                    if (stale) page.copy(descriptor = SecondaryTelemetrySpool.Descriptor(
+                        fixture.descriptor.spoolOrder, fixture.descriptor.identity, fixture.descriptor.kind,
+                        fixture.descriptor.capturedWallMs, fixture.descriptor.capturedElapsedMs,
+                        fixture.descriptor.fileName, fixture.descriptor.length, "0".repeat(64)
+                    )) else page
+                }
+            },
+            acknowledge = { acks++; offered = false; okAction(1) },
+            quarantine = { _, _ -> error("unexpected quarantine") },
+            importRecord = { _, _ -> imports++; SecondaryImportResult.Committed(1L, false) }
+        )
+
+        assertTrue(coordinator.drain().retryable)
+        assertEquals(0, imports)
+        assertEquals(0, acks)
+        stale = false
+        assertTrue(coordinator.drain().drained)
+        assertEquals(1, imports)
+        assertEquals(1, acks)
+    }
+
     private fun oneRecordCoordinator(
         fixture: Fixture,
         importer: (SecondaryTelemetrySpool.Record, String) -> SecondaryImportResult,

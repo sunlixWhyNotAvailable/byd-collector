@@ -31,6 +31,7 @@ class CallbackIntakeWorker(
     private val ready: () -> Boolean = { true },
     private val onStatus: (CallbackIntakeStatus) -> Unit = {},
     private val onStopped: () -> Unit = {},
+    private val progressPaceMs: () -> Long = { 0L },
     private val sleepMs: (Long) -> Unit = { Thread.sleep(it) },
     private val monotonicNanos: () -> Long = System::nanoTime,
     private val wallTimeMs: () -> Long = System::currentTimeMillis
@@ -244,7 +245,11 @@ class CallbackIntakeWorker(
                 report(condition, result)
 
                 when (result.kind) {
-                    CallbackDrainKind.PROGRESS -> backoffIndex = 0
+                    CallbackDrainKind.PROGRESS -> {
+                        backoffIndex = 0
+                        val pace = progressPaceMs()
+                        if (pace > 0L) sleepMs(pace)
+                    }
                     CallbackDrainKind.EMPTY -> sleepMs(EMPTY_WAIT_MS)
                     CallbackDrainKind.PENDING, CallbackDrainKind.FAULT -> {
                         sleepMs(BACKOFF_MS[backoffIndex])

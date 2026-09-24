@@ -805,26 +805,27 @@ private fun VehicleKpiCard(kpi: VehicleKpis?, strings: UiStrings, modifier: Modi
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
                     KpiTile(strings.kpiSoc, kpi?.socPercent ?: "-", modifier = Modifier.fillMaxWidth())
-                    KpiTile(chargeLabel, kpi?.batteryPowerKw ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(strings.kpiEnergyLeft, kpi?.remainingEnergyKwh ?: "-", modifier = Modifier.fillMaxWidth())
                 }
                 Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
                     KpiTile(strings.kpiOdometer, kpi?.odometerKm ?: "-", modifier = Modifier.fillMaxWidth())
-                    KpiTile(strings.kpiRange, kpi?.remainingRangeKm ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(chargeLabel, kpi?.batteryPowerKw ?: "-", modifier = Modifier.fillMaxWidth())
                 }
                 Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
                     KpiTile(strings.kpiCabinTemp, kpi?.cabinTempC ?: "-", modifier = Modifier.fillMaxWidth())
-                    KpiTile(strings.kpiBatteryTemp, kpi?.batteryTempC ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(strings.kpiRange, kpi?.remainingRangeKm ?: "-", modifier = Modifier.fillMaxWidth())
                 }
                 Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
                     KpiTile(strings.kpiPerfume1, kpi?.perfume1RemainingPercent ?: "-", modifier = Modifier.fillMaxWidth())
-                    KpiTile(strings.kpiCellDelta, kpi?.cellVoltageDeltaMv ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(strings.kpiBatteryTemp, kpi?.batteryTempC ?: "-", modifier = Modifier.fillMaxWidth())
                 }
                 Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
                     KpiTile(strings.kpiPerfume2, kpi?.perfume2RemainingPercent ?: "-", modifier = Modifier.fillMaxWidth())
-                    KpiTile(strings.kpiSoh, kpi?.sohPercent ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(strings.kpiCellDelta, kpi?.cellVoltageDeltaMv ?: "-", modifier = Modifier.fillMaxWidth())
                 }
                 Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
                     KpiTile(strings.kpiPerfume3, kpi?.perfume3RemainingPercent ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(strings.kpiSoh, kpi?.sohPercent ?: "-", modifier = Modifier.fillMaxWidth())
                 }
             }
         }

@@ -13,7 +13,8 @@ data class CallbackSpoolStatus(
     val readyBatches: Int = 0,
     val quarantinedFiles: Int = 0,
     val loss: CallbackLoss? = null,
-    val error: String? = null
+    val error: String? = null,
+    val liveRetainedBytes: Long = 0
 ) { val ok: Boolean get() = status == CollectorHelperProtocol.STATUS_OK }
 
 data class CallbackSpoolPage(

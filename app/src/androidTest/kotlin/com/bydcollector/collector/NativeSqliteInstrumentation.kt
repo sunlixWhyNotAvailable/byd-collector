@@ -11,6 +11,8 @@ import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.debug.DirectDebugParameterAsset
 import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.data.debug.SecondaryImportResult
+import com.bydcollector.collector.data.energy.EnergyInput
+import com.bydcollector.collector.data.energy.EnergyReceipt
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.local.PersistedPollInput
@@ -118,6 +120,7 @@ class NativeSqliteInstrumentation : Instrumentation() {
             "callback_normalization_atomic_receipt" to ::normalizationReceipt,
             "callback_source_order_compact" to { sourceOrderedNormalization(false) },
             "callback_source_order_legacy" to { sourceOrderedNormalization(true) },
+            "deferred_energy_survives_reopen" to ::deferredEnergySurvivesReopen,
             "callback_android_parcel_paging_ack" to {
                 CallbackParcelGate.run(File(targetContext.cacheDir, "${prefix}_parcel"))
             }
@@ -446,6 +449,27 @@ class NativeSqliteInstrumentation : Instrumentation() {
             check(text(reopened.readableDatabase, "SELECT value_number FROM vehicle_state_current WHERE field_key='speed_kmh'").toDouble() == 50.0)
             check(count(reopened.readableDatabase, "raw_callback_normalization_receipts") == 4L)
             check(count(reopened.readableDatabase, "raw_callback_events") == 4L)
+        }
+    }
+
+    private fun deferredEnergySurvivesReopen() {
+        val name = "${prefix}_deferred_energy.db"
+        val receipt = EnergyReceipt("boot:sample:9", "2026-09-24T10:00:00Z",
+            EnergyInput("boot", 9L, 410.0, -12.5, true, true, false))
+        val first = TelemetryDatabaseHelper(targetContext, name)
+        TelemetryStore(targetContext, first, operationalEventJournal = OperationalEventJournal(targetContext)).use { store ->
+            check(store.enqueueDeferredEnergy(receipt))
+            check(!store.enqueueDeferredEnergy(receipt))
+            store.deferEnergyRetry(checkNotNull(store.oldestDeferredEnergy(System.currentTimeMillis())).id,
+                0, IllegalStateException("Trips busy"), System.currentTimeMillis())
+            check(store.hasDeferredEnergy())
+        }
+        val reopened = TelemetryDatabaseHelper(targetContext, name)
+        TelemetryStore(targetContext, reopened, operationalEventJournal = OperationalEventJournal(targetContext)).use { store ->
+            val pending = checkNotNull(store.oldestDeferredEnergy(System.currentTimeMillis() + 2_000L))
+            check(pending.receipt == receipt && pending.retryCount == 1)
+            store.completeDeferredEnergy(pending.id)
+            check(!store.hasDeferredEnergy())
         }
     }
 

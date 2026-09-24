@@ -126,6 +126,7 @@ data class DashboardState(
 
 data class VehicleKpis(
     val socPercent: String = "-",
+    val remainingEnergyKwh: String = "-",
     val odometerKm: String = "-",
     val cabinTempC: String = "-",
     val perfume1RemainingPercent: String = "-",

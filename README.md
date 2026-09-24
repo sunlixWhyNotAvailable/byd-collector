@@ -21,7 +21,9 @@ The app reads vehicle parameters without changing them. It keeps raw values, ava
 
 The v2.8.3 personal-test build uses hybrid callback collection. Supported fields switch to push updates after usable callbacks are observed, with verification reads every five seconds; unproven fields keep polling. Power, gear and SOC keep their regular fast reads. Every received callback, including repeated equal values, is retained separately in the existing SQLite databases. Vehicle validation is still required before a wider release.
 
-Callback buffering is bounded: each stream has a combined 4 MiB allowance for queued/in-flight callback payloads, while poll and callback files share its existing 128 MiB fallback-spool allowance. The app imports committed batches idempotently after interruptions. Capacity or I/O losses are reported explicitly; data still in memory is not guaranteed to survive a kernel reboot.
+Callback buffering is bounded: each stream has a combined 16 MiB RAM allowance for queued/in-flight callback payloads, of which the live transport can retain up to 12 MiB. Unconsumed retained batches move to disk after five seconds or when the RAM cap is reached; poll and callback files share the existing 128 MiB fallback-spool allowance. While the vehicle and screen are on, SQLite import is paced unless disk backlog grows; when the vehicle is off and the app remains running, it catches up without that pacing. Capacity or I/O losses are reported explicitly; data still in memory is not guaranteed to survive a kernel reboot.
+
+Energy-projection errors are retried from a durable SQLite queue without stopping raw collection. Main database archiving is deferred until that queue drains. Normalized source ordering treats readings from the current boot as newer than retained readings from an earlier boot, even if the wall clock moved backwards.
 
 The app remembers your selected tab, scroll positions, and expanded trip groups during the current session, including when you switch tabs or return from another app. Closing the app with `Shutdown` or restarting its process resets navigation.
 
@@ -52,7 +54,7 @@ The app is available in English and Ukrainian, with dark and light themes.
 
 - Collects 95 selected read-only vehicle fields.
 - Shows collection, MQTT, and InfluxDB status, last success, last error, and session errors.
-- Displays SOC, SOH, odometer, cabin and battery temperatures, charging/discharging, range, cell-voltage difference, and category summaries.
+- Displays SOC, remaining battery energy, SOH, odometer, cabin and battery temperatures, charging/discharging, range, cell-voltage difference, and category summaries. These KPI cards use an independent reader while the vehicle is on, even if Main and All data collection are stopped.
 - Stores raw readings and normalized history locally. History is not automatically deleted or reduced.
 
 The collected data includes charging mode and battery charging status, the charging connector type, opening percentages for all four windows, and estimated remaining perfume and installation state for three slots. The vehicle's estimated charging time remaining is exported as one `hh:mm:ss` value; unavailable readings are not shown as zero. Front and rear motor-current readings remain unitless raw values because their physical units are not yet verified. These fields are available to MQTT and InfluxDB through their selected categories.

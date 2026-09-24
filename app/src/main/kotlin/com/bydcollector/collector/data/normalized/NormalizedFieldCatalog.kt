@@ -262,7 +262,7 @@ object NormalizedFieldCatalog {
     )
 
     /** Dashboard fields share one source definition for display freshness and helper validation. */
-    val kpiFields = listOf(soc, odometerKm, insideTemp,
+    val kpiFields = listOf(soc, batteryRemainingEnergy, odometerKm, insideTemp,
         perfume1RemainingPercent, perfume2RemainingPercent, perfume3RemainingPercent,
         batterySoh, batteryChargePower, batteryDischargePower, remainingRangeKm,
         batteryAverageTemp, batteryHighestCellVoltage, batteryLowestCellVoltage)

@@ -29,6 +29,7 @@ final class HelperCallbackController implements AutoCloseable {
     static final long RECONCILE_MS = 5_000L;
     static final long KPI_RECONCILE_MS = 2_000L;
     private static final Set<CollectorHelperDaemon.Address> KPI_SOURCES = kpiSources();
+    static boolean isKpiSource(CollectorHelperDaemon.Address address) { return KPI_SOURCES.contains(address); }
     static final int MAX_ADDITION = 128;
     static final int MAX_DEVICE_FIDS = 4_096;
     static final int PERMISSION_DENIED = -2147482644;

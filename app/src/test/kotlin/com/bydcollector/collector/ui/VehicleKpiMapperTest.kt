@@ -11,6 +11,16 @@ import kotlin.test.assertEquals
 
 class VehicleKpiMapperTest {
     @Test
+    fun formatsObservedRemainingEnergyWithoutEstimatingFromSoc() {
+        val observed = observation("battery_remaining_energy_kwh", 53.4)
+        assertEquals("53,4 kWh", VehicleKpiMapper.fromObservations(listOf(observed)).remainingEnergyKwh)
+        assertEquals("53.4 kWh", VehicleKpiMapper.fromObservations(listOf(observed), VehicleKpiLanguage.EN).remainingEnergyKwh)
+        assertEquals("-", VehicleKpiMapper.fromObservations(listOf(observation(
+            "battery_remaining_energy_kwh", 53.4, NormalizedQuality.INVALID
+        ))).remainingEnergyKwh)
+    }
+
+    @Test
     fun mapsSohAndCellVoltageDeltaFromNormalizedState() {
         val kpis = VehicleKpiMapper.from(
             listOf(

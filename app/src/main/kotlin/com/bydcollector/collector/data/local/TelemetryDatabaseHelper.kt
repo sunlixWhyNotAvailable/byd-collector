@@ -20,6 +20,7 @@ class TelemetryDatabaseHelper(
         executeSqlAsset(db, COMPACT_SCHEMA_ASSET)
         CallbackRawSchema.create(db)
         createCollectorEvents(db)
+        createDeferredEnergyReceipts(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -28,6 +29,7 @@ class TelemetryDatabaseHelper(
         executeSqlAsset(db, if (compactV2) COMPACT_SCHEMA_ASSET else LEGACY_SCHEMA_ASSET)
         CallbackRawSchema.create(db)
         createCollectorEvents(db)
+        createDeferredEnergyReceipts(db)
         if (!compactV2) ensureLegacySchemaCompatibility(db)
         ensureNormalizedQualityDetails(db)
     }
@@ -90,6 +92,29 @@ class TelemetryDatabaseHelper(
             check(cursor.moveToFirst()) { "Compact storage marker is missing" }
             return cursor.getInt(0)
         }
+    }
+
+    private fun createDeferredEnergyReceipts(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS energy_deferred_receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_identity TEXT NOT NULL UNIQUE,
+                observed_at TEXT NOT NULL,
+                boot_id TEXT NOT NULL,
+                elapsed_ms INTEGER NOT NULL,
+                voltage REAL,
+                current_a REAL,
+                power_on INTEGER,
+                gun_disconnected INTEGER,
+                external_charging INTEGER,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                next_retry_at_ms INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at_ms INTEGER NOT NULL
+            )
+            """.trimIndent()
+        )
     }
 
     private fun ensureNormalizedQualityDetails(db: SQLiteDatabase) {
@@ -429,7 +454,7 @@ class TelemetryDatabaseHelper(
 
     companion object {
         val DATABASE_NAME: String = BuildConfig.COLLECTOR_DATABASE_NAME
-        const val DATABASE_VERSION = 13
+        const val DATABASE_VERSION = 14
         const val LEGACY_SCHEMA_ASSET = "schema.sql"
         const val COMPACT_SCHEMA_ASSET = "schema_v2.sql"
         const val LEGACY_STORAGE_FORMAT = 1

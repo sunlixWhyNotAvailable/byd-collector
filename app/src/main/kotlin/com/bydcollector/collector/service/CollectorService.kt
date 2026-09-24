@@ -41,8 +41,16 @@ import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
 import com.bydcollector.collector.diagnostics.BoundedProcessWindow
 import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
 import com.bydcollector.collector.data.direct.DirectStreamController
+import com.bydcollector.collector.data.direct.DirectFidRegistry
+import com.bydcollector.collector.data.direct.DirectValueDecoders
+import com.bydcollector.collector.data.direct.DirectAutoserviceField
+import com.bydcollector.collector.data.direct.DirectAutoserviceSnapshot
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.data.local.TelemetryStore
+import com.bydcollector.collector.data.energy.EnergyReceipt
+import com.bydcollector.collector.data.energy.EnergySessionCoordinator
+import com.bydcollector.collector.data.energy.EnergySessionSeed
+import com.bydcollector.collector.data.energy.EnergyTelemetryProjection
 import com.bydcollector.collector.data.local.HealthSnapshotDetail
 import com.bydcollector.collector.data.normalized.NormalizedWriteSummary
 import com.bydcollector.collector.data.normalized.PollingErrorSummaries
@@ -57,6 +65,9 @@ import com.bydcollector.collector.data.polling.TelemetryWorkerReplayCoordinator
 import com.bydcollector.collector.data.polling.TelemetryWorkerReplayPollCycleRunner
 import com.bydcollector.collector.data.local.PollReading
 import com.bydcollector.collector.data.normalized.NormalizedObservation
+import com.bydcollector.collector.data.normalized.NormalizedFieldCatalog
+import com.bydcollector.collector.data.normalized.NormalizedSourceKind
+import com.bydcollector.collector.data.normalized.NormalizedSourceStamp
 import com.bydcollector.collector.data.remote.DirectTelemetryClient
 import com.bydcollector.collector.data.remote.DirectBridgeManager
 import com.bydcollector.collector.direct.CollectorHelperProtocol
@@ -161,8 +172,14 @@ class CollectorService : Service() {
     private lateinit var mainCallbackIntake: CallbackIntakeWorker
     private lateinit var secondaryCallbackIntake: CallbackIntakeWorker
     private lateinit var callbackNormalizer: CallbackNormalizationWorker
+    private lateinit var deferredEnergyWorker: CallbackNormalizationWorker
+    @Volatile private var kpiWorker: Thread? = null
+    @Volatile private var kpiPowerOn = false
+    private lateinit var energyCoordinator: EnergySessionCoordinator
+    private var energyHydrated = false
     private val secondaryCallbackFinished = AtomicBoolean(true)
     private val callbackDiagnosticQueued = arrayOf(AtomicBoolean(false), AtomicBoolean(false))
+    private val callbackBacklogBytes = arrayOf(AtomicLong(0L), AtomicLong(0L))
     private val appProcessWindow = BoundedProcessWindow(SystemClock::elapsedRealtime, android.os.Process::getElapsedCpuTime)
     private val diagnosticOwners = mutableMapOf<Int, Any>() // guarded by appProcessWindow
     private data class NormalizationProgress(val processed: Int, val oldestWallMs: Long?, val completedWallMs: Long, val hasMore: Boolean)
@@ -419,6 +436,17 @@ class CollectorService : Service() {
         telegramCoordinator = createTelegramCoordinator()
         normalizedStateChangedCallback = { changedCategories -> publishChangedCategoriesAsync(changedCategories) }
         tripRuntime = createTripRuntimeCoordinator()
+        val trips = BydCollectorApplication.trips(applicationContext)
+        energyCoordinator = EnergySessionCoordinator(trips) {
+            trips.loadOpenSession()?.let { EnergySessionSeed(it.tripId, it.startedAt) }
+        }
+        deferredEnergyWorker = CallbackNormalizationWorker(
+            threadName = "byd-deferred-energy",
+            drainPage = ::drainDeferredEnergy,
+            onFault = { error ->
+                store.recordEvent("energy_deferred_worker_error", "Deferred energy worker failed", error.diagnosticDetail())
+            }
+        )
         poller = createTelemetryPoller()
         maintenanceCoordinator = DbMaintenanceCoordinator(
             context = applicationContext,
@@ -455,6 +483,8 @@ class CollectorService : Service() {
         if (settings.hasActiveAccessWork()) {
             requestAccessSelfCheck("runtime_supervisor_start")
         }
+        if (!startupShutdownSuppressed) check(deferredEnergyWorker.start())
+        if (!startupShutdownSuppressed) startKpiWorker()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -555,6 +585,8 @@ class CollectorService : Service() {
     override fun onDestroy() {
         requireRuntimeOwner()
         running.set(false)
+        if (::deferredEnergyWorker.isInitialized) deferredEnergyWorker.stopAndJoin(0L)
+        kpiWorker?.interrupt()
         getSharedPreferences(CollectorSettings.PREFS_NAME, Context.MODE_PRIVATE)
             .unregisterOnSharedPreferenceChangeListener(collectionPolicyListener)
         debugStoreCloseRequested.set(true)
@@ -746,6 +778,10 @@ class CollectorService : Service() {
             threadName = "byd-callback-intake-$stream",
             ready = { DirectStreamController.credentials(stream) != null },
             drain = { drain.drain(maxBatches = 1) },
+            progressPaceMs = {
+                val interactive = (getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive
+                if (kpiPowerOn && interactive && callbackBacklogBytes[stream - 1].get() < 16L * 1024 * 1024) 1_000L else 0L
+            },
             onStatus = { summary ->
                 queueCallbackDiagnostic(stream, summary.detail +
                     (summary.fault?.let { "\n${it.diagnosticDetail()}" } ?: ""))
@@ -777,10 +813,11 @@ class CollectorService : Service() {
             dashboardMetricsExecutor.execute {
                 try {
                     val backlog = DirectVehicleHelperClient().callbackSpoolStatus(stream)
+                    if (backlog.ok) callbackBacklogBytes[stream - 1].set(backlog.footprintBytes)
                     val loss = backlog.loss
                     store.recordEvent("callback_drain_summary", "Callback raw persistence summary",
                         "$stateDetail spool_status=${backlog.status} " +
-                            "spool_bytes=${backlog.footprintBytes} ready_batches=${backlog.readyBatches} " +
+                            "spool_bytes=${backlog.footprintBytes} ram_bytes=${backlog.liveRetainedBytes} ready_batches=${backlog.readyBatches} " +
                             "quarantined_files=${backlog.quarantinedFiles} loss_count=${loss?.count ?: 0} " +
                             "loss_first_wall_ms=${loss?.firstWallMs} loss_last_wall_ms=${loss?.lastWallMs} " +
                             "loss_reason=${loss?.reason.orEmpty()} spool_error=${backlog.error.orEmpty()}")
@@ -833,9 +870,8 @@ class CollectorService : Service() {
                 "normalization_page_oldest_age_ms=${progress?.oldestWallMs?.let { (now - it).coerceAtLeast(0L) }} " +
                 "normalization_last_completion_wall_ms=${progress?.completedWallMs} " +
                 "normalization_page_may_have_more=${progress?.hasMore}")
-        val ownerSession = sessionId
         mainHandler.post {
-            if (!running.get() || !mainPollingRunning.get() || ownerSession != sessionId) return@post
+            if (!running.get() || !kpiPowerOn) return@post
             kpiFreshness.expiryDiagnostics(SystemClock.elapsedRealtime())?.let {
                 store.recordEvent("kpi_expiry_summary", "KPI source freshness evidence", it)
             }
@@ -883,69 +919,41 @@ class CollectorService : Service() {
             normalizedCurrentRows = summary.currentInsertedCount.toLong(),
             normalizedHistoryRows = summary.historyInsertedCount.toLong()
         )
-        if (observations.isNotEmpty()) queueDashboardVehicleKpis(observations)
         scheduleDatabaseFootprintRefresh(force = false)
         if (summary.changedCategories.isNotEmpty()) normalizedStateChangedCallback?.invoke(summary.changedCategories)
         exportInfluxAfterNormalizedWrite(summary)
     }
 
     private fun createSuccessfulPollObserver(): SuccessfulPollObserver {
-        val trips = BydCollectorApplication.trips(applicationContext)
-        val energy = com.bydcollector.collector.data.energy.EnergySessionCoordinator(trips) {
-            trips.loadOpenSession()?.let {
-                com.bydcollector.collector.data.energy.EnergySessionSeed(it.tripId, it.startedAt)
-            }
-        }
         val fallbackSource = com.bydcollector.collector.data.polling.LivePollSource()
-        var energyHydrated = false
         //normalizes only after raw poll persistence so raw telemetry remains the source of truth
         return object : SuccessfulPollObserver {
-            private var energyFailure: Exception? = null
             private var lastEnergyFailureKey: String? = null
 
-            private fun <T> energyAttempt(action: () -> T): T? = try {
-                action()
-            } catch (error: Exception) {
-                if (error is InterruptedException) throw error
-                energyFailure = error
-                val detail = "${error::class.java.simpleName}: ${error.message.orEmpty()}"
-                if (detail != lastEnergyFailureKey) {
+            private fun processOrDefer(receipt: EnergyReceipt): com.bydcollector.collector.data.energy.EnergyProcessResult? =
+                synchronized(energyCoordinator) {
+                    if (store.hasDeferredEnergy()) {
+                        store.enqueueDeferredEnergy(receipt)
+                        deferredEnergyWorker.signal()
+                        return@synchronized null
+                    }
                     try {
-                        store.recordEvent("energy_processing_error", "Energy processing is unavailable; raw collection continues", detail)
-                        lastEnergyFailureKey = detail
-                    } catch (diagnosticError: Exception) {
-                        if (diagnosticError is InterruptedException) throw diagnosticError
+                        prepareEnergyProjection()
+                        energyCoordinator.process(receipt).also { lastEnergyFailureKey = null }
+                    } catch (error: Exception) {
+                        if (error is InterruptedException) throw error
+                        // The receipt must be durable before a helper replay may be ACKed.
+                        store.enqueueDeferredEnergy(receipt)
+                        deferredEnergyWorker.signal()
+                        val detail = "${error::class.java.simpleName}: ${error.message.orEmpty()}"
+                        if (detail != lastEnergyFailureKey) {
+                            runCatching { store.recordEvent("energy_processing_error",
+                                "Energy processing deferred; raw collection continues", detail) }
+                            lastEnergyFailureKey = detail
+                        }
+                        null
                     }
                 }
-                null
-            }
-
-            private fun finishEnergyAttempt(origin: PollOrigin) {
-                if (energyFailure == null) lastEnergyFailureKey = null
-                // Ordinary energy storage/projection faults are still retryable, not
-                // permission to ACK an unfinished shell sample. Core consumers ran first.
-                if (origin == PollOrigin.REPLAY) energyFailure?.let { throw it }
-            }
-
-            private fun prepareEnergyProjection() {
-                if (!energyHydrated) {
-                    energy.stageCurrentProjection()
-                    energyHydrated = true
-                }
-                // Pending domain state is portable across Main archive; drain before any newer receipt.
-                energy.pendingProjection()?.let(::persistEnergyProjection)
-            }
-
-            private fun persistEnergyProjection(
-                pending: com.bydcollector.collector.data.energy.EnergyPendingProjection
-            ) {
-                persistLocationObservations(
-                    com.bydcollector.collector.data.energy.EnergyTelemetryProjection.observations(pending.snapshot)
-                )
-                check(energy.confirmProjected(pending.snapshot.snapshotId)) {
-                    "Energy projection receipt changed"
-                }
-            }
 
             override fun onSuccessfulPoll(
                 sessionId: Long,
@@ -962,7 +970,6 @@ class CollectorService : Service() {
                 sessionId: Long, pollId: Long, timestamp: String, readings: List<PollReading>,
                 origin: PollOrigin, source: com.bydcollector.collector.data.polling.PollSampleSource
             ) {
-                energyFailure = null
                 if (origin == PollOrigin.LIVE) {
                     (applicationContext as BydCollectorApplication).scheduleHistoricalEnergyBackfill(historicalEnergyGeneration)
                 }
@@ -971,19 +978,23 @@ class CollectorService : Service() {
                     observedAt = timestamp,
                     readings = readings
                 )
-                val energyResult = energyAttempt {
-                    prepareEnergyProjection()
-                    energy.process(com.bydcollector.collector.data.energy.EnergyTelemetryProjection.receipt(
-                        source, timestamp, readings, observations
-                    ))
-                }?.takeUnless { it.stale }
+                val receipt = EnergyTelemetryProjection.receipt(source, timestamp, readings, observations)
+                val energyResult = processOrDefer(receipt)?.takeUnless { it.stale }
                 val energySnapshot = energyResult?.snapshot
                 // Inactive cursor-only receipts retain the final snapshot, but must not
                 // republish it as fresh and oscillate an expired Main value between OK/STALE.
                 val energyObservations = energyResult?.pendingProjection?.snapshot
                     ?.let(com.bydcollector.collector.data.energy.EnergyTelemetryProjection::observations).orEmpty()
                 val sourceResult = store.applySourcePollNormalization(pollId, timestamp, source, readings, vehicleStateNormalizer)
-                val energySummary = store.applyNormalizedObservations(energyObservations)
+                var energyProjectionWritten = false
+                val energySummary = try {
+                    store.applyNormalizedObservations(energyObservations).also { energyProjectionWritten = true }
+                } catch (error: Exception) {
+                    if (error is InterruptedException) throw error
+                    store.enqueueDeferredEnergy(receipt)
+                    deferredEnergyWorker.signal()
+                    NormalizedWriteSummary(0, 0, 0)
+                }
                 val summary = NormalizedWriteSummary(
                     observedCount = sourceResult.summary.observedCount + energySummary.observedCount,
                     changedCount = sourceResult.summary.changedCount + energySummary.changedCount,
@@ -991,9 +1002,13 @@ class CollectorService : Service() {
                     currentInsertedCount = sourceResult.summary.currentInsertedCount + energySummary.currentInsertedCount,
                     changedCategories = sourceResult.summary.changedCategories + energySummary.changedCategories
                 )
-                energyResult?.pendingProjection?.let {
-                    energyAttempt {
-                        check(energy.confirmProjected(it.snapshot.snapshotId)) { "Energy projection receipt changed" }
+                energyResult?.pendingProjection?.takeIf { energyProjectionWritten }?.let {
+                    try {
+                        check(energyCoordinator.confirmProjected(it.snapshot.snapshotId)) { "Energy projection receipt changed" }
+                    } catch (error: Exception) {
+                        if (error is InterruptedException) throw error
+                        store.enqueueDeferredEnergy(receipt)
+                        deferredEnergyWorker.signal()
                     }
                 }
                 val diagnosticPowerSession = CompletableFuture<String?>()
@@ -1027,7 +1042,6 @@ class CollectorService : Service() {
                     }
                 )
                 publishNormalizedWrite(summary, sourceResult.appliedObservations)
-                finishEnergyAttempt(origin)
             }
 
             override fun onSourceFailure(
@@ -1037,24 +1051,60 @@ class CollectorService : Service() {
                 origin: PollOrigin,
                 source: com.bydcollector.collector.data.polling.PollSampleSource
             ) {
-                energyFailure = null
                 if (origin == PollOrigin.LIVE) {
                     (applicationContext as BydCollectorApplication).scheduleHistoricalEnergyBackfill(historicalEnergyGeneration)
                 }
-                energyAttempt {
-                    prepareEnergyProjection()
-                    val energyResult = energy.process(
-                        com.bydcollector.collector.data.energy.EnergyTelemetryProjection.receipt(
-                            source = source,
-                            observedAt = timestamp,
-                            readings = emptyList(),
-                            observations = emptyList()
-                        )
-                    )
-                    if (!energyResult.stale) energyResult.pendingProjection?.let(::persistEnergyProjection)
+                val receipt = EnergyTelemetryProjection.receipt(source, timestamp, emptyList(), emptyList())
+                val result = processOrDefer(receipt)
+                if (result?.stale != true) result?.pendingProjection?.let {
+                    try { persistEnergyProjection(it) }
+                    catch (error: Exception) {
+                        if (error is InterruptedException) throw error
+                        store.enqueueDeferredEnergy(receipt)
+                        deferredEnergyWorker.signal()
+                    }
                 }
-                finishEnergyAttempt(origin)
             }
+        }
+    }
+
+    private fun prepareEnergyProjection() {
+        if (!energyHydrated) {
+            energyCoordinator.stageCurrentProjection()
+            energyHydrated = true
+        }
+        energyCoordinator.pendingProjection()?.let(::persistEnergyProjection)
+    }
+
+    private fun persistEnergyProjection(pending: com.bydcollector.collector.data.energy.EnergyPendingProjection) {
+        persistLocationObservations(EnergyTelemetryProjection.observations(pending.snapshot))
+        check(energyCoordinator.confirmProjected(pending.snapshot.snapshotId)) { "Energy projection receipt changed" }
+    }
+
+    private fun drainDeferredEnergy(): Boolean {
+        if (!running.get()) return false
+        return synchronized(energyCoordinator) {
+            val pending = (applicationContext as BydCollectorApplication).withDatabaseRead {
+                store.oldestDeferredEnergy(System.currentTimeMillis())
+            }
+            if (pending == null) {
+                val hasPending = (applicationContext as BydCollectorApplication).withDatabaseRead { store.hasDeferredEnergy() }
+                if (hasPending) Thread.sleep(1_000L)
+                return@synchronized hasPending
+            }
+            try {
+                prepareEnergyProjection()
+                val result = energyCoordinator.process(pending.receipt)
+                if (!result.stale) result.pendingProjection?.let(::persistEnergyProjection)
+                (applicationContext as BydCollectorApplication).withDatabaseRead { store.completeDeferredEnergy(pending.id) }
+            } catch (error: Exception) {
+                if (error is InterruptedException) throw error
+                (applicationContext as BydCollectorApplication).withDatabaseRead {
+                    store.deferEnergyRetry(pending.id, pending.retryCount, error, System.currentTimeMillis())
+                }
+                store.recordEvent("energy_deferred_retry", "Deferred energy projection will retry", error.diagnosticDetail())
+            }
+            true
         }
     }
 
@@ -1198,7 +1248,7 @@ class CollectorService : Service() {
             val telegramEnabled = settings.isTelegramEnabled()
             val runtimeDemand = settings.runtimeDemand()
             //stops the foreground service only after keep-alive settings have been mirrored to the shell delegate
-            if (!mainAllowed && !debugAllowed && !runtimeDemand.any) {
+            if (!mainAllowed && !debugAllowed && !runtimeDemand.any && kpiWorker?.isAlive != true) {
                 store.recordEvent("service_start_skipped", "No runtime channel is enabled")
                 stopMain("polling_disabled")
                 stopDebug("debug_disabled")
@@ -1208,7 +1258,7 @@ class CollectorService : Service() {
             val initialNotificationText = notificationText(mainAllowed, debugAllowed, keepAliveEnabled, telegramEnabled)
             lastNotificationText = initialNotificationText
             startForeground(NOTIFICATION_ID, buildNotification(initialNotificationText))
-            acquireWakeLock()
+            if (mainAllowed || debugAllowed || runtimeDemand.any) acquireWakeLock()
             //keeps network/bluetooth policy independent from whether telemetry polling itself is active
             keepAliveSupervisor.reconcile(
                 keepAliveConfig,
@@ -1824,6 +1874,8 @@ class CollectorService : Service() {
         unregisterTelegramNetworkCallback()
         runCatching { (applicationContext as BydCollectorApplication).updateRuntime.shutdown() }
         runCatching { (applicationContext as BydCollectorApplication).updateHints.shutdown() }
+        deferredEnergyWorker.requestStopAfterCurrentPage()
+        kpiWorker?.interrupt()
         stopMain("user_shutdown")
         stopDebug("user_shutdown")
     }
@@ -1836,7 +1888,7 @@ class CollectorService : Service() {
     }
 
     private fun performUserShutdown(token: String, previousToken: String?, deadlineElapsedMs: Long, listenerError: String?) {
-        val workers = Executors.newFixedThreadPool(14) { runnable ->
+        val workers = Executors.newFixedThreadPool(16) { runnable ->
             Thread(runnable, "byd-user-shutdown-worker").apply { isDaemon = true }
         }
         try {
@@ -1879,6 +1931,13 @@ class CollectorService : Service() {
             }
             val normalizerStop = workers.submit<Boolean> {
                 runCatching { callbackNormalizer.awaitStopped(remainingShutdownMs(deadlineElapsedMs)) }.getOrDefault(false)
+            }
+            val energyStop = workers.submit<Boolean> {
+                runCatching { deferredEnergyWorker.awaitStopped(remainingShutdownMs(deadlineElapsedMs)) }.getOrDefault(false)
+            }
+            val kpiStop = workers.submit<Boolean> {
+                val current = kpiWorker
+                runCatching { current?.join(remainingShutdownMs(deadlineElapsedMs)) }.isSuccess && current?.isAlive != true
             }
             val debugStop = workers.submit<Boolean> {
                 val stopped = runCatching {
@@ -1950,12 +2009,14 @@ class CollectorService : Service() {
             val mainIntakeStopped = completedFutureValue(mainIntakeStop, false)
             val secondaryIntakeStopped = completedFutureValue(secondaryIntakeStop, false)
             val normalizerStopped = completedFutureValue(normalizerStop, false)
+            val energyStopped = completedFutureValue(energyStop, false)
+            val kpiStopped = completedFutureValue(kpiStop, false)
             val debugStopped = completedFutureValue(debugStop, false)
             val recorderResult = completedFutureValue(logcatClose, null)
 
             val cutoverJournal = settings.storageCutoverJournal()
             val workerSummary = "poller=$pollerStopped main_callback=$mainIntakeStopped secondary_callback=$secondaryIntakeStopped " +
-                "normalizer=$normalizerStopped debug=$debugStopped mqtt=$mqttStopped influx=$influxStopped telegram=$telegramStopped " +
+                "normalizer=$normalizerStopped energy=$energyStopped kpi=$kpiStopped debug=$debugStopped mqtt=$mqttStopped influx=$influxStopped telegram=$telegramStopped " +
                 "helper_stop_accepted=$helperStopAccepted helper_graceful_exit=${result.output.contains("helper_forced=0")} " +
                 "raw_tail=unknown_if_helper_forced_or_shutdown_spill logcat_close_pending=${!logcatClose.isDone} " +
                 "cutover_journal_present=${cutoverJournal != null} cutover_phase=${cutoverJournal?.phase ?: "none"}"
@@ -2150,7 +2211,6 @@ class CollectorService : Service() {
             //publishes retained offline only after there was a real live mqtt runtime to retire
             disconnectOfflineAsync()
         }
-        clearDashboardVehicleKpis()
         if (!settings.isPollingEnabled() || settings.isMainManuallyStopped() || reason == "service_destroyed") {
             setMainRuntime(RuntimeActionStatus.STOPPED)
         } else if (poller.isRunning() && reason != "user_shutdown") {
@@ -2551,9 +2611,8 @@ class CollectorService : Service() {
     }
 
     private fun queueDashboardVehicleKpis(observations: List<NormalizedObservation>) {
-        val ownerSession = sessionId
         mainHandler.post {
-            if (!running.get() || !mainPollingRunning.get() || ownerSession != sessionId) return@post
+            if (!running.get() || !kpiPowerOn || settings.isUserShutdownRequested()) return@post
             val nowMs = SystemClock.elapsedRealtime()
             if (!kpiFreshness.accept(observations, nowMs)) return@post
             mainHandler.removeCallbacks(kpiStaleTask)
@@ -2575,6 +2634,7 @@ class CollectorService : Service() {
     }
 
     private fun publishVehicleKpisNow() {
+        if (!kpiPowerOn) return
         val nowMs = SystemClock.elapsedRealtime()
         val observations = kpiFreshness.freshObservations(nowMs)
         lastKpiPublishAtMs = nowMs
@@ -2595,6 +2655,81 @@ class CollectorService : Service() {
         lastKpiPublishAtMs = Long.MIN_VALUE
         kpiFreshness.clear()
         dashboardUiStateStore.clearVehicleKpis()
+    }
+
+    private fun startKpiWorker() {
+        if (kpiWorker?.isAlive == true) return
+        val worker = Thread({ runKpiLoop() }, "byd-kpi-reader").apply { isDaemon = true }
+        kpiWorker = worker
+        worker.start()
+    }
+
+    private fun runKpiLoop() {
+        val helper = DirectVehicleHelperClient()
+        val launcher = DirectTelemetryClient(applicationContext, helper = helper,
+            expectedOwnerMode = DirectHelperOwnerMode.APP_GAP_SPOOL, ensureStreamReady = { true })
+        val powerEntry = DirectFidRegistry.entries.first { it.key == "bodywork_power_level" }
+        val entries = DirectFidRegistry.entries.filter { it.key in NormalizedFieldCatalog.kpiSourceKeys }
+        val normalizer = VehicleStateNormalizer(NormalizedFieldCatalog.kpiFields)
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        var lastFault: String? = null
+        var lastFaultAt = Long.MIN_VALUE
+        try {
+            while (running.get() && !settings.isUserShutdownRequested()) {
+                try {
+                    val launchFailure = launcher.ensureHelperReady()
+                    if (launchFailure != null) error("${launchFailure.category}: ${launchFailure.message}")
+                    val power = helper.read(powerEntry)
+                    check(power.status == 0 && power.raw != null) {
+                        "KPI power read status=${power.status} ${power.error.orEmpty()}"
+                    }
+                    val on = power.raw > 0
+                    if (on != kpiPowerOn) {
+                        kpiPowerOn = on
+                        if (!on) mainHandler.post {
+                            mainHandler.removeCallbacks(kpiPublishTask)
+                            mainHandler.removeCallbacks(kpiStaleTask)
+                            kpiPublishScheduled = false
+                        }
+                    }
+                    if (on) {
+                        val batch = helper.readKpiBatch(entries)
+                        check(batch.diagnostics.status == 0 && batch.results.size == entries.size) {
+                            "KPI batch status=${batch.diagnostics.status} ${batch.diagnostics.error.orEmpty()}"
+                        }
+                        if (powerManager.isInteractive) {
+                            val snapshot = DirectAutoserviceSnapshot(entries.zip(batch.results).map { (entry, result) ->
+                                DirectAutoserviceField(entry, result.status, result.raw,
+                                    result.raw?.let { DirectValueDecoders.decode(entry, it) }, result.error, result.callbackSource)
+                            }, batch.diagnostics)
+                            val wall = System.currentTimeMillis()
+                            val elapsed = SystemClock.elapsedRealtime()
+                            val stamp = NormalizedSourceStamp(NormalizedSourceKind.POLL, "kpi:$elapsed",
+                                com.bydcollector.collector.data.polling.LivePollSource.liveBootId,
+                                null, null, wall, elapsed)
+                            val observations = normalizer.normalize(0L, Instant.ofEpochMilli(wall).toString(), snapshot.readings)
+                                .map { it.copy(sourceStamp = stamp) }
+                            queueDashboardVehicleKpis(observations)
+                        }
+                    }
+                    lastFault = null
+                    Thread.sleep(if (on && powerManager.isInteractive) 1_000L else 2_000L)
+                } catch (interrupted: InterruptedException) {
+                    throw interrupted
+                } catch (error: Exception) {
+                    val detail = error.diagnosticDetail()
+                    val now = SystemClock.elapsedRealtime()
+                    if (detail != lastFault || lastFaultAt == Long.MIN_VALUE || now - lastFaultAt >= 30_000L) {
+                        runCatching { store.recordEvent("kpi_reader_error", "Independent KPI read failed", detail) }
+                        lastFault = detail
+                        lastFaultAt = now
+                    }
+                    Thread.sleep(5_000L)
+                }
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
     }
 
     private fun scheduleDashboardCountBootstrap(force: Boolean) {
@@ -2738,6 +2873,15 @@ class CollectorService : Service() {
 
     private fun stopRuntimeForMaintenance(operation: DbMaintenanceOperation) {
         check(!isRuntimeOwner()) { "Database maintenance must not wait for workers on the main handler" }
+        if (operation != DbMaintenanceOperation.DEBUG_ARCHIVE) {
+            // An unresolved receipt belongs to this Main DB; never archive it away from the live energy worker.
+            check(!store.hasDeferredEnergy()) { "Deferred energy work is pending; retry Main archive after recovery" }
+            check(deferredEnergyWorker.stopAndJoin(2_000L)) { "Deferred energy worker did not stop" }
+            kpiWorker?.interrupt()
+            kpiWorker?.join(2_000L)
+            check(kpiWorker?.isAlive != true) { "KPI worker did not stop" }
+            check(!store.hasDeferredEnergy()) { "Deferred energy work appeared during archive preparation" }
+        }
         val detached = runOnRuntimeOwnerBlocking {
             prepareRuntimeStopForMaintenance(operation)
         }
@@ -2760,6 +2904,9 @@ class CollectorService : Service() {
         ) {
             maintenanceRuntimeRestoreAllowed.set(false)
             error("Callback workers did not stop for database maintenance")
+        }
+        if (operation != DbMaintenanceOperation.DEBUG_ARCHIVE) {
+            check(!store.hasDeferredEnergy()) { "Deferred energy work became pending; retry Main archive after recovery" }
         }
         if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
             prepareSecondaryArchive(detached.secondaryWasRunning)
@@ -2915,6 +3062,8 @@ class CollectorService : Service() {
                 }
                 return
             }
+            if (!deferredEnergyWorker.isRunning()) check(deferredEnergyWorker.start())
+            startKpiWorker()
             settings.setPollingEnabled(snapshot.mainEnabled)
             settings.setDebugPollingEnabled(snapshot.debugEnabled)
             settings.setMqttEnabled(snapshot.mqttEnabled)
@@ -2950,6 +3099,8 @@ class CollectorService : Service() {
         influxCoordinator = createInfluxCoordinator()
         telegramCoordinator = createTelegramCoordinator()
         poller = createTelemetryPoller()
+        if (!deferredEnergyWorker.isRunning()) check(deferredEnergyWorker.start())
+        startKpiWorker()
         lastDatabaseFootprintAtMs = Long.MIN_VALUE
         scheduleDashboardCountBootstrap(force = true)
         scheduleDatabaseFootprintRefresh(force = true)
@@ -3562,6 +3713,7 @@ class CollectorService : Service() {
 
     private fun stopIfNoActiveRuntime() {
         if (settings.isUserShutdownRequested() || userShutdownCoordinatorActive.get()) return
+        if (kpiWorker?.isAlive == true) return
         val liveness = currentRuntimeLiveness()
         if (liveness.active) return
         if (!settings.runtimeDemand().requiresPersistentOwner) {
@@ -3588,7 +3740,6 @@ class CollectorService : Service() {
         sessionId = null
         DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_MAIN)
         setMainRuntime(RuntimeActionStatus.ERROR)
-        clearDashboardVehicleKpis()
         updateNotification("Polling error: ${PollingErrorSummaries.summary("service_start_error")}")
     }
 

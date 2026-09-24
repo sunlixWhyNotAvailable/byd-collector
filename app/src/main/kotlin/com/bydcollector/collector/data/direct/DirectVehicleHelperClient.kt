@@ -59,28 +59,36 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
         } ?: DirectHelperReadResult(status = STATUS_NO_BINDER, raw = null, error = "helper binder unavailable")
     }
 
-    override fun readBatch(entries: List<DirectFidEntry>): DirectHelperBatchResult {
+    override fun readBatch(entries: List<DirectFidEntry>): DirectHelperBatchResult = readBatchInternal(entries, false)
+
+    fun readKpiBatch(entries: List<DirectFidEntry>): DirectHelperBatchResult = readBatchInternal(entries, true)
+
+    private fun readBatchInternal(entries: List<DirectFidEntry>, kpi: Boolean): DirectHelperBatchResult {
         if (entries.isEmpty() || entries.size > CollectorHelperProtocol.MAX_BATCH_SIZE) {
             return batchFailure(entries.size, STATUS_CLIENT_ERROR, "invalid batch size: ${entries.size}")
         }
         return synchronized(lock) {
-            val owner = DirectStreamController.credentials(CollectorHelperProtocol.STREAM_MAIN)
-                ?: return@synchronized batchFailure(entries.size, CollectorHelperProtocol.STATUS_STALE_TOKEN, "Main stream is not claimed")
+            val owner = if (kpi) null else DirectStreamController.credentials(CollectorHelperProtocol.STREAM_MAIN)
+            if (!kpi && owner == null) return@synchronized batchFailure(entries.size,
+                CollectorHelperProtocol.STATUS_STALE_TOKEN, "Main stream is not claimed")
             val binder = ensureBinder()
                 ?: return@synchronized batchFailure(entries.size, STATUS_NO_BINDER, "helper binder unavailable")
             val data = Parcel.obtain()
             val reply = Parcel.obtain()
             try {
                 data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
-                data.writeLong(owner.controllerToken)
-                data.writeLong(owner.epoch)
+                if (!kpi) {
+                    data.writeLong(requireNotNull(owner).controllerToken)
+                    data.writeLong(owner.epoch)
+                }
                 data.writeInt(entries.size)
                 entries.forEach { entry ->
                     data.writeInt(entry.tx)
                     data.writeInt(entry.dev)
                     data.writeInt(entry.fid)
                 }
-                if (!binder.transact(CollectorHelperProtocol.TX_READ_BATCH, data, reply, 0)) {
+                if (!binder.transact(if (kpi) CollectorHelperProtocol.TX_KPI_READ_BATCH else CollectorHelperProtocol.TX_READ_BATCH,
+                        data, reply, 0)) {
                     cached = null
                     return@synchronized batchFailure(entries.size, STATUS_TRANSACT_FALSE, "batch transact returned false")
                 }
@@ -285,10 +293,12 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
             require(lossMarker in 0..1) { "invalid callback loss marker" }
             val loss = if (lossMarker == 1) CallbackLoss(reply.readLong(), reply.readLong(), reply.readLong(), reply.readString() ?: error("missing loss reason")) else null
             val error = reply.readString()
+            val liveRetainedBytes = reply.readLong()
             require(footprint >= 0 && ready >= 0 && bad >= 0 && reply.dataAvail() == 0 &&
+                liveRetainedBytes >= 0 &&
                 (loss == null || (loss.count > 0 && loss.firstWallMs >= 0 && loss.lastWallMs >= loss.firstWallMs && loss.reason.length <= 128))
             ) { "invalid callback status reply" }
-            CallbackSpoolStatus(status, footprint, ready, bad, loss, error)
+            CallbackSpoolStatus(status, footprint, ready, bad, loss, error, liveRetainedBytes)
         } catch (error: DeadObjectException) {
             cached = null; CallbackSpoolStatus(STATUS_DEAD_OBJECT, error = error.message ?: "dead binder")
         } catch (error: Exception) {

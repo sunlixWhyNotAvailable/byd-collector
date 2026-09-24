@@ -6,7 +6,7 @@ import java.util.List;
 
 /** Bounded, allocation-only callback-thread handoff. It performs no filesystem or SQL work. */
 public final class TelemetryCallbackQueue {
-    public static final long MAX_RETAINED_BYTES = 4L * 1024L * 1024L;
+    public static final long MAX_RETAINED_BYTES = 16L * 1024L * 1024L;
     private static final long BATCH_OVERHEAD_BYTES = 1024L;
 
     private final int stream;
@@ -41,7 +41,7 @@ public final class TelemetryCallbackQueue {
         return offerDetailed(event, epoch, 0L);
     }
 
-    /** reservedTransportBytes charges the currently retained live Binder batch to the same 4 MiB cap. */
+    /** Charge retained Binder batches against the same 16 MiB per-stream RAM cap. */
     public synchronized OfferResult offerDetailed(TelemetryCallbackBatch.Event event, long epoch, long reservedTransportBytes) {
         if (event == null) throw new IllegalArgumentException("callback event is required");
         if (epoch < 0) throw new IllegalArgumentException("negative callback epoch");

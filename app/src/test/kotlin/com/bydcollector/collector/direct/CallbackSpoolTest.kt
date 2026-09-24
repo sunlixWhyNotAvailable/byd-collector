@@ -153,7 +153,7 @@ class CallbackSpoolTest {
         }
     }
 
-    @Test fun newerBatchCannotPersistAheadOfOlderLiveBatch() {
+    @Test fun healthyBatchesStayInMemoryThenExpireToDiskInOrder() {
         val mainRoot = Files.createTempDirectory("callback-live-main").toFile()
         val secondaryRoot = Files.createTempDirectory("callback-live-secondary").toFile()
         val main = CallbackSpool.openForTest(mainRoot, 128 * 1024L)
@@ -162,8 +162,12 @@ class CallbackSpoolTest {
             val older = batch(1, 1)
             val newer = batch(2, 2)
             assertEquals(CallbackSpool.AppendResult.SUCCESS, transport.deliver(older, true))
-            assertTrue(transport.liveRetainedBytes(1) > 0)
+            val retained = transport.liveRetainedBytes(1)
+            assertTrue(retained > 0)
             assertEquals(CallbackSpool.AppendResult.SUCCESS, transport.deliver(newer, true))
+            assertTrue(transport.liveRetainedBytes(1) > retained)
+            assertNull(main.oldest())
+            transport.spillExpired(1, System.nanoTime() / 1_000_000L + 5_001L)
             assertEquals(0, transport.liveRetainedBytes(1))
             assertEquals(older.identity(), main.oldest()!!.identity)
             main.acknowledge(main.oldest()!!)

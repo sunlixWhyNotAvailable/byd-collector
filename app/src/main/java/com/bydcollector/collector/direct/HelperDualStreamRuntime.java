@@ -273,6 +273,14 @@ final class HelperDualStreamRuntime implements AutoCloseable {
         }
     }
 
+    CollectorHelperDaemon.BatchResult readKpi(List<CollectorHelperDaemon.Address> rows) {
+        try {
+            return vendor.call(true, () -> CollectorHelperDaemon.BatchEngine.run(rows, scalarReader, nativeReader));
+        } catch (Throwable error) {
+            return rejected(rows.size(), CollectorHelperProtocol.STATUS_READ_ERROR, describe(error));
+        }
+    }
+
     CollectorHelperDaemon.BatchResult readSecondary(long token, long epoch, String catalogVersion) {
         if (!secondaryCatalogVersion.equals(catalogVersion)) {
             return rejected(secondaryRows.size(), CollectorHelperProtocol.STATUS_INVALID_REQUEST,

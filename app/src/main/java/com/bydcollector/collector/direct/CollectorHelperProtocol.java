@@ -8,7 +8,7 @@ public final class CollectorHelperProtocol {
     public static final String SPOOL_MODE_ARG = "spool";
     public static final String LOG_PATH = "/data/local/tmp/bydcollector_helper.log";
     public static final String LOCK_PATH = "/data/local/tmp/bydcollector_helper.lock";
-    public static final int PROTOCOL_VERSION = 13;
+    public static final int PROTOCOL_VERSION = 14;
     public static final int TX_PING = 1;
     public static final int TX_READ = 2;
     public static final int TX_READ_BATCH = 3;
@@ -25,6 +25,7 @@ public final class CollectorHelperProtocol {
     public static final int TX_CALLBACK_ACK = 14;
     public static final int TX_CALLBACK_STATUS = 15;
     public static final int TX_CALLBACK_QUARANTINE = 16;
+    public static final int TX_KPI_READ_BATCH = 17;
     public static final int STREAM_MAIN = 1;
     public static final int STREAM_SECONDARY = 2;
     public static final int CONTROL_CLAIM = 1;
