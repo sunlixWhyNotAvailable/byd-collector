@@ -1,6 +1,8 @@
 package com.bydcollector.collector.ui
 
 import com.bydcollector.collector.data.local.CollectorEvent
+import com.bydcollector.collector.data.callback.CallbackQueuePhase
+import com.bydcollector.collector.data.callback.CallbackQueueState
 import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.ArchiveStorageSnapshot
 import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
@@ -13,6 +15,25 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class DashboardUiStateStoreTest {
+    @Test
+    fun liveQueuesStayIndependentAndSurviveAnOlderDatabaseSnapshot() {
+        val store = DashboardUiStateStore { 1L }
+        store.seed(dashboardState("initial"))
+        val main = CallbackQueueState(CallbackQueuePhase.HEALTHY, null)
+        val secondary = CallbackQueueState(CallbackQueuePhase.CATCHING_UP, "pending_head_age")
+        store.publishRuntimeFlags(DashboardRuntimeFlags(
+            serviceRunning = true, mainPollingRunning = true, debugPollingRunning = true,
+            pollingEnabled = true, debugPollingEnabled = true, mqttEnabled = false, influxEnabled = false,
+            permissionsGranted = true, adbAuthorized = true, dbMaintenanceStatus = DbMaintenanceRuntimeStatus(),
+            archiveStorageJobStatus = ArchiveStorageJobStatus(), mainCallbackQueue = main, secondaryCallbackQueue = secondary))
+        val generation = store.beginChromeRefresh()
+        store.publishChrome(generation, dashboardState("stale database"))
+        assertEquals(main, store.currentChrome()?.mainCallbackQueue)
+        assertEquals(secondary, store.currentChrome()?.secondaryCallbackQueue)
+        assertEquals(main, store.currentTab(AppTab.MAIN)?.mainCallbackQueue)
+        assertEquals(secondary, store.currentTab(AppTab.ALL_PARAMETERS)?.secondaryCallbackQueue)
+    }
+
     @Test
     fun backgroundAccessCheckSurvivesReopeningAndStaleServiceFlags() {
         val store = DashboardUiStateStore { 1L }

@@ -15,11 +15,16 @@ import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.Base64;
 
@@ -47,6 +52,9 @@ final class TelemetryWorkerSpool implements AutoCloseable {
     private DiagnosticListener diagnostics = NO_DIAGNOSTICS;
     private Footprint capacityBlockedFootprint;
     private String pendingBootId;
+    // Ready records are immutable. Keep only ordering metadata, never their value arrays.
+    private final Map<String, PendingRecord> pendingRecords = new HashMap<String, PendingRecord>();
+    private long decodedRecordCount;
     private boolean closed;
 
     static TelemetryWorkerSpool open() {
@@ -122,6 +130,7 @@ final class TelemetryWorkerSpool implements AutoCloseable {
             rootState.noteFile(temporary);
             Files.move(temporary.toPath(), ready.toPath(), StandardCopyOption.ATOMIC_MOVE);
             rootState.noteRename(temporary, ready);
+            pendingRecords.remove(ready.getName());
             capacityBlockedFootprint = null;
             Footprint appended = footprint.plus(payload.length, 1);
             notifyAppend(AppendResult.SUCCESS, appended);
@@ -173,69 +182,119 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         if (limit < 1 || limit > CollectorHelperProtocol.MAX_PENDING_WORKER_SAMPLES) {
             throw new IllegalArgumentException("invalid pending sample limit: " + limit);
         }
+        refreshPendingRecords();
+        int reorderedPages = 0;
+        while (!pendingRecords.isEmpty()) {
+            List<PendingRecord> records = new ArrayList<PendingRecord>(pendingRecords.values());
+            Collections.sort(records, WALL_ORDER);
+
+            // Pin one boot across pages; within it wall-clock corrections must not reorder samples.
+            if (pendingBootId == null || !containsBoot(records, pendingBootId)) {
+                pendingBootId = records.get(0).identity.bootId;
+            }
+            List<PendingRecord> selected = new ArrayList<PendingRecord>();
+            for (PendingRecord record : records) {
+                if (record.identity.bootId.equals(pendingBootId)) selected.add(record);
+            }
+            Collections.sort(selected, ELAPSED_ORDER);
+            List<Sample> result = new ArrayList<Sample>(Math.min(limit, selected.size()));
+            boolean reordered = false;
+            for (PendingRecord record : selected) {
+                if (result.size() == limit) break;
+                try {
+                    Sample sample = readPendingSample(record.file);
+                    // Validation belongs to this request: backlog probes and replay use different validators.
+                    validator.validate(sample);
+                    pendingRecords.put(record.file.getName(), new PendingRecord(record.file, attributes(record.file), sample));
+                    if (!record.sameOrder(sample)) {
+                        reordered = true;
+                        break;
+                    }
+                    result.add(sample);
+                } catch (Exception error) {
+                    quarantine(record.file);
+                }
+            }
+            if (reordered) {
+                // Fail closed if an external writer keeps changing a page underneath this reader.
+                if (++reorderedPages > 3) throw new IllegalStateException("telemetry spool ordering changed repeatedly during pending read");
+                continue;
+            }
+            if (!result.isEmpty()) return result;
+            // All records in this boot were rejected; do not report false-empty while another boot remains.
+            pendingBootId = null;
+        }
+        pendingBootId = null;
+        return Collections.emptyList();
+    }
+
+    private void refreshPendingRecords() {
         File[] files = directory.listFiles((dir, name) -> name.endsWith(READY_SUFFIX));
         if (files == null) {
             IllegalStateException error = new IllegalStateException("cannot list telemetry worker spool: " + directory);
             notifyPersistenceFailure("pending", error);
             throw error;
         }
-        List<PendingRecord> records = new ArrayList<PendingRecord>();
+        Set<String> seen = new HashSet<String>();
         for (File file : files) {
             if (!file.isFile()) continue;
+            seen.add(file.getName());
             try {
-                Sample sample = decode(readBytes(file));
-                if (!file.equals(readyFile(sample.recordVersion, sample.identity))) throw new IllegalArgumentException("record filename does not match identity");
-                validator.validate(sample);
-                records.add(new PendingRecord(file, sample));
+                BasicFileAttributes signature = attributes(file);
+                PendingRecord previous = pendingRecords.get(file.getName());
+                if (previous == null || !previous.matches(signature)) {
+                    pendingRecords.put(file.getName(), new PendingRecord(file, signature, readPendingSample(file)));
+                }
             } catch (Exception error) {
                 quarantine(file);
             }
         }
-        Collections.sort(records, new Comparator<PendingRecord>() {
-            @Override public int compare(PendingRecord left, PendingRecord right) {
-                int result = compareLong(left.sample.capturedWallMs, right.sample.capturedWallMs);
-                if (result != 0) return result;
-                result = compareLong(left.sample.capturedElapsedMs, right.sample.capturedElapsedMs);
-                if (result != 0) return result;
-                result = left.sample.identity.bootId.compareTo(right.sample.identity.bootId);
-                if (result != 0) return result;
-                result = left.sample.identity.helperGeneration.compareTo(right.sample.identity.helperGeneration);
-                if (result != 0) return result;
-                return compareLong(left.sample.identity.pollSequence, right.sample.identity.pollSequence);
-            }
-        });
-
-        // Wall time establishes order only between boot epochs. Once a boot is selected,
-        // keep draining it across bounded pending()/ACK batches and use its monotonic clock.
-        // Mixing conditional wall/elapsed comparisons in one comparator would be non-transitive.
-        if (pendingBootId == null || !containsBoot(records, pendingBootId)) {
-            pendingBootId = records.isEmpty() ? null : records.get(0).sample.identity.bootId;
-        }
-        List<PendingRecord> selected = new ArrayList<PendingRecord>();
-        for (PendingRecord record : records) {
-            if (record.sample.identity.bootId.equals(pendingBootId)) selected.add(record);
-        }
-        Collections.sort(selected, new Comparator<PendingRecord>() {
-            @Override public int compare(PendingRecord left, PendingRecord right) {
-                int result = compareLong(left.sample.capturedElapsedMs, right.sample.capturedElapsedMs);
-                if (result != 0) return result;
-                result = left.sample.identity.helperGeneration.compareTo(right.sample.identity.helperGeneration);
-                if (result != 0) return result;
-                result = compareLong(left.sample.identity.pollSequence, right.sample.identity.pollSequence);
-                if (result != 0) return result;
-                return compareLong(left.sample.capturedWallMs, right.sample.capturedWallMs);
-            }
-        });
-        List<Sample> result = new ArrayList<Sample>(Math.min(limit, selected.size()));
-        for (int index = 0; index < selected.size() && index < limit; index++) {
-            result.add(selected.get(index).sample);
-        }
-        return result;
+        pendingRecords.keySet().retainAll(seen);
     }
+
+    private static BasicFileAttributes attributes(File file) throws IOException {
+        return Files.readAttributes(file.toPath(), BasicFileAttributes.class);
+    }
+
+    private Sample readPendingSample(File file) throws Exception {
+        decodedRecordCount++;
+        Sample sample = decode(readBytes(file));
+        if (!file.equals(readyFile(sample.recordVersion, sample.identity))) {
+            throw new IllegalArgumentException("record filename does not match identity");
+        }
+        return sample;
+    }
+
+    synchronized long decodedRecordCountForTest() { return decodedRecordCount; }
+
+    private static final Comparator<PendingRecord> WALL_ORDER = new Comparator<PendingRecord>() {
+            @Override public int compare(PendingRecord left, PendingRecord right) {
+                int result = compareLong(left.capturedWallMs, right.capturedWallMs);
+                if (result != 0) return result;
+                result = compareLong(left.capturedElapsedMs, right.capturedElapsedMs);
+                if (result != 0) return result;
+                result = left.identity.bootId.compareTo(right.identity.bootId);
+                if (result != 0) return result;
+                result = left.identity.helperGeneration.compareTo(right.identity.helperGeneration);
+                if (result != 0) return result;
+                return compareLong(left.identity.pollSequence, right.identity.pollSequence);
+            }
+        };
+    private static final Comparator<PendingRecord> ELAPSED_ORDER = new Comparator<PendingRecord>() {
+            @Override public int compare(PendingRecord left, PendingRecord right) {
+                int result = compareLong(left.capturedElapsedMs, right.capturedElapsedMs);
+                if (result != 0) return result;
+                result = left.identity.helperGeneration.compareTo(right.identity.helperGeneration);
+                if (result != 0) return result;
+                result = compareLong(left.identity.pollSequence, right.identity.pollSequence);
+                if (result != 0) return result;
+                return compareLong(left.capturedWallMs, right.capturedWallMs);
+            }
+        };
 
     private static boolean containsBoot(List<PendingRecord> records, String bootId) {
         for (PendingRecord record : records) {
-            if (record.sample.identity.bootId.equals(bootId)) return true;
+            if (record.identity.bootId.equals(bootId)) return true;
         }
         return false;
     }
@@ -274,6 +333,7 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         AckResult result;
         if (ready.delete()) {
             rootState.noteDelete(ready);
+            pendingRecords.remove(ready.getName());
             capacityBlockedFootprint = null;
             result = AckResult.released(recordBytes);
         } else {
@@ -286,6 +346,7 @@ final class TelemetryWorkerSpool implements AutoCloseable {
 
     @Override public synchronized void close() {
         closed = true;
+        pendingRecords.clear();
     }
 
     private void ensureOpen() {
@@ -460,6 +521,7 @@ final class TelemetryWorkerSpool implements AutoCloseable {
     }
 
     private void quarantine(File file) {
+        pendingRecords.remove(file.getName());
         long recordBytes = file.length();
         File bad = new File(file.getPath() + BAD_SUFFIX);
         int suffix = 1;
@@ -508,11 +570,33 @@ final class TelemetryWorkerSpool implements AutoCloseable {
 
     private static final class PendingRecord {
         final File file;
-        final Sample sample;
+        final long size;
+        final FileTime modified;
+        final Object fileKey;
+        final int recordVersion;
+        final TelemetryWorkerSampleIdentity identity;
+        final long capturedWallMs;
+        final long capturedElapsedMs;
 
-        PendingRecord(File file, Sample sample) {
+        PendingRecord(File file, BasicFileAttributes signature, Sample sample) {
             this.file = file;
-            this.sample = sample;
+            this.size = signature.size();
+            this.modified = signature.lastModifiedTime();
+            this.fileKey = signature.fileKey();
+            this.recordVersion = sample.recordVersion;
+            this.identity = sample.identity;
+            this.capturedWallMs = sample.capturedWallMs;
+            this.capturedElapsedMs = sample.capturedElapsedMs;
+        }
+
+        boolean matches(BasicFileAttributes signature) {
+            return size == signature.size() && modified.equals(signature.lastModifiedTime()) &&
+                Objects.equals(fileKey, signature.fileKey());
+        }
+
+        boolean sameOrder(Sample sample) {
+            return recordVersion == sample.recordVersion && identity.equals(sample.identity) &&
+                capturedWallMs == sample.capturedWallMs && capturedElapsedMs == sample.capturedElapsedMs;
         }
     }
 

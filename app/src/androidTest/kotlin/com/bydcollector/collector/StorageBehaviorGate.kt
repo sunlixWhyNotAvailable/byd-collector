@@ -3,15 +3,22 @@ package com.bydcollector.collector
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteException
+import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.local.*
 import com.bydcollector.collector.data.trips.*
 import com.bydcollector.collector.diagnostics.OperationalEventJournal
 import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
+import com.bydcollector.collector.maintenance.ArchiveStorageManager
+import com.bydcollector.collector.maintenance.DatabaseArchiveManager
+import com.bydcollector.collector.maintenance.DbMaintenanceOperation
+import com.bydcollector.collector.maintenance.StorageFormatCutoverCoordinator
 import com.bydcollector.collector.util.sharedOperationalEventExecutor
 import java.io.File
+import java.security.MessageDigest
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import java.util.zip.ZipFile
 import kotlin.concurrent.thread
 
 /** Failure injection uses actual production stores, not copies of their SQL. */
@@ -20,9 +27,228 @@ internal object StorageBehaviorGate {
         "main_worker_import_rollback_and_reopen" to { workerImport(context, prefix) },
         "diagnostic_event_does_not_wait_for_sqlite" to { eventDuringWriteLock(context, prefix) },
         "diagnostic_close_serializes_active_and_queued_writers" to { diagnosticClose(context, prefix) },
+        "per_database_maintenance_keeps_sibling_commits_live" to { maintenanceIsolation(context, prefix) },
+        "archive_storage_default_verifier_compact_families" to { archiveStorageDefaultVerifier(context, prefix) },
+        "archive_busy_full_and_create_failure_preserve_evidence" to { archiveFailureSafety(context, prefix) },
         "trip_completion_atomic_close_and_exact_ack" to { tripCompletion(context, prefix) },
         "telegram_atomic_outbox_state_and_delivery" to { telegramTransactions(context, prefix) }
     )
+
+    private fun archiveFailureSafety(context: Context, prefix: String) {
+        val root = File(context.cacheDir, "${prefix}_archive_failures")
+        check(root.mkdirs())
+        val file = File(root, "evidence.db")
+        SQLiteDatabase.openOrCreateDatabase(file, null).use { database ->
+            check(database.enableWriteAheadLogging())
+            database.execSQL("CREATE TABLE evidence(value BLOB)")
+            database.execSQL("INSERT INTO evidence VALUES (X'01')")
+            database.beginTransactionNonExclusive()
+            try {
+                database.execSQL("INSERT INTO evidence VALUES (X'02')")
+                check(!StorageFormatCutoverCoordinator.checkpointDatabase(file)) {
+                    "Busy checkpoint must not report success"
+                }
+            } finally { database.endTransaction() }
+            check(count(database, "evidence") == 1L)
+            // Pin the primary connection: outside a transaction this PRAGMA can
+            // configure a WAL reader instead of the connection doing the insert.
+            database.beginTransactionNonExclusive()
+            try {
+                val pages = database.rawQuery("PRAGMA page_count", null).use {
+                    check(it.moveToFirst()); it.getLong(0)
+                }
+                val limit = pages * database.pageSize
+                check(database.setMaximumSize(limit) == limit)
+                database.setTransactionSuccessful()
+            } finally { database.endTransaction() }
+            val failure = runCatching { database.execSQL("INSERT INTO evidence VALUES (zeroblob(4194304))") }.exceptionOrNull()
+            check(failure is android.database.sqlite.SQLiteFullException) {
+                "Expected bounded-page SQLITE_FULL, got $failure"
+            }
+            check(count(database, "evidence") == 1L) { "Failed write altered committed evidence" }
+        }
+        check(StorageFormatCutoverCoordinator.checkpointDatabase(file))
+        val archived = DatabaseArchiveManager.archive(file, File(root, "archives"), "failure_gate")
+        check(archived.ok && !file.exists())
+        // A directory at the replacement path forces real SQLite open/create failure,
+        // without filling the emulator's disk or touching any active app database.
+        check(file.mkdir())
+        try {
+            check(runCatching { SQLiteDatabase.openOrCreateDatabase(file, null).close() }.exceptionOrNull() is SQLiteException)
+            check(archived.movedFiles.all { it.isFile })
+        } finally { check(file.delete()) }
+        check(DatabaseArchiveManager.restore(file, archived.movedFiles))
+        SQLiteDatabase.openDatabase(file.path, null, SQLiteDatabase.OPEN_READONLY).use { restored ->
+            check(count(restored, "evidence") == 1L)
+            restored.rawQuery("PRAGMA quick_check", null).use {
+                check(it.moveToFirst() && it.getString(0) == "ok")
+            }
+        }
+    }
+
+    private fun archiveStorageDefaultVerifier(context: Context, prefix: String) {
+        val testRoot = File(context.cacheDir, "${prefix}_archive_default_verifier")
+        val archiveRoot = File(testRoot, "archives")
+        check(archiveRoot.mkdirs() || archiveRoot.isDirectory)
+        val mainActive = File(testRoot, "${prefix}_main_active.db")
+        val secondaryActive = File(testRoot, DirectDebugDatabaseHelper.DATABASE_NAME)
+        createCompactArchiveFixture(context, mainActive, main = true)
+        createCompactArchiveFixture(context, secondaryActive, main = false)
+        val activeContentBefore = listOf(mainActive, secondaryActive)
+            .associate { it.absolutePath to sqliteFileSetDigest(it) }
+
+        // No verifier override: exercise ArchiveStorageManager's production default against
+        // compact schemas created by the real SQLiteOpenHelper implementations.
+        val manager = ArchiveStorageManager(
+            archiveRoot = archiveRoot,
+            mainDatabaseFile = mainActive,
+            debugDatabaseFile = secondaryActive,
+            tripsDatabaseFile = File(testRoot, "${prefix}_trips.db")
+        )
+        val validMain = File(archiveRoot, "${ArchiveStorageManager.MAIN_ARCHIVE_PREFIX}${prefix}_valid")
+        val validSecondary = File(archiveRoot, "${ArchiveStorageManager.DEBUG_ARCHIVE_PREFIX}${prefix}_valid")
+        copySqliteFileSet(mainActive, validMain)
+        copySqliteFileSet(secondaryActive, validSecondary)
+
+        for (rawArchive in listOf(validMain, validSecondary)) {
+            check(manager.compressRawArchiveDirectory(rawArchive)) {
+                "Default verifier rejected compact archive ${rawArchive.name}"
+            }
+            check(!rawArchive.exists()) { "Verified raw archive was not deleted: ${rawArchive.name}" }
+            val zip = File(archiveRoot, "${rawArchive.name}.zip")
+            check(zip.isFile) { "Verified archive ZIP is missing: ${rawArchive.name}" }
+            ZipFile(zip).use { archive ->
+                val marker = checkNotNull(archive.getEntry(ArchiveStorageManager.ARCHIVE_VERIFICATION_MARKER))
+                val state = archive.getInputStream(marker).bufferedReader(Charsets.UTF_8).use { it.readLine() }
+                check(state == "state=PASSED") { "ZIP did not retain the successful audit marker: ${rawArchive.name}" }
+            }
+        }
+
+        val invalidMain = File(archiveRoot, "${ArchiveStorageManager.MAIN_ARCHIVE_PREFIX}${prefix}_invalid")
+        val invalidSecondary = File(archiveRoot, "${ArchiveStorageManager.DEBUG_ARCHIVE_PREFIX}${prefix}_invalid")
+        copySqliteFileSet(mainActive, invalidMain)
+        copySqliteFileSet(secondaryActive, invalidSecondary)
+        for ((rawArchive, databaseName) in listOf(
+            invalidMain to mainActive.name,
+            invalidSecondary to secondaryActive.name
+        )) {
+            File(rawArchive, databaseName).writeText("not a SQLite database", Charsets.UTF_8)
+            check(!manager.compressRawArchiveDirectory(rawArchive)) {
+                "Default verifier accepted unrecognized archive ${rawArchive.name}"
+            }
+            check(rawArchive.isDirectory) { "Failed raw archive was removed: ${rawArchive.name}" }
+            check(!File(archiveRoot, "${rawArchive.name}.zip").exists()) {
+                "Failed archive produced a ZIP: ${rawArchive.name}"
+            }
+            val marker = File(rawArchive, ArchiveStorageManager.ARCHIVE_VERIFICATION_MARKER)
+            val markerText = marker.readText(Charsets.UTF_8)
+            check("state=FAILED" in markerText && "error=archive_verification_unavailable:format" in markerText) {
+                "Failed archive marker did not preserve the verifier result: ${rawArchive.name}"
+            }
+        }
+
+        assertArchiveFixtureEvidence(mainActive, main = true)
+        assertArchiveFixtureEvidence(secondaryActive, main = false)
+        val activeContentAfter = listOf(mainActive, secondaryActive)
+            .associate { it.absolutePath to sqliteFileSetDigest(it) }
+        check(activeContentAfter == activeContentBefore) { "Archive verification changed an active database file set" }
+    }
+
+    private fun createCompactArchiveFixture(context: Context, databaseFile: File, main: Boolean) {
+        check(databaseFile.parentFile?.mkdirs() == true || databaseFile.parentFile?.isDirectory == true)
+        if (main) {
+            val helper = TelemetryDatabaseHelper(context, databaseFile.absolutePath)
+            try {
+                val database = helper.writableDatabase
+                check(TelemetryDatabaseHelper.isCompactV2(database)) { "Main archive fixture is not compact v2" }
+                database.execSQL(
+                    "INSERT INTO collector_events(ts, category, message, detail) VALUES (?, ?, ?, ?)",
+                    arrayOf("2026-09-27T00:00:00Z", "archive_gate_fixture", "active evidence", databaseFile.name)
+                )
+            } finally { helper.close() }
+        } else {
+            val helper = DirectDebugDatabaseHelper(context, databaseFile.absolutePath)
+            try {
+                val database = helper.writableDatabase
+                check(DirectDebugDatabaseHelper.isCompactV2(database)) { "Secondary archive fixture is not compact v2" }
+                database.execSQL(
+                    "INSERT INTO debug_direct_catalog_versions(source_version) VALUES (?)",
+                    arrayOf(databaseFile.name)
+                )
+            } finally { helper.close() }
+        }
+    }
+
+    private fun copySqliteFileSet(source: File, rawArchive: File) {
+        check(rawArchive.mkdirs() || rawArchive.isDirectory)
+        val files = DatabaseArchiveManager.sidecarFiles(source).filter { it.isFile }
+        check(source in files) { "Compact archive fixture database is missing: $source" }
+        files.forEach { file -> check(file.copyTo(File(rawArchive, file.name)).isFile) }
+    }
+
+    private fun sqliteFileSetDigest(databaseFile: File): Map<String, String> =
+        DatabaseArchiveManager.sidecarFiles(databaseFile)
+            .filter { it.isFile }
+            .associate { file ->
+                file.name to MessageDigest.getInstance("SHA-256")
+                    .digest(file.readBytes())
+                    .joinToString("") { byte -> (byte.toInt() and 0xff).toString(16).padStart(2, '0') }
+            }
+
+    private fun assertArchiveFixtureEvidence(databaseFile: File, main: Boolean) {
+        SQLiteDatabase.openDatabase(databaseFile.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { database ->
+            val table = if (main) "collector_events" else "debug_direct_catalog_versions"
+            val column = if (main) "detail" else "source_version"
+            check(count(database, table) == 1L) { "Active database evidence changed: $databaseFile" }
+            database.rawQuery("SELECT $column FROM $table", null).use { cursor ->
+                check(cursor.moveToFirst() && cursor.getString(0) == databaseFile.name) {
+                    "Active database evidence changed: $databaseFile"
+                }
+            }
+        }
+    }
+
+    private fun maintenanceIsolation(context: Context, prefix: String) {
+        val application = context.applicationContext as BydCollectorApplication
+        val mainFile = File(context.cacheDir, "${prefix}_main_gate.db")
+        val secondaryFile = File(context.cacheDir, "${prefix}_secondary_gate.db")
+        SQLiteDatabase.openOrCreateDatabase(mainFile, null).use { main ->
+            SQLiteDatabase.openOrCreateDatabase(secondaryFile, null).use { secondary ->
+                main.execSQL("CREATE TABLE evidence(value INTEGER)")
+                secondary.execSQL("CREATE TABLE evidence(value INTEGER)")
+                for (operation in DbMaintenanceOperation.entries) {
+                    val entered = CountDownLatch(1)
+                    val release = CountDownLatch(1)
+                    val failure = AtomicReference<Throwable?>(null)
+                    val writer = thread(name = "native-maintenance-gate") {
+                        try {
+                            check(application.tryWithExclusiveDatabaseMaintenance(operation, 2_000L) {
+                                entered.countDown()
+                                check(release.await(5, TimeUnit.SECONDS))
+                                true
+                            } == true)
+                        } catch (error: Throwable) { failure.set(error) }
+                    }
+                    try {
+                        check(entered.await(3, TimeUnit.SECONDS))
+                        if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
+                            check(application.trySecondaryDatabaseRead { true } == null)
+                            application.withDatabaseRead { main.execSQL("INSERT INTO evidence VALUES (1)") }
+                        } else {
+                            check(application.tryDatabaseRead { true } == null)
+                            application.withSecondaryDatabaseRead { secondary.execSQL("INSERT INTO evidence VALUES (1)") }
+                        }
+                    } finally {
+                        release.countDown()
+                        writer.join(3_000L)
+                    }
+                    check(!writer.isAlive)
+                    failure.get()?.let { throw it }
+                }
+                check(count(main, "evidence") == 1L && count(secondary, "evidence") == 1L)
+            }
+        }
+    }
 
     private fun workerImport(context: Context, prefix: String) {
         val name = "${prefix}_worker_import.db"

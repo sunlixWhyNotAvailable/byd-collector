@@ -426,9 +426,10 @@ private fun TopHeader(
             horizontalAlignment = Alignment.End
         ) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                val collectionStatus = collectionDisplayStatus(state, strings)
                 StatusPill(
-                    text = "${strings.collection}: ${if (state?.running == true) strings.running else strings.idle}",
-                    kind = if (state?.running == true) StatusKind.OK else StatusKind.WAITING
+                    text = "${strings.collection}: ${collectionStatus.text}",
+                    kind = collectionStatus.kind
                 )
                 StatusPill(
                     text = "${strings.adb}: ${if (state?.adbAuthorized == true) strings.ok else strings.missing}",
@@ -542,6 +543,8 @@ private val TelegramMessageDefinitions = listOf(
             "trip_net_kwh",
             "trip_net_kwh_per_100km",
             "trip_duration",
+            "trip_start_time",
+            "trip_end_time",
             "soc_start",
             "soc_end",
             "total_soc_start",
@@ -554,6 +557,8 @@ private val TelegramMessageDefinitions = listOf(
             "total_net_kwh",
             "total_net_kwh_per_100km",
             "total_duration",
+            "total_start_time",
+            "total_end_time",
             "time"
         )
     )
@@ -681,16 +686,7 @@ private fun MainStatusCard(
     actionUiState: BydCollectorActionUiState,
     modifier: Modifier
 ) {
-    val mainPollingStatus = when (state?.mainRuntimeStatus ?: RuntimeActionStatus.STOPPED) {
-        RuntimeActionStatus.STARTING -> MainPollDisplayStatus(strings.starting, StatusKind.WAITING)
-        RuntimeActionStatus.STOPPING -> MainPollDisplayStatus(strings.stopping, StatusKind.WAITING)
-        RuntimeActionStatus.ERROR -> MainPollDisplayStatus(strings.error, StatusKind.ERROR)
-        else -> MainPollStatusFormatter.format(
-            running = state?.mainPollingRunning == true,
-            lastPollStatus = state?.lastPollStatus,
-            strings = strings
-        )
-    }
+    val mainPollingStatus = mainRuntimeDisplay(state, strings)
     SectionCard(title = strings.status, modifier = modifier.height(226.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             StatusRow(strings.mainPolling, mainPollingStatus.text, mainPollingStatus.kind, modifier = Modifier.weight(1f))
@@ -786,13 +782,51 @@ private fun AllParametersTab(
 }
 
 private fun debugRuntimeDisplay(state: DashboardState?, strings: UiStrings): Pair<String, StatusKind> {
+    if (state?.dbMaintenanceStatus?.running == true &&
+        state.dbMaintenanceStatus.operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
+        return strings.stopping to StatusKind.WAITING
+    }
     return when (state?.debugRuntimeStatus ?: DebugRuntimeStatus.STOPPED) {
         DebugRuntimeStatus.STOPPED -> strings.stopped to StatusKind.WAITING
         DebugRuntimeStatus.STARTING -> strings.starting to StatusKind.WAITING
-        DebugRuntimeStatus.RUNNING -> strings.running to StatusKind.OK
+        DebugRuntimeStatus.RUNNING -> MainPollStatusFormatter.queueStatus(state?.secondaryCallbackQueue, strings)
+            ?.let { it.text to it.kind } ?: (strings.collectionRunning to StatusKind.OK)
         DebugRuntimeStatus.STOPPING -> strings.stopping to StatusKind.WAITING
         DebugRuntimeStatus.ERROR -> strings.error to StatusKind.ERROR
     }
+}
+
+private fun mainRuntimeDisplay(state: DashboardState?, strings: UiStrings): MainPollDisplayStatus {
+    if (state?.dbMaintenanceStatus?.running == true &&
+        state.dbMaintenanceStatus.operation == DbMaintenanceOperation.ARCHIVE) {
+        return MainPollDisplayStatus(strings.stopping, StatusKind.WAITING)
+    }
+    return when (state?.mainRuntimeStatus ?: RuntimeActionStatus.STOPPED) {
+        RuntimeActionStatus.STARTING -> MainPollDisplayStatus(strings.starting, StatusKind.WAITING)
+        RuntimeActionStatus.STOPPING -> MainPollDisplayStatus(strings.stopping, StatusKind.WAITING)
+        RuntimeActionStatus.ERROR -> MainPollDisplayStatus(strings.error, StatusKind.ERROR)
+        else -> MainPollStatusFormatter.format(state?.mainPollingRunning == true,
+            state?.lastPollStatus, strings, state?.mainCallbackQueue)
+    }
+}
+
+private fun collectionDisplayStatus(state: DashboardState?, strings: UiStrings): MainPollDisplayStatus {
+    val active = buildList {
+        if (state != null && (state.mainRuntimeStatus != RuntimeActionStatus.STOPPED ||
+                (state.dbMaintenanceStatus.running && state.dbMaintenanceStatus.operation == DbMaintenanceOperation.ARCHIVE))) {
+            add(mainRuntimeDisplay(state, strings))
+        }
+        if (state != null && (state.debugRuntimeStatus != DebugRuntimeStatus.STOPPED ||
+                (state.dbMaintenanceStatus.running && state.dbMaintenanceStatus.operation == DbMaintenanceOperation.DEBUG_ARCHIVE))) {
+            val (text, kind) = debugRuntimeDisplay(state, strings)
+            add(MainPollDisplayStatus(text, kind))
+        }
+    }
+    return active.firstOrNull { it.kind == StatusKind.ERROR }
+        ?: active.firstOrNull { it.kind == StatusKind.WARNING }
+        ?: active.firstOrNull { it.kind == StatusKind.WAITING }
+        ?: active.firstOrNull()
+        ?: MainPollDisplayStatus(strings.idle, StatusKind.WAITING)
 }
 
 @Composable

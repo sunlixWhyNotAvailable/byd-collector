@@ -535,10 +535,10 @@ internal class StorageFormatCutoverCoordinator(
         internal fun detectDebug(databaseFile: File): StorageFormat =
             detectFile(databaseFile, recoverWal = true, detector = ::detectDebug)
 
-        private fun detectArchivedMain(databaseFile: File): StorageFormat =
+        internal fun detectArchivedMain(databaseFile: File): StorageFormat =
             detectFile(databaseFile, recoverWal = false, detector = ::detectMain)
 
-        private fun detectArchivedDebug(databaseFile: File): StorageFormat =
+        internal fun detectArchivedDebug(databaseFile: File): StorageFormat =
             detectFile(databaseFile, recoverWal = false, detector = ::detectDebug)
 
         internal fun verifyArchivedSource(

@@ -35,15 +35,16 @@ internal object UserShutdownShellPlanner {
     }
 
     /**
-     * Force-cleans exact owned processes over the foreground ADB shell, then starts a detached
-     * finalizer which re-verifies absence, force-stops this package, and writes shell-side evidence.
+     * Waits for app workers and exact owned delegates within the remaining grace window, then starts
+     * a detached finalizer which re-verifies absence, force-stops this package, and writes evidence.
      */
     fun detachedFinalizerCommand(
         packageName: String,
         token: String,
         logcatOwnerEnv: String,
         apkPath: String,
-        gracefulWaitMs: Long = 0L
+        gracefulWaitMs: Long = 0L,
+        appWorkersDrained: Boolean = false
     ): String {
         require(packageName.matches(Regex("[A-Za-z0-9_.]+")))
         requireToken(token)
@@ -55,14 +56,27 @@ internal object UserShutdownShellPlanner {
         val detachedScript = boundedFinalizerScript(token, detachedScript(packageName, token, evidencePath, functionText))
         return buildString {
             append("umask 077; ")
+            append("shutdown_grace_started_ms=\$(awk '{printf \"%.0f\", \$1 * 1000}' /proc/uptime 2>/dev/null) || exit 79; ")
+            append("case \"\$shutdown_grace_started_ms\" in ''|*[!0-9]*) exit 79 ;; esac; ")
+            append("shutdown_grace_deadline_ms=\$((shutdown_grace_started_ms + $gracefulWaitMs)); ")
             append("command -v timeout >/dev/null 2>&1 || { echo BYDCOLLECTOR_TIMEOUT_UNAVAILABLE; exit 97; }; ")
             append(functionText)
             append("${generationCurrent(token)} || { echo BYDCOLLECTOR_USER_REOPENED_DURING_GRACE; exit 96; }; ")
             append("shutdown_app_snapshot=\$(shutdown_package_snapshot '$packageName') || exit 94; ")
             append("[ -n \"\$shutdown_app_snapshot\" ] || exit 95; export shutdown_app_snapshot; ")
-            if (gracefulWaitMs > 0L) append("sleep ${shellSeconds(gracefulWaitMs)}; ")
+            append("shutdown_graceful_ready=0; ")
+            append("while :; do ")
+            append("${generationCurrent(token)} || { echo BYDCOLLECTOR_USER_REOPENED_DURING_GRACE; exit 96; }; ")
+            if (appWorkersDrained) {
+                append("if shutdown_verify_named_absent '$HELPER_PROCESS' '$HELPER_CLASS' && shutdown_verify_named_absent '$KEEP_ALIVE_PROCESS' '$KEEP_ALIVE_CLASS' && shutdown_verify_owned_logcat_absent; then shutdown_graceful_ready=1; break; fi; ")
+            }
+            append("shutdown_grace_now_ms=\$(awk '{printf \"%.0f\", \$1 * 1000}' /proc/uptime 2>/dev/null) || exit 79; ")
+            append("case \"\$shutdown_grace_now_ms\" in ''|*[!0-9]*) exit 79 ;; esac; ")
+            append("[ \"\$shutdown_grace_now_ms\" -lt \"\$shutdown_grace_deadline_ms\" ] || break; sleep 0.1; done; ")
             append("${generationCurrent(token)} || { echo BYDCOLLECTOR_USER_REOPENED_DURING_GRACE; exit 96; }; ")
             append("shutdown_forced_helper=0; shutdown_forced_keepalive=0; shutdown_forced_logcat=0; ")
+            // The bounded fallback kills exact owned identities; this final recheck also catches any
+            // process that races back after the early-readiness scan.
             append("shutdown_has_named_process '$HELPER_PROCESS' '$HELPER_CLASS' || exit 81; ")
             append("shutdown_forced_helper=\$shutdown_named_present; ")
             append("shutdown_signal_named_process '$HELPER_PROCESS' '$HELPER_CLASS' KILL || exit 82; ")
@@ -90,7 +104,7 @@ internal object UserShutdownShellPlanner {
             append("for shutdown_i in 1 2 3 4 5 6 7 8 9 10; do ")
             append("grep -Fqx 'phase=started token=$token' '$evidencePath' 2>/dev/null && break; sleep 0.1; done; ")
             append("grep -Fqx 'phase=started token=$token' '$evidencePath' 2>/dev/null || exit 95; ")
-            append("echo \"SHUTDOWN_FINALIZER_HANDOFF=$token helper_forced=\$shutdown_forced_helper keepalive_forced=\$shutdown_forced_keepalive logcat_forced=\$shutdown_forced_logcat\"")
+            append("echo \"SHUTDOWN_FINALIZER_HANDOFF=$token app_workers_drained=$appWorkersDrained graceful_ready=\$shutdown_graceful_ready helper_forced=\$shutdown_forced_helper keepalive_forced=\$shutdown_forced_keepalive logcat_forced=\$shutdown_forced_logcat\"")
         }
     }
 
@@ -223,6 +237,4 @@ internal object UserShutdownShellPlanner {
 
     private fun shellQuote(value: String): String = "'" + value.replace("'", "'\\''") + "'"
 
-    private fun shellSeconds(milliseconds: Long): String =
-        "${milliseconds / 1_000}.${(milliseconds % 1_000).toString().padStart(3, '0')}"
 }

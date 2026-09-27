@@ -10,6 +10,7 @@ import android.location.LocationListener
 import android.location.LocationManager
 import android.os.Looper
 import androidx.core.content.ContextCompat
+import com.bydcollector.collector.util.diagnosticDetail
 import java.time.Instant
 
 interface GpsLocationSink {
@@ -22,8 +23,30 @@ interface GpsLocationSink {
 data class GpsStartResult(
     val started: Boolean,
     val failureReason: String? = null,
-    val recordGap: Boolean = false
+    val recordGap: Boolean = false,
+    val errorDetail: String? = null
 )
+
+internal fun queryGpsProvider(query: () -> Boolean): Result<Boolean> = runCatching(query)
+
+/** Both Binder operations return failures to the existing caller-owned retry gate. */
+internal fun attemptGpsStart(
+    permissionGranted: Boolean,
+    providerEnabled: () -> Boolean,
+    requestUpdates: () -> Unit
+): GpsStartResult {
+    if (!permissionGranted) return GpsStartResult(false, "gps_permission_missing")
+    val enabled = queryGpsProvider(providerEnabled).getOrElse {
+        return GpsStartResult(false, "gps_provider_query_failed:${it::class.java.simpleName}", true, it.diagnosticDetail())
+    }
+    if (!enabled) return GpsStartResult(false, "gps_provider_disabled", recordGap = true)
+    return runCatching {
+        requestUpdates()
+        GpsStartResult(true)
+    }.getOrElse {
+        GpsStartResult(false, "gps_request_failed:${it::class.java.simpleName}", true, it.diagnosticDetail())
+    }
+}
 
 /** Native Android GPS source. Permission and foreground-service ownership remain with the caller. */
 class AndroidGpsLocationSource(
@@ -50,7 +73,9 @@ class AndroidGpsLocationSource(
             if (intent?.action != LocationManager.PROVIDERS_CHANGED_ACTION) return
             val provider = intent.getStringExtra(LocationManager.EXTRA_PROVIDER_NAME)
             if (provider != null && provider != LocationManager.GPS_PROVIDER) return
-            val enabled = runCatching { locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) }.getOrDefault(false)
+            // Unknown is not disabled: keep the last known state and existing subscription.
+            val enabled = queryGpsProvider { locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) }
+                .getOrNull() ?: return
             if (enabled == lastGpsEnabled) return
             lastGpsEnabled = enabled
             if (!enabled) runCatching { locationManager.removeUpdates(listener) }
@@ -61,18 +86,14 @@ class AndroidGpsLocationSource(
     fun start(anchor: GpsLocationSample? = null): GpsStartResult {
         trustGate.beginRecovery(anchor)
         registerProviderReceiver()
-        if (appContext.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED && appContext.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            return GpsStartResult(false, "gps_permission_missing")
-        }
-        if (!locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-            return GpsStartResult(false, "gps_provider_disabled", recordGap = true)
-        }
-        return runCatching {
-            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1_000L, 0f, listener, looper)
-            GpsStartResult(true)
-        }.getOrElse {
-            GpsStartResult(false, "gps_request_failed:${it::class.java.simpleName}", recordGap = true)
-        }
+        return attemptGpsStart(
+            permissionGranted = appContext.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+                appContext.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED,
+            providerEnabled = {
+                locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER).also { lastGpsEnabled = it }
+            },
+            requestUpdates = { locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1_000L, 0f, listener, looper) }
+        )
     }
 
     fun stop(markFinal: Boolean = false) {
@@ -92,7 +113,6 @@ class AndroidGpsLocationSource(
             )
         }.onSuccess {
             providerReceiverRegistered = true
-            lastGpsEnabled = runCatching { locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) }.getOrNull()
         }
     }
 

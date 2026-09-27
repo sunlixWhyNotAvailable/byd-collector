@@ -9,12 +9,9 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
-import android.os.SystemClock
 import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.BuildConfig
 import com.bydcollector.collector.data.debug.DirectDebugStore
-import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
-import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.maintenance.DbMaintenanceCoordinator
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.util.namedSingleThreadExecutor
@@ -39,7 +36,9 @@ class DatabaseMaintenanceService : Service() {
             stopRuntime = ::stopCollectorRuntime,
             onStoreReopened = {},
             closeDebugStore = {},
-            onDebugStoreReopened = { store -> closeReopenedDebugStore(application, store) }
+            onDebugStoreReopened = { store -> closeReopenedDebugStore(application, store) },
+            // A normal Service can appear while this recovery entrypoint waits for the file gate.
+            beforeFileMaintenance = ::requireCollectorAbsent
         )
         createNotificationChannel()
     }
@@ -108,17 +107,12 @@ class DatabaseMaintenanceService : Service() {
     }
 
     private fun stopCollectorRuntime(operation: DbMaintenanceOperation) {
-        stopService(Intent(applicationContext, CollectorService::class.java))
-        val deadline = SystemClock.elapsedRealtime() + COLLECTOR_STOP_TIMEOUT_MS
-        while (CollectorService.isRunning() && SystemClock.elapsedRealtime() < deadline) {
-            SystemClock.sleep(COLLECTOR_STOP_POLL_MS)
-        }
-        check(!CollectorService.isRunning()) { "Collector service did not stop for database recovery" }
-        if (operation == DbMaintenanceOperation.ARCHIVE) {
-            val helper = DirectVehicleHelperClient()
-            if (helper.ownerMode() == DirectHelperOwnerMode.APP_GAP_SPOOL) {
-                helper.requestStop(DirectHelperOwnerMode.APP_GAP_SPOOL)
-            }
+        requireCollectorAbsent()
+    }
+
+    private fun requireCollectorAbsent() {
+        check(!CollectorService.isRunning()) {
+            "Collector became active; retry archive through the running collector"
         }
     }
 
@@ -193,8 +187,6 @@ class DatabaseMaintenanceService : Service() {
         private const val EXTRA_OPERATION = "operation"
         private const val CHANNEL_ID = "database_maintenance"
         private const val NOTIFICATION_ID = 1002
-        private const val COLLECTOR_STOP_TIMEOUT_MS = 20_000L
-        private const val COLLECTOR_STOP_POLL_MS = 25L
         private const val WAKE_LOCK_TIMEOUT_MS = 30 * 60_000L
         private val running = AtomicBoolean(false)
 

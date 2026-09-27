@@ -31,6 +31,7 @@ import com.bydcollector.collector.adb.AdbLocalClient
 import com.bydcollector.collector.data.callback.CallbackBatchDrainCoordinator
 import com.bydcollector.collector.data.callback.CallbackIntakeWorker
 import com.bydcollector.collector.data.callback.CallbackNormalizationWorker
+import com.bydcollector.collector.data.callback.CallbackQueueStatusTracker
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseResolver
 import com.bydcollector.collector.data.debug.DirectDebugParameterAsset
@@ -166,6 +167,7 @@ class CollectorService : Service() {
     private val debugStartExecutor = namedSingleThreadExecutor("byd-debug-start")
     private val maintenanceExecutor = namedSingleThreadExecutor("byd-db-maintenance")
     private val archiveStorageExecutor = namedSingleThreadExecutor("byd-archive-storage")
+    private val archiveAuditRetryQueued = AtomicBoolean(false)
     private val tailscaleExecutor = namedSingleThreadExecutor("byd-tailscale")
     private val dashboardMetricsExecutor = namedSingleThreadExecutor("byd-dashboard-metrics")
     private val dashboardCountExecutor = namedSingleThreadExecutor("byd-dashboard-counts")
@@ -226,7 +228,9 @@ class CollectorService : Service() {
     private val debugWorkGeneration = AtomicLong(0L)
     private val debugStartInProgress = AtomicBoolean(false)
     private val debugStartQueued = AtomicBoolean(false)
-    private val secondaryArchiveFenced = AtomicBoolean(false)
+    private val archiveFenceRequested = AtomicInteger(0)
+    private val maintenanceResumeAllowed = AtomicBoolean(false)
+    private var maintenanceDetachedRuntime: DetachedMaintenanceRuntime? = null
     private val debugStoreCloseRequested = AtomicBoolean(false)
     private val debugPollerShutdownInProgress = AtomicBoolean(false)
     @Volatile private var mqttRuntimeStatus = RuntimeActionStatus.STOPPED
@@ -405,7 +409,7 @@ class CollectorService : Service() {
         reconcilePersistedHelperStateAsync()
         debugStorageReady = BydCollectorApplication.isDebugStorageReady(applicationContext)
         // Keep Main available when the secondary filename is ambiguous; readiness fails closed on start.
-        debugStore = DirectDebugStore(applicationContext)
+        debugStore = application.withSecondaryDatabaseRead { DirectDebugStore(applicationContext) }
         dashboardUiStateStore = BydCollectorApplication.dashboardUiStateStore(applicationContext)
         dashboardStateProvider = DashboardStateProvider(applicationContext, { store }, settings)
         if (dashboardUiStateStore.currentChrome() == null) {
@@ -453,6 +457,7 @@ class CollectorService : Service() {
             settings = settings,
             application = applicationContext as BydCollectorApplication,
             stopRuntime = { stopRuntimeForMaintenance(it) },
+            drainRuntime = ::drainRuntimeForMaintenance,
             onStoreReopened = { newStore ->
                 runOnRuntimeOwnerBlocking {
                     check(running.get()) { "Collector service stopped during database maintenance" }
@@ -520,7 +525,8 @@ class CollectorService : Service() {
         if (
             maintenanceActive.get() &&
             activeMaintenanceOperation == DbMaintenanceOperation.ARCHIVE &&
-            action != ACTION_CANCEL_DATABASE_MAINTENANCE
+            action !in setOf(ACTION_CANCEL_DATABASE_MAINTENANCE, ACTION_START_DEBUG,
+                ACTION_RECONCILE_DEBUG, ACTION_STOP_DEBUG)
         ) {
             return START_STICKY
         }
@@ -773,15 +779,12 @@ class CollectorService : Service() {
 
     private fun createCallbackIntake(stream: Int): CallbackIntakeWorker {
         // Each intake owns its Binder client: a slow getter or the other stream cannot hold its lock.
-        val drain = callbackDrain(DirectVehicleHelperClient(), stream)
+        val queueStatus = CallbackQueueStatusTracker()
+        val drain = callbackDrain(DirectVehicleHelperClient(), stream, queueStatus)
         return CallbackIntakeWorker(
             threadName = "byd-callback-intake-$stream",
             ready = { DirectStreamController.credentials(stream) != null },
             drain = { drain.drain(maxBatches = 1) },
-            progressPaceMs = {
-                val interactive = (getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive
-                if (kpiPowerOn && interactive && callbackBacklogBytes[stream - 1].get() < 16L * 1024 * 1024) 1_000L else 0L
-            },
             onStatus = { summary ->
                 queueCallbackDiagnostic(stream, summary.detail +
                     (summary.fault?.let { "\n${it.diagnosticDetail()}" } ?: ""))
@@ -791,7 +794,8 @@ class CollectorService : Service() {
                     secondaryCallbackFinished.set(true)
                     mainHandler.post { closeDebugStoreAfterLocalWorkers() }
                 }
-            }
+            },
+            queueStatusTracker = queueStatus
         )
     }
 
@@ -878,11 +882,18 @@ class CollectorService : Service() {
         }
     }
 
-    private fun callbackDrain(helper: DirectVehicleHelperClient, stream: Int): CallbackBatchDrainCoordinator =
+    private fun callbackDrain(
+        helper: DirectVehicleHelperClient,
+        stream: Int,
+        queueStatus: CallbackQueueStatusTracker? = null
+    ): CallbackBatchDrainCoordinator =
         CallbackBatchDrainCoordinator(
             download = { helper.drainCallbackBatch(stream) },
             importBatch = { batch, digest, delivery ->
-                val imported = (applicationContext as BydCollectorApplication).withDatabaseRead {
+                val application = applicationContext as BydCollectorApplication
+                val gate = if (stream == CollectorHelperProtocol.STREAM_MAIN) application.databaseMaintenanceGate
+                    else application.secondaryDatabaseMaintenanceGate
+                val imported = gate.withRead {
                     if (!running.get() || Thread.currentThread().isInterrupted)
                         throw InterruptedException("Callback owner stopped")
                     if (stream == CollectorHelperProtocol.STREAM_MAIN) store.importCallbackBatch(batch, digest, delivery)
@@ -898,7 +909,11 @@ class CollectorService : Service() {
                 imported
             },
             acknowledge = { helper.acknowledgeCallbackSpool(stream, it) },
-            quarantine = { descriptor, reason -> helper.quarantineCallbackSpool(stream, descriptor, reason) }
+            quarantine = { descriptor, reason -> helper.quarantineCallbackSpool(stream, descriptor, reason) },
+            onDownloadStarted = { queueStatus?.downloadStarted() },
+            onPendingBatchObserved = { headWallMs -> queueStatus?.pendingBatchObserved(headWallMs) },
+            onRawCommitCompleted = { queueStatus?.rawCommitCompleted() },
+            onPendingBatchCompleted = { queueStatus?.pendingBatchCompleted() }
         )
 
     private fun normalizeCallbackPage(): Boolean =
@@ -1236,7 +1251,12 @@ class CollectorService : Service() {
         debugStartReason: String = DEBUG_REASON_AUTOSTART,
         forceKeepAliveStatusCheck: Boolean = false
     ) {
-        if (maintenanceBlocksRuntimeStart()) return
+        if (maintenanceBlocksRuntimeStart()) {
+            if (!maintenanceBlocksRuntimeStart(debugRuntime = true) &&
+                settings.isDebugPollingEnabled() && !settings.isDebugManuallyStopped()
+            ) startDebugIfNeeded(debugStartReason)
+            return
+        }
         try {
             configureDesiredStreams()
             val mainEnabled = settings.isPollingEnabled()
@@ -1588,7 +1608,7 @@ class CollectorService : Service() {
                         parameters = parameters,
                         helper = helper,
                         store = debugStore,
-                        databaseMaintenanceGate = (applicationContext as BydCollectorApplication).databaseMaintenanceGate,
+                        databaseMaintenanceGate = (applicationContext as BydCollectorApplication).secondaryDatabaseMaintenanceGate,
                         ownerActive = { running.get() && debugStartStillCurrent(startGeneration) },
                         handoverIdentity = {
                             if (debugStartStillCurrent(startGeneration) && !Thread.currentThread().isInterrupted &&
@@ -1610,7 +1630,7 @@ class CollectorService : Service() {
                             acknowledge = helper::acknowledgeSecondarySpool,
                             quarantine = helper::quarantineSecondarySpool,
                             importRecord = { record, digest ->
-                                (applicationContext as BydCollectorApplication).withDatabaseRead {
+                                (applicationContext as BydCollectorApplication).withSecondaryDatabaseRead {
                                     if (!debugStartStillCurrent(startGeneration) || Thread.currentThread().isInterrupted)
                                         throw InterruptedException("Secondary replay owner stopped")
                                     debugStore.importSecondaryRecord(openedSessionId, record, digest)
@@ -1920,8 +1940,7 @@ class CollectorService : Service() {
             }
             val pollerStop = workers.submit<Boolean> {
                 val stopped = runCatching { poller.awaitStopped(remainingShutdownMs(deadlineElapsedMs)) }.getOrDefault(false)
-                if (stopped) runCatching { finishMainSessionAfterUserShutdown() }
-                stopped
+                stopped && runCatching { finishMainSessionAfterUserShutdown() }.getOrDefault(false)
             }
             val mainIntakeStop = workers.submit<Boolean> {
                 runCatching { mainCallbackIntake.awaitStopped(remainingShutdownMs(deadlineElapsedMs)) }.getOrDefault(false)
@@ -1937,7 +1956,8 @@ class CollectorService : Service() {
             }
             val kpiStop = workers.submit<Boolean> {
                 val current = kpiWorker
-                runCatching { current?.join(remainingShutdownMs(deadlineElapsedMs)) }.isSuccess && current?.isAlive != true
+                val remaining = remainingShutdownMs(deadlineElapsedMs)
+                runCatching { if (remaining > 0L) current?.join(remaining) }.isSuccess && current?.isAlive != true
             }
             val debugStop = workers.submit<Boolean> {
                 val stopped = runCatching {
@@ -1979,13 +1999,23 @@ class CollectorService : Service() {
                 return
             }
 
+            // All waits share the original deadline. A completed future returning false is
+            // not a drain proof; helper STOP acceptance likewise does not prove process exit.
+            val workersDrained = awaitShutdownWorkers(
+                listOf(pollerStop, mainIntakeStop, secondaryIntakeStop, normalizerStop,
+                    energyStop, kpiStop, debugStop, mqttStop, influxStop, telegramStop),
+                deadlineElapsedMs
+            )
+            val recorderAtDrain = awaitShutdownFuture(logcatClose, deadlineElapsedMs, null)
+            val appWorkersDrained = workersDrained && recorderAtDrain != null && recorderAtDrain.closeError == null
             val remainingForGracefulMs = remainingShutdownMs(deadlineElapsedMs)
             val command = UserShutdownShellPlanner.detachedFinalizerCommand(
                 packageName = BuildConfig.APPLICATION_ID,
                 token = token,
                 logcatOwnerEnv = DiagnosticLogRecorder.LOGCAT_OWNER_ENV,
                 apkPath = applicationInfo.sourceDir,
-                gracefulWaitMs = remainingForGracefulMs
+                gracefulWaitMs = remainingForGracefulMs,
+                appWorkersDrained = appWorkersDrained
             )
             val result = adb.execShell(
                 command = command,
@@ -2015,7 +2045,7 @@ class CollectorService : Service() {
             val recorderResult = completedFutureValue(logcatClose, null)
 
             val cutoverJournal = settings.storageCutoverJournal()
-            val workerSummary = "poller=$pollerStopped main_callback=$mainIntakeStopped secondary_callback=$secondaryIntakeStopped " +
+            val workerSummary = "app_workers_drained=$appWorkersDrained poller=$pollerStopped main_callback=$mainIntakeStopped secondary_callback=$secondaryIntakeStopped " +
                 "normalizer=$normalizerStopped energy=$energyStopped kpi=$kpiStopped debug=$debugStopped mqtt=$mqttStopped influx=$influxStopped telegram=$telegramStopped " +
                 "helper_stop_accepted=$helperStopAccepted helper_graceful_exit=${result.output.contains("helper_forced=0")} " +
                 "raw_tail=unknown_if_helper_forced_or_shutdown_spill logcat_close_pending=${!logcatClose.isDone} " +
@@ -2090,11 +2120,13 @@ class CollectorService : Service() {
         return result.ok && result.accepted
     }
 
-    private fun finishMainSessionAfterUserShutdown() {
+    private fun finishMainSessionAfterUserShutdown(): Boolean {
+        // STOP runs concurrently: a helper that already exited cannot ACK this intent.
+        // APP drain readiness covers local persistence; the shell separately proves helper absence.
         DirectStreamController.setDesired(CollectorHelperProtocol.STREAM_MAIN, false)
         DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_MAIN)
-        if (::tripRuntime.isInitialized) runCatching { tripRuntime.pause("user_shutdown") }
-        sessionId?.let { openedSessionId ->
+        val tripPaused = !::tripRuntime.isInitialized || runCatching { tripRuntime.pause("user_shutdown") }.isSuccess
+        val sessionClosed = sessionId?.let { openedSessionId ->
             runCatching { store.endSession(openedSessionId, "user_shutdown") }
                 .onFailure { error ->
                     runCatching {
@@ -2104,24 +2136,14 @@ class CollectorService : Service() {
                             "${error::class.java.simpleName}: ${error.message ?: "no message"}"
                         )
                     }
-                }
-        }
-        sessionId = null
+                }.isSuccess
+        } ?: true
+        if (sessionClosed) sessionId = null
+        return tripPaused && sessionClosed
     }
 
     private fun remainingShutdownMs(deadlineElapsedMs: Long): Long =
         (deadlineElapsedMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
-
-    private fun <T> awaitShutdownFuture(future: java.util.concurrent.Future<T>?, deadlineElapsedMs: Long, fallback: T): T {
-        if (future == null) return fallback
-        val remaining = remainingShutdownMs(deadlineElapsedMs)
-        if (remaining <= 0L && !future.isDone) return fallback
-        return try {
-            future.get(remaining, TimeUnit.MILLISECONDS)
-        } catch (_: Exception) {
-            fallback
-        }
-    }
 
     private fun <T> completedFutureValue(future: java.util.concurrent.Future<T>?, fallback: T): T {
         if (future == null || !future.isDone) return fallback
@@ -2605,7 +2627,10 @@ class CollectorService : Service() {
                 permissionsGranted = access.permissionsGranted,
                 adbAuthorized = access.adbAuthorized,
                 dbMaintenanceStatus = settings.dbMaintenanceStatus(),
-                archiveStorageJobStatus = settings.archiveStorageJobStatus()
+                archiveStorageJobStatus = settings.archiveStorageJobStatus(),
+                mainCallbackQueue = if (::mainCallbackIntake.isInitialized) mainCallbackIntake.snapshotQueueState() else null,
+                secondaryCallbackQueue = if (::secondaryCallbackIntake.isInitialized)
+                    secondaryCallbackIntake.snapshotQueueState() else null
             )
         )
     }
@@ -2742,26 +2767,28 @@ class CollectorService : Service() {
                 mainHandler.postDelayed(cancel, DASHBOARD_COUNT_BUDGET_MS)
                 runCatching {
                     android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
-                    (applicationContext as BydCollectorApplication).withDatabaseRead {
-                        if (generation != dashboardMetricsGeneration.get()) return@withDatabaseRead null
-                        val main = store.dashboardRowCounts(cancellation)
-                        val debug = if (debugStorageReady) {
-                            debugStore.dashboardReadingCount(cancellation)
-                        } else {
-                            0L
-                        }
-                        DashboardRowCounts(
-                            pollCount = main.pollCount,
-                            valueRowCount = main.valueRowCount,
-                            ecRowCount = main.ecRowCount,
-                            normalizedCurrentCount = main.normalizedCurrentCount,
-                            normalizedHistoryCount = main.normalizedHistoryCount,
-                            debugReadingCount = debug
-                        )
-                    }
+                    if (generation != dashboardMetricsGeneration.get()) return@runCatching null
+                    val application = applicationContext as BydCollectorApplication
+                    val main = application.tryDatabaseRead {
+                        store.dashboardRowCounts(cancellation)
+                    } ?: return@runCatching null
+                    val debug = if (debugStorageReady) {
+                        application.trySecondaryDatabaseRead { debugStore.dashboardReadingCount(cancellation) }
+                            ?: return@runCatching null
+                    } else 0L
+                    DashboardRowCounts(
+                        pollCount = main.pollCount,
+                        valueRowCount = main.valueRowCount,
+                        ecRowCount = main.ecRowCount,
+                        normalizedCurrentCount = main.normalizedCurrentCount,
+                        normalizedHistoryCount = main.normalizedHistoryCount,
+                        debugReadingCount = debug
+                    )
                 }.also { mainHandler.removeCallbacks(cancel) }.onSuccess { counts ->
                     if (counts != null && generation == dashboardMetricsGeneration.get()) {
                         dashboardUiStateStore.publishRowCountBaseline(countGeneration, counts)
+                    } else {
+                        dashboardUiStateStore.failCountBootstrap(countGeneration)
                     }
                 }.onFailure { error ->
                     if (generation == dashboardMetricsGeneration.get()) {
@@ -2868,56 +2895,55 @@ class CollectorService : Service() {
         val mainPoller: TelemetryPoller? = null,
         val debugPoller: DirectDebugRoundRobinPoller? = null,
         val openedSessionId: Long? = null,
-        val secondaryWasRunning: Boolean = false
+        val secondaryWasRunning: Boolean = false,
+        val mainWasRunning: Boolean = false
     )
 
     private fun stopRuntimeForMaintenance(operation: DbMaintenanceOperation) {
         check(!isRuntimeOwner()) { "Database maintenance must not wait for workers on the main handler" }
         if (operation != DbMaintenanceOperation.DEBUG_ARCHIVE) {
-            // An unresolved receipt belongs to this Main DB; never archive it away from the live energy worker.
-            check(!store.hasDeferredEnergy()) { "Deferred energy work is pending; retry Main archive after recovery" }
-            check(deferredEnergyWorker.stopAndJoin(2_000L)) { "Deferred energy worker did not stop" }
-            kpiWorker?.interrupt()
-            kpiWorker?.join(2_000L)
-            check(kpiWorker?.isAlive != true) { "KPI worker did not stop" }
-            check(!store.hasDeferredEnergy()) { "Deferred energy work appeared during archive preparation" }
+            deferredEnergyWorker.requestStopAfterCurrentPage()
+            check(deferredEnergyWorker.awaitStopped(2_000L)) { "Deferred energy worker did not stop" }
         }
         val detached = runOnRuntimeOwnerBlocking {
             prepareRuntimeStopForMaintenance(operation)
         }
-        if (detached.mainPoller?.stopAndJoin(2_000L) == false) {
+        maintenanceDetachedRuntime = detached
+        if (detached.mainPoller?.awaitStopped(2_000L) == false) {
             maintenanceRuntimeRestoreAllowed.set(false)
             error("Main poller did not stop for database maintenance")
         }
-        val debugStopReason = if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
-            "debug_database_maintenance"
-        } else {
-            "database_maintenance"
-        }
-        if (detached.debugPoller?.shutdownAndAwait(debugStopReason, 2_000L) == false) {
+        if (detached.debugPoller?.awaitTermination(2_000L) == false) {
             maintenanceRuntimeRestoreAllowed.set(false)
             error("Debug poller did not stop for database maintenance")
         }
-        if (!secondaryCallbackIntake.stopAndJoin(2_000L) ||
-            (operation != DbMaintenanceOperation.DEBUG_ARCHIVE &&
-                (!mainCallbackIntake.stopAndJoin(2_000L) || !callbackNormalizer.stopAndJoin(2_000L)))
-        ) {
+        val intakeStopped = if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
+            secondaryCallbackIntake.awaitStopped(2_000L)
+        } else mainCallbackIntake.awaitStopped(2_000L) && callbackNormalizer.awaitStopped(2_000L)
+        if (!intakeStopped) {
             maintenanceRuntimeRestoreAllowed.set(false)
             error("Callback workers did not stop for database maintenance")
         }
-        if (operation != DbMaintenanceOperation.DEBUG_ARCHIVE) {
-            check(!store.hasDeferredEnergy()) { "Deferred energy work became pending; retry Main archive after recovery" }
-        }
+    }
+
+    private fun drainRuntimeForMaintenance(operation: DbMaintenanceOperation) {
+        val detached = checkNotNull(maintenanceDetachedRuntime) { "Collection stop was not completed" }
         if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
             prepareSecondaryArchive(detached.secondaryWasRunning)
             return
         }
-
-        // Local writers have stopped. Finish only raw already committed in this DB;
-        // the helper's continuing gap capture belongs to the next active database.
+        prepareMainArchive(detached)
         do {
+            maintenanceCoordinator.checkDrainCancelled(operation)
             val pending = store.normalizePendingCallbackPage(vehicleStateNormalizer)
+            maintenanceCoordinator.reportDrainProgress(operation, if (pending.hasMore) null else 0,
+                "нормалізація", "normalization", pending.processedCount > 0)
         } while (pending.hasMore)
+        while (store.hasDeferredEnergy()) {
+            maintenanceCoordinator.checkDrainCancelled(operation)
+            maintenanceCoordinator.reportDrainProgress(operation, null, "енергетичні записи", "energy receipts", false)
+            drainDeferredEnergy()
+        }
 
         if (!tripRuntime.pauseAndAwait("database_maintenance")) {
             maintenanceRuntimeRestoreAllowed.set(false)
@@ -2951,17 +2977,19 @@ class CollectorService : Service() {
 
     private fun prepareRuntimeStopForMaintenance(operation: DbMaintenanceOperation): DetachedMaintenanceRuntime {
         requireRuntimeOwner()
-        mainHandler.removeCallbacks(debugStartRetryTask)
-        debugStartRetryScheduled = false
-        secondaryCallbackIntake.stopAndJoin(0L)
         if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
+            mainHandler.removeCallbacks(debugStartRetryTask)
+            debugStartRetryScheduled = false
+            secondaryCallbackIntake.requestStopAfterCurrentBatch()
             val stopGeneration = debugWorkGeneration.incrementAndGet()
             val detachedDebugPoller = detachDebugPoller()
+            val wasRunning = detachedDebugPoller?.isRunning() == true
+            detachedDebugPoller?.requestStopAfterCurrentCycle("debug_database_maintenance")
             setDebugRuntime(DebugRuntimeStatus.STOPPING, generation = stopGeneration)
             setDebugRuntime(DebugRuntimeStatus.STOPPED)
             return DetachedMaintenanceRuntime(
                 debugPoller = detachedDebugPoller,
-                secondaryWasRunning = detachedDebugPoller?.isRunning() == true
+                secondaryWasRunning = wasRunning
             )
         }
 
@@ -2970,26 +2998,92 @@ class CollectorService : Service() {
         cancelTelegramTick()
         mainHandler.removeCallbacks(mainStartRetryTask)
         mainStartRetryScheduled = false
-        mainCallbackIntake.stopAndJoin(0L)
-        callbackNormalizer.stopAndJoin(0L)
+        mainCallbackIntake.requestStopAfterCurrentBatch()
+        callbackNormalizer.requestStopAfterCurrentPage()
         DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_MAIN)
         if (mainRuntimeStatus != RuntimeActionStatus.STOPPED) setMainRuntime(RuntimeActionStatus.STOPPING)
-        poller.stop()
-        val stopGeneration = debugWorkGeneration.incrementAndGet()
-        val detachedDebugPoller = detachDebugPoller()
+        val wasRunning = poller.isRunning()
+        poller.requestStopAfterCurrentCycle()
         val openedSessionId = sessionId
         sessionId = null
         mainPollingRunning.set(false)
         setMainRuntime(RuntimeActionStatus.STOPPED)
-        setDebugRuntime(DebugRuntimeStatus.STOPPING, generation = stopGeneration)
-        setDebugRuntime(DebugRuntimeStatus.STOPPED)
         mqttRuntimeActive.set(false)
         publishDashboardRuntimeFlags()
         return DetachedMaintenanceRuntime(
             mainPoller = poller,
-            debugPoller = detachedDebugPoller,
-            openedSessionId = openedSessionId
+            openedSessionId = openedSessionId,
+            mainWasRunning = wasRunning
         )
+    }
+
+    private fun prepareMainArchive(detached: DetachedMaintenanceRuntime) {
+        val operation = DbMaintenanceOperation.ARCHIVE
+        val helper = DirectVehicleHelperClient()
+        if (!detached.mainWasRunning) {
+            check(!settings.isPollingEnabled() || settings.isMainManuallyStopped()) {
+                "Main archive requires the enabled collector to be running; restart it before archiving"
+            }
+            check(DirectStreamController.setDesired(CollectorHelperProtocol.STREAM_MAIN, false)) {
+                "Main archive could not quiesce the stopped helper stream"
+            }
+            // Stopped-stream transport is lease-protected. Do not turn collection on to inspect it.
+            // Raw helper files stay intact and are replayed by the next explicitly started collector.
+            maintenanceCoordinator.recordDrainWarning(
+                "Main collection was stopped: any retained helper backlog remains outside this archive for the next collection start"
+            )
+            return
+        }
+        fenceArchiveStream(CollectorHelperProtocol.STREAM_MAIN)
+        drainArchiveCallbacks(helper, operation, CollectorHelperProtocol.STREAM_MAIN)
+        val archiveSession = checkNotNull(detached.openedSessionId) { "Main archive session is missing" }
+        val replay = TelemetryWorkerReplayCoordinator(
+            store = store,
+            ensureHelper = { null }, // The exact stream has already acknowledged pause/fence.
+            pendingSamples = helper::pendingWorkerSamples,
+            acknowledgeSample = { identity, at ->
+                helper.acknowledgeWorkerSample(identity, at).also { ack ->
+                    if (ack.ok) maintenanceCoordinator.reportDrainProgress(operation, null,
+                        "знімки телеметрії", "legacy snapshots", true)
+                }
+            },
+            successfulPollObserver = createSuccessfulPollObserver(),
+            isActive = { running.get() && !Thread.currentThread().isInterrupted }
+        )
+        replay.drainFencedTail(archiveSession) {
+            maintenanceCoordinator.checkDrainCancelled(operation)
+        }
+        maintenanceCoordinator.reportDrainProgress(operation, 0, "знімки телеметрії", "legacy snapshots", false)
+    }
+
+    private fun fenceArchiveStream(stream: Int) {
+        check(DirectStreamController.setConsumerReady(stream, true) {
+            running.get() && !Thread.currentThread().isInterrupted
+        }) { "Archive consumer readiness failed" }
+        // A lost pause reply may still have paused the helper; restoration must attempt resume.
+        archiveFenceRequested.set(stream)
+        check(DirectStreamController.pauseAndFence(stream)) { "Archive pause/fence failed" }
+    }
+
+    private fun drainArchiveCallbacks(helper: DirectVehicleHelperClient, operation: DbMaintenanceOperation, stream: Int) {
+        val status = helper.callbackSpoolStatus(stream)
+        var remaining = status.takeIf { it.ok && it.liveRetainedBytes == 0L }?.readyBatches?.toLong()
+        val drain = callbackDrain(helper, stream)
+        while (true) {
+            maintenanceCoordinator.checkDrainCancelled(operation)
+            maintenanceCoordinator.reportDrainProgress(operation, remaining, "callback-пакети", "callback batches", false)
+            val result = drain.drain(maxBatches = 1)
+            check(result.blockedReason == null) { result.blockedReason ?: "Archive callback replay failed" }
+            if (result.drained) {
+                maintenanceCoordinator.reportDrainProgress(operation, 0, "callback-пакети", "callback batches", false)
+                return
+            }
+            check(result.kind == com.bydcollector.collector.data.callback.CallbackDrainKind.PROGRESS) {
+                "Archive callback replay did not progress"
+            }
+            remaining = remaining?.minus(1)?.coerceAtLeast(0L)
+            maintenanceCoordinator.reportDrainProgress(operation, remaining, "callback-пакети", "callback batches", true)
+        }
     }
 
     private fun prepareSecondaryArchive(wasRunning: Boolean) {
@@ -3009,36 +3103,41 @@ class CollectorService : Service() {
                 "Secondary archive blocked by retained backlog; Start secondary collection to drain it first"
             }
             val callbackBacklog = helper.callbackSpoolStatus(CollectorHelperProtocol.STREAM_SECONDARY)
-            check(callbackBacklog.ok && callbackBacklog.readyBatches == 0) {
+            check(callbackBacklog.ok && callbackBacklog.readyBatches == 0 && callbackBacklog.liveRetainedBytes == 0L) {
                 "Secondary archive blocked by callback backlog or unavailable status; Start secondary collection first"
             }
             return
         }
 
-        // Local consumers are joined. The archive now owns a temporary real replay consumer.
-        check(DirectStreamController.setConsumerReady(CollectorHelperProtocol.STREAM_SECONDARY, true) {
-            running.get() && !Thread.currentThread().isInterrupted
-        }) {
-            "Secondary archive consumer readiness failed"
-        }
-        check(DirectStreamController.pauseAndFence(CollectorHelperProtocol.STREAM_SECONDARY)) {
-            "Secondary archive pause/fence failed"
-        }
-        secondaryArchiveFenced.set(true)
+        fenceArchiveStream(CollectorHelperProtocol.STREAM_SECONDARY)
+        val operation = DbMaintenanceOperation.DEBUG_ARCHIVE
         val parameters = DirectDebugParameterAsset.load(applicationContext)
         val archiveSessionId = debugStore.openSession(parameters, DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT)
         try {
-            val callbacks = callbackDrain(helper, CollectorHelperProtocol.STREAM_SECONDARY).drain(Int.MAX_VALUE)
-            check(callbacks.drained) { callbacks.blockedReason ?: "Secondary archive callback replay did not drain" }
+            drainArchiveCallbacks(helper, operation, CollectorHelperProtocol.STREAM_SECONDARY)
+            var remaining = helper.secondarySpoolStatus().takeIf { it.ok && !it.inFlight }?.readyRecords?.toLong()
+            fun progress(affected: Int) {
+                remaining = remaining?.minus(affected)?.coerceAtLeast(0L)
+                maintenanceCoordinator.reportDrainProgress(operation, remaining, "вторинні записи", "secondary records", affected > 0)
+            }
+            progress(0)
             val replay = SecondaryReplayCoordinator(
-                fetchPage = helper::secondarySpoolPage,
-                acknowledge = helper::acknowledgeSecondarySpool,
-                quarantine = helper::quarantineSecondarySpool,
+                fetchPage = { descriptor, offset, limit ->
+                    maintenanceCoordinator.checkDrainCancelled(operation)
+                    helper.secondarySpoolPage(descriptor, offset, limit)
+                },
+                acknowledge = { descriptor ->
+                    helper.acknowledgeSecondarySpool(descriptor).also { if (it.ok) progress(it.affected) }
+                },
+                quarantine = { descriptor, reason ->
+                    helper.quarantineSecondarySpool(descriptor, reason).also { if (it.ok) progress(it.affected) }
+                },
                 importRecord = { record, digest ->
                     debugStore.importSecondaryRecord(archiveSessionId, record, digest)
                 }
             ).drain()
             check(replay.drained) { replay.blockedReason ?: "Secondary archive replay did not drain" }
+            maintenanceCoordinator.reportDrainProgress(operation, 0, "вторинні записи", "secondary records", false)
         } finally {
             debugStore.endSession(archiveSessionId, "debug_database_maintenance")
         }
@@ -3065,11 +3164,10 @@ class CollectorService : Service() {
             if (!deferredEnergyWorker.isRunning()) check(deferredEnergyWorker.start())
             startKpiWorker()
             settings.setPollingEnabled(snapshot.mainEnabled)
-            settings.setDebugPollingEnabled(snapshot.debugEnabled)
             settings.setMqttEnabled(snapshot.mqttEnabled)
             settings.setInfluxEnabled(snapshot.influxEnabled)
             settings.setTelegramEnabled(snapshot.telegramEnabled)
-            val collectionRuntimeRestored = snapshot.mainEnabled || snapshot.debugEnabled ||
+            val collectionRuntimeRestored = snapshot.mainEnabled || settings.isDebugPollingEnabled() ||
                 settings.keepAliveConfig().anyEnabled || snapshot.telegramEnabled
             if (collectionRuntimeRestored) {
                 reconcileCollection()
@@ -3502,8 +3600,7 @@ class CollectorService : Service() {
             expectedGeneration != telegramWorkGeneration.get() ||
             !::settings.isInitialized ||
             !settings.isTelegramEnabled() ||
-            settings.isUserShutdownRequested() ||
-            maintenanceActive.get()
+            settings.isUserShutdownRequested()
         ) return false
         return !maintenanceBlocksRuntimeStart()
     }
@@ -4311,32 +4408,42 @@ class CollectorService : Service() {
 
     private fun startDatabaseMaintenance(operation: DbMaintenanceOperation) {
         requireRuntimeOwner()
+        if (DbMaintenanceCoordinator.currentOperation() != null) return
         if (!maintenanceActive.compareAndSet(false, true)) return
-        telegramRecoveryCoalescer.invalidate()
+        maintenanceResumeAllowed.set(false)
+        maintenanceDetachedRuntime = null
         activeMaintenanceOperation = operation
         maintenanceRuntimeRestoreAllowed.set(true)
         maintenanceRunningInProcess.set(true)
         if (operation == DbMaintenanceOperation.ARCHIVE) {
+            telegramRecoveryCoalescer.invalidate()
             CollectorAutoStart.cancelRuntimeRecovery(applicationContext)
         }
         val snapshot = runtimeSnapshot()
         ensureForegroundForChannel("Database maintenance")
-        var restoreAfterMaintenance = false
+        var restorationRequested = false
         try {
             maintenanceExecutor.execute {
                 try {
                     val result = maintenanceCoordinator.run(operation) {
-                        if (maintenanceRuntimeRestoreAllowed.get()) restoreAfterMaintenance = true
+                        if (!restorationRequested) {
+                            restorationRequested = true
+                            dispatchDatabaseMaintenanceCompletion(operation, snapshot,
+                                restoreAfterMaintenance = maintenanceRuntimeRestoreAllowed.get())
+                        }
+                        check(maintenanceRuntimeRestoreAllowed.get()) { "Collection workers did not quiesce; runtime restore is unsafe" }
+                        awaitMaintenanceRuntimeRestored(operation, snapshot)
                     }
                     if (result.ok && result.archivePath != null) {
                         enqueueArchiveStorageMaintenance(result.archivePath)
                     }
                 } finally {
-                    dispatchDatabaseMaintenanceCompletion(
-                        operation = operation,
-                        snapshot = snapshot,
-                        restoreAfterMaintenance = restoreAfterMaintenance
-                    )
+                    try {
+                        if (!restorationRequested) dispatchDatabaseMaintenanceCompletion(operation, snapshot, false)
+                    } finally {
+                        maintenanceResumeAllowed.set(false)
+                        maintenanceDetachedRuntime = null
+                    }
                 }
             }
         } catch (error: RejectedExecutionException) {
@@ -4358,13 +4465,41 @@ class CollectorService : Service() {
         snapshot: RuntimeSnapshot,
         restoreAfterMaintenance: Boolean
     ) {
-        if (isRuntimeOwner()) {
+        val stream = archiveFenceRequested.getAndSet(0)
+        val resumeFailure = runCatching {
+            if (stream != 0) {
+                val enabled = if (stream == CollectorHelperProtocol.STREAM_MAIN) {
+                    settings.isPollingEnabled() && !settings.isMainManuallyStopped()
+                } else settings.isDebugPollingEnabled() && !settings.isDebugManuallyStopped()
+                try {
+                    if (!settings.isUserShutdownRequested() && enabled) {
+                        check(DirectStreamController.resume(stream)) { "Helper stream resume failed after archive: stream=$stream" }
+                    }
+                } finally { DirectStreamController.releaseLease(stream) }
+            }
+        }.exceptionOrNull()
+        runOnRuntimeOwnerBlocking {
             finishDatabaseMaintenanceOnRuntimeOwner(operation, snapshot, restoreAfterMaintenance)
-            return
         }
-        check(mainHandler.post {
-            finishDatabaseMaintenanceOnRuntimeOwner(operation, snapshot, restoreAfterMaintenance)
-        }) { "Collector runtime owner is unavailable" }
+        if (resumeFailure != null) throw resumeFailure
+    }
+
+    private fun awaitMaintenanceRuntimeRestored(operation: DbMaintenanceOperation, snapshot: RuntimeSnapshot) {
+        val deadline = SystemClock.elapsedRealtime() + RUNTIME_OWNER_HANDOFF_TIMEOUT_MS
+        while (true) {
+            if (settings.isUserShutdownRequested()) return
+            check(running.get()) { "Collector service stopped during restoration" }
+            val ready = if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
+                !snapshot.debugRunning || !settings.isDebugPollingEnabled() || settings.isDebugManuallyStopped() ||
+                    (isDebugPollerRunning() && secondaryCallbackIntake.isRunning())
+            } else {
+                !snapshot.mainEnabled || settings.isMainManuallyStopped() ||
+                    (poller.isRunning() && mainCallbackIntake.isRunning() && callbackNormalizer.isRunning())
+            }
+            if (ready) return
+            check(SystemClock.elapsedRealtime() < deadline) { "Collection did not resume after database maintenance" }
+            Thread.sleep(25L)
+        }
     }
 
     private fun finishDatabaseMaintenanceOnRuntimeOwner(
@@ -4373,20 +4508,7 @@ class CollectorService : Service() {
         restoreAfterMaintenance: Boolean
     ) {
         requireRuntimeOwner()
-        if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE && secondaryArchiveFenced.getAndSet(false)) {
-            if (!settings.isUserShutdownRequested() && settings.isDebugPollingEnabled() &&
-                !settings.isDebugManuallyStopped() &&
-                !DirectStreamController.resume(CollectorHelperProtocol.STREAM_SECONDARY)
-            ) {
-                store.recordEvent(
-                    "secondary_archive_resume_failed",
-                    "Secondary helper stream did not resume after archive"
-                )
-            }
-        }
-        if (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) {
-            DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_SECONDARY)
-        }
+        maintenanceResumeAllowed.set(true)
         activeMaintenanceOperation = null
         maintenanceActive.set(false)
         maintenanceRunningInProcess.set(false)
@@ -4426,7 +4548,8 @@ class CollectorService : Service() {
     }
 
     private fun enqueueArchiveStorageMaintenance(preferredArchivePath: String?) {
-        enqueueArchiveStorageWork("archive_storage_rejected", ArchiveStorageJobMode.RETENTION) {
+        enqueueArchiveStorageWork("archive_storage_rejected", ArchiveStorageJobMode.RETENTION,
+            onRejected = ::deferPendingArchiveAudit) {
             val manager = archiveStorageManager()
             val limitBytes = settings.archiveStorageLimitGb() * 1024L * 1024L * 1024L
             preferredArchivePath
@@ -4434,15 +4557,34 @@ class CollectorService : Service() {
                 ?.takeIf { it.isDirectory }
                 ?.let { manager.compressRawArchiveDirectory(it, ::publishArchiveStorageStatus) }
             manager.compressPendingRawArchives(::publishArchiveStorageStatus)
-            val rawArchiveRemains = File(applicationContext.filesDir, "db_archive").listFiles().orEmpty().any { file ->
+            val rawArchives = File(applicationContext.filesDir, "db_archive").listFiles().orEmpty().filter { file ->
                 file.isDirectory && (
                     file.name.startsWith("${File(store.databaseFile().name).nameWithoutExtension}_") ||
                         ArchiveStorageManager.isSecondaryArchiveName(file.name)
                     )
             }
-            check(!rawArchiveRemains) { "Raw database archive compression remains pending" }
+            check(rawArchives.none { !archiveFileOperationProtected(it.name) }) {
+                "Raw database archive verification/compression remains pending; raw data retained"
+            }
             manager.enforceRetention(limitBytes, ::publishArchiveStorageStatus)
-            settings.setCutoverArchiveStoragePending(false)
+            if (rawArchives.isEmpty()) settings.setCutoverArchiveStoragePending(false)
+        }
+    }
+
+    /** The existing serial archive worker orders audits after an in-progress ZIP/delete. */
+    private fun deferPendingArchiveAudit() {
+        if (!settings.isCutoverArchiveStoragePending() || !archiveAuditRetryQueued.compareAndSet(false, true)) return
+        try {
+            archiveStorageExecutor.execute {
+                if (!mainHandler.post {
+                        archiveAuditRetryQueued.set(false)
+                        if (running.get() && !settings.isUserShutdownRequested() && settings.isCutoverArchiveStoragePending()) {
+                            enqueueArchiveStorageMaintenance(null)
+                        }
+                    }) archiveAuditRetryQueued.set(false)
+            }
+        } catch (_: RejectedExecutionException) {
+            archiveAuditRetryQueued.set(false) // The persisted pending flag is retried at next startup.
         }
     }
 
@@ -4548,6 +4690,7 @@ class CollectorService : Service() {
         try {
             archiveStorageExecutor.execute {
                 try {
+                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
                     val result = runCatching { work() }
                         .onFailure { error ->
                             settings.setArchiveStorageJobStatus(
@@ -4646,8 +4789,16 @@ class CollectorService : Service() {
             debugDatabaseFile = applicationContext.getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME),
             debugDatabaseFileProvider = { DirectDebugDatabaseResolver.databaseFile(applicationContext) },
             tripsDatabaseFile = applicationContext.getDatabasePath(com.bydcollector.collector.data.trips.TripDatabaseHelper.DATABASE_NAME),
-            isRetentionProtected = archiveShareLeaseRegistry::isActive
+            isRetentionProtected = archiveShareLeaseRegistry::isActive,
+            isArchiveInUse = ::archiveFileOperationProtected
         )
+    }
+
+    private fun archiveFileOperationProtected(id: String): Boolean {
+        // The short cutover/restore owns its raw files; a previous ZIP worker may still be running.
+        if (DbMaintenanceCoordinator.currentOperation() != null) return true
+        val pendingPath = settings.storageCutoverJournal()?.archivePath ?: return false
+        return id.removeSuffix(".zip") == File(pendingPath).name
     }
 
     private fun publishArchiveStorageStatus(status: ArchiveStorageJobStatus) {
@@ -4657,7 +4808,11 @@ class CollectorService : Service() {
     private fun maintenanceBlocksRuntimeStart(debugRuntime: Boolean = false): Boolean {
         if (restoringRuntime.get() && isRuntimeOwner()) return false
         if (maintenanceActive.get()) {
-            return activeMaintenanceOperation != DbMaintenanceOperation.DEBUG_ARCHIVE || debugRuntime
+            return (activeMaintenanceOperation == DbMaintenanceOperation.DEBUG_ARCHIVE) == debugRuntime
+        }
+        DbMaintenanceCoordinator.currentOperation()?.let { operation ->
+            return !maintenanceResumeAllowed.get() &&
+                (operation == DbMaintenanceOperation.DEBUG_ARCHIVE) == debugRuntime
         }
         if (settings.dbMaintenanceStatus().running) {
             settings.recoverInterruptedDbMaintenanceIfNeeded("runtime_start_guard")
@@ -5021,7 +5176,8 @@ class CollectorService : Service() {
         fun debugRuntimeStatus(): DebugRuntimeStatus = debugRuntimeStatusRef.get()
         fun mqttRuntimeStatus(): RuntimeActionStatus = mqttRuntimeStatusRef.get()
         fun influxRuntimeStatus(): RuntimeActionStatus = influxRuntimeStatusRef.get()
-        fun isMaintenanceRunningInProcess(): Boolean = maintenanceRunningInProcess.get()
+        fun isMaintenanceRunningInProcess(): Boolean = maintenanceRunningInProcess.get() ||
+            DbMaintenanceCoordinator.currentOperation() != null
         fun isArchiveStorageActive(): Boolean = archiveStorageActiveInProcess.get()
 
         fun startIntent(context: Context, forceKeepAliveStatusCheck: Boolean = false): Intent =
@@ -5115,6 +5271,36 @@ class CollectorService : Service() {
             putStringArrayListExtra(EXTRA_ARCHIVE_IDS, ids)
         }
     }
+}
+
+internal fun <T> awaitShutdownFuture(
+    future: java.util.concurrent.Future<T>?,
+    deadlineElapsedMs: Long,
+    fallback: T,
+    elapsedMs: () -> Long = SystemClock::elapsedRealtime
+): T {
+    if (future == null) return fallback
+    val remaining = (deadlineElapsedMs - elapsedMs()).coerceAtLeast(0L)
+    if (remaining == 0L && !future.isDone) return fallback
+    return try {
+        future.get(remaining, TimeUnit.MILLISECONDS)
+    } catch (_: InterruptedException) {
+        Thread.currentThread().interrupt()
+        fallback
+    } catch (_: Exception) {
+        fallback
+    }
+}
+
+internal fun awaitShutdownWorkers(
+    futures: List<java.util.concurrent.Future<Boolean>?>,
+    deadlineElapsedMs: Long,
+    elapsedMs: () -> Long = SystemClock::elapsedRealtime
+): Boolean {
+    var drained = true
+    // Do not short-circuit: even after one failure, allow siblings their remaining grace.
+    futures.forEach { if (!awaitShutdownFuture(it, deadlineElapsedMs, false, elapsedMs)) drained = false }
+    return drained
 }
 
 internal fun awaitSerializedExecutorAction(

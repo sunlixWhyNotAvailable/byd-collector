@@ -79,7 +79,7 @@ class TripRuntimeCoordinator(
 
             override fun onProviderChanged(enabled: Boolean) {
                 dispatch {
-                    gpsStartRetry.reset()
+                    gpsStartRetry.reset(preserveOutage = true)
                     gpsStarted = false
                     if (enabled && powerTracker.current() == VehiclePowerState.ON && locationCaptureEnabled()) ensureGpsRunning()
                 }
@@ -323,11 +323,17 @@ class TripRuntimeCoordinator(
         if (!gpsStartRetry.canAttempt(nowMs)) return
         val result = locationSource.start(lastLocation)
         gpsStarted = result.started
-        if (gpsStarted) return gpsStartRetry.reset()
-        if (!gpsStartRetry.onFailure(nowMs)) return
+        if (gpsStarted) {
+            val recovered = gpsStartRetry.hasFailures
+            gpsStartRetry.reset()
+            if (recovered) recordEvent("gps_capture_recovered", "GPS route capture restarted", null)
+            return
+        }
+        val firstFailure = gpsStartRetry.onFailure(elapsedRealtimeMs())
         val reason = result.failureReason ?: "gps_start_failed"
-        if (result.recordGap) handleGap(reason, Instant.now().toString())
-        recordEvent("gps_capture_unavailable", "GPS route capture did not start", "reason=$reason")
+        if (firstFailure && result.recordGap) handleGap(reason, Instant.now().toString())
+        recordEvent(if (firstFailure) "gps_capture_unavailable" else "gps_capture_retry",
+            "GPS route capture did not start", "reason=$reason" + result.errorDetail?.let { "\n$it" }.orEmpty())
     }
 
     private fun stopGps(markFinal: Boolean = false) {

@@ -19,9 +19,9 @@ The collector is an engineering and research tool, not an OEM diagnostic or safe
 
 The app reads vehicle parameters without changing them. It keeps raw values, available Chinese names and descriptions, timestamps, and data-quality information in a local SQLite database. These readings also provide the vehicle status shown in the app and shared with enabled integrations. Unavailable or unknown values remain identifiable rather than being presented as valid readings.
 
-The v3.0.0 build uses hybrid callback collection. Supported fields switch to push updates after usable callbacks are observed, with verification reads every five seconds; unproven fields keep polling. Power, gear and SOC keep their regular fast reads. Every received callback, including repeated equal values, is retained separately in the existing SQLite databases. Vehicle-specific support and background recovery can vary by firmware.
+Collection uses hybrid callbacks. Supported fields switch to push updates after usable callbacks are observed, with verification reads every five seconds; unproven fields keep polling. Power, gear and SOC keep their regular fast reads. Every received callback, including repeated equal values, is retained separately in the existing SQLite databases. Vehicle-specific support and background recovery can vary by firmware.
 
-Callback buffering is bounded: each stream has a combined 16 MiB RAM allowance for queued/in-flight callback payloads, of which the live transport can retain up to 12 MiB. Unconsumed retained batches move to disk after five seconds or when the RAM cap is reached; poll and callback files share the existing 128 MiB fallback-spool allowance. While the vehicle and screen are on, SQLite import is paced unless disk backlog grows; when the vehicle is off and the app remains running, it catches up without that pacing. Capacity or I/O losses are reported explicitly; data still in memory is not guaranteed to survive a kernel reboot.
+Callback buffering is bounded: each stream has a combined 16 MiB RAM allowance for queued/in-flight callback payloads, of which the live transport can retain up to 12 MiB. Unconsumed retained batches move to disk after five seconds or when the RAM cap is reached; poll and callback files share the existing 128 MiB fallback-spool allowance. Main and Secondary import independently without an artificial pause after a successfully persisted batch, both while awake and while the app remains running with the vehicle off. Empty-queue waits, error backoff and stop checks remain. Capacity or I/O losses are reported explicitly; data still in memory is not guaranteed to survive a kernel reboot.
 
 Energy-projection errors are retried from a durable SQLite queue without stopping raw collection. Main database archiving is deferred until that queue drains. Normalized source ordering treats readings from the current boot as newer than retained readings from an earlier boot, even if the wall clock moved backwards.
 
@@ -147,6 +147,7 @@ Charging reports can include SOC, energy, power, local event time (`dd.MM.yyyy H
 - The first valid vehicle power-off reading triggers an immediate send attempt without waiting for the parking delay. Delivery still depends on connectivity.
 - Current statistics show that drive's energy used, recovered energy, and battery net with net-based average consumption and start/end SOC. Total statistics use the power-on session, including parked consumption; Overall SOC runs from the first drive to the latest reading. Recognized default templates update automatically; custom text and legacy energy variables retain their meaning.
 - The Overall block is omitted when it duplicates the only trip. Different totals or parked SOC changes keep it visible.
+- Standard messages use emoji to distinguish rows. Each trip-summary block begins with distance, driving duration and its own start/end time. Total times span the first drive to the latest completed drive; duration excludes parking. Missing historical times remain unavailable, and custom templates are preserved.
 - A summary requires at least a 1% SOC change, more than 0.1 km, or more than 0.1 kWh.
 
 **Location links**
@@ -179,7 +180,7 @@ Telemetry and trips are stored locally in SQLite. Main and All data databases ca
 
 Manual archiving also provides a recovery path when a database can no longer be used normally. Failed preliminary checks are shown as warnings; the operation still stops if it cannot preserve the source database or create a usable replacement.
 
-Archiving can temporarily stop collection and integrations. Read the confirmation carefully, especially warnings about queued MQTT/InfluxDB data or an older Telegram queue awaiting transfer. Do not interrupt an archive operation. Archiving Main or All data does not remove the current Telegram message queue.
+Archiving pauses only the selected collector and its related exports; the other collector continues. Seven stages distinguish finishing a write, draining the old queue, closing, moving, creating, verifying and restoring. The full archived-copy audit and ZIP compression run after collection resumes; failed verification retains the raw archive. Automatic retention never deletes raw directories awaiting successful verification. Read the confirmation carefully, especially warnings about queued MQTT/InfluxDB data or an older Telegram queue awaiting transfer. Do not interrupt an archive operation. Archiving Main or All data does not remove the current Telegram message queue.
 
 <p align="center"><img src="docs/screenshots/en/storage.png" alt="BYD Collector storage and database archives" width="100%"></p>
 
@@ -198,6 +199,7 @@ Archiving can temporarily stop collection and integrations. Read the confirmatio
 - Service recovery helps the app return after supported process or boot events. Its notification-listener permission is used for background recovery, not to read notification contents.
 - Optional Tailscale activation can help reach a configured server through your VPN.
 - Use `Shutdown` to stop operation until you open the app again.
+- Shutdown proceeds as soon as workers finish safely instead of always waiting the full grace period. Slow workers retain the bounded fallback and reopening still cancels a stale shutdown.
 
 These controls restore Android services and connections; they do not send vehicle-control commands.
 
@@ -220,6 +222,7 @@ The app keeps a local operational event log, separate from telemetry databases. 
 `Share logs` prepares a fresh ZIP and opens Android's share chooser with just the file. It includes app/device information, recent operational events, available system and background-service logs, and diagnostic summaries for InfluxDB, trips, and Telegram. Missing sources are reported without blocking the rest of the archive. Telemetry and Telegram databases are not included. ZIP preparation needs additional free space; a failure preserves existing logs and the previous valid bundle.
 
 The bundle also includes available telemetry-helper startup logs and a summary of buffered telemetry occupancy, imports, and released space. These diagnostic logs are bounded and can be cleared without deleting unimported telemetry or resetting the current occupancy summary.
+Archive phase timing/progress and available Android process-exit evidence are also retained independently of telemetry SQLite, so a blocked database does not hide the last completed stage. Missing exit evidence remains explicit; diagnostics do not guarantee recovery from every crash.
 
 `Clear logs` asks for confirmation, removes completed captures and generated bundles, and resets the event log without stopping an active logcat recording. Unavailable background-service logs may result in partial cleanup. A recently shared copy can remain temporarily so the receiving app can finish reading it. Database archives, trip history, and pending Telegram messages are not cleared.
 

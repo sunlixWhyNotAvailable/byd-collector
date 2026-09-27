@@ -1,6 +1,7 @@
 package com.bydcollector.collector.ui
 
 import android.os.SystemClock
+import com.bydcollector.collector.data.callback.CallbackQueueState
 import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
 import com.bydcollector.collector.ui.compose.AppTab
@@ -35,7 +36,9 @@ data class DashboardRuntimeFlags(
     val mqttRuntimeStatus: RuntimeActionStatus =
         if (mqttEnabled) RuntimeActionStatus.RUNNING else RuntimeActionStatus.STOPPED,
     val influxRuntimeStatus: RuntimeActionStatus =
-        if (influxEnabled) RuntimeActionStatus.RUNNING else RuntimeActionStatus.STOPPED
+        if (influxEnabled) RuntimeActionStatus.RUNNING else RuntimeActionStatus.STOPPED,
+    val mainCallbackQueue: CallbackQueueState? = null,
+    val secondaryCallbackQueue: CallbackQueueState? = null
 )
 
 data class DashboardMainPollState(
@@ -454,6 +457,8 @@ class DashboardUiStateStore(
                 mainPollingRunning = flags.mainPollingRunning,
                 pollingEnabled = flags.pollingEnabled,
                 mainRuntimeStatus = flags.mainRuntimeStatus,
+                mainCallbackQueue = flags.mainCallbackQueue,
+                secondaryCallbackQueue = flags.secondaryCallbackQueue,
                 debugPollingEnabled = flags.debugPollingEnabled,
                 debugPollingRunning = flags.debugPollingRunning,
                 debugRuntimeStatus = flags.debugRuntimeStatus,

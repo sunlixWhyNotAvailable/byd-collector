@@ -38,7 +38,11 @@ class CallbackBatchDrainCoordinator(
     private val importBatch: (TelemetryCallbackBatch, String, CallbackDelivery) -> CallbackImportResult,
     private val acknowledge: (CallbackSpool.Descriptor) -> CallbackSpoolActionResult,
     private val quarantine: (CallbackSpool.Descriptor, String) -> CallbackSpoolActionResult,
-    private val wallTimeMs: () -> Long = System::currentTimeMillis
+    private val wallTimeMs: () -> Long = System::currentTimeMillis,
+    private val onDownloadStarted: () -> Unit = {},
+    private val onPendingBatchObserved: (Long?) -> Unit = {},
+    private val onRawCommitCompleted: () -> Unit = {},
+    private val onPendingBatchCompleted: () -> Unit = {}
 ) {
     /** A finite slice lets the serial owner recheck cancellation between packets. */
     fun drain(maxBatches: Int = 4): CallbackDrainResult {
@@ -84,12 +88,17 @@ class CallbackBatchDrainCoordinator(
         try {
             repeat(maxBatches) {
                 interrupted()
+                runCatching(onDownloadStarted)
                 val payload = download()
                 interrupted()
                 payload.batch?.events?.minOfOrNull { it.receivedWallMs }?.let { oldestInBatch ->
                     oldestObservedWallMs = oldestObservedWallMs?.let { minOf(it, oldestInBatch) } ?: oldestInBatch
                 }
                 val descriptor = payload.descriptor
+                if (descriptor != null) {
+                    val oldestHead = payload.batch?.events?.minOfOrNull { it.receivedWallMs }
+                    runCatching { onPendingBatchObserved(oldestHead) }
+                }
                 if (!payload.ok && (!payload.permanentFormatError || descriptor == null)) {
                     return result(
                         drained = false,
@@ -118,6 +127,7 @@ class CallbackBatchDrainCoordinator(
                     val committedAtWallMs = wallTimeMs()
                     lastRawCommitWallMs = committedAtWallMs
                     lastProgressWallMs = committedAtWallMs
+                    runCatching(onRawCommitCompleted)
                 }
                 interrupted()
                 when (imported) {
@@ -139,6 +149,7 @@ class CallbackBatchDrainCoordinator(
                         }
                         progressed = true
                         lastProgressWallMs = wallTimeMs()
+                        runCatching(onPendingBatchCompleted)
                     }
                     is CallbackImportResult.Rejected -> {
                         val action = quarantine(descriptor, imported.reason.take(512))
@@ -153,6 +164,7 @@ class CallbackBatchDrainCoordinator(
                         quarantinedBatches++
                         progressed = true
                         lastProgressWallMs = wallTimeMs()
+                        runCatching(onPendingBatchCompleted)
                     }
                 }
                 interrupted()

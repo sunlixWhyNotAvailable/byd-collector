@@ -26,6 +26,42 @@ import kotlin.test.assertTrue
 
 class TelemetryWorkerReplayCoordinatorTest {
     @Test
+    fun fencedDrainReadsPastShortPagesAndFailsClosedOnUnavailableOrCancelledTail() {
+        val actions = mutableListOf<String>()
+        val storage = FakeWorkerPollStorage(actions)
+        var fetched = 0
+        var acknowledged = 0
+        val coordinator = TelemetryWorkerReplayCoordinator(
+            store = storage, ensureHelper = { null },
+            pendingSamples = {
+                fetched++
+                PendingTelemetryWorkerSamples(0, if (fetched <= 2) listOf(sample(fetched.toLong())) else emptyList())
+            },
+            acknowledgeSample = { _, _ -> acknowledged++; TelemetryWorkerAckResult(0, true) },
+            replayEntriesForCatalog = ::testCatalogEntries
+        )
+        coordinator.drainFencedTail(7L)
+        assertEquals(3, fetched)
+        assertEquals(2, acknowledged)
+        assertEquals(2, storage.inputs.size)
+
+        for (status in listOf(CollectorHelperProtocol.STATUS_SPOOL_UNAVAILABLE, CollectorHelperProtocol.STATUS_REPLAY_PENDING)) {
+            var attempts = 0
+            val unavailable = TelemetryWorkerReplayCoordinator(
+                store = storage, ensureHelper = { null },
+                pendingSamples = { attempts++; PendingTelemetryWorkerSamples(status, emptyList()) },
+                acknowledgeSample = { _, _ -> error("No sample may be acknowledged") }
+            )
+            assertFailsWith<IllegalStateException> { unavailable.drainFencedTail(7L) }
+            assertEquals(1, attempts)
+        }
+        assertFailsWith<InterruptedException> {
+            coordinator.drainFencedTail(7L) { throw InterruptedException("cancelled") }
+        }
+        assertEquals(3, fetched)
+    }
+
+    @Test
     fun failedRawSampleNotifiesOnlyFailureObserverBeforeAcknowledgement() {
         val actions = mutableListOf<String>()
         val storage = FakeWorkerPollStorage(actions)

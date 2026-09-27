@@ -8,6 +8,40 @@ import kotlin.test.assertTrue
 
 class TelegramTemplatesTest {
     @Test
+    fun preEmojiDefaultsUpgradeInBothLanguagesWithoutRewritingNearMatches() {
+        val oldDefaults = listOf(
+            Triple(TelegramEventType.CHARGING_STARTED, TelegramTemplateLanguage.UK, "Заряджання розпочато\nSOC: {soc}%\nЧас: {time}"),
+            Triple(TelegramEventType.CHARGING_STARTED, TelegramTemplateLanguage.EN, "Charging started\nSOC: {soc}%\nTime: {time}"),
+            Triple(TelegramEventType.CHARGING_PROGRESS, TelegramTemplateLanguage.UK, "Заряд: {soc}%\nПотужність: {battery_power_kw} кВт\nЗа крок: +{charge_step_added_percent}% / +{charge_step_added_kwh} кВт·год\nЧас кроку: {charge_step_duration}\nЗа сесію: +{charge_added_percent}% / +{charge_added_kwh} кВт·год\nЧас сесії: {charge_duration}\nЧас: {time}"),
+            Triple(TelegramEventType.CHARGING_PROGRESS, TelegramTemplateLanguage.EN, "Charge: {soc}%\nPower: {battery_power_kw} kW\nThis step: +{charge_step_added_percent}% / +{charge_step_added_kwh} kWh\nStep time: {charge_step_duration}\nSession total: +{charge_added_percent}% / +{charge_added_kwh} kWh\nSession time: {charge_duration}\nTime: {time}"),
+            Triple(TelegramEventType.CHARGED_TO_100, TelegramTemplateLanguage.UK, "Авто заряджено до 100%\nЗаряджено: {charge_added_percent}% / {charge_added_kwh} кВт·год\nЧас заряджання: {charge_start_time} → {charge_end_time} ({charge_duration_hhmm})\nЕнергія: {remaining_energy_kwh} кВт·год\nЗапас ходу: {range_km} км"),
+            Triple(TelegramEventType.CHARGED_TO_100, TelegramTemplateLanguage.EN, "Vehicle charged to 100%\nCharged: {charge_added_percent}% / {charge_added_kwh} kWh\nCharging time: {charge_start_time} → {charge_end_time} ({charge_duration_hhmm})\nEnergy: {remaining_energy_kwh} kWh\nRange: {range_km} km"),
+            Triple(TelegramEventType.CHARGING_STOPPED, TelegramTemplateLanguage.UK, "Заряджання зупинено\nSOC: {soc}%\nТривалість: {charge_duration}\nЧас: {time}"),
+            Triple(TelegramEventType.CHARGING_STOPPED, TelegramTemplateLanguage.EN, "Charging stopped\nSOC: {soc}%\nDuration: {charge_duration}\nTime: {time}"),
+            Triple(TelegramEventType.CHARGE_GUN_CONNECTED, TelegramTemplateLanguage.UK, "Зарядний кабель підключено\nSOC: {soc}%\nЧас: {time}"),
+            Triple(TelegramEventType.CHARGE_GUN_CONNECTED, TelegramTemplateLanguage.EN, "Charge gun connected\nSOC: {soc}%\nTime: {time}"),
+            Triple(TelegramEventType.CHARGE_GUN_DISCONNECTED, TelegramTemplateLanguage.UK, "Зарядний кабель відключено\nSOC: {soc}%\nЧас: {time}"),
+            Triple(TelegramEventType.CHARGE_GUN_DISCONNECTED, TelegramTemplateLanguage.EN, "Charge gun disconnected\nSOC: {soc}%\nTime: {time}"),
+            Triple(TelegramEventType.LOW_12V_VOLTAGE, TelegramTemplateLanguage.UK, "Низька напруга 12V акумулятора\nНапруга: {battery_12v} В\nЧас: {time}"),
+            Triple(TelegramEventType.LOW_12V_VOLTAGE, TelegramTemplateLanguage.EN, "Low 12V battery voltage\nVoltage: {battery_12v} V\nTime: {time}"),
+            Triple(TelegramEventType.TELEMETRY_UNAVAILABLE, TelegramTemplateLanguage.UK, "Телеметрія недоступна\nОстанні дані: {last_data_time}\nПомилка: {error}"),
+            Triple(TelegramEventType.TELEMETRY_UNAVAILABLE, TelegramTemplateLanguage.EN, "Telemetry unavailable\nLast data: {last_data_time}\nError: {error}"),
+            Triple(TelegramEventType.TRIP_SUMMARY, TelegramTemplateLanguage.UK, "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\n\nПоточна статистика.\nВитрачено: {trip_discharged_kwh} кВт·год\nРекуперовано: {trip_regenerated_kwh} кВт·год\nБаланс АКБ: {trip_net_kwh} кВт·год ({trip_net_kwh_per_100km} кВт·год/100 км), SOC: {soc_start}% -> {soc_end}%\nЗагалом: {total_distance_km} км / {total_duration}\n\nЗагальна статистика.\nВитрачено: {total_discharged_kwh} кВт·год\nРекуперовано: {total_regenerated_kwh} кВт·год\nБаланс АКБ: {total_net_kwh} кВт·год ({total_net_kwh_per_100km} кВт·год/100 км), SOC: {total_soc_start}% -> {total_soc_end}%"),
+            Triple(TelegramEventType.TRIP_SUMMARY, TelegramTemplateLanguage.EN, "Trip complete\nCurrent trip: {trip_distance_km} km / {trip_duration}\n\nCurrent statistics.\nUsed: {trip_discharged_kwh} kWh\nRecovered: {trip_regenerated_kwh} kWh\nBattery net: {trip_net_kwh} kWh ({trip_net_kwh_per_100km} kWh/100 km), SOC: {soc_start}% -> {soc_end}%\nTotal: {total_distance_km} km / {total_duration}\n\nTotal statistics.\nUsed: {total_discharged_kwh} kWh\nRecovered: {total_regenerated_kwh} kWh\nBattery net: {total_net_kwh} kWh ({total_net_kwh_per_100km} kWh/100 km), SOC: {total_soc_start}% -> {total_soc_end}%")
+        )
+        oldDefaults.forEach { (event, language, previous) ->
+            assertTrue(TelegramBuiltInTemplates.isHistoricBuiltIn(event, previous))
+            assertEquals(
+                TelegramBuiltInTemplates.defaultTemplate(event, language),
+                TelegramBuiltInTemplates.migrateKnownSaved(event.key, previous)
+            )
+            val custom = previous + "\nMy note"
+            assertFalse(TelegramBuiltInTemplates.isKnownBuiltIn(event, custom))
+            assertEquals(custom, TelegramBuiltInTemplates.migrateKnownSaved(event.key, custom))
+        }
+    }
+
+    @Test
     fun previousReleaseDefaultsMigrateButCustomLegacyEnergyKeepsItsMeaning() {
         val uk = "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\nПоточна витрата: {trip_energy_kwh} кВт·год ({trip_avg_kwh_per_100km} кВт·год/100 км), SOC: {soc_start}% -> {soc_end}%\nЗагалом: {total_distance_km} км / {total_duration}\nЗагальна витрата: {total_energy_kwh} кВт·год ({total_avg_kwh_per_100km} кВт·год/100 км), SOC: {total_soc_start}% -> {total_soc_end}%"
         val en = "Trip complete\nCurrent trip: {trip_distance_km} km / {trip_duration}\nCurrent energy used: {trip_energy_kwh} kWh ({trip_avg_kwh_per_100km} kWh/100 km), SOC: {soc_start}% -> {soc_end}%\nTotal: {total_distance_km} km / {total_duration}\nTotal energy used: {total_energy_kwh} kWh ({total_avg_kwh_per_100km} kWh/100 km), SOC: {total_soc_start}% -> {total_soc_end}%"
@@ -115,8 +149,7 @@ class TelegramTemplatesTest {
             "range_km" to "300"
         )
         assertEquals(
-            "Авто заряджено до 100%\nЗаряджено: 20% / 10 кВт·год\n" +
-                "Час заряджання: 08:03 → 09:04 (25:07)\nЕнергія: 40 кВт·год\nЗапас ходу: 300 км",
+            "✅ Авто заряджено до 100%\n📈 Заряджено: 20% / 10 кВт·год\n⏱️ Час заряджання: 08:03 → 09:04 (25:07)\n🔋 Енергія: 40 кВт·год\n🛣️ Запас ходу: 300 км",
             TelegramTemplateRenderer.render(
                 TelegramEventType.CHARGED_TO_100,
                 TelegramBuiltInTemplates.CHARGED_TO_100_UK,
@@ -124,8 +157,7 @@ class TelegramTemplatesTest {
             ).text
         )
         assertEquals(
-            "Vehicle charged to 100%\nCharged: 20% / 10 kWh\n" +
-                "Charging time: 08:03 → 09:04 (25:07)\nEnergy: 40 kWh\nRange: 300 km",
+            "✅ Vehicle charged to 100%\n📈 Charged: 20% / 10 kWh\n⏱️ Charging time: 08:03 → 09:04 (25:07)\n🔋 Energy: 40 kWh\n🛣️ Range: 300 km",
             TelegramTemplateRenderer.render(
                 TelegramEventType.CHARGED_TO_100,
                 TelegramBuiltInTemplates.CHARGED_TO_100_EN,
@@ -139,6 +171,8 @@ class TelegramTemplatesTest {
         val values = mapOf(
             "trip_distance_km" to "12.3",
             "trip_duration" to "00:24:18",
+            "trip_start_time" to "08:10", "trip_end_time" to "08:34",
+            "total_start_time" to "06:00", "total_end_time" to "08:34",
             "trip_energy_kwh" to "3.4",
             "trip_avg_kwh_per_100km" to "27.64",
             "soc_start" to "81",
@@ -155,11 +189,7 @@ class TelegramTemplatesTest {
             "total_net_kwh" to "98.7", "total_net_kwh_per_100km" to "21.62"
         )
         assertEquals(
-            "Поїздку завершено\nПоточна поїздка: 12.3 км / 00:24:18\n" +
-                "\nПоточна статистика.\nВитрачено: 4.0 кВт·год\nРекуперовано: 0.6 кВт·год\n" +
-                "Баланс АКБ: 3.4 кВт·год (27.64 кВт·год/100 км), SOC: 81% -> 76%\n" +
-                "Загалом: 456.7 км / 12:34:56\n\nЗагальна статистика.\nВитрачено: 100.0 кВт·год\nРекуперовано: 1.3 кВт·год\n" +
-                "Баланс АКБ: 98.7 кВт·год (21.62 кВт·год/100 км), SOC: 84% -> 75%",
+            "🏁 Поїздку завершено\n\n📊 Поточна статистика.\n🚗 Поїздка: 12.3 км / 00:24:18 (08:10 → 08:34)\n⚡ Витрачено: 4.0 кВт·год\n♻️ Рекуперовано: 0.6 кВт·год\n🔋 Баланс АКБ: 3.4 кВт·год (27.64 кВт·год/100 км), SOC: 81% → 76%\n\n📈 Загальна статистика.\n🚗 Поїздка: 456.7 км / 12:34:56 (06:00 → 08:34)\n⚡ Витрачено: 100.0 кВт·год\n♻️ Рекуперовано: 1.3 кВт·год\n🔋 Баланс АКБ: 98.7 кВт·год (21.62 кВт·год/100 км), SOC: 84% → 75%",
             TelegramTemplateRenderer.render(
                 TelegramEventType.TRIP_SUMMARY,
                 TelegramBuiltInTemplates.TRIP_SUMMARY_UK,
@@ -167,11 +197,7 @@ class TelegramTemplatesTest {
             ).text
         )
         assertEquals(
-            "Trip complete\nCurrent trip: 12.3 km / 00:24:18\n" +
-                "\nCurrent statistics.\nUsed: 4.0 kWh\nRecovered: 0.6 kWh\n" +
-                "Battery net: 3.4 kWh (27.64 kWh/100 km), SOC: 81% -> 76%\n" +
-                "Total: 456.7 km / 12:34:56\n\nTotal statistics.\nUsed: 100.0 kWh\nRecovered: 1.3 kWh\n" +
-                "Battery net: 98.7 kWh (21.62 kWh/100 km), SOC: 84% -> 75%",
+            "🏁 Trip complete\n\n📊 Current statistics.\n🚗 Trip: 12.3 km / 00:24:18 (08:10 → 08:34)\n⚡ Used: 4.0 kWh\n♻️ Recovered: 0.6 kWh\n🔋 Battery net: 3.4 kWh (27.64 kWh/100 km), SOC: 81% → 76%\n\n📈 Total statistics.\n🚗 Trip: 456.7 km / 12:34:56 (06:00 → 08:34)\n⚡ Used: 100.0 kWh\n♻️ Recovered: 1.3 kWh\n🔋 Battery net: 98.7 kWh (21.62 kWh/100 km), SOC: 84% → 75%",
             TelegramTemplateRenderer.render(
                 TelegramEventType.TRIP_SUMMARY,
                 TelegramBuiltInTemplates.TRIP_SUMMARY_EN,
@@ -185,6 +211,8 @@ class TelegramTemplatesTest {
         val values = mapOf(
             "trip_distance_km" to "12.3",
             "trip_duration" to "00:24:18",
+            "trip_start_time" to "08:10", "trip_end_time" to "08:34",
+            "total_start_time" to "06:00", "total_end_time" to "08:34",
             "trip_energy_kwh" to "3.4",
             "trip_avg_kwh_per_100km" to "27.64",
             "soc_start" to "81",
@@ -201,9 +229,7 @@ class TelegramTemplatesTest {
             "total_net_kwh" to "3.4", "total_net_kwh_per_100km" to "27.64"
         )
         assertEquals(
-            "Поїздку завершено\nПоточна поїздка: 12.3 км / 00:24:18\n" +
-                "\nПоточна статистика.\nВитрачено: 4.0 кВт·год\nРекуперовано: 0.6 кВт·год\n" +
-                "Баланс АКБ: 3.4 кВт·год (27.64 кВт·год/100 км), SOC: 81% -> 76%",
+            "🏁 Поїздку завершено\n\n📊 Поточна статистика.\n🚗 Поїздка: 12.3 км / 00:24:18 (08:10 → 08:34)\n⚡ Витрачено: 4.0 кВт·год\n♻️ Рекуперовано: 0.6 кВт·год\n🔋 Баланс АКБ: 3.4 кВт·год (27.64 кВт·год/100 км), SOC: 81% → 76%",
             TelegramTemplateRenderer.render(
                 TelegramEventType.TRIP_SUMMARY,
                 TelegramBuiltInTemplates.tripSummaryTemplate(TelegramTemplateLanguage.UK, includeOverall = false),
@@ -211,9 +237,7 @@ class TelegramTemplatesTest {
             ).text
         )
         assertEquals(
-            "Trip complete\nCurrent trip: 12.3 km / 00:24:18\n" +
-                "\nCurrent statistics.\nUsed: 4.0 kWh\nRecovered: 0.6 kWh\n" +
-                "Battery net: 3.4 kWh (27.64 kWh/100 km), SOC: 81% -> 76%",
+            "🏁 Trip complete\n\n📊 Current statistics.\n🚗 Trip: 12.3 km / 00:24:18 (08:10 → 08:34)\n⚡ Used: 4.0 kWh\n♻️ Recovered: 0.6 kWh\n🔋 Battery net: 3.4 kWh (27.64 kWh/100 km), SOC: 81% → 76%",
             TelegramTemplateRenderer.render(
                 TelegramEventType.TRIP_SUMMARY,
                 TelegramBuiltInTemplates.tripSummaryTemplate(TelegramTemplateLanguage.EN, includeOverall = false),

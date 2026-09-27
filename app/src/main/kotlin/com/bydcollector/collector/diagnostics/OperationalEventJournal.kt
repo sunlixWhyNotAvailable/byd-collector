@@ -7,6 +7,9 @@ import java.io.File
 import java.io.FileOutputStream
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 // Keeps operational evidence available even when SQLite cannot be opened.
 class OperationalEventJournal internal constructor(
@@ -17,15 +20,36 @@ class OperationalEventJournal internal constructor(
     private val pid: Int = Process.myPid()
 ) {
     constructor(context: Context) : this(File(context.filesDir, JOURNAL_DIR))
+    private val lock = ReentrantLock()
 
-    @Synchronized
     fun append(
         timestamp: String,
         elapsedMs: Long,
         category: String,
         message: String,
         detail: String?
-    ) {
+    ) = lock.withLock { appendLocked(timestamp, elapsedMs, category, message, detail) }
+
+    // A fatal handler must not wait behind a diagnostic Share snapshot indefinitely.
+    // This bounds lock acquisition, not filesystem latency; persistence is best effort.
+    internal fun tryAppend(
+        timestamp: String,
+        elapsedMs: Long,
+        category: String,
+        message: String,
+        detail: String?,
+        lockWaitMs: Long = 100L
+    ): Boolean {
+        if (!lock.tryLock(lockWaitMs, TimeUnit.MILLISECONDS)) return false
+        return try {
+            appendLocked(timestamp, elapsedMs, category, message, detail)
+            true
+        } finally {
+            lock.unlock()
+        }
+    }
+
+    private fun appendLocked(timestamp: String, elapsedMs: Long, category: String, message: String, detail: String?) {
         val line = journalLine(timestamp, elapsedMs, bootId, pid, category, message, detail)
         check(root.isDirectory || root.mkdirs()) {
             "Failed to create operational journal directory: ${root.absolutePath}"
@@ -38,8 +62,7 @@ class OperationalEventJournal internal constructor(
         FileOutputStream(active, true).use { output -> output.write(bytes) }
     }
 
-    @Synchronized
-    fun snapshotTo(target: File): Int {
+    fun snapshotTo(target: File): Int = lock.withLock {
         check(target.isDirectory || target.mkdirs()) {
             "Failed to create operational journal snapshot: ${target.absolutePath}"
         }
@@ -49,18 +72,17 @@ class OperationalEventJournal internal constructor(
             source.copyTo(File(target, source.name), overwrite = true)
             copied += 1
         }
-        return copied
+        copied
     }
 
-    @Synchronized
-    fun clear(): Int {
+    fun clear(): Int = lock.withLock {
         var removed = 0
         segmentFiles().forEach { file ->
             if (!file.exists()) return@forEach
             check(file.delete()) { "Failed to delete operational journal segment: ${file.absolutePath}" }
             removed += 1
         }
-        return removed
+        removed
     }
 
     private fun rotate() {

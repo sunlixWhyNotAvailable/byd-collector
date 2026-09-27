@@ -66,26 +66,16 @@ class DashboardStateProvider(
         val application = context.applicationContext as BydCollectorApplication
         return when {
             profile.readsTelemetryStore && !mainMaintenanceRunning -> {
-                application.withTelemetryStoreRead {
+                application.withTelemetryStoreRead { currentStore ->
                     loadSnapshot(
                         profile,
                         previous,
                         vehicleKpiLanguage,
                         mainMaintenanceRunning,
                         debugMaintenanceRunning,
-                        storeProvider()
+                        currentStore
                     )
                 }
-            }
-            profile.readsDebugStatus && !debugMaintenanceRunning -> application.withDatabaseRead {
-                loadSnapshot(
-                    profile,
-                    previous,
-                    vehicleKpiLanguage,
-                    mainMaintenanceRunning,
-                    debugMaintenanceRunning,
-                    null
-                )
             }
             else -> loadSnapshot(
                 profile,
@@ -118,17 +108,18 @@ class DashboardStateProvider(
             maintenanceHealthSnapshot(mainPollingRunning)
         }
         val debugStatusRequested = profile.readsDebugStatus && !debugMaintenanceRunning
-        val debugStatusLoaded = debugStatusRequested &&
-            BydCollectorApplication.isDebugStorageReady(context)
-        val debugStatus = if (debugStatusLoaded) {
-            debugStatusCache.get(nowMs = nowMs) {
-                DirectDebugStore(context).use { debugStore ->
-                    debugStore.status(previous?.debugReadingCount ?: UNKNOWN_DASHBOARD_COUNT)
+        val loadedDebugStatus = if (debugStatusRequested && BydCollectorApplication.isDebugStorageReady(context)) {
+            // This snapshot may hold Main's gate; never wait for the sibling DB.
+            (context.applicationContext as BydCollectorApplication).trySecondaryDatabaseRead {
+                debugStatusCache.get(nowMs = nowMs) {
+                    DirectDebugStore(context).use { debugStore ->
+                        debugStore.status(previous?.debugReadingCount ?: UNKNOWN_DASHBOARD_COUNT)
+                    }
                 }
             }
-        } else {
-            lightweightDebugStatus()
-        }
+        } else null
+        val debugStatusLoaded = loadedDebugStatus != null
+        val debugStatus = loadedDebugStatus ?: lightweightDebugStatus()
         val debugParameterCount = DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT
         val runtimeSettingsLoaded = profile.readsRuntimeSettings
         val keepAliveConfig = if (runtimeSettingsLoaded) settings.keepAliveConfig() else null

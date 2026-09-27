@@ -19,7 +19,10 @@ import com.bydcollector.collector.data.energy.HistoricalEnergyResult
 import com.bydcollector.collector.data.energy.HistoricalBackfillFinalizationGate
 import java.util.concurrent.locks.ReentrantLock
 import com.bydcollector.collector.diagnostics.OperationalEventJournal
+import com.bydcollector.collector.diagnostics.ProcessExitDiagnostics
 import com.bydcollector.collector.maintenance.DatabaseMaintenanceGate
+import com.bydcollector.collector.maintenance.DbMaintenanceOperation
+import com.bydcollector.collector.maintenance.MaintenanceDiagnostics
 import com.bydcollector.collector.maintenance.StorageFormatCutoverCoordinator
 import com.bydcollector.collector.maintenance.StorageFormat
 import com.bydcollector.collector.service.CollectorSettings
@@ -38,22 +41,36 @@ import com.bydcollector.collector.util.sharedOperationalEventExecutor
 import java.io.File
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.withLock
 import com.bydcollector.collector.data.local.HistoricalMainIdentity
 import com.bydcollector.collector.data.local.HistoricalPollEndpoint
 
 //starts process-scoped app bookkeeping before either CollectorService or MainActivity is created
 class BydCollectorApplication : Application() {
-    private var telemetryStore: TelemetryStore? = null
+    @Volatile private var telemetryStore: TelemetryStore? = null
     private var telegramStore: TelegramStore? = null
     private var telegramStorageError: String? = null
     private var telegramLegacyMigrationUnresolved = false
     private var tripsStore: TripStore? = null
     private var cutoverCoordinator: StorageFormatCutoverCoordinator? = null
-    private var debugStorageReady: Boolean? = null
+    @Volatile private var debugStorageReady: Boolean? = null
     internal val databaseMaintenanceGate = DatabaseMaintenanceGate()
+    internal val secondaryDatabaseMaintenanceGate = DatabaseMaintenanceGate()
+    // The cutover journal is shared by both database families.
+    private val storageCutoverLock = ReentrantLock(true)
     // Only file barriers and archive's runtime-stop boundary share this lock, not ongoing collection.
     internal val tripsFileOperationLock = ReentrantLock(true)
     internal val operationalEventJournal by lazy { OperationalEventJournal(applicationContext) }
+    private val maintenanceDiagnosticsDelegate = lazy {
+        MaintenanceDiagnostics(appendEvent = { event, detail ->
+            operationalEventJournal.tryAppend(
+                Instant.now().toString(), SystemClock.elapsedRealtime(), "database_maintenance", event, detail
+            )
+            Unit
+        })
+    }
+    internal val maintenanceDiagnostics by maintenanceDiagnosticsDelegate
     val dashboardUiStateStore by lazy { DashboardUiStateStore() }
     val navigationSession by lazy { UiSessionState() }
     private val updateCheckExecutorDelegate = lazy { namedSingleThreadExecutor("byd-update-check") }
@@ -95,6 +112,11 @@ class BydCollectorApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        runCatching {
+            ProcessExitDiagnostics.install(this, operationalEventJournal) {
+                if (maintenanceDiagnosticsDelegate.isInitialized()) maintenanceDiagnostics.cachedSnapshot().detail else "maintenance=inactive"
+            }
+        }.onFailure { android.util.Log.w("BYDCollectorExit", "Exit evidence initialization failed", it) }
         CollectorSettings.resetCollectionAfterProcessDeath(this)
         // A Messenger bind can create only this Application. Normal runtime entry
         // points start update timing explicitly; IPC must not start checks or collection.
@@ -196,8 +218,7 @@ class BydCollectorApplication : Application() {
             val page = try {
                 tryDatabaseRead {
                     StoreReadResult(
-                        synchronized(this) { telemetryStore }
-                            ?.historicalEnergyPollPage(first.pollId, last.pollId, afterPollId, HISTORICAL_POLL_PAGE_SIZE)
+                        telemetryStore?.historicalEnergyPollPage(first.pollId, last.pollId, afterPollId, HISTORICAL_POLL_PAGE_SIZE)
                     )
                 }?.value ?: return historicalEnergyRetry("main_maintenance_busy")
             } catch (error: IllegalArgumentException) {
@@ -251,9 +272,7 @@ class BydCollectorApplication : Application() {
         while (true) {
             if (!historicalEnergyCanContinue(generation)) return null
             val page = tryDatabaseRead {
-                StoreReadResult(
-                    synchronized(this) { telemetryStore }?.historicalPollHeaderPage(afterPollId, HISTORICAL_HEADER_PAGE_SIZE)
-                )
+                StoreReadResult(telemetryStore?.historicalPollHeaderPage(afterPollId, HISTORICAL_HEADER_PAGE_SIZE))
             }?.value ?: return null
             val expected = sourceIdentity
             if (expected != null && expected.stableKey != page.sourceIdentity.stableKey) return null
@@ -328,10 +347,17 @@ class BydCollectorApplication : Application() {
 
     internal fun <T : Any> tryDatabaseRead(action: () -> T): T? = databaseMaintenanceGate.tryRead(action)
 
+    internal fun <T : Any> tryTelemetryStoreRead(action: (TelemetryStore) -> T): T? =
+        databaseMaintenanceGate.tryRead { StoreReadResult(telemetryStore?.let(action)) }?.value
+
+    fun <T> withSecondaryDatabaseRead(action: () -> T): T = secondaryDatabaseMaintenanceGate.withRead(action)
+
+    internal fun <T : Any> trySecondaryDatabaseRead(action: () -> T): T? = secondaryDatabaseMaintenanceGate.tryRead(action)
+
     fun <T> withTelemetryStoreRead(action: (TelemetryStore) -> T): T {
         while (true) {
             val result = withDatabaseRead {
-                synchronized(this) { telemetryStore }?.let { StoreReadResult(action(it)) }
+                telemetryStore?.let { StoreReadResult(action(it)) }
             }
             if (result != null) return result.value
             store()
@@ -339,10 +365,32 @@ class BydCollectorApplication : Application() {
     }
 
     fun <T> withExclusiveDatabaseMaintenance(action: () -> T): T =
-        databaseMaintenanceGate.withExclusive(action)
+        withStorageCutoverLock { databaseMaintenanceGate.withExclusive(action) }
 
     internal fun <T : Any> tryWithExclusiveDatabaseMaintenance(timeoutMs: Long, action: () -> T): T? =
-        databaseMaintenanceGate.tryWithExclusive(timeoutMs, action)
+        tryWithExclusiveDatabaseMaintenance(DbMaintenanceOperation.ARCHIVE, timeoutMs, action)
+
+    internal fun <T : Any> tryWithExclusiveDatabaseMaintenance(
+        operation: DbMaintenanceOperation,
+        timeoutMs: Long,
+        action: () -> T
+    ): T? {
+        require(timeoutMs >= 0)
+        val startedAtNanos = System.nanoTime()
+        val acquired = try {
+            storageCutoverLock.tryLock(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        if (!acquired) return null
+        return try {
+            val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos)
+            maintenanceGateFor(operation).tryWithExclusive((timeoutMs - elapsedMs).coerceAtLeast(0L), action)
+        } finally {
+            storageCutoverLock.unlock()
+        }
+    }
 
     @Synchronized
     fun telegramStoreOrNull(): TelegramStore? = telegramStore.takeIf { telegramStorageError == null }
@@ -384,19 +432,19 @@ class BydCollectorApplication : Application() {
     }
 
     fun ensureDebugStorageReady(): Boolean {
-        return withExclusiveDatabaseMaintenance {
-            synchronized(this) {
-                debugStorageReady ?: coordinator().ensureDebugReady().also { ready ->
+        if (trySecondaryDatabaseRead { debugStorageReady == true } == true) return true
+        return withStorageCutoverLock {
+            secondaryDatabaseMaintenanceGate.withExclusive {
+                if (debugStorageReady == true) true
+                else coordinator().ensureDebugReady().also { ready ->
                     debugStorageReady = ready.takeIf { it }
                 }
             }
         }
     }
 
-    @Synchronized
     fun isDebugStorageReady(): Boolean = debugStorageReady == true
 
-    @Synchronized
     fun setDebugStorageReadyAfterMaintenance(ready: Boolean) {
         debugStorageReady = ready.takeIf { it }
         CollectorSettings(applicationContext).setDebugStorageCutoverError(if (ready) null else "Debug database verification failed")
@@ -435,7 +483,7 @@ class BydCollectorApplication : Application() {
     }
 
     private fun store(): TelemetryStore {
-        withDatabaseRead { synchronized(this) { telemetryStore } }?.let { return it }
+        withDatabaseRead { telemetryStore }?.let { return it }
         return withExclusiveDatabaseMaintenance {
             synchronized(this) {
                 telemetryStore?.let { return@synchronized it }
@@ -476,6 +524,13 @@ class BydCollectorApplication : Application() {
             applicationContext,
             CollectorSettings(applicationContext)
         ).also { cutoverCoordinator = it }
+    }
+
+    private fun <T> withStorageCutoverLock(action: () -> T): T = storageCutoverLock.withLock(action)
+
+    private fun maintenanceGateFor(operation: DbMaintenanceOperation): DatabaseMaintenanceGate = when (operation) {
+        DbMaintenanceOperation.ARCHIVE -> databaseMaintenanceGate
+        DbMaintenanceOperation.DEBUG_ARCHIVE -> secondaryDatabaseMaintenanceGate
     }
 
     @Synchronized

@@ -11,6 +11,7 @@ import com.bydcollector.collector.data.normalized.VehicleStateNormalizer
 import com.bydcollector.collector.telegram.TelegramEventType
 import com.bydcollector.collector.telegram.TelegramNavigatorMask
 import com.bydcollector.collector.telegram.TelegramTemplateLanguage
+import org.json.JSONObject
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -925,16 +926,24 @@ class TelegramEventEngineTest {
     fun oneStopBuiltInSummaryOmitsIdenticalOverallBlockAndPersistsLocationMarker() {
         val engine = pendingTripEngine()
         val tripId = engine.state.tripId
+        val tripStartedAtMs = engine.state.tripStartedAtMs
+        val tripEndedAtMs = engine.state.tripParkedSinceMs
 
         val finalized = engine.onTick(config, false, null, 20_000L)
         val summary = finalized.events.single()
 
         assertTrue(summary.omitOverall)
+        assertEquals(summary.variables["trip_start_time"], summary.variables["total_start_time"])
+        assertEquals(summary.variables["trip_end_time"], summary.variables["total_end_time"])
+        assertEquals(tripStartedAtMs, finalized.state.bootTotalStartedAtMs)
+        assertEquals(tripEndedAtMs, finalized.state.bootTotalEndedAtMs)
         assertEquals(tripId, finalized.state.pendingPowerOffLocationTripId)
         assertFalse(finalized.state.pendingPowerOffLocationSummaryDelivered)
         assertTrue(finalized.state.hasDeferredStorageWork())
 
         val restarted = TelegramEventEngine(TelegramEventState.fromJson(finalized.state.toJson()))
+        assertEquals(finalized.state.bootTotalStartedAtMs, restarted.state.bootTotalStartedAtMs)
+        assertEquals(finalized.state.bootTotalEndedAtMs, restarted.state.bootTotalEndedAtMs)
         assertFalse(restarted.state.pendingPowerOffLocationSummaryDelivered)
         assertNull(restarted.markTripSummaryDelivered("wrong:summary", 20_500L))
         assertEquals(
@@ -961,6 +970,60 @@ class TelegramEventEngineTest {
             location = location,
             nowMs = 22_000L
         ).events.isEmpty())
+    }
+
+    @Test
+    fun legacyTotalBoundsStayUnknownUntilAnActualDriveCompletes() {
+        val pending = pendingTripEngine().state.copy(
+            bootStartSoc = 60.0,
+            bootEndSoc = 58.0,
+            bootTotalDistanceKm = 4.0,
+            bootTotalEnergyKwh = 2.0,
+            bootTotalDurationMs = 120_000L
+        )
+        val legacyJson = JSONObject(pending.toJson()).apply {
+            remove("tripEndedAtMs")
+            remove("bootTotalStartedAtMs")
+            remove("bootTotalEndedAtMs")
+        }.toString()
+        val legacy = TelegramEventState.fromJson(legacyJson)
+        assertNull(legacy.tripEndedAtMs)
+        assertNull(legacy.bootTotalStartedAtMs)
+        assertNull(legacy.bootTotalEndedAtMs)
+
+        val restarted = TelegramEventEngine(legacy)
+        val parkEndAtMs = legacy.tripParkedSinceMs
+        val summary = restarted.onTick(config, false, null, 3_600_000L).events.single()
+
+        assertEquals("n/a", summary.variables["total_start_time"])
+        assertEquals(summary.variables["trip_end_time"], summary.variables["total_end_time"])
+        assertEquals(parkEndAtMs, restarted.state.bootTotalEndedAtMs)
+        assertNull(restarted.state.bootTotalStartedAtMs)
+        assertEquals(5.0, restarted.state.bootTotalDistanceKm)
+        assertTrue(restarted.state.hasDeferredStorageWork())
+
+        val persisted = TelegramEventEngine(TelegramEventState.fromJson(restarted.state.toJson()))
+        assertNull(persisted.state.bootTotalStartedAtMs)
+        assertEquals(parkEndAtMs, persisted.state.bootTotalEndedAtMs)
+    }
+
+    @Test
+    fun displayedTotalsWithDifferentPeriodBoundsAreNotSuppressed() {
+        val pending = pendingTripEngine().state
+        val shiftedTotalStartAtMs = checkNotNull(pending.tripStartedAtMs) - 60L * 60_000L
+        val shiftedTotalEndAtMs = checkNotNull(pending.tripParkedSinceMs) - 60L * 60_000L
+        val state = pending.copy(
+            bootTotalStartedAtMs = shiftedTotalStartAtMs,
+            bootTotalEndedAtMs = shiftedTotalEndAtMs
+        )
+
+        val summary = TelegramEventEngine(state).onTick(config, false, null, 20_000L).events.single()
+
+        assertEquals(summary.variables["trip_distance_km"], summary.variables["total_distance_km"])
+        assertEquals(summary.variables["trip_energy_kwh"], summary.variables["total_energy_kwh"])
+        assertTrue(summary.variables.getValue("trip_start_time") != summary.variables.getValue("total_start_time"))
+        assertEquals(summary.variables["trip_end_time"], summary.variables["total_end_time"])
+        assertFalse(summary.omitOverall)
     }
 
     @Test
@@ -1107,13 +1170,21 @@ class TelegramEventEngineTest {
 
     @Test
     fun tripSummaryUsesCounterDeltaAndAccumulatesFinalizedSessions() {
+        val hourMs = 60L * 60_000L
+        val firstStartAtMs = 7L * hourMs + 500L
+        val firstEndAtMs = 7L * hourMs + 121_000L
         val engine = TelegramEventEngine()
         engine.onSuccessfulPoll(snapshot(gear = "P", odometer = 100.0, soc = 56.0, tripEnergy = 10.0), config, 0L)
-        engine.onSuccessfulPoll(snapshot(gear = "D", odometer = 100.0, soc = 56.0, tripEnergy = 10.0), config, 1_000L)
-        engine.onSuccessfulPoll(snapshot(gear = "D", odometer = 100.0, soc = 56.0, tripEnergy = 10.0), config, 2_000L)
-        engine.onSuccessfulPoll(snapshot(gear = "P", odometer = 101.0, soc = 54.0, tripEnergy = 10.5), config, 62_000L)
-        engine.onSuccessfulPoll(snapshot(gear = "P", odometer = 101.0, soc = 54.0, tripEnergy = 10.5), config, 63_000L)
-        val first = engine.onTick(config, false, null, 73_000L).events.single()
+        engine.onSuccessfulPoll(snapshot(gear = "D", odometer = 100.0, soc = 56.0, tripEnergy = 10.0), config, 7L * hourMs)
+        engine.onSuccessfulPoll(snapshot(gear = "D", odometer = 100.0, soc = 56.0, tripEnergy = 10.0), config, firstStartAtMs)
+        engine.onSuccessfulPoll(snapshot(gear = "P", odometer = 101.0, soc = 54.0, tripEnergy = 10.5), config, firstEndAtMs - 500L)
+        engine.onSuccessfulPoll(snapshot(gear = "P", odometer = 101.0, soc = 54.0, tripEnergy = 10.5), config, firstEndAtMs)
+        val first = engine.onTick(
+            config,
+            false,
+            null,
+            firstEndAtMs + config.tripEndDelayMs + hourMs
+        ).events.single()
 
         assertEquals("1", first.variables["trip_distance_km"])
         assertEquals("0.5", first.variables["trip_energy_kwh"])
@@ -1121,22 +1192,28 @@ class TelegramEventEngineTest {
         assertEquals("1", first.variables["total_distance_km"])
         assertEquals("0.5", first.variables["total_energy_kwh"])
         assertEquals("50", first.variables["total_avg_kwh_per_100km"])
-        assertEquals("0:01", first.variables["trip_duration"])
-        assertEquals("0:01", first.variables["total_duration"])
+        assertEquals("0:02", first.variables["trip_duration"])
+        assertEquals("0:02", first.variables["total_duration"])
+        assertEquals(first.variables["trip_start_time"], first.variables["total_start_time"])
+        assertEquals(first.variables["trip_end_time"], first.variables["total_end_time"])
         assertEquals("56", first.variables["soc_start"])
         assertEquals("54", first.variables["soc_end"])
         assertEquals("56", first.variables["total_soc_start"])
         assertEquals("54", first.variables["total_soc_end"])
         assertTrue(first.omitOverall)
+        assertEquals(firstStartAtMs, engine.state.bootTotalStartedAtMs)
+        assertEquals(firstEndAtMs, engine.state.bootTotalEndedAtMs)
 
         val restarted = TelegramEventEngine(TelegramEventState.fromJson(engine.state.toJson()))
-        restarted.onSuccessfulPoll(snapshot(gear = "P", odometer = 101.0, soc = 53.0, tripEnergy = 10.5), config, 74_000L)
-        restarted.onSuccessfulPoll(snapshot(gear = "D", odometer = 101.0, soc = 53.0, tripEnergy = 10.5), config, 75_000L)
-        restarted.onSuccessfulPoll(snapshot(gear = "D", odometer = 101.0, soc = 53.0, tripEnergy = 10.5), config, 76_000L)
+        val secondStartAtMs = 10L * hourMs + 500L
+        val secondEndAtMs = 10L * hourMs + 180_500L
+        restarted.onSuccessfulPoll(snapshot(gear = "P", odometer = 101.0, soc = 53.0, tripEnergy = 10.5), config, 9L * hourMs)
+        restarted.onSuccessfulPoll(snapshot(gear = "D", odometer = 101.0, soc = 53.0, tripEnergy = 10.5), config, 10L * hourMs)
+        restarted.onSuccessfulPoll(snapshot(gear = "D", odometer = 101.0, soc = 53.0, tripEnergy = 10.5), config, secondStartAtMs)
         val second = restarted.onPowerOffConfirmed(
             config,
             TelegramPowerOffSnapshot(103.0, 52.0, 11.2),
-            nowMs = 196_000L
+            nowMs = secondEndAtMs
         ).events.single()
 
         assertEquals("2", second.variables["trip_distance_km"])
@@ -1145,7 +1222,10 @@ class TelegramEventEngineTest {
         assertEquals("3", second.variables["total_distance_km"])
         assertEquals("1.2", second.variables["total_energy_kwh"])
         assertEquals("40", second.variables["total_avg_kwh_per_100km"])
-        assertEquals("0:03", second.variables["total_duration"])
+        assertEquals("0:05", second.variables["total_duration"])
+        assertTrue(second.variables.getValue("trip_start_time") != second.variables.getValue("total_start_time"))
+        assertEquals(second.variables["trip_end_time"], second.variables["total_end_time"])
+        assertTrue(second.variables.getValue("trip_end_time") != first.variables.getValue("trip_end_time"))
         assertEquals("53", second.variables["soc_start"])
         assertEquals("52", second.variables["soc_end"])
         assertEquals("56", second.variables["total_soc_start"])
@@ -1154,6 +1234,8 @@ class TelegramEventEngineTest {
         assertEquals(0.0, restarted.state.bootTotalEnergyKwh)
         assertNull(restarted.state.bootStartSoc)
         assertNull(restarted.state.bootEndSoc)
+        assertNull(restarted.state.bootTotalStartedAtMs)
+        assertNull(restarted.state.bootTotalEndedAtMs)
     }
 
     @Test

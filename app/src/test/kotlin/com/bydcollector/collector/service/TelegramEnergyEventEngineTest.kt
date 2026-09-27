@@ -256,7 +256,9 @@ class TelegramEnergyEventEngineTest {
                 powerEnergyPoint = start,
                 bootStartSoc = 50.0,
                 bootEndSoc = 50.0,
-                bootTotalEnergyKwh = 5.0
+                bootTotalEnergyKwh = 5.0,
+                bootTotalStartedAtMs = 0L,
+                bootTotalEndedAtMs = 1_000L
             )
         )
 

@@ -31,10 +31,10 @@ class CallbackIntakeWorker(
     private val ready: () -> Boolean = { true },
     private val onStatus: (CallbackIntakeStatus) -> Unit = {},
     private val onStopped: () -> Unit = {},
-    private val progressPaceMs: () -> Long = { 0L },
     private val sleepMs: (Long) -> Unit = { Thread.sleep(it) },
     private val monotonicNanos: () -> Long = System::nanoTime,
-    private val wallTimeMs: () -> Long = System::currentTimeMillis
+    private val wallTimeMs: () -> Long = System::currentTimeMillis,
+    private val queueStatusTracker: CallbackQueueStatusTracker = CallbackQueueStatusTracker()
 ) {
     private val lock = Any()
     private val running = AtomicBoolean(false)
@@ -56,8 +56,12 @@ class CallbackIntakeWorker(
 
     fun isStopping(): Boolean = !running.get() && worker?.isAlive == true
 
+    /** Cached queue state; this never contacts the helper or reads SQLite. */
+    fun snapshotQueueState(): CallbackQueueState = queueStatusTracker.snapshot()
+
     fun start(): Boolean = synchronized(lock) {
         if (worker?.isAlive == true || !running.compareAndSet(false, true)) return@synchronized false
+        queueStatusTracker.start()
         val next = Thread(::runLoop, threadName).apply { isDaemon = true }
         worker = next
         next.start()
@@ -119,6 +123,7 @@ class CallbackIntakeWorker(
             lastReportedAt = now
             val wallNowMs = wallTimeMs()
             val headAgeMs = lastObservedHeadWallMs?.let { (wallNowMs - it).coerceAtLeast(0L) }
+            val queueState = queueStatusTracker.snapshot()
             val fault = result.fault
             val detail = buildString {
                 append("condition=").append(condition.name.lowercase())
@@ -135,6 +140,8 @@ class CallbackIntakeWorker(
                 append(" last_observed_head_age_ms=").append(headAgeMs ?: "unknown")
                 append(" last_raw_commit_wall_ms=").append(lastRawCommitWallMs ?: "unknown")
                 append(" last_progress_wall_ms=").append(lastProgressWallMs ?: "unknown")
+                append(" queue_phase=").append(queueState.phase.name.lowercase())
+                queueState.reason?.let { append(" queue_reason=\"").append(it.replace("\"", "'")).append('\"') }
                 result.status?.let { append(" status=").append(it) }
                 result.blockedReason?.let { append(" detail=").append(it.take(256)) }
                 fault?.let {
@@ -169,6 +176,14 @@ class CallbackIntakeWorker(
 
         fun record(result: CallbackDrainResult) {
             latestResult = result
+            when (result.kind) {
+                CallbackDrainKind.EMPTY -> queueStatusTracker.confirmedEmpty()
+                CallbackDrainKind.PROGRESS -> queueStatusTracker.progressRecordedAt(result.lastProgressWallMs)
+                CallbackDrainKind.PENDING -> queueStatusTracker.waiting(result.blockedReason)
+                CallbackDrainKind.FAULT -> queueStatusTracker.failed(
+                    result.blockedReason ?: result.fault?.message ?: "callback intake failed"
+                )
+            }
             if (result.kind == CallbackDrainKind.EMPTY) lastObservedHeadWallMs = null
             else result.oldestObservedWallMs?.let { lastObservedHeadWallMs = it }
             result.lastRawCommitWallMs?.let { lastRawCommitWallMs = it }
@@ -217,6 +232,7 @@ class CallbackIntakeWorker(
                         kind = CallbackDrainKind.PENDING
                     )
                     latestResult = waiting
+                    queueStatusTracker.waiting(waiting.blockedReason)
                     report(CallbackIntakeCondition.WAITING, waiting)
                     sleepMs(EMPTY_WAIT_MS)
                     continue
@@ -247,8 +263,6 @@ class CallbackIntakeWorker(
                 when (result.kind) {
                     CallbackDrainKind.PROGRESS -> {
                         backoffIndex = 0
-                        val pace = progressPaceMs()
-                        if (pace > 0L) sleepMs(pace)
                     }
                     CallbackDrainKind.EMPTY -> sleepMs(EMPTY_WAIT_MS)
                     CallbackDrainKind.PENDING, CallbackDrainKind.FAULT -> {
@@ -261,6 +275,7 @@ class CallbackIntakeWorker(
             Thread.currentThread().interrupt()
         } finally {
             running.set(false)
+            queueStatusTracker.stop()
             report(CallbackIntakeCondition.STOPPED, latestResult, force = true)
             runCatching(onStopped)
         }

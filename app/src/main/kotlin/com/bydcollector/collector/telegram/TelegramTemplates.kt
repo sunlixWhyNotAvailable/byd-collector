@@ -34,17 +34,36 @@ data class TelegramBuiltInTemplateMatch(
 )
 
 object TelegramBuiltInTemplates {
-    const val CHARGING_STARTED_UK = "Заряджання розпочато\nSOC: {soc}%\nЧас: {time}"
-    const val CHARGING_STARTED_EN = "Charging started\nSOC: {soc}%\nTime: {time}"
-    const val CHARGING_PROGRESS_UK =
+    const val CHARGING_STARTED_UK = "⚡ Заряджання розпочато\n🔋 SOC: {soc}%\n🕒 Час: {time}"
+    const val CHARGING_STARTED_EN = "⚡ Charging started\n🔋 SOC: {soc}%\n🕒 Time: {time}"
+    const val CHARGING_PROGRESS_UK = "🔋 Заряд: {soc}%\n⚡ Потужність: {battery_power_kw} кВт\n📈 За крок: +{charge_step_added_percent}% / +{charge_step_added_kwh} кВт·год\n⏱️ Час кроку: {charge_step_duration}\n📊 За сесію: +{charge_added_percent}% / +{charge_added_kwh} кВт·год\n⏱️ Час сесії: {charge_duration}\n🕒 Час: {time}"
+    const val CHARGING_PROGRESS_EN = "🔋 Charge: {soc}%\n⚡ Power: {battery_power_kw} kW\n📈 This step: +{charge_step_added_percent}% / +{charge_step_added_kwh} kWh\n⏱️ Step time: {charge_step_duration}\n📊 Session total: +{charge_added_percent}% / +{charge_added_kwh} kWh\n⏱️ Session time: {charge_duration}\n🕒 Time: {time}"
+    const val CHARGED_TO_100_UK = "✅ Авто заряджено до 100%\n📈 Заряджено: {charge_added_percent}% / {charge_added_kwh} кВт·год\n⏱️ Час заряджання: {charge_start_time} → {charge_end_time} ({charge_duration_hhmm})\n🔋 Енергія: {remaining_energy_kwh} кВт·год\n🛣️ Запас ходу: {range_km} км"
+    const val CHARGED_TO_100_EN = "✅ Vehicle charged to 100%\n📈 Charged: {charge_added_percent}% / {charge_added_kwh} kWh\n⏱️ Charging time: {charge_start_time} → {charge_end_time} ({charge_duration_hhmm})\n🔋 Energy: {remaining_energy_kwh} kWh\n🛣️ Range: {range_km} km"
+    const val CHARGING_STOPPED_UK = "⏹️ Заряджання зупинено\n🔋 SOC: {soc}%\n⏱️ Тривалість: {charge_duration}\n🕒 Час: {time}"
+    const val CHARGING_STOPPED_EN = "⏹️ Charging stopped\n🔋 SOC: {soc}%\n⏱️ Duration: {charge_duration}\n🕒 Time: {time}"
+    const val CHARGE_GUN_CONNECTED_UK = "🔌 Зарядний кабель підключено\n🔋 SOC: {soc}%\n🕒 Час: {time}"
+    const val CHARGE_GUN_CONNECTED_EN = "🔌 Charge gun connected\n🔋 SOC: {soc}%\n🕒 Time: {time}"
+    const val CHARGE_GUN_DISCONNECTED_UK = "🔌 Зарядний кабель відключено\n🔋 SOC: {soc}%\n🕒 Час: {time}"
+    const val CHARGE_GUN_DISCONNECTED_EN = "🔌 Charge gun disconnected\n🔋 SOC: {soc}%\n🕒 Time: {time}"
+    const val LOW_12V_VOLTAGE_UK = "⚠️ Низька напруга 12V акумулятора\n🔋 Напруга: {battery_12v} В\n🕒 Час: {time}"
+    const val LOW_12V_VOLTAGE_EN = "⚠️ Low 12V battery voltage\n🔋 Voltage: {battery_12v} V\n🕒 Time: {time}"
+    const val TELEMETRY_UNAVAILABLE_UK = "⚠️ Телеметрія недоступна\n🕒 Останні дані: {last_data_time}\n❌ Помилка: {error}"
+    const val TELEMETRY_UNAVAILABLE_EN = "⚠️ Telemetry unavailable\n🕒 Last data: {last_data_time}\n❌ Error: {error}"
+    const val TRIP_SUMMARY_UK = "🏁 Поїздку завершено\n\n📊 Поточна статистика.\n🚗 Поїздка: {trip_distance_km} км / {trip_duration} ({trip_start_time} → {trip_end_time})\n⚡ Витрачено: {trip_discharged_kwh} кВт·год\n♻️ Рекуперовано: {trip_regenerated_kwh} кВт·год\n🔋 Баланс АКБ: {trip_net_kwh} кВт·год ({trip_net_kwh_per_100km} кВт·год/100 км), SOC: {soc_start}% → {soc_end}%\n\n📈 Загальна статистика.\n🚗 Поїздка: {total_distance_km} км / {total_duration} ({total_start_time} → {total_end_time})\n⚡ Витрачено: {total_discharged_kwh} кВт·год\n♻️ Рекуперовано: {total_regenerated_kwh} кВт·год\n🔋 Баланс АКБ: {total_net_kwh} кВт·год ({total_net_kwh_per_100km} кВт·год/100 км), SOC: {total_soc_start}% → {total_soc_end}%"
+    const val TRIP_SUMMARY_EN = "🏁 Trip complete\n\n📊 Current statistics.\n🚗 Trip: {trip_distance_km} km / {trip_duration} ({trip_start_time} → {trip_end_time})\n⚡ Used: {trip_discharged_kwh} kWh\n♻️ Recovered: {trip_regenerated_kwh} kWh\n🔋 Battery net: {trip_net_kwh} kWh ({trip_net_kwh_per_100km} kWh/100 km), SOC: {soc_start}% → {soc_end}%\n\n📈 Total statistics.\n🚗 Trip: {total_distance_km} km / {total_duration} ({total_start_time} → {total_end_time})\n⚡ Used: {total_discharged_kwh} kWh\n♻️ Recovered: {total_regenerated_kwh} kWh\n🔋 Battery net: {total_net_kwh} kWh ({total_net_kwh_per_100km} kWh/100 km), SOC: {total_soc_start}% → {total_soc_end}%"
+
+    private const val PRE_EMOJI_CHARGING_STARTED_UK = "Заряджання розпочато\nSOC: {soc}%\nЧас: {time}"
+    private const val PRE_EMOJI_CHARGING_STARTED_EN = "Charging started\nSOC: {soc}%\nTime: {time}"
+    private const val PRE_EMOJI_CHARGING_PROGRESS_UK =
         "Заряд: {soc}%\nПотужність: {battery_power_kw} кВт\nЗа крок: +{charge_step_added_percent}% / +{charge_step_added_kwh} кВт·год\nЧас кроку: {charge_step_duration}\nЗа сесію: +{charge_added_percent}% / +{charge_added_kwh} кВт·год\nЧас сесії: {charge_duration}\nЧас: {time}"
-    const val CHARGING_PROGRESS_EN =
+    private const val PRE_EMOJI_CHARGING_PROGRESS_EN =
         "Charge: {soc}%\nPower: {battery_power_kw} kW\nThis step: +{charge_step_added_percent}% / +{charge_step_added_kwh} kWh\nStep time: {charge_step_duration}\nSession total: +{charge_added_percent}% / +{charge_added_kwh} kWh\nSession time: {charge_duration}\nTime: {time}"
-    const val CHARGED_TO_100_UK =
+    private const val PRE_EMOJI_CHARGED_TO_100_UK =
         "Авто заряджено до 100%\nЗаряджено: {charge_added_percent}% / {charge_added_kwh} кВт·год\n" +
             "Час заряджання: {charge_start_time} → {charge_end_time} ({charge_duration_hhmm})\n" +
             "Енергія: {remaining_energy_kwh} кВт·год\nЗапас ходу: {range_km} км"
-    const val CHARGED_TO_100_EN =
+    private const val PRE_EMOJI_CHARGED_TO_100_EN =
         "Vehicle charged to 100%\nCharged: {charge_added_percent}% / {charge_added_kwh} kWh\n" +
             "Charging time: {charge_start_time} → {charge_end_time} ({charge_duration_hhmm})\n" +
             "Energy: {remaining_energy_kwh} kWh\nRange: {range_km} km"
@@ -52,24 +71,24 @@ object TelegramBuiltInTemplates {
         "Авто заряджено до 100%\nЕнергія: {remaining_energy_kwh} кВт·год\nЗапас ходу: {range_km} км"
     private const val HISTORIC_CHARGED_TO_100_EN =
         "Vehicle charged to 100%\nEnergy: {remaining_energy_kwh} kWh\nRange: {range_km} km"
-    const val CHARGING_STOPPED_UK = "Заряджання зупинено\nSOC: {soc}%\nТривалість: {charge_duration}\nЧас: {time}"
-    const val CHARGING_STOPPED_EN = "Charging stopped\nSOC: {soc}%\nDuration: {charge_duration}\nTime: {time}"
-    const val CHARGE_GUN_CONNECTED_UK = "Зарядний кабель підключено\nSOC: {soc}%\nЧас: {time}"
-    const val CHARGE_GUN_CONNECTED_EN = "Charge gun connected\nSOC: {soc}%\nTime: {time}"
-    const val CHARGE_GUN_DISCONNECTED_UK = "Зарядний кабель відключено\nSOC: {soc}%\nЧас: {time}"
-    const val CHARGE_GUN_DISCONNECTED_EN = "Charge gun disconnected\nSOC: {soc}%\nTime: {time}"
-    const val LOW_12V_VOLTAGE_UK = "Низька напруга 12V акумулятора\nНапруга: {battery_12v} В\nЧас: {time}"
-    const val LOW_12V_VOLTAGE_EN = "Low 12V battery voltage\nVoltage: {battery_12v} V\nTime: {time}"
-    const val TELEMETRY_UNAVAILABLE_UK = "Телеметрія недоступна\nОстанні дані: {last_data_time}\nПомилка: {error}"
-    const val TELEMETRY_UNAVAILABLE_EN = "Telemetry unavailable\nLast data: {last_data_time}\nError: {error}"
-    const val TRIP_SUMMARY_UK =
+    private const val PRE_EMOJI_CHARGING_STOPPED_UK = "Заряджання зупинено\nSOC: {soc}%\nТривалість: {charge_duration}\nЧас: {time}"
+    private const val PRE_EMOJI_CHARGING_STOPPED_EN = "Charging stopped\nSOC: {soc}%\nDuration: {charge_duration}\nTime: {time}"
+    private const val PRE_EMOJI_CHARGE_GUN_CONNECTED_UK = "Зарядний кабель підключено\nSOC: {soc}%\nЧас: {time}"
+    private const val PRE_EMOJI_CHARGE_GUN_CONNECTED_EN = "Charge gun connected\nSOC: {soc}%\nTime: {time}"
+    private const val PRE_EMOJI_CHARGE_GUN_DISCONNECTED_UK = "Зарядний кабель відключено\nSOC: {soc}%\nЧас: {time}"
+    private const val PRE_EMOJI_CHARGE_GUN_DISCONNECTED_EN = "Charge gun disconnected\nSOC: {soc}%\nTime: {time}"
+    private const val PRE_EMOJI_LOW_12V_VOLTAGE_UK = "Низька напруга 12V акумулятора\nНапруга: {battery_12v} В\nЧас: {time}"
+    private const val PRE_EMOJI_LOW_12V_VOLTAGE_EN = "Low 12V battery voltage\nVoltage: {battery_12v} V\nTime: {time}"
+    private const val PRE_EMOJI_TELEMETRY_UNAVAILABLE_UK = "Телеметрія недоступна\nОстанні дані: {last_data_time}\nПомилка: {error}"
+    private const val PRE_EMOJI_TELEMETRY_UNAVAILABLE_EN = "Telemetry unavailable\nLast data: {last_data_time}\nError: {error}"
+    private const val PRE_EMOJI_TRIP_SUMMARY_UK =
         "Поїздку завершено\nПоточна поїздка: {trip_distance_km} км / {trip_duration}\n\n" +
             "Поточна статистика.\nВитрачено: {trip_discharged_kwh} кВт·год\nРекуперовано: {trip_regenerated_kwh} кВт·год\n" +
             "Баланс АКБ: {trip_net_kwh} кВт·год ({trip_net_kwh_per_100km} кВт·год/100 км), SOC: {soc_start}% -> {soc_end}%\n" +
             "Загалом: {total_distance_km} км / {total_duration}\n\n" +
             "Загальна статистика.\nВитрачено: {total_discharged_kwh} кВт·год\nРекуперовано: {total_regenerated_kwh} кВт·год\n" +
             "Баланс АКБ: {total_net_kwh} кВт·год ({total_net_kwh_per_100km} кВт·год/100 км), SOC: {total_soc_start}% -> {total_soc_end}%"
-    const val TRIP_SUMMARY_EN =
+    private const val PRE_EMOJI_TRIP_SUMMARY_EN =
         "Trip complete\nCurrent trip: {trip_distance_km} km / {trip_duration}\n\n" +
             "Current statistics.\nUsed: {trip_discharged_kwh} kWh\nRecovered: {trip_regenerated_kwh} kWh\n" +
             "Battery net: {trip_net_kwh} kWh ({trip_net_kwh_per_100km} kWh/100 km), SOC: {soc_start}% -> {soc_end}%\n" +
@@ -115,6 +134,18 @@ object TelegramBuiltInTemplates {
         TelegramEventType.LOW_12V_VOLTAGE to mapOf(TelegramTemplateLanguage.UK to LOW_12V_VOLTAGE_UK, TelegramTemplateLanguage.EN to LOW_12V_VOLTAGE_EN),
         TelegramEventType.TELEMETRY_UNAVAILABLE to mapOf(TelegramTemplateLanguage.UK to TELEMETRY_UNAVAILABLE_UK, TelegramTemplateLanguage.EN to TELEMETRY_UNAVAILABLE_EN),
         TelegramEventType.TRIP_SUMMARY to mapOf(TelegramTemplateLanguage.UK to TRIP_SUMMARY_UK, TelegramTemplateLanguage.EN to TRIP_SUMMARY_EN)
+    )
+
+    private val preEmoji = mapOf(
+        TelegramEventType.CHARGING_STARTED to mapOf(TelegramTemplateLanguage.UK to PRE_EMOJI_CHARGING_STARTED_UK, TelegramTemplateLanguage.EN to PRE_EMOJI_CHARGING_STARTED_EN),
+        TelegramEventType.CHARGING_PROGRESS to mapOf(TelegramTemplateLanguage.UK to PRE_EMOJI_CHARGING_PROGRESS_UK, TelegramTemplateLanguage.EN to PRE_EMOJI_CHARGING_PROGRESS_EN),
+        TelegramEventType.CHARGED_TO_100 to mapOf(TelegramTemplateLanguage.UK to PRE_EMOJI_CHARGED_TO_100_UK, TelegramTemplateLanguage.EN to PRE_EMOJI_CHARGED_TO_100_EN),
+        TelegramEventType.CHARGING_STOPPED to mapOf(TelegramTemplateLanguage.UK to PRE_EMOJI_CHARGING_STOPPED_UK, TelegramTemplateLanguage.EN to PRE_EMOJI_CHARGING_STOPPED_EN),
+        TelegramEventType.CHARGE_GUN_CONNECTED to mapOf(TelegramTemplateLanguage.UK to PRE_EMOJI_CHARGE_GUN_CONNECTED_UK, TelegramTemplateLanguage.EN to PRE_EMOJI_CHARGE_GUN_CONNECTED_EN),
+        TelegramEventType.CHARGE_GUN_DISCONNECTED to mapOf(TelegramTemplateLanguage.UK to PRE_EMOJI_CHARGE_GUN_DISCONNECTED_UK, TelegramTemplateLanguage.EN to PRE_EMOJI_CHARGE_GUN_DISCONNECTED_EN),
+        TelegramEventType.LOW_12V_VOLTAGE to mapOf(TelegramTemplateLanguage.UK to PRE_EMOJI_LOW_12V_VOLTAGE_UK, TelegramTemplateLanguage.EN to PRE_EMOJI_LOW_12V_VOLTAGE_EN),
+        TelegramEventType.TELEMETRY_UNAVAILABLE to mapOf(TelegramTemplateLanguage.UK to PRE_EMOJI_TELEMETRY_UNAVAILABLE_UK, TelegramTemplateLanguage.EN to PRE_EMOJI_TELEMETRY_UNAVAILABLE_EN),
+        TelegramEventType.TRIP_SUMMARY to mapOf(TelegramTemplateLanguage.UK to PRE_EMOJI_TRIP_SUMMARY_UK, TelegramTemplateLanguage.EN to PRE_EMOJI_TRIP_SUMMARY_EN)
     )
 
     private val historic = mapOf(
@@ -193,7 +224,7 @@ object TelegramBuiltInTemplates {
     fun tripSummaryTemplate(language: TelegramTemplateLanguage, includeOverall: Boolean): String {
         val full = defaultTemplate(TelegramEventType.TRIP_SUMMARY, language)
         return if (includeOverall) full else full.substringBefore(
-            if (language == TelegramTemplateLanguage.UK) "\nЗагалом:" else "\nTotal:"
+            if (language == TelegramTemplateLanguage.UK) "\n\n📈 Загальна статистика." else "\n\n📈 Total statistics."
         )
     }
 
@@ -201,6 +232,9 @@ object TelegramBuiltInTemplates {
         val normalized = normalizeForBuiltInMatch(template)
         current[type]?.entries?.firstOrNull { normalizeForBuiltInMatch(it.value) == normalized }?.let {
             return TelegramBuiltInTemplateMatch(it.key, historic = false)
+        }
+        preEmoji[type]?.entries?.firstOrNull { normalizeForBuiltInMatch(it.value) == normalized }?.let {
+            return TelegramBuiltInTemplateMatch(it.key, historic = true)
         }
         historic[type]?.entries?.firstNotNullOfOrNull { (language, values) ->
             values.firstOrNull { normalizeForBuiltInMatch(it) == normalized }?.let {
@@ -310,6 +344,8 @@ object TelegramTemplateCatalog {
                 "trip_net_kwh",
                 "trip_net_kwh_per_100km",
                 "trip_duration",
+                "trip_start_time",
+                "trip_end_time",
                 "soc_start",
                 "soc_end",
                 "total_soc_start",
@@ -322,6 +358,8 @@ object TelegramTemplateCatalog {
                 "total_net_kwh",
                 "total_net_kwh_per_100km",
                 "total_duration",
+                "total_start_time",
+                "total_end_time",
                 "time"
             )
         )

@@ -793,6 +793,7 @@ class CollectorSettings(
     }
 
     fun recoverInterruptedDbMaintenanceIfNeeded(source: String): Boolean {
+        if (CollectorService.isMaintenanceRunningInProcess() || DatabaseMaintenanceService.isRunning()) return false
         val operationKey = prefs.getString(KEY_DB_MAINTENANCE_OPERATION, null)
         if (prefs.getBoolean(KEY_DB_MAINTENANCE_RUNNING, false) && DbMaintenanceOperation.fromKey(operationKey) == null) {
             clearDbMaintenanceStatus(synchronous = true)

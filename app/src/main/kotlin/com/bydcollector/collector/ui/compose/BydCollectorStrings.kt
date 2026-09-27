@@ -291,6 +291,8 @@ data class UiStrings(
     val batch: String,
     val waiting: String,
     val running: String,
+    val collectionRunning: String,
+    val catchingUp: String,
     val exporting: String,
     val successful: String,
     val missing: String,
@@ -418,6 +420,8 @@ private val telegramUk = TelegramStrings(
         "trip_net_kwh" to "Баланс АКБ за переїзд, кВт·год",
         "trip_net_kwh_per_100km" to "Витрата за балансом переїзду, кВт·год/100 км",
         "trip_duration" to "Тривалість поїздки",
+        "trip_start_time" to "Початок поточної поїздки, HH:mm",
+        "trip_end_time" to "Завершення поточної поїздки, HH:mm",
         "soc_start" to "SOC на початку поїздки, %",
         "soc_end" to "SOC наприкінці поїздки, %",
         "total_soc_start" to "SOC на початку загального підсумку, %",
@@ -429,7 +433,9 @@ private val telegramUk = TelegramStrings(
         "total_net_kwh" to "Баланс АКБ за сесію, кВт·год",
         "total_net_kwh_per_100km" to "Витрата за балансом сесії, кВт·год/100 км",
         "total_avg_kwh_per_100km" to "Середня загальна витрата, кВт·год/100 км",
-        "total_duration" to "Загальна тривалість поїздок"
+        "total_duration" to "Загальна тривалість поїздок",
+        "total_start_time" to "Початок першої поїздки сесії, HH:mm",
+        "total_end_time" to "Завершення останньої поїздки сесії, HH:mm"
     )
 )
 
@@ -529,6 +535,8 @@ private val telegramEn = TelegramStrings(
         "trip_net_kwh" to "Drive battery net, kWh",
         "trip_net_kwh_per_100km" to "Drive net consumption, kWh/100 km",
         "trip_duration" to "Trip duration",
+        "trip_start_time" to "Current trip start, HH:mm",
+        "trip_end_time" to "Current trip end, HH:mm",
         "soc_start" to "SOC at trip start, %",
         "soc_end" to "SOC at trip end, %",
         "total_soc_start" to "SOC at overall-summary start, %",
@@ -540,7 +548,9 @@ private val telegramEn = TelegramStrings(
         "total_net_kwh" to "Power-session battery net, kWh",
         "total_net_kwh_per_100km" to "Power-session net consumption, kWh/100 km",
         "total_avg_kwh_per_100km" to "Average total consumption, kWh/100 km",
-        "total_duration" to "Total trip duration"
+        "total_duration" to "Total trip duration",
+        "total_start_time" to "First trip start in this session, HH:mm",
+        "total_end_time" to "Last trip end in this session, HH:mm"
     )
 )
 
@@ -762,6 +772,8 @@ private fun buildStrings(language: UiLanguage): UiStrings {
             batch = "Батч",
             waiting = "очікування",
             running = "працює",
+            collectionRunning = "Працює",
+            catchingUp = "Обробка черги",
             exporting = "експортує",
             successful = "успішно",
             missing = "відсутні",
@@ -776,7 +788,7 @@ private fun buildStrings(language: UiLanguage): UiStrings {
             yes = "Так",
             no = "Ні",
             step = "Крок",
-            dbMaintenanceStopWarning = "Буде тимчасово зупинено основний збір, всі дані, MQTT та InfluxDB.",
+            dbMaintenanceStopWarning = "Буде тимчасово зупинено основний збір та пов'язаний експорт. Вторинний збір продовжить роботу.",
             dbMaintenanceDebugStopWarning = "Буде тимчасово зупинено лише вторинний збір. Основний збір, MQTT та InfluxDB продовжать роботу.",
             dbMaintenancePendingTemplate = "У черзі: MQTT %d, InfluxDB %d.",
             dbMaintenanceTelegramStorageWarningTemplate = "Попередження міграції сховища Telegram: %s",
@@ -1009,6 +1021,8 @@ private fun buildStrings(language: UiLanguage): UiStrings {
             batch = "Batch",
             waiting = "waiting",
             running = "running",
+            collectionRunning = "Running",
+            catchingUp = "Catching up",
             exporting = "exporting",
             successful = "success",
             missing = "missing",
@@ -1023,7 +1037,7 @@ private fun buildStrings(language: UiLanguage): UiStrings {
             yes = "Yes",
             no = "No",
             step = "Step",
-            dbMaintenanceStopWarning = "Main collection, all data, MQTT, and InfluxDB will be temporarily stopped.",
+            dbMaintenanceStopWarning = "Main collection and its exports will stop temporarily. Secondary collection will continue running.",
             dbMaintenanceDebugStopWarning = "Only secondary collection will stop temporarily. Main collection, MQTT, and InfluxDB will continue running.",
             dbMaintenancePendingTemplate = "Queued: MQTT %d, InfluxDB %d.",
             dbMaintenanceTelegramStorageWarningTemplate = "Telegram storage migration warning: %s",

@@ -4,12 +4,35 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.FutureTask
+import com.bydcollector.collector.service.awaitShutdownWorkers
 import kotlin.concurrent.thread
 import kotlin.test.Test
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class UserShutdownContractTest {
+
+    @Test
+    fun shutdownReadinessUsesActualOutcomesAndOneDeadlineForEveryWorker() {
+        fun completed(value: Boolean) = FutureTask { value }.apply { run() }
+        val neverStarted = FutureTask { true }
+        val failed = FutureTask<Boolean> { error("flush failed") }.apply { run() }
+        var clockReads = 0
+        val elapsed = { clockReads++; 100L }
+        assertTrue(awaitShutdownWorkers(listOf(completed(true), completed(true)), 100L, elapsed))
+        clockReads = 0
+        assertFalse(awaitShutdownWorkers(listOf(completed(false), completed(true), neverStarted), 100L, elapsed))
+        kotlin.test.assertEquals(3, clockReads) // A false result must not skip the other workers.
+        assertFalse(awaitShutdownWorkers(listOf(failed), 100L, elapsed))
+        assertFalse(awaitShutdownWorkers(listOf(null), 100L, elapsed))
+
+        val start = System.nanoTime() / 1_000_000
+        assertFalse(awaitShutdownWorkers(listOf(neverStarted, FutureTask { true }), start + 30) {
+            System.nanoTime() / 1_000_000
+        })
+        assertTrue(System.nanoTime() / 1_000_000 - start < 1_000L)
+    }
 
     @Test
     fun serializedStopRunsAfterCurrentWorkAndDoesNotDeadlockOnItsOwnWorker() {

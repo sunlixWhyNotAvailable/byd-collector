@@ -1,6 +1,7 @@
 package com.bydcollector.collector.ui
 
 import com.bydcollector.collector.data.local.CollectorEvent
+import com.bydcollector.collector.data.callback.CallbackQueueState
 import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.ArchiveStorageSnapshot
 import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
@@ -121,7 +122,9 @@ data class DashboardState(
     val mqttRuntimeStatus: RuntimeActionStatus =
         if (mqttEnabled) RuntimeActionStatus.RUNNING else RuntimeActionStatus.STOPPED,
     val influxRuntimeStatus: RuntimeActionStatus =
-        if (influxEnabled) RuntimeActionStatus.RUNNING else RuntimeActionStatus.STOPPED
+        if (influxEnabled) RuntimeActionStatus.RUNNING else RuntimeActionStatus.STOPPED,
+    val mainCallbackQueue: CallbackQueueState? = null,
+    val secondaryCallbackQueue: CallbackQueueState? = null
 )
 
 data class VehicleKpis(

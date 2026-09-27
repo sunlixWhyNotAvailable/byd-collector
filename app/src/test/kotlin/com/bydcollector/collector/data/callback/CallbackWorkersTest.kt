@@ -175,6 +175,41 @@ class CallbackWorkersTest {
         }
     }
 
+    @Test fun `intake immediately processes a progress burst and keeps the empty wait`() {
+        val calls = AtomicInteger()
+        val sleeps = CopyOnWriteArrayList<Long>()
+        val statuses = CopyOnWriteArrayList<CallbackIntakeStatus>()
+        val emptyWaitEntered = CountDownLatch(1)
+        val holdWorker = CountDownLatch(1)
+        val worker = CallbackIntakeWorker(
+            threadName = "test-callback-progress-burst",
+            drain = {
+                if (calls.getAndIncrement() < 4) progressResult() else emptyResult()
+            },
+            onStatus = { statuses.add(it) },
+            sleepMs = { delay ->
+                sleeps.add(delay)
+                if (delay == CallbackIntakeWorker.EMPTY_WAIT_MS) {
+                    emptyWaitEntered.countDown()
+                    holdWorker.await()
+                }
+            }
+        )
+
+        try {
+            assertTrue(worker.start())
+            await(emptyWaitEntered, "worker did not reach the empty-queue wait")
+            assertEquals(5, calls.get(), "all progress passes should run before the empty wait")
+            assertEquals(listOf(CallbackIntakeWorker.EMPTY_WAIT_MS), sleeps.toList())
+        } finally {
+            worker.stopAndJoin(1_000)
+            holdWorker.countDown()
+        }
+
+        assertEquals(4L, statuses.last().progressPasses)
+        assertEquals(1L, statuses.last().emptyPasses)
+    }
+
     @Test fun `distinct intake faults report immediately while repeats aggregate`() {
         val first = IllegalStateException("first failure")
         val second = IOException("different failure")
@@ -316,6 +351,44 @@ class CallbackWorkersTest {
         } finally {
             worker.stopAndJoin(1_000)
             keepWorker.countDown()
+        }
+    }
+
+    @Test fun `historical progress head remains diagnostic evidence not a pending UI head`() {
+        val wall = AtomicLong(10_000L)
+        val elapsedMs = AtomicLong(10_000L)
+        val tracker = CallbackQueueStatusTracker(
+            monotonicMs = elapsedMs::get,
+            wallTimeMs = wall::get
+        )
+        val reported = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val statuses = CopyOnWriteArrayList<CallbackIntakeStatus>()
+        val worker = CallbackIntakeWorker(
+            threadName = "test-callback-acked-head-status",
+            drain = {
+                progressResult(oldestObservedWallMs = 0L, lastProgressWallMs = wall.get())
+            },
+            onStatus = {
+                statuses += it
+                if (it.kind == CallbackDrainKind.PROGRESS) reported.countDown()
+            },
+            sleepMs = { release.await() },
+            monotonicNanos = { elapsedMs.get() * 1_000_000L },
+            wallTimeMs = wall::get,
+            queueStatusTracker = tracker
+        )
+
+        try {
+            assertTrue(worker.start())
+            await(reported, "worker did not report the successful batch")
+            assertEquals(0L, statuses.first().lastObservedHeadWallMs, "historical diagnostics remain available")
+            assertEquals(CallbackQueuePhase.UNKNOWN, worker.snapshotQueueState().phase)
+            assertFalse(worker.snapshotQueueState().reason.orEmpty().contains("pending callback head"))
+            assertTrue(statuses.first().detail.contains("queue_phase=unknown"))
+        } finally {
+            release.countDown()
+            worker.stopAndJoin(2_000)
         }
     }
 

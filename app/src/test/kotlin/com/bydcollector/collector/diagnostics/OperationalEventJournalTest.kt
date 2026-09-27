@@ -69,6 +69,40 @@ class OperationalEventJournalTest {
     }
 
     @Test
+    fun tryAppendPersistsAValidEventWithoutTheOperationalExecutor() {
+        val root = Files.createTempDirectory("bydcollector-event-journal-try-append").toFile()
+        try {
+            val journal = OperationalEventJournal(
+                root = root,
+                bootId = "boot-try-append",
+                pid = 17
+            )
+
+            assertTrue(
+                journal.tryAppend(
+                    timestamp = "2026-09-27T12:00:00Z",
+                    elapsedMs = 456,
+                    category = "process_exit",
+                    message = "fatal_exception",
+                    detail = "evidence"
+                )
+            )
+
+            val active = File(root, OperationalEventJournal.ACTIVE_FILE_NAME)
+            val lines = active.readLines()
+            assertEquals(1, lines.size)
+            val event = JSONObject(lines.single())
+            assertEquals("boot-try-append", event.getString("boot_id"))
+            assertEquals(17, event.getInt("pid"))
+            assertEquals("process_exit", event.getString("category"))
+            assertEquals("fatal_exception", event.getString("message"))
+            assertEquals("evidence", event.getString("detail"))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun concurrentAppendsRemainCompleteJsonLinesAndSnapshotThenClearIsSerialized() {
         val root = Files.createTempDirectory("bydcollector-event-journal-concurrent").toFile()
         val snapshot = Files.createTempDirectory("bydcollector-event-journal-snapshot").toFile()

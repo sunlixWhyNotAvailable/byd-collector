@@ -498,14 +498,17 @@ class TelegramCoordinator(
 internal fun recoverCompletionState(state: TelegramEventState, intent: TripCompletionIntent): TelegramEventState {
     if (state.tripId != null || state.pendingPowerOffLocationTripId != null) return state
     val trip = intent.session?.takeIf { it.movementObserved } ?: return state
+    val tripStartedAtMs = TripTime.instant(trip.startedAt)?.toEpochMilli()
+    val tripEndedAtMs = trip.endedAt?.let { TripTime.instant(it)?.toEpochMilli() }
     return state.copy(
         tripId = "${intent.identity}:recovered",
         tripPowerSessionId = trip.tripId,
-        tripStartedAtMs = TripTime.instant(trip.startedAt)?.toEpochMilli(),
+        tripStartedAtMs = tripStartedAtMs,
         tripStartOdometerKm = trip.startOdometerKm,
         tripStartSoc = trip.startSoc,
         tripStartEnergyKwh = trip.startTripEnergyKwh,
         tripParkedSinceMs = null,
+        tripEndedAtMs = tripEndedAtMs,
         tripEndOdometerKm = trip.lastOdometerKm,
         tripEndSoc = trip.endSoc,
         tripEndEnergyKwh = trip.lastTripEnergyKwh,
@@ -515,7 +518,9 @@ internal fun recoverCompletionState(state: TelegramEventState, intent: TripCompl
         bootEndSoc = trip.endSoc,
         bootTotalDistanceKm = 0.0,
         bootTotalEnergyKwh = 0.0,
-        bootTotalDurationMs = 0L
+        bootTotalDurationMs = 0L,
+        bootTotalStartedAtMs = tripStartedAtMs,
+        bootTotalEndedAtMs = tripEndedAtMs
     )
 }
 

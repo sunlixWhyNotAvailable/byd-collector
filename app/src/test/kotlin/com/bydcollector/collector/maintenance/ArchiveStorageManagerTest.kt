@@ -31,7 +31,214 @@ class ArchiveStorageManagerTest {
         ZipFile(zip).use { archive ->
             assertTrue(archive.getEntry("bydcollector_telemetry.db") != null)
             assertTrue(archive.getEntry("bydcollector_telemetry.db-wal") != null)
+            assertEquals(
+                "state=PASSED",
+                archive.getInputStream(archive.getEntry(ArchiveStorageManager.ARCHIVE_VERIFICATION_MARKER))
+                    .bufferedReader().use { it.readLine() }
+            )
         }
+    }
+
+    @Test
+    fun archiveAuditRunsBeforeZipCreationAndRawDeletion() {
+        val root = createTempDirectory().toFile()
+        val active = File(root, "bydcollector_telemetry.db").apply { writeText("active") }
+        val archiveRoot = File(root, "db_archive")
+        val raw = File(archiveRoot, "bydcollector_telemetry_20260707_120000").apply { mkdirs() }
+        File(raw, active.name).writeText("db")
+        val events = mutableListOf<String>()
+        val manager = manager(archiveRoot, active) { family, databaseFile, directory ->
+            assertEquals("main_telemetry", family)
+            assertEquals(active.name, databaseFile.name)
+            assertTrue(File(directory, ArchiveStorageManager.ARCHIVE_VERIFICATION_MARKER).readText().startsWith("state=IN_PROGRESS"))
+            events += "audit"
+            null
+        }
+
+        assertTrue(manager.compressRawArchiveDirectory(raw) { status ->
+            when (status.messageEn) {
+                "Preparing archive" -> events += "zip"
+                "Deleting raw archive" -> events += "delete"
+            }
+        })
+
+        assertEquals(listOf("audit", "zip", "delete"), events)
+    }
+
+    @Test
+    fun failedAuditKeepsRawAndExistingZipAndPersistsFailure() {
+        val root = createTempDirectory().toFile()
+        val active = File(root, "bydcollector_telemetry.db").apply { writeText("active") }
+        val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+        val raw = rawArchive(archiveRoot, active.name)
+        val zip = zipRaw(archiveRoot, raw)
+        val statuses = mutableListOf<ArchiveStorageJobStatus>()
+        val manager = manager(archiveRoot, active) { _, _, _ -> "archive_verification_failed" }
+
+        assertFalse(manager.compressRawArchiveDirectory(raw, statuses::add))
+
+        assertTrue(raw.exists())
+        assertTrue(zip.exists())
+        assertTrue(File(raw, ArchiveStorageManager.ARCHIVE_VERIFICATION_MARKER).readText().contains("state=FAILED"))
+        assertEquals("archive_verification_failed", statuses.last().error)
+        assertFalse(statuses.last().running)
+    }
+
+    @Test
+    fun interruptedAuditKeepsRawAndExistingZipAndRestoresInterruptFlag() {
+        val root = createTempDirectory().toFile()
+        val active = File(root, "bydcollector_telemetry.db").apply { writeText("active") }
+        val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+        val raw = rawArchive(archiveRoot, active.name)
+        val zip = zipRaw(archiveRoot, raw)
+        val statuses = mutableListOf<ArchiveStorageJobStatus>()
+        val manager = manager(archiveRoot, active) { _, _, _ -> throw InterruptedException("test interruption") }
+
+        try {
+            assertFalse(manager.compressRawArchiveDirectory(raw, statuses::add))
+            assertTrue(Thread.currentThread().isInterrupted)
+            assertTrue(raw.exists())
+            assertTrue(zip.exists())
+            assertTrue(File(raw, ArchiveStorageManager.ARCHIVE_VERIFICATION_MARKER).readText().contains("state=FAILED"))
+            assertEquals("archive_verification_interrupted", statuses.last().error)
+        } finally {
+            Thread.interrupted()
+        }
+    }
+
+    @Test
+    fun successfulRetryReauditsAndCleansUpAgainstExistingCompleteZip() {
+        val root = createTempDirectory().toFile()
+        val active = File(root, "bydcollector_telemetry.db").apply { writeText("active") }
+        val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+        val raw = rawArchive(archiveRoot, active.name)
+        val zip = zipRaw(archiveRoot, raw)
+        var attempts = 0
+        val manager = manager(archiveRoot, active) { _, _, _ ->
+            attempts += 1
+            if (attempts == 1) "archive_verification_unavailable:format" else null
+        }
+
+        assertFalse(manager.compressRawArchiveDirectory(raw))
+        assertTrue(raw.exists())
+        assertTrue(manager.compressRawArchiveDirectory(raw))
+
+        assertEquals(2, attempts)
+        assertFalse(raw.exists())
+        assertTrue(zip.exists())
+    }
+
+    @Test
+    fun existingNonMatchingZipNeverAuthorizesRawDeletion() {
+        val root = createTempDirectory().toFile()
+        val active = File(root, "bydcollector_telemetry.db").apply { writeText("active") }
+        val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+        val raw = rawArchive(archiveRoot, active.name)
+        val target = File(archiveRoot, "${raw.name}.zip").apply { writeText("nonempty but incomplete") }
+        val statuses = mutableListOf<ArchiveStorageJobStatus>()
+        val manager = manager(archiveRoot, active)
+
+        assertFalse(manager.compressRawArchiveDirectory(raw, statuses::add))
+
+        assertTrue(raw.exists())
+        assertTrue(target.exists())
+        assertEquals("archive_zip_mismatch", statuses.last().error)
+    }
+
+    @Test
+    fun defaultVerifierFailsClosedForUnrecognizedDatabaseAndRetentionNeverDeletesRaw() {
+        val root = createTempDirectory().toFile()
+        val active = File(root, "bydcollector_telemetry.db").apply { writeText("active") }
+        val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+        val raw = rawArchive(archiveRoot, active.name)
+        val statuses = mutableListOf<ArchiveStorageJobStatus>()
+        val manager = ArchiveStorageManager(
+            archiveRoot,
+            active,
+            File(root, "bydcollector_debug_round_robin.db")
+        )
+
+        assertFalse(manager.compressRawArchiveDirectory(raw, statuses::add))
+        assertEquals(0, manager.enforceRetention(limitBytes = 0L))
+
+        assertTrue(raw.exists())
+        assertTrue(statuses.last().error?.startsWith("archive_verification_") == true)
+        assertTrue(File(raw, ArchiveStorageManager.ARCHIVE_VERIFICATION_MARKER).readText().contains("state=FAILED"))
+        assertEquals(1, manager.deleteArchiveIds(listOf(raw.name)))
+        assertFalse(raw.exists())
+    }
+
+    @Test
+    fun onlyExactDatabaseAndSidecarNamesAreAcceptedAndBothSecondaryNamesWork() {
+        val root = createTempDirectory().toFile()
+        val main = File(root, "bydcollector_telemetry.db").apply { writeText("active") }
+        val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+        val invalidRaw = rawArchive(archiveRoot, main.name).apply { File(this, "extra.txt").writeText("extra") }
+        var verifierCalls = 0
+        val mainManager = manager(archiveRoot, main) { _, _, _ -> verifierCalls += 1; null }
+        assertFalse(mainManager.compressRawArchiveDirectory(invalidRaw))
+        assertEquals(0, verifierCalls)
+        assertTrue(invalidRaw.exists())
+
+        val verified = mutableListOf<String>()
+        listOf(
+            "bydcollector_secondary_20260707_120000" to "bydcollector_secondary.db",
+            "bydcollector_debug_round_robin_20260707_120000" to "bydcollector_debug_round_robin.db"
+        ).forEach { (archiveName, databaseName) ->
+            val raw = File(archiveRoot, archiveName).apply { mkdirs() }
+            File(raw, databaseName).writeText("db")
+            val manager = manager(archiveRoot, main) { family, databaseFile, _ ->
+                assertEquals("debug_round_robin", family)
+                assertEquals(databaseName, databaseFile.name)
+                verified += databaseFile.name
+                null
+            }
+            assertTrue(manager.compressRawArchiveDirectory(raw))
+        }
+
+        assertEquals(
+            listOf("bydcollector_secondary.db", "bydcollector_debug_round_robin.db"),
+            verified
+        )
+    }
+
+    @Test
+    fun activeCutoverArchiveIsProtectedFromCompressionAndExplicitDeletion() {
+        val root = createTempDirectory().toFile()
+        val main = File(root, "bydcollector_telemetry.db").apply { writeText("active") }
+        val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+        val raw = rawArchive(archiveRoot, main.name)
+        val manager = manager(archiveRoot, main, isArchiveInUse = { it == raw.name })
+
+        assertFalse(manager.compressRawArchiveDirectory(raw))
+        assertEquals(0, manager.deleteArchiveIds(listOf(raw.name)))
+
+        assertTrue(raw.exists())
+        assertFalse(File(raw, ArchiveStorageManager.ARCHIVE_VERIFICATION_MARKER).exists())
+    }
+
+    @Test
+    fun archiveBecomingActiveAfterZipCreationIsRetainedAndRetryable() {
+        val root = createTempDirectory().toFile()
+        val main = File(root, "bydcollector_telemetry.db").apply { writeText("active") }
+        val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+        val raw = rawArchive(archiveRoot, main.name)
+        val zip = File(archiveRoot, "${raw.name}.zip")
+        var inUse = false
+        val manager = manager(archiveRoot, main, isArchiveInUse = { inUse })
+        val statuses = mutableListOf<ArchiveStorageJobStatus>()
+
+        assertFalse(manager.compressRawArchiveDirectory(raw) { status ->
+            statuses += status
+            if (status.messageEn == "Deleting raw archive") inUse = true
+        })
+
+        assertTrue(raw.exists())
+        assertTrue(zip.exists())
+        assertEquals("archive_in_use", statuses.last().error)
+        inUse = false
+        assertTrue(manager.compressRawArchiveDirectory(raw))
+        assertFalse(raw.exists())
     }
 
     @Test
@@ -68,6 +275,26 @@ class ArchiveStorageManagerTest {
 
         assertFalse(oldest.exists())
         assertTrue(newest.exists())
+    }
+
+    @Test
+    fun retentionCountsRawBytesButNeverSelectsRawDirectoriesForDeletion() {
+        val root = createTempDirectory().toFile()
+        val main = File(root, "bydcollector_telemetry.db").apply { writeText("active") }
+        val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+        val oldest = archive(archiveRoot, "bydcollector_telemetry_20260707_010000.zip", 1_000L)
+        val newest = archive(archiveRoot, "bydcollector_telemetry_20260707_020000.zip", 2_000L)
+        val raw = File(archiveRoot, "bydcollector_telemetry_20260707_000000").apply {
+            mkdirs()
+            File(this, main.name).writeText("raw database")
+        }
+        val manager = manager(archiveRoot, main)
+
+        assertEquals(1, manager.enforceRetention(limitBytes = oldest.length() + newest.length()))
+
+        assertFalse(oldest.exists())
+        assertTrue(newest.exists())
+        assertTrue(raw.exists())
     }
 
     @Test
@@ -123,7 +350,12 @@ class ArchiveStorageManagerTest {
         val archiveRoot = File(root, "db_archive")
         val raw = File(archiveRoot, "bydcollector_debug_round_robin_20260713_120000").apply { mkdirs() }
         File(raw, debug.name).writeText("archived-debug")
-        val manager = ArchiveStorageManager(archiveRoot, main, debug)
+        val manager = ArchiveStorageManager(
+            archiveRoot,
+            main,
+            debug,
+            archivedDatabaseVerifier = { _, _, _ -> null }
+        )
 
         assertTrue(manager.compressRawArchiveDirectory(raw))
         val snapshot = manager.snapshot(1024L)
@@ -248,8 +480,39 @@ class ArchiveStorageManagerTest {
         ).forEach { ids -> assertNull(manager.resolveShareZipFiles(ids), "Expected rejection for $ids") }
     }
 
-    private fun manager(archiveRoot: File, main: File): ArchiveStorageManager {
-        return ArchiveStorageManager(archiveRoot, main, File(main.parentFile, "bydcollector_debug_round_robin.db"))
+    private fun manager(
+        archiveRoot: File,
+        main: File,
+        isArchiveInUse: (String) -> Boolean = { false },
+        archivedDatabaseVerifier: (String, File, File) -> String? = { _, _, _ -> null }
+    ): ArchiveStorageManager {
+        return ArchiveStorageManager(
+            archiveRoot,
+            main,
+            File(main.parentFile, "bydcollector_debug_round_robin.db"),
+            archivedDatabaseVerifier = archivedDatabaseVerifier,
+            isArchiveInUse = isArchiveInUse
+        )
+    }
+
+    private fun rawArchive(root: File, databaseName: String): File =
+        File(root, "bydcollector_telemetry_20260707_120000").apply {
+            mkdirs()
+            File(this, databaseName).writeText("db")
+        }
+
+    private fun zipRaw(root: File, raw: File): File {
+        val target = File(root, "${raw.name}.zip")
+        File(raw, ArchiveStorageManager.ARCHIVE_VERIFICATION_MARKER)
+            .writeText("state=PASSED\nupdated_at_ms=1\n")
+        ZipOutputStream(target.outputStream()).use { zip ->
+            raw.listFiles().orEmpty().sortedBy { it.name }.forEach { file ->
+                zip.putNextEntry(ZipEntry(file.name))
+                file.inputStream().use { it.copyTo(zip) }
+                zip.closeEntry()
+            }
+        }
+        return target
     }
 
     private fun archive(root: File, name: String, modifiedAt: Long): File {

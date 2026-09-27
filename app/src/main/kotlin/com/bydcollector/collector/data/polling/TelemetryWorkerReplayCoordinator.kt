@@ -54,6 +54,19 @@ class TelemetryWorkerReplayCoordinator(
     private var lastFailureLoggedAtNanos = 0L
     private var repeatedFailureCount = 0L
 
+    /** After a successful helper fence, only an explicit empty reply proves the finite tail drained. */
+    fun drainFencedTail(sessionId: Long, beforeBatch: () -> Unit = {}) {
+        while (true) {
+            beforeBatch()
+            val result = replayNextBatch(sessionId)
+            if (!result.needsReplay && result.cycleResult == null) return
+            check(result.cycleResult?.ok == true && !result.cycleResult.deferred) {
+                "Main archive replay did not drain: ${result.cycleResult?.category ?: "pending"}"
+            }
+            // The 256 KiB reply bound can produce a short nonempty page. It is not end-of-tail.
+        }
+    }
+
     fun replayNextBatch(sessionId: Long): WorkerReplayBatchResult {
         var batchCount = 0
         var importAttempts = 0L

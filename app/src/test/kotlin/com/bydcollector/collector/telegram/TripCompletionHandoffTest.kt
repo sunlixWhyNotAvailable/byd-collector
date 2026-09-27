@@ -3,6 +3,7 @@ package com.bydcollector.collector.telegram
 import com.bydcollector.collector.data.trips.TripCompletionIntent
 import com.bydcollector.collector.data.trips.TripSession
 import com.bydcollector.collector.service.TelegramEventState
+import java.time.Instant
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -10,6 +11,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class TripCompletionHandoffTest {
@@ -87,12 +89,24 @@ class TripCompletionHandoffTest {
         val completion = intent(1).copy(session = trip)
         val restored = recoverCompletionState(TelegramEventState(), completion)
         assertEquals(trip.tripId, restored.tripPowerSessionId)
+        assertEquals(Instant.parse(trip.startedAt).toEpochMilli(), restored.tripStartedAtMs)
+        assertEquals(Instant.parse(checkNotNull(trip.endedAt)).toEpochMilli(), restored.tripEndedAtMs)
+        assertEquals(restored.tripStartedAtMs, restored.bootTotalStartedAtMs)
+        assertEquals(restored.tripEndedAtMs, restored.bootTotalEndedAtMs)
         assertEquals(100.0, restored.tripStartOdometerKm)
         assertEquals(0.4, restored.tripAccumulatedEnergyKwh)
         val parked = TelegramEventState(pendingPowerOffLocationTripId = "parked")
         assertEquals(parked, recoverCompletionState(parked, completion))
         val active = TelegramEventState(tripId = "moving")
         assertEquals(active, recoverCompletionState(active, completion))
+
+        val missingEnd = recoverCompletionState(
+            TelegramEventState(),
+            completion.copy(session = trip.copy(endedAt = null))
+        )
+        assertEquals(Instant.parse(trip.startedAt).toEpochMilli(), missingEnd.bootTotalStartedAtMs)
+        assertNull(missingEnd.tripEndedAtMs)
+        assertNull(missingEnd.bootTotalEndedAtMs)
     }
 
     @Test fun slowHttpDoesNotBlockLocalOwnerAndQuiescenceWaitsThroughReceipt() {

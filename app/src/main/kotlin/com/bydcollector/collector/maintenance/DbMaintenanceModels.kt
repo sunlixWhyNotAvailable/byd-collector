@@ -8,16 +8,18 @@ enum class DbMaintenanceOperation(
     ARCHIVE(
         key = "archive",
         stepsUk = listOf(
-            "Зупиняємо збір та експорт",
-            "Закриваємо поточну базу даних",
+            "Завершуємо поточний запис",
+            "Записуємо накопичену чергу",
+            "Контрольна точка та закриття бази",
             "Переносимо базу в архів",
             "Створюємо нову базу даних",
             "Перевіряємо нову базу",
             "Відновлюємо попередній стан"
         ),
         stepsEn = listOf(
-            "Stopping collection and export",
-            "Closing current database",
+            "Finishing the current write",
+            "Draining the queued records",
+            "Checkpointing and closing database",
             "Moving database to archive",
             "Creating new database",
             "Verifying new database",
@@ -27,16 +29,18 @@ enum class DbMaintenanceOperation(
     DEBUG_ARCHIVE(
         key = "debug_archive",
         stepsUk = listOf(
-            "Зупиняємо вторинний збір",
-            "Закриваємо вторинну базу даних",
+            "Завершуємо поточний вторинний запис",
+            "Записуємо накопичену вторинну чергу",
+            "Контрольна точка та закриття вторинної бази",
             "Переносимо вторинну базу в архів",
             "Створюємо нову вторинну базу",
             "Перевіряємо нову вторинну базу",
             "Відновлюємо вторинний збір"
         ),
         stepsEn = listOf(
-            "Stopping secondary collection",
-            "Closing secondary database",
+            "Finishing the current secondary write",
+            "Draining the queued secondary records",
+            "Checkpointing and closing secondary database",
             "Moving secondary database to archive",
             "Creating new secondary database",
             "Verifying new secondary database",

@@ -6,8 +6,10 @@ import com.bydcollector.collector.data.energy.EnergyRuntimeRow
 import com.bydcollector.collector.data.energy.EnergyRuntimeStorage
 import com.bydcollector.collector.data.energy.EnergySessionCoordinator
 import com.bydcollector.collector.data.energy.EnergySnapshot
+import org.json.JSONObject
 import java.io.File
 import java.nio.file.Files
+import java.nio.file.attribute.FileTime
 import java.io.RandomAccessFile
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -136,6 +138,135 @@ class TelemetryWorkerSpoolContractTest {
                 assertEquals(aLate.identity, second.identity)
                 assertEquals(TelemetryWorkerSpool.AckStatus.RELEASED, spool.acknowledge(second.identity, 2).status)
                 assertEquals(b.identity, spool.pending(1).single().identity)
+            }
+        } finally {
+            deleteRecursively(root)
+        }
+    }
+
+    @Test
+    fun cachedOrderingAvoidsDecodingTheUnselectedTailOnLaterPages() {
+        val root = tempDirectory()
+        try {
+            TelemetryWorkerSpool.openForTest(root, TelemetryWorkerSpool.MAX_SPOOL_BYTES).use { spool ->
+                val samples = (1L..3L).map { sample("boot-a", "generation-a", it, it * 100, it * 100) }
+                samples.forEach { assertEquals(TelemetryWorkerSpool.AppendResult.SUCCESS, spool.append(it)) }
+
+                val first = spool.pending(1).single()
+                assertEquals(samples[0].identity, first.identity)
+                assertEquals(TelemetryWorkerSpool.AckStatus.RELEASED, spool.acknowledge(first.identity, 1).status)
+
+                val beforeSecondPage = spool.decodedRecordCountForTest()
+                val second = spool.pending(1).single()
+                assertEquals(samples[1].identity, second.identity)
+                assertEquals(beforeSecondPage + 1, spool.decodedRecordCountForTest())
+            }
+        } finally {
+            deleteRecursively(root)
+        }
+    }
+
+    @Test
+    fun selectedRecordSortKeyChangeWithSameFileSignatureReselectsThePage() {
+        val root = tempDirectory()
+        try {
+            TelemetryWorkerSpool.openForTest(root, TelemetryWorkerSpool.MAX_SPOOL_BYTES).use { spool ->
+                val samples = listOf(
+                    sample("boot-a", "generation-a", 1, wall = 100, elapsed = 100),
+                    sample("boot-a", "generation-a", 2, wall = 200, elapsed = 200),
+                    sample("boot-a", "generation-a", 3, wall = 300, elapsed = 300)
+                )
+                samples.forEach { assertEquals(TelemetryWorkerSpool.AppendResult.SUCCESS, spool.append(it)) }
+                val first = spool.pending(1).single()
+                assertEquals(samples[0].identity, first.identity)
+                assertEquals(TelemetryWorkerSpool.AckStatus.RELEASED, spool.acknowledge(first.identity, 1).status)
+
+                val secondFile = readyFile(root, samples[1].identity)
+                rewriteLongField(secondFile, "captured_elapsed_ms", 200, 500, preserveModificationTime = true)
+
+                // The cached order would choose sequence 2. Its fresh decoded sort key changed,
+                // so the worker must rebuild the ordering index and return sequence 3 first.
+                assertEquals(samples[2].identity, spool.pending(1).single().identity)
+                assertEquals(TelemetryWorkerSpool.AckStatus.RELEASED, spool.acknowledge(samples[2].identity, 2).status)
+                assertEquals(samples[1].identity, spool.pending(1).single().identity)
+            }
+        } finally {
+            deleteRecursively(root)
+        }
+    }
+
+    @Test
+    fun externalWallClockRewriteInvalidatesOrderingAcrossBoots() {
+        val root = tempDirectory()
+        try {
+            TelemetryWorkerSpool.openForTest(root, TelemetryWorkerSpool.MAX_SPOOL_BYTES).use { spool ->
+                val earliest = sample("boot-a", "generation-a", 1, wall = 100, elapsed = 100)
+                val later = sample("boot-b", "generation-b", 1, wall = 300, elapsed = 100)
+                val middle = sample("boot-c", "generation-c", 1, wall = 200, elapsed = 100)
+                listOf(later, middle, earliest).forEach {
+                    assertEquals(TelemetryWorkerSpool.AppendResult.SUCCESS, spool.append(it))
+                }
+
+                val first = spool.pending(1).single()
+                assertEquals(earliest.identity, first.identity)
+                assertEquals(TelemetryWorkerSpool.AckStatus.RELEASED, spool.acknowledge(first.identity, 1).status)
+
+                rewriteLongField(readyFile(root, later.identity), "captured_wall_ms", 300, 150)
+                assertEquals(later.identity, spool.pending(1).single().identity)
+            }
+        } finally {
+            deleteRecursively(root)
+        }
+    }
+
+    @Test
+    fun alternatingValidatorsQuarantineRejectedBootAndRefillFromNextBoot() {
+        val root = tempDirectory()
+        try {
+            val rejected = sample("boot-a", "generation-a", 1, wall = 100, elapsed = 100)
+            val accepted = sample("boot-b", "generation-b", 1, wall = 200, elapsed = 100)
+            TelemetryWorkerSpool.openForTest(root, TelemetryWorkerSpool.MAX_SPOOL_BYTES).use { spool ->
+                listOf(rejected, accepted).forEach {
+                    assertEquals(TelemetryWorkerSpool.AppendResult.SUCCESS, spool.append(it))
+                }
+                val rejectedReady = readyFile(root, rejected.identity)
+
+                // Warm the metadata index under a permissive caller, then use a stricter caller.
+                assertEquals(rejected.identity, spool.pending(1) { }.single().identity)
+                assertEquals(
+                    accepted.identity,
+                    spool.pending(1) {
+                        if (it.identity.bootId == rejected.identity.bootId) {
+                            throw IllegalArgumentException("catalog mismatch")
+                        }
+                    }.single().identity
+                )
+                assertFalse(rejectedReady.exists())
+                assertTrue(File(rejectedReady.path + ".bad").isFile)
+            }
+        } finally {
+            deleteRecursively(root)
+        }
+    }
+
+    @Test
+    fun acknowledgedIdentityCanBeRecreatedWithFreshOrderingMetadata() {
+        val root = tempDirectory()
+        try {
+            val first = sample("boot-a", "generation-a", 1, wall = 100, elapsed = 100)
+            val second = sample("boot-a", "generation-a", 2, wall = 200, elapsed = 200)
+            val recreated = sample("boot-a", "generation-a", 1, wall = 300, elapsed = 300)
+            TelemetryWorkerSpool.openForTest(root, TelemetryWorkerSpool.MAX_SPOOL_BYTES).use { spool ->
+                listOf(first, second).forEach {
+                    assertEquals(TelemetryWorkerSpool.AppendResult.SUCCESS, spool.append(it))
+                }
+                assertEquals(first.identity, spool.pending(1).single().identity)
+                assertEquals(TelemetryWorkerSpool.AckStatus.RELEASED, spool.acknowledge(first.identity, 1).status)
+                assertEquals(TelemetryWorkerSpool.AppendResult.SUCCESS, spool.append(recreated))
+
+                assertEquals(second.identity, spool.pending(1).single().identity)
+                assertEquals(TelemetryWorkerSpool.AckStatus.RELEASED, spool.acknowledge(second.identity, 2).status)
+                assertEquals(recreated.identity, spool.pending(1).single().identity)
             }
         } finally {
             deleteRecursively(root)
@@ -552,6 +683,39 @@ class TelemetryWorkerSpoolContractTest {
     private class RealtimeClock : HelperDiagnostics.Clock {
         override fun wallTimeMs() = System.currentTimeMillis()
         override fun elapsedTimeMs() = System.nanoTime() / 1_000_000L
+    }
+
+    private fun readyFile(root: File, identity: TelemetryWorkerSampleIdentity): File =
+        root.listFiles { _, name -> name.endsWith(".ready") }!!.single { file ->
+            val recordIdentity = JSONObject(file.readText()).getJSONObject("identity")
+            recordIdentity.getString("boot_id") == identity.bootId &&
+                recordIdentity.getString("helper_generation") == identity.helperGeneration &&
+                recordIdentity.getLong("poll_sequence") == identity.pollSequence
+        }
+
+    private fun rewriteLongField(
+        file: File,
+        field: String,
+        oldValue: Long,
+        newValue: Long,
+        preserveModificationTime: Boolean = false
+    ) {
+        val originalTime = Files.getLastModifiedTime(file.toPath())
+        val original = file.readText()
+        val oldToken = "\"$field\":$oldValue"
+        val newToken = "\"$field\":$newValue"
+        assertTrue(original.contains(oldToken), "missing $field=$oldValue in $file")
+        val updated = original.replace(oldToken, newToken)
+        assertEquals(original.length, updated.length, "fixture rewrite must preserve file length")
+        file.writeText(updated)
+        val timestamp = if (preserveModificationTime) {
+            originalTime
+        } else {
+            FileTime.fromMillis(originalTime.toMillis() + 60_000L)
+        }
+        Files.setLastModifiedTime(file.toPath(), timestamp)
+        assertEquals(original.length.toLong(), file.length())
+        assertEquals(timestamp, Files.getLastModifiedTime(file.toPath()))
     }
 
     private fun deleteRecursively(file: File) {

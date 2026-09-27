@@ -77,7 +77,7 @@ class DatabaseMaintenanceGateTest {
     }
 
     @Test
-    fun queuedMainAndDebugReadersOpenOnlyAfterExclusiveMaintenanceCompletes() {
+    fun queuedReadersOpenOnlyAfterExclusiveMaintenanceCompletes() {
         val gate = DatabaseMaintenanceGate()
         val executor = Executors.newFixedThreadPool(3)
         val maintenanceEntered = CountDownLatch(1)
@@ -113,8 +113,8 @@ class DatabaseMaintenanceGateTest {
                 }
             }
 
-            queueReader("main_open", mainEntered)
-            queueReader("debug_open", debugEntered)
+            queueReader("first_open", mainEntered)
+            queueReader("second_open", debugEntered)
             assertTrue(readersQueued.await(1, TimeUnit.SECONDS))
             assertFalse(mainEntered.await(100, TimeUnit.MILLISECONDS))
             assertFalse(debugEntered.await(100, TimeUnit.MILLISECONDS))
@@ -125,8 +125,36 @@ class DatabaseMaintenanceGateTest {
             assertTrue(mainEntered.await(1, TimeUnit.SECONDS))
             assertTrue(debugEntered.await(1, TimeUnit.SECONDS))
             assertEquals(2, openAttempts.get())
-            assertTrue(events.indexOf("main_open") > events.indexOf("recreate"))
-            assertTrue(events.indexOf("debug_open") > events.indexOf("recreate"))
+            assertTrue(events.indexOf("first_open") > events.indexOf("recreate"))
+            assertTrue(events.indexOf("second_open") > events.indexOf("recreate"))
+        } finally {
+            releaseMaintenance.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun exclusiveSecondaryMaintenanceBlocksOnlySecondaryReads() {
+        val mainGate = DatabaseMaintenanceGate()
+        val secondaryGate = DatabaseMaintenanceGate()
+        val executor = Executors.newSingleThreadExecutor()
+        val maintenanceEntered = CountDownLatch(1)
+        val releaseMaintenance = CountDownLatch(1)
+        try {
+            val maintenance = executor.submit {
+                secondaryGate.withExclusive {
+                    maintenanceEntered.countDown()
+                    check(releaseMaintenance.await(2, TimeUnit.SECONDS))
+                }
+            }
+            assertTrue(maintenanceEntered.await(1, TimeUnit.SECONDS))
+
+            assertNull(secondaryGate.tryRead { "secondary" })
+            assertEquals("main", mainGate.tryRead { "main" })
+
+            releaseMaintenance.countDown()
+            maintenance.get(1, TimeUnit.SECONDS)
+            assertEquals("secondary", secondaryGate.tryRead { "secondary" })
         } finally {
             releaseMaintenance.countDown()
             executor.shutdownNow()

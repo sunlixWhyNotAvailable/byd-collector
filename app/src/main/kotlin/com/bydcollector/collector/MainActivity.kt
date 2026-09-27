@@ -1165,24 +1165,25 @@ class MainActivity : ComponentActivity() {
                 handler.postDelayed(cancel, DASHBOARD_COUNT_BUDGET_MS)
                 runCatching {
                     android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
-                    withTelemetryStoreRead { countStore ->
-                        val main = countStore.dashboardRowCounts(cancellation)
-                        val debug = if (BydCollectorApplication.isDebugStorageReady(applicationContext)) {
+                    val application = applicationContext as BydCollectorApplication
+                    val main = application.tryTelemetryStoreRead { it.dashboardRowCounts(cancellation) }
+                        ?: return@runCatching null
+                    val debug = if (BydCollectorApplication.isDebugStorageReady(applicationContext)) {
+                        application.trySecondaryDatabaseRead {
                             DirectDebugStore(applicationContext).use { it.dashboardReadingCount(cancellation) }
-                        } else {
-                            0L
-                        }
-                        DashboardRowCounts(
-                            pollCount = main.pollCount,
-                            valueRowCount = main.valueRowCount,
-                            ecRowCount = main.ecRowCount,
-                            normalizedCurrentCount = main.normalizedCurrentCount,
-                            normalizedHistoryCount = main.normalizedHistoryCount,
-                            debugReadingCount = debug
-                        )
-                    }
+                        } ?: return@runCatching null
+                    } else 0L
+                    DashboardRowCounts(
+                        pollCount = main.pollCount,
+                        valueRowCount = main.valueRowCount,
+                        ecRowCount = main.ecRowCount,
+                        normalizedCurrentCount = main.normalizedCurrentCount,
+                        normalizedHistoryCount = main.normalizedHistoryCount,
+                        debugReadingCount = debug
+                    )
                 }.also { handler.removeCallbacks(cancel) }.onSuccess { counts ->
-                    dashboardUiStateStore.publishRowCountBaseline(countGeneration, counts)
+                    if (counts != null) dashboardUiStateStore.publishRowCountBaseline(countGeneration, counts)
+                    else dashboardUiStateStore.failCountBootstrap(countGeneration)
                 }
                     .onFailure { error ->
                         dashboardUiStateStore.failCountBootstrap(countGeneration)

@@ -195,6 +195,32 @@ class CallbackBatchDrainCoordinatorTest {
         assertEquals(5_000L, result.lastProgressWallMs)
     }
 
+    @Test fun `queue observers see the actual head before import and clear it only after exact ACK`() {
+        val calls = mutableListOf<String>()
+        val coordinator = CallbackBatchDrainCoordinator(
+            download = { payload },
+            importBatch = { _, _, _ ->
+                calls += "import"
+                CallbackImportResult.Committed(1, 1, false)
+            },
+            acknowledge = { selected ->
+                assertEquals(descriptor, selected)
+                calls += "ack"
+                action()
+            },
+            quarantine = { _, _ -> error("no quarantine") },
+            onDownloadStarted = { calls += "download" },
+            onPendingBatchObserved = { calls += "head:$it" },
+            onRawCommitCompleted = { calls += "commit" },
+            onPendingBatchCompleted = { calls += "complete" }
+        )
+
+        val result = coordinator.drain(maxBatches = 1)
+
+        assertEquals(CallbackDrainKind.PROGRESS, result.kind)
+        assertEquals(listOf("download", "head:1000", "import", "commit", "ack", "complete"), calls)
+    }
+
     @Test fun `interruption after durable commit leaves exact batch for retry`() {
         val coordinator = CallbackBatchDrainCoordinator(
             download = { payload },

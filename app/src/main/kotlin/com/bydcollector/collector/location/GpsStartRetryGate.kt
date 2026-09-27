@@ -5,6 +5,7 @@ class GpsStartRetryGate {
     private var failureCount = 0
     private var nextAttemptAtMs = Long.MIN_VALUE
     private var outageReported = false
+    val hasFailures: Boolean get() = outageReported
 
     fun canAttempt(nowMs: Long): Boolean = nowMs >= nextAttemptAtMs
 
@@ -18,10 +19,10 @@ class GpsStartRetryGate {
         return true
     }
 
-    fun reset() {
+    fun reset(preserveOutage: Boolean = false) {
         failureCount = 0
         nextAttemptAtMs = Long.MIN_VALUE
-        outageReported = false
+        if (!preserveOutage) outageReported = false
     }
 
     companion object {
