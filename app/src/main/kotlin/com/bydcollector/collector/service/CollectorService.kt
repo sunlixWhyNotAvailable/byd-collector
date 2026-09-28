@@ -89,6 +89,11 @@ import com.bydcollector.collector.ha.TailscaleActivationGate
 import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
 import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.ArchiveStorageManager
+import com.bydcollector.collector.maintenance.ArchiveStorageAdmissionKind
+import com.bydcollector.collector.maintenance.ArchiveStorageItemState
+import com.bydcollector.collector.maintenance.ArchiveStorageItemPhase
+import com.bydcollector.collector.maintenance.ArchiveStorageOperationCoordinator
+import com.bydcollector.collector.maintenance.ArchiveStorageOperationOutcome
 import com.bydcollector.collector.maintenance.ArchiveShareLeaseRegistry
 import com.bydcollector.collector.maintenance.DbMaintenanceCoordinator
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
@@ -170,7 +175,7 @@ class CollectorService : Service() {
     private val debugStartExecutor = namedSingleThreadExecutor("byd-debug-start")
     private val maintenanceExecutor = namedSingleThreadExecutor("byd-db-maintenance")
     private val archiveStorageExecutor = namedSingleThreadExecutor("byd-archive-storage")
-    private val archiveAuditRetryQueued = AtomicBoolean(false)
+    @Volatile private var cancelQueuedArchiveWork: (() -> Unit)? = null
     private val tailscaleExecutor = namedSingleThreadExecutor("byd-tailscale")
     private val dashboardMetricsExecutor = namedSingleThreadExecutor("byd-dashboard-metrics")
     private val dashboardCountExecutor = namedSingleThreadExecutor("byd-dashboard-counts")
@@ -533,7 +538,7 @@ class CollectorService : Service() {
             return START_STICKY
         }
         recoverInterruptedMaintenanceIfNeeded(action)
-        recoverInterruptedArchiveDeleteIfNeeded(action)
+        recoverInterruptedArchiveStorageIfNeeded(action)
         if (
             maintenanceActive.get() &&
             activeMaintenanceOperation == DbMaintenanceOperation.ARCHIVE &&
@@ -630,6 +635,8 @@ class CollectorService : Service() {
         closeDebugStoreAfterDebugStartExecutorStops()
         maintenanceExecutor.shutdownNow()
         archiveStorageExecutor.shutdownNow()
+        cancelQueuedArchiveWork?.invoke()
+        cancelQueuedArchiveWork = null
         tailscaleExecutor.shutdownNow()
         dashboardMetricsExecutor.shutdownNow()
         dashboardCountExecutor.shutdownNow()
@@ -3821,7 +3828,7 @@ class CollectorService : Service() {
             influxRetryScheduled = influxRetryScheduled,
             influxOwned = influxConnection.owned,
             maintenance = maintenanceActive.get(),
-            archiveStorage = archiveStorageActiveInProcess.get()
+            archiveStorage = archiveStorageOperations.isActive()
         )
     }
 
@@ -4189,6 +4196,9 @@ class CollectorService : Service() {
                 )
             )
         )
+        if (remaining == 0 && !queued && !settings.isInfluxEnabled()) {
+            influxRuntimeDiagnostics.flushSummary("stop")
+        }
         mainHandler.post {
             if (influxWorkInFlight.get() == 0 && influxConnection.stopping && !settings.isInfluxEnabled()) {
                 // A queued Stop may have been superseded by maintenance; retain ownership but allow retry.
@@ -4585,48 +4595,35 @@ class CollectorService : Service() {
     }
 
     private fun enqueueArchiveStorageMaintenance(preferredArchivePath: String?) {
-        enqueueArchiveStorageWork("archive_storage_rejected", ArchiveStorageJobMode.RETENTION,
-            onRejected = ::deferPendingArchiveAudit) {
+        enqueueArchiveStorageWork(
+            "archive_storage_rejected", ArchiveStorageJobMode.RETENTION,
+            deferIfBusy = true,
+            queuedArchiveIds = listOfNotNull(preferredArchivePath?.let { File(it).name })
+        ) { operationId, publish ->
             val manager = archiveStorageManager()
             val limitBytes = settings.archiveStorageLimitGb() * 1024L * 1024L * 1024L
-            preferredArchivePath
-                ?.let(::File)
-                ?.takeIf { it.isDirectory }
-                ?.let { manager.compressRawArchiveDirectory(it, ::publishArchiveStorageStatus) }
-            manager.compressPendingRawArchives(::publishArchiveStorageStatus)
-            val rawArchives = File(applicationContext.filesDir, "db_archive").listFiles().orEmpty().filter { file ->
-                file.isDirectory && (
-                    file.name.startsWith("${File(store.databaseFile().name).nameWithoutExtension}_") ||
-                        ArchiveStorageManager.isSecondaryArchiveName(file.name)
-                    )
+            val reconciliation = manager.reconcilePersistedItems(settings.archiveStorageItems())
+            check(settings.reconcileArchiveStorageItems(operationId, reconciliation)) {
+                "Could not reconcile archive state"
             }
-            check(rawArchives.none { !archiveFileOperationProtected(it.name) }) {
+            val pending = checkNotNull(manager.pendingRawArchiveIds()) { "Cannot list pending archives" }
+            check(settings.queueArchiveStorageItems(operationId, pending)) { "Could not persist archive queue" }
+            dashboardStateProvider.invalidateArchiveStorageSnapshot()
+            // A failed preferred archive is attempted once, not immediately again by the scan.
+            val preferred = preferredArchivePath?.let(::File)?.takeIf { it.name in pending }
+            preferred?.let { manager.compressRawArchiveDirectory(it, publish) }
+            manager.compressPendingRawArchives(publish, setOfNotNull(preferred?.name))
+            val rawArchives = checkNotNull(manager.pendingRawArchiveIds()) { "Cannot verify remaining archives" }
+            check(rawArchives.none { !archiveFileOperationProtected(it) }) {
                 "Raw database archive verification/compression remains pending; raw data retained"
             }
-            manager.enforceRetention(limitBytes, ::publishArchiveStorageStatus)
+            manager.enforceRetention(limitBytes, publish)
             if (rawArchives.isEmpty()) settings.setCutoverArchiveStoragePending(false)
         }
     }
 
-    /** The existing serial archive worker orders audits after an in-progress ZIP/delete. */
-    private fun deferPendingArchiveAudit() {
-        if (!settings.isCutoverArchiveStoragePending() || !archiveAuditRetryQueued.compareAndSet(false, true)) return
-        try {
-            archiveStorageExecutor.execute {
-                if (!mainHandler.post {
-                        archiveAuditRetryQueued.set(false)
-                        if (running.get() && !settings.isUserShutdownRequested() && settings.isCutoverArchiveStoragePending()) {
-                            enqueueArchiveStorageMaintenance(null)
-                        }
-                    }) archiveAuditRetryQueued.set(false)
-            }
-        } catch (_: RejectedExecutionException) {
-            archiveAuditRetryQueued.set(false) // The persisted pending flag is retried at next startup.
-        }
-    }
-
     private fun reconcilePendingCutoverArchiveStorage(action: String) {
-        if (!settings.isCutoverArchiveStoragePending()) return
+        if (!settings.isCutoverArchiveStoragePending() && settings.archiveStorageAuditOperationId() == null) return
         if (
             action in setOf(
                 ACTION_ARCHIVE_DATABASE,
@@ -4662,9 +4659,8 @@ class CollectorService : Service() {
                 dashboardStateProvider.restoreRetiredArchiveStorageEntries(safeIds - successfulIds)
                 dashboardStateProvider.completeArchiveStorageDeletion()
             }
-        ) {
+        ) { _, publish ->
             val manager = archiveStorageManager()
-            val failedIds = linkedSetOf<String>()
             store.recordEvent(
                 "archive_delete_started",
                 "Archive deletion started",
@@ -4672,9 +4668,8 @@ class CollectorService : Service() {
             )
             archiveShareLeaseRegistry.forceRelease(ids)
             manager.deleteArchiveIds(ids) { status ->
-                publishArchiveStorageStatus(status)
+                publish(status)
                 if (status.error != null && status.itemId != null) {
-                    failedIds += status.itemId
                     store.recordEvent(
                         "archive_delete_item",
                         "Archive deletion failed",
@@ -4690,21 +4685,6 @@ class CollectorService : Service() {
                     )
                 }
             }
-            if (failedIds.isNotEmpty()) {
-                settings.setArchiveStorageJobStatus(
-                    ArchiveStorageJobStatus(
-                        mode = ArchiveStorageJobMode.DELETE,
-                        running = false,
-                        stepIndex = safeIds.size,
-                        stepCount = safeIds.size,
-                        messageUk = "Видалення завершено з помилками",
-                        messageEn = "Archive deletion completed with failures",
-                        error = summarizeArchiveDeleteFailures(failedIds),
-                        updatedAtMs = System.currentTimeMillis()
-                    ),
-                    synchronous = true
-                )
-            }
         }
     }
 
@@ -4712,111 +4692,130 @@ class CollectorService : Service() {
         errorCategory: String,
         requestedMode: ArchiveStorageJobMode,
         initialStatus: ArchiveStorageJobStatus? = null,
+        deferIfBusy: Boolean = false,
+        queuedArchiveIds: List<String> = emptyList(),
         onRejected: () -> Unit = {},
         onFinished: () -> Unit = {},
-        work: () -> Unit
+        work: (String, (ArchiveStorageJobStatus) -> Unit) -> Unit
     ) {
-        if (!archiveStorageActiveInProcess.compareAndSet(false, true)) {
-            publishArchiveStorageTerminalError(requestedMode, "Archive storage is already active")
+        val requestedId = if (deferIfBusy) settings.archiveStorageAuditOperationId() else null
+        val admission = synchronized(archiveStorageOperations) {
+            archiveStorageOperations.admit(requestedId ?: UUID.randomUUID().toString(), deferIfBusy).also { accepted ->
+                if (accepted.kind == ArchiveStorageAdmissionKind.DEFERRED) {
+                    runCatching { settings.deferArchiveStorageAudit(checkNotNull(accepted.operationId), queuedArchiveIds) }
+                        .onFailure { store.recordEvent(errorCategory, "Could not persist deferred archive audit", it.diagnosticDetail()) }
+                }
+            }
+        }
+        if (admission.kind == ArchiveStorageAdmissionKind.DEFERRED) {
+            store.recordEvent("archive_storage_deferred", "Archive audit deferred",
+                "operation_id=${admission.operationId} items=${queuedArchiveIds.joinToString(",")}")
+            dashboardStateProvider.invalidateArchiveStorageSnapshot()
+            scheduleIntegrationDashboardRefresh()
+            return
+        }
+        if (admission.kind == ArchiveStorageAdmissionKind.REJECTED) {
             onRejected()
             store.recordEvent(errorCategory, "Archive storage action rejected", "archive_storage_active")
             scheduleIntegrationDashboardRefresh()
             return
         }
-        initialStatus?.let { settings.setArchiveStorageJobStatus(it, synchronous = true) }
+        val operationId = checkNotNull(admission.operationId)
+        val outcome = ArchiveStorageOperationOutcome()
+        val startedOrCancelled = AtomicBoolean(false)
+        val settled = AtomicBoolean(false)
+        var lastStatus = initialStatus ?: ArchiveStorageJobStatus(
+            mode = requestedMode,
+            messageUk = "Готуємо архівну операцію",
+            messageEn = "Preparing archive operation"
+        )
+        fun settle(error: Throwable?, rejected: Boolean = false) {
+            if (!settled.compareAndSet(false, true)) return
+            val detail = outcome.terminalError(error)
+            val terminal = lastStatus.copy(
+                mode = requestedMode, operationId = operationId, running = false,
+                error = detail,
+                phase = if (detail != null) ArchiveStorageItemPhase.FAILED else lastStatus.phase,
+                messageUk = if (detail == null) "Архівну операцію завершено" else "Архівну операцію завершено з помилками",
+                messageEn = if (detail == null) "Archive operation completed" else "Archive operation completed with failures",
+                updatedAtMs = System.currentTimeMillis()
+            )
+            var deferred: String? = null
+            try {
+                var saved = false
+                synchronized(archiveStorageOperations) {
+                    try {
+                        saved = runCatching { settings.finishArchiveStorageOperation(operationId, terminal) }.getOrDefault(false)
+                    } finally {
+                        deferred = if (rejected) archiveStorageOperations.reject(operationId, deferIfBusy)
+                            else archiveStorageOperations.finish(operationId)
+                    }
+                    if (rejected && deferred != null) {
+                        runCatching { settings.deferArchiveStorageAudit(checkNotNull(deferred), queuedArchiveIds) }
+                    }
+                }
+                runCatching {
+                    val terminalError = detail ?: "archive_terminal_state_not_saved".takeUnless { saved }
+                    store.recordEvent(
+                        "archive_storage_terminal", "Archive storage action completed",
+                        "operation_id=$operationId mode=${requestedMode.name.lowercase()} ok=${terminalError == null} error=${terminalError ?: "none"}"
+                    )
+                }
+            } finally {
+                runCatching { if (rejected) onRejected() else onFinished() }
+                runCatching {
+                    dashboardStateProvider.invalidateArchiveStorageSnapshot()
+                    scheduleIntegrationDashboardRefresh()
+                }
+                // Only an independently deferred request schedules another audit, never this failure.
+                if (!rejected && deferred != null) {
+                    mainHandler.post {
+                        if (!settings.isUserShutdownRequested()) {
+                            if (!archiveStorageExecutor.isShutdown) enqueueArchiveStorageMaintenance(null)
+                            else runCatching {
+                                applicationContext.startForegroundService(reconcileArchiveStorageIntent(applicationContext))
+                            }.onFailure {
+                                store.recordEvent(errorCategory, "Deferred archive audit remains pending", it.diagnosticDetail())
+                            }
+                        }
+                    }
+                }
+                if (!archiveStorageExecutor.isShutdown) mainHandler.post { stopIfNoActiveRuntime() }
+            }
+        }
+        val cancelQueued = {
+            if (startedOrCancelled.compareAndSet(false, true)) {
+                settle(RejectedExecutionException("Archive worker stopped before execution"), rejected = true)
+            }
+        }
         try {
+            check(settings.beginArchiveStorageOperation(operationId, lastStatus)) { "Could not persist archive operation owner" }
+            store.recordEvent("archive_storage_begin", "Archive storage action accepted",
+                "operation_id=$operationId mode=${requestedMode.name.lowercase()}")
+            archiveStorageOperations.acceptDeferredAudit(operationId)
+            cancelQueuedArchiveWork = cancelQueued
             archiveStorageExecutor.execute {
+                if (!startedOrCancelled.compareAndSet(false, true)) return@execute
+                cancelQueuedArchiveWork = null
                 try {
                     android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
-                    val result = runCatching { work() }
-                        .onFailure { error ->
-                            settings.setArchiveStorageJobStatus(
-                                ArchiveStorageJobStatus(
-                                    mode = requestedMode,
-                                    running = false,
-                                    error = "${error::class.java.simpleName}: ${error.message ?: "no message"}",
-                                    updatedAtMs = System.currentTimeMillis()
-                                ),
-                                synchronous = true
-                            )
-                            store.recordEvent(
-                                "archive_storage_error",
-                                "Archive storage action failed",
-                                "${error::class.java.simpleName}: ${error.message ?: "no message"}"
-                            )
-                            store.recordEvent(
-                                "archive_storage_terminal",
-                                "Archive storage action completed",
-                                "mode=${requestedMode.name.lowercase()} ok=false error=${error.message?.take(160) ?: error::class.java.simpleName}"
-                            )
-                        }
-                    if (settings.archiveStorageJobStatus().error == null) {
-                        if (requestedMode == ArchiveStorageJobMode.DELETE) {
-                            settings.setArchiveStorageJobStatus(
-                                ArchiveStorageJobStatus(
-                                    mode = requestedMode,
-                                    running = false,
-                                    messageUk = "Видалення архівів завершено",
-                                    messageEn = "Archive deletion completed",
-                                    updatedAtMs = System.currentTimeMillis()
-                                ),
-                                synchronous = true
-                            )
-                        } else {
-                            settings.clearArchiveStorageJobStatus()
+                    val result = runCatching {
+                        work(operationId) { status ->
+                            outcome.record(status)
+                            lastStatus = status
+                            publishArchiveStorageStatus(operationId, status)
                         }
                     }
-                    try {
-                        result.onSuccess {
-                            val terminal = settings.archiveStorageJobStatus()
-                            store.recordEvent(
-                                "archive_storage_terminal",
-                                "Archive storage action completed",
-                                "mode=${requestedMode.name.lowercase()} ok=${terminal.error == null} error=${terminal.error?.take(160) ?: "none"}"
-                            )
-                        }
-                    } finally {
-                        onFinished()
-                    }
-                } finally {
-                    archiveStorageActiveInProcess.set(false)
-                    mainHandler.post { stopIfNoActiveRuntime() }
+                    settle(result.exceptionOrNull())
+                } catch (error: Throwable) {
+                    // Includes failures before entering work; never strand process ownership.
+                    settle(error)
                 }
             }
-        } catch (error: RejectedExecutionException) {
-            archiveStorageActiveInProcess.set(false)
-            publishArchiveStorageTerminalError(
-                requestedMode,
-                "${error::class.java.simpleName}: ${error.message ?: "no message"}"
-            )
-            onRejected()
-            store.recordEvent(
-                errorCategory,
-                "Archive storage action rejected",
-                "${error::class.java.simpleName}: ${error.message ?: "no message"}"
-            )
-            scheduleIntegrationDashboardRefresh()
+        } catch (error: Throwable) {
+            cancelQueuedArchiveWork = null
+            if (startedOrCancelled.compareAndSet(false, true)) settle(error, rejected = true)
         }
-    }
-
-    private fun publishArchiveStorageTerminalError(mode: ArchiveStorageJobMode, detail: String) {
-        settings.setArchiveStorageJobStatus(
-            ArchiveStorageJobStatus(
-                mode = mode,
-                running = false,
-                error = detail,
-                updatedAtMs = System.currentTimeMillis()
-            ),
-            synchronous = true
-        )
-    }
-
-    private fun summarizeArchiveDeleteFailures(failedIds: Collection<String>): String {
-        val cappedIds = failedIds
-            .take(8)
-            .joinToString(",") { it.take(96) }
-        val suffix = if (failedIds.size > 8) ",..." else ""
-        return "failed_count=${failedIds.size} failed_ids=$cappedIds$suffix"
     }
 
     private fun archiveStorageManager(): ArchiveStorageManager {
@@ -4838,8 +4837,20 @@ class CollectorService : Service() {
         return id.removeSuffix(".zip") == File(pendingPath).name
     }
 
-    private fun publishArchiveStorageStatus(status: ArchiveStorageJobStatus) {
-        settings.setArchiveStorageJobStatus(status, synchronous = true)
+    private fun publishArchiveStorageStatus(operationId: String, status: ArchiveStorageJobStatus) {
+        val now = System.currentTimeMillis()
+        val item = status.itemId?.removeSuffix(".zip.tmp")?.removeSuffix(".zip")?.let { archiveId ->
+            status.phase?.let { phase ->
+                ArchiveStorageItemState(archiveId, operationId, phase, status.stepIndex, status.stepCount,
+                    now, now, error = status.error)
+            }
+        }
+        check(settings.publishArchiveStorageProgress(operationId, status, item)) { "Could not persist archive progress" }
+        store.recordEvent("archive_storage_phase", "Archive storage progress",
+            "operation_id=$operationId item=${item?.archiveId ?: "none"} phase=${status.phase} " +
+                "step=${status.stepIndex}/${status.stepCount} error=${status.error ?: "none"}")
+        dashboardStateProvider.invalidateArchiveStorageSnapshot()
+        scheduleIntegrationDashboardRefresh()
     }
 
     private fun maintenanceBlocksRuntimeStart(debugRuntime: Boolean = false): Boolean {
@@ -4895,26 +4906,16 @@ class CollectorService : Service() {
         settings.recoverInterruptedDbMaintenanceIfNeeded("service_start:$action")
     }
 
-    private fun recoverInterruptedArchiveDeleteIfNeeded(action: String) {
-        val status = settings.archiveStorageJobStatus()
-        if (status.mode != ArchiveStorageJobMode.DELETE || !status.running) return
-        if (archiveStorageActiveInProcess.get()) return
-        val detail = "archive_delete_interrupted: process_restart action=$action"
-        settings.setArchiveStorageJobStatus(
-            status.copy(
-                running = false,
-                messageUk = "Видалення перервано після перезапуску",
-                messageEn = "Archive deletion interrupted by process restart",
-                error = detail,
-                updatedAtMs = System.currentTimeMillis()
-            ),
-            synchronous = true
-        )
+    private fun recoverInterruptedArchiveStorageIfNeeded(action: String) {
+        val pending = synchronized(archiveStorageOperations) {
+            if (archiveStorageOperations.isActive()) return
+            settings.recoverArchiveStorageAfterProcessRestart(UUID.randomUUID().toString())
+        } ?: return
         runCatching {
             store.recordEvent(
-                "archive_delete_interrupted",
-                "Archive deletion interrupted by process restart",
-                "action=$action step=${status.stepIndex}/${status.stepCount}"
+                "archive_storage_recovery_pending",
+                "Archive state requires reconciliation",
+                "action=$action operation_id=$pending"
             )
         }
         dashboardStateProvider.invalidateArchiveStorageSnapshot()
@@ -5116,7 +5117,7 @@ class CollectorService : Service() {
         internal val influxConnection = HaConnectionOwnership()
         internal val influxRuntimeDiagnostics = InfluxRuntimeDiagnosticsProcess.instance
         private val maintenanceRunningInProcess = AtomicBoolean(false)
-        private val archiveStorageActiveInProcess = AtomicBoolean(false)
+        private val archiveStorageOperations = ArchiveStorageOperationCoordinator()
         private val processMqttClientFacade = PahoMqttClientFacade()
         val archiveShareLeaseRegistry = ArchiveShareLeaseRegistry(
             elapsedRealtimeMs = { SystemClock.elapsedRealtime() }
@@ -5225,7 +5226,7 @@ class CollectorService : Service() {
         fun influxRuntimeStatus(): RuntimeActionStatus = influxRuntimeStatusRef.get()
         fun isMaintenanceRunningInProcess(): Boolean = maintenanceRunningInProcess.get() ||
             DbMaintenanceCoordinator.currentOperation() != null
-        fun isArchiveStorageActive(): Boolean = archiveStorageActiveInProcess.get()
+        fun isArchiveStorageActive(): Boolean = archiveStorageOperations.isActive()
 
         fun startIntent(context: Context, forceKeepAliveStatusCheck: Boolean = false): Intent =
             Intent(context, CollectorService::class.java).apply {

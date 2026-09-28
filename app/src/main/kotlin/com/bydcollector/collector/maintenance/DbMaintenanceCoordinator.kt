@@ -76,18 +76,24 @@ class DbMaintenanceCoordinator(
     fun recordDrainWarning(message: String) {
         val warning = message.trim().take(MAX_DRAIN_WARNING_CHARS)
         if (warning.isEmpty()) return
-        synchronized(drainWarningsLock) {
-            if (running.get() && warning !in drainWarnings) drainWarnings += warning
+        val added = synchronized(drainWarningsLock) {
+            if (running.get() && warning !in drainWarnings) {
+                drainWarnings += warning
+                true
+            } else false
         }
+        if (added) application.recordMaintenanceEvent("database_maintenance_warning", warning)
     }
 
     fun run(operation: DbMaintenanceOperation, restoreRuntime: () -> Unit): DbMaintenanceResult {
         val diagnostics = application.maintenanceDiagnostics
         if (!running.compareAndSet(false, true)) {
+            application.recordMaintenanceEvent("database_maintenance_rejected", "operation=${operation.key} reason=already_running")
             return DbMaintenanceResult(false, "Database maintenance already running")
         }
         if (!tryClaim(operation)) {
             running.set(false)
+            application.recordMaintenanceEvent("database_maintenance_rejected", "operation=${operation.key} reason=another_entrypoint")
             return DbMaintenanceResult(false, "Database maintenance already running in another entrypoint")
         }
 
@@ -117,6 +123,9 @@ class DbMaintenanceCoordinator(
             }
             val resultWithDrainWarnings = mergeDrainWarnings(result)
             val resultWithAuditPending = markArchiveVerificationPending(resultWithDrainWarnings)
+            resultWithAuditPending.warning?.let { warning ->
+                application.recordMaintenanceEvent("database_maintenance_warning", "operation=${operation.key} warning=$warning")
+            }
             publishRestoring(operation, resultWithAuditPending)
             diagnostics.runPhase("runtime_restore") { restoreRuntime() }
             restored = true

@@ -12,19 +12,35 @@ import com.bydcollector.collector.data.local.TelegramDiagnosticRow
 import com.bydcollector.collector.data.local.TelegramDiagnosticSnapshot
 import com.bydcollector.collector.data.trips.TripRouteDiagnosticEvidence
 import com.bydcollector.collector.data.trips.TripSession
+import com.bydcollector.collector.maintenance.ArchiveStorageItemState
+import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.ArchiveShareLeaseRegistry
+import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
 import com.bydcollector.collector.ha.HaIntegrationCategories
 import com.bydcollector.collector.influx.InfluxConfig
 import com.bydcollector.collector.influx.InfluxRuntimeDiagnostics
+import com.bydcollector.collector.influx.InfluxRuntimeDiagnosticsProcess
 import com.bydcollector.collector.influx.safeInfluxDiagnosticHost
 import com.bydcollector.collector.service.CollectorSettings
+import com.bydcollector.collector.util.sharedOperationalEventExecutor
 import org.json.JSONObject
+import org.json.JSONArray
 import java.io.File
 import java.nio.charset.StandardCharsets
+import java.nio.ByteBuffer
+import java.nio.charset.CodingErrorAction
 import java.text.SimpleDateFormat
+import java.time.Instant
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.Callable
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executor
+import java.util.concurrent.FutureTask
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicInteger
 
 data class DiagnosticShutdownLogcatResult(val runToken: String?, val closeError: String?)
 
@@ -72,6 +88,7 @@ object DiagnosticLogRecorder {
     private const val KEEP_ALIVE_LOG_STATUS_NAME = "bydcollector_keepalive_status.txt"
     private const val KEEP_ALIVE_LOG_TAIL_BYTES = 512 * 1024
     private const val SHARE_PREPARE_HEADROOM_BYTES = 16L * 1024L * 1024L
+    private const val OPERATIONAL_JOURNAL_BARRIER_TIMEOUT_MS = 5_000L
     private const val LOGCAT_COMMAND = "logcat -b all -v threadtime"
     val LOGCAT_OWNER_ENV = "BYDCOLLECTOR_LOGCAT_OWNER=${BuildConfig.APPLICATION_ID}"
     internal const val LOGCAT_SEGMENT_BYTES = 16L * 1024L * 1024L
@@ -213,7 +230,12 @@ object DiagnosticLogRecorder {
             val appContext = context.applicationContext
             val root = logRoot(appContext)
             val captureStamp = timestamp()
-            val sourceSize = diagnosticLogcatSourceBytes(root, captureState().runDir)
+            val application = appContext as BydCollectorApplication
+            val sourceSize = diagnosticShareSourceBytes(
+                diagnosticLogcatSourceBytes(root, captureState().runDir),
+                application.operationalEventJournal.retainedBytes(),
+                application.maintenanceEventJournal.retainedBytes()
+            )
             val shareRoot = shareRoot(appContext)
             check(
                 hasDiagnosticShareSpace(
@@ -226,6 +248,7 @@ object DiagnosticLogRecorder {
             return try {
                 val logcatStatus = writeLogcatSnapshot(root, snapshotDir)
                 val journalStatus = writeOperationalJournalSnapshot(appContext, snapshotDir)
+                val archiveStateStatus = writeArchiveStorageStateSnapshot(appContext, snapshotDir)
                 val databaseStatus = writeCollectorEventsSnapshot(appContext, snapshotDir)
                 val helperStatus = writeKeepAliveLogSnapshot(appContext, snapshotDir)
                 val telemetryHelperStatus = writeTelemetryHelperSnapshot(appContext, snapshotDir)
@@ -239,6 +262,7 @@ object DiagnosticLogRecorder {
                         appendLine("snapshot=${snapshotDir.name}")
                         appendLine("logcat=$logcatStatus")
                         appendLine("operational_journal=$journalStatus")
+                        appendLine("archive_storage_state=$archiveStateStatus")
                         appendLine("collector_events=$databaseStatus")
                         appendLine("keep_alive_log=$helperStatus")
                         appendLine("telemetry_helper=$telemetryHelperStatus")
@@ -247,7 +271,12 @@ object DiagnosticLogRecorder {
                     },
                     Charsets.UTF_8
                 )
-                sanitizeDiagnosticSnapshot(snapshotDir)
+                val privacyStatus = sanitizeDiagnosticSnapshot(snapshotDir)
+                val journalTimeBoundsStatus = writeJournalTimeBounds(snapshotDir)
+                File(snapshotDir, "diagnostic_info.txt").appendText(
+                    "privacy=$privacyStatus\njournal_time_bounds=$journalTimeBoundsStatus\n",
+                    Charsets.UTF_8
+                )
                 val latestZip = latestZip(appContext).also { writeLatestZip(it, snapshotDir) }
                 val handedOff = createDiagnosticShareCopy(latestZip, shareRoot, captureStamp)
                 pruneExpiredDiagnosticShareFiles(
@@ -280,10 +309,25 @@ object DiagnosticLogRecorder {
                 )
             }.onSuccess { removed += it }
                 .onFailure { warnings += "share_cache=${it::class.java.simpleName}: ${it.message ?: "no message"}" }
+            runCatching { InfluxRuntimeDiagnosticsProcess.instance.flushSummary("clear") }
+                .onFailure { warnings += "influx_summary_flush=${it::class.java.simpleName}" }
             runCatching {
-                (appContext as BydCollectorApplication).operationalEventJournal.clear()
-            }.onSuccess { removed += it }
-                .onFailure { warnings += "operational_journal=${it::class.java.simpleName}: ${it.message ?: "no message"}" }
+                val application = appContext as BydCollectorApplication
+                clearDiagnosticJournalsOnExecutor(
+                    executor = sharedOperationalEventExecutor,
+                    timeoutMs = OPERATIONAL_JOURNAL_BARRIER_TIMEOUT_MS,
+                    clearOperational = application.operationalEventJournal::clear,
+                    clearMaintenance = application.maintenanceEventJournal::clear
+                )
+            }.onSuccess { execution ->
+                execution.result?.let { result ->
+                    removed += result.removed
+                    warnings += result.warnings
+                }
+                execution.warning?.let { warnings += "diagnostic_journal_clear=$it" }
+            }.onFailure { error ->
+                warnings += "diagnostic_journal_clear=${error::class.java.simpleName}: ${diagnosticSafeText(error.message)}"
+            }
             val helperResult = runCatching {
                 AdbLocalClient(File(appContext.filesDir, "adb_keys")).execShell(
                     command = ": > $KEEP_ALIVE_LOG_PATH",
@@ -337,24 +381,105 @@ object DiagnosticLogRecorder {
     }
 
     private fun writeOperationalJournalSnapshot(context: Context, runDir: File): String {
-        val output = File(runDir, "operational_journal")
-        return runCatching {
-            val count = (context.applicationContext as BydCollectorApplication)
-                .operationalEventJournal
-                .snapshotTo(output)
-            File(output, "status.txt").writeText(
-                "status=ok\nsegments=$count\n",
-                Charsets.UTF_8
-            )
-            "ok segments=$count"
-        }.getOrElse { error ->
-            output.mkdirs()
-            File(output, "status.txt").writeText(
-                "status=error\nerror=${error::class.java.simpleName}: ${error.message ?: "no message"}\n",
-                Charsets.UTF_8
-            )
-            "error"
+        val application = context.applicationContext as BydCollectorApplication
+        val flushStatus = runCatching {
+            InfluxRuntimeDiagnosticsProcess.instance.flushSummary("share")
+        }.fold({ "ok" }, { "error=${it::class.java.simpleName}" })
+        val barrierStatus = awaitOperationalEventBarrier(
+            sharedOperationalEventExecutor,
+            OPERATIONAL_JOURNAL_BARRIER_TIMEOUT_MS
+        )
+        val statuses = listOf(
+            snapshotJournal("operational_journal", application.operationalEventJournal, runDir),
+            snapshotJournal("maintenance_journal", application.maintenanceEventJournal, runDir)
+        )
+        val complete = flushStatus == "ok" && barrierStatus == "ok" && statuses.all { it.startsWith("ok") }
+        return buildString {
+            append(if (complete) "ok" else "partial")
+            append(" influx_flush=$flushStatus event_barrier=$barrierStatus")
+            statuses.forEach { append(' ').append(it) }
         }
+    }
+
+    private fun snapshotJournal(name: String, journal: OperationalEventJournal, runDir: File): String {
+        val output = File(runDir, name)
+        return runCatching {
+            val count = journal.snapshotTo(output)
+            val bytes = output.listFiles().orEmpty().filter(File::isFile).sumOf(File::length)
+            File(output, "status.txt").writeText(
+                "status=ok\nsegments=$count\nbytes=$bytes\n",
+                Charsets.UTF_8
+            )
+            "ok name=$name segments=$count bytes=$bytes"
+        }.getOrElse { error ->
+            runCatching {
+                check(output.isDirectory || output.mkdirs())
+                File(output, "status.txt").writeText(
+                    "status=error\nerror=${error::class.java.simpleName}: ${diagnosticSafeText(error.message)}\n",
+                    Charsets.UTF_8
+                )
+            }
+            "error name=$name type=${error::class.java.simpleName}"
+        }
+    }
+
+    private fun writeArchiveStorageStateSnapshot(context: Context, runDir: File): String {
+        val output = File(runDir, "archive_storage_state.json")
+        return runCatching {
+            val settings = CollectorSettings(context.applicationContext)
+            val job = settings.archiveStorageJobStatus()
+            val items = settings.archiveStorageItems()
+            val maintenance = settings.dbMaintenanceStatus()
+            val json = buildArchiveStorageStateJson(
+                job,
+                items,
+                settings.archiveStorageAuditOperationId(),
+                maintenance
+            )
+            output.writeText(json.toString() + "\n", Charsets.UTF_8)
+            "ok items=${items.size}"
+        }.getOrElse { error ->
+            runCatching {
+                File(runDir, "archive_storage_state_status.txt").writeText(
+                    "status=error\nerror=${error::class.java.simpleName}: ${diagnosticSafeText(error.message)}\n",
+                    Charsets.UTF_8
+                )
+            }
+            "error type=${error::class.java.simpleName}"
+        }
+    }
+
+    private fun writeJournalTimeBounds(snapshotDir: File): String {
+        return runCatching {
+            val operational = diagnosticJournalTimeBounds(File(snapshotDir, "operational_journal"))
+            val maintenance = diagnosticJournalTimeBounds(File(snapshotDir, "maintenance_journal"))
+            val partial = listOf(operational, maintenance).any {
+                it.invalidRecords > 0 || it.failedFiles > 0
+            }
+            val present = operational.records > 0 || maintenance.records > 0
+            val status = when {
+                partial -> "partial"
+                present -> "ok"
+                else -> "empty"
+            }
+            File(snapshotDir, "journal_time_bounds.txt").writeText(
+                buildString {
+                    appendLine("status=$status")
+                    appendJournalBounds("operational", operational)
+                    appendJournalBounds("maintenance", maintenance)
+                },
+                Charsets.UTF_8
+            )
+            status
+        }.getOrElse { "error=${it.javaClass.simpleName}" }
+    }
+
+    private fun StringBuilder.appendJournalBounds(name: String, bounds: DiagnosticJournalTimeBounds) {
+        appendLine("${name}_first_timestamp=${bounds.firstTimestamp ?: "none"}")
+        appendLine("${name}_last_timestamp=${bounds.lastTimestamp ?: "none"}")
+        appendLine("${name}_records=${bounds.records}")
+        appendLine("${name}_invalid_records=${bounds.invalidRecords}")
+        appendLine("${name}_failed_files=${bounds.failedFiles}")
     }
 
     private fun writeLogcatSnapshot(root: File, runDir: File): String {
@@ -915,6 +1040,207 @@ internal fun diagnosticLogcatSourceBytes(root: File, activeRunDir: File? = null)
     return source?.listFiles().orEmpty()
         .filter { it.isFile && it.name.startsWith("logcat_") }
         .sumOf(File::length)
+}
+
+internal fun diagnosticShareSourceBytes(
+    logcatBytes: Long,
+    operationalJournalBytes: Long,
+    maintenanceJournalBytes: Long
+): Long {
+    require(logcatBytes >= 0L && operationalJournalBytes >= 0L && maintenanceJournalBytes >= 0L)
+    return Math.addExact(Math.addExact(logcatBytes, operationalJournalBytes), maintenanceJournalBytes)
+}
+
+internal fun awaitOperationalEventBarrier(executor: Executor, timeoutMs: Long): String {
+    require(timeoutMs >= 0L)
+    val barrier = FutureTask<Unit>(Callable { Unit })
+    return try {
+        executor.execute(barrier)
+        barrier.get(timeoutMs, TimeUnit.MILLISECONDS)
+        "ok"
+    } catch (_: TimeoutException) {
+        barrier.cancel(false)
+        "timeout"
+    } catch (_: InterruptedException) {
+        barrier.cancel(false)
+        Thread.currentThread().interrupt()
+        "interrupted"
+    } catch (error: ExecutionException) {
+        "failed=${error.cause?.javaClass?.simpleName ?: error.javaClass.simpleName}"
+    } catch (error: RuntimeException) {
+        "rejected=${error.javaClass.simpleName}"
+    }
+}
+
+internal data class DiagnosticJournalClearResult(val removed: Int, val warnings: List<String>)
+
+internal fun clearDiagnosticJournalHistory(
+    clearOperational: () -> Int,
+    clearMaintenance: () -> Int
+): DiagnosticJournalClearResult {
+    var removed = 0
+    val warnings = mutableListOf<String>()
+    listOf(
+        "operational_journal" to clearOperational,
+        "maintenance_journal" to clearMaintenance
+    ).forEach { (name, clear) ->
+        runCatching(clear).onSuccess { removed += it }.onFailure { error ->
+            warnings += "$name=${error.javaClass.simpleName}: ${diagnosticSafeText(error.message)}"
+        }
+    }
+    return DiagnosticJournalClearResult(removed, warnings)
+}
+
+internal data class DiagnosticJournalClearExecutionResult(
+    val result: DiagnosticJournalClearResult? = null,
+    val warning: String? = null
+)
+
+internal fun clearDiagnosticJournalsOnExecutor(
+    executor: Executor,
+    timeoutMs: Long,
+    clearOperational: () -> Int,
+    clearMaintenance: () -> Int
+): DiagnosticJournalClearExecutionResult {
+    require(timeoutMs >= 0L)
+    val phase = AtomicInteger(CLEAR_QUEUED)
+    val task = FutureTask(Callable {
+        if (phase.compareAndSet(CLEAR_QUEUED, CLEAR_STARTED)) {
+            clearDiagnosticJournalHistory(clearOperational, clearMaintenance)
+        } else {
+            DiagnosticJournalClearResult(0, emptyList())
+        }
+    })
+    return try {
+        executor.execute(task)
+        DiagnosticJournalClearExecutionResult(result = task.get(timeoutMs, TimeUnit.MILLISECONDS))
+    } catch (_: TimeoutException) {
+        val cancelledBeforeStart = phase.compareAndSet(CLEAR_QUEUED, CLEAR_CANCELLED)
+        task.cancel(false)
+        DiagnosticJournalClearExecutionResult(
+            warning = if (cancelledBeforeStart) {
+                "timeout started=false outcome=cancelled_before_start"
+            } else "timeout started=true outcome=unknown"
+        )
+    } catch (_: InterruptedException) {
+        val cancelledBeforeStart = phase.compareAndSet(CLEAR_QUEUED, CLEAR_CANCELLED)
+        task.cancel(false)
+        Thread.currentThread().interrupt()
+        DiagnosticJournalClearExecutionResult(
+            warning = if (cancelledBeforeStart) {
+                "interrupted started=false outcome=cancelled_before_start"
+            } else "interrupted started=true outcome=unknown"
+        )
+    } catch (error: ExecutionException) {
+        val cause = error.cause ?: error
+        DiagnosticJournalClearExecutionResult(warning = "failed=${cause.javaClass.simpleName}")
+    } catch (error: RuntimeException) {
+        DiagnosticJournalClearExecutionResult(warning = "rejected=${error.javaClass.simpleName}")
+    }
+}
+
+private const val CLEAR_QUEUED = 0
+private const val CLEAR_STARTED = 1
+private const val CLEAR_CANCELLED = 2
+
+internal fun buildArchiveStorageStateJson(
+    job: ArchiveStorageJobStatus,
+    items: List<ArchiveStorageItemState>,
+    pendingAuditOperationId: String?,
+    maintenance: DbMaintenanceRuntimeStatus
+): JSONObject = JSONObject()
+    .put("pending_audit_operation_id", pendingAuditOperationId ?: JSONObject.NULL)
+    .put("archive_job", JSONObject()
+        .put("mode", job.mode?.name ?: "none")
+        .put("running", job.running)
+        .put("step_index", job.stepIndex)
+        .put("step_count", job.stepCount)
+        .put("message_uk", job.messageUk)
+        .put("message_en", job.messageEn)
+        .put("item_id", job.itemId ?: JSONObject.NULL)
+        .put("operation_id", job.operationId ?: JSONObject.NULL)
+        .put("phase", job.phase?.name ?: "none")
+        .put("error", job.error ?: JSONObject.NULL)
+        .put("updated_at_ms", job.updatedAtMs))
+    .put("archive_items", JSONArray().apply {
+        items.sortedBy { it.archiveId }.forEach { item ->
+            put(JSONObject()
+                .put("archive_id", item.archiveId)
+                .put("operation_id", item.operationId)
+                .put("phase", item.phase.name)
+                .put("step_index", item.stepIndex)
+                .put("step_count", item.stepCount)
+                .put("started_at_ms", item.startedAtMs)
+                .put("updated_at_ms", item.updatedAtMs)
+                .put("completed_at_ms", item.completedAtMs ?: JSONObject.NULL)
+                .put("error", item.error ?: JSONObject.NULL))
+        }
+    })
+    .put("database_maintenance", JSONObject()
+        .put("operation", maintenance.operation?.key ?: "none")
+        .put("running", maintenance.running)
+        .put("completed", maintenance.completed)
+        .put("step_index", maintenance.stepIndex)
+        .put("step_count", maintenance.stepCount)
+        .put("message_uk", maintenance.messageUk)
+        .put("message_en", maintenance.messageEn)
+        .put("error", maintenance.error ?: JSONObject.NULL)
+        .put("warning", maintenance.warning ?: JSONObject.NULL)
+        .put("archive_basename", maintenance.archivePath?.let { File(it).name } ?: JSONObject.NULL)
+        .put("started_at_ms", maintenance.startedAtMs)
+        .put("updated_at_ms", maintenance.updatedAtMs)
+        .put("cancel_available", maintenance.cancelAvailable))
+
+internal data class DiagnosticJournalTimeBounds(
+    val firstTimestamp: String?,
+    val lastTimestamp: String?,
+    val records: Int,
+    val invalidRecords: Int,
+    val failedFiles: Int
+)
+
+internal fun diagnosticJournalTimeBounds(directory: File): DiagnosticJournalTimeBounds {
+    var first: Instant? = null
+    var last: Instant? = null
+    var records = 0
+    var invalid = 0
+    var failedFiles = 0
+    if (!directory.isDirectory) {
+        if (directory.exists()) failedFiles += 1
+    } else {
+        val files = directory.listFiles()
+        if (files == null) failedFiles += 1
+        else files.filter { it.isFile && it.name.endsWith(".jsonl") }.forEach { file ->
+            try {
+                forEachDiagnosticRecord(file) { raw ->
+                    val line = raw?.let {
+                        runCatching {
+                            StandardCharsets.UTF_8.newDecoder()
+                                .onMalformedInput(CodingErrorAction.REPORT)
+                                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                                .decode(ByteBuffer.wrap(it))
+                                .toString()
+                                .removeSuffix("\r")
+                        }.getOrNull()
+                    }
+                    val timestamp = line?.let {
+                        runCatching { JSONObject(it).optString("timestamp").takeIf(String::isNotBlank) }.getOrNull()
+                    }
+                    val instant = timestamp?.let { runCatching { Instant.parse(it) }.getOrNull() }
+                    if (instant == null) {
+                        invalid += 1
+                    } else {
+                        if (first?.let { instant < it } != false) first = instant
+                        if (last?.let { instant > it } != false) last = instant
+                        records += 1
+                    }
+                }
+            } catch (_: Exception) {
+                failedFiles += 1
+            }
+        }
+    }
+    return DiagnosticJournalTimeBounds(first?.toString(), last?.toString(), records, invalid, failedFiles)
 }
 
 internal fun hasDiagnosticShareSpace(usableBytes: Long, sourceBytes: Long, headroomBytes: Long): Boolean {

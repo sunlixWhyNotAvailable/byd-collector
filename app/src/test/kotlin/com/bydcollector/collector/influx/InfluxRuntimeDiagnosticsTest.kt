@@ -32,7 +32,7 @@ class InfluxRuntimeDiagnosticsTest {
     @Test
     fun snapshotExposesMetadataAndGateTransitionsAreCoalesced() {
         val events = mutableListOf<InfluxDiagnosticEvent>()
-        val diagnostics = InfluxRuntimeDiagnosticsState { events += it }
+        val diagnostics = InfluxRuntimeDiagnosticsState(eventSink = { events += it })
         diagnostics.updateState(
             running = true,
             generation = 7,
@@ -96,5 +96,127 @@ class InfluxRuntimeDiagnosticsTest {
         assertTrue(snapshot.contains("influx_runtime_work_generation=8"))
         assertTrue(snapshot.contains("influx_runtime_frozen=true"))
         assertTrue(snapshot.contains("influx_runtime_actual_route=primary"))
+    }
+
+    @Test
+    fun routineEventsStayInMemoryAndSuccessfulWorkIsSummarizedAtSixtySecondsOrFlush() {
+        val seen = mutableListOf<InfluxDiagnosticEvent>()
+        val journal = mutableListOf<InfluxDiagnosticEvent>()
+        var elapsedMs = 1_000L
+        val diagnostics = InfluxRuntimeDiagnosticsState(
+            eventSink = { seen += it },
+            elapsedRealtimeMs = { elapsedMs },
+            journalSink = { journal += it }
+        )
+
+        diagnostics.record(InfluxDiagnosticEvent("influx_work_queued"))
+        diagnostics.record(InfluxDiagnosticEvent("influx_request_started", mapOf(
+            "request_id" to "first", "mode" to "export", "source" to "frozen_export",
+            "host" to "influx.local", "port" to "8086", "profile" to "primary", "batch_rows" to "3"
+        )))
+        diagnostics.record(InfluxDiagnosticEvent("influx_request_result", mapOf(
+            "request_id" to "first", "mode" to "export", "result" to "ok",
+            "duration_ms" to "40", "profile" to "primary"
+        )))
+        diagnostics.record(InfluxDiagnosticEvent("influx_cursor_persistence_end", mapOf(
+            "request_id" to "first", "cursor_rows" to "3", "cursor_fields" to "2"
+        )))
+
+        elapsedMs = 61_000L
+        diagnostics.record(InfluxDiagnosticEvent("influx_cycle_gate", mapOf("reason" to "no_work")))
+
+        val intervalSummary = journal.single { it.type == "influx_success_summary" }
+        assertEquals("interval", intervalSummary.details["reason"])
+        assertEquals("1", intervalSummary.details["successful_http_requests"])
+        assertEquals("3", intervalSummary.details["confirmed_rows"])
+        assertEquals("40", intervalSummary.details["request_duration_total_ms"])
+        assertTrue(journal.none { it.type == "influx_work_queued" || it.type == "influx_cycle_gate" })
+        assertEquals("false", intervalSummary.details["running"])
+        assertEquals("false", intervalSummary.details["queued"])
+        assertTrue(seen.any { it.type == "influx_work_queued" })
+        assertTrue(seen.any { it.type == "influx_cycle_gate" })
+
+        diagnostics.record(InfluxDiagnosticEvent("influx_request_started", mapOf(
+            "request_id" to "second", "mode" to "export", "source" to "frozen_export",
+            "host" to "influx.local", "port" to "8086", "profile" to "alternative", "batch_rows" to "2"
+        )))
+        diagnostics.record(InfluxDiagnosticEvent("influx_request_result", mapOf(
+            "request_id" to "second", "mode" to "export", "result" to "ok",
+            "duration_ms" to "25", "profile" to "alternative"
+        )))
+        diagnostics.record(InfluxDiagnosticEvent("influx_cursor_persistence_end", mapOf(
+            "request_id" to "second", "cursor_rows" to "2"
+        )))
+        diagnostics.flushSummary("share")
+
+        val shareSummary = journal.last { it.type == "influx_success_summary" }
+        assertEquals("share", shareSummary.details["reason"])
+        assertEquals("2", shareSummary.details["confirmed_rows"])
+        assertEquals("alternative", shareSummary.details["route"])
+    }
+
+    @Test
+    fun failuresCaptureBoundedRequestContextAndTheNextCompleteCursorRecordsRecovery() {
+        val journal = mutableListOf<InfluxDiagnosticEvent>()
+        var elapsedMs = 10L
+        val diagnostics = InfluxRuntimeDiagnosticsState(
+            elapsedRealtimeMs = { elapsedMs },
+            journalSink = { journal += it }
+        )
+        diagnostics.record(InfluxDiagnosticEvent("influx_runtime_state", mapOf(
+            "runtime_id" to "runtime-a", "reason" to "service_started", "generation" to "0",
+            "running" to "true", "actual_route" to "PRIMARY"
+        )))
+        (1..5).forEach { index ->
+            diagnostics.record(InfluxDiagnosticEvent("influx_request_started", mapOf(
+                "request_id" to "bounded-$index", "mode" to "export", "source" to "frozen_export",
+                "host" to "influx.local", "port" to "8086", "profile" to "primary", "batch_rows" to "1"
+            )))
+        }
+        assertTrue(diagnostics.snapshotLines().any { it == "influx_runtime_active_request_count=4" })
+
+        diagnostics.record(InfluxDiagnosticEvent("influx_request_result", mapOf(
+            "request_id" to "bounded-5", "mode" to "export", "result" to "ok",
+            "duration_ms" to "17", "profile" to "primary"
+        )))
+        elapsedMs += 20L
+        diagnostics.record(InfluxDiagnosticEvent("influx_cursor_persistence_failure", mapOf(
+            "request_id" to "bounded-5", "failed_field" to "vehicle.speed", "completed_fields" to "1",
+            "error_class" to "IllegalStateException"
+        )))
+
+        val failure = journal.single { it.type == "influx_cursor_persistence_failure" }
+        assertEquals("export", failure.details["mode"])
+        assertEquals("influx.local", failure.details["host"])
+        assertEquals("primary", failure.details["profile"])
+        assertEquals("0", failure.details["runtime_generation"])
+        assertTrue(journal.any { it.type == "influx_problem_started" })
+        assertEquals("error", journal.last { it.type == "influx_success_summary" }.details["reason"])
+
+        elapsedMs += 20L
+        diagnostics.record(InfluxDiagnosticEvent("influx_cursor_persistence_end", mapOf(
+            "request_id" to "later", "cursor_rows" to "4"
+        )))
+        assertTrue(journal.any { it.type == "influx_problem_recovered" })
+    }
+
+    @Test
+    fun durableGateReasonsAreDeduplicatedAcrossRoutineEventsUntilSuccess() {
+        val journal = mutableListOf<InfluxDiagnosticEvent>()
+        val diagnostics = InfluxRuntimeDiagnosticsState(journalSink = { journal += it })
+
+        diagnostics.gate("backoff")
+        diagnostics.record(InfluxDiagnosticEvent("influx_work_queued"))
+        diagnostics.gate("backoff")
+        diagnostics.gate("disabled")
+
+        assertEquals(listOf("backoff", "disabled"), journal.filter { it.type == "influx_cycle_gate" }
+            .map { it.details["reason"] })
+
+        diagnostics.record(InfluxDiagnosticEvent("influx_request_result", mapOf(
+            "mode" to "export", "result" to "ok", "duration_ms" to "10"
+        )))
+        diagnostics.gate("backoff")
+        assertEquals(2, journal.count { it.type == "influx_cycle_gate" && it.details["reason"] == "backoff" })
     }
 }

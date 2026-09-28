@@ -715,6 +715,17 @@ class TelemetryStore(
         } catch (error: Exception) {
             Log.w(TAG, "operational journal write failed: $logLine", error)
         }
+        if (OperationalEventJournal.isMaintenanceEvent(category, message)) {
+            val elapsed = clock.elapsedRealtimeMs()
+            dispatchOperationalEvent(sharedOperationalEventExecutor) {
+                try {
+                    (context.applicationContext as? com.bydcollector.collector.BydCollectorApplication)
+                        ?.maintenanceEventJournal?.append(timestamp, elapsed, category, message, detail)
+                } catch (error: Exception) {
+                    Log.w(TAG, "maintenance journal write failed: $logLine", error)
+                }
+            }
+        }
         dispatchOperationalEvent(sharedOperationalEventExecutor) {
             synchronized(this) {
                 // Closing/archive and an already queued diagnostic must not reopen the old file.

@@ -51,13 +51,21 @@ class DatabaseMaintenanceService : Service() {
         }
         val operation = DbMaintenanceOperation.fromKey(intent?.getStringExtra(EXTRA_OPERATION))
             ?: return START_NOT_STICKY.also { stopSelf(startId) }
-        if (!running.compareAndSet(false, true)) return START_NOT_STICKY
+        if (!running.compareAndSet(false, true)) {
+            (applicationContext as BydCollectorApplication).recordMaintenanceEvent(
+                "database_maintenance_rejected", "operation=${operation.key} reason=recovery_service_busy"
+            )
+            return START_NOT_STICKY
+        }
 
         startForeground(NOTIFICATION_ID, buildNotification())
         acquireWakeLock()
         try {
             executor.execute { runMaintenance(operation) }
         } catch (error: RejectedExecutionException) {
+            (applicationContext as BydCollectorApplication).recordMaintenanceEvent(
+                "database_maintenance_rejected", "operation=${operation.key} reason=executor_rejected error=${error.message}"
+            )
             settings.setDbMaintenanceStatus(
                 settings.dbMaintenanceStatus().copy(
                     running = false,

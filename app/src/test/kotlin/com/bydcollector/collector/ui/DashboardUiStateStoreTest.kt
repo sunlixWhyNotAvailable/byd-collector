@@ -169,6 +169,26 @@ class DashboardUiStateStoreTest {
     }
 
     @Test
+    fun archiveInvalidationSurvivesAnOlderInFlightLoadUntilFreshStorageLoad() {
+        var now = 100L
+        val store = DashboardUiStateStore { now }
+        store.seed(dashboardState("raw archive"))
+        val staleLoad = store.beginTabRefresh(AppTab.STORAGE)
+
+        store.markTabStale(AppTab.STORAGE)
+        assertFalse(store.publishTab(AppTab.STORAGE, staleLoad, dashboardState("old scan")))
+        assertFalse(store.failTab(AppTab.STORAGE, staleLoad, "old failure"))
+        assertEquals(0L, store.tabState(AppTab.STORAGE).value?.loadedAtElapsedMs)
+        assertEquals("raw archive", store.currentTab(AppTab.STORAGE)?.databasePath)
+
+        now = 200L
+        val freshLoad = store.beginTabRefresh(AppTab.STORAGE)
+        assertTrue(store.publishTab(AppTab.STORAGE, freshLoad, dashboardState("ready zip")))
+        assertEquals(200L, store.tabState(AppTab.STORAGE).value?.loadedAtElapsedMs)
+        assertEquals("ready zip", store.currentTab(AppTab.STORAGE)?.databasePath)
+    }
+
+    @Test
     fun producerOwnedValuesSurviveAStaleTabRefresh() {
         val store = DashboardUiStateStore { 1L }
         store.seed(dashboardState("initial"))

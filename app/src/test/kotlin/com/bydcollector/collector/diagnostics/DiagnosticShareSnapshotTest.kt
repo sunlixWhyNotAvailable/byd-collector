@@ -2,7 +2,16 @@ package com.bydcollector.collector.diagnostics
 
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.zip.ZipInputStream
+import com.bydcollector.collector.maintenance.ArchiveStorageItemPhase
+import com.bydcollector.collector.maintenance.ArchiveStorageItemState
+import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
+import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
+import com.bydcollector.collector.maintenance.DbMaintenanceOperation
+import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
 import org.json.JSONObject
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
@@ -10,6 +19,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
+import kotlin.test.assertNull
 
 class DiagnosticShareSnapshotTest {
     @Test
@@ -135,4 +145,217 @@ class DiagnosticShareSnapshotTest {
             root.deleteRecursively()
         }
     }
+
+    @Test
+    fun timeBoundsUseActualStreamingJournalTimestampsAcrossRotations() {
+        val root = Files.createTempDirectory("collector-share-time-bounds").toFile()
+        try {
+            val operational = File(root, "operational_journal").apply { mkdirs() }
+            val maintenance = File(root, "maintenance_journal").apply { mkdirs() }
+            File(operational, "operational_events.1.jsonl").apply {
+                writeText(eventAt("2026-09-28T10:00:00Z") + "\n")
+                setLastModified(1L)
+            }
+            File(operational, "operational_events.jsonl").apply {
+                writeText(
+                    eventAt("2026-09-28T12:00:00Z") + "\n" +
+                        "{broken}\n" + eventAt("2026-09-28T11:00:00Z") + "\n"
+                )
+                setLastModified(Long.MAX_VALUE)
+            }
+            File(maintenance, "operational_events.jsonl").writeText(eventAt("2026-09-28T09:30:00Z") + "\n")
+
+            val operationalBounds = diagnosticJournalTimeBounds(operational)
+            val maintenanceBounds = diagnosticJournalTimeBounds(maintenance)
+
+            assertEquals("2026-09-28T10:00:00Z", operationalBounds.firstTimestamp)
+            assertEquals("2026-09-28T12:00:00Z", operationalBounds.lastTimestamp)
+            assertEquals(3, operationalBounds.records)
+            assertEquals(1, operationalBounds.invalidRecords)
+            assertEquals(0, operationalBounds.failedFiles)
+            assertEquals("2026-09-28T09:30:00Z", maintenanceBounds.firstTimestamp)
+            assertEquals("2026-09-28T09:30:00Z", maintenanceBounds.lastTimestamp)
+            assertEquals(1, maintenanceBounds.records)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun journalTimeBoundsSkipOversizedAndInvalidUtf8RecordsButKeepValidRows() {
+        val root = Files.createTempDirectory("collector-share-time-bounds-limits").toFile()
+        try {
+            val journal = File(root, "operational_journal").apply { mkdirs() }
+            File(journal, "operational_events.jsonl").writeBytes(
+                ("{\"timestamp\":\"2026-09-28T10:00:00Z\",\"detail\":\"" +
+                    "x".repeat(256 * 1024) + "\"}\n").toByteArray() +
+                    byteArrayOf(0xC3.toByte(), 0x0A) +
+                    (eventAt("2026-09-28T11:00:00Z") + "\n").toByteArray()
+            )
+
+            val bounds = diagnosticJournalTimeBounds(journal)
+
+            assertEquals("2026-09-28T11:00:00Z", bounds.firstTimestamp)
+            assertEquals("2026-09-28T11:00:00Z", bounds.lastTimestamp)
+            assertEquals(1, bounds.records)
+            assertEquals(2, bounds.invalidRecords)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun sharePreflightSourceSizeIncludesBothJournalRings() {
+        assertEquals(1_500L, diagnosticShareSourceBytes(1_000L, 300L, 200L))
+        assertTrue(hasDiagnosticShareSpace(1_500L * 4L + 64L, 1_500L, 64L))
+        assertFailsWith<ArithmeticException> {
+            diagnosticShareSourceBytes(Long.MAX_VALUE, 1L, 0L)
+        }
+    }
+
+    @Test
+    fun eventBarrierWaitsForEarlierWorkAndReportsTimeoutOrRejection() {
+        val executor = Executors.newSingleThreadExecutor()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        try {
+            executor.execute {
+                entered.countDown()
+                release.await()
+            }
+            assertTrue(entered.await(1, TimeUnit.SECONDS))
+            assertEquals("timeout", awaitOperationalEventBarrier(executor, 25L))
+            release.countDown()
+            assertEquals("ok", awaitOperationalEventBarrier(executor, 1_000L))
+            assertTrue(awaitOperationalEventBarrier({ throw java.util.concurrent.RejectedExecutionException() }, 1_000L)
+                .startsWith("rejected="))
+        } finally {
+            release.countDown()
+            executor.shutdownNow()
+            executor.awaitTermination(1, TimeUnit.SECONDS)
+        }
+    }
+
+    @Test
+    fun journalClearAttemptsBothRingsAndPreservesPerRingFailure() {
+        val result = clearDiagnosticJournalHistory(
+            clearOperational = { throw IllegalStateException("operational failed") },
+            clearMaintenance = { 2 }
+        )
+
+        assertEquals(2, result.removed)
+        assertEquals(1, result.warnings.size)
+        assertTrue(result.warnings.single().startsWith("operational_journal=IllegalStateException"))
+    }
+
+    @Test
+    fun timedOutQueuedClearIsCancelledBeforeItCanEraseLaterEvidence() {
+        val executor = Executors.newSingleThreadExecutor()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val clearCalled = java.util.concurrent.atomic.AtomicBoolean(false)
+        try {
+            executor.execute {
+                entered.countDown()
+                release.await()
+            }
+            assertTrue(entered.await(1, TimeUnit.SECONDS))
+
+            val execution = clearDiagnosticJournalsOnExecutor(
+                executor = executor,
+                timeoutMs = 25L,
+                clearOperational = { clearCalled.set(true); 1 },
+                clearMaintenance = { 1 }
+            )
+
+            assertNull(execution.result)
+            assertEquals("timeout started=false outcome=cancelled_before_start", execution.warning)
+            release.countDown()
+            assertEquals("ok", awaitOperationalEventBarrier(executor, 1_000L))
+            assertFalse(clearCalled.get())
+        } finally {
+            release.countDown()
+            executor.shutdownNow()
+            executor.awaitTermination(1, TimeUnit.SECONDS)
+        }
+    }
+
+    @Test
+    fun timedOutRunningClearReportsUnknownOutcomeWithoutRemovedCount() {
+        val executor = Executors.newSingleThreadExecutor()
+        val clearStarted = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val maintenanceAttempted = CountDownLatch(1)
+        try {
+            val execution = clearDiagnosticJournalsOnExecutor(
+                executor = executor,
+                timeoutMs = 25L,
+                clearOperational = {
+                    clearStarted.countDown()
+                    release.await()
+                    1
+                },
+                clearMaintenance = { maintenanceAttempted.countDown(); 1 }
+            )
+
+            assertTrue(clearStarted.await(1, TimeUnit.SECONDS))
+            assertNull(execution.result)
+            assertEquals("timeout started=true outcome=unknown", execution.warning)
+            release.countDown()
+            assertTrue(maintenanceAttempted.await(1, TimeUnit.SECONDS))
+            assertEquals("ok", awaitOperationalEventBarrier(executor, 1_000L))
+        } finally {
+            release.countDown()
+            executor.shutdownNow()
+            executor.awaitTermination(1, TimeUnit.SECONDS)
+        }
+    }
+
+    @Test
+    fun archiveStateSnapshotKeepsPerItemOutcomeAndOmitsFullMaintenancePath() {
+        val state = ArchiveStorageItemState(
+            archiveId = "main_20260928_120000",
+            operationId = "owner-1",
+            phase = ArchiveStorageItemPhase.FAILED,
+            stepIndex = 4,
+            stepCount = 5,
+            startedAtMs = 10L,
+            updatedAtMs = 20L,
+            completedAtMs = 20L,
+            error = "CRC verification failed"
+        )
+        val json = buildArchiveStorageStateJson(
+            job = ArchiveStorageJobStatus(
+                mode = ArchiveStorageJobMode.COMPRESS,
+                running = true,
+                operationId = "owner-1",
+                phase = ArchiveStorageItemPhase.VERIFYING_ZIP,
+                updatedAtMs = 19L
+            ),
+            items = listOf(state),
+            pendingAuditOperationId = "audit-2",
+            maintenance = DbMaintenanceRuntimeStatus(
+                operation = DbMaintenanceOperation.ARCHIVE,
+                running = true,
+                stepIndex = 3,
+                stepCount = 7,
+                archivePath = "/private/vehicle/archive.db",
+                startedAtMs = 5L,
+                updatedAtMs = 20L
+            )
+        )
+
+        assertEquals("audit-2", json.getString("pending_audit_operation_id"))
+        assertEquals("VERIFYING_ZIP", json.getJSONObject("archive_job").getString("phase"))
+        val savedItem = json.getJSONArray("archive_items").getJSONObject(0)
+        assertEquals("main_20260928_120000", savedItem.getString("archive_id"))
+        assertEquals("FAILED", savedItem.getString("phase"))
+        assertEquals(10L, savedItem.getLong("started_at_ms"))
+        assertEquals("CRC verification failed", savedItem.getString("error"))
+        assertEquals("archive.db", json.getJSONObject("database_maintenance").getString("archive_basename"))
+        assertFalse(json.toString().contains("/private/vehicle"))
+    }
+
+    private fun eventAt(timestamp: String): String =
+        JSONObject().put("timestamp", timestamp).put("message", "test").toString()
 }

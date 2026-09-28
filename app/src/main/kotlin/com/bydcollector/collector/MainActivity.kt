@@ -1509,7 +1509,7 @@ class MainActivity : ComponentActivity() {
             tab = tab,
             storageRefreshPending = tabSnapshot?.state?.let { state ->
                 state.archiveStorageJobStatus.running || state.archiveStorageScanPending
-            } == true || actionUiState.archiveDeleteDispatch
+            } == true || tabSnapshot?.loadedAtElapsedMs == 0L || actionUiState.archiveDeleteDispatch
         )
         val tabDue = profile != null && (
             force || dashboardSnapshotDue(tabSnapshot?.loadedAtElapsedMs, tabIntervalMs, nowMs)

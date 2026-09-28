@@ -134,7 +134,8 @@ class DashboardStateProvider(
             archiveStorageCache.invalidate()
             archiveStorageJobActive = archiveJobActiveNow
         }
-        val archiveDetailsLoaded = profile.readsArchiveDetails && !archiveJobActiveNow
+        // The first Storage visit must warm the physical archive list even during ZIP work.
+        val archiveDetailsLoaded = profile.readsArchiveDetails
         val archiveStorageResult = archiveStorageCache.snapshot(
             limitBytes = archiveStorageLimitGb * 1024L * 1024L * 1024L,
             includeDetails = archiveDetailsLoaded
@@ -207,8 +208,15 @@ class DashboardStateProvider(
             dbMaintenanceStatus = maintenanceStatus,
             archiveStorageLimitGb = archiveStorageLimitGb,
             archiveStorageSnapshot = archiveStorageResult.snapshot,
-            archiveStorageScanPending = archiveStorageResult.pending,
+            // INITIAL does not list archives: an empty seed is not a completed empty scan.
+            archiveStorageScanPending = profile == DashboardLoadProfile.INITIAL || archiveStorageResult.pending,
             archiveStorageJobStatus = archiveStorageJobStatus,
+            archiveStorageItemStates = if (archiveDetailsLoaded) settings.archiveStorageItems() else emptyList(),
+            archiveStorageScanError = if (archiveDetailsLoaded) {
+                archiveStorageResult.error?.let { error ->
+                    error.message?.take(160)?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName
+                }
+            } else null,
             latestSoc = health.latestSoc,
             latestSpeed = health.latestSpeed,
             latestCharging = health.latestCharging,
@@ -312,6 +320,7 @@ class DashboardStateProvider(
 
     fun invalidateArchiveStorageSnapshot() {
         archiveStorageCache.invalidate()
+        BydCollectorApplication.dashboardUiStateStore(context).markTabStale(com.bydcollector.collector.ui.compose.AppTab.STORAGE)
     }
 
     fun completeArchiveStorageDeletion() {

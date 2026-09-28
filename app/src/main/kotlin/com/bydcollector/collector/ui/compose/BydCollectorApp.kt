@@ -42,6 +42,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -86,7 +87,8 @@ import com.bydcollector.collector.R
 import com.bydcollector.collector.ha.HaEndpointProfile
 import com.bydcollector.collector.maintenance.ArchiveEntryStatus
 import com.bydcollector.collector.maintenance.ArchiveStorageSnapshot
-import com.bydcollector.collector.maintenance.ArchiveStorageEntry
+import com.bydcollector.collector.maintenance.ArchiveStorageItemState
+import com.bydcollector.collector.maintenance.ArchiveStorageItemPhase
 import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
 import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
@@ -100,6 +102,8 @@ import com.bydcollector.collector.telegram.TelegramPayloadLimitState
 import com.bydcollector.collector.telegram.TelegramTemplateErrorKind
 import com.bydcollector.collector.telegram.TelegramTemplateRenderer
 import com.bydcollector.collector.ui.DashboardState
+import com.bydcollector.collector.ui.ArchiveStorageRow
+import com.bydcollector.collector.ui.projectArchiveStorageRows
 import com.bydcollector.collector.ui.DebugRuntimeStatus
 import com.bydcollector.collector.ui.RuntimeActionStatus
 import com.bydcollector.collector.ui.VehicleKpis
@@ -259,7 +263,7 @@ fun BydCollectorApp(
                 if (pendingArchiveDeleteIds.isNotEmpty()) {
                     ArchiveDeleteDialog(
                         strings = s,
-                        count = pendingArchiveDeleteIds.size,
+                        count = pendingArchiveDeleteIds.map { it.removeSuffix(".zip") }.distinct().size,
                         onConfirm = {
                             val ids = pendingArchiveDeleteIds
                             pendingArchiveDeleteIds = emptyList()
@@ -3219,25 +3223,29 @@ private fun StorageTab(
     contentReady: Boolean
 ) {
     val snapshot = state?.archiveStorageSnapshot
-    val entries = snapshot?.entries.orEmpty()
-    val listKey = entries.joinToString("|") { it.id }
-    var selectedIds by remember(listKey, actionUiState.archiveShareHandoffGeneration) {
+    val entries = snapshot?.let {
+        projectArchiveStorageRows(it, state?.archiveStorageItemStates.orEmpty(), state?.archiveStorageScanPending == true)
+    }.orEmpty()
+    val listKey = entries.map { it.key }.sorted()
+    var selectedIds by remember(actionUiState.archiveShareHandoffGeneration) {
         mutableStateOf(emptySet<String>())
     }
+    LaunchedEffect(listKey) { selectedIds = selectedIds.intersect(listKey.toSet()) }
     val limitGb = state?.archiveStorageLimitGb ?: 2
     var draftLimitGb by remember(limitGb) { mutableStateOf(limitGb) }
     var newestFirst by remember { mutableStateOf(true) }
     val sortedEntries = if (newestFirst) {
-        entries.sortedWith(compareByDescending<ArchiveStorageEntry> { it.createdAtMs }.thenBy { it.id })
+        entries.sortedWith(compareByDescending<ArchiveStorageRow> { it.sortTimestampMs }.thenBy { it.key })
     } else {
-        entries.sortedWith(compareBy<ArchiveStorageEntry> { it.createdAtMs }.thenBy { it.id })
+        entries.sortedWith(compareBy<ArchiveStorageRow> { it.sortTimestampMs }.thenBy { it.key })
     }
     val job = state?.archiveStorageJobStatus
-    val selectedArchiveIds = sortedEntries.filter { selectedIds.contains(it.id) }.map { it.id }
-    val selectedEntries = entries.filter { selectedIds.contains(it.id) }
+    val selectedEntries = sortedEntries.filter { it.key in selectedIds }
+    val selectedArchiveIds = selectedEntries.mapNotNull { it.shareEntryId }
+    val selectedDeleteIds = selectedEntries.flatMap { it.deleteEntryIds }
     val shareEnabled = selectedIds.isNotEmpty() &&
         selectedEntries.size == selectedIds.size &&
-        selectedEntries.all { it.status == ArchiveEntryStatus.COMPRESSED_ZIP } &&
+        selectedArchiveIds.size == selectedIds.size &&
         job?.running != true &&
         !CollectorService.isArchiveStorageActive()
     val topCardHeight = 156.dp
@@ -3353,34 +3361,42 @@ private fun StorageTab(
                 job?.takeIf { !it.running && it.error != null }?.let {
                     ArchiveStorageInlineStatus(strings, it)
                 }
-                if (entries.isEmpty()) {
+                state?.archiveStorageScanError?.let { error ->
+                    Text(
+                        (if (strings.step == "Крок") "Не вдалося прочитати архіви: " else "Could not read archives: ") + error,
+                        color = LocalBydPalette.current.red, fontSize = 14.sp, lineHeight = 19.sp
+                    )
+                }
+                if (entries.isEmpty() && state?.archiveStorageScanError == null) {
                     Text(
                         if (state?.archiveStorageScanPending == true) strings.archiveStorageScanning else strings.archiveStorageEmpty,
                         color = LocalBydPalette.current.muted,
                         fontSize = 14.sp,
                         fontWeight = FontWeight.SemiBold
                     )
-                } else {
+                } else if (entries.isNotEmpty()) {
                     sortedEntries.forEach { entry ->
-                        ArchiveEntryRow(
-                            entry = entry,
-                            strings = strings,
-                            selected = selectedIds.contains(entry.id),
-                            onToggle = {
-                                selectedIds = if (selectedIds.contains(entry.id)) {
-                                    selectedIds - entry.id
-                                } else {
-                                    selectedIds + entry.id
+                        key(entry.key) {
+                            ArchiveEntryRow(
+                                entry = entry,
+                                strings = strings,
+                                selected = selectedIds.contains(entry.key),
+                                onToggle = {
+                                    selectedIds = if (selectedIds.contains(entry.key)) {
+                                        selectedIds - entry.key
+                                    } else {
+                                        selectedIds + entry.key
+                                    }
                                 }
-                            }
-                        )
+                            )
+                        }
                     }
                     Spacer(Modifier.height(6.dp))
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                         ActionButton(if (actionUiState.archiveDeleteDispatch) strings.loading else strings.deleteSelected,
-                            { onRequestDelete(selectedIds.toList()) },
+                            { onRequestDelete(selectedDeleteIds) },
                             primary = true,
-                            enabled = selectedIds.isNotEmpty() &&
+                            enabled = selectedDeleteIds.isNotEmpty() &&
                                 !actionUiState.archiveDeleteDispatch &&
                                 job?.running != true &&
                                 !CollectorService.isArchiveStorageActive(),
@@ -3422,7 +3438,7 @@ private fun ArchiveStorageInlineStatus(strings: UiStrings, status: ArchiveStorag
 
 @Composable
 private fun ArchiveEntryRow(
-    entry: ArchiveStorageEntry,
+    entry: ArchiveStorageRow,
     strings: UiStrings,
     selected: Boolean,
     onToggle: () -> Unit
@@ -3431,7 +3447,8 @@ private fun ArchiveEntryRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .height(48.dp),
+            .heightIn(min = 48.dp)
+            .padding(vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp)
     ) {
@@ -3440,16 +3457,40 @@ private fun ArchiveEntryRow(
                 .size(32.dp)
                 .background(if (selected) p.active else p.surface, Rounded8)
                 .border(1.dp, if (selected) p.accent else p.borderStrong, Rounded8)
-                .clickable(enabled = entry.deletable, onClick = onToggle),
+                .clickable(enabled = entry.deleteEntryIds.isNotEmpty(), onClick = onToggle),
             contentAlignment = Alignment.Center
         ) {
             if (selected) Text("✓", color = p.text, fontSize = 15.sp, fontWeight = FontWeight.Bold)
         }
-        Column(modifier = Modifier.weight(1f)) {
-            Text(entry.displayName, color = p.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(entry.displayName, color = p.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            entry.itemState?.let { item ->
+                Row(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (item.phase.inProgress && item.phase != ArchiveStorageItemPhase.QUEUED) {
+                        CircularProgressIndicator(modifier = Modifier.size(12.dp), color = p.accent, strokeWidth = 2.dp)
+                    }
+                    Text(
+                        archiveItemProgressLabel(item, strings.step == "Крок"),
+                        color = when (item.phase) {
+                            ArchiveStorageItemPhase.QUEUED -> p.yellow
+                            ArchiveStorageItemPhase.READY -> p.green
+                            ArchiveStorageItemPhase.FAILED -> p.red
+                            else -> p.accent
+                        },
+                        fontSize = 12.sp, lineHeight = 16.sp
+                    )
+                }
+            }
         }
-        Text(UiSizeFormatter.bytes(entry.sizeBytes, strings), color = p.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-        StatusPill(archiveStatusLabel(strings, entry.status), archiveStatusKind(entry.status), compact = true)
+        Text(if (entry.entries.isEmpty()) "—" else UiSizeFormatter.bytes(entry.sizeBytes, strings),
+            color = p.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+        val format = when {
+            entry.entries.any { it.status == ArchiveEntryStatus.TMP } -> ArchiveEntryStatus.TMP
+            entry.entries.any { it.status == ArchiveEntryStatus.RAW_DIRECTORY } -> ArchiveEntryStatus.RAW_DIRECTORY
+            entry.entries.any { it.status == ArchiveEntryStatus.COMPRESSED_ZIP } -> ArchiveEntryStatus.COMPRESSED_ZIP
+            else -> null
+        }
+        format?.let { StatusPill(archiveStatusLabel(strings, it), archiveStatusKind(it), compact = true) }
     }
     Box(Modifier.fillMaxWidth().height(1.dp).background(p.border))
 }
@@ -3526,6 +3567,23 @@ private fun AvailableUpdateNotes(strings: UiStrings, info: UpdateInfo, language:
     )
     Spacer(Modifier.height(12.dp))
     MarkdownPatchNotesText(selectedReleaseNotes)
+}
+
+private fun archiveItemProgressLabel(item: ArchiveStorageItemState, ukrainian: Boolean): String {
+    val phase = when (item.phase) {
+        ArchiveStorageItemPhase.QUEUED -> if (ukrainian) "У черзі" else "Queued"
+        ArchiveStorageItemPhase.VERIFYING_DATABASE -> if (ukrainian) "Перевіряємо базу..." else "Verifying database..."
+        ArchiveStorageItemPhase.CREATING_ZIP -> if (ukrainian) "Створюємо ZIP..." else "Creating ZIP..."
+        ArchiveStorageItemPhase.VERIFYING_ZIP -> if (ukrainian) "Перевіряємо ZIP..." else "Verifying ZIP..."
+        ArchiveStorageItemPhase.FINALIZING -> if (ukrainian) "Завершуємо..." else "Finalizing..."
+        ArchiveStorageItemPhase.READY -> if (ukrainian) "Готовий" else "Ready"
+        ArchiveStorageItemPhase.FAILED -> if (ukrainian) "Помилка архівації" else "Archive failed"
+        ArchiveStorageItemPhase.DELETING -> if (ukrainian) "Видаляємо..." else "Deleting..."
+        ArchiveStorageItemPhase.DELETED -> if (ukrainian) "Видалено" else "Deleted"
+        ArchiveStorageItemPhase.RETENTION -> if (ukrainian) "Очищення за лімітом..." else "Applying retention..."
+    }
+    val step = if (item.stepCount > 0) "${item.stepIndex} / ${item.stepCount} · " else ""
+    return step + phase + item.error?.let { ": $it" }.orEmpty()
 }
 
 @Composable

@@ -137,7 +137,9 @@ internal object DashboardStateProfileMerger {
                     debugDatabaseSizeBytes = next.archiveStorageSnapshot.debugDatabaseSizeBytes,
                     tripsDatabaseSizeBytes = next.archiveStorageSnapshot.tripsDatabaseSizeBytes
                 ),
-                archiveStorageScanPending = previous.archiveStorageScanPending
+                archiveStorageScanPending = previous.archiveStorageScanPending,
+                archiveStorageItemStates = previous.archiveStorageItemStates,
+                archiveStorageScanError = previous.archiveStorageScanError
             )
         }
         return merged

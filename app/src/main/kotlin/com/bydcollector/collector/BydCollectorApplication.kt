@@ -62,15 +62,31 @@ class BydCollectorApplication : Application() {
     // Only file barriers and archive's runtime-stop boundary share this lock, not ongoing collection.
     internal val tripsFileOperationLock = ReentrantLock(true)
     internal val operationalEventJournal by lazy { OperationalEventJournal(applicationContext) }
+    internal val maintenanceEventJournal by lazy {
+        OperationalEventJournal(
+            File(filesDir, OperationalEventJournal.MAINTENANCE_DIR),
+            maxFileBytes = OperationalEventJournal.MAINTENANCE_MAX_FILE_BYTES
+        )
+    }
     private val maintenanceDiagnosticsDelegate = lazy {
         MaintenanceDiagnostics(appendEvent = { event, detail ->
-            operationalEventJournal.tryAppend(
-                Instant.now().toString(), SystemClock.elapsedRealtime(), "database_maintenance", event, detail
-            )
-            Unit
+            recordMaintenanceEvent(event, detail)
         })
     }
     internal val maintenanceDiagnostics by maintenanceDiagnosticsDelegate
+
+    // Stateless evidence also covers rejected work without replacing another owner's live phase.
+    internal fun recordMaintenanceEvent(event: String, detail: String) {
+        val timestamp = Instant.now().toString()
+        val elapsed = SystemClock.elapsedRealtime()
+        val journals = if (OperationalEventJournal.isMaintenanceEvent("database_maintenance", event))
+            listOf(operationalEventJournal, maintenanceEventJournal) else listOf(operationalEventJournal)
+        dispatchOperationalEvent(sharedOperationalEventExecutor) {
+            journals.forEach { journal ->
+                runCatching { journal.append(timestamp, elapsed, "database_maintenance", event, detail) }
+            }
+        }
+    }
     val dashboardUiStateStore by lazy { DashboardUiStateStore() }
     val navigationSession by lazy { UiSessionState() }
     private val updateCheckExecutorDelegate = lazy { namedSingleThreadExecutor("byd-update-check") }

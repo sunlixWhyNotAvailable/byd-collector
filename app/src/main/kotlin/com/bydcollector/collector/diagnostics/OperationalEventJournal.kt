@@ -85,6 +85,10 @@ class OperationalEventJournal internal constructor(
         removed
     }
 
+    internal fun retainedBytes(): Long = lock.withLock {
+        segmentFiles().filter { it.isFile }.sumOf { it.length() }
+    }
+
     private fun rotate() {
         for (index in retainedRotations downTo 1) {
             val source = segment(index - 1)
@@ -110,11 +114,18 @@ class OperationalEventJournal internal constructor(
     companion object {
         internal const val JOURNAL_DIR = "diagnostic_journal"
         internal const val ACTIVE_FILE_NAME = "operational_events.jsonl"
-        internal const val MAX_FILE_BYTES = 2L * 1024L * 1024L
+        internal const val MAX_FILE_BYTES = 16L * 1024L * 1024L
+        internal const val MAINTENANCE_DIR = "maintenance_journal"
+        internal const val MAINTENANCE_MAX_FILE_BYTES = 2L * 1024L * 1024L
         internal const val RETAINED_ROTATIONS = 3
         private const val MAX_CATEGORY_CHARS = 512
         private const val MAX_MESSAGE_CHARS = 16_384
         private const val MAX_DETAIL_CHARS = 32_768
+
+        internal fun isMaintenanceEvent(category: String, message: String): Boolean =
+            category.startsWith("archive_") ||
+                ((category == "database_maintenance" || category.startsWith("database_maintenance_")) &&
+                    category != "database_maintenance_heartbeat" && message != "database_maintenance_heartbeat")
 
         private fun readBootId(): String = runCatching {
             File("/proc/sys/kernel/random/boot_id").readText(Charsets.UTF_8).trim()

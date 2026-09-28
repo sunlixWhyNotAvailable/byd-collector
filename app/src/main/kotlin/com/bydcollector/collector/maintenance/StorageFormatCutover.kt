@@ -150,6 +150,20 @@ internal class StorageFormatCutoverCoordinator(
     }
 
     private fun cutoverLegacy(databaseFile: File, family: String, createDatabase: () -> Unit): Boolean {
+        val application = appContext as? com.bydcollector.collector.BydCollectorApplication
+        val detail = "family=$family database=${databaseFile.name}"
+        application?.recordMaintenanceEvent("legacy_archive_begin", detail)
+        return try {
+            performLegacyCutover(databaseFile, family, createDatabase).also { ok ->
+                application?.recordMaintenanceEvent("legacy_archive_end", "$detail ok=$ok")
+            }
+        } catch (error: Throwable) {
+            application?.recordMaintenanceEvent("legacy_archive_error", "$detail error=${error::class.java.simpleName}: ${error.message}")
+            throw error
+        }
+    }
+
+    private fun performLegacyCutover(databaseFile: File, family: String, createDatabase: () -> Unit): Boolean {
         if (settings.storageCutoverJournal() != null) return false
         if (!checkpoint(databaseFile)) return false
         val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())

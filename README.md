@@ -174,6 +174,7 @@ Telemetry and trips are stored locally in SQLite. Main and All data databases ca
 
 - `Storage` shows the combined size of Main, All data, and Trips, including supporting database files, plus archive size/count and the shared archive limit.
 - Select existing archives to share them or delete them after confirmation. Deletion shows progress and reports files that could not be removed.
+- Each archive stays in the list while being prepared, with its current step or error below its name. Temporary and completed files for the same archive share one row; the displayed size includes all files still on disk.
 - The archive limit applies to completed Main/All data archives, not active databases or Trips. Automatic cleanup removes older archives while protecting the newest archive of each type.
 - Trips uses lossless compression instead of archiving. Main and Trips history are not automatically deleted.
 - When a Main/All data storage-format update is required, the existing database is archived before replacement. Trips updates preserve its history.
@@ -217,12 +218,13 @@ The hint requires Android's permission to display over other apps, requested thr
 
 ## Diagnostics and privacy
 
-The app keeps a local operational event log, separate from telemetry databases. For a reproducible problem, use `Start logcat` under `Options -> Keep alive`, reproduce the issue, then stop recording. Full-system recording requires ADB authorization and is limited to 128 MiB; the regular event log is limited to 8 MiB.
+The app keeps a local operational event log, separate from telemetry databases. For a reproducible problem, use `Start logcat` under `Options -> Keep alive`, reproduce the issue, then stop recording. Full-system recording requires ADB authorization and is limited to 128 MiB; the regular event log is limited to 64 MiB, with a separate 8 MiB history for archive and database-maintenance events. Routine successful InfluxDB activity is summarized; errors and connection changes remain individually recorded. These size limits do not guarantee a fixed number of days of history.
 
 `Share logs` prepares a fresh ZIP and opens Android's share chooser with just the file. It includes app/device information, recent operational events, available system and background-service logs, and diagnostic summaries for InfluxDB, trips, and Telegram. Missing sources are reported without blocking the rest of the archive. Telemetry and Telegram databases are not included. ZIP preparation needs additional free space; a failure preserves existing logs and the previous valid bundle.
 
 The bundle also includes available telemetry-helper startup logs and a summary of buffered telemetry occupancy, imports, and released space. These diagnostic logs are bounded and can be cleared without deleting unimported telemetry or resetting the current occupancy summary.
 Archive phase timing/progress and available Android process-exit evidence are also retained independently of telemetry SQLite, so a blocked database does not hide the last completed stage. Missing exit evidence remains explicit; diagnostics do not guarantee recovery from every crash.
+The ZIP includes both event histories, their retained time ranges, and current archive states. Clearing logs removes both histories without resetting active archive progress.
 
 `Clear logs` asks for confirmation, removes completed captures and generated bundles, and resets the event log without stopping an active logcat recording. Unavailable background-service logs may result in partial cleanup. A recently shared copy can remain temporarily so the receiving app can finish reading it. Database archives, trip history, and pending Telegram messages are not cleared.
 

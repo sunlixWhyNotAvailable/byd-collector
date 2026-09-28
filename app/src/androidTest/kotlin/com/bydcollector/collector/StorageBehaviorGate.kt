@@ -9,6 +9,9 @@ import com.bydcollector.collector.data.trips.*
 import com.bydcollector.collector.diagnostics.OperationalEventJournal
 import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
 import com.bydcollector.collector.maintenance.ArchiveStorageManager
+import com.bydcollector.collector.maintenance.ArchiveStorageItemPhase
+import com.bydcollector.collector.maintenance.ArchiveEntryStatus
+import com.bydcollector.collector.ui.ArchiveStorageSnapshotCache
 import com.bydcollector.collector.maintenance.DatabaseArchiveManager
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.maintenance.StorageFormatCutoverCoordinator
@@ -29,6 +32,7 @@ internal object StorageBehaviorGate {
         "diagnostic_close_serializes_active_and_queued_writers" to { diagnosticClose(context, prefix) },
         "per_database_maintenance_keeps_sibling_commits_live" to { maintenanceIsolation(context, prefix) },
         "archive_storage_default_verifier_compact_families" to { archiveStorageDefaultVerifier(context, prefix) },
+        "archive_cold_cache_stays_visible_during_zip" to { archiveColdCache(context, prefix) },
         "archive_busy_full_and_create_failure_preserve_evidence" to { archiveFailureSafety(context, prefix) },
         "trip_completion_atomic_close_and_exact_ack" to { tripCompletion(context, prefix) },
         "telegram_atomic_outbox_state_and_delivery" to { telegramTransactions(context, prefix) }
@@ -152,6 +156,68 @@ internal object StorageBehaviorGate {
         val activeContentAfter = listOf(mainActive, secondaryActive)
             .associate { it.absolutePath to sqliteFileSetDigest(it) }
         check(activeContentAfter == activeContentBefore) { "Archive verification changed an active database file set" }
+    }
+
+    private fun archiveColdCache(context: Context, prefix: String) {
+        val provider = com.bydcollector.collector.ui.DashboardStateProvider(
+            context, { error("Initial dashboard must not read telemetry SQLite") },
+            com.bydcollector.collector.service.CollectorSettings(context)
+        )
+        check(provider.loadInitial().archiveStorageScanPending) {
+            "Cold dashboard must not claim the archive directory is empty before its first scan"
+        }
+        val root = File(context.cacheDir, "${prefix}_archive_cold_cache")
+        val archives = File(root, "archives").apply { check(mkdirs()) }
+        val main = File(root, TelemetryDatabaseHelper.DATABASE_NAME)
+        val secondary = File(root, DirectDebugDatabaseHelper.DATABASE_NAME)
+        createCompactArchiveFixture(context, main, main = true)
+        val raw = File(archives, "bydcollector_telemetry_20260928_120000")
+        copySqliteFileSet(main, raw)
+        val manager = ArchiveStorageManager(archives, main, secondary)
+        val cache = ArchiveStorageSnapshotCache(archives, main, secondary)
+        val zipStarted = CountDownLatch(1)
+        val resume = CountDownLatch(1)
+        val failure = AtomicReference<Throwable?>(null)
+        val worker = thread(name = "native-archive-cold-cache") {
+            try {
+                check(manager.compressRawArchiveDirectory(raw) { status ->
+                    if (status.phase == ArchiveStorageItemPhase.CREATING_ZIP) {
+                        zipStarted.countDown()
+                        check(resume.await(5, TimeUnit.SECONDS))
+                    }
+                })
+            } catch (error: Throwable) { failure.set(error) }
+        }
+        fun loaded() = run {
+            val deadline = android.os.SystemClock.elapsedRealtime() + 3_000L
+            var snapshot = cache.snapshot(1024L * 1024L, includeDetails = true)
+            while (snapshot.pending && android.os.SystemClock.elapsedRealtime() < deadline) {
+                Thread.sleep(10L)
+                snapshot = cache.snapshot(1024L * 1024L, includeDetails = true)
+            }
+            check(!snapshot.pending && snapshot.error == null)
+            snapshot.snapshot
+        }
+        try {
+            check(zipStarted.await(3, TimeUnit.SECONDS))
+            val during = loaded()
+            check(during.entries.single().id == raw.name)
+            check(during.entries.single().status == ArchiveEntryStatus.RAW_DIRECTORY)
+            check(during.mainDatabaseSizeBytes > 0L)
+            resume.countDown()
+            worker.join(5_000L)
+            check(!worker.isAlive)
+            failure.get()?.let { throw it }
+            cache.invalidate()
+            val after = loaded()
+            check(after.entries.single().id == "${raw.name}.zip")
+            check(after.entries.single().status == ArchiveEntryStatus.COMPRESSED_ZIP)
+            check(after.mainDatabaseSizeBytes == during.mainDatabaseSizeBytes)
+        } finally {
+            resume.countDown()
+            worker.join(5_000L)
+            cache.close()
+        }
     }
 
     private fun createCompactArchiveFixture(context: Context, databaseFile: File, main: Boolean) {

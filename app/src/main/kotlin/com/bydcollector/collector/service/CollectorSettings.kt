@@ -2,6 +2,8 @@ package com.bydcollector.collector.service
 
 import android.content.Context
 import android.content.SharedPreferences
+import org.json.JSONArray
+import org.json.JSONObject
 import com.bydcollector.collector.update.UpdateHintAppearance
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.telegram.TelegramBuiltInTemplates
@@ -15,6 +17,8 @@ import com.bydcollector.collector.keepalive.KeepAliveConfig
 import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
 import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
 import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
+import com.bydcollector.collector.maintenance.ArchiveStorageItemPhase
+import com.bydcollector.collector.maintenance.ArchiveStorageItemState
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
 import com.bydcollector.collector.maintenance.StorageFormat
@@ -694,53 +698,42 @@ class CollectorSettings(
     }
 
     fun archiveStorageJobStatus(): ArchiveStorageJobStatus {
-        val mode = prefs.getString(KEY_ARCHIVE_STORAGE_JOB_MODE, null)
-            ?.let { runCatching { ArchiveStorageJobMode.valueOf(it) }.getOrNull() }
-        return ArchiveStorageJobStatus(
-            mode = mode,
-            running = prefs.getBoolean(KEY_ARCHIVE_STORAGE_JOB_RUNNING, false),
-            stepIndex = prefs.getInt(KEY_ARCHIVE_STORAGE_JOB_STEP_INDEX, 0),
-            stepCount = prefs.getInt(KEY_ARCHIVE_STORAGE_JOB_STEP_COUNT, 0),
-            messageUk = prefs.getString(KEY_ARCHIVE_STORAGE_JOB_MESSAGE_UK, "") ?: "",
-            messageEn = prefs.getString(KEY_ARCHIVE_STORAGE_JOB_MESSAGE_EN, "") ?: "",
-            itemId = prefs.getString(KEY_ARCHIVE_STORAGE_JOB_ITEM_ID, null),
-            error = prefs.getString(KEY_ARCHIVE_STORAGE_JOB_ERROR, null),
-            updatedAtMs = prefs.getLong(KEY_ARCHIVE_STORAGE_JOB_UPDATED_AT_MS, 0L)
-        )
+        return ArchiveStorageSettingsStore.readJobStatus(prefs)
     }
 
-    fun setArchiveStorageJobStatus(status: ArchiveStorageJobStatus, synchronous: Boolean = false) {
-        val now = System.currentTimeMillis()
-        val editor = prefs.edit().apply {
-            status.mode?.let { putString(KEY_ARCHIVE_STORAGE_JOB_MODE, it.name) }
-                ?: remove(KEY_ARCHIVE_STORAGE_JOB_MODE)
-            putBoolean(KEY_ARCHIVE_STORAGE_JOB_RUNNING, status.running)
-            putInt(KEY_ARCHIVE_STORAGE_JOB_STEP_INDEX, status.stepIndex)
-            putInt(KEY_ARCHIVE_STORAGE_JOB_STEP_COUNT, status.stepCount)
-            putString(KEY_ARCHIVE_STORAGE_JOB_MESSAGE_UK, status.messageUk)
-            putString(KEY_ARCHIVE_STORAGE_JOB_MESSAGE_EN, status.messageEn)
-            status.itemId?.let { putString(KEY_ARCHIVE_STORAGE_JOB_ITEM_ID, it) }
-                ?: remove(KEY_ARCHIVE_STORAGE_JOB_ITEM_ID)
-            status.error?.let { putString(KEY_ARCHIVE_STORAGE_JOB_ERROR, it) }
-                ?: remove(KEY_ARCHIVE_STORAGE_JOB_ERROR)
-            putLong(KEY_ARCHIVE_STORAGE_JOB_UPDATED_AT_MS, status.updatedAtMs.takeIf { it > 0L } ?: now)
-        }
-        if (synchronous) editor.commit() else editor.apply()
-    }
+    fun archiveStorageItems(): List<ArchiveStorageItemState> = ArchiveStorageSettingsStore.readItems(prefs)
 
-    fun clearArchiveStorageJobStatus() {
-        prefs.edit()
-            .remove(KEY_ARCHIVE_STORAGE_JOB_MODE)
-            .remove(KEY_ARCHIVE_STORAGE_JOB_RUNNING)
-            .remove(KEY_ARCHIVE_STORAGE_JOB_STEP_INDEX)
-            .remove(KEY_ARCHIVE_STORAGE_JOB_STEP_COUNT)
-            .remove(KEY_ARCHIVE_STORAGE_JOB_MESSAGE_UK)
-            .remove(KEY_ARCHIVE_STORAGE_JOB_MESSAGE_EN)
-            .remove(KEY_ARCHIVE_STORAGE_JOB_ITEM_ID)
-            .remove(KEY_ARCHIVE_STORAGE_JOB_ERROR)
-            .remove(KEY_ARCHIVE_STORAGE_JOB_UPDATED_AT_MS)
-            .apply()
-    }
+    fun archiveStorageAuditOperationId(): String? =
+        ArchiveStorageSettingsStore.pendingAuditOperationId(prefs)
+
+    fun beginArchiveStorageOperation(operationId: String, status: ArchiveStorageJobStatus): Boolean =
+        ArchiveStorageSettingsStore.beginOperation(prefs, operationId, status)
+
+    fun publishArchiveStorageProgress(
+        operationId: String,
+        status: ArchiveStorageJobStatus,
+        itemState: ArchiveStorageItemState? = null
+    ): Boolean = ArchiveStorageSettingsStore.publishProgress(prefs, operationId, status, itemState)
+
+    fun queueArchiveStorageItems(operationId: String, archiveIds: Collection<String>): Boolean =
+        ArchiveStorageSettingsStore.queueItems(prefs, operationId, archiveIds)
+
+    fun reconcileArchiveStorageItems(
+        operationId: String,
+        reconciliation: com.bydcollector.collector.maintenance.ArchiveStorageItemsReconciliation
+    ): Boolean = ArchiveStorageSettingsStore.reconcileItems(prefs, operationId, reconciliation)
+
+    fun deferArchiveStorageAudit(operationId: String, archiveIds: Collection<String>): String =
+        ArchiveStorageSettingsStore.deferAudit(prefs, operationId, archiveIds)
+
+    fun finishArchiveStorageOperation(operationId: String, status: ArchiveStorageJobStatus): Boolean =
+        ArchiveStorageSettingsStore.finishOperation(prefs, operationId, status)
+
+    fun clearArchiveStorageJobStatus(operationId: String): Boolean =
+        ArchiveStorageSettingsStore.clearJobStatus(prefs, operationId)
+
+    fun recoverArchiveStorageAfterProcessRestart(operationId: String): String? =
+        ArchiveStorageSettingsStore.recoverAfterProcessRestart(prefs, operationId)
 
     fun dbMaintenanceStatus(): DbMaintenanceRuntimeStatus {
         return DbMaintenanceRuntimeStatus(
@@ -1341,8 +1334,12 @@ class CollectorSettings(
         const val KEY_ARCHIVE_STORAGE_JOB_MESSAGE_UK = "archiveStorageJobMessageUk"
         const val KEY_ARCHIVE_STORAGE_JOB_MESSAGE_EN = "archiveStorageJobMessageEn"
         const val KEY_ARCHIVE_STORAGE_JOB_ITEM_ID = "archiveStorageJobItemId"
+        const val KEY_ARCHIVE_STORAGE_JOB_OPERATION_ID = "archiveStorageJobOperationId"
+        const val KEY_ARCHIVE_STORAGE_JOB_PHASE = "archiveStorageJobPhase"
         const val KEY_ARCHIVE_STORAGE_JOB_ERROR = "archiveStorageJobError"
         const val KEY_ARCHIVE_STORAGE_JOB_UPDATED_AT_MS = "archiveStorageJobUpdatedAtMs"
+        const val KEY_ARCHIVE_STORAGE_ITEM_STATES = "archiveStorageItemStates"
+        const val KEY_ARCHIVE_STORAGE_AUDIT_PENDING_OPERATION_ID = "archiveStorageAuditPendingOperationId"
         const val KEY_DB_MAINTENANCE_OPERATION = "dbMaintenanceOperation"
         const val KEY_DB_MAINTENANCE_RUNNING = "dbMaintenanceRunning"
         const val KEY_DB_MAINTENANCE_COMPLETED = "dbMaintenanceCompleted"
@@ -1439,4 +1436,316 @@ class CollectorSettings(
             return operation != null && prefs.getBoolean(KEY_DB_MAINTENANCE_RUNNING, false)
         }
     }
+}
+
+/** SharedPreferences-backed archive state. Mutations are owner checked under one process lock. */
+internal object ArchiveStorageSettingsStore {
+    private const val MAX_ERROR_LENGTH = 512
+    private val lock = Any()
+
+    fun readJobStatus(prefs: SharedPreferences): ArchiveStorageJobStatus {
+        val mode = prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_MODE, null)
+            ?.let { runCatching { ArchiveStorageJobMode.valueOf(it) }.getOrNull() }
+        val phase = prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_PHASE, null)
+            ?.let { runCatching { ArchiveStorageItemPhase.valueOf(it) }.getOrNull() }
+        return ArchiveStorageJobStatus(
+            mode = mode,
+            running = prefs.getBoolean(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_RUNNING, false),
+            stepIndex = prefs.getInt(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_STEP_INDEX, 0),
+            stepCount = prefs.getInt(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_STEP_COUNT, 0),
+            messageUk = prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_MESSAGE_UK, "") ?: "",
+            messageEn = prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_MESSAGE_EN, "") ?: "",
+            itemId = prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_ITEM_ID, null),
+            operationId = prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_OPERATION_ID, null),
+            phase = phase,
+            error = prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_ERROR, null),
+            updatedAtMs = prefs.getLong(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_UPDATED_AT_MS, 0L)
+        )
+    }
+
+    fun readItems(prefs: SharedPreferences): List<ArchiveStorageItemState> = synchronized(lock) {
+        decodeItems(prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_ITEM_STATES, null))
+    }
+
+    fun pendingAuditOperationId(prefs: SharedPreferences): String? =
+        prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_AUDIT_PENDING_OPERATION_ID, null)
+
+    fun beginOperation(
+        prefs: SharedPreferences,
+        operationId: String,
+        status: ArchiveStorageJobStatus
+    ): Boolean = synchronized(lock) {
+        val current = readJobStatus(prefs)
+        if (current.running && current.operationId != operationId) return@synchronized false
+        val editor = prefs.edit()
+        writeJobStatus(
+            editor,
+            status.copy(
+                running = true,
+                operationId = operationId,
+                error = null,
+                updatedAtMs = status.updatedAtMs.takeIf { it > 0L } ?: System.currentTimeMillis()
+            ),
+            operationId
+        )
+        if (pendingAuditOperationId(prefs) == operationId) {
+            editor.remove(CollectorSettings.KEY_ARCHIVE_STORAGE_AUDIT_PENDING_OPERATION_ID)
+        }
+        editor.commit()
+    }
+
+    fun publishProgress(
+        prefs: SharedPreferences,
+        operationId: String,
+        status: ArchiveStorageJobStatus,
+        itemState: ArchiveStorageItemState?
+    ): Boolean = synchronized(lock) {
+        val current = readJobStatus(prefs)
+        if (current.operationId != operationId || !current.running) return@synchronized false
+        val now = System.currentTimeMillis()
+        val editor = prefs.edit()
+        writeJobStatus(editor, status.copy(running = true, operationId = operationId, updatedAtMs = now), operationId)
+        if (itemState != null && isRecognizedArchiveId(itemState.archiveId)) {
+            val items = decodeItems(prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_ITEM_STATES, null))
+                .associateByTo(linkedMapOf()) { it.archiveId }
+            val previous = items[itemState.archiveId]
+            val sameOwner = previous?.operationId == operationId
+            val terminal = itemState.phase == ArchiveStorageItemPhase.READY ||
+                itemState.phase == ArchiveStorageItemPhase.FAILED ||
+                itemState.phase == ArchiveStorageItemPhase.DELETED
+            items[itemState.archiveId] = itemState.copy(
+                operationId = operationId,
+                startedAtMs = previous?.startedAtMs?.takeIf { sameOwner } ?: now,
+                updatedAtMs = now,
+                completedAtMs = if (terminal) now else null,
+                error = itemState.error?.take(MAX_ERROR_LENGTH)
+            )
+            editor.putString(CollectorSettings.KEY_ARCHIVE_STORAGE_ITEM_STATES, encodeItems(items.values))
+        }
+        editor.commit()
+    }
+
+    fun queueItems(prefs: SharedPreferences, operationId: String, archiveIds: Collection<String>): Boolean = synchronized(lock) {
+        val current = readJobStatus(prefs)
+        if (current.operationId != operationId || !current.running) return@synchronized false
+        val now = System.currentTimeMillis()
+        val items = decodeItems(prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_ITEM_STATES, null))
+            .associateByTo(linkedMapOf()) { it.archiveId }
+        archiveIds.filter(::isRecognizedArchiveId).distinct().forEach { archiveId ->
+            val previous = items[archiveId]
+            val previousPhase = previous?.phase
+            if (previous?.operationId != operationId || previousPhase == null || previousPhase !in setOf(
+                    ArchiveStorageItemPhase.QUEUED,
+                    ArchiveStorageItemPhase.VERIFYING_DATABASE,
+                    ArchiveStorageItemPhase.CREATING_ZIP,
+                    ArchiveStorageItemPhase.VERIFYING_ZIP,
+                    ArchiveStorageItemPhase.FINALIZING
+                )) {
+                items[archiveId] = ArchiveStorageItemState(
+                    archiveId = archiveId,
+                    operationId = operationId,
+                    phase = ArchiveStorageItemPhase.QUEUED,
+                    startedAtMs = now,
+                    updatedAtMs = now
+                )
+            }
+        }
+        prefs.edit().putString(CollectorSettings.KEY_ARCHIVE_STORAGE_ITEM_STATES, encodeItems(items.values)).commit()
+    }
+
+    fun reconcileItems(
+        prefs: SharedPreferences,
+        operationId: String,
+        reconciliation: com.bydcollector.collector.maintenance.ArchiveStorageItemsReconciliation
+    ): Boolean = synchronized(lock) {
+        val currentJob = readJobStatus(prefs)
+        if (currentJob.operationId != operationId || !currentJob.running || !reconciliation.scanSucceeded) {
+            return@synchronized false
+        }
+        val scanned = reconciliation.itemStates.filter {
+            it.archiveId in reconciliation.knownArchiveIds && isRecognizedArchiveId(it.archiveId)
+        }.associateBy { it.archiveId }
+        val currentItems = decodeItems(prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_ITEM_STATES, null))
+            .associateByTo(linkedMapOf()) { it.archiveId }
+        val source = reconciliation.sourceItemStates
+            ?.associateBy { it.archiveId }
+            ?: currentItems
+        val merged = linkedMapOf<String, ArchiveStorageItemState>()
+        currentItems.forEach { (archiveId, currentState) ->
+            val sourceState = source[archiveId]
+            if (sourceState == null || currentState != sourceState) {
+                // A row added or changed while the filesystem scan ran belongs to newer work.
+                merged[archiveId] = currentState
+            } else {
+                scanned[archiveId]?.let { merged[archiveId] = it }
+                // An unchanged source row absent from the successful scan is obsolete and pruned.
+            }
+        }
+        scanned.forEach { (archiveId, state) ->
+            if (archiveId !in currentItems) merged[archiveId] = state
+        }
+        prefs.edit().putString(CollectorSettings.KEY_ARCHIVE_STORAGE_ITEM_STATES, encodeItems(merged.values)).commit()
+    }
+
+    fun deferAudit(prefs: SharedPreferences, operationId: String, archiveIds: Collection<String>): String = synchronized(lock) {
+        val activeOwner = readJobStatus(prefs).takeIf { it.running }?.operationId
+        val selectedId = pendingAuditOperationId(prefs) ?: operationId
+        val now = System.currentTimeMillis()
+        val items = decodeItems(prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_ITEM_STATES, null))
+            .associateByTo(linkedMapOf()) { it.archiveId }
+        archiveIds.filter(::isRecognizedArchiveId).distinct().forEach { archiveId ->
+            val previous = items[archiveId]
+            if (previous?.operationId != activeOwner) {
+                val sameDeferredOwner = previous?.operationId == selectedId
+                items[archiveId] = ArchiveStorageItemState(
+                    archiveId = archiveId,
+                    operationId = selectedId,
+                    phase = ArchiveStorageItemPhase.QUEUED,
+                    startedAtMs = previous?.startedAtMs?.takeIf { sameDeferredOwner } ?: now,
+                    updatedAtMs = now
+                )
+            }
+        }
+        val persisted = prefs.edit()
+            .putString(CollectorSettings.KEY_ARCHIVE_STORAGE_AUDIT_PENDING_OPERATION_ID, selectedId)
+            .putString(CollectorSettings.KEY_ARCHIVE_STORAGE_ITEM_STATES, encodeItems(items.values))
+            .commit()
+        check(persisted) { "Could not persist deferred archive audit" }
+        selectedId
+    }
+
+    fun finishOperation(
+        prefs: SharedPreferences,
+        operationId: String,
+        status: ArchiveStorageJobStatus
+    ): Boolean = synchronized(lock) {
+        val current = readJobStatus(prefs)
+        if (current.operationId != operationId || !current.running) return@synchronized false
+        val editor = prefs.edit()
+        writeJobStatus(editor, status.copy(running = false, operationId = operationId), operationId)
+        editor.commit()
+    }
+
+    fun clearJobStatus(prefs: SharedPreferences, operationId: String): Boolean = synchronized(lock) {
+        val current = readJobStatus(prefs)
+        if (current.operationId != operationId || !current.running) return@synchronized false
+        prefs.edit()
+            .remove(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_MODE)
+            .remove(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_RUNNING)
+            .remove(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_STEP_INDEX)
+            .remove(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_STEP_COUNT)
+            .remove(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_MESSAGE_UK)
+            .remove(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_MESSAGE_EN)
+            .remove(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_ITEM_ID)
+            .remove(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_OPERATION_ID)
+            .remove(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_PHASE)
+            .remove(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_ERROR)
+            .remove(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_UPDATED_AT_MS)
+            .commit()
+    }
+
+    fun recoverAfterProcessRestart(prefs: SharedPreferences, recoveryOperationId: String): String? = synchronized(lock) {
+        val status = readJobStatus(prefs)
+        val items = decodeItems(prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_ITEM_STATES, null))
+        val interrupted = status.running || items.any { it.phase.inProgress }
+        val pending = pendingAuditOperationId(prefs)
+            ?: status.operationId.takeIf { status.running }
+            ?: items.firstOrNull { it.phase.inProgress }?.operationId
+            ?: recoveryOperationId.takeIf { interrupted }
+        val editor = prefs.edit()
+        if (status.running) {
+            writeJobStatus(
+                editor,
+                status.copy(
+                    running = false,
+                    phase = ArchiveStorageItemPhase.FAILED,
+                    error = "archive_operation_interrupted:process_restart",
+                    messageUk = "Архівну операцію перервано перезапуском",
+                    messageEn = "Archive operation interrupted by process restart",
+                    updatedAtMs = System.currentTimeMillis()
+                ),
+                status.operationId ?: recoveryOperationId
+            )
+        }
+        if (pending != null) editor.putString(CollectorSettings.KEY_ARCHIVE_STORAGE_AUDIT_PENDING_OPERATION_ID, pending)
+        val saved = editor.commit()
+        pending.takeIf { saved }
+    }
+
+    private fun writeJobStatus(editor: SharedPreferences.Editor, status: ArchiveStorageJobStatus, operationId: String) {
+        editor.apply {
+            status.mode?.let { putString(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_MODE, it.name) }
+                ?: remove(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_MODE)
+            putBoolean(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_RUNNING, status.running)
+            putInt(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_STEP_INDEX, status.stepIndex)
+            putInt(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_STEP_COUNT, status.stepCount)
+            putString(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_MESSAGE_UK, status.messageUk)
+            putString(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_MESSAGE_EN, status.messageEn)
+            status.itemId?.let { putString(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_ITEM_ID, it) }
+                ?: remove(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_ITEM_ID)
+            putString(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_OPERATION_ID, operationId)
+            status.phase?.let { putString(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_PHASE, it.name) }
+                ?: remove(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_PHASE)
+            status.error?.let { putString(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_ERROR, it.take(MAX_ERROR_LENGTH)) }
+                ?: remove(CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_ERROR)
+            putLong(
+                CollectorSettings.KEY_ARCHIVE_STORAGE_JOB_UPDATED_AT_MS,
+                status.updatedAtMs.takeIf { it > 0L } ?: System.currentTimeMillis()
+            )
+        }
+    }
+
+    private fun decodeItems(raw: String?): List<ArchiveStorageItemState> = runCatching {
+        val json = JSONArray(raw.orEmpty())
+        buildList {
+            for (index in 0 until json.length()) {
+                val item = json.optJSONObject(index) ?: continue
+                val archiveId = item.optString("archiveId")
+                val operationId = item.optString("operationId")
+                val phase = item.optString("phase")
+                    .let { value -> runCatching { ArchiveStorageItemPhase.valueOf(value) }.getOrNull() }
+                if (!isRecognizedArchiveId(archiveId) || operationId.isBlank() || phase == null) continue
+                add(
+                    ArchiveStorageItemState(
+                        archiveId = archiveId,
+                        operationId = operationId,
+                        phase = phase,
+                        stepIndex = item.optInt("stepIndex"),
+                        stepCount = item.optInt("stepCount"),
+                        startedAtMs = item.optLong("startedAtMs"),
+                        updatedAtMs = item.optLong("updatedAtMs"),
+                        completedAtMs = if (item.isNull("completedAtMs")) null else item.optLong("completedAtMs"),
+                        error = if (item.isNull("error")) null else item.optString("error").take(MAX_ERROR_LENGTH)
+                    )
+                )
+            }
+        }.distinctBy { it.archiveId }
+    }.getOrDefault(emptyList())
+
+    private fun encodeItems(items: Collection<ArchiveStorageItemState>): String = JSONArray().apply {
+        items.asSequence()
+            .filter { isRecognizedArchiveId(it.archiveId) }
+            .sortedBy { it.archiveId }
+            .forEach { item ->
+                put(
+                    JSONObject()
+                        .put("archiveId", item.archiveId)
+                        .put("operationId", item.operationId)
+                        .put("phase", item.phase.name)
+                        .put("stepIndex", item.stepIndex)
+                        .put("stepCount", item.stepCount)
+                        .put("startedAtMs", item.startedAtMs)
+                        .put("updatedAtMs", item.updatedAtMs)
+                        .put("completedAtMs", item.completedAtMs ?: JSONObject.NULL)
+                        .put("error", item.error?.take(MAX_ERROR_LENGTH) ?: JSONObject.NULL)
+                )
+            }
+    }.toString()
+
+    private fun isRecognizedArchiveId(archiveId: String): Boolean =
+        archiveId.isNotBlank() && !archiveId.contains('/') && !archiveId.contains('\\') &&
+            !archiveId.contains("..") && !archiveId.endsWith(".zip") && !archiveId.endsWith(".zip.tmp") &&
+            (archiveId.startsWith("bydcollector_telemetry_") ||
+                archiveId.startsWith("bydcollector_secondary_") ||
+                archiveId.startsWith("bydcollector_debug_round_robin_"))
 }

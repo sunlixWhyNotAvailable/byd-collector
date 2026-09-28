@@ -13,6 +13,17 @@ import kotlin.test.assertTrue
 
 class ArchiveStorageManagerTest {
     @Test
+    fun failedDirectoryScanIsNotReportedAsAnEmptyArchiveList() {
+        val root = createTempDirectory().toFile()
+        try {
+            val blocked = File(root, "db_archive").apply { writeText("not a directory") }
+            val result = runCatching { manager(blocked, File(root, "active.db")).snapshot(1024L) }
+            assertTrue(result.exceptionOrNull() is IllegalStateException)
+            assertEquals("not a directory", blocked.readText())
+        } finally { root.deleteRecursively() }
+    }
+
+    @Test
     fun compressArchiveDirectoryWritesTmpThenZipAndDeletesRawDirectoryOnSuccess() {
         val root = createTempDirectory().toFile()
         val active = File(root, "bydcollector_telemetry.db").apply { writeText("active") }
@@ -47,6 +58,7 @@ class ArchiveStorageManagerTest {
         val raw = File(archiveRoot, "bydcollector_telemetry_20260707_120000").apply { mkdirs() }
         File(raw, active.name).writeText("db")
         val events = mutableListOf<String>()
+        val phases = mutableListOf<ArchiveStorageItemPhase>()
         val manager = manager(archiveRoot, active) { family, databaseFile, directory ->
             assertEquals("main_telemetry", family)
             assertEquals(active.name, databaseFile.name)
@@ -56,6 +68,7 @@ class ArchiveStorageManagerTest {
         }
 
         assertTrue(manager.compressRawArchiveDirectory(raw) { status ->
+            status.phase?.let(phases::add)
             when (status.messageEn) {
                 "Preparing archive" -> events += "zip"
                 "Deleting raw archive" -> events += "delete"
@@ -63,6 +76,16 @@ class ArchiveStorageManagerTest {
         })
 
         assertEquals(listOf("audit", "zip", "delete"), events)
+        assertEquals(
+            listOf(
+                ArchiveStorageItemPhase.VERIFYING_DATABASE,
+                ArchiveStorageItemPhase.CREATING_ZIP,
+                ArchiveStorageItemPhase.VERIFYING_ZIP,
+                ArchiveStorageItemPhase.FINALIZING,
+                ArchiveStorageItemPhase.READY
+            ),
+            phases
+        )
     }
 
     @Test
@@ -82,6 +105,7 @@ class ArchiveStorageManagerTest {
         assertTrue(File(raw, ArchiveStorageManager.ARCHIVE_VERIFICATION_MARKER).readText().contains("state=FAILED"))
         assertEquals("archive_verification_failed", statuses.last().error)
         assertFalse(statuses.last().running)
+        assertEquals(ArchiveStorageItemPhase.FAILED, statuses.last().phase)
     }
 
     @Test
@@ -126,6 +150,34 @@ class ArchiveStorageManagerTest {
         assertEquals(2, attempts)
         assertFalse(raw.exists())
         assertTrue(zip.exists())
+    }
+
+    @Test
+    fun failedNewZipVerificationKeepsRawAndAllowsCleanRetry() {
+        val root = createTempDirectory().toFile()
+        val active = File(root, "bydcollector_telemetry.db").apply { writeText("active") }
+        val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+        val raw = rawArchive(archiveRoot, active.name)
+        val target = File(archiveRoot, "${raw.name}.zip")
+        val temporary = File(archiveRoot, "${raw.name}.zip.tmp")
+        val statuses = mutableListOf<ArchiveStorageJobStatus>()
+        val manager = manager(archiveRoot, active)
+
+        assertFalse(manager.compressRawArchiveDirectory(raw) { status ->
+            statuses += status
+            if (status.phase == ArchiveStorageItemPhase.VERIFYING_ZIP) {
+                assertFalse(target.exists())
+                temporary.writeText("corrupted generated ZIP")
+            }
+        })
+        assertTrue(raw.isDirectory)
+        assertFalse(target.exists())
+        assertFalse(temporary.exists())
+        assertEquals("archive_zip_verify_failed", statuses.last().error)
+
+        assertTrue(manager.compressRawArchiveDirectory(raw))
+        assertFalse(raw.exists())
+        assertTrue(target.isFile)
     }
 
     @Test
@@ -254,6 +306,74 @@ class ArchiveStorageManagerTest {
         assertEquals(1, snapshot.entries.size)
         assertEquals(ArchiveEntryStatus.TMP, snapshot.entries.single().status)
         assertFalse(snapshot.entries.single().deletable)
+    }
+
+    @Test
+    fun pendingCompressionPreservesOrphanTmpWhenRawSourceIsAbsent() {
+        val root = createTempDirectory().toFile()
+        val active = File(root, "bydcollector_telemetry.db").apply { writeText("active") }
+        val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+        val tmp = File(archiveRoot, "bydcollector_telemetry_20260707_120000.zip.tmp").apply {
+            writeText("partial zip")
+        }
+        val manager = manager(archiveRoot, active)
+
+        assertEquals(0, manager.compressPendingRawArchives())
+
+        assertTrue(tmp.exists(), "An orphan tmp ZIP must not be discarded without its raw source")
+    }
+
+    @Test
+    fun finalizingRestartPromotesOnlyZipWithVerifiedEntriesAndPassedRawAuditMarker() {
+        val root = createTempDirectory().toFile()
+        val active = File(root, "bydcollector_telemetry.db").apply { writeText("active") }
+        val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+        val completeRaw = rawArchive(archiveRoot, active.name)
+        val completeZip = zipRaw(archiveRoot, completeRaw)
+        assertTrue(completeRaw.deleteRecursively())
+
+        val corruptRaw = File(archiveRoot, "bydcollector_telemetry_20260707_130000").apply {
+            mkdirs()
+            File(this, active.name).writeText("db")
+        }
+        val corruptZip = zipRaw(archiveRoot, corruptRaw)
+        assertTrue(corruptRaw.deleteRecursively())
+        corruptCentralDirectoryCrc(corruptZip)
+        ZipFile(corruptZip).use { archive ->
+            assertEquals("db", archive.getInputStream(archive.getEntry(active.name)).bufferedReader().use { it.readText() })
+        }
+
+        val manager = manager(archiveRoot, active)
+        val reconciled = manager.reconcilePersistedItems(
+            listOf(
+                finalizingState(completeRaw.name),
+                finalizingState(corruptRaw.name)
+            )
+        ).itemStates.associateBy { it.archiveId }
+
+        assertTrue(completeZip.exists())
+        assertEquals(ArchiveStorageItemPhase.READY, reconciled.getValue(completeRaw.name).phase)
+        assertEquals(ArchiveStorageItemPhase.FAILED, reconciled.getValue(corruptRaw.name).phase)
+        assertEquals("archive_operation_interrupted:archive_unverified", reconciled.getValue(corruptRaw.name).error)
+    }
+
+    @Test
+    fun readyRestartReconciliationUsesPersistedVerificationWithoutReadingZipPayloads() {
+        val root = createTempDirectory().toFile()
+        val active = File(root, "bydcollector_telemetry.db").apply { writeText("active") }
+        val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+        val raw = rawArchive(archiveRoot, active.name)
+        val zip = zipRaw(archiveRoot, raw)
+        assertTrue(raw.deleteRecursively())
+        corruptCentralDirectoryCrc(zip)
+        val ready = finalizingState(raw.name).copy(
+            phase = ArchiveStorageItemPhase.READY,
+            completedAtMs = 3L
+        )
+
+        val reconciled = manager(archiveRoot, active).reconcilePersistedItems(listOf(ready))
+
+        assertEquals(ready, reconciled.itemStates.single())
     }
 
     @Test
@@ -513,6 +633,24 @@ class ArchiveStorageManagerTest {
             }
         }
         return target
+    }
+
+    private fun finalizingState(archiveId: String) = ArchiveStorageItemState(
+        archiveId = archiveId,
+        operationId = "archive-op-test",
+        phase = ArchiveStorageItemPhase.FINALIZING,
+        startedAtMs = 1L,
+        updatedAtMs = 2L
+    )
+
+    private fun corruptCentralDirectoryCrc(zip: File) {
+        val bytes = zip.readBytes()
+        val signature = byteArrayOf(0x50, 0x4b, 0x01, 0x02)
+        val offset = (0..bytes.size - signature.size).firstOrNull { index ->
+            signature.indices.all { bytes[index + it] == signature[it] }
+        } ?: error("ZIP central directory entry not found")
+        bytes[offset + 16] = (bytes[offset + 16].toInt() xor 0x01).toByte()
+        zip.writeBytes(bytes)
     }
 
     private fun archive(root: File, name: String, modifiedAt: Long): File {

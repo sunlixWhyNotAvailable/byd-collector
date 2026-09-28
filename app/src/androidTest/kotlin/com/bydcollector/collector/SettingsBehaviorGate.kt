@@ -11,6 +11,10 @@ import com.bydcollector.collector.data.direct.DirectHelperReadResult
 import com.bydcollector.collector.data.direct.DirectHelperStopResult
 import com.bydcollector.collector.data.direct.DirectVehicleHelper
 import com.bydcollector.collector.data.remote.DirectBridgeManager
+import com.bydcollector.collector.maintenance.ArchiveStorageItemPhase
+import com.bydcollector.collector.maintenance.ArchiveStorageItemState
+import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
+import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.service.RuntimeDemand
 import com.bydcollector.collector.telegram.TelegramNavigatorMask
@@ -19,6 +23,57 @@ import java.io.File
 /** Exercises the production settings facade against isolated Android preferences. */
 internal object SettingsBehaviorGate {
     fun cases(context: Context, prefix: String): List<Pair<String, () -> Unit>> = listOf(
+        "archive_owner_and_item_state_survive_reopen" to {
+            isolated(context, prefix) { scoped ->
+                val settings = CollectorSettings(scoped)
+                val mainId = "bydcollector_telemetry_20260928_120000"
+                val secondaryId = "bydcollector_secondary_20260928_120001"
+                val active = ArchiveStorageJobStatus(
+                    mode = ArchiveStorageJobMode.COMPRESS,
+                    running = true,
+                    operationId = "first",
+                    itemId = mainId,
+                    stepIndex = 2,
+                    stepCount = 4,
+                    phase = ArchiveStorageItemPhase.CREATING_ZIP
+                )
+                check(settings.beginArchiveStorageOperation("first", active))
+                check(settings.publishArchiveStorageProgress("first", active,
+                    ArchiveStorageItemState(mainId, "first", ArchiveStorageItemPhase.CREATING_ZIP,
+                        2, 4, 1L, 1L)))
+                val before = settings.archiveStorageJobStatus()
+                check(settings.deferArchiveStorageAudit("second", listOf(secondaryId)) == "second")
+                check(settings.archiveStorageJobStatus() == before) { "Deferred work replaced its active owner" }
+                check(!settings.publishArchiveStorageProgress("stale", active.copy(error = "stale failure")))
+                check(!settings.finishArchiveStorageOperation("stale", active))
+                check(!settings.clearArchiveStorageJobStatus("stale"))
+
+                val reopened = CollectorSettings(scoped)
+                check(reopened.archiveStorageJobStatus() == before)
+                val items = reopened.archiveStorageItems().associateBy { it.archiveId }
+                check(items.getValue(mainId).phase == ArchiveStorageItemPhase.CREATING_ZIP)
+                check(items.getValue(secondaryId).phase == ArchiveStorageItemPhase.QUEUED)
+                check(items.values.all { it.startedAtMs > 0 && it.updatedAtMs >= it.startedAtMs })
+                check(reopened.recoverArchiveStorageAfterProcessRestart("recovery") == "second")
+                check(!reopened.archiveStorageJobStatus().running)
+                check(reopened.archiveStorageJobStatus().error?.contains("interrupted") == true)
+                check(!reopened.finishArchiveStorageOperation("first", active))
+
+                val next = active.copy(operationId = "second", itemId = secondaryId)
+                check(reopened.beginArchiveStorageOperation("second", next))
+                check(reopened.archiveStorageAuditOperationId() == null)
+                val failed = next.copy(phase = ArchiveStorageItemPhase.FAILED, error = "archive_zip_mismatch")
+                check(reopened.publishArchiveStorageProgress("second", failed,
+                    ArchiveStorageItemState(secondaryId, "second", ArchiveStorageItemPhase.FAILED,
+                        3, 4, 1L, 1L, error = failed.error)))
+                check(reopened.finishArchiveStorageOperation("second", failed))
+                val settled = CollectorSettings(scoped)
+                check(!settled.archiveStorageJobStatus().running)
+                val item = settled.archiveStorageItems().single { it.archiveId == secondaryId }
+                check(item.phase == ArchiveStorageItemPhase.FAILED && item.error == failed.error)
+                check(item.completedAtMs != null)
+            }
+        },
         "settings_process_death_and_boot_policy" to {
             isolated(context, prefix) { scoped ->
                 val settings = CollectorSettings(scoped)

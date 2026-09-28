@@ -2,6 +2,8 @@ package com.bydcollector.collector.ui
 
 import com.bydcollector.collector.data.local.CollectorEvent
 import com.bydcollector.collector.data.local.HealthSnapshotDetail
+import com.bydcollector.collector.maintenance.ArchiveStorageItemPhase
+import com.bydcollector.collector.maintenance.ArchiveStorageItemState
 import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.ArchiveStorageSnapshot
 import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
@@ -99,6 +101,39 @@ class DashboardLoadProfileTest {
         )
 
         assertSame(previousKpis, merged.vehicleKpis)
+    }
+
+    @Test
+    fun archiveItemStatesAndScanErrorsFollowTheArchiveDetailsSlice() {
+        val previousItem = archiveItem("previous", ArchiveStorageItemPhase.CREATING_ZIP)
+        val loadedItem = archiveItem("loaded", ArchiveStorageItemPhase.READY)
+        val previous = dashboardState("previous").copy(
+            archiveStorageItemStates = listOf(previousItem),
+            archiveStorageScanError = "previous scan error"
+        )
+        val next = dashboardState("next").copy(
+            archiveStorageItemStates = listOf(loadedItem),
+            archiveStorageScanError = "current scan error"
+        )
+
+        fun merge(archiveDetailsLoaded: Boolean) = DashboardStateProfileMerger.merge(
+            previous = previous,
+            next = next,
+            healthDetailLoaded = null,
+            debugStatusLoaded = false,
+            vehicleKpisLoaded = false,
+            integrationSettingsLoaded = false,
+            runtimeSettingsLoaded = false,
+            archiveDetailsLoaded = archiveDetailsLoaded
+        )
+
+        val lightweight = merge(archiveDetailsLoaded = false)
+        assertEquals(listOf(previousItem), lightweight.archiveStorageItemStates)
+        assertEquals("previous scan error", lightweight.archiveStorageScanError)
+
+        val storage = merge(archiveDetailsLoaded = true)
+        assertEquals(listOf(loadedItem), storage.archiveStorageItemStates)
+        assertEquals("current scan error", storage.archiveStorageScanError)
     }
 
     @Test
@@ -307,4 +342,14 @@ class DashboardLoadProfileTest {
             recentEvents = listOf(CollectorEvent(1L, marker, "test", marker, null))
         )
     }
+
+    private fun archiveItem(archiveId: String, phase: ArchiveStorageItemPhase) = ArchiveStorageItemState(
+        archiveId = archiveId,
+        operationId = "operation-$archiveId",
+        phase = phase,
+        stepIndex = 1,
+        stepCount = 4,
+        startedAtMs = 1L,
+        updatedAtMs = 2L
+    )
 }

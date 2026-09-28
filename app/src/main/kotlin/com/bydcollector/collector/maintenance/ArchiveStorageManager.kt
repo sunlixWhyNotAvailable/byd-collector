@@ -10,6 +10,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.security.MessageDigest
+import java.util.zip.CRC32
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
@@ -47,9 +48,8 @@ class ArchiveStorageManager(
     private val isArchiveInUse: (String) -> Boolean = { false }
 ) {
     fun snapshot(limitBytes: Long): ArchiveStorageSnapshot {
-        archiveRoot.mkdirs()
-        val entries = archiveRoot.listFiles()
-            .orEmpty()
+        check(archiveRoot.isDirectory || archiveRoot.mkdirs() || archiveRoot.isDirectory) { "Cannot open archive directory" }
+        val entries = checkNotNull(archiveRoot.listFiles()) { "Cannot list archives" }
             .mapNotNull(::entryFor)
             .sortedWith(compareByDescending<ArchiveStorageEntry> { it.createdAtMs }.thenBy { it.id })
         return ArchiveStorageSnapshot(
@@ -81,7 +81,8 @@ class ArchiveStorageManager(
                 4,
                 "Перевіряємо базу даних архіву",
                 "Verifying archived database",
-                directory.name
+                directory.name,
+                phase = ArchiveStorageItemPhase.VERIFYING_DATABASE
             ))
             val verificationError = auditRawArchive(directory)
             if (verificationError != null) {
@@ -99,29 +100,47 @@ class ArchiveStorageManager(
                     4,
                     "Перевіряємо готовий ZIP",
                     "Verifying existing ZIP",
-                    directory.name
+                    directory.name,
+                    phase = ArchiveStorageItemPhase.VERIFYING_ZIP
                 ))
                 check(!isArchiveInUse(directory.name)) { "archive_in_use" }
                 check(zipMatchesRawDirectory(target, directory)) { "archive_zip_mismatch" }
             } else {
                 tmp.delete()
-                onStatus(status(ArchiveStorageJobMode.COMPRESS, 2, 4, "Готуємо архів", "Preparing archive", directory.name))
+                onStatus(status(
+                    ArchiveStorageJobMode.COMPRESS, 2, 4,
+                    "Готуємо архів", "Preparing archive", directory.name,
+                    phase = ArchiveStorageItemPhase.CREATING_ZIP
+                ))
                 check(!isArchiveInUse(directory.name)) { "archive_in_use" }
                 ZipOutputStream(BufferedOutputStream(FileOutputStream(tmp))).use { zip ->
                     zipDirectory(directory, zip)
                 }
-                onStatus(status(ArchiveStorageJobMode.COMPRESS, 3, 4, "Завершуємо ZIP", "Finalizing ZIP", directory.name))
+                onStatus(status(
+                    ArchiveStorageJobMode.COMPRESS, 3, 4,
+                    "Перевіряємо ZIP", "Verifying ZIP", directory.name,
+                    phase = ArchiveStorageItemPhase.VERIFYING_ZIP
+                ))
                 check(tmp.length() > 0L) { "Archive ZIP is empty" }
+                check(zipMatchesRawDirectory(tmp, directory)) { "archive_zip_verify_failed" }
                 check(!isArchiveInUse(directory.name)) { "archive_in_use" }
                 check(tmp.renameTo(target)) { "Cannot finalize archive ZIP" }
-                check(zipMatchesRawDirectory(target, directory)) { "archive_zip_verify_failed" }
             }
             check(!isArchiveInUse(directory.name)) { "archive_in_use" }
             check(!Thread.currentThread().isInterrupted) { "archive_compression_interrupted" }
-            onStatus(status(ArchiveStorageJobMode.COMPRESS, 4, 4, "Видаляємо raw архів", "Deleting raw archive", directory.name))
+            onStatus(status(
+                ArchiveStorageJobMode.COMPRESS, 4, 4,
+                "Видаляємо raw архів", "Deleting raw archive", directory.name,
+                phase = ArchiveStorageItemPhase.FINALIZING
+            ))
             check(!isArchiveInUse(directory.name)) { "archive_in_use" }
             check(!Thread.currentThread().isInterrupted) { "archive_compression_interrupted" }
             check(directory.deleteRecursively() && !directory.exists()) { "Cannot delete raw archive directory" }
+            onStatus(status(
+                ArchiveStorageJobMode.COMPRESS, 4, 4,
+                "Архів готовий", "Archive ready", directory.name,
+                phase = ArchiveStorageItemPhase.READY
+            ))
             true
         } catch (error: Throwable) {
             if (error is InterruptedException) Thread.currentThread().interrupt()
@@ -139,13 +158,70 @@ class ArchiveStorageManager(
         }
     }
 
-    fun compressPendingRawArchives(onStatus: (ArchiveStorageJobStatus) -> Unit = {}): Int {
+    fun compressPendingRawArchives(
+        onStatus: (ArchiveStorageJobStatus) -> Unit = {},
+        excludedArchiveIds: Set<String> = emptySet()
+    ): Int {
         cleanupTmpFiles()
         return archiveRoot.listFiles()
             .orEmpty()
-            .filter { it.isDirectory && isArchiveName(it.name) }
+            .filter { it.isDirectory && isArchiveName(it.name) && it.name !in excludedArchiveIds }
             .sortedBy { it.lastModified() }
             .count { compressRawArchiveDirectory(it, onStatus) }
+    }
+
+    fun pendingRawArchiveIds(): List<String>? {
+        if (!archiveRoot.isDirectory && !archiveRoot.mkdirs() && !archiveRoot.isDirectory) return null
+        return (archiveRoot.listFiles() ?: return null)
+            .filter { it.isDirectory && isDirectArchiveChild(it) && isArchiveName(it.name) }
+            .map { it.name }
+    }
+
+    fun reconcilePersistedItems(persisted: List<ArchiveStorageItemState>): ArchiveStorageItemsReconciliation {
+        if (!archiveRoot.isDirectory && !archiveRoot.mkdirs() && !archiveRoot.isDirectory) {
+            return ArchiveStorageItemsReconciliation(
+                persisted, emptySet(), scanSucceeded = false, sourceItemStates = persisted
+            )
+        }
+        val files = archiveRoot.listFiles()
+            ?: return ArchiveStorageItemsReconciliation(
+                persisted, emptySet(), scanSucceeded = false, sourceItemStates = persisted
+            )
+        val currentIds = files.mapNotNull(::logicalArchiveId).toSet()
+        val reconciled = persisted.asSequence()
+            .filter { it.archiveId in currentIds }
+            .map { state ->
+                val raw = File(archiveRoot, state.archiveId).takeIf { it.isDirectory }
+                val zip = File(archiveRoot, "${state.archiveId}.zip").takeIf { it.isFile }
+                when {
+                    state.phase == ArchiveStorageItemPhase.READY ->
+                        if (raw == null && zip != null) state
+                        else state.interrupted(clock(), "archive_ready_representation_inconsistent")
+                    state.phase == ArchiveStorageItemPhase.FINALIZING && raw == null &&
+                        zip != null && verifyStandaloneArchiveZip(zip) ->
+                        state.copy(
+                            phase = ArchiveStorageItemPhase.READY,
+                            updatedAtMs = clock(),
+                            completedAtMs = clock(),
+                            error = null
+                        )
+                    state.phase.inProgress -> state.interrupted(
+                        clock(),
+                        if (raw != null) "archive_operation_interrupted:raw_retained"
+                        else "archive_operation_interrupted:archive_unverified"
+                    )
+                    state.phase == ArchiveStorageItemPhase.DELETED ->
+                        state.interrupted(clock(), "archive_delete_interrupted:archive_reappeared")
+                    else -> state
+                }
+            }
+            .toList()
+        return ArchiveStorageItemsReconciliation(
+            itemStates = reconciled,
+            knownArchiveIds = currentIds,
+            scanSucceeded = true,
+            sourceItemStates = persisted
+        )
     }
 
     fun enforceRetention(
@@ -171,10 +247,26 @@ class ArchiveStorageManager(
             .sortedBy { it.createdAtMs }
             .forEach { entry ->
                 if (total <= limitBytes) return@forEach
-                onStatus(status(ArchiveStorageJobMode.RETENTION, deleted + 1, entries.size, "Видаляємо старий архів", "Deleting old archive", entry.id))
+                onStatus(status(
+                    ArchiveStorageJobMode.RETENTION, deleted + 1, entries.size,
+                    "Видаляємо старий архів", "Deleting old archive", entry.id,
+                    phase = ArchiveStorageItemPhase.RETENTION
+                ))
                 if (!isRetentionProtected(entry.id) && deleteArchiveFile(entry.id)) {
                     total -= entry.sizeBytes
                     deleted += 1
+                    onStatus(status(
+                        ArchiveStorageJobMode.RETENTION, deleted, entries.size,
+                        "Старий архів видалено", "Old archive deleted", entry.id,
+                        phase = ArchiveStorageItemPhase.DELETED
+                    ))
+                } else {
+                    onStatus(status(
+                        ArchiveStorageJobMode.RETENTION, deleted + 1, entries.size,
+                        "Не вдалося видалити старий архів", "Old archive deletion failed", entry.id,
+                        error = "archive_retention_delete_failed",
+                        phase = ArchiveStorageItemPhase.FAILED
+                    ))
                 }
             }
         return deleted
@@ -202,7 +294,8 @@ class ArchiveStorageManager(
                 messageUk = "Готуємо видалення",
                 messageEn = "Preparing archive deletion",
                 itemId = null,
-                running = true
+                running = true,
+                phase = ArchiveStorageItemPhase.DELETING
             )
         )
         safeIds.forEachIndexed { index, id ->
@@ -214,7 +307,8 @@ class ArchiveStorageManager(
                     "Видаляємо архів",
                     "Deleting archive",
                     id,
-                    running = true
+                    running = true,
+                    phase = ArchiveStorageItemPhase.DELETING
                 )
             )
             val outcome = deleteArchiveFileOutcome(id)
@@ -228,7 +322,8 @@ class ArchiveStorageManager(
                         "Архів видалено",
                         "Archive deleted",
                         id,
-                        running = true
+                        running = true,
+                        phase = ArchiveStorageItemPhase.DELETED
                     )
                 )
             } else {
@@ -241,7 +336,8 @@ class ArchiveStorageManager(
                         "Archive deletion failed",
                         id,
                         error = outcome.error,
-                        running = true
+                        running = true,
+                        phase = ArchiveStorageItemPhase.FAILED
                     )
                 )
             }
@@ -302,8 +398,88 @@ class ArchiveStorageManager(
         archiveRoot.listFiles()
             .orEmpty()
             .filter { it.isFile && it.name.endsWith(".zip.tmp") && isDirectArchiveChild(it) }
+            .filter { tmp ->
+                val archiveId = logicalArchiveId(tmp) ?: return@filter false
+                val raw = File(archiveRoot, archiveId)
+                raw.isDirectory && isDirectArchiveChild(raw)
+            }
             .forEach { it.delete() }
     }
+
+    private fun logicalArchiveId(file: File): String? {
+        if (!isDirectArchiveChild(file)) return null
+        val archiveId = when {
+            file.isDirectory -> file.name
+            file.isFile && file.name.endsWith(".zip.tmp") -> file.name.removeSuffix(".zip.tmp")
+            file.isFile && file.name.endsWith(".zip") -> file.name.removeSuffix(".zip")
+            else -> return null
+        }
+        return archiveId.takeIf(::isArchiveName)
+    }
+
+    /** Restart proof for the narrow crash window after raw deletion during FINALIZING. */
+    private fun verifyStandaloneArchiveZip(zipFile: File): Boolean = runCatching {
+        if (!isDirectArchiveChild(zipFile) || !zipFile.isFile || zipFile.length() <= 0L) return@runCatching false
+        val archiveId = zipFile.name.removeSuffix(".zip")
+        val database = archiveDatabaseFor(File(archiveRoot, archiveId)) ?: return@runCatching false
+        val allowedNames = DatabaseArchiveManager.sidecarFiles(database.databaseFile)
+            .mapTo(mutableSetOf()) { it.name } + ARCHIVE_VERIFICATION_MARKER
+        var databaseSeen = false
+        var passedMarkerSeen = false
+        ZipFile(zipFile).use { archive ->
+            val seenNames = mutableSetOf<String>()
+            val enumeration = archive.entries()
+            val buffer = ByteArray(8 * 1024)
+            while (enumeration.hasMoreElements()) {
+                val entry = enumeration.nextElement()
+                if (entry.isDirectory || entry.name.contains('/') || entry.name.contains('\\') ||
+                    !seenNames.add(entry.name) || entry.name !in allowedNames
+                ) return@use false
+                if (entry.name == ARCHIVE_VERIFICATION_MARKER) {
+                    if (entry.size !in 1L..MAX_VERIFICATION_MARKER_BYTES || entry.crc < 0L) return@use false
+                    val markerBytes = java.io.ByteArrayOutputStream()
+                    var markerLength = 0L
+                    val markerCrc = CRC32()
+                    var markerWithinBound = true
+                    archive.getInputStream(entry).use { input ->
+                        while (true) {
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            if (count == 0) continue
+                            markerLength += count
+                            if (markerLength > MAX_VERIFICATION_MARKER_BYTES) {
+                                markerWithinBound = false
+                                break
+                            }
+                            markerBytes.write(buffer, 0, count)
+                            markerCrc.update(buffer, 0, count)
+                        }
+                    }
+                    if (!markerWithinBound || markerLength != entry.size || markerCrc.value != entry.crc) return@use false
+                    val marker = markerBytes.toString(Charsets.UTF_8.name())
+                    if (marker.lineSequence().firstOrNull() != "state=PASSED") return@use false
+                    passedMarkerSeen = true
+                } else {
+                    if (entry.size < 0L || entry.crc < 0L) return@use false
+                    if (entry.name == database.databaseFile.name) databaseSeen = entry.size > 0L
+                    val crc = CRC32()
+                    var entryLength = 0L
+                    archive.getInputStream(entry).use { input ->
+                        while (true) {
+                            check(!Thread.currentThread().isInterrupted) { "archive_restart_verification_interrupted" }
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            if (count == 0) continue
+                            entryLength += count
+                            crc.update(buffer, 0, count)
+                        }
+                    }
+                    if (entryLength != entry.size || crc.value != entry.crc) return@use false
+                }
+            }
+        }
+        databaseSeen && passedMarkerSeen
+    }.getOrDefault(false)
 
     private fun auditRawArchive(directory: File): String? {
         if (isArchiveInUse(directory.name)) return "archive_in_use"
@@ -497,6 +673,7 @@ class ArchiveStorageManager(
         messageUk: String,
         messageEn: String,
         itemId: String?,
+        phase: ArchiveStorageItemPhase? = null,
         error: String? = null,
         running: Boolean = error == null
     ): ArchiveStorageJobStatus {
@@ -508,6 +685,7 @@ class ArchiveStorageManager(
             messageUk = messageUk,
             messageEn = messageEn,
             itemId = itemId,
+            phase = phase,
             error = error,
             updatedAtMs = clock()
         )
@@ -532,6 +710,7 @@ class ArchiveStorageManager(
             messageUk = if (verificationFailed) "Перевірку не завершено; raw архів збережено" else "ZIP не створено; raw архів збережено",
             messageEn = if (verificationFailed) "Archive verification failed; raw retained" else "ZIP failed; raw archive retained",
             itemId = itemId,
+            phase = ArchiveStorageItemPhase.FAILED,
             error = error,
             running = false
         )
@@ -549,3 +728,10 @@ class ArchiveStorageManager(
             name.startsWith(DEBUG_ARCHIVE_PREFIX) || name.startsWith(LEGACY_DEBUG_ARCHIVE_PREFIX)
     }
 }
+
+private fun ArchiveStorageItemState.interrupted(nowMs: Long, errorCode: String): ArchiveStorageItemState = copy(
+    phase = ArchiveStorageItemPhase.FAILED,
+    updatedAtMs = nowMs,
+    completedAtMs = nowMs,
+    error = errorCode
+)

@@ -151,7 +151,9 @@ class DashboardUiStateStore(
         synchronized(lock) {
             val flow = tabs.getValue(tab)
             //Zero is the stale sentinel; the last non-null snapshot remains visible.
-            flow.value = flow.value?.copy(loadedAtElapsedMs = 0L)
+            // A load begun before this invalidation must not erase it with an older result.
+            pendingGenerations.remove(tab)
+            flow.value = flow.value?.copy(loadedAtElapsedMs = 0L, inFlight = false)
         }
     }
 

@@ -116,7 +116,7 @@ internal fun sanitizeDiagnosticSnapshot(snapshot: File): String {
 private const val DIAGNOSTIC_RECORD_LIMIT_BYTES = 256 * 1024
 
 /** Split bytes before UTF-8 decoding so one torn final record cannot discard its valid predecessors. */
-private fun forEachDiagnosticRecord(file: File, consume: (ByteArray?) -> Unit) {
+internal fun forEachDiagnosticRecord(file: File, consume: (ByteArray?) -> Unit) {
     file.inputStream().buffered().use { input ->
         val buffer = ByteArray(8192)
         val line = ByteArrayOutputStream()

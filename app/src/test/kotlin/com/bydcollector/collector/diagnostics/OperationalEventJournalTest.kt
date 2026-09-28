@@ -12,6 +12,32 @@ import kotlin.test.assertTrue
 
 class OperationalEventJournalTest {
     @Test
+    fun maintenanceEvidenceSurvivesGeneralRotationAndHasIndependentClear() {
+        assertEquals(64L * 1024 * 1024, OperationalEventJournal.MAX_FILE_BYTES * 4)
+        assertEquals(8L * 1024 * 1024, OperationalEventJournal.MAINTENANCE_MAX_FILE_BYTES * 4)
+        assertTrue(OperationalEventJournal.isMaintenanceEvent("archive_storage_phase", "progress"))
+        assertTrue(OperationalEventJournal.isMaintenanceEvent("database_maintenance", "database_maintenance_end"))
+        assertFalse(OperationalEventJournal.isMaintenanceEvent("database_maintenance", "database_maintenance_heartbeat"))
+        assertFalse(OperationalEventJournal.isMaintenanceEvent("influx", "request"))
+        val root = Files.createTempDirectory("bydcollector-journal-independence").toFile()
+        try {
+            val general = OperationalEventJournal(File(root, "general"), 512, bootId = "boot", pid = 1)
+            val maintenance = OperationalEventJournal(File(root, "maintenance"), 512, bootId = "boot", pid = 1)
+            maintenance.append("2026-09-28T10:00:00Z", 1, "archive_storage_terminal", "ready", null)
+            repeat(100) { general.append("2026-09-28T10:01:00Z", it.toLong(), "influx", "progress", null) }
+            assertTrue(general.retainedBytes() <= 512L * 4)
+            assertEquals(1, maintenance.snapshotTo(File(root, "snapshot")))
+            general.clear()
+            assertEquals(0L, general.retainedBytes())
+            assertTrue(maintenance.retainedBytes() > 0)
+            assertEquals(1, maintenance.clear())
+            assertEquals(0L, maintenance.retainedBytes())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun rotatesToActivePlusThreeSegmentsAndDropsTheOldest() {
         val root = Files.createTempDirectory("bydcollector-event-journal").toFile()
         try {
