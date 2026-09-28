@@ -7,6 +7,13 @@ object ReleaseNotesSelector {
     private const val UK_CLOSE = "<!-- /bydcollector:release-notes:uk -->"
     private val MARKERS = setOf(EN_OPEN, EN_CLOSE, UK_OPEN, UK_CLOSE)
 
+    fun forVersion(entry: ReleaseNotesEntry, ukrainian: Boolean): String {
+        val notes = select(entry.body, ukrainian).trim()
+        val firstLine = notes.lineSequence().firstOrNull().orEmpty().trim()
+        val heading = Regex("#{1,3}\\s+v?${Regex.escape(entry.version.removePrefix("v"))}")
+        return if (heading.matches(firstLine)) notes.substringAfter('\n', "").trimStart() else notes
+    }
+
     fun select(rawBody: String, ukrainian: Boolean): String {
         val requested = if (ukrainian) {
             block(rawBody, UK_OPEN, UK_CLOSE)

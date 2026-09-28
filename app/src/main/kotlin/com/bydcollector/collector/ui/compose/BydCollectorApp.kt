@@ -109,6 +109,8 @@ import com.bydcollector.collector.ui.RuntimeActionStatus
 import com.bydcollector.collector.ui.VehicleKpis
 import com.bydcollector.collector.ui.UiSessionState
 import com.bydcollector.collector.update.ReleaseNotesSelector
+import com.bydcollector.collector.update.ReleaseNotesHistory
+import com.bydcollector.collector.update.ReleaseNotesEntry
 import com.bydcollector.collector.update.UpdateInfo
 import com.bydcollector.collector.update.UpdateHintAppearance
 import com.bydcollector.collector.update.UpdateUiState
@@ -142,6 +144,7 @@ fun BydCollectorApp(
     updateHintEnabled: Boolean = true,
     updateHintAppearance: UpdateHintAppearance = UpdateHintAppearance(),
     updateUiState: UpdateUiState = UpdateUiState.Hidden,
+    releaseNotesHistory: ReleaseNotesHistory? = null,
     onUpdateOfferPresented: () -> Unit = {},
     databaseMaintenanceUiState: DbMaintenanceUiState? = null,
     diagnosticsBusy: Boolean = false,
@@ -317,6 +320,7 @@ fun BydCollectorApp(
                         appVersionName = appVersionName,
                         language = language,
                         state = updateUiState,
+                        releaseNotesHistory = releaseNotesHistory,
                         onPresented = onUpdateOfferPresented,
                         onDismiss = actions::onDismissUpdateDialog,
                         onUpdate = actions::onInstallUpdate
@@ -2849,6 +2853,7 @@ private fun UpdateCheckDialog(
     appVersionName: String,
     language: UiLanguage,
     state: UpdateUiState,
+    releaseNotesHistory: ReleaseNotesHistory?,
     onPresented: () -> Unit,
     onDismiss: () -> Unit,
     onUpdate: () -> Unit
@@ -2895,11 +2900,11 @@ private fun UpdateCheckDialog(
                     when (state) {
                         UpdateUiState.Checking -> Text(strings.checkingForUpdate, color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                         UpdateUiState.UpToDate -> Text(strings.latestVersion, color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                        is UpdateUiState.Available -> AvailableUpdateNotes(strings, state.info, language)
+                        is UpdateUiState.Available -> AvailableUpdateNotes(strings, state.info, language, releaseNotesHistory)
                         is UpdateUiState.Downloading -> {
                             DownloadingUpdateHeader(strings)
                             Spacer(Modifier.height(10.dp))
-                            AvailableUpdateNotes(strings, state.info, language)
+                            AvailableUpdateNotes(strings, state.info, language, releaseNotesHistory)
                         }
                         is UpdateUiState.Error -> Text("${strings.updateError}: ${localizedUpdateError(strings, state.message)}", color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                         UpdateUiState.Hidden -> Text(strings.checkingForUpdate, color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
@@ -3555,10 +3560,9 @@ private fun localizedArchiveStorageMessage(strings: UiStrings, status: ArchiveSt
 }
 
 @Composable
-private fun AvailableUpdateNotes(strings: UiStrings, info: UpdateInfo, language: UiLanguage) {
-    val selectedReleaseNotes = remember(info.releaseNotes, language) {
-        ReleaseNotesSelector.select(info.releaseNotes, language == UiLanguage.UK)
-    }
+private fun AvailableUpdateNotes(strings: UiStrings, info: UpdateInfo, language: UiLanguage, history: ReleaseNotesHistory?) {
+    val p = LocalBydPalette.current
+    val ukrainian = language == UiLanguage.UK
     Text(
         text = "${strings.availableVersion} ${info.version}",
         color = LocalBydPalette.current.text,
@@ -3566,7 +3570,31 @@ private fun AvailableUpdateNotes(strings: UiStrings, info: UpdateInfo, language:
         fontWeight = FontWeight.SemiBold
     )
     Spacer(Modifier.height(12.dp))
-    MarkdownPatchNotesText(selectedReleaseNotes)
+    if (history == null || history.loading) {
+        Text(if (ukrainian) "Завантажуємо історію змін..." else "Loading release history...", color = p.muted, fontSize = 13.sp)
+        Spacer(Modifier.height(12.dp))
+    } else if (history.incomplete) {
+        Text(
+            if (ukrainian) "Історію змін завантажено не повністю. Повторіть перевірку оновлень, щоб спробувати ще раз."
+            else "Release history is incomplete. Check for updates again to retry.",
+            color = p.yellow, fontSize = 13.sp
+        )
+        Spacer(Modifier.height(12.dp))
+    }
+    val entries = history?.entries ?: listOf(ReleaseNotesEntry(info.version, info.releaseNotes))
+    entries.forEachIndexed { index, entry ->
+        key(entry.version) {
+            if (index > 0) {
+                Spacer(Modifier.height(12.dp))
+                Box(Modifier.fillMaxWidth().height(1.dp).background(p.border))
+                Spacer(Modifier.height(12.dp))
+            }
+            Text("v${entry.version.removePrefix("v")}", color = p.text, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(12.dp))
+            val notes = remember(entry, ukrainian) { ReleaseNotesSelector.forVersion(entry, ukrainian) }
+            MarkdownPatchNotesText(notes.ifBlank { if (ukrainian) "Опис змін відсутній." else "No release notes provided." })
+        }
+    }
 }
 
 private fun archiveItemProgressLabel(item: ArchiveStorageItemState, ukrainian: Boolean): String {

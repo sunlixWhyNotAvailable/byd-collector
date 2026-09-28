@@ -572,8 +572,8 @@ class VehicleStateNormalizerTest {
     fun catalogVersionAndExpansionWaveExposeRepresentativeFields() {
         val fieldsByKey = NormalizedFieldCatalog.fields.associateBy { it.fieldKey }
 
-        assertEquals("normalized-direct-v15-20260914-energy", NormalizedFieldCatalog.CATALOG_VERSION)
-        assertEquals(105, NormalizedFieldCatalog.fields.size)
+        assertEquals("normalized-direct-v16-20260928-discharge-limit", NormalizedFieldCatalog.CATALOG_VERSION)
+        assertEquals(106, NormalizedFieldCatalog.fields.size)
         assertFalse(fieldsByKey.containsKey("charging_state"))
         assertEquals(emptyList(), NormalizedFieldCatalog.fields.filter { field ->
             field.sourceKeys.any {
@@ -720,6 +720,31 @@ class VehicleStateNormalizerTest {
         assertEquals(123.0, output.single { it.field == maxDischarge }.value.number)
         assertEquals(4.0, output.single { it.field == sunroof }.value.number)
         output.forEach { assertEquals(NormalizedQuality.OK, it.quality) }
+    }
+
+    @Test
+    fun dischargeLimitIsAdditiveAndScalesRawNotDescriptionOrMeasuredPower() {
+        val rawField = NormalizedFieldCatalog.maxDischargePowerAllow
+        val limit = NormalizedFieldCatalog.maxDischargePowerAllowKw
+        val normalizer = VehicleStateNormalizer(listOf(rawField, limit))
+        assertEquals(NormalizedCategory.BATTERY, limit.category)
+        assertEquals("kW", limit.unit)
+        assertEquals(rawField.sourceKeys, limit.sourceKeys)
+        assertEquals("Discharge power limit", limit.displayName)
+        listOf(4200.0 to 420.0, 123.0 to 12.3, 0.0 to 0.0, 5000.0 to 500.0).forEach { (raw, expected) ->
+            val values = normalizer.normalize(1, "2026-09-28T12:00:00Z", listOf(PollReading(rawField.sourceKeys.single(), raw.toInt().toString(), "9999")))
+            assertEquals(raw, values.single { it.field == rawField }.value.number)
+            assertEquals(expected, values.single { it.field == limit }.value.number)
+            assertTrue(values.all { it.quality == NormalizedQuality.OK })
+        }
+        listOf("-10011", "-10013", "65535", "1048575", "-1", "1.5", "NaN", "Infinity", "bad").forEach { raw ->
+            val value = normalizer.normalize(2, "2026-09-28T12:00:01Z", listOf(PollReading(rawField.sourceKeys.single(), raw, "420"))).single { it.field == limit }
+            assertEquals(NormalizedQuality.INVALID, value.quality)
+            assertEquals(null, value.value.number)
+        }
+        val missing = normalizer.normalize(3, "2026-09-28T12:00:02Z", emptyList()).single { it.field == limit }
+        assertEquals(NormalizedQuality.MISSING, missing.quality)
+        assertEquals(null, missing.value.number)
     }
 
     @Test

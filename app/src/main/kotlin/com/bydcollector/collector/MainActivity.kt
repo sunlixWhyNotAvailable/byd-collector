@@ -111,6 +111,9 @@ class MainActivity : ComponentActivity() {
     private val updateExecutor = namedSingleThreadExecutor("byd-update")
     private val updateChecks: UpdateCheckSession
         get() = (applicationContext as BydCollectorApplication).updateChecks
+    private val releaseNotesHistory
+        get() = (applicationContext as BydCollectorApplication).releaseNotesHistory
+    private var updateReleaseNotes by mutableStateOf<com.bydcollector.collector.update.ReleaseNotesHistory?>(null)
     private val updateRuntime: UpdateRuntime
         get() = (applicationContext as BydCollectorApplication).updateRuntime
     private val updateDownloader by lazy { UpdateDownloader(applicationContext) }
@@ -218,6 +221,7 @@ class MainActivity : ComponentActivity() {
     private val startupAdbSelfCheckTask = Runnable { runStartupAdbSelfCheckIfReady() }
     private val updateCheckUiTask = Runnable { syncUpdateCheckUi() }
     private val updateCheckListener: () -> Unit = { handler.post(updateCheckUiTask); Unit }
+    private val releaseNotesListener: () -> Unit = { handler.post { syncReleaseNotesUi() }; Unit }
     private val telegramReconcileTask = Runnable {
         if (!destroyed && ::settings.isInitialized) {
             CollectorServiceController.reconcileTelegram(this@MainActivity)
@@ -705,6 +709,7 @@ class MainActivity : ComponentActivity() {
             settings.recoverInterruptedDbMaintenanceIfNeeded("activity_start")
         }
         updateChecks.addListener(updateCheckListener)
+        releaseNotesHistory.addListener(releaseNotesListener)
         stateProvider = DashboardStateProvider(applicationContext, { BydCollectorApplication.store(applicationContext) }, settings)
         dashboardUiStateStore = BydCollectorApplication.dashboardUiStateStore(applicationContext)
         dashboardUiStateStore.selectVehicleKpiLanguage(uiLanguage.vehicleKpiLanguage())
@@ -767,6 +772,7 @@ class MainActivity : ComponentActivity() {
                 updateHintEnabled = updateHintEnabled,
                 updateHintAppearance = updateHintAppearance,
                 updateUiState = updateUiState,
+                releaseNotesHistory = updateReleaseNotes,
                 onUpdateOfferPresented = {
                     // A frame drawn behind native permission UI is not an offer
                     // shown to the user. Focus is observed in the draw callback.
@@ -965,6 +971,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         destroyed = true
         updateChecks.removeListener(updateCheckListener)
+        releaseNotesHistory.removeListener(releaseNotesListener)
         archiveDeleteDispatchStartedAtMs = null
         actionUiState = BydCollectorActionUiState()
         diagnosticsBusy = false
@@ -1946,6 +1953,18 @@ class MainActivity : ComponentActivity() {
         updatePresentationRevision = snapshot.revision
         updateOfferResultId = snapshot.availableResultId
         updateUiState = snapshot.uiState
+        (updateUiState as? UpdateUiState.Available)?.let { releaseNotesHistory.request(it.info) }
+        syncReleaseNotesUi()
+    }
+
+    private fun syncReleaseNotesUi() {
+        if (destroyed) return
+        val info = when (val state = updateUiState) {
+            is UpdateUiState.Available -> state.info
+            is UpdateUiState.Downloading -> state.info
+            else -> null
+        }
+        updateReleaseNotes = info?.let(releaseNotesHistory::snapshot)
     }
 
     private fun recordUpdateEvent(message: String, detail: String? = null) {

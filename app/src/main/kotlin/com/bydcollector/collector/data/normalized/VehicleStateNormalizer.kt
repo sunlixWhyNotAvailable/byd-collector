@@ -1,6 +1,7 @@
 package com.bydcollector.collector.data.normalized
 
 import com.bydcollector.collector.data.direct.DirectFidRegistry
+import com.bydcollector.collector.data.direct.DirectValueDecoders
 import com.bydcollector.collector.data.local.PollReading
 import java.time.Instant
 import java.util.Locale
@@ -110,6 +111,14 @@ class VehicleStateNormalizer(
     ): Pair<NormalizedQuality, NormalizedValue> {
         if (reading == null) {
             return NormalizedQuality.MISSING to emptyValue(field.valueType)
+        }
+        if (field.fieldKey == "max_discharge_power_allow_kw" && reading.rawValue != null) {
+            val raw = parseInteger(reading.rawValue)
+            val source = DirectFidRegistry.entries.first { it.key == "statistic_1014_877658120_5" }
+            // Keep the legacy raw field untouched, but never scale known native error sentinels into kW.
+            if (raw == null || DirectValueDecoders.decode(source, raw) == null) {
+                return NormalizedQuality.INVALID to emptyValue(field.valueType)
+            }
         }
         return when (field.normalizerId) {
             "percent_0_100" -> normalizeNumber(field, rawOnly(reading)) { it in 0.0..100.0 }

@@ -9,6 +9,20 @@ import org.json.JSONObject
 
 class HaMqttPayloadBuilderTest {
     @Test
+    fun dischargeLimitAndLegacyRawKeepIndependentValuesAndIdentity() {
+        val source = "statistic_1014_877658120_5"
+        val rows = listOf(
+            storedState("max_discharge_power_allow_raw", "NUMBER", valueNumber = 4200.0, quality = "OK", sourcePollId = 42L, sourceKeys = source),
+            storedState("max_discharge_power_allow_kw", "NUMBER", valueNumber = 420.0, quality = "OK", sourcePollId = 42L, sourceKeys = source).copy(unit = "kW")
+        )
+        val json = JSONObject(HaMqttPayloadBuilder.categoryState("battery", "2026-09-28T12:00:00Z", rows))
+        assertEquals(4200.0, json.getJSONObject("fields").getDouble("max_discharge_power_allow_raw"))
+        assertEquals(420.0, json.getJSONObject("fields").getDouble("max_discharge_power_allow_kw"))
+        assertEquals(source, json.getJSONObject("source_keys").getString("max_discharge_power_allow_kw"))
+        assertEquals("ok", json.getJSONObject("quality").getString("max_discharge_power_allow_kw"))
+    }
+
+    @Test
     fun categoryStateGroupsFieldsWithQualityAndTimestamps() {
         val payload = HaMqttPayloadBuilder.categoryState(
             category = "battery",

@@ -170,6 +170,22 @@ class HaDiscoveryBuilderTest {
     }
 
     @Test
+    fun dischargeLimitDiscoveryKeepsRawEntityAndAddsSeparatePowerLimit() {
+        val messages = HaDiscoveryBuilder.discoveryMessages(
+            config = config(enabledCategories = setOf("battery")),
+            fields = listOf(NormalizedFieldCatalog.maxDischargePowerAllow, NormalizedFieldCatalog.maxDischargePowerAllowKw)
+        )
+        assertEquals(2, messages.size)
+        val limit = JSONObject(messages.single { it.topic.endsWith("/max_discharge_power_allow_kw/config") }.payload)
+        assertEquals("Discharge power limit", limit.getString("name"))
+        assertEquals("kW", limit.getString("unit_of_measurement"))
+        assertEquals("power", limit.getString("device_class"))
+        assertEquals("measurement", limit.getString("state_class"))
+        assertEquals("{{ value_json.fields.max_discharge_power_allow_kw }}", limit.getString("value_template"))
+        assertFalse(JSONObject(messages.single { it.topic.endsWith("/max_discharge_power_allow_raw/config") }.payload).has("unit_of_measurement"))
+    }
+
+    @Test
     fun discoverySkipsNonDefaultRawFieldsWithinEnabledDefaultCategory() {
         val tireStateRaw = NormalizedFieldCatalog.fields.single { it.fieldKey == "tyre_state_lf" }
         val radarDistance = NormalizedFieldCatalog.fields.single { it.fieldKey == "radar_1025_neg_1728053151_5" }

@@ -2,7 +2,7 @@ package com.bydcollector.collector.data.normalized
 
 //semantic catalog that maps curated raw keys to stable fields exposed to dashboard, mqtt, and influx
 object NormalizedFieldCatalog {
-    const val CATALOG_VERSION = "normalized-direct-v15-20260914-energy"
+    const val CATALOG_VERSION = "normalized-direct-v16-20260928-discharge-limit"
 
     val soc = number(
         fieldKey = "soc",
@@ -142,6 +142,7 @@ object NormalizedFieldCatalog {
     val batteryAverageTemp = number("battery_average_temp_raw", NormalizedCategory.BATTERY, "°C", "Battery average temperature", "temperature", "measurement", listOf("statistic_average_battery_temp"), "raw_temp_c_offset_40")
     val chargerConnected = bool("charger_connected_raw", NormalizedCategory.BATTERY, "Charger connected", "plug", listOf("charging_1009_89128973_5"), "charger_connected_openapi")
     val maxDischargePowerAllow = number("max_discharge_power_allow_raw", NormalizedCategory.BATTERY, null, "Max discharge power allow raw", null, null, listOf("statistic_1014_877658120_5"), "number_raw")
+    val maxDischargePowerAllowKw = number("max_discharge_power_allow_kw", NormalizedCategory.BATTERY, "kW", "Discharge power limit", "power", "measurement", maxDischargePowerAllow.sourceKeys, "raw_number_deci_non_negative")
 
     val locationLatitude = number("location_latitude", NormalizedCategory.LOCATION, "°", "GPS latitude", null, "measurement", listOf("android_gps"), "android_gps")
     val locationLongitude = number("location_longitude", NormalizedCategory.LOCATION, "°", "GPS longitude", null, "measurement", listOf("android_gps"), "android_gps")
@@ -250,6 +251,7 @@ object NormalizedFieldCatalog {
         batteryAverageTemp,
         chargerConnected,
         maxDischargePowerAllow,
+        maxDischargePowerAllowKw,
         locationLatitude,
         locationLongitude,
         locationAccuracy,

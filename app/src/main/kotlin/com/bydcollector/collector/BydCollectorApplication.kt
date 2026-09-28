@@ -113,6 +113,16 @@ class BydCollectorApplication : Application() {
         }
     }
     internal val updateRuntime by lazy { UpdateRuntime(this) }
+    internal val releaseNotesHistory by lazy {
+        com.bydcollector.collector.update.ReleaseNotesHistorySession(
+            dispatch = { task -> updateCheckExecutorDelegate.value.execute(Runnable { task() }) },
+            loader = { info, isCurrent ->
+                com.bydcollector.collector.update.loadReleaseNotesHistory(BuildConfig.VERSION_NAME, info, isCurrent).also {
+                    recordUpdateEvent("release_history_result", "target=${info.version} releases=${it.entries.size} incomplete=${it.incomplete}")
+                }
+            }
+        )
+    }
     val telegramDeliveryRuntime by telegramDeliveryRuntimeDelegate
     internal val updateHints by lazy { UpdateHintOverlay(this) }
     private val archiveStorageSnapshotCacheDelegate = lazy {

@@ -240,6 +240,8 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
                 return false
             }
         }
+        // Invalidate before dispatch/join: the worker may settle before request() returns.
+        if (manual) app.releaseNotesHistory.reset()
         val accepted = app.updateChecks.request(manual)
         if (accepted || (manual && app.updateChecks.hasCurrentManualRequest())) {
             UpdateAutoCheckRuntime.onCheckStarted()
@@ -267,6 +269,7 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
         UpdateAutoCheckRuntime.reset()
         hintCreationRetry.offer(null)
         app.updateChecks.reset()
+        app.releaseNotesHistory.reset()
         presentation.reset()
         app.updateHints.shutdown()
         wakeReceiver?.let { receiver ->

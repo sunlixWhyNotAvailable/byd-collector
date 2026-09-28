@@ -437,7 +437,8 @@ class InfluxExportCoordinatorTest {
                     category = "body",
                     valueNumber = 4.0,
                     unit = null
-                )
+                ),
+                row(id = 4, fieldKey = "max_discharge_power_allow_kw").copy(valueNumber = 12.3, unit = "kW")
             )
         )
         val client = FakeInfluxClient()
@@ -451,10 +452,11 @@ class InfluxExportCoordinatorTest {
 
         assertTrue(result.ok)
         val lines = client.writtenLines.single()
-        assertEquals(2, lines.size)
+        assertEquals(3, lines.size)
         assertTrue(lines.none { it.contains("field_key=charging_state") })
         assertTrue(lines.any { it.contains("field_key=max_discharge_power_allow_raw") && it.contains("unit=none") })
         assertTrue(lines.any { it.contains("field_key=bodywork_sunroof_windoblind_position") && it.contains("unit=none") })
+        assertTrue(lines.any { it.contains("field_key=max_discharge_power_allow_kw") && it.contains("unit=kW") && it.contains("value_num=12.3") })
     }
 
     @Test

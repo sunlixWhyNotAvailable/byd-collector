@@ -26,16 +26,20 @@ class UpdateChecker(
 
 private fun fetchLatestReleaseFromGitHub(): String {
     //keep github url outside ui so release target is build-time configurable
-    val trustedUrl = GitHubReleaseTrust.requireTrustedApiUrl(BuildConfig.UPDATE_RELEASES_API_URL)
-    val connection = (URL(trustedUrl).openConnection() as HttpURLConnection).apply {
+    return readUpdateResponse(openUpdateConnection(BuildConfig.UPDATE_RELEASES_API_URL))
+}
+
+internal fun openUpdateConnection(url: String): HttpURLConnection {
+    val trustedUrl = GitHubReleaseTrust.requireTrustedApiUrl(url)
+    return (URL(trustedUrl).openConnection() as HttpURLConnection).apply {
         requestMethod = "GET"
+        instanceFollowRedirects = false
         useCaches = false
         connectTimeout = 10_000
         readTimeout = 10_000
         setRequestProperty("Accept", "application/vnd.github+json")
         setRequestProperty("User-Agent", "BYDCollector-UpdateCheck")
     }
-    return readUpdateResponse(connection)
 }
 
 internal fun readUpdateResponse(connection: HttpURLConnection): String {

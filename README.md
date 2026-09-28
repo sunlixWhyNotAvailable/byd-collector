@@ -59,7 +59,9 @@ The app is available in English and Ukrainian, with dark and light themes.
 
 The collected data includes charging mode and battery charging status, the charging connector type, opening percentages for all four windows, and estimated remaining perfume and installation state for three slots. The vehicle's estimated charging time remaining is exported as one `hh:mm:ss` value; unavailable readings are not shown as zero. Front and rear motor-current readings remain unitless raw values because their physical units are not yet verified. These fields are available to MQTT and InfluxDB through their selected categories.
 
-Some fields have known interpretation limits: raw `CHARGING_STATE` is unreliable and is not used to identify charging for exports or Telegram. Charging notifications use confirmed battery charging states together with connector and power readings, falling back to connector and power when the battery state is unavailable. A confirmed full charge takes priority over a stopped notification. `max_discharge_power_allow_raw` has no verified unit or kW scale, and sunroof/windblind position codes must not be interpreted as a simple open/closed value.
+Some fields have known interpretation limits: raw `CHARGING_STATE` is unreliable and is not used to identify charging for exports or Telegram. Charging notifications use confirmed battery charging states together with connector and power readings, falling back to connector and power when the battery state is unavailable. A confirmed full charge takes priority over a stopped notification. Sunroof/windblind position codes must not be interpreted as a simple open/closed value.
+
+The Battery category also exports **Discharge power limit** in kW: the permitted limit, not measured power or energy used. The original unitless raw field and its history remain available separately; existing history is not rewritten.
 
 Use `Stop` when collection is no longer needed. Background collection and its vehicle-specific limits are described under [Known limitations](#known-limitations).
 
@@ -209,6 +211,8 @@ The autonomous telemetry helper asks Android to keep the CPU awake while it is r
 Automatic update checking starts after 30 seconds and runs in the background without opening Collector. Failed checks retry after 30, 60, 120, and then every 300 seconds, measured from completion of the failed attempt; a successful check stops retries. Screen-off pauses only update checking, not telemetry collection. The next screen wake starts a fresh 30-second cycle. Opening or minimizing Collector does not reset this timer.
 
 When Collector is visible, an available update is offered inside the app. Closing an update offer pauses automatic checks for an hour, unless a new wake starts a fresh cycle first. Manual checking remains available and checks the latest published release; if a valid check is already running, it shares that request instead of starting another.
+
+The update dialog shows release notes for every published version newer than the installed version through the offered update, newest first, in the selected language when available. Notes load separately; if the history is incomplete, a warning appears and Update/Close remain available. A new manual update check retries loading the history.
 
 `New version hint widget` is enabled by default. When a background check finds an update, it can show a hint above other apps for 10 seconds. Tap it to open `Options` and the saved update offer, or close it with the X. Returning to Collector removes its hint without repeating the check; minimizing the app does not replay a hint or offer that was already shown. The settings button beside the switch adjusts size, transparency, corners, and frame/stripe color; the default accent is green.
 
