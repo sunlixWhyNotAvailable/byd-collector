@@ -3,6 +3,7 @@ package com.bydcollector.collector.telegram
 import com.bydcollector.collector.data.local.TelegramDeliveryStore
 import com.bydcollector.collector.data.local.TelegramOutboxEntry
 import java.security.MessageDigest
+import java.util.UUID
 
 internal data class TelegramDeliveryCredentials(val enabled: Boolean, val token: String, val chatId: String)
 
@@ -12,7 +13,15 @@ internal data class TelegramDeliveryAttempt(
     val entry: TelegramOutboxEntry?,
     val request: TelegramSendMessage,
     val trigger: String,
-    val startedAtMs: Long
+    val startedAtMs: Long,
+    val dedupeKey: String? = entry?.dedupeKey,
+    val eventType: String = entry?.eventType ?: "connection_test"
+)
+
+internal data class TelegramPendingResult(
+    val attempt: TelegramDeliveryAttempt,
+    val result: TelegramSendResult,
+    val confirmedAtMs: Long
 )
 
 internal sealed class TelegramConnectionSelection {
@@ -28,10 +37,11 @@ internal class TelegramDeliveryQueue(
     private val send: (TelegramSendMessage) -> TelegramSendResult = {
         error("Synchronous Telegram delivery is unavailable")
     },
-    private val commitDelivery: (TelegramOutboxEntry, Long) -> Unit,
+    private val commitDelivery: (TelegramOutboxEntry, Long?, Long) -> Unit,
     private val record: (String, TelegramOutboxEntry?, String) -> Unit,
     private val nowMs: () -> Long,
-    private val retryPolicy: TelegramRetryPolicy = TelegramRetryPolicy()
+    private val retryPolicy: TelegramRetryPolicy = TelegramRetryPolicy(),
+    private val deliveryLaneAvailable: () -> Boolean = { true }
 ) {
     private var lastWait: String? = null
     private var inFlight: TelegramDeliveryAttempt? = null
@@ -68,7 +78,7 @@ internal class TelegramDeliveryQueue(
         priorityKey: String? = null,
         expediteLocal: Boolean = false
     ): TelegramDeliveryAttempt? {
-        if (inFlight != null) return null
+        if (inFlight != null || !deliveryLaneAvailable()) return null
         val config = credentials()
         if (!canDeliver(config)) {
             finishDrain(null)
@@ -106,7 +116,13 @@ internal class TelegramDeliveryQueue(
         }
         lastWait = null
         attemptedInDrain.add(entry.id)
-        record("attempt", entry, "trigger=$trigger age_ms=${(now - entry.createdAtMs).coerceAtLeast(0)} attempt=${entry.attemptCount + 1}")
+        record(
+            "attempt",
+            entry,
+            "trigger=$trigger age_ms=${(now - entry.createdAtMs).coerceAtLeast(0)} " +
+                "created_at_ms=${entry.createdAtMs} occurred_at_ms=${entry.occurredAtMs ?: "unknown"} " +
+                "attempt=${entry.attemptCount + 1}"
+        )
         return TelegramDeliveryAttempt(
             token = allocateAttemptToken(),
             entry = entry,
@@ -119,7 +135,7 @@ internal class TelegramDeliveryQueue(
     /** Expedites eligible local network failures, then reserves one recovery delivery. */
     @Synchronized
     fun beginRecovery(trigger: String): TelegramDeliveryAttempt? {
-        if (inFlight != null) return null
+        if (inFlight != null || !deliveryLaneAvailable()) return null
         if (!canDeliver(credentials())) {
             finishDrain(null)
             return null
@@ -128,26 +144,44 @@ internal class TelegramDeliveryQueue(
         return beginAttempt(trigger)
     }
 
-    /** Applies the HTTP result on the ordered owner and releases the shared lane. */
+    /** Applies an HTTP result for an attempt reserved by this queue. */
     @Synchronized
     fun completeAttempt(attempt: TelegramDeliveryAttempt, result: TelegramSendResult): Long? {
         check(inFlight == attempt && attempt.entry != null) { "Telegram delivery attempt is not active" }
+        return settleReceivedAttempt(attempt, result, nowMs()) {}
+    }
+
+    /** Applies a process-retained result, adopting its immutable attempt after owner recreation. */
+    @Synchronized
+    fun settleReceivedAttempt(
+        attempt: TelegramDeliveryAttempt,
+        result: TelegramSendResult,
+        confirmedAtMs: Long,
+        onDurablySettled: () -> Unit
+    ): Long? {
+        check(attempt.entry != null) { "Telegram outbox attempt has no entry" }
+        check(inFlight == null || inFlight == attempt) { "Telegram delivery queue is busy" }
+        if (inFlight == null) inFlight = attempt
         val entry = requireNotNull(attempt.entry)
         try {
             when (result) {
-                TelegramSendResult.Success -> {
-                    val deliveredAt = nowMs()
+                is TelegramSendResult.Success -> {
                     // The owner atomically commits outbox removal, dependency release and semantic receipt.
-                    commitDelivery(entry, deliveredAt)
-                    record(
-                        "delivered",
-                        entry,
-                        "trigger=${attempt.trigger} age_ms=${(deliveredAt - entry.createdAtMs).coerceAtLeast(0)}"
-                    )
-                    expediteNetworkFailures("delivery_success")
+                    commitDelivery(entry, result.messageId, confirmedAtMs)
+                    onDurablySettled()
+                    runCatching {
+                        record(
+                            "delivered",
+                            entry,
+                            "trigger=${attempt.trigger} age_ms=${(confirmedAtMs - entry.createdAtMs).coerceAtLeast(0)} " +
+                                "created_at_ms=${entry.createdAtMs} occurred_at_ms=${entry.occurredAtMs ?: "unknown"} " +
+                                "http_confirmed_at_ms=$confirmedAtMs message_id=${result.messageId ?: "none"}"
+                        )
+                    }
+                    runCatching { expediteNetworkFailures("delivery_success") }
                 }
                 is TelegramSendResult.Failure -> {
-                    val failedAt = nowMs()
+                    val failedAt = confirmedAtMs
                     val error = telegramFailureCode(result)
                     val localAt = deadlineAfter(failedAt, retryPolicy.delayForFailure(entry.failureCount + 1))
                     val serverDeadline = recordServerLimit(attempt.request.botToken, result, failedAt, localAt)
@@ -159,26 +193,30 @@ internal class TelegramDeliveryQueue(
                         store.markTelegramBlocked(entry.id, error, attempt.startedAtMs)
                         null
                     }
-                    record(
-                        "failed",
-                        entry,
-                        "trigger=${attempt.trigger} ${telegramFailureDetail(result)} " +
-                            "next_attempt_at_ms=${next ?: "none"}"
-                    )
+                    onDurablySettled()
+                    runCatching {
+                        record(
+                            "failed",
+                            entry,
+                            "trigger=${attempt.trigger} ${telegramFailureDetail(result)} " +
+                                "created_at_ms=${entry.createdAtMs} occurred_at_ms=${entry.occurredAtMs ?: "unknown"} " +
+                                "http_result_at_ms=$confirmedAtMs next_attempt_at_ms=${next ?: "none"}"
+                        )
+                    }
                 }
             }
         } finally {
-            inFlight = null
+            if (inFlight == attempt) inFlight = null
         }
         // A future retry of this row must not hide another due row.
-        return finishDrain(pendingDeadline())
+        return runCatching { finishDrain(pendingDeadline()) }.getOrNull()
     }
 
     @Synchronized
     fun pendingDeadline(): Long? {
         // Completion posts the next owner callback. Returning an immediate deadline here while HTTP
         // is active would make the local executor spin on a lane that cannot yet make progress.
-        if (inFlight != null) return null
+        if (inFlight != null || !deliveryLaneAvailable()) return null
         val config = credentials()
         if (!canDeliver(config)) return null
         val localAt = store.nextTelegramAttemptAtMs() ?: return null
@@ -208,13 +246,18 @@ internal class TelegramDeliveryQueue(
 
     /** Connection tests share the same single-flight lane as durable deliveries. */
     @Synchronized
-    fun beginConnectionTest(request: TelegramSendMessage): TelegramConnectionSelection {
+    fun beginConnectionTest(
+        request: TelegramSendMessage,
+        requestKey: String = "manual:${UUID.randomUUID()}"
+    ): TelegramConnectionSelection {
         if (!request.botToken.matches(Regex("[0-9]+:[A-Za-z0-9_-]+")) || request.chatId.isBlank()) {
             return TelegramConnectionSelection.Immediate(
                 TelegramSendResult.Failure(TelegramSendFailureKind.CONFIGURATION)
             )
         }
-        if (inFlight != null || Thread.currentThread().isInterrupted) return TelegramConnectionSelection.Busy
+        if (inFlight != null || !deliveryLaneAvailable() || Thread.currentThread().isInterrupted) {
+            return TelegramConnectionSelection.Busy
+        }
         val now = nowMs()
         val serverAt = store.telegramServerNotBefore(botScope(request.botToken))
         if (serverAt > now) {
@@ -233,7 +276,9 @@ internal class TelegramDeliveryQueue(
                 entry = null,
                 request = request,
                 trigger = "connection_test",
-                startedAtMs = now
+                startedAtMs = now,
+                dedupeKey = requestKey,
+                eventType = "connection_test"
             ).also { inFlight = it }
         )
     }
@@ -244,20 +289,46 @@ internal class TelegramDeliveryQueue(
         result: TelegramSendResult
     ): TelegramSendResult {
         check(inFlight == attempt && attempt.entry == null) { "Telegram connection attempt is not active" }
+        return settleReceivedConnectionTest(
+            attempt = attempt,
+            result = result,
+            confirmedAtMs = nowMs(),
+            persistSuccess = {},
+            onDurablySettled = {}
+        )
+    }
+
+    /** Persists a manual success/cooldown before the process-owned lane is released. */
+    @Synchronized
+    fun settleReceivedConnectionTest(
+        attempt: TelegramDeliveryAttempt,
+        result: TelegramSendResult,
+        confirmedAtMs: Long,
+        persistSuccess: (TelegramSendResult.Success) -> Unit,
+        onDurablySettled: () -> Unit
+    ): TelegramSendResult {
+        check(attempt.entry == null) { "Telegram connection attempt unexpectedly has an outbox row" }
+        check(inFlight == null || inFlight == attempt) { "Telegram delivery queue is busy" }
+        if (inFlight == null) inFlight = attempt
         try {
-            if (result is TelegramSendResult.Failure) {
-                val failedAt = nowMs()
-                recordServerLimit(
-                    attempt.request.botToken,
-                    result,
-                    failedAt,
-                    deadlineAfter(failedAt, retryPolicy.delayForFailure(1))
-                )
-            } else if (canDeliver(credentials())) {
-                expediteNetworkFailures("connection_test")
+            when (result) {
+                is TelegramSendResult.Success -> persistSuccess(result)
+                is TelegramSendResult.Failure -> {
+                    val failedAt = confirmedAtMs
+                    recordServerLimit(
+                        attempt.request.botToken,
+                        result,
+                        failedAt,
+                        deadlineAfter(failedAt, retryPolicy.delayForFailure(1))
+                    )
+                }
+            }
+            onDurablySettled()
+            if (result is TelegramSendResult.Success && canDeliver(credentials())) {
+                runCatching { expediteNetworkFailures("connection_test") }
             }
         } finally {
-            inFlight = null
+            if (inFlight == attempt) inFlight = null
         }
         return result
     }
@@ -331,5 +402,15 @@ internal fun telegramFailureCode(result: TelegramSendResult.Failure): String = l
     result.kind.name.lowercase(), result.httpStatus?.toString(), result.exceptionClass
 ).joinToString(":")
 
-internal fun telegramFailureDetail(result: TelegramSendResult.Failure): String =
-    "kind=${result.kind.name.lowercase()} status=${result.httpStatus ?: "none"} exception=${result.exceptionClass ?: "none"}"
+internal fun telegramFailureDetail(result: TelegramSendResult.Failure): String {
+    val deliveryState = when (result.kind) {
+        TelegramSendFailureKind.NETWORK_ERROR,
+        TelegramSendFailureKind.INVALID_RESPONSE,
+        TelegramSendFailureKind.SERVER_ERROR -> "ambiguous"
+        TelegramSendFailureKind.CONFIGURATION,
+        TelegramSendFailureKind.INVALID_MESSAGE -> "not_sent"
+        else -> "rejected"
+    }
+    return "kind=${result.kind.name.lowercase()} status=${result.httpStatus ?: "none"} " +
+        "exception=${result.exceptionClass ?: "none"} delivery_state=$deliveryState"
+}

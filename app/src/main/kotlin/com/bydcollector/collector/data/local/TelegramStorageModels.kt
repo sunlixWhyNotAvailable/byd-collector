@@ -11,7 +11,8 @@ data class TelegramOutboxEntry(
     val waitsForSummaryKey: String? = null,
     val createdAtMs: Long = 0L,
     val failureCount: Int = attemptCount,
-    val lastError: String? = null
+    val lastError: String? = null,
+    val occurredAtMs: Long? = null
 )
 
 /** Narrow durable delivery contract shared by the independent Telegram sender. */
@@ -48,7 +49,15 @@ data class TelegramOutboxMessage(
     val dedupeKey: String,
     val eventType: String,
     val payload: String,
-    val waitsForSummaryKey: String? = null
+    val waitsForSummaryKey: String? = null,
+    val occurredAtMs: Long? = null
+)
+
+data class TelegramDeliveryReceipt(
+    val dedupeKey: String,
+    val eventType: String,
+    val confirmedAtMs: Long,
+    val telegramMessageId: Long? = null
 )
 
 /** A lossless copy of one row from the pre-sidecar Main database. */

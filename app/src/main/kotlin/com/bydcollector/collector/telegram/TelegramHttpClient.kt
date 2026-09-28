@@ -29,7 +29,7 @@ enum class TelegramSendFailureKind(val retryable: Boolean) {
 }
 
 sealed interface TelegramSendResult {
-    data object Success : TelegramSendResult
+    data class Success(val messageId: Long? = null) : TelegramSendResult
 
     data class Failure(
         val kind: TelegramSendFailureKind,
@@ -79,7 +79,7 @@ class TelegramHttpClient(
             val response = responseBody(activeConnection, responseStatus)
             if (response.truncated) {
                 if (responseStatus in 200..299 && TRUNCATED_SUCCESS_PREFIX.containsMatchIn(response.text)) {
-                    TelegramSendResult.Success
+                    TelegramSendResult.Success()
                 } else {
                     oversizedResponse(responseStatus)
                 }
@@ -92,7 +92,8 @@ class TelegramHttpClient(
                 exceptionClass = error::class.java.name
             )
         } finally {
-            connection?.disconnect()
+            // Cleanup must not turn an already-confirmed send into a retryable failure.
+            runCatching { connection?.disconnect() }
         }
     }
 
@@ -103,7 +104,12 @@ class TelegramHttpClient(
             } else {
                 failure(kindFor(httpStatus), httpStatus, httpStatus)
             }
-        if (httpStatus in 200..299 && json.optBoolean("ok", false)) return TelegramSendResult.Success
+        if (httpStatus in 200..299 && json.optBoolean("ok", false)) {
+            // A proven send stays successful even when optional receipt metadata is absent.
+            val messageId = json.optJSONObject("result")?.opt("message_id")
+                ?.toString()?.toLongOrNull()?.takeIf { it > 0L }
+            return TelegramSendResult.Success(messageId)
+        }
 
         val errorCode = json.optInt("error_code", httpStatus).takeIf { it > 0 }
         val retryAfter = json.optJSONObject("parameters")

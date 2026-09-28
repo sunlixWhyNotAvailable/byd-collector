@@ -32,10 +32,13 @@ import com.bydcollector.collector.data.normalized.StoredNormalizedState
 import com.bydcollector.collector.data.normalized.SourceOrderedApplyResult
 import com.bydcollector.collector.data.normalized.VehicleStateNormalizer
 import com.bydcollector.collector.data.normalized.normalizedIsoTime
+import com.bydcollector.collector.data.normalized.normalizedCallbackSourceStamp
+import com.bydcollector.collector.data.normalized.normalizedPollSourceStamp
+import com.bydcollector.collector.data.normalized.normalizedSourceInputForPollReading
+import com.bydcollector.collector.data.normalized.usableNormalizedCallbackQuality
 import com.bydcollector.collector.data.polling.PollSampleSource
 import com.bydcollector.collector.data.polling.PollStorage
 import com.bydcollector.collector.data.polling.WorkerPollStorage
-import com.bydcollector.collector.direct.CallbackValueSource
 import com.bydcollector.collector.mqtt.HaMqttMessage
 import com.bydcollector.collector.influx.InfluxExportStateSnapshot
 import com.bydcollector.collector.influx.InfluxExportStore
@@ -116,7 +119,6 @@ class TelemetryStore(
     private val directImporter = DirectCatalogImporter(helper)
     private val ecImporter = EcDatabaseImporter(context, helper, clock)
     private val normalizedStore = NormalizedStateStore(helper, clock)
-    private val mainEntriesByKey = DirectFidRegistry.entries.associateBy { it.key }
     private val mainEntriesByAddress = DirectFidRegistry.entries
         .groupBy { Triple(it.dev, it.fid, it.tx) }
         .mapValues { (_, entries) -> entries.singleOrNull() }
@@ -333,15 +335,7 @@ class TelemetryStore(
         normalizer: VehicleStateNormalizer
     ): SourceOrderedApplyResult {
         ensureNormalizedCatalogImported()
-        val pollStamp = NormalizedSourceStamp(
-            kind = NormalizedSourceKind.POLL,
-            identity = source.identity,
-            bootId = source.bootId,
-            generatorId = source.generatorId,
-            sequence = source.sequence,
-            wallMs = epochMillis(timestamp),
-            elapsedMs = source.capturedElapsedMs
-        )
+        val pollStamp = normalizedPollSourceStamp(source, timestamp)
         val db = helper.writableDatabase
         var result: SourceOrderedApplyResult? = null
         db.beginTransaction()
@@ -349,7 +343,7 @@ class TelemetryStore(
             val cached = loadNormalizedSourceInputs(db)
             val accepted = linkedSetOf<String>()
             readings.forEach { reading ->
-                val input = sourceInputForPollReading(reading, pollStamp, pollId) ?: return@forEach
+                val input = normalizedSourceInputForPollReading(reading, pollStamp, pollId) ?: return@forEach
                 if (mergeNormalizedSourceInput(db, cached, input)) accepted += reading.rawKey
             }
             val observations = normalizer.normalizeSparse(cached, accepted)
@@ -500,7 +494,7 @@ class TelemetryStore(
 
     private fun callbackEventInput(event: StoredCallbackEvent): NormalizedSourceInput? {
         if (event.stream != CallbackRawStore.MAIN_STREAM || event.rawBytes != null ||
-            event.quality !in CALLBACK_USABLE_QUALITIES
+            !usableNormalizedCallbackQuality(event.quality)
         ) {
             return null
         }
@@ -516,59 +510,13 @@ class TelemetryStore(
                 rawValue = DirectValueDecoders.rawString(event.rawBits),
                 descValue = DirectValueDecoders.decode(entry, event.rawBits)
             ),
-            stamp = NormalizedSourceStamp(
-                kind = NormalizedSourceKind.CALLBACK,
-                identity = callbackIdentity(event.bootId, event.helperGeneration, event.stream, event.epoch, event.eventSequence),
-                bootId = event.bootId,
-                generatorId = callbackGenerator(event.helperGeneration, event.stream, event.epoch),
-                sequence = event.eventSequence,
-                wallMs = event.receivedWallMs,
-                elapsedMs = event.receivedElapsedMs
+            stamp = normalizedCallbackSourceStamp(
+                event.bootId, event.helperGeneration, event.stream, event.epoch,
+                event.eventSequence, event.receivedWallMs, event.receivedElapsedMs
             ),
             sourcePollId = null
         )
     }
-
-    private fun sourceInputForPollReading(
-        reading: PollReading,
-        pollStamp: NormalizedSourceStamp,
-        pollId: Long
-    ): NormalizedSourceInput? {
-        val entry = mainEntriesByKey[reading.rawKey] ?: return null
-        val callback = reading.callbackSource
-            ?: return NormalizedSourceInput(reading, pollStamp, pollId)
-        val raw = reading.rawInt ?: return null
-        if (callback.quality !in CALLBACK_USABLE_QUALITIES ||
-            !callback.matches(entry.tx, entry.dev, entry.fid, raw)
-        ) return null
-        return NormalizedSourceInput(reading.withoutCallbackSource(), callback.toNormalizedStamp(), null)
-    }
-
-    private fun PollReading.withoutCallbackSource(): PollReading =
-        if (callbackSource == null) this else copy(callbackSource = null)
-
-    private fun CallbackValueSource.toNormalizedStamp(): NormalizedSourceStamp = NormalizedSourceStamp(
-        kind = NormalizedSourceKind.CALLBACK,
-        identity = callbackIdentity(bootId, helperGeneration, stream, epoch, eventSequence),
-        bootId = bootId,
-        generatorId = callbackGenerator(helperGeneration, stream, epoch),
-        sequence = eventSequence,
-        wallMs = receivedWallMs,
-        elapsedMs = receivedElapsedMs
-    )
-
-    private fun callbackIdentity(
-        bootId: String,
-        helperGeneration: String,
-        stream: Int,
-        epoch: Long,
-        eventSequence: Long
-    ): String = "callback:${callbackComponent(bootId)}:${callbackComponent(helperGeneration)}:$stream:$epoch:$eventSequence"
-
-    private fun callbackGenerator(helperGeneration: String, stream: Int, epoch: Long): String =
-        "callback:${callbackComponent(helperGeneration)}:$stream:$epoch"
-
-    private fun callbackComponent(value: String): String = "${value.length}:$value"
 
     private fun epochMillis(value: String): Long = runCatching {
         OffsetDateTime.parse(value).toInstant().toEpochMilli()
@@ -2121,7 +2069,6 @@ class TelemetryStore(
         private const val TAG = "BYDCollectorEvent"
         private const val MAX_ERROR_TEXT_LENGTH = 2_048
         private const val MAX_RAW_RESPONSE_BODY_LENGTH = 4_096
-        private val CALLBACK_USABLE_QUALITIES = setOf("callback", "usable")
         private const val UNKNOWN_COUNT = -1L
         private const val DECODED_VALUE_CACHE_SIZE = 2_048
         private const val TELEGRAM_MAX_PENDING = 1_000L

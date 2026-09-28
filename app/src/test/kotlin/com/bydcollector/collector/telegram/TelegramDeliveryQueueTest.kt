@@ -5,7 +5,9 @@ import com.bydcollector.collector.data.local.TelegramOutboxEntry
 import java.time.LocalDate
 import java.time.ZoneOffset
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -13,6 +15,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -26,7 +29,7 @@ class TelegramDeliveryQueueTest {
             )
         )
         val sent = mutableListOf<TelegramSendMessage>()
-        val queue = queue(store, send = { request -> sent += request; TelegramSendResult.Success })
+        val queue = queue(store, send = { request -> sent += request; TelegramSendResult.Success() })
 
         queue.flush("ordinary")
 
@@ -65,7 +68,7 @@ class TelegramDeliveryQueueTest {
             )
         )
         val sent = mutableListOf<TelegramSendMessage>()
-        val queue = queue(store, send = { request -> sent += request; TelegramSendResult.Success })
+        val queue = queue(store, send = { request -> sent += request; TelegramSendResult.Success() })
 
         queue.flush("power_off")
 
@@ -87,7 +90,7 @@ class TelegramDeliveryQueueTest {
             )
         )
         val sent = mutableListOf<TelegramSendMessage>()
-        val queue = queue(store, send = { request -> sent += request; TelegramSendResult.Success })
+        val queue = queue(store, send = { request -> sent += request; TelegramSendResult.Success() })
 
         assertNull(queue.flush("ordinary"))
         assertNull(queue.flush("power_off", priorityKey = "trip:summary", expediteLocal = true))
@@ -114,7 +117,7 @@ class TelegramDeliveryQueueTest {
                 if (sent.size == 1) {
                     TelegramSendResult.Failure(TelegramSendFailureKind.NETWORK_ERROR)
                 } else {
-                    TelegramSendResult.Success
+                    TelegramSendResult.Success()
                 }
             }
         )
@@ -194,7 +197,7 @@ class TelegramDeliveryQueueTest {
         assertEquals(1, sent.size)
         assertEquals(120L, testFailure.retryAfterSeconds)
 
-        val newQueue = queue(store, now = { now }, send = { sent += it; TelegramSendResult.Success })
+        val newQueue = queue(store, now = { now }, send = { sent += it; TelegramSendResult.Success() })
         assertEquals(120_000L, newQueue.flush("startup"))
         assertEquals(1, sent.size)
     }
@@ -215,7 +218,7 @@ class TelegramDeliveryQueueTest {
                         retryAfterSeconds = 60L
                     )
                 } else {
-                    TelegramSendResult.Success
+                    TelegramSendResult.Success()
                 }
             }
         )
@@ -227,7 +230,7 @@ class TelegramDeliveryQueueTest {
         assertEquals(0L, store.telegramServerNotBefore(TelegramDeliveryQueue.botScope("456:new")))
 
         config = config.copy(token = "456:new")
-        val differentBotQueue = queue(store, credentials = { config }, send = { request -> sent += request; TelegramSendResult.Success })
+        val differentBotQueue = queue(store, credentials = { config }, send = { request -> sent += request; TelegramSendResult.Success() })
         differentBotQueue.flush("ordinary")
 
         assertEquals(listOf("payload-1", "other"), sent.map { it.text })
@@ -238,9 +241,9 @@ class TelegramDeliveryQueueTest {
         val store = FakeDeliveryStore(entries = listOf(entry(id = 1)))
         val config = TelegramDeliveryCredentials(enabled = false, token = "", chatId = "")
         val sent = mutableListOf<TelegramSendMessage>()
-        val queue = queue(store, credentials = { config }, send = { request -> sent += request; TelegramSendResult.Success })
+        val queue = queue(store, credentials = { config }, send = { request -> sent += request; TelegramSendResult.Success() })
 
-        assertEquals(TelegramSendResult.Success, queue.testConnection(TelegramSendMessage("123:token", "chat", "manual")))
+        assertEquals(TelegramSendResult.Success(), queue.testConnection(TelegramSendMessage("123:token", "chat", "manual")))
 
         assertEquals(1, sent.size)
         assertTrue(store.rows.containsKey(1L))
@@ -260,8 +263,8 @@ class TelegramDeliveryQueueTest {
         val queue = queue(
             store,
             records = records,
-            commit = { _, _ -> throw IllegalStateException("commit failed") },
-            send = { TelegramSendResult.Success }
+            commit = { _, _, _ -> throw IllegalStateException("commit failed") },
+            send = { TelegramSendResult.Success() }
         )
 
         assertFailsWith<IllegalStateException> { queue.flush("ordinary") }
@@ -276,7 +279,7 @@ class TelegramDeliveryQueueTest {
         Thread.interrupted()
         val store = FakeDeliveryStore(entries = listOf(entry(id = 1)))
         val sent = mutableListOf<TelegramSendMessage>()
-        val queue = queue(store, send = { request -> sent += request; TelegramSendResult.Success })
+        val queue = queue(store, send = { request -> sent += request; TelegramSendResult.Success() })
 
         try {
             Thread.currentThread().interrupt()
@@ -352,7 +355,7 @@ class TelegramDeliveryQueueTest {
             )
         )
         val sent = mutableListOf<TelegramSendMessage>()
-        val queue = queue(store, now = { now }, send = { request -> sent += request; TelegramSendResult.Success })
+        val queue = queue(store, now = { now }, send = { request -> sent += request; TelegramSendResult.Success() })
 
         assertEquals(oldDeadline, queue.flush("tick"))
         assertTrue(sent.isEmpty())
@@ -385,7 +388,7 @@ class TelegramDeliveryQueueTest {
             )
         )
         val sent = mutableListOf<TelegramSendMessage>()
-        val queue = queue(store, now = { now }, send = { request -> sent += request; TelegramSendResult.Success })
+        val queue = queue(store, now = { now }, send = { request -> sent += request; TelegramSendResult.Success() })
 
         queue.flush("on")
 
@@ -423,7 +426,7 @@ class TelegramDeliveryQueueTest {
             )
         )
         val sent = mutableListOf<TelegramSendMessage>()
-        val queue = queue(store, now = { now }, send = { request -> sent += request; TelegramSendResult.Success })
+        val queue = queue(store, now = { now }, send = { request -> sent += request; TelegramSendResult.Success() })
 
         queue.flush("off", priorityKey = "trip:summary")
 
@@ -452,7 +455,7 @@ class TelegramDeliveryQueueTest {
                     entry(id = 5, nextAttemptAtMs = future, failureCount = 2, lastError = "NETWORK_ERROR")
                 )
             )
-            val queue = queue(store, now = { now }, send = { TelegramSendResult.Success })
+            val queue = queue(store, now = { now }, send = { TelegramSendResult.Success() })
 
             queue.recover(trigger)
 
@@ -473,7 +476,7 @@ class TelegramDeliveryQueueTest {
                 entry(id = 2, nextAttemptAtMs = now + 30_000L, attemptCount = 8, failureCount = 3, lastError = "network_error")
             )
         )
-        val queue = queue(store, now = { now }, send = { TelegramSendResult.Success })
+        val queue = queue(store, now = { now }, send = { TelegramSendResult.Success() })
 
         queue.recover("on")
 
@@ -502,7 +505,7 @@ class TelegramDeliveryQueueTest {
                 if (request.text == "payload-1") {
                     TelegramSendResult.Failure(TelegramSendFailureKind.NETWORK_ERROR)
                 } else {
-                    TelegramSendResult.Success
+                    TelegramSendResult.Success()
                 }
             }
         )
@@ -530,7 +533,7 @@ class TelegramDeliveryQueueTest {
             now = { now },
             send = { request ->
                 if (request.text == "payload-1") TelegramSendResult.Failure(TelegramSendFailureKind.NETWORK_ERROR)
-                else TelegramSendResult.Success
+                else TelegramSendResult.Success()
             }
         )
 
@@ -552,9 +555,9 @@ class TelegramDeliveryQueueTest {
             )
         )
         val sent = mutableListOf<TelegramSendMessage>()
-        val queue = queue(store, now = { now }, send = { request -> sent += request; TelegramSendResult.Success })
+        val queue = queue(store, now = { now }, send = { request -> sent += request; TelegramSendResult.Success() })
 
-        assertEquals(TelegramSendResult.Success, queue.testConnection(TelegramSendMessage("123:token", "chat", "manual-payload")))
+        assertEquals(TelegramSendResult.Success(), queue.testConnection(TelegramSendMessage("123:token", "chat", "manual-payload")))
 
         assertEquals(listOf("manual-payload"), sent.map { it.text })
         assertEquals(now, store.rows[1L]?.nextAttemptAtMs)
@@ -575,7 +578,7 @@ class TelegramDeliveryQueueTest {
             entries = listOf(entry(id = 1, nextAttemptAtMs = future, failureCount = 2, lastError = "network_error"))
         )
         val sent = mutableListOf<TelegramSendMessage>()
-        val queue = queue(store, credentials = { config }, now = { now }, send = { request -> sent += request; TelegramSendResult.Success })
+        val queue = queue(store, credentials = { config }, now = { now }, send = { request -> sent += request; TelegramSendResult.Success() })
 
         assertNull(queue.recover("off"))
         assertEquals(future, store.rows[1L]?.nextAttemptAtMs)
@@ -603,8 +606,8 @@ class TelegramDeliveryQueueTest {
             store,
             now = { now },
             records = records,
-            commit = { _, _ -> throw IllegalStateException("commit failed") },
-            send = { TelegramSendResult.Success }
+            commit = { _, _, _ -> throw IllegalStateException("commit failed") },
+            send = { TelegramSendResult.Success() }
         )
 
         assertFailsWith<IllegalStateException> { queue.flush("ordinary") }
@@ -623,7 +626,7 @@ class TelegramDeliveryQueueTest {
             store,
             send = {
                 synchronousSenderCalls += 1
-                TelegramSendResult.Success
+                TelegramSendResult.Success()
             }
         )
 
@@ -638,7 +641,7 @@ class TelegramDeliveryQueueTest {
         val httpThread = Thread {
             httpEntered.countDown()
             releaseHttp.await()
-            result.set(TelegramSendResult.Success)
+            result.set(TelegramSendResult.Success())
         }
         try {
             httpThread.start()
@@ -660,7 +663,7 @@ class TelegramDeliveryQueueTest {
         queue.completeAttempt(attempt, assertNotNull(result.get()))
         assertTrue(store.rows.isEmpty())
         assertFailsWith<IllegalStateException> {
-            queue.completeAttempt(attempt, TelegramSendResult.Success)
+            queue.completeAttempt(attempt, TelegramSendResult.Success())
         }
     }
 
@@ -675,7 +678,7 @@ class TelegramDeliveryQueueTest {
         assertEquals("old-chat", oldAttempt.request.chatId)
 
         config = TelegramDeliveryCredentials(enabled = true, token = "456:new", chatId = "new-chat")
-        queue.completeAttempt(oldAttempt, TelegramSendResult.Success)
+        queue.completeAttempt(oldAttempt, TelegramSendResult.Success())
         assertTrue(store.rows.isEmpty(), "accepted old-credential success must still commit its exact row")
 
         store.add(entry(id = 2))
@@ -715,11 +718,184 @@ class TelegramDeliveryQueueTest {
 
         val delivery = assertNotNull(queue.beginAttempt("ordinary"))
         assertIs<TelegramConnectionSelection.Busy>(queue.beginConnectionTest(request))
-        queue.completeAttempt(delivery, TelegramSendResult.Success)
+        queue.completeAttempt(delivery, TelegramSendResult.Success())
 
         val connection = assertIs<TelegramConnectionSelection.Ready>(queue.beginConnectionTest(request)).attempt
         assertNull(queue.beginAttempt("ordinary"))
-        assertEquals(TelegramSendResult.Success, queue.completeConnectionTest(connection, TelegramSendResult.Success))
+        assertEquals(TelegramSendResult.Success(), queue.completeConnectionTest(connection, TelegramSendResult.Success()))
+
+        val deliberateRepeat = assertIs<TelegramConnectionSelection.Ready>(queue.beginConnectionTest(request)).attempt
+        assertNotEquals(connection.dedupeKey, deliberateRepeat.dedupeKey)
+        assertEquals("connection_test", deliberateRepeat.eventType)
+        queue.completeConnectionTest(deliberateRepeat, TelegramSendResult.Success())
+    }
+
+    @Test
+    fun processRetainsHttpSuccessAcrossQueueRecreationAndDisabledSettings() {
+        val store = FakeDeliveryStore(entries = listOf(entry(id = 71L, dedupeKey = "trip:summary")))
+        val httpEntered = CountDownLatch(1)
+        val httpRelease = CountDownLatch(1)
+        val firstOwnerFailed = CountDownLatch(1)
+        val currentOwnerReady = CountDownLatch(1)
+        val sendCount = AtomicInteger()
+        val committedMessageIds = mutableListOf<Long?>()
+        val runtime = TelegramDeliveryRuntime(send = {
+            sendCount.incrementAndGet()
+            httpEntered.countDown()
+            check(httpRelease.await(3, TimeUnit.SECONDS))
+            TelegramSendResult.Success(123L)
+        })
+        val firstQueue = queue(
+            store,
+            commit = { _, _, _ -> error("sidecar commit failed") }
+        )
+        val attempt = assertNotNull(firstQueue.beginAttempt("ordinary"))
+        val firstOwner = Any()
+        val currentOwner = Any()
+        try {
+            runtime.attach(
+                token = firstOwner,
+                onReady = {},
+                onFailure = { firstOwnerFailed.countDown() },
+                onPendingResult = { outcome, acknowledge ->
+                    firstQueue.settleReceivedAttempt(
+                        outcome.attempt,
+                        outcome.result,
+                        outcome.confirmedAtMs,
+                        acknowledge
+                    )
+                }
+            )
+            runtime.executor.submit { runtime.dispatchSend(attempt) }.get(1, TimeUnit.SECONDS)
+            assertTrue(httpEntered.await(1, TimeUnit.SECONDS))
+            assertEquals(setOf(71L), runtime.protectedTelegramIds)
+            httpRelease.countDown()
+            assertTrue(firstOwnerFailed.await(2, TimeUnit.SECONDS))
+            assertTrue(runtime.hasPendingResult)
+            assertEquals(1, sendCount.get())
+
+            val disabledSettingsQueue = queue(
+                store = store,
+                credentials = { TelegramDeliveryCredentials(enabled = false, token = "456:new", chatId = "new-chat") },
+                now = { 10_000L },
+                commit = { entry, messageId, _ ->
+                    committedMessageIds += messageId
+                    store.commit(entry)
+                }
+            )
+            runtime.attach(
+                token = currentOwner,
+                onReady = {
+                    currentOwnerReady.countDown()
+                    error("post-ack schedule failed")
+                },
+                onFailure = { throw it },
+                onPendingResult = { outcome, acknowledge ->
+                    disabledSettingsQueue.settleReceivedAttempt(
+                        outcome.attempt,
+                        outcome.result,
+                        outcome.confirmedAtMs,
+                        acknowledge
+                    )
+                }
+            )
+            runtime.executor.submit {}.get(2, TimeUnit.SECONDS)
+
+            assertTrue(currentOwnerReady.await(1, TimeUnit.SECONDS))
+            assertEquals(1, sendCount.get())
+            assertEquals(123L, committedMessageIds.single())
+            assertTrue(store.rows.isEmpty())
+            assertFalse(runtime.hasInFlightDelivery)
+            assertFalse(runtime.hasPendingResult)
+            assertTrue(runtime.protectedTelegramIds.isEmpty())
+        } finally {
+            httpRelease.countDown()
+            runtime.close()
+        }
+    }
+
+    @Test
+    fun completedHttpResultIsRetainedWhenOwnerExecutorRejectsSubmission() {
+        val httpEntered = CountDownLatch(1)
+        val httpRelease = CountDownLatch(1)
+        val ownerRejected = CountDownLatch(1)
+        val httpExecutor = Executors.newSingleThreadExecutor()
+        val runtime = TelegramDeliveryRuntime(
+            send = {
+                httpEntered.countDown()
+                check(httpRelease.await(3, TimeUnit.SECONDS))
+                TelegramSendResult.Success(456L)
+            },
+            httpExecutor = httpExecutor
+        )
+        val store = FakeDeliveryStore(entries = listOf(entry(id = 89L, dedupeKey = "power_off:summary")))
+        val queue = queue(store)
+        val attempt = assertNotNull(queue.beginAttempt("ordinary"))
+        try {
+            runtime.attach(
+                token = Any(),
+                onReady = {},
+                onFailure = { ownerRejected.countDown() },
+                onPendingResult = { _, _ -> error("closed owner must not settle the result") }
+            )
+            runtime.executor.submit { runtime.dispatchSend(attempt) }.get(1, TimeUnit.SECONDS)
+            assertTrue(httpEntered.await(1, TimeUnit.SECONDS))
+            runtime.executor.shutdown()
+            httpRelease.countDown()
+
+            assertTrue(ownerRejected.await(2, TimeUnit.SECONDS))
+            assertTrue(runtime.hasPendingResult)
+            assertTrue(runtime.hasInFlightDelivery)
+            assertEquals(setOf(89L), runtime.protectedTelegramIds)
+            assertTrue(store.rows.containsKey(89L))
+        } finally {
+            httpRelease.countDown()
+            runtime.executor.shutdownNow()
+            httpExecutor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun manualSuccessWaitsForLocalReceiptAndCanSettleOnReplacementQueue() {
+        val store = FakeDeliveryStore(emptyList())
+        val first = queue(store)
+        val attempt = assertIs<TelegramConnectionSelection.Ready>(
+            first.beginConnectionTest(TelegramSendMessage("123:token", "chat", "manual"))
+        ).attempt
+        var acknowledged = false
+        val success = TelegramSendResult.Success(88L)
+        assertFailsWith<IllegalStateException> {
+            first.settleReceivedConnectionTest(attempt, success, 500L,
+                persistSuccess = { error("local receipt unavailable") },
+                onDurablySettled = { acknowledged = true })
+        }
+        assertFalse(acknowledged)
+        val receipts = mutableMapOf<String, Long?>()
+        val replacement = queue(store,
+            credentials = { TelegramDeliveryCredentials(false, "456:changed", "another-chat") })
+        replacement.settleReceivedConnectionTest(attempt, success, 500L,
+            persistSuccess = { receipts[checkNotNull(attempt.dedupeKey)] = it.messageId },
+            onDurablySettled = { acknowledged = true })
+        assertTrue(acknowledged)
+        assertEquals(mapOf<String, Long?>(checkNotNull(attempt.dedupeKey) to 88L), receipts)
+        assertTrue(store.rows.isEmpty(), "manual sends do not create a background HTTP retry")
+    }
+
+    @Test
+    fun diagnosticsDistinguishAmbiguousDeliveryFromRejectionWithoutChangingRetryCodes() {
+        for (kind in TelegramSendFailureKind.entries) {
+            val failure = TelegramSendResult.Failure(kind)
+            val state = when (kind) {
+                TelegramSendFailureKind.NETWORK_ERROR,
+                TelegramSendFailureKind.INVALID_RESPONSE,
+                TelegramSendFailureKind.SERVER_ERROR -> "ambiguous"
+                TelegramSendFailureKind.CONFIGURATION,
+                TelegramSendFailureKind.INVALID_MESSAGE -> "not_sent"
+                else -> "rejected"
+            }
+            assertTrue(telegramFailureDetail(failure).contains("delivery_state=$state"))
+            assertEquals(kind.name.lowercase(), telegramFailureCode(failure))
+        }
     }
 
     private fun queue(
@@ -729,8 +905,8 @@ class TelegramDeliveryQueueTest {
         },
         now: () -> Long = { 0L },
         records: MutableList<DeliveryRecord> = mutableListOf(),
-        commit: (TelegramOutboxEntry, Long) -> Unit = { entry, _ -> store.commit(entry) },
-        send: (TelegramSendMessage) -> TelegramSendResult = { TelegramSendResult.Success }
+        commit: (TelegramOutboxEntry, Long?, Long) -> Unit = { entry, _, _ -> store.commit(entry) },
+        send: (TelegramSendMessage) -> TelegramSendResult = { TelegramSendResult.Success() }
     ): TelegramDeliveryQueue {
         return TelegramDeliveryQueue(
             store = store,

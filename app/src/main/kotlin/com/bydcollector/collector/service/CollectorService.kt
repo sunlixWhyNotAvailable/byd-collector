@@ -57,6 +57,7 @@ import com.bydcollector.collector.data.normalized.NormalizedWriteSummary
 import com.bydcollector.collector.data.normalized.PollingErrorSummaries
 import com.bydcollector.collector.data.normalized.VehicleStateNormalizer
 import com.bydcollector.collector.data.polling.PollOrigin
+import com.bydcollector.collector.data.polling.LivePollSource
 import com.bydcollector.collector.data.polling.PollCycleResult
 import com.bydcollector.collector.data.polling.PollCycleRunner
 import com.bydcollector.collector.data.polling.PollPersistenceCoordinator
@@ -146,9 +147,11 @@ class CollectorService : Service() {
     private lateinit var mqttCoordinator: MqttPublishCoordinator
     private lateinit var influxCoordinator: InfluxExportCoordinator
     private val telegramDeliveryRuntime get() = (applicationContext as BydCollectorApplication).telegramDeliveryRuntime
-    private var telegramCoordinator: TelegramCoordinator?
-        get() = telegramDeliveryRuntime.coordinator
-        set(value) { telegramDeliveryRuntime.coordinator = value }
+    @Volatile private var telegramCoordinator: TelegramCoordinator? = null
+        set(value) {
+            field = value
+            if (value != null) telegramDeliveryRuntime.retryPendingResult()
+        }
     private lateinit var tripRuntime: TripRuntimeCoordinator
     private lateinit var maintenanceCoordinator: DbMaintenanceCoordinator
     private lateinit var dashboardUiStateStore: DashboardUiStateStore
@@ -328,9 +331,18 @@ class CollectorService : Service() {
         override fun run() {
             telegramTickScheduled = false
             telegramTickAtMs = null
-            if (!running.get() || settings.isUserShutdownRequested() || !settings.isTelegramEnabled() || maintenanceBlocksRuntimeStart()) return
-            val coordinator = telegramCoordinator ?: return
+            if (!running.get() || settings.isUserShutdownRequested() || maintenanceBlocksRuntimeStart()) return
+            if (!settings.isTelegramEnabled() && !telegramDeliveryRuntime.hasInFlightDelivery) {
+                stopIfNoActiveRuntime()
+                return
+            }
             scheduleTelegramTick()
+            val coordinator = telegramCoordinator ?: run {
+                reconcileTelegramRuntime()
+                return
+            }
+            telegramDeliveryRuntime.retryPendingResult()
+            if (!settings.isTelegramEnabled()) return
             executeOrderedTelegram(
                 "telegram_tick_error",
                 coordinator = coordinator,
@@ -1041,7 +1053,10 @@ class CollectorService : Service() {
                             executeTelegram("telegram_event_error", onSuccess = ::postTelegramTickSchedule) {
                                 if (telegramCoordinator !== coordinator) return@executeTelegram null
                                 drainTripCompletions(coordinator, watermark)
-                                coordinator.onSuccessfulPoll(observations, energySnapshot) { legId ->
+                                coordinator.onSourcePoll(
+                                    pollId, timestamp, source, readings, origin,
+                                    LivePollSource.liveBootId, energySnapshot
+                                ) { legId ->
                                     correlateTripDiagnostic(
                                         legId, diagnosticPowerSession,
                                         isCurrent = {
@@ -1220,6 +1235,9 @@ class CollectorService : Service() {
                 RuntimeRecoveryAction.KEEP_ALIVE -> reconcileKeepAliveOnly(forceKeepAliveStatusCheck)
             }
         }
+        if (!demand.telegram && telegramDeliveryRuntime.hasInFlightDelivery) {
+            reconcileTelegramRuntime()
+        }
         if (reconcileKeepAliveState && !demand.main && !demand.keepAlive) {
             reconcileKeepAliveOnly(forceKeepAliveStatusCheck)
         } else if (!demand.any) {
@@ -1266,9 +1284,10 @@ class CollectorService : Service() {
             val keepAliveConfig = settings.keepAliveConfig()
             val keepAliveEnabled = keepAliveConfig.anyEnabled
             val telegramEnabled = settings.isTelegramEnabled()
+            val telegramRuntimeNeeded = telegramEnabled || telegramDeliveryRuntime.hasInFlightDelivery
             val runtimeDemand = settings.runtimeDemand()
             //stops the foreground service only after keep-alive settings have been mirrored to the shell delegate
-            if (!mainAllowed && !debugAllowed && !runtimeDemand.any && kpiWorker?.isAlive != true) {
+            if (!mainAllowed && !debugAllowed && !runtimeDemand.any && !telegramRuntimeNeeded && kpiWorker?.isAlive != true) {
                 store.recordEvent("service_start_skipped", "No runtime channel is enabled")
                 stopMain("polling_disabled")
                 stopDebug("debug_disabled")
@@ -1278,7 +1297,7 @@ class CollectorService : Service() {
             val initialNotificationText = notificationText(mainAllowed, debugAllowed, keepAliveEnabled, telegramEnabled)
             lastNotificationText = initialNotificationText
             startForeground(NOTIFICATION_ID, buildNotification(initialNotificationText))
-            if (mainAllowed || debugAllowed || runtimeDemand.any) acquireWakeLock()
+            if (mainAllowed || debugAllowed || runtimeDemand.any || telegramRuntimeNeeded) acquireWakeLock()
             //keeps network/bluetooth policy independent from whether telemetry polling itself is active
             keepAliveSupervisor.reconcile(
                 keepAliveConfig,
@@ -1306,7 +1325,7 @@ class CollectorService : Service() {
                 (settings.isInfluxEnabled() || runtimeDemand.influx) &&
                 !settings.isInfluxManuallyStopped()
             ) startInfluxExport(clearManualStop = false)
-            if (telegramEnabled) reconcileTelegramRuntime()
+            if (telegramRuntimeNeeded) reconcileTelegramRuntime()
 
             CollectorAutoStart.scheduleWatchdog(applicationContext, settings, store)
         } catch (error: RuntimeException) {
@@ -3494,19 +3513,28 @@ class CollectorService : Service() {
     private fun reconcileTelegramRuntime(unblockBlocked: Boolean = false) {
         if (maintenanceBlocksRuntimeStart()) return
         if (!settings.isTelegramEnabled()) {
-            cancelTelegramTick()
             telegramRecoveryCoalescer.invalidate()
-            telegramCoordinator?.let { coordinator ->
-                executeTelegram("telegram_reset_error") {
-                    coordinator.integrationDisabled()
+            if (!telegramDeliveryRuntime.hasInFlightDelivery) {
+                cancelTelegramTick()
+                val coordinator = telegramCoordinator
+                if (coordinator == null) {
+                    stopIfNoActiveRuntime()
+                } else {
+                    executeTelegram(
+                        "telegram_reset_error",
+                        onSettled = { mainHandler.post { stopIfNoActiveRuntime() } }
+                    ) {
+                        if (!settings.isTelegramEnabled() && !telegramDeliveryRuntime.hasInFlightDelivery &&
+                            telegramCoordinator === coordinator
+                        ) coordinator.integrationDisabled()
+                    }
                 }
+                return
             }
-            stopIfNoActiveRuntime()
-            return
         }
         val coordinator = telegramCoordinator
         if (coordinator == null) {
-            cancelTelegramTick()
+            scheduleTelegramTick()
             settings.setTelegramConnectionStatus(
                 "storage_error",
                 BydCollectorApplication.TELEGRAM_STORAGE_ERROR
@@ -3529,17 +3557,22 @@ class CollectorService : Service() {
                 },
                 onSettled = { telegramStorageRecoveryInFlight.set(false) }
             ) {
-                if (!settings.isTelegramEnabled() || settings.isUserShutdownRequested() ||
-                    telegramDeliveryRuntime.hasInFlightDelivery) null
+                if ((!settings.isTelegramEnabled() && !telegramDeliveryRuntime.hasInFlightDelivery) ||
+                    settings.isUserShutdownRequested()) null
                 else (applicationContext as BydCollectorApplication).reconcileTelegramStorage(store)
                     ?.let { createTelegramCoordinator() }
             }
             return
         }
-        ensureForegroundForChannel("Telegram notifications enabled")
-        requestTelegramRecovery(
-            if (unblockBlocked) RECOVERY_STARTUP_CREDENTIALS else RECOVERY_STARTUP
-        )
+        telegramDeliveryRuntime.retryPendingResult()
+        if (settings.isTelegramEnabled()) {
+            ensureForegroundForChannel("Telegram notifications enabled")
+            requestTelegramRecovery(
+                if (unblockBlocked) RECOVERY_STARTUP_CREDENTIALS else RECOVERY_STARTUP
+            )
+        } else {
+            ensureForegroundForChannel("Recovering Telegram storage")
+        }
         scheduleTelegramTick()
         CollectorAutoStart.scheduleWatchdog(applicationContext, settings, store)
     }
@@ -3557,17 +3590,13 @@ class CollectorService : Service() {
         ensureForegroundForChannel("Testing Telegram connection")
         executeTelegram(
             errorCategory = "telegram_test_error",
+            onSuccess = { _, generation -> postTelegramTickSchedule(null, generation) },
             onFailedAction = {
                 settings.setTelegramConnectionStatus("failed", "telegram_test_error")
                 mainHandler.post { stopIfNoActiveRuntime() }
             },
         ) {
-            coordinator.testConnection { result ->
-                if (result == TelegramSendResult.Success && settings.isTelegramEnabled()) {
-                    requestTelegramRecovery(RECOVERY_MANUAL_TEST_SUCCESS)
-                }
-                mainHandler.post { stopIfNoActiveRuntime() }
-            }
+            coordinator.testConnection()
         }
     }
 
@@ -3599,7 +3628,7 @@ class CollectorService : Service() {
             !running.get() ||
             expectedGeneration != telegramWorkGeneration.get() ||
             !::settings.isInitialized ||
-            !settings.isTelegramEnabled() ||
+            (!settings.isTelegramEnabled() && !telegramDeliveryRuntime.hasInFlightDelivery) ||
             settings.isUserShutdownRequested()
         ) return false
         return !maintenanceBlocksRuntimeStart()
@@ -3749,8 +3778,7 @@ class CollectorService : Service() {
         if (
             !running.get() ||
             settings.isUserShutdownRequested() ||
-            !settings.isTelegramEnabled() ||
-            telegramCoordinator == null ||
+            (!settings.isTelegramEnabled() && !telegramDeliveryRuntime.hasInFlightDelivery) ||
             maintenanceBlocksRuntimeStart()
         ) return
         val nowMs = System.currentTimeMillis()
@@ -3766,7 +3794,12 @@ class CollectorService : Service() {
     private fun postTelegramTickSchedule(deadlineAtMs: Long?, submittedGeneration: Long) {
         mainHandler.post {
             if (submittedGeneration != telegramWorkGeneration.get()) return@post
+            if (running.get() && !settings.isTelegramEnabled() && !telegramDeliveryRuntime.hasInFlightDelivery) {
+                reconcileTelegramRuntime()
+                return@post
+            }
             scheduleTelegramTick(deadlineAtMs)
+            if (running.get()) stopIfNoActiveRuntime()
         }
     }
 
@@ -3782,7 +3815,7 @@ class CollectorService : Service() {
             debug = isDebugPollerRunning(),
             keepAlive = settings.keepAliveConfig().anyEnabled,
             mqtt = mqttRuntimeActive.get() || mqttConnection.owned,
-            telegram = settings.isTelegramEnabled(),
+            telegram = settings.isTelegramEnabled() || telegramDeliveryRuntime.hasInFlightDelivery,
             influxQueued = influxRequestQueued.get(),
             influxInFlight = influxWorkInFlight.get() > 0,
             influxRetryScheduled = influxRetryScheduled,
@@ -4347,13 +4380,17 @@ class CollectorService : Service() {
     )
 
     private fun handleTelegramExecutionFailure(error: Throwable) {
-        if (error !is SQLiteException) return
+        if (error !is SQLiteException) {
+            if (telegramDeliveryRuntime.hasPendingResult) mainHandler.post { scheduleTelegramTick() }
+            return
+        }
         (applicationContext as BydCollectorApplication).markTelegramStorageUnavailable(store, error)
         telegramCoordinator = null
         telegramWorkGeneration.incrementAndGet()
         telegramRecoveryCoalescer.invalidate()
         mainHandler.post {
             cancelTelegramTick()
+            scheduleTelegramTick()
             scheduleIntegrationDashboardRefresh()
             stopIfNoActiveRuntime()
         }
@@ -4930,11 +4967,13 @@ class CollectorService : Service() {
         telegramDeliveryRuntime.attach(
             this,
             onReady = { postTelegramTickSchedule(it, telegramWorkGeneration.get()) },
-            onFailure = ::handleTelegramExecutionFailure
+            onFailure = ::handleTelegramExecutionFailure,
+            onPendingResult = { outcome, acknowledge ->
+                telegramCoordinator?.settlePendingResult(outcome, acknowledge)
+            }
         )
         telegramDeliveryRuntime.resume()
         telegramCoordinator?.let { return it }
-        if (telegramDeliveryRuntime.hasInFlightDelivery) return null
         val telegramStore = application.telegramStoreOrNull() ?: run {
             settings.setTelegramConnectionStatus(
                 "storage_error",
@@ -4946,8 +4985,16 @@ class CollectorService : Service() {
             eventStore = store,
             telegramStore = telegramStore,
             settings = settings,
+            normalizer = vehicleStateNormalizer,
             dispatchSend = telegramDeliveryRuntime::dispatchSend,
-            onDeliveryReady = telegramDeliveryRuntime::deliveryReady,
+            protectedTelegramIds = { telegramDeliveryRuntime.protectedTelegramIds },
+            deliveryLaneAvailable = { !telegramDeliveryRuntime.hasInFlightDelivery },
+            onConnectionTestSettled = { result ->
+                if (result is TelegramSendResult.Success && settings.isTelegramEnabled()) {
+                    requestTelegramRecovery(RECOVERY_MANUAL_TEST_SUCCESS)
+                }
+                mainHandler.post { stopIfNoActiveRuntime() }
+            },
             currentEnergySnapshot = {
                 BydCollectorApplication.trips(application).readEnergyRuntimeRow()?.let { row ->
                     com.bydcollector.collector.data.energy.EnergyStateCodec.decodeState(row.stateJson).currentSnapshot

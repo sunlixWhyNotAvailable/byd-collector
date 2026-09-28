@@ -35,7 +35,8 @@ class TelegramDatabaseHelper(
                 last_error TEXT,
                 blocked INTEGER NOT NULL DEFAULT 0 CHECK (blocked IN (0, 1)),
                 waits_for_summary_key TEXT,
-                failure_count INTEGER NOT NULL DEFAULT 0
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                occurred_at_ms INTEGER
             )
             """.trimIndent()
         )
@@ -85,6 +86,8 @@ class TelegramDatabaseHelper(
             )
             """.trimIndent()
         )
+        db.execSQL(TelegramDatabaseSql.CREATE_DELIVERY_RECEIPT_TABLE)
+        db.execSQL(TelegramDatabaseSql.CREATE_DELIVERY_RECEIPT_INDEX)
         db.execSQL(
             """
             INSERT OR IGNORE INTO telegram_migration_state(id, main_import_complete)
@@ -101,6 +104,7 @@ class TelegramDatabaseHelper(
             db.execSQL("ALTER TABLE telegram_outbox ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0")
             db.execSQL("UPDATE telegram_outbox SET failure_count = attempt_count")
         }
+        if (oldVersion < 5) db.execSQL(TelegramDatabaseSql.MIGRATE_V4_TO_V5)
         onCreate(db)
         if (oldVersion < 3) seedLegacyRateLimitCooldown(db)
     }
@@ -113,7 +117,7 @@ class TelegramDatabaseHelper(
 
     companion object {
         const val DATABASE_NAME = "bydcollector_telegram.db"
-        const val DATABASE_VERSION = 4
+        const val DATABASE_VERSION = 5
         const val MAX_PENDING = 1_000L
         const val RETENTION_MS = 30L * 24L * 60L * 60L * 1_000L
         const val LEGACY_UNCLAIMED_BOT_SCOPE = "__legacy_unclaimed__"

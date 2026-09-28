@@ -22,7 +22,8 @@ class TelegramStore(
         stateJson: String?,
         nowMs: Long = clockMs(),
         completionSequence: Long? = null,
-        completionIdentity: String? = null
+        completionIdentity: String? = null,
+        protectedTelegramIds: Set<Long> = emptySet()
     ): List<TelegramEnqueueResult> {
         require((completionSequence == null) == (completionIdentity == null))
         if (messages.isEmpty() && stateJson == null && completionSequence == null) return emptyList()
@@ -33,7 +34,7 @@ class TelegramStore(
                 db.setTransactionSuccessful()
                 return emptyList()
             }
-            val results = messages.map { enqueueTelegramMessage(db, it, nowMs) }
+            val results = messages.map { enqueueTelegramMessage(db, it, nowMs, protectedTelegramIds) }
             stateJson?.let { saveTelegramRuntimeState(db, it, nowMs) }
             if (completionSequence != null) {
                 db.delete("telegram_trip_completion_receipt", "id = 1", emptyArray())
@@ -67,18 +68,30 @@ class TelegramStore(
     private fun enqueueTelegramMessage(
         db: SQLiteDatabase,
         message: TelegramOutboxMessage,
-        nowMs: Long
+        nowMs: Long,
+        protectedTelegramIds: Set<Long>
     ): TelegramEnqueueResult {
         require(message.dedupeKey.isNotBlank()) { "Telegram dedupe key must not be blank" }
         require(message.eventType.isNotBlank()) { "Telegram event type must not be blank" }
         require(message.payload.isNotBlank()) { "Telegram payload must not be blank" }
+        val (protectedClause, protectedArgs) = protectedIdFilter(protectedTelegramIds)
         val expired = db.delete(
             "telegram_outbox",
-            "created_at_ms < ? AND attempt_count > 0",
-            arrayOf((nowMs - TelegramDatabaseHelper.RETENTION_MS).toString())
+            "created_at_ms < ? AND attempt_count > 0$protectedClause",
+            arrayOf((nowMs - TelegramDatabaseHelper.RETENTION_MS).toString()) + protectedArgs
         )
+        pruneDeliveryReceipts(db, nowMs)
+        telegramDeliveryReceipt(db, message.dedupeKey)?.let { receipt ->
+            check(receipt.eventType == message.eventType) {
+                "Telegram dedupe key was reused for a different event type"
+            }
+            return TelegramEnqueueResult(inserted = false, expiredCount = expired, overflowCount = 0)
+        }
         if (telegramMessageExists(db, message.dedupeKey)) {
             return TelegramEnqueueResult(inserted = false, expiredCount = expired, overflowCount = 0)
+        }
+        val waitsForSummaryKey = message.waitsForSummaryKey?.takeUnless {
+            telegramDeliveryReceipt(db, it) != null
         }
         val pending = db.rawQuery("SELECT COUNT(*) FROM telegram_outbox", emptyArray()).use { cursor ->
             if (cursor.moveToFirst()) cursor.getLong(0) else 0L
@@ -87,8 +100,8 @@ class TelegramStore(
         if (overflow > 0) {
             db.delete(
                 "telegram_outbox",
-                "id IN (SELECT id FROM telegram_outbox ORDER BY id LIMIT ?)",
-                arrayOf(overflow.toString())
+                "id IN (SELECT id FROM telegram_outbox WHERE 1 = 1$protectedClause ORDER BY id LIMIT ?)",
+                protectedArgs + overflow.toString()
             )
         }
         val inserted = db.insertWithOnConflict(
@@ -98,7 +111,8 @@ class TelegramStore(
                 put("dedupe_key", message.dedupeKey)
                 put("event_type", message.eventType)
                 put("payload", message.payload)
-                message.waitsForSummaryKey?.let { put("waits_for_summary_key", it) }
+                waitsForSummaryKey?.let { put("waits_for_summary_key", it) }
+                message.occurredAtMs?.let { put("occurred_at_ms", it) }
                 put("created_at_ms", nowMs)
                 put("next_attempt_at_ms", nowMs)
             },
@@ -112,7 +126,7 @@ class TelegramStore(
         return queryTelegramMessage(
             """
             SELECT id, dedupe_key, event_type, payload, attempt_count, next_attempt_at_ms, blocked,
-                   waits_for_summary_key, created_at_ms, failure_count, last_error
+                   waits_for_summary_key, created_at_ms, failure_count, last_error, occurred_at_ms
             FROM telegram_outbox
             WHERE blocked = 0 AND waits_for_summary_key IS NULL$filter
             ORDER BY id
@@ -132,7 +146,7 @@ class TelegramStore(
         return queryTelegramMessage(
             """
             SELECT id, dedupe_key, event_type, payload, attempt_count, next_attempt_at_ms, blocked,
-                   waits_for_summary_key, created_at_ms, failure_count, last_error
+                   waits_for_summary_key, created_at_ms, failure_count, last_error, occurred_at_ms
             FROM telegram_outbox
             WHERE blocked = 0 AND waits_for_summary_key IS NULL
               AND next_attempt_at_ms <= ?$filter
@@ -161,7 +175,7 @@ class TelegramStore(
     override fun telegramMessageByDedupeKey(dedupeKey: String): TelegramOutboxEntry? = queryTelegramMessage(
         """
             SELECT id, dedupe_key, event_type, payload, attempt_count, next_attempt_at_ms, blocked,
-                   waits_for_summary_key, created_at_ms, failure_count, last_error
+                   waits_for_summary_key, created_at_ms, failure_count, last_error, occurred_at_ms
             FROM telegram_outbox
             WHERE dedupe_key = ?
             LIMIT 1
@@ -183,41 +197,120 @@ class TelegramStore(
                 waitsForSummaryKey = if (cursor.isNull(7)) null else cursor.getString(7),
                 createdAtMs = cursor.getLong(8),
                 failureCount = cursor.getInt(9),
-                lastError = if (cursor.isNull(10)) null else cursor.getString(10)
+                lastError = if (cursor.isNull(10)) null else cursor.getString(10),
+                occurredAtMs = if (cursor.isNull(11)) null else cursor.getLong(11)
             )
         }
 
-    fun pruneTelegramMessages(nowMs: Long = clockMs()): Int = helper.writableDatabase.delete(
-        "telegram_outbox",
-        "created_at_ms < ? AND attempt_count > 0",
-        arrayOf((nowMs - TelegramDatabaseHelper.RETENTION_MS).toString())
-    )
+    fun telegramDeliveryReceipt(dedupeKey: String): TelegramDeliveryReceipt? =
+        telegramDeliveryReceipt(helper.readableDatabase, dedupeKey)
 
-    fun markTelegramDelivered(id: Long, stateJson: String?, deliveredAtMs: Long = clockMs()) {
+    private fun telegramDeliveryReceipt(db: SQLiteDatabase, dedupeKey: String): TelegramDeliveryReceipt? =
+        db.rawQuery(TelegramDatabaseSql.RECEIPT_BY_KEY, arrayOf(dedupeKey)).use { cursor ->
+            if (!cursor.moveToFirst()) return@use null
+            TelegramDeliveryReceipt(
+                dedupeKey = cursor.getString(0),
+                eventType = cursor.getString(1),
+                confirmedAtMs = cursor.getLong(2),
+                telegramMessageId = if (cursor.isNull(3)) null else cursor.getLong(3)
+            )
+        }
+
+    fun pruneTelegramMessages(
+        nowMs: Long = clockMs(),
+        protectedTelegramIds: Set<Long> = emptySet()
+    ): Int {
         val db = helper.writableDatabase
+        val (protectedClause, protectedArgs) = protectedIdFilter(protectedTelegramIds)
         db.beginTransactionNonExclusive()
         try {
-            val dedupeKey = db.rawQuery(
-                "SELECT dedupe_key FROM telegram_outbox WHERE id = ?",
-                arrayOf(id.toString())
-            ).use { cursor ->
-                check(cursor.moveToFirst()) { "Telegram outbox row disappeared before delivery commit" }
-                cursor.getString(0)
-            }
-            check(db.delete("telegram_outbox", "id = ?", arrayOf(id.toString())) == 1) {
-                "Telegram outbox row disappeared before delivery commit"
-            }
-            db.update(
+            val expired = db.delete(
                 "telegram_outbox",
-                ContentValues().apply { putNull("waits_for_summary_key") },
-                "waits_for_summary_key = ?",
-                arrayOf(dedupeKey)
+                "created_at_ms < ? AND attempt_count > 0$protectedClause",
+                arrayOf((nowMs - TelegramDatabaseHelper.RETENTION_MS).toString()) + protectedArgs
             )
-            stateJson?.let { saveTelegramRuntimeState(db, it, deliveredAtMs) }
+            pruneDeliveryReceipts(db, nowMs)
             db.setTransactionSuccessful()
+            return expired
         } finally {
             db.endTransaction()
         }
+    }
+
+    fun markTelegramDelivered(id: Long, stateJson: String?, deliveredAtMs: Long = clockMs()) {
+        val entry = queryTelegramMessage(
+            """
+                SELECT id, dedupe_key, event_type, payload, attempt_count, next_attempt_at_ms, blocked,
+                       waits_for_summary_key, created_at_ms, failure_count, last_error, occurred_at_ms
+                FROM telegram_outbox WHERE id = ? LIMIT 1
+            """.trimIndent(),
+            arrayOf(id.toString())
+        ) ?: error("Telegram outbox row disappeared before delivery commit")
+        markTelegramDelivered(entry, stateJson, deliveredAtMs = deliveredAtMs)
+    }
+
+    /** Settles a captured outbox entry even if retention already removed its row. */
+    fun markTelegramDelivered(
+        entry: TelegramOutboxEntry,
+        stateJson: String?,
+        telegramMessageId: Long? = null,
+        deliveredAtMs: Long = clockMs()
+    ): Boolean = recordTelegramDelivery(
+        TelegramDeliveryReceipt(entry.dedupeKey, entry.eventType, deliveredAtMs, telegramMessageId),
+        stateJson
+    )
+
+    /** Records success for queued or manual sends through one atomic, idempotent transaction. */
+    fun recordTelegramDelivery(
+        receipt: TelegramDeliveryReceipt,
+        stateJson: String? = null
+    ): Boolean {
+        require(receipt.dedupeKey.isNotBlank()) { "Telegram dedupe key must not be blank" }
+        require(receipt.eventType.isNotBlank()) { "Telegram event type must not be blank" }
+        require(receipt.confirmedAtMs >= 0L) { "Telegram delivery time must not be negative" }
+        require(receipt.telegramMessageId == null || receipt.telegramMessageId > 0L) {
+            "Telegram message ID must be positive"
+        }
+        stateJson?.let { require(it.isNotBlank()) { "Telegram runtime state must not be blank" } }
+        val db = helper.writableDatabase
+        db.beginTransactionNonExclusive()
+        try {
+            val statement = db.compileStatement(TelegramDatabaseSql.INSERT_DELIVERY_RECEIPT)
+            val inserted = try {
+                statement.bindString(1, receipt.dedupeKey)
+                statement.bindString(2, receipt.eventType)
+                statement.bindLong(3, receipt.confirmedAtMs)
+                if (receipt.telegramMessageId == null) statement.bindNull(4)
+                else statement.bindLong(4, receipt.telegramMessageId)
+                statement.executeInsert() != -1L
+            } finally {
+                statement.close()
+            }
+            if (!inserted) {
+                val existing = checkNotNull(telegramDeliveryReceipt(db, receipt.dedupeKey)) {
+                    "Telegram receipt insert was ignored without an existing receipt"
+                }
+                check(existing.eventType == receipt.eventType) {
+                    "Telegram dedupe key was reused for a different event type"
+                }
+                db.setTransactionSuccessful()
+                return false
+            }
+            db.execSQL(TelegramDatabaseSql.DELETE_OUTBOX_BY_KEY, arrayOf(receipt.dedupeKey))
+            db.execSQL(TelegramDatabaseSql.RELEASE_SUMMARY_DEPENDENTS, arrayOf(receipt.dedupeKey))
+            stateJson?.let { saveTelegramRuntimeState(db, it, receipt.confirmedAtMs) }
+            db.setTransactionSuccessful()
+            return true
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    private fun pruneDeliveryReceipts(db: SQLiteDatabase, nowMs: Long) {
+        db.execSQL(
+            TelegramDatabaseSql.PRUNE_DELIVERY_RECEIPTS,
+            arrayOf(nowMs - TelegramDatabaseHelper.RETENTION_MS)
+        )
     }
 
     override fun markTelegramRetry(
@@ -415,6 +508,13 @@ class TelegramStore(
                 nowMs.toString()
             )
         )
+    }
+
+    private fun protectedIdFilter(ids: Set<Long>): Pair<String, Array<String>> {
+        if (ids.isEmpty()) return "" to emptyArray()
+        require(ids.all { it > 0L }) { "Protected Telegram outbox IDs must be positive" }
+        return " AND id NOT IN (${ids.joinToString(",") { "?" }})" to
+            ids.map { it.toString() }.toTypedArray()
     }
 
     fun telegramRuntimeState(): String? = helper.readableDatabase.rawQuery(

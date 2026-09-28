@@ -7,6 +7,7 @@ import java.time.Instant
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -115,18 +116,34 @@ class TripCompletionHandoffTest {
         val receiptEntered = CountDownLatch(1)
         val receiptRelease = CountDownLatch(1)
         val delivered = AtomicBoolean(false)
+        val attempt = TelegramDeliveryAttempt(
+            token = 1L,
+            entry = null,
+            request = TelegramSendMessage("123:test", "chat", "message"),
+            trigger = "manual",
+            startedAtMs = 1L,
+            dedupeKey = "manual:test"
+        )
         val runtime = TelegramDeliveryRuntime(send = {
             httpEntered.countDown()
             check(httpRelease.await(3, TimeUnit.SECONDS))
-            TelegramSendResult.Success
+            TelegramSendResult.Success(9L)
         })
         try {
-            runtime.executor.submit {
-                runtime.dispatchSend(TelegramSendMessage("123:test", "chat", "message")) {
+            runtime.attach(
+                token = Any(),
+                onReady = {},
+                onFailure = { throw it },
+                onPendingResult = { outcome, acknowledge ->
                     receiptEntered.countDown()
                     check(receiptRelease.await(3, TimeUnit.SECONDS))
-                    delivered.set(it == TelegramSendResult.Success)
+                    acknowledge()
+                    delivered.set(outcome.result is TelegramSendResult.Success)
+                    null
                 }
+            )
+            runtime.executor.submit {
+                runtime.dispatchSend(attempt)
             }.get(1, TimeUnit.SECONDS)
             assertTrue(httpEntered.await(1, TimeUnit.SECONDS))
             assertEquals("local trip closed", runtime.executor.submit<String> { "local trip closed" }.get(1, TimeUnit.SECONDS))
@@ -145,17 +162,48 @@ class TripCompletionHandoffTest {
         }
     }
 
-    @Test fun oldServiceDetachCannotRemoveNewServiceCallbacks() {
-        val runtime = TelegramDeliveryRuntime(send = { TelegramSendResult.Success })
+    @Test fun retainedHttpResultUsesReboundCurrentOwnerAndNeverResends() {
+        val sends = AtomicInteger()
+        val firstOwnerFailure = CountDownLatch(1)
+        val currentOwnerSettled = CountDownLatch(1)
+        val runtime = TelegramDeliveryRuntime(send = { sends.incrementAndGet(); TelegramSendResult.Success(14L) })
         val first = Any()
         val next = Any()
-        var deadline: Long? = null
+        val attempt = TelegramDeliveryAttempt(
+            token = 1L,
+            entry = null,
+            request = TelegramSendMessage("123:test", "chat", "message"),
+            trigger = "manual",
+            startedAtMs = 1L,
+            dedupeKey = "manual:rebind"
+        )
         try {
-            runtime.attach(first, { error("stale callback") }, { throw it })
-            runtime.attach(next, { deadline = it }, { throw it })
+            runtime.attach(
+                token = first,
+                onReady = {},
+                onFailure = { firstOwnerFailure.countDown() },
+                onPendingResult = { _, _ -> error("old coordinator/store failed") }
+            )
+            runtime.executor.submit { runtime.dispatchSend(attempt) }.get(1, TimeUnit.SECONDS)
+            assertTrue(firstOwnerFailure.await(2, TimeUnit.SECONDS))
+            assertTrue(runtime.hasInFlightDelivery)
+            assertTrue(runtime.hasPendingResult)
+
+            runtime.attach(
+                token = next,
+                onReady = { currentOwnerSettled.countDown() },
+                onFailure = { throw it },
+                onPendingResult = { result, acknowledge ->
+                    assertEquals(14L, (result.result as TelegramSendResult.Success).messageId)
+                    acknowledge()
+                    null
+                }
+            )
             runtime.detach(first)
-            runtime.deliveryReady(42L)
-            assertEquals(42L, deadline)
+            assertTrue(currentOwnerSettled.await(2, TimeUnit.SECONDS))
+            assertFalse(runtime.hasInFlightDelivery)
+            assertFalse(runtime.hasPendingResult)
+            assertEquals(1, sends.get())
         } finally { runtime.close() }
     }
 }

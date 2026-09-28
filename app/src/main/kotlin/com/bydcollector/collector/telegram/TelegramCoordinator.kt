@@ -1,11 +1,15 @@
 package com.bydcollector.collector.telegram
 
 import com.bydcollector.collector.data.local.TelemetryStore
+import com.bydcollector.collector.data.local.TelegramDeliveryReceipt
 import com.bydcollector.collector.data.local.TelegramStore
 import com.bydcollector.collector.data.local.TelegramOutboxEntry
 import com.bydcollector.collector.data.local.TelegramOutboxMessage
 import com.bydcollector.collector.diagnostics.diagnosticSha256
-import com.bydcollector.collector.data.normalized.NormalizedObservation
+import com.bydcollector.collector.data.local.PollReading
+import com.bydcollector.collector.data.normalized.VehicleStateNormalizer
+import com.bydcollector.collector.data.polling.PollOrigin
+import com.bydcollector.collector.data.polling.PollSampleSource
 import com.bydcollector.collector.data.energy.EnergySnapshot
 import com.bydcollector.collector.data.trips.TripCompletionIntent
 import com.bydcollector.collector.data.trips.TripTime
@@ -18,6 +22,7 @@ import com.bydcollector.collector.service.TelegramEventState
 import com.bydcollector.collector.service.TelegramLocationSnapshot
 import com.bydcollector.collector.service.TelegramPowerOffSnapshot
 import java.util.LinkedHashMap
+import java.util.UUID
 import java.util.concurrent.CompletableFuture
 
 internal data class TelegramPowerOffPreparation(
@@ -25,32 +30,45 @@ internal data class TelegramPowerOffPreparation(
     val eventDeadlineAtMs: Long?
 )
 
-class TelegramCoordinator(
+class TelegramCoordinator internal constructor(
     private val eventStore: TelemetryStore,
     private val telegramStore: TelegramStore,
     private val settings: CollectorSettings,
-    private val dispatchSend: (TelegramSendMessage, (TelegramSendResult) -> Unit) -> Unit,
-    private val onDeliveryReady: (Long?) -> Unit = {},
+    private val normalizer: VehicleStateNormalizer,
+    private val dispatchSend: (TelegramDeliveryAttempt) -> Unit,
     private val retryPolicy: TelegramRetryPolicy = TelegramRetryPolicy(),
     private val nowMs: () -> Long = System::currentTimeMillis,
-    private val currentEnergySnapshot: () -> EnergySnapshot? = { null }
+    private val currentEnergySnapshot: () -> EnergySnapshot? = { null },
+    private val protectedTelegramIds: () -> Set<Long> = { emptySet() },
+    private val deliveryLaneAvailable: () -> Boolean = { true },
+    private val onConnectionTestSettled: (TelegramSendResult) -> Unit = {}
 ) {
     private var engine = TelegramEventEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
     private var enabledRuntimeStartedAtMs: Long? = null
     private var startupRecoveryPending = true
     private val locationKindsByDedupeKey = LinkedHashMap<String, String>(16, 0.75f, true)
     private val locationKindCacheLock = Any()
+    private val sourceCounts = linkedMapOf<String, Long>()
+    private val rejectedSourceRefs = linkedSetOf<String>()
+    private val rejectedKeyRefs = linkedSetOf<String>()
+    private val sourceOrigins = linkedSetOf<String>()
     private val delivery = TelegramDeliveryQueue(
         store = telegramStore,
         credentials = { TelegramDeliveryCredentials(settings.isTelegramEnabled(), settings.telegramBotToken(), settings.telegramChatId()) },
         commitDelivery = ::commitDelivery,
         record = ::recordDelivery,
         nowMs = nowMs,
-        retryPolicy = retryPolicy
+        retryPolicy = retryPolicy,
+        deliveryLaneAvailable = deliveryLaneAvailable
     )
 
-    fun onSuccessfulPoll(
-        observations: List<NormalizedObservation>,
+    fun onSourcePoll(
+        pollId: Long,
+        timestamp: String,
+        source: PollSampleSource,
+        readings: List<PollReading>,
+        origin: PollOrigin,
+        currentBootId: String,
         energySnapshot: EnergySnapshot? = null,
         onDiagnosticLegStarted: ((String) -> Unit)? = null
     ): Long? {
@@ -59,8 +77,12 @@ class TelegramCoordinator(
         val previousChargingActive = engine.state.chargingActive
         val previousBmsConflict = engine.state.bmsFinishHighPowerConflictActive
         val previousTripId = engine.state.tripId
-        val result = engine.onSuccessfulPoll(observations, eventConfig(), nowMs(), energySnapshot)
+        val result = engine.onSourcePoll(
+            pollId, timestamp, source, readings, origin, currentBootId,
+            eventConfig(), nowMs(), normalizer, energySnapshot
+        )
         val committed = handle(result)
+        if (committed) recordSourceDecisions(result, origin)
         // Only a leg created by this poll has a proven relation to this poll's Trips session.
         // Restored active/pending legs without metadata remain explicitly unlinked.
         if (committed) {
@@ -111,7 +133,8 @@ class TelegramCoordinator(
         val runtimeStartedAtMs = activateEnabledRuntime() ?: return null
         val startupDeadline = ensureStartupRecovery()
         val tickAtMs = nowMs()
-        val expired = telegramStore.pruneTelegramMessages(tickAtMs)
+        flushSourceDiagnostics(tickAtMs)
+        val expired = telegramStore.pruneTelegramMessages(tickAtMs, protectedTelegramIds())
         if (expired > 0) {
             eventStore.recordEvent(
                 "telegram_outbox_pruned",
@@ -209,45 +232,109 @@ class TelegramCoordinator(
         return deliverPreparedPowerOff(preparation)
     }
 
-    fun testConnection(onComplete: (TelegramSendResult) -> Unit) {
+    fun testConnection() {
         settings.setTelegramConnectionStatus("testing", null)
+        val request = TelegramSendMessage(
+            botToken = settings.telegramBotToken(),
+            chatId = settings.telegramChatId(),
+            text = "BYD Collector: Telegram connection test"
+        )
         val selection = delivery.beginConnectionTest(
-            TelegramSendMessage(
-                botToken = settings.telegramBotToken(),
-                chatId = settings.telegramChatId(),
-                text = "BYD Collector: Telegram connection test"
-            )
+            request = request,
+            requestKey = "manual:${UUID.randomUUID()}"
         )
         when (selection) {
-            is TelegramConnectionSelection.Immediate -> finishConnectionTest(selection.result, onComplete)
-            is TelegramConnectionSelection.Ready -> dispatchSend(selection.attempt.request) { response ->
-                finishConnectionTest(delivery.completeConnectionTest(selection.attempt, response), onComplete)
-                onDeliveryReady(delivery.pendingDeadline())
-            }
+            is TelegramConnectionSelection.Immediate -> finishConnectionTest(selection.result, request, null)
+            is TelegramConnectionSelection.Ready -> dispatchSend(selection.attempt)
             TelegramConnectionSelection.Busy -> {
                 settings.setTelegramConnectionStatus("failed", "sender_busy")
-                onComplete(TelegramSendResult.Failure(TelegramSendFailureKind.CONFIGURATION))
+                runCatching { onConnectionTestSettled(TelegramSendResult.Failure(TelegramSendFailureKind.CONFIGURATION)) }
             }
         }
     }
 
-    private fun finishConnectionTest(result: TelegramSendResult, onComplete: (TelegramSendResult) -> Unit) {
+    /** Current coordinator/store settles a process-owned HTTP result; no old store closure is retained. */
+    internal fun settlePendingResult(
+        outcome: TelegramPendingResult,
+        onDurablySettled: () -> Unit
+    ): Long? {
+        val attempt = outcome.attempt
+        if (attempt.entry != null) {
+            return delivery.settleReceivedAttempt(
+                attempt = attempt,
+                result = outcome.result,
+                confirmedAtMs = outcome.confirmedAtMs,
+                onDurablySettled = onDurablySettled
+            )
+        }
+        val result = delivery.settleReceivedConnectionTest(
+            attempt = attempt,
+            result = outcome.result,
+            confirmedAtMs = outcome.confirmedAtMs,
+            persistSuccess = { success ->
+                val receipt = TelegramDeliveryReceipt(
+                    dedupeKey = checkNotNull(attempt.dedupeKey),
+                    eventType = attempt.eventType,
+                    confirmedAtMs = outcome.confirmedAtMs,
+                    telegramMessageId = success.messageId
+                )
+                try {
+                    telegramStore.recordTelegramDelivery(receipt)
+                } catch (error: Exception) {
+                    if (error is InterruptedException) throw error
+                    recordLocalReceiptFailure(
+                        receipt, error, "requested_at_ms=${attempt.startedAtMs}"
+                    )
+                    throw error
+                }
+            },
+            onDurablySettled = onDurablySettled
+        )
+        finishConnectionTest(result, attempt.request, attempt, outcome.confirmedAtMs)
+        return runCatching { delivery.pendingDeadline() }.getOrNull()
+    }
+
+    private fun finishConnectionTest(
+        result: TelegramSendResult,
+        request: TelegramSendMessage,
+        attempt: TelegramDeliveryAttempt?,
+        confirmedAtMs: Long? = null
+    ) {
+        val credentialsStillMatch = settings.telegramBotToken() == request.botToken &&
+            settings.telegramChatId() == request.chatId
         when (result) {
-            TelegramSendResult.Success -> {
-                settings.setTelegramConnectionStatus("success", null)
-                telegramStore.unblockTelegramMessages(nowMs())
-                eventStore.recordEvent("telegram_connection_test_success", "Telegram connection test succeeded")
+            is TelegramSendResult.Success -> {
+                if (credentialsStillMatch) {
+                    runCatching { settings.setTelegramConnectionStatus("success", null) }
+                    runCatching { telegramStore.unblockTelegramMessages(nowMs()) }
+                }
+                runCatching {
+                    eventStore.recordEvent(
+                        "telegram_connection_test_success",
+                        "Telegram connection test succeeded",
+                        "request_ref=${attempt?.dedupeKey?.let(::diagnosticSha256) ?: "none"} " +
+                            "requested_at_ms=${attempt?.startedAtMs ?: "none"} " +
+                            "http_confirmed_at_ms=${confirmedAtMs ?: "none"} " +
+                            "message_id=${result.messageId ?: "none"}"
+                    )
+                }
             }
             is TelegramSendResult.Failure -> {
-                settings.setTelegramConnectionStatus("failed", result.kind.name.lowercase())
-                eventStore.recordEvent(
-                    "telegram_connection_test_failed",
-                    "Telegram connection test failed",
-                    failureDetail(result)
-                )
+                if (credentialsStillMatch) {
+                    runCatching { settings.setTelegramConnectionStatus("failed", result.kind.name.lowercase()) }
+                }
+                runCatching {
+                    eventStore.recordEvent(
+                        "telegram_connection_test_failed",
+                        "Telegram connection test failed",
+                        "request_ref=${attempt?.dedupeKey?.let(::diagnosticSha256) ?: "none"} " +
+                            "requested_at_ms=${attempt?.startedAtMs ?: "none"} " +
+                            "http_result_at_ms=${confirmedAtMs ?: "none"} ${failureDetail(result)}"
+                    )
+                }
             }
         }
-        onComplete(result)
+        runCatching { onConnectionTestSettled(result) }
     }
 
     fun credentialsChanged() {
@@ -256,6 +343,7 @@ class TelegramCoordinator(
     }
 
     fun integrationDisabled() {
+        flushSourceDiagnostics(nowMs())
         delivery.resetSession()
         telegramStore.saveTelegramRuntimeState(engine.reset().toJson(), nowMs())
         enabledRuntimeStartedAtMs = null
@@ -278,9 +366,7 @@ class TelegramCoordinator(
     }
 
     private fun dispatchAttempt(attempt: TelegramDeliveryAttempt?): Long? {
-        if (attempt != null) dispatchSend(attempt.request) { response ->
-            onDeliveryReady(delivery.completeAttempt(attempt, response))
-        }
+        if (attempt != null) dispatchSend(attempt)
         return delivery.pendingDeadline()
     }
 
@@ -288,15 +374,59 @@ class TelegramCoordinator(
         return delivery.pendingDeadline()
     }
 
-    private fun commitDelivery(entry: TelegramOutboxEntry, deliveredAtMs: Long) {
-        val deliveredState = engine.markTripSummaryDelivered(entry.dedupeKey, deliveredAtMs)
+    private fun commitDelivery(entry: TelegramOutboxEntry, messageId: Long?, deliveredAtMs: Long) {
+        val deliveredState = stateAfterTripSummaryDelivery(engine.state, entry.dedupeKey, deliveredAtMs)
         try {
-            telegramStore.markTelegramDelivered(entry.id, deliveredState?.toJson(), deliveredAtMs)
+            val inserted = telegramStore.markTelegramDelivered(
+                entry = entry,
+                stateJson = deliveredState?.toJson(),
+                telegramMessageId = messageId,
+                deliveredAtMs = deliveredAtMs
+            )
+            if (inserted && deliveredState != null) {
+                engine.markTripSummaryDelivered(entry.dedupeKey, deliveredAtMs)
+            }
         } catch (error: Exception) {
             if (error is InterruptedException) throw error
-            engine = TelegramEventEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
+            recordLocalReceiptFailure(
+                TelegramDeliveryReceipt(entry.dedupeKey, entry.eventType, deliveredAtMs, messageId),
+                error, "created_at_ms=${entry.createdAtMs} occurred_at_ms=${entry.occurredAtMs ?: "unknown"}"
+            )
+            runCatching { telegramStore.telegramRuntimeState() }
+                .getOrNull()
+                ?.let { engine = TelegramEventEngine(TelegramEventState.fromJson(it)) }
             throw error
         }
+    }
+
+    private fun recordLocalReceiptFailure(receipt: TelegramDeliveryReceipt, error: Exception, context: String) {
+        runCatching {
+            eventStore.recordEvent(
+                "telegram_message_local_commit_pending",
+                "Telegram HTTP success is waiting for its local receipt",
+                buildTelegramDiagnosticDetail(
+                    dedupeKey = receipt.dedupeKey,
+                    eventType = receipt.eventType,
+                    location = knownLocationKind(receipt.dedupeKey),
+                    extra = "delivery_state=known_success_local_commit_pending $context " +
+                        "http_confirmed_at_ms=${receipt.confirmedAtMs} " +
+                        "message_id=${receipt.telegramMessageId ?: "none"} storage_error=${error::class.java.simpleName}"
+                )
+            )
+        }
+    }
+
+    private fun stateAfterTripSummaryDelivery(
+        state: TelegramEventState,
+        dedupeKey: String,
+        deliveredAtMs: Long
+    ): TelegramEventState? {
+        val tripId = state.pendingPowerOffLocationTripId ?: return null
+        if (dedupeKey != "$tripId:summary" || state.pendingPowerOffLocationSummaryDelivered) return null
+        return state.copy(
+            pendingPowerOffLocationSummaryDelivered = true,
+            lastPersistedAtMs = deliveredAtMs
+        )
     }
 
     private fun recordDelivery(kind: String, entry: TelegramOutboxEntry?, detail: String) {
@@ -349,7 +479,8 @@ class TelegramCoordinator(
                 stateJson = result.state.toJson().takeIf { result.shouldPersist },
                 nowMs = committedAt,
                 completionSequence = completion?.sequence,
-                completionIdentity = completion?.identity
+                completionIdentity = completion?.identity,
+                protectedTelegramIds = protectedTelegramIds()
             )
         } catch (error: Exception) {
             if (error is InterruptedException) throw error
@@ -368,7 +499,10 @@ class TelegramCoordinator(
                         dedupeKey = message.dedupeKey,
                         eventType = message.eventType,
                         waitsForSummaryKey = message.waitsForSummaryKey,
-                        location = locationKind
+                        location = locationKind,
+                        extra = "occurred_at_ms=${message.occurredAtMs ?: "unknown"} " +
+                            "created_at_ms=$committedAt " +
+                            "source_ref=${eventsByDedupeKey[message.dedupeKey]?.sourceIdentityHash ?: "none"}"
                     )
                 )
             }
@@ -381,6 +515,49 @@ class TelegramCoordinator(
             }
         }
         return true
+    }
+
+    private fun recordSourceDecisions(result: TelegramEventResult, origin: PollOrigin) {
+        result.sourceOrderStats?.let { stats ->
+            sourceOrigins += origin.name.lowercase()
+            for ((reason, count) in listOf(
+                "accepted" to stats.accepted, "seeded" to stats.seeded,
+                "repeated" to stats.repeated, "older" to stats.older,
+                "incomparable" to stats.incomparable, "conflicting_equal" to stats.conflictingEqual,
+                "invalid" to stats.invalid
+            )) sourceCounts[reason] = (sourceCounts[reason] ?: 0L) + count
+            // Bounded examples only; counts retain all rejects until the existing tick flushes them.
+            stats.sourceRefs.take((8 - rejectedSourceRefs.size).coerceAtLeast(0)).forEach(rejectedSourceRefs::add)
+            stats.keyRefs.take((16 - rejectedKeyRefs.size).coerceAtLeast(0)).forEach(rejectedKeyRefs::add)
+        }
+        result.detectorDecisions.forEach { decision ->
+            runCatching {
+                eventStore.recordEvent(
+                    "telegram_detector_decision", "Telegram fresh-source decision",
+                    "detector=${decision.detector} source_ref=${decision.sourceIdentityHash} " +
+                        "source_at_ms=${decision.sourceAtMs} decided_at_ms=${decision.decisionAtMs} " +
+                        "origin=${origin.name.lowercase()} candidate=${decision.candidate} " +
+                        "confirmed=${decision.confirmed} reason=${decision.reason}"
+                )
+            }
+        }
+    }
+
+    /** Uses the existing owner tick, never another polling loop or per-cache-sample log. */
+    private fun flushSourceDiagnostics(atMs: Long) {
+        if (sourceCounts.values.none { it > 0L }) return
+        runCatching {
+            eventStore.recordEvent(
+                "telegram_source_order", "Telegram input ordering summary",
+                sourceCounts.entries.joinToString(" ") { "${it.key}=${it.value}" } +
+                    " processed_at_ms=$atMs origins=${sourceOrigins.joinToString(",")} " +
+                    "source_refs=${rejectedSourceRefs.joinToString(",")} key_refs=${rejectedKeyRefs.joinToString(",")}")
+        }.onSuccess {
+            sourceCounts.clear()
+            rejectedSourceRefs.clear()
+            rejectedKeyRefs.clear()
+            sourceOrigins.clear()
+        }
     }
 
     private fun buildTelegramDiagnosticDetail(
@@ -462,7 +639,8 @@ class TelegramCoordinator(
             dedupeKey = event.dedupeKey,
             eventType = event.type.key,
             payload = payload,
-            waitsForSummaryKey = event.waitsForSummaryKey
+            waitsForSummaryKey = event.waitsForSummaryKey,
+            occurredAtMs = event.occurredAtMs
         )
     }
 

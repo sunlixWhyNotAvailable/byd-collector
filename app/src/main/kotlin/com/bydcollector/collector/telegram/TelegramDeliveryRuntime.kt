@@ -8,29 +8,44 @@ import java.util.concurrent.TimeUnit
 /** Process-owned bridge between ordered Telegram state and blocking HTTP. */
 class TelegramDeliveryRuntime(
     private val send: (TelegramSendMessage) -> TelegramSendResult = TelegramHttpClient()::sendMessage,
-    private val httpExecutor: ExecutorService = namedSingleThreadExecutor(HTTP_THREAD_NAME)
+    private val httpExecutor: ExecutorService = namedSingleThreadExecutor(HTTP_THREAD_NAME),
+    private val nowMs: () -> Long = System::currentTimeMillis
 ) {
     val executor: ExecutorService = namedSingleThreadExecutor(OWNER_THREAD_NAME)
-
-    @Volatile
-    var coordinator: TelegramCoordinator? = null
 
     private val lock = Object()
     private var attachedToken: Any? = null
     private var readyCallback: ((Long?) -> Unit)? = null
     private var failureCallback: ((Throwable) -> Unit)? = null
-    private var inFlight = false
+    private var resultHandler: ((TelegramPendingResult, () -> Unit) -> Long?)? = null
+    private var activeAttempt: TelegramDeliveryAttempt? = null
+    private var pendingResult: TelegramPendingResult? = null
+    private var settling = false
     private var quiesced = false
 
     val hasInFlightDelivery: Boolean
-        get() = synchronized(lock) { inFlight }
+        get() = synchronized(lock) { activeAttempt != null }
 
-    fun attach(token: Any, onReady: (Long?) -> Unit, onFailure: (Throwable) -> Unit) {
+    val hasPendingResult: Boolean
+        get() = synchronized(lock) { pendingResult != null }
+
+    /** Outbox rows must not age out while HTTP or its local receipt is unresolved. */
+    val protectedTelegramIds: Set<Long>
+        get() = synchronized(lock) { activeAttempt?.entry?.id?.let(::setOf) ?: emptySet() }
+
+    internal fun attach(
+        token: Any,
+        onReady: (Long?) -> Unit,
+        onFailure: (Throwable) -> Unit,
+        onPendingResult: (TelegramPendingResult, () -> Unit) -> Long?
+    ) {
         synchronized(lock) {
             attachedToken = token
             readyCallback = onReady
             failureCallback = onFailure
+            resultHandler = onPendingResult
         }
+        retryPendingResult()
     }
 
     fun detach(token: Any) {
@@ -39,65 +54,64 @@ class TelegramDeliveryRuntime(
             attachedToken = null
             readyCallback = null
             failureCallback = null
+            resultHandler = null
         }
     }
 
-    /** Called on [executor]; HTTP runs separately and its receipt always returns to this owner. */
-    fun dispatchSend(
-        request: TelegramSendMessage,
-        completion: (TelegramSendResult) -> Unit
-    ) {
+    /** Called on [executor]; HTTP runs separately and its immutable result returns to this owner. */
+    internal fun dispatchSend(attempt: TelegramDeliveryAttempt) {
         check(Thread.currentThread().name == OWNER_THREAD_NAME) { "Telegram send must be dispatched by its owner" }
-        val rejection = synchronized(lock) {
-            when {
-                quiesced -> "TelegramDeliveryQuiesced"
-                inFlight -> "TelegramDeliveryBusy"
-                else -> {
-                    inFlight = true
-                    null
-                }
-            }
+        val doNotSend = synchronized(lock) {
+            check(activeAttempt == null) { "Telegram delivery lane is already occupied" }
+            activeAttempt = attempt
+            quiesced
         }
-        if (rejection != null) {
-            completeReceipt(completion, networkFailure(rejection), releaseInFlight = false)
+        if (doNotSend) {
+            receiveResult(attempt, networkFailure("TelegramDeliveryQuiesced"), nowMs())
             return
         }
         try {
             httpExecutor.execute {
                 val result = try {
-                    send(request)
+                    send(attempt.request)
                 } catch (error: Exception) {
-                    if (error is InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        throw error
-                    }
+                    if (error is InterruptedException) Thread.currentThread().interrupt()
                     networkFailure(error::class.java.name)
                 }
-                try {
-                    executor.execute { completeReceipt(completion, result) }
-                } catch (error: RejectedExecutionException) {
-                    finishInFlight()
-                    notifyFailure(error)
-                }
+                val confirmedAtMs = nowMs().coerceAtLeast(0L)
+                receiveResult(attempt, result, confirmedAtMs)
             }
         } catch (error: RejectedExecutionException) {
-            completeReceipt(completion, networkFailure(error::class.java.name))
+            receiveResult(attempt, networkFailure(error::class.java.name), nowMs())
+        }
+    }
+
+    /** Replays a retained HTTP outcome through the currently attached owner's store. */
+    fun retryPendingResult() {
+        if (Thread.currentThread().name == OWNER_THREAD_NAME) {
+            settlePendingResult()
+            return
+        }
+        try {
+            executor.execute(::settlePendingResult)
+        } catch (error: RejectedExecutionException) {
+            notifyFailure(error)
         }
     }
 
     fun deliveryReady(deadline: Long?) {
         val callback = synchronized(lock) { readyCallback }
-        callback?.invoke(deadline)
+        runCatching { callback?.invoke(deadline) }
     }
 
-    /** Blocks new sends and waits for HTTP, its durable receipt, and prior owner work. */
+    /** Blocks new sends and waits for HTTP plus its durable local settlement. */
     fun quiesceAndAwait(timeoutMs: Long): Boolean {
         val timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMs.coerceAtLeast(0L))
         val startedAt = System.nanoTime()
         synchronized(lock) {
             quiesced = true
-            if (inFlight && Thread.currentThread().name == OWNER_THREAD_NAME) return false
-            while (inFlight) {
+            if (activeAttempt != null && Thread.currentThread().name == OWNER_THREAD_NAME) return false
+            while (activeAttempt != null) {
                 val remaining = timeoutNanos - (System.nanoTime() - startedAt)
                 if (remaining <= 0L) return false
                 try {
@@ -124,6 +138,7 @@ class TelegramDeliveryRuntime(
 
     fun resume() {
         synchronized(lock) { quiesced = false }
+        retryPendingResult()
     }
 
     fun close() {
@@ -133,34 +148,58 @@ class TelegramDeliveryRuntime(
         executor.shutdown()
     }
 
-    private fun completeReceipt(
-        completion: (TelegramSendResult) -> Unit,
-        result: TelegramSendResult,
-        releaseInFlight: Boolean = true
-    ) {
-        try {
-            completion(result)
-        } catch (error: Exception) {
-            if (error is InterruptedException) {
-                Thread.currentThread().interrupt()
-                throw error
+    private fun receiveResult(attempt: TelegramDeliveryAttempt, result: TelegramSendResult, confirmedAtMs: Long) {
+        synchronized(lock) {
+            if (activeAttempt != attempt) return
+            if (pendingResult == null) {
+                pendingResult = TelegramPendingResult(attempt, result, confirmedAtMs.coerceAtLeast(0L))
             }
-            notifyFailure(error)
-        } finally {
-            if (releaseInFlight) finishInFlight()
+        }
+        if (Thread.currentThread().name == OWNER_THREAD_NAME) {
+            settlePendingResult()
+        } else {
+            try {
+                executor.execute(::settlePendingResult)
+            } catch (error: RejectedExecutionException) {
+                // The result is already process-owned even if its owner thread is closing.
+                notifyFailure(error)
+            }
         }
     }
 
-    private fun finishInFlight() {
-        synchronized(lock) {
-            inFlight = false
-            lock.notifyAll()
+    private fun settlePendingResult() {
+        check(Thread.currentThread().name == OWNER_THREAD_NAME) { "Telegram receipt must be settled by its owner" }
+        val (outcome, handler) = synchronized(lock) {
+            val current = pendingResult ?: return
+            val currentHandler = resultHandler ?: return
+            if (settling) return
+            settling = true
+            current to currentHandler
+        }
+        var acknowledged = false
+        try {
+            val deadline = handler(outcome) {
+                synchronized(lock) {
+                    if (pendingResult == outcome) {
+                        pendingResult = null
+                        activeAttempt = null
+                        acknowledged = true
+                        lock.notifyAll()
+                    }
+                }
+            }
+            if (acknowledged) deliveryReady(deadline)
+        } catch (error: Exception) {
+            if (error is InterruptedException) Thread.currentThread().interrupt()
+            if (!acknowledged) notifyFailure(error)
+        } finally {
+            synchronized(lock) { settling = false }
         }
     }
 
     private fun notifyFailure(error: Throwable) {
         val callback = synchronized(lock) { failureCallback }
-        callback?.invoke(error)
+        runCatching { callback?.invoke(error) }
     }
 
     private fun networkFailure(exceptionClass: String) = TelegramSendResult.Failure(

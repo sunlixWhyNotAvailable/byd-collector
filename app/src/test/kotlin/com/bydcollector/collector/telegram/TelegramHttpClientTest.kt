@@ -26,7 +26,7 @@ class TelegramHttpClientTest {
         val result = client.sendMessage(TelegramSendMessage("123:secret", "-100 42", "Привіт & 81%"))
         val body = connection.sentBody.toString(StandardCharsets.UTF_8.name())
 
-        assertEquals(TelegramSendResult.Success, result)
+        assertEquals(TelegramSendResult.Success(messageId = 1L), result)
         assertEquals("https://api.telegram.org/bot123:secret/sendMessage", openedUrl.toString())
         assertEquals("POST", connection.requestMethod)
         assertEquals("application/x-www-form-urlencoded; charset=UTF-8", connection.getRequestProperty("Content-Type"))
@@ -107,7 +107,44 @@ class TelegramHttpClientTest {
         val result = TelegramHttpClient { FakeConnection(200, oversized) }
             .sendMessage(TelegramSendMessage("123:secret", "42", "hello"))
 
-        assertEquals(TelegramSendResult.Success, result)
+        assertEquals(TelegramSendResult.Success(), result)
+    }
+
+    @Test
+    fun provenSuccessWithoutUsableMessageIdNeverBecomesARetryableFailure() {
+        val bodies = listOf(
+            """{"ok":true}""",
+            """{"ok":true,"result":null}""",
+            """{"ok":true,"result":{}}""",
+            """{"ok":true,"result":{"message_id":null}}""",
+            """{"ok":true,"result":{"message_id":0}}""",
+            """{"ok":true,"result":{"message_id":-1}}""",
+            """{"ok":true,"result":{"message_id":"unknown"}}""",
+            """{"ok":true,"result":{"message_id":1.5}}"""
+        )
+        bodies.forEach { body ->
+            val result = TelegramHttpClient { FakeConnection(200, body) }
+                .sendMessage(TelegramSendMessage("123:secret", "42", "hello"))
+            assertEquals(TelegramSendResult.Success(), result, body)
+        }
+        val result = TelegramHttpClient {
+            FakeConnection(200, """{"ok":true,"result":{"message_id":7000000000}}""")
+        }.sendMessage(TelegramSendMessage("123:secret", "42", "hello"))
+        assertEquals(TelegramSendResult.Success(messageId = 7_000_000_000L), result)
+    }
+
+    @Test
+    fun cleanupFailureDoesNotOverrideConfirmedDelivery() {
+        val connection = FakeConnection(
+            200,
+            """{"ok":true,"result":{"message_id":42}}""",
+            failDisconnect = true
+        )
+        val result = TelegramHttpClient { connection }
+            .sendMessage(TelegramSendMessage("123:secret", "42", "hello"))
+
+        assertEquals(TelegramSendResult.Success(messageId = 42L), result)
+        assertTrue(connection.disconnected)
     }
 
     @Test
@@ -145,7 +182,8 @@ class TelegramHttpClientTest {
 
     private class FakeConnection(
         private val status: Int,
-        response: String
+        response: String,
+        private val failDisconnect: Boolean = false
     ) : HttpURLConnection(URL("https://example.invalid")) {
         val sentBody = ByteArrayOutputStream()
         var disconnected = false
@@ -157,6 +195,7 @@ class TelegramHttpClientTest {
         override fun getErrorStream(): InputStream? = ByteArrayInputStream(responseBytes)
         override fun disconnect() {
             disconnected = true
+            if (failDisconnect) throw IllegalStateException("cleanup failed")
         }
         override fun usingProxy(): Boolean = false
         override fun connect() = Unit
