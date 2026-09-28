@@ -10,6 +10,25 @@ import kotlin.test.assertTrue
 
 class MqttPublishCoordinatorTest {
     @Test
+    fun failedInitialStateReadIsTerminalEvenWhenDiscoveryIsAlreadyQueued() {
+        val client = FakeMqttClient()
+        val outbox = FakeOutboxStore()
+        val coordinator = coordinator(client = client, outbox = outbox, provider = object : NormalizedStateProvider {
+            override fun currentState(categories: Set<String>?): List<StoredNormalizedState> = error("database unavailable")
+        })
+
+        val result = coordinator.startLiveExport()
+
+        assertEquals("mqtt_state_error", result.category)
+        assertFalse(result.retryable)
+        assertTrue(outbox.pendingCount() > 0)
+        assertEquals(null, coordinator.retryDelayMs())
+        assertEquals(0, client.connectCount)
+        assertTrue(coordinator.disconnectOffline().ok)
+        assertEquals(1, client.disconnectCount)
+    }
+
+    @Test
     fun stoppedStatusReadDoesNotFreezeDraftAndOwnedSessionFreezesDestinationsUntilStop() {
         var live = config(enabled = false).copy(host = "before.local")
         val client = FakeMqttClient()
@@ -584,7 +603,7 @@ class MqttPublishCoordinatorTest {
         client: FakeMqttClient = FakeMqttClient(),
         outbox: FakeOutboxStore = FakeOutboxStore(),
         retry: FakeRetryStateStore = FakeRetryStateStore(),
-        provider: MutableNormalizedProvider = MutableNormalizedProvider(
+        provider: NormalizedStateProvider = MutableNormalizedProvider(
             listOf(storedState("soc", "battery", valueNumber = 73.0))
         ),
         config: HaMqttConfig = config(),

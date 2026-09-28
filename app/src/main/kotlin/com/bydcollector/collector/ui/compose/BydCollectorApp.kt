@@ -1757,6 +1757,8 @@ private fun MqttCard(
     modifier: Modifier
 ) {
     val connection by CollectorService.mqttConnection.state.collectAsStateWithLifecycle()
+    val controls = ChannelStatusFormatter.controls(state?.mqttRuntimeStatus ?: RuntimeActionStatus.STOPPED,
+        connection.owned, connection.stopping, actionUiState.mqttTest)
     SectionCard(
         title = "MQTT",
         trailing = { StatusPill(compactChannelStatusText(state?.mqttStatus, strings, state?.mqttRuntimeStatus), channelStatusKind(state?.mqttStatus, state?.mqttEnabled == true, state?.mqttRuntimeStatus), compact = true) },
@@ -1768,17 +1770,16 @@ private fun MqttCard(
             onStop = actions::onStopMqtt,
             onTest = actions::onTestMqtt,
             runtimeStatus = state?.mqttRuntimeStatus ?: RuntimeActionStatus.STOPPED,
-            channelEnabled = state?.mqttEnabled == true,
             testInFlight = actionUiState.mqttTest,
             connectionOwned = connection.owned,
             connectionStopping = connection.stopping
         )
         ChannelQueueRow(strings, "${state?.mqttPendingCount ?: 0L} ${strings.messages}",
             state?.mqttAutoStartEnabled == true, actions::onToggleMqttAutoStart)
-        CategoryGrid(strings.mqttCategories, state?.mqttEnabledCategories.orEmpty(), enabled = state?.mqttEnabled != true, strings = strings) { category ->
+        CategoryGrid(strings.mqttCategories, state?.mqttEnabledCategories.orEmpty(), enabled = controls.edit, strings = strings) { category ->
             actions.onToggleMqttCategory(category, !state?.mqttEnabledCategories.orEmpty().contains(category))
         }
-        CredentialGridMqtt(strings, draft, actions, connection.activeRoute, !connection.owned && !actionUiState.mqttTest)
+        CredentialGridMqtt(strings, draft, actions, connection.activeRoute, controls.edit)
         if (connection.owned) Text(strings.stopChannelToEdit, color = LocalBydPalette.current.muted, fontSize = 12.sp)
     }
 }
@@ -1793,6 +1794,8 @@ private fun InfluxCard(
     modifier: Modifier
 ) {
     val connection by CollectorService.influxConnection.state.collectAsStateWithLifecycle()
+    val controls = ChannelStatusFormatter.controls(state?.influxRuntimeStatus ?: RuntimeActionStatus.STOPPED,
+        connection.owned, connection.stopping, actionUiState.influxTest)
     SectionCard(
         title = "InfluxDB",
         trailing = { StatusPill(compactChannelStatusText(state?.influxStatus, strings, state?.influxRuntimeStatus), channelStatusKind(state?.influxStatus, state?.influxEnabled == true, state?.influxRuntimeStatus), compact = true) },
@@ -1804,7 +1807,6 @@ private fun InfluxCard(
             onStop = actions::onStopInflux,
             onTest = actions::onTestInflux,
             runtimeStatus = state?.influxRuntimeStatus ?: RuntimeActionStatus.STOPPED,
-            channelEnabled = state?.influxEnabled == true,
             testInFlight = actionUiState.influxTest,
             connectionOwned = connection.owned,
             connectionStopping = connection.stopping
@@ -1814,12 +1816,12 @@ private fun InfluxCard(
         CategoryGrid(
             strings.influxCategories,
             if (state?.haSharedCategoriesEnabled == true) state.mqttEnabledCategories else state?.influxEnabledCategories.orEmpty(),
-            enabled = state?.influxEnabled != true && state?.haSharedCategoriesEnabled != true,
+            enabled = controls.edit && state?.haSharedCategoriesEnabled != true,
             strings = strings
         ) { category ->
             actions.onToggleInfluxCategory(category, !state?.influxEnabledCategories.orEmpty().contains(category))
         }
-        CredentialGridInflux(strings, draft, actions, connection.activeRoute, !connection.owned && !actionUiState.influxTest)
+        CredentialGridInflux(strings, draft, actions, connection.activeRoute, controls.edit)
         if (connection.owned) Text(strings.stopChannelToEdit, color = LocalBydPalette.current.muted, fontSize = 12.sp)
     }
 }
@@ -1851,27 +1853,25 @@ private fun ChannelButtons(
     onStop: () -> Unit,
     onTest: () -> Unit,
     runtimeStatus: RuntimeActionStatus,
-    channelEnabled: Boolean,
     testInFlight: Boolean,
     connectionOwned: Boolean = false,
     connectionStopping: Boolean = false
 ) {
     val starting = runtimeStatus == RuntimeActionStatus.STARTING ||
         (connectionOwned && runtimeStatus == RuntimeActionStatus.STOPPED)
+    val controls = ChannelStatusFormatter.controls(runtimeStatus, connectionOwned, connectionStopping, testInFlight)
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         ActionButton(
             if (starting) strings.starting else strings.start,
             onStart,
             primary = true,
-            enabled = !testInFlight && !starting && !connectionStopping &&
-                runtimeStatus != RuntimeActionStatus.RUNNING && runtimeStatus != RuntimeActionStatus.STOPPING,
+            enabled = controls.start,
             modifier = Modifier.weight(1f)
         )
         ActionButton(
             if (connectionStopping || runtimeStatus == RuntimeActionStatus.STOPPING) strings.stopping else strings.stop,
             onStop,
-            enabled = !connectionStopping && runtimeStatus != RuntimeActionStatus.STOPPING &&
-                (runtimeStatus != RuntimeActionStatus.STOPPED || channelEnabled || connectionOwned),
+            enabled = controls.stop,
             modifier = Modifier.weight(1f)
         )
         ActionButton(

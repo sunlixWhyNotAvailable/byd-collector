@@ -145,7 +145,7 @@ class HttpInfluxClient(
                         failureKind = when {
                             code == 401 || code == 403 -> InfluxFailureKind.AUTHENTICATION
                             code == 400 || code == 422 -> InfluxFailureKind.DATA
-                            code in 502..504 -> InfluxFailureKind.TRANSPORT
+                            code == 408 || code == 500 || code in 502..504 -> InfluxFailureKind.TRANSPORT
                             else -> InfluxFailureKind.OTHER
                         }
                     )

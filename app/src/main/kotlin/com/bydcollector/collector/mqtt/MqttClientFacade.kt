@@ -22,6 +22,10 @@ data class MqttActionResult(
     val message: String,
     val failureKind: MqttFailureKind? = null
 ) {
+    val retryable: Boolean get() = !ok && failureKind !in setOf(
+        MqttFailureKind.AUTHENTICATION, MqttFailureKind.PROTOCOL, MqttFailureKind.DATA, MqttFailureKind.CANCELLED
+    ) && category !in setOf("mqtt_disabled", "mqtt_endpoint_invalid", "mqtt_state_error")
+
     companion object {
         fun ok(message: String = "ok") = MqttActionResult(true, "ok", message)
         fun fail(

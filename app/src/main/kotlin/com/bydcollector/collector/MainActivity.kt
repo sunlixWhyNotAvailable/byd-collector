@@ -45,6 +45,8 @@ import com.bydcollector.collector.maintenance.ArchiveShareLeaseRegistry
 import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
 import com.bydcollector.collector.mqtt.HaMqttActions
 import com.bydcollector.collector.ha.HaEndpointProfile
+import com.bydcollector.collector.ha.HaExportChannel
+import com.bydcollector.collector.ha.HaRunSession
 import com.bydcollector.collector.ui.compose.validEndpointDraft
 import com.bydcollector.collector.mqtt.MqttActionResult
 import com.bydcollector.collector.service.CollectorService
@@ -475,7 +477,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onStartMqtt() {
             refreshStoreBackedState()
-            if (actionUiState.mqttTest || CollectorService.mqttConnection.stopping) return
+            if (actionUiState.mqttTest || CollectorService.mqttConnection.owned) return
             if (!CollectorService.mqttConnection.owned && !validateMqttDraft()) return
             requestAccessCheck("start_mqtt", AccessCheckMode.NORMAL)
             if (!saveMqttDraft()) {
@@ -511,6 +513,8 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onToggleMqttAutoStart(enabled: Boolean) {
+            if (!enabled && CollectorService.mqttConnection.owned && !CollectorService.mqttConnection.stopping &&
+                !settings.isMqttManuallyStopped()) HaRunSession.process.start(HaExportChannel.MQTT)
             if (enabled) settings.setMqttManuallyStopped(false)
             settings.setMqttAutoStartEnabled(enabled)
             refresh()
@@ -532,7 +536,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onStartInflux() {
             refreshStoreBackedState()
-            if (actionUiState.influxTest || CollectorService.influxConnection.stopping) return
+            if (actionUiState.influxTest || CollectorService.influxConnection.owned) return
             if (!CollectorService.influxConnection.owned && !validateInfluxDraft()) return
             requestAccessCheck("start_influx", AccessCheckMode.NORMAL)
             if (!saveInfluxDraft()) {
@@ -568,6 +572,8 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onToggleInfluxAutoStart(enabled: Boolean) {
+            if (!enabled && CollectorService.influxConnection.owned && !CollectorService.influxConnection.stopping &&
+                !settings.isInfluxManuallyStopped()) HaRunSession.process.start(HaExportChannel.INFLUX)
             if (enabled) settings.setInfluxManuallyStopped(false)
             settings.setInfluxAutoStartEnabled(enabled)
             refresh()

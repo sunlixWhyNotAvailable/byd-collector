@@ -22,6 +22,7 @@ class InfluxExportCoordinator(
     private val cancellationGeneration = AtomicLong(0L)
     @Volatile private var sessionConnection: InfluxConfig? = null
     private var lastDiagnosticGate: String? = null
+    @Volatile private var terminalFailure = false
 
     @Volatile
     private var currentRoute: HaEndpointProfile? = null
@@ -75,11 +76,16 @@ class InfluxExportCoordinator(
     }
 
     fun startExport(isCurrent: () -> Boolean = { true }): InfluxActionResult {
+        terminalFailure = false
         //a real batch write is the only start success signal; a separate HTTP test caused a false-success flicker
         return runOneCycle(force = true, isCurrent = isCurrent)
     }
 
     fun resumeExport(isCurrent: () -> Boolean = { true }): InfluxActionResult {
+        return guardCycle(isCurrent) { resumeCycle(isCurrent) }
+    }
+
+    private fun resumeCycle(isCurrent: () -> Boolean): InfluxActionResult {
         val pass = ExportPass(cancellationGeneration.get(), isCurrent)
         if (!isCurrent()) return InfluxActionResult.ok("influx work superseded")
         val liveConfig = configProvider()
@@ -124,6 +130,7 @@ class InfluxExportCoordinator(
     }
 
     fun retryDelayMs(): Long? {
+        if (terminalFailure) return null
         val config = runtimeConfig(configProvider())
         if (validate(config) != null) return null
         val fieldKeys = effectiveFields(config)
@@ -165,6 +172,27 @@ class InfluxExportCoordinator(
     }
 
     fun runOneCycle(force: Boolean = false, isCurrent: () -> Boolean = { true }): InfluxActionResult {
+        return guardCycle(isCurrent) { runCycle(force, isCurrent) }
+    }
+
+    private fun guardCycle(isCurrent: () -> Boolean, action: () -> InfluxActionResult): InfluxActionResult {
+        val generation = cancellationGeneration.get()
+        val result = try { action() }
+        catch (error: CancellationException) { throw error }
+        catch (error: RuntimeException) {
+            if (!isCurrent() || generation != cancellationGeneration.get()) return InfluxActionResult.ok("influx work superseded")
+            InfluxActionResult.fail("influx_export_exception", "${error::class.java.simpleName}: ${error.message ?: "no message"}".take(512))
+        }
+        if (!result.ok && !result.retryable && isCurrent() && generation == cancellationGeneration.get()) {
+            terminalFailure = true
+            // File evidence precedes best-effort SQL: a broken database cannot hide termination.
+            diagnostic("influx_terminal_failure", mapOf("category" to result.category))
+            runCatching { recordFailure("error", result.message) }
+        }
+        return result
+    }
+
+    private fun runCycle(force: Boolean, isCurrent: () -> Boolean): InfluxActionResult {
         // Capture before config/SQL; old work must not adopt a cancellation generation advanced during preparation.
         val pass = ExportPass(cancellationGeneration.get(), isCurrent)
         if (!isCurrent()) return InfluxActionResult.ok("influx work superseded")
@@ -262,7 +290,7 @@ class InfluxExportCoordinator(
                 if (isTransientFailure(failure)) {
                     deescalateBatchSize(pendingAfterFailure.rows)
                 }
-                recordFailure(STATUS_BACKOFF, failure.message, pendingAfterFailure)
+                recordFailure(if (failure.retryable) STATUS_BACKOFF else "error", failure.message, pendingAfterFailure)
                 return failure
             }
 
@@ -330,10 +358,7 @@ class InfluxExportCoordinator(
         } catch (error: Error) {
             throw error
         } catch (error: RuntimeException) {
-            val detail = "${error::class.java.simpleName}: ${error.message ?: "no message"}".take(512)
-            deescalateBatchSize(pendingBefore.rows)
-            recordFailure(STATUS_BACKOFF, detail, store.pendingInfluxSummary(fieldKeys))
-            InfluxActionResult.fail("influx_export_exception", detail)
+            throw error // The outer guard also covers config/SQL preparation and failed result persistence.
         }
     }
 
@@ -620,7 +645,7 @@ class InfluxExportCoordinator(
             result.failureKind == InfluxFailureKind.PROTOCOL
         ) return false
         return result.failureKind == InfluxFailureKind.TRANSPORT ||
-            result.httpStatus in 502..504 ||
+            result.httpStatus == 408 || result.httpStatus == 500 || result.httpStatus in 502..504 ||
             (result.failureKind == null && result.category == "influx_network_error")
     }
 
@@ -780,7 +805,7 @@ class InfluxExportCoordinator(
             mode = modeFor(pendingSummary.rows),
             pendingRows = pendingSummary.rows,
             oldestPendingAt = pendingSummary.oldestObservedAt,
-            nextRetryAt = plusSeconds(now, FAILURE_RETRY_INTERVAL_SECONDS),
+            nextRetryAt = if (status == STATUS_BACKOFF) plusSeconds(now, FAILURE_RETRY_INTERVAL_SECONDS) else null,
             lastSuccessAt = state.lastSuccessAt,
             lastErrorAt = now,
             lastError = error,
@@ -793,7 +818,7 @@ class InfluxExportCoordinator(
             fromHistoryId = null,
             toHistoryId = null
         )
-        diagnostic(
+        if (status == STATUS_BACKOFF) diagnostic(
             "influx_retry_pending",
             mapOf("retry_deadline" to plusSeconds(now, FAILURE_RETRY_INTERVAL_SECONDS), "reason" to "failure")
         )

@@ -1223,7 +1223,7 @@ class CollectorService : Service() {
         forceKeepAliveStatusCheck: Boolean = false,
         resetCollectionToAutoStartDemand: Boolean = false
     ) {
-        val demand = settings.runtimeDemand(includeEnabledExports = true)
+        val demand = settings.runtimeDemand()
         // A dead APP cannot retain manual ownership through a sticky restart.
         if (resetCollectionToAutoStartDemand) {
             settings.setPollingEnabled(demand.main)
@@ -1253,7 +1253,7 @@ class CollectorService : Service() {
     }
 
     private fun reconcileMqttAutoStart() {
-        if (!settings.isMqttAutoStartEnabled() || settings.isMqttManuallyStopped()) {
+        if (!settings.runtimeDemand().mqtt) {
             if (!mqttRuntimeActive.get() && !mqttConnection.stopping) mqttConnection.release()
             stopIfNoActiveRuntime()
             return
@@ -1263,7 +1263,7 @@ class CollectorService : Service() {
     }
 
     private fun reconcileInfluxAutoStart() {
-        if (!settings.isInfluxAutoStartEnabled() || settings.isInfluxManuallyStopped()) {
+        if (!settings.runtimeDemand().influx) {
             if (influxWorkInFlight.get() == 0 && !settings.isInfluxEnabled() && !influxConnection.stopping) influxConnection.release()
             stopIfNoActiveRuntime()
             return
@@ -1328,10 +1328,7 @@ class CollectorService : Service() {
             }
 
             if (runtimeDemand.mqtt) startMqttExport(clearManualStop = false)
-            if (
-                (settings.isInfluxEnabled() || runtimeDemand.influx) &&
-                !settings.isInfluxManuallyStopped()
-            ) startInfluxExport(clearManualStop = false)
+            if (runtimeDemand.influx) startInfluxExport(clearManualStop = false)
             if (telegramRuntimeNeeded) reconcileTelegramRuntime()
 
             CollectorAutoStart.scheduleWatchdog(applicationContext, settings, store)
@@ -1890,6 +1887,7 @@ class CollectorService : Service() {
 
     private fun beginUserShutdown(reason: String, token: String) {
         if (!userShutdownCoordinatorActive.compareAndSet(false, true)) return
+        com.bydcollector.collector.ha.HaRunSession.process.clear()
         val previousToken = settings.userShutdownToken()
         val deadlineElapsedMs = SystemClock.elapsedRealtime() + USER_SHUTDOWN_STOP_TIMEOUT_MS
         if (!settings.setUserShutdownRequested(true) ||
@@ -2411,7 +2409,10 @@ class CollectorService : Service() {
             )
             return
         }
-        val delayMs = runCatching { influxCoordinator.retryDelayMs() }.getOrNull()
+        val delayMs = try { influxCoordinator.retryDelayMs() } catch (error: RuntimeException) {
+            mainHandler.post { finishInfluxFailure(submittedGeneration, "retry_preparation:${error::class.java.simpleName}") }
+            return
+        }
         mainHandler.post {
             val applied = synchronized(influxQueueLock) {
                 when (
@@ -2735,6 +2736,13 @@ class CollectorService : Service() {
                         "KPI power read status=${power.status} ${power.error.orEmpty()}"
                     }
                     val on = power.raw > 0
+                    mainHandler.post {
+                        if (running.get() && com.bydcollector.collector.ha.HaRunSession.process.observePower(power.raw.toLong())) {
+                            val demand = settings.runtimeDemand()
+                            if (!demand.mqtt && mqttConnection.owned) stopMqttExport(manualStop = false)
+                            if (!demand.influx && influxConnection.owned) stopInfluxExport(manualStop = false)
+                        }
+                    }
                     if (on != kpiPowerOn) {
                         kpiPowerOn = on
                         if (!on) mainHandler.post {
@@ -3323,13 +3331,16 @@ class CollectorService : Service() {
 
     private fun startMqttExport(clearManualStop: Boolean = true) {
         if (settings.isUserShutdownRequested()) return
+        if (!settings.runtimeDemand().mqtt) { if (!mqttRuntimeActive.get()) mqttConnection.release(); return }
         if (mqttConnection.stopping || mqttOfflineQueued.get()) return
         if (maintenanceBlocksRuntimeStart() ||
             (clearManualStop && (!settings.isMqttEnabled() || settings.isMqttManuallyStopped()))) {
             if (!mqttRuntimeActive.get()) mqttConnection.release()
             return
         }
+        com.bydcollector.collector.ha.HaRunSession.process.start(com.bydcollector.collector.ha.HaExportChannel.MQTT)
         mqttConnection.reserve()
+        mqttTerminalError = false
         mqttWorkGeneration.incrementAndGet()
         if (clearManualStop) settings.setMqttManuallyStopped(false)
         settings.setMqttEnabled(true)
@@ -3345,6 +3356,7 @@ class CollectorService : Service() {
     private fun stopMqttExport(manualStop: Boolean = true) {
         if (settings.isUserShutdownRequested()) return
         if (manualStop && settings.isMqttEnabled() && !settings.isMqttManuallyStopped()) return
+        com.bydcollector.collector.ha.HaRunSession.process.stop(com.bydcollector.collector.ha.HaExportChannel.MQTT)
         mqttConnection.beginStop()
         mqttWorkGeneration.incrementAndGet()
         setMqttRuntime(RuntimeActionStatus.STOPPING)
@@ -3366,13 +3378,16 @@ class CollectorService : Service() {
 
     private fun startInfluxExport(clearManualStop: Boolean = true) {
         if (settings.isUserShutdownRequested()) return
+        if (!settings.runtimeDemand().influx) { if (influxWorkInFlight.get() == 0) influxConnection.release(); return }
         if (influxConnection.stopping) return
         if (maintenanceBlocksRuntimeStart() ||
             (clearManualStop && (!settings.isInfluxEnabled() || settings.isInfluxManuallyStopped()))) {
             if (influxWorkInFlight.get() == 0) influxConnection.release()
             return
         }
+        com.bydcollector.collector.ha.HaRunSession.process.start(com.bydcollector.collector.ha.HaExportChannel.INFLUX)
         influxConnection.reserve()
+        influxTerminalError = false
         settings.setInfluxEnabled(true)
         if (!clearManualStop) {
             val workActive = influxRequestQueued.get() || influxWorkInFlight.get() > 0
@@ -3482,6 +3497,7 @@ class CollectorService : Service() {
 
     private fun stopInfluxExport(manualStop: Boolean = true) {
         if (manualStop && settings.isInfluxEnabled() && !settings.isInfluxManuallyStopped()) return
+        com.bydcollector.collector.ha.HaRunSession.process.stop(com.bydcollector.collector.ha.HaExportChannel.INFLUX)
         recordInfluxGate("stopped")
         influxConnection.beginStop()
         advanceInfluxGeneration()
@@ -3515,6 +3531,44 @@ class CollectorService : Service() {
             }
         }
         if (!accepted) influxConnection.stopSubmissionFailed()
+    }
+
+    private var mqttTerminalError = false
+    private var influxTerminalError = false
+
+    private fun finishMqttFailure(generation: Long, reason: String) {
+        if (!running.get() || generation != mqttWorkGeneration.get() || mqttConnection.stopping) return
+        mqttTerminalError = true
+        settings.setMqttManuallyStopped(true)
+        runCatching { store.recordEvent("mqtt_terminal_failure", "MQTT run ended", reason) }
+        stopMqttExport(manualStop = false)
+        setMqttRuntime(RuntimeActionStatus.ERROR)
+    }
+
+    private fun finishInfluxFailure(generation: Long, reason: String) {
+        if (!running.get() || generation != influxWorkGeneration.get() || influxConnection.stopping) return
+        influxTerminalError = true
+        settings.setInfluxManuallyStopped(true)
+        com.bydcollector.collector.ha.HaRunSession.process.stop(com.bydcollector.collector.ha.HaExportChannel.INFLUX)
+        settings.setInfluxEnabled(false)
+        influxConnection.beginStop()
+        advanceInfluxGeneration()
+        cancelInfluxRetry("terminal_failure")
+        recordInfluxGate("terminal_failure", mapOf("category" to reason))
+        setInfluxRuntime(RuntimeActionStatus.ERROR)
+        releaseTerminalInfluxOwner()
+    }
+
+    private fun releaseTerminalInfluxOwner() {
+        if (!influxTerminalError || !influxConnection.stopping || influxWorkInFlight.get() != 0) return
+        // Every submitted task has settled; no new SQL operation is needed to unlock a broken database.
+        influxCoordinator.endSession()
+        synchronized(influxExecutorLock) {
+            if (influxExecutor.isShutdown && running.get()) influxExecutor = namedSingleThreadExecutor("byd-influx")
+        }
+        influxConnection.release()
+        publishDashboardRuntimeFlags()
+        scheduleIntegrationDashboardRefresh()
     }
 
     private fun reconcileTelegramRuntime(unblockBlocked: Boolean = false) {
@@ -3882,7 +3936,10 @@ class CollectorService : Service() {
 
     private fun postMqttRetrySchedule(submittedGeneration: Long) {
         if (submittedGeneration != mqttWorkGeneration.get()) return
-        val delayMs = runCatching { mqttCoordinator.retryDelayMs() }.getOrNull()
+        val delayMs = try { mqttCoordinator.retryDelayMs() } catch (error: RuntimeException) {
+            mainHandler.post { finishMqttFailure(submittedGeneration, "retry_preparation:${error::class.java.simpleName}") }
+            return
+        }
         mainHandler.post {
             if (submittedGeneration != mqttWorkGeneration.get()) return@post
             scheduleMqttRetry(delayMs)
@@ -4010,8 +4067,8 @@ class CollectorService : Service() {
             mqttOfflineQueued.set(false)
             mainHandler.post {
                 if (!settings.isMqttEnabled()) mqttConnection.release()
-                if (!settings.isMqttEnabled() && mqttRuntimeStatus == RuntimeActionStatus.STOPPING) {
-                    setMqttRuntime(if (completedOk) RuntimeActionStatus.STOPPED else RuntimeActionStatus.ERROR)
+                if (!settings.isMqttEnabled() && (mqttRuntimeStatus == RuntimeActionStatus.STOPPING || mqttTerminalError)) {
+                    setMqttRuntime(if (completedOk && !mqttTerminalError) RuntimeActionStatus.STOPPED else RuntimeActionStatus.ERROR)
                     stopIfNoActiveRuntime()
                 }
                 scheduleIntegrationDashboardRefresh()
@@ -4024,6 +4081,8 @@ class CollectorService : Service() {
         activateTailscaleOnFailure: Boolean = true,
         action: () -> MqttActionResult
     ): Boolean {
+        val submitted = mqttWorkGeneration.get()
+        val terminal = java.util.concurrent.atomic.AtomicReference<String?>(null)
         if (settings.isMqttEnabled() && !maintenanceBlocksRuntimeStart()) mqttConnection.reserve()
         return executeChannel(
             channelName = "MQTT",
@@ -4037,6 +4096,7 @@ class CollectorService : Service() {
             },
             action = action,
             onSuccess = { result, submittedGeneration ->
+                if (!result.ok && !result.retryable) terminal.set(result.category)
                 if (submittedGeneration == mqttWorkGeneration.get()) {
                     if (result.ok && settings.isMqttEnabled()) {
                         setMqttRuntime(RuntimeActionStatus.RUNNING)
@@ -4044,8 +4104,10 @@ class CollectorService : Service() {
                         setMqttRuntime(RuntimeActionStatus.ERROR)
                     }
                 }
-                postMqttRetrySchedule(submittedGeneration)
+                if (terminal.get() == null) postMqttRetrySchedule(submittedGeneration)
             },
+            onException = { terminal.set("exception:${it::class.java.simpleName}") },
+            onSettled = { terminal.get()?.let { reason -> mainHandler.post { finishMqttFailure(submitted, reason) } } },
             onComplete = ::scheduleIntegrationDashboardRefresh,
             onFailedAction = {
                 if (settings.isMqttEnabled() && !mqttConnection.stopping) {
@@ -4132,6 +4194,8 @@ class CollectorService : Service() {
         expectedGeneration: Long? = null,
         action: () -> InfluxActionResult
     ): Boolean {
+        val submitted = expectedGeneration ?: influxWorkGeneration.get()
+        val terminal = java.util.concurrent.atomic.AtomicReference<String?>(null)
         if (!isStop && settings.isInfluxEnabled() && !maintenanceBlocksRuntimeStart()) influxConnection.reserve()
         influxWorkInFlight.incrementAndGet()
         return executeChannel(
@@ -4149,11 +4213,12 @@ class CollectorService : Service() {
             },
             action = action,
             onSuccess = { result, submittedGeneration ->
+                if (!isStop && !result.ok && !result.retryable) terminal.set(result.category)
                 if (submittedGeneration == influxWorkGeneration.get()) {
                     if (result.ok && settings.isInfluxEnabled()) {
                         setInfluxRuntime(RuntimeActionStatus.RUNNING)
                     } else if (result.ok && !settings.isInfluxEnabled()) {
-                        setInfluxRuntime(RuntimeActionStatus.STOPPED)
+                        setInfluxRuntime(if (influxTerminalError) RuntimeActionStatus.ERROR else RuntimeActionStatus.STOPPED)
                     } else if (!result.ok) {
                         setInfluxRuntime(RuntimeActionStatus.ERROR)
                     }
@@ -4167,9 +4232,12 @@ class CollectorService : Service() {
                 try {
                     settleInfluxWork()
                 } finally {
-                    afterSettled?.invoke()
+                    val reason = terminal.get()
+                    if (reason != null) mainHandler.post { finishInfluxFailure(submitted, reason) }
+                    else afterSettled?.invoke()
                 }
             },
+            onException = { if (!isStop) terminal.set("exception:${it::class.java.simpleName}") },
             onFailedAction = {
                 if (isInfluxSubmissionCurrent(expectedGeneration, influxWorkGeneration.get()) &&
                     (isStop || (settings.isInfluxEnabled() && !influxConnection.stopping))
@@ -4200,6 +4268,7 @@ class CollectorService : Service() {
             influxRuntimeDiagnostics.flushSummary("stop")
         }
         mainHandler.post {
+            releaseTerminalInfluxOwner()
             if (influxWorkInFlight.get() == 0 && influxConnection.stopping && !settings.isInfluxEnabled()) {
                 // A queued Stop may have been superseded by maintenance; retain ownership but allow retry.
                 influxConnection.stopSubmissionFailed()
@@ -4328,12 +4397,12 @@ class CollectorService : Service() {
                                 if (submittedGeneration != generation.get() || !canExecute()) return@onSuccess
                                 val state = status(result)
                                 if (!state.ok) {
-                                    store.recordEvent(
+                                    recordChannelFailure(
                                         errorCategory,
                                         "$channelName async action failed",
                                         "${state.category}: ${state.message}"
                                     )
-                                    onFailedAction?.invoke()
+                                    runCatching { onFailedAction?.invoke() }
                                 }
                                 if (submittedGeneration == generation.get()) {
                                     onSuccess?.invoke(result, submittedGeneration)
@@ -4341,12 +4410,12 @@ class CollectorService : Service() {
                             }
                             .onFailure { error ->
                                 if (submittedGeneration != generation.get() || !canExecute()) return@onFailure
-                                store.recordEvent(
+                                recordChannelFailure(
                                     errorCategory,
                                     "$channelName async action failed",
                                     "${error::class.java.simpleName}: ${error.message ?: "no message"}"
                                 )
-                                onFailedAction?.invoke()
+                                runCatching { onFailedAction?.invoke() }
                                 onException?.invoke(error)
                             }
                     } finally {
@@ -4370,12 +4439,13 @@ class CollectorService : Service() {
                 )
             }
             if (submittedGeneration == generation.get() && canExecute()) {
-                store.recordEvent(
+                recordChannelFailure(
                     errorCategory,
                     "$channelName async action rejected",
                     "${error::class.java.simpleName}: ${error.message ?: "no message"}"
                 )
-                onFailedAction?.invoke()
+                runCatching { onFailedAction?.invoke() }
+                onException?.invoke(error)
                 onComplete?.invoke()
             }
             onSettled?.invoke()
@@ -4388,6 +4458,16 @@ class CollectorService : Service() {
         val category: String,
         val message: String
     )
+
+    private fun recordChannelFailure(category: String, message: String, detail: String) {
+        runCatching { store.recordEvent(category, message, detail) }.onFailure {
+            runCatching {
+                (applicationContext as BydCollectorApplication).operationalEventJournal.tryAppend(
+                    Instant.now().toString(), SystemClock.elapsedRealtime(), category, message, detail
+                )
+            }
+        }
+    }
 
     private fun handleTelegramExecutionFailure(error: Throwable) {
         if (error !is SQLiteException) {

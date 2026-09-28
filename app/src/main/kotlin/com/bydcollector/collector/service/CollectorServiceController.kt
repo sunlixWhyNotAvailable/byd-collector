@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import com.bydcollector.collector.ha.HaConnectionOwnership
+import com.bydcollector.collector.ha.HaRunSession
+import com.bydcollector.collector.ha.HaExportChannel
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 
 object CollectorServiceController {
@@ -56,7 +58,10 @@ object CollectorServiceController {
     }
 
     fun startMqttExport(context: Context) {
-        startOwnedChannel(context, CollectorService.mqttConnection, CollectorService.startMqttExportIntent(context))
+        if (CollectorService.mqttConnection.owned) return
+        startManualChannel(HaExportChannel.MQTT) {
+            startOwnedChannel(context, CollectorService.mqttConnection, CollectorService.startMqttExportIntent(context))
+        }
     }
 
     fun reconcileDebug(context: Context) {
@@ -77,7 +82,18 @@ object CollectorServiceController {
     }
 
     fun startInfluxExport(context: Context) {
-        startOwnedChannel(context, CollectorService.influxConnection, CollectorService.startInfluxExportIntent(context))
+        if (CollectorService.influxConnection.owned) return
+        startManualChannel(HaExportChannel.INFLUX) {
+            startOwnedChannel(context, CollectorService.influxConnection, CollectorService.startInfluxExportIntent(context))
+        }
+    }
+
+    private inline fun startManualChannel(channel: HaExportChannel, start: () -> Unit) {
+        val granted = HaRunSession.process.start(channel)
+        try { start() } catch (error: RuntimeException) {
+            if (granted) HaRunSession.process.stop(channel)
+            throw error
+        }
     }
 
     fun reconcileInfluxExport(context: Context) {

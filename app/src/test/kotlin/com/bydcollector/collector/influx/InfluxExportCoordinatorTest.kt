@@ -10,6 +10,110 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class InfluxExportCoordinatorTest {
+    @Test fun actualHttpFailoverUsesAlternativePortAndKeepsWorkingRoute() {
+        for (primaryStatus in listOf(408, 500, 503, 401)) {
+            var primaryWrites = 0
+            var alternativeWrites = 0
+            var alternativeStatus = 204
+            val primary = LocalHttpEndpoint {
+                primaryWrites++
+                primaryStatus
+            }
+            val alternative = LocalHttpEndpoint { request ->
+                if (request.startsWith("POST /write")) alternativeWrites++
+                alternativeStatus
+            }
+            try {
+                val config = config().copy(host = "127.0.0.1", port = primary.port,
+                    alternativeHost = "127.0.0.1", alternativePort = alternative.port)
+                val store = FakeInfluxStore(listOf(row(10, "soc")))
+                val client = HttpInfluxClient()
+                val coordinator = InfluxExportCoordinator(store, client, { config }, FakeClock())
+                assertTrue(coordinator.testConnection(config.forProfile(HaEndpointProfile.ALTERNATIVE)).ok)
+                alternativeWrites = 0
+                val result = coordinator.startExport()
+                assertEquals(1, primaryWrites)
+                if (primaryStatus == 401) {
+                    assertFalse(result.ok)
+                    assertEquals(0, alternativeWrites)
+                    assertEquals(null, coordinator.retryDelayMs())
+                } else {
+                    assertTrue(result.ok, "HTTP $primaryStatus")
+                    assertEquals(1, alternativeWrites)
+                    assertEquals(10, store.cursor("soc").lastExportedHistoryId)
+                    store.addRow(row(11, "soc"))
+                    assertTrue(coordinator.runOneCycle(force = true).ok)
+                    assertEquals(1, primaryWrites) // Sticky Alternative; selector is not a route lock.
+                    assertEquals(2, alternativeWrites)
+                    alternativeStatus = 503
+                    store.addRow(row(12, "soc"))
+                    assertFalse(coordinator.runOneCycle(force = true).ok)
+                    assertEquals(2, primaryWrites)
+                    assertEquals(30_000L, coordinator.retryDelayMs())
+                    assertEquals(11, store.cursor("soc").lastExportedHistoryId)
+                }
+            } finally {
+                primary.close()
+                alternative.close()
+            }
+        }
+    }
+
+    private class LocalHttpEndpoint(private val response: (String) -> Int) : AutoCloseable {
+        private val server = java.net.ServerSocket(0, 8, java.net.InetAddress.getByName("127.0.0.1"))
+        val port: Int get() = server.localPort
+        private val worker = kotlin.concurrent.thread(isDaemon = true) {
+            while (!server.isClosed) {
+                val socket = try { server.accept() } catch (_: java.net.SocketException) { break }
+                socket.use {
+                    it.soTimeout = 5_000
+                    val reader = it.getInputStream().bufferedReader(Charsets.UTF_8)
+                    val request = reader.readLine()
+                    var length = 0
+                    while (true) {
+                        val header = reader.readLine() ?: break
+                        if (header.isEmpty()) break
+                        if (header.startsWith("Content-Length:", ignoreCase = true)) length = header.substringAfter(':').trim().toInt()
+                    }
+                    repeat(length) { reader.read() }
+                    val code = response(request)
+                    it.getOutputStream().write("HTTP/1.1 $code Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                }
+            }
+        }
+        override fun close() { server.close(); worker.join(5_000); check(!worker.isAlive) }
+    }
+
+    @Test fun preparationAndPersistenceFailuresTerminateWithoutDependingOnSqlDiagnostics() {
+        for (stage in listOf("config", "summary", "rows", "state")) {
+            val store = FakeInfluxStore(listOf(row(10, "soc")), failStage = stage,
+                eventFailure = IllegalStateException("diagnostics unavailable"))
+            val events = mutableListOf<InfluxDiagnosticEvent>()
+            val client = FakeInfluxClient()
+            val coordinator = InfluxExportCoordinator(store, client, {
+                if (stage == "config") error("config failure")
+                config()
+            }, FakeClock(), { events += it })
+            val result = coordinator.startExport()
+            assertFalse(result.ok, stage)
+            assertFalse(result.retryable, stage)
+            assertEquals(null, coordinator.retryDelayMs(), stage)
+            assertTrue(client.writtenLines.isEmpty(), stage)
+            assertEquals(0, store.cursor("soc").lastExportedHistoryId, stage)
+            assertTrue(events.any { it.type == "influx_terminal_failure" }, stage)
+        }
+    }
+
+    @Test fun authenticationAndInvalidConfigAreTerminalNotNetworkRetries() {
+        val store = FakeInfluxStore(listOf(row(10, "soc")))
+        val coordinator = coordinator(store, FakeInfluxClient(writeResult = InfluxActionResult.fail(
+            "influx_http_error", "unauthorized", 401, InfluxFailureKind.AUTHENTICATION)))
+        assertFalse(coordinator.startExport().retryable)
+        assertEquals(null, coordinator.retryDelayMs())
+        assertEquals("error", store.influxExportState().status)
+        assertFalse(InfluxActionResult.fail("influx_endpoint_invalid", "invalid").retryable)
+    }
+
     @Test
     fun staleServiceOwnershipCannotEnterCycleStartOrResume() {
         val store = FakeInfluxStore(listOf(row(10, "soc")))
@@ -1200,7 +1304,8 @@ class InfluxExportCoordinatorTest {
     private class FakeInfluxStore(
         rows: List<InfluxPendingHistoryRow>,
         private val cursorFailureField: String? = null,
-        private val eventFailure: RuntimeException? = null
+        private val eventFailure: RuntimeException? = null,
+        private val failStage: String? = null
     ) : InfluxExportStore {
         private val rows = rows.toMutableList()
         val cursors = linkedMapOf<String, InfluxCursor>()
@@ -1228,6 +1333,7 @@ class InfluxExportCoordinatorTest {
         }
 
         override fun pendingInfluxSummary(fieldKeys: Set<String>): InfluxPendingSummary {
+            if (failStage == "summary") error("pending summary failure")
             summaryCalls++
             ensureInfluxCursors(fieldKeys)
             val pending = rows.filter { row ->
@@ -1240,6 +1346,7 @@ class InfluxExportCoordinatorTest {
         }
 
         override fun pendingInfluxRows(fieldKeys: Set<String>, limit: Int): List<InfluxPendingHistoryRow> {
+            if (failStage == "rows") error("pending rows failure")
             ensureInfluxCursors(fieldKeys)
             pendingBatchLimits += limit
             return rows.asSequence()
@@ -1271,6 +1378,7 @@ class InfluxExportCoordinatorTest {
             lastError: String?,
             exportedRowsDelta: Long
         ) {
+            if (failStage == "state") error("state persistence failure")
             state = state.copy(
                 status = status,
                 mode = mode,

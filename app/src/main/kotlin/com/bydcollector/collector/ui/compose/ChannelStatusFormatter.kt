@@ -3,8 +3,17 @@ package com.bydcollector.collector.ui.compose
 import com.bydcollector.collector.ui.RuntimeActionStatus
 import java.util.Locale
 
+data class HaChannelControls(val start: Boolean, val stop: Boolean, val edit: Boolean)
+
 //maps verbose channel health strings into compact ui labels without treating a healthy next batch as a retry failure
 object ChannelStatusFormatter {
+    fun controls(runtime: RuntimeActionStatus, owned: Boolean, stopping: Boolean, testing: Boolean): HaChannelControls {
+        val stoppingNow = stopping || runtime == RuntimeActionStatus.STOPPING
+        val active = owned || runtime == RuntimeActionStatus.STARTING || runtime == RuntimeActionStatus.RUNNING
+        val idle = !active && !stoppingNow
+        return HaChannelControls(start = idle && !testing, stop = active && !stoppingNow, edit = idle && !testing)
+    }
+
     fun compactText(
         status: String?,
         strings: UiStrings,

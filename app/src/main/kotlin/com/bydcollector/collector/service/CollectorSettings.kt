@@ -12,6 +12,8 @@ import com.bydcollector.collector.telegram.TelegramNavigatorMask
 import com.bydcollector.collector.telegram.TelegramPayloadLimitState
 import com.bydcollector.collector.telegram.TelegramTemplateLanguage
 import com.bydcollector.collector.ha.HaIntegrationCategories
+import com.bydcollector.collector.ha.HaRunSession
+import com.bydcollector.collector.ha.HaExportChannel
 import com.bydcollector.collector.influx.InfluxConfig
 import com.bydcollector.collector.keepalive.KeepAliveConfig
 import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
@@ -57,14 +59,14 @@ class CollectorSettings(
 
     fun isAutoStartEnabled(): Boolean = prefs.getBoolean(KEY_AUTO_START, false)
 
-    fun runtimeDemand(includeEnabledExports: Boolean = false): RuntimeDemand {
+    fun runtimeDemand(): RuntimeDemand {
         if (isUserShutdownRequested()) return RuntimeDemand()
         return RuntimeDemand(
             main = isAutoStartEnabled() && !isMainManuallyStopped(),
             debug = isDebugAutoStartEnabled() && !isDebugManuallyStopped(),
-            mqtt = (isMqttAutoStartEnabled() || includeEnabledExports && isMqttEnabled()) &&
+            mqtt = HaRunSession.process.allows(HaExportChannel.MQTT, isMqttAutoStartEnabled()) &&
                 !isMqttManuallyStopped(),
-            influx = (isInfluxAutoStartEnabled() || includeEnabledExports && isInfluxEnabled()) &&
+            influx = HaRunSession.process.allows(HaExportChannel.INFLUX, isInfluxAutoStartEnabled()) &&
                 !isInfluxManuallyStopped(),
             telegram = isTelegramEnabled(),
             keepAlive = keepAliveConfig().anyEnabled
@@ -258,10 +260,11 @@ class CollectorSettings(
         )
     }
 
-    fun isMqttEnabled(): Boolean = prefs.getBoolean(KEY_MQTT_ENABLED, false)
+    fun isMqttEnabled(): Boolean = prefs.getBoolean(KEY_MQTT_ENABLED, false) &&
+        HaRunSession.process.allows(HaExportChannel.MQTT, isMqttAutoStartEnabled()) && !isMqttManuallyStopped()
 
     fun setMqttEnabled(enabled: Boolean) {
-        if (isMqttEnabled() == enabled) return
+        if (prefs.getBoolean(KEY_MQTT_ENABLED, false) == enabled) return
         prefs.edit().putBoolean(KEY_MQTT_ENABLED, enabled).apply()
         recordEvent(
             category = if (enabled) "mqtt_enabled" else "mqtt_disabled",
@@ -395,10 +398,11 @@ class CollectorSettings(
         )
     }
 
-    fun isInfluxEnabled(): Boolean = prefs.getBoolean(KEY_INFLUX_ENABLED, false)
+    fun isInfluxEnabled(): Boolean = prefs.getBoolean(KEY_INFLUX_ENABLED, false) &&
+        HaRunSession.process.allows(HaExportChannel.INFLUX, isInfluxAutoStartEnabled()) && !isInfluxManuallyStopped()
 
     fun setInfluxEnabled(enabled: Boolean) {
-        if (isInfluxEnabled() == enabled) return
+        if (prefs.getBoolean(KEY_INFLUX_ENABLED, false) == enabled) return
         prefs.edit().putBoolean(KEY_INFLUX_ENABLED, enabled).apply()
         recordEvent(
             category = if (enabled) "influx_enabled" else "influx_disabled",

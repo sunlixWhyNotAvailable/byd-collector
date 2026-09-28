@@ -5,6 +5,28 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 
 class ChannelStatusFormatterTest {
+    @Test fun buttonsAndFieldsAgreeDuringRetriesAndAfterTerminalCleanup() {
+        for (runtime in RuntimeActionStatus.entries) {
+            val owned = ChannelStatusFormatter.controls(runtime, owned = true, stopping = false, testing = false)
+            assertEquals(false, owned.start)
+            assertEquals(false, owned.edit)
+            assertEquals(runtime != RuntimeActionStatus.STOPPING, owned.stop)
+            assertEquals(HaChannelControls(false, false, false),
+                ChannelStatusFormatter.controls(runtime, owned = true, stopping = true, testing = false))
+        }
+        for (runtime in listOf(RuntimeActionStatus.STOPPED, RuntimeActionStatus.ERROR)) {
+            assertEquals(HaChannelControls(true, false, true),
+                ChannelStatusFormatter.controls(runtime, owned = false, stopping = false, testing = false))
+            assertEquals(HaChannelControls(false, false, false),
+                ChannelStatusFormatter.controls(runtime, owned = false, stopping = false, testing = true))
+        }
+        for (language in listOf(UiLanguage.UK, UiLanguage.EN)) {
+            assertEquals(strings(language).error.lowercase(),
+                ChannelStatusFormatter.compactText("backoff", strings(language), RuntimeActionStatus.ERROR))
+            assertEquals(StatusKind.ERROR, ChannelStatusFormatter.kind("backoff", true, RuntimeActionStatus.ERROR))
+        }
+    }
+
     @Test
     fun healthyInfluxBatchScheduleIsActiveWhileRuntimeIsRunning() {
         val status = "scheduled; pending: 10362; retry at 2026-08-13 17:23:15"
