@@ -3,6 +3,8 @@ package com.bydcollector.collector.ui
 import com.bydcollector.collector.data.normalized.NormalizedQuality
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.data.normalized.StoredNormalizedState
+import com.bydcollector.collector.data.energy.RemainingRangeEstimate
+import com.bydcollector.collector.data.energy.RemainingRangeResolver
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -12,7 +14,8 @@ enum class VehicleKpiLanguage { UK, EN }
 object VehicleKpiMapper {
     fun from(
         rows: List<StoredNormalizedState>,
-        language: VehicleKpiLanguage = VehicleKpiLanguage.UK
+        language: VehicleKpiLanguage = VehicleKpiLanguage.UK,
+        ecMeanKwhPer100Km: Double? = null
     ): VehicleKpis {
         val byKey = rows.associateBy { it.fieldKey }
         val chargePower = byKey.number("battery_charge_power_kw")
@@ -23,6 +26,13 @@ object VehicleKpiMapper {
 
         val charging = chargePower != null && chargePower > 0.05
         val power = if (charging) chargePower else dischargePower
+        val range = resolveRange(
+            ecMeanKwhPer100Km,
+            byKey.number("cumulative_energy_kwh"),
+            byKey.number("odometer_km"),
+            byKey.number("battery_remaining_energy_kwh"),
+            byKey.number("remaining_range_km")
+        )
         return VehicleKpis(
             socPercent = byKey.percent("soc"),
             remainingEnergyKwh = formatKwh(byKey.number("battery_remaining_energy_kwh"), language),
@@ -34,7 +44,7 @@ object VehicleKpiMapper {
             sohPercent = byKey.percent("battery_soh_percent"),
             batteryPowerCharging = charging,
             batteryPowerKw = power?.let { formatKw(if (charging) abs(it) else -abs(it), language) } ?: "-",
-            remainingRangeKm = byKey.km("remaining_range_km", language),
+            remainingRangeKm = range.rangeKm.kmValue(language),
             batteryTempC = byKey.temp("battery_average_temp_raw"),
             cellVoltageDeltaMv = deltaMv?.let { formatMv(it, language) } ?: "-"
         )
@@ -42,15 +52,10 @@ object VehicleKpiMapper {
 
     fun fromObservations(
         observations: List<NormalizedObservation>,
-        language: VehicleKpiLanguage = VehicleKpiLanguage.UK
+        language: VehicleKpiLanguage = VehicleKpiLanguage.UK,
+        ecMeanKwhPer100Km: Double? = null
     ): VehicleKpis {
-        val numbers = observations
-            .asSequence()
-            .filter { it.quality == NormalizedQuality.OK }
-            .mapNotNull { observation ->
-                observation.value.number?.let { observation.field.fieldKey to it }
-            }
-            .toMap()
+        val numbers = currentNumbers(observations)
         val chargePower = numbers["battery_charge_power_kw"]
         val dischargePower = numbers["battery_discharge_power_kw"]
         val deltaMv = cellDeltaMv(
@@ -59,6 +64,13 @@ object VehicleKpiMapper {
         )
         val charging = chargePower != null && chargePower > 0.05
         val power = if (charging) chargePower else dischargePower
+        val range = resolveRange(
+            ecMeanKwhPer100Km,
+            numbers["cumulative_energy_kwh"],
+            numbers["odometer_km"],
+            numbers["battery_remaining_energy_kwh"],
+            numbers["remaining_range_km"]
+        )
         return VehicleKpis(
             socPercent = numbers.percentValue("soc"),
             remainingEnergyKwh = formatKwh(numbers["battery_remaining_energy_kwh"], language),
@@ -70,11 +82,45 @@ object VehicleKpiMapper {
             sohPercent = numbers.percentValue("battery_soh_percent"),
             batteryPowerCharging = charging,
             batteryPowerKw = power?.let { formatKw(if (charging) abs(it) else -abs(it), language) } ?: "-",
-            remainingRangeKm = numbers.kmValue("remaining_range_km", language),
+            remainingRangeKm = range.rangeKm.kmValue(language),
             batteryTempC = numbers.tempValue("battery_average_temp_raw"),
             cellVoltageDeltaMv = deltaMv?.let { formatMv(it, language) } ?: "-"
         )
     }
+
+    internal fun rangeEstimateFromObservations(
+        observations: List<NormalizedObservation>,
+        ecMeanKwhPer100Km: Double?
+    ): RemainingRangeEstimate {
+        val numbers = currentNumbers(observations)
+        return resolveRange(
+            ecMeanKwhPer100Km,
+            numbers["cumulative_energy_kwh"],
+            numbers["odometer_km"],
+            numbers["battery_remaining_energy_kwh"],
+            numbers["remaining_range_km"]
+        )
+    }
+
+    private fun currentNumbers(observations: List<NormalizedObservation>): Map<String, Double> = observations
+        .asSequence()
+        .filter { it.quality == NormalizedQuality.OK }
+        .mapNotNull { observation -> observation.value.number?.let { observation.field.fieldKey to it } }
+        .toMap()
+
+    private fun resolveRange(
+        ecMeanKwhPer100Km: Double?,
+        cumulativeEnergyKwh: Double?,
+        odometerKm: Double?,
+        remainingEnergyKwh: Double?,
+        oemRangeKm: Double?
+    ): RemainingRangeEstimate = RemainingRangeResolver.resolve(
+        ecMeanKwhPer100Km = ecMeanKwhPer100Km,
+        cumulativeEnergyKwh = cumulativeEnergyKwh,
+        odometerKm = odometerKm,
+        remainingEnergyKwh = remainingEnergyKwh,
+        oemRangeKm = oemRangeKm
+    )
 
     private fun Map<String, StoredNormalizedState>.number(fieldKey: String): Double? {
         val row = this[fieldKey] ?: return null
@@ -118,6 +164,11 @@ object VehicleKpiMapper {
     private fun Map<String, Double>.kmValue(fieldKey: String, language: VehicleKpiLanguage): String {
         val unit = if (language == VehicleKpiLanguage.UK) "км" else "km"
         return this[fieldKey]?.roundToInt()?.let { "${it.formatInt()} $unit" } ?: "-"
+    }
+
+    private fun Double?.kmValue(language: VehicleKpiLanguage): String {
+        val unit = if (language == VehicleKpiLanguage.UK) "км" else "km"
+        return this?.roundToInt()?.let { "${it.formatInt()} $unit" } ?: "-"
     }
 
     private fun Map<String, Double>.tempValue(fieldKey: String): String {

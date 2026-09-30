@@ -8,6 +8,7 @@ import com.bydcollector.collector.data.normalized.NormalizedValueType
 import com.bydcollector.collector.data.normalized.StoredNormalizedState
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertTrue
 
 class VehicleKpiMapperTest {
     @Test
@@ -18,6 +19,34 @@ class VehicleKpiMapperTest {
         assertEquals("-", VehicleKpiMapper.fromObservations(listOf(observation(
             "battery_remaining_energy_kwh", 53.4, NormalizedQuality.INVALID
         ))).remainingEnergyKwh)
+    }
+
+    @Test
+    fun remainingRangeUsesSharedResolverAndKeepsOemObservationUnchanged() {
+        val rows = listOf(
+            state("battery_remaining_energy_kwh", 9.0),
+            state("cumulative_energy_kwh", 500.0),
+            state("odometer_km", 1_000.0),
+            state("remaining_range_km", 321.0)
+        )
+        val observations = listOf(
+            observation("battery_remaining_energy_kwh", 9.0),
+            observation("cumulative_energy_kwh", 500.0),
+            observation("odometer_km", 1_000.0),
+            observation("remaining_range_km", 321.0)
+        )
+
+        assertEquals("30 km", VehicleKpiMapper.from(rows, VehicleKpiLanguage.EN, 30.0).remainingRangeKm)
+        assertEquals("30 km", VehicleKpiMapper.fromObservations(
+            observations, VehicleKpiLanguage.EN, 30.0
+        ).remainingRangeKm)
+        assertEquals("18 km", VehicleKpiMapper.from(rows, VehicleKpiLanguage.EN).remainingRangeKm)
+        assertEquals("321 km", VehicleKpiMapper.from(
+            rows.filterNot { it.fieldKey == "battery_remaining_energy_kwh" }, VehicleKpiLanguage.EN
+        ).remainingRangeKm)
+        assertEquals(321.0, observations.last().value.number)
+        assertTrue(NormalizedFieldCatalog.kpiSourceKeys.size <= 24)
+        assertTrue(NormalizedFieldCatalog.kpiKeys.contains("cumulative_energy_kwh"))
     }
 
     @Test

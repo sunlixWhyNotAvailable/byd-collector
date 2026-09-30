@@ -74,21 +74,129 @@ class KpiLiveSourcesTest {
         assertFalse(buffer.resetTransport())
     }
 
-    @Test fun `one second fallback two second reconciliation and forced entry seed`() {
+    @Test fun `visible fallback and callback cadence remain one and two seconds while hidden cadence is five minutes`() {
         val cadence = KpiPollCadence()
         val rows = listOf(soc, current)
         val proven: (String) -> Boolean = { it == current.key }
         assertEquals(rows, cadence.due(rows, 10_000, true, true, true, proven))
         cadence.markStarted(rows, 10_000)
+        cadence.markResults(
+            listOf(
+                soc to DirectHelperReadResult(CollectorHelperProtocol.STATUS_OK, 80),
+                current to DirectHelperReadResult(CollectorHelperProtocol.STATUS_OK, 10.0f.toBits())
+            ),
+            requestElapsedMs = 10_000,
+            nowElapsedMs = 10_050
+        )
         assertEquals(listOf(soc), cadence.due(rows, 11_000, true, true, true, proven))
-        assertEquals(rows, cadence.due(rows, 11_000, true, false, true, proven))
-        assertEquals(rows, cadence.due(rows, 11_000, true, true, false, proven))
-        assertTrue(cadence.due(rows, 11_000, false, false, true, proven).isEmpty())
         assertEquals(rows, cadence.due(rows, 12_000, true, true, true, proven))
-        assertEquals(rows, cadence.due(rows, 10_001, true, true, true, proven, forceSeed = true))
+        assertTrue(cadence.due(rows, 11_000, true, false, true, proven).isEmpty())
+        assertTrue(cadence.due(rows, 11_000, false, true, true, proven).isEmpty())
+        assertEquals(rows, cadence.due(rows, 310_000, true, false, true, proven))
+        assertEquals(rows, cadence.due(rows, 310_000, false, true, true, proven))
+        assertEquals(rows, cadence.due(rows, 11_000, true, false, true, proven, forceSeed = true))
         assertEquals(500L, cadence.nextDelayMs(rows, 10_500, true, true, true, proven))
         cadence.clear()
         assertEquals(0L, cadence.nextDelayMs(rows, 10_500, true, true, true, proven))
+    }
+
+    @Test fun `a partial success leaves only the failed field on retry cadence`() {
+        val cadence = KpiPollCadence()
+        val rows = listOf(soc, current)
+
+        cadence.markStarted(rows, 10_000)
+        cadence.markResults(
+            listOf(
+                soc to DirectHelperReadResult(CollectorHelperProtocol.STATUS_OK, 80),
+                current to DirectHelperReadResult(CollectorHelperProtocol.STATUS_READ_ERROR, null)
+            ),
+            requestElapsedMs = 10_000,
+            nowElapsedMs = 10_050
+        )
+
+        assertEquals(listOf(current), cadence.due(rows, 11_000, true, true, true, callbackProven = { true }))
+    }
+
+    @Test fun `missing or failed getters use one two five fifteen then thirty second backoff`() {
+        val cadence = KpiPollCadence()
+        val delays = listOf(1_000L, 2_000L, 5_000L, 15_000L, 30_000L, 30_000L)
+        var started = 1_000L
+
+        delays.forEach { delay ->
+            cadence.markStarted(listOf(soc), started)
+            assertEquals(delay, cadence.nextDelayMs(listOf(soc), started, true, true, true) { false })
+            assertEquals(
+                listOf(soc),
+                cadence.due(listOf(soc), started + delay, true, true, true, callbackProven = { false })
+            )
+            started += delay
+        }
+    }
+
+    @Test fun `explicitly unsupported getters wait five minutes unless force seeded or cleared`() {
+        val cadence = KpiPollCadence()
+        val rows = listOf(soc, current)
+        cadence.markStarted(rows, 10_000)
+        cadence.markResults(
+            listOf(
+                soc to DirectHelperReadResult(CollectorHelperProtocol.STATUS_INVALID_REQUEST, null),
+                current to DirectHelperReadResult(CollectorHelperProtocol.STATUS_NOT_WHITELISTED, null)
+            ),
+            requestElapsedMs = 10_000,
+            nowElapsedMs = 10_050
+        )
+
+        assertTrue(cadence.due(rows, 11_000, true, true, true, callbackProven = { false }).isEmpty())
+        assertEquals(rows, cadence.due(rows, 11_000, true, true, true, { false }, forceSeed = true))
+        assertEquals(299_050L, cadence.nextDelayMs(rows, 11_000, true, true, true) { false })
+        assertEquals(rows, cadence.due(rows, 310_050, true, true, true, callbackProven = { false }))
+        cadence.clear()
+        assertEquals(rows, cadence.due(rows, 310_050, true, true, true, callbackProven = { false }))
+    }
+
+    @Test fun `helper identity replacement resets cadence and clear preserves the identity`() {
+        val cadence = KpiPollCadence()
+        val first = Any()
+        val replacement = Any()
+
+        assertTrue(cadence.observeHelper(first))
+        cadence.markStarted(listOf(soc), 10_000)
+        assertFalse(cadence.observeHelper(first))
+        assertFalse(cadence.observeHelper(null))
+        assertTrue(cadence.due(listOf(soc), 10_500, true, true, true, callbackProven = { false }).isEmpty())
+        assertTrue(cadence.observeHelper(replacement))
+        assertEquals(
+            listOf(soc),
+            cadence.due(listOf(soc), 10_500, true, true, true, callbackProven = { false })
+        )
+
+        cadence.clear()
+        assertFalse(cadence.observeHelper(replacement))
+        assertEquals(
+            listOf(soc),
+            cadence.due(listOf(soc), 10_500, true, true, true, callbackProven = { false })
+        )
+    }
+
+    @Test fun `invalid normalized source keeps its retry and expired results are not marked successful`() {
+        val cadence = KpiPollCadence()
+        cadence.markStarted(listOf(soc), 10_000)
+        cadence.markResults(
+            listOf(soc to DirectHelperReadResult(CollectorHelperProtocol.STATUS_OK, 80)),
+            requestElapsedMs = 10_000,
+            nowElapsedMs = 10_100,
+            invalidSourceKeys = setOf(soc.key)
+        )
+        assertEquals(listOf(soc), cadence.due(listOf(soc), 11_000, true, true, true, callbackProven = { false }))
+
+        cadence.clear()
+        cadence.markStarted(listOf(soc), 20_000)
+        cadence.markResults(
+            listOf(soc to DirectHelperReadResult(CollectorHelperProtocol.STATUS_OK, 80)),
+            requestElapsedMs = 20_000,
+            nowElapsedMs = 23_000
+        )
+        assertEquals(listOf(soc), cadence.due(listOf(soc), 23_000, true, true, true, callbackProven = { false }))
     }
 
     private fun buffer() = KpiLiveSourceBuffer(bootId = "boot").apply {

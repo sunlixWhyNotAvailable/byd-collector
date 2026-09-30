@@ -231,9 +231,12 @@ internal data class KpiSourceUpdate(
 internal class KpiPollCadence(
     private val normalIntervalMs: Long = 1_000L,
     private val visibleCallbackIntervalMs: Long = 2_000L,
-    private val nonInteractiveIntervalMs: Long = 2_000L
+    private val backgroundIntervalMs: Long = 300_000L
 ) {
     private val lastRequestStart = mutableMapOf<String, Long>()
+    private val failureCounts = mutableMapOf<String, Int>()
+    private val unsupportedUntilMs = mutableMapOf<String, Long>()
+    private var helperIdentity: Any? = null
 
     fun due(
         entries: List<DirectFidEntry>,
@@ -244,16 +247,41 @@ internal class KpiPollCadence(
         callbackProven: (String) -> Boolean,
         forceSeed: Boolean = false
     ): List<DirectFidEntry> = entries.filter { entry ->
-        val interval = when {
-            !interactive -> nonInteractiveIntervalMs
-            visibleLive && listenerReady && callbackProven(entry.key) -> visibleCallbackIntervalMs
-            else -> normalIntervalMs
-        }
-        forceSeed || lastRequestStart[entry.key]?.let { nowElapsedMs - it >= interval } != false
+        forceSeed || remainingDelayMs(entry, nowElapsedMs, interactive, visibleLive, listenerReady, callbackProven) == 0L
     }
 
     fun markStarted(entries: List<DirectFidEntry>, elapsedMs: Long) {
-        entries.forEach { lastRequestStart[it.key] = elapsedMs }
+        entries.forEach { entry ->
+            lastRequestStart[entry.key] = elapsedMs
+            failureCounts[entry.key] = ((failureCounts[entry.key] ?: 0) + 1).coerceAtMost(RETRY_DELAYS_MS.size)
+        }
+    }
+
+    fun markResults(
+        results: List<Pair<DirectFidEntry, DirectHelperReadResult>>,
+        requestElapsedMs: Long,
+        nowElapsedMs: Long,
+        invalidSourceKeys: Set<String> = emptySet()
+    ) {
+        val ageMs = nowElapsedMs - requestElapsedMs
+        results.forEach { (entry, result) ->
+            if (result.status == CollectorHelperProtocol.STATUS_INVALID_REQUEST ||
+                result.status == CollectorHelperProtocol.STATUS_NOT_WHITELISTED
+            ) {
+                unsupportedUntilMs[entry.key] = nowElapsedMs + backgroundIntervalMs
+                return@forEach
+            }
+
+            val raw = result.raw ?: return@forEach
+            val decodable = result.status == CollectorHelperProtocol.STATUS_OK && !result.callbackCached &&
+                requestElapsedMs >= 0L && ageMs >= 0L && ageMs < SOURCE_MAX_AGE_MS && entry.key !in invalidSourceKeys &&
+                !(entry.tx == DirectFidRegistry.TX_GET_FLOAT && Float.fromBits(raw) == 65_535.0f) &&
+                DirectValueDecoders.decode(entry, raw) != null
+            if (decodable) {
+                failureCounts.remove(entry.key)
+                unsupportedUntilMs.remove(entry.key)
+            }
+        }
     }
 
     fun nextDelayMs(
@@ -264,13 +292,52 @@ internal class KpiPollCadence(
         listenerReady: Boolean,
         callbackProven: (String) -> Boolean
     ): Long = entries.minOfOrNull { entry ->
-        val interval = when {
-            !interactive -> nonInteractiveIntervalMs
-            visibleLive && listenerReady && callbackProven(entry.key) -> visibleCallbackIntervalMs
-            else -> normalIntervalMs
-        }
-        lastRequestStart[entry.key]?.let { (interval - (nowElapsedMs - it)).coerceAtLeast(0L) } ?: 0L
+        remainingDelayMs(entry, nowElapsedMs, interactive, visibleLive, listenerReady, callbackProven)
     } ?: normalIntervalMs
 
-    fun clear() = lastRequestStart.clear()
+    fun observeHelper(identity: Any?): Boolean {
+        if (identity == null || identity === helperIdentity) return false
+        helperIdentity = identity
+        clear()
+        return true
+    }
+
+    fun clear() {
+        lastRequestStart.clear()
+        failureCounts.clear()
+        unsupportedUntilMs.clear()
+    }
+
+    private fun remainingDelayMs(
+        entry: DirectFidEntry,
+        nowElapsedMs: Long,
+        interactive: Boolean,
+        visibleLive: Boolean,
+        listenerReady: Boolean,
+        callbackProven: (String) -> Boolean
+    ): Long {
+        unsupportedUntilMs[entry.key]?.let { until ->
+            if (until > nowElapsedMs) return until - nowElapsedMs
+        }
+        failureCounts[entry.key]?.takeIf { it > 0 }?.let { count ->
+            val interval = RETRY_DELAYS_MS[count - 1]
+            val started = lastRequestStart[entry.key] ?: return 0L
+            val age = nowElapsedMs - started
+            return if (age < 0L) interval else (interval - age).coerceAtLeast(0L)
+        }
+
+        val interval = when {
+            !interactive || !visibleLive -> backgroundIntervalMs
+            listenerReady && callbackProven(entry.key) -> visibleCallbackIntervalMs
+            else -> normalIntervalMs
+        }
+        val started = lastRequestStart[entry.key] ?: return 0L
+        val age = nowElapsedMs - started
+        return if (age < 0L) interval else (interval - age).coerceAtLeast(0L)
+    }
+
+    private companion object {
+        val RETRY_DELAYS_MS = longArrayOf(1_000L, 2_000L, 5_000L, 15_000L, 30_000L)
+        const val SOURCE_MAX_AGE_MS = 3_000L
+    }
 }

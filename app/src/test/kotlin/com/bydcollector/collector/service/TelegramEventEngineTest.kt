@@ -530,6 +530,36 @@ class TelegramEventEngineTest {
     }
 
     @Test
+    fun fullChargeRangeUsesEcThenLifetimeCountersWhenEcIsUnavailable() {
+        fun rangeFor(ecMean: Double?): String {
+            val engine = TelegramEventEngine(ecMeanKwhPer100Km = { ecMean })
+            fun sample(soc: Double, power: Double, atMs: Long) = engine.onSuccessfulPoll(
+                snapshot(
+                    soc = soc,
+                    odometer = 1_000.0,
+                    remainingEnergy = 10.0,
+                    chargePower = power,
+                    chargeGun = true,
+                    cumulativeEnergy = 1_000.0,
+                    oemRange = 999.0
+                ),
+                config,
+                atMs
+            )
+            sample(98.0, 7.0, 0L)
+            sample(98.0, 7.0, 500L)
+            sample(99.6, 4.0, 1_000L)
+            return sample(99.6, 4.0, 1_500L).events.single().variables.getValue("range_km")
+        }
+
+        assertEquals("50", rangeFor(20.0))
+        assertEquals("10", rangeFor(null))
+        assertEquals(999.0, snapshot(oemRange = 999.0).single {
+            it.field.fieldKey == "remaining_range_km"
+        }.value.number)
+    }
+
+    @Test
     fun simultaneousBmsFinishAndFullConfirmationEmitsOnlyFullAndRetainsFullLatch() {
         val engine = startedBmsChargingEngine(soc = 98.0, remainingEnergy = 30.0)
         val sessionId = engine.state.chargingSessionId
@@ -1544,7 +1574,9 @@ class TelegramEventEngineTest {
         remainingEnergy: Double? = 40.0,
         chargePower: Double? = 0.0,
         chargeGun: Boolean? = false,
-        bmsState: String? = null
+        bmsState: String? = null,
+        cumulativeEnergy: Double? = null,
+        oemRange: Double = 300.0
     ): List<NormalizedObservation> = buildList {
         soc?.let { add(number(NormalizedFieldCatalog.soc, it)) }
         remainingEnergy?.let { add(number(NormalizedFieldCatalog.batteryRemainingEnergy, it)) }
@@ -1552,7 +1584,8 @@ class TelegramEventEngineTest {
         auxVoltage?.let { add(number(NormalizedFieldCatalog.auxVoltage, it)) }
         odometer?.let { add(number(NormalizedFieldCatalog.odometerKm, it)) }
         tripEnergy?.let { add(number(NormalizedFieldCatalog.tripEnergy, it)) }
-        add(number(NormalizedFieldCatalog.remainingRangeKm, 300.0))
+        cumulativeEnergy?.let { add(number(NormalizedFieldCatalog.cumulativeEnergy, it)) }
+        add(number(NormalizedFieldCatalog.remainingRangeKm, oemRange))
         gear?.let { add(text(NormalizedFieldCatalog.gearAutoMode, it)) }
         chargeGun?.let { add(bool(NormalizedFieldCatalog.chargeGunConnected, it)) }
         bmsState?.let { add(text(NormalizedFieldCatalog.chargingBatteryDeviceState, it)) }

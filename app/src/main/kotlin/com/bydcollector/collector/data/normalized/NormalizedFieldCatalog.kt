@@ -264,12 +264,14 @@ object NormalizedFieldCatalog {
     )
 
     /** Dashboard fields share one source definition for display freshness and helper validation. */
-    val kpiFields = listOf(soc, batteryRemainingEnergy, odometerKm, insideTemp,
+    val kpiFields = listOf(soc, batteryRemainingEnergy, cumulativeEnergy, odometerKm, insideTemp,
         perfume1RemainingPercent, perfume2RemainingPercent, perfume3RemainingPercent,
         batterySoh, batteryChargePower, batteryDischargePower, remainingRangeKm,
         batteryAverageTemp, batteryHighestCellVoltage, batteryLowestCellVoltage)
     val kpiKeys: Set<String> = kpiFields.map { it.fieldKey }.toSet()
     val kpiSourceKeys: Set<String> = kpiFields.flatMap { it.sourceKeys }.toSet()
+    // Adding the range fallback input must not accelerate Main/Secondary recording reads.
+    val kpiReconcileSourceKeys: Set<String> = kpiSourceKeys - cumulativeEnergy.sourceKeys.toSet()
 
     private fun textEnum(
         fieldKey: String,

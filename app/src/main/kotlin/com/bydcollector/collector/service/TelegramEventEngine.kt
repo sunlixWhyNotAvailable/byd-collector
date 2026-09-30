@@ -1,6 +1,7 @@
 package com.bydcollector.collector.service
 
 import com.bydcollector.collector.data.energy.EnergySnapshot
+import com.bydcollector.collector.data.energy.RemainingRangeResolver
 import com.bydcollector.collector.data.local.PollReading
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.data.normalized.NormalizedQuality
@@ -328,7 +329,10 @@ data class TelegramEventState(
     }
 }
 
-class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState()) {
+class TelegramEventEngine(
+    initialState: TelegramEventState = TelegramEventState(),
+    private val ecMeanKwhPer100Km: () -> Double? = { null }
+) {
     private val resumePendingChargingTransition =
         initialState.chargingActiveCandidate != null &&
             initialState.chargingActiveCandidateCount > 0 &&
@@ -576,7 +580,15 @@ class TelegramEventEngine(initialState: TelegramEventState = TelegramEventState(
         val auxVoltage = values.number("aux_voltage_v")
         val odometer = values.number("odometer_km")
         val tripEnergy = values.number("trip_energy_kwh")
-        val range = values.number("remaining_range_km")
+        fun currentBootNumber(fieldKey: String): Double? = values.number(fieldKey)
+            .takeIf { freshness == null || freshness.hasCurrentBoot(fieldKey) }
+        val range = RemainingRangeResolver.resolve(
+            ecMeanKwhPer100Km = runCatching(ecMeanKwhPer100Km).getOrNull(),
+            cumulativeEnergyKwh = currentBootNumber("cumulative_energy_kwh"),
+            odometerKm = currentBootNumber("odometer_km"),
+            remainingEnergyKwh = currentBootNumber("battery_remaining_energy_kwh"),
+            oemRangeKm = currentBootNumber("remaining_range_km")
+        ).rangeKm
         val rawGun = values.bool("charge_gun_connected_raw")
         val bmsState = values.text("charging_battery_device_state")
         val rawGear = values.text("gear_auto_mode_raw")

@@ -41,9 +41,10 @@ class TelegramCoordinator internal constructor(
     private val currentEnergySnapshot: () -> EnergySnapshot? = { null },
     private val protectedTelegramIds: () -> Set<Long> = { emptySet() },
     private val deliveryLaneAvailable: () -> Boolean = { true },
-    private val onConnectionTestSettled: (TelegramSendResult) -> Unit = {}
+    private val onConnectionTestSettled: (TelegramSendResult) -> Unit = {},
+    private val ecMeanKwhPer100Km: () -> Double? = { null }
 ) {
-    private var engine = TelegramEventEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
+    private var engine = createEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
     private var enabledRuntimeStartedAtMs: Long? = null
     private var startupRecoveryPending = true
     private val locationKindsByDedupeKey = LinkedHashMap<String, String>(16, 0.75f, true)
@@ -179,7 +180,7 @@ class TelegramCoordinator internal constructor(
         val recovered = recoverStartupLocally(snapshot.energySnapshot, occurredAtMs)
         // No Telegram samples may have been processed while its SQLite was unavailable.
         // Preserve the known complete power session instead of inventing moving-leg splits.
-        if (completion != null) engine = TelegramEventEngine(recoverCompletionState(engine.state, completion))
+        if (completion != null) engine = createEngine(recoverCompletionState(engine.state, completion))
         val pendingSummaryKey = engine.state.pendingPowerOffLocationTripId
             ?.takeIf { !engine.state.pendingPowerOffLocationSummaryDelivered }
             ?.let { "$it:summary" }
@@ -394,7 +395,7 @@ class TelegramCoordinator internal constructor(
             )
             runCatching { telegramStore.telegramRuntimeState() }
                 .getOrNull()
-                ?.let { engine = TelegramEventEngine(TelegramEventState.fromJson(it)) }
+                ?.let { engine = createEngine(TelegramEventState.fromJson(it)) }
             throw error
         }
     }
@@ -462,6 +463,8 @@ class TelegramCoordinator internal constructor(
         return enabledRuntimeStartedAtMs ?: nowMs().also { enabledRuntimeStartedAtMs = it }
     }
 
+    private fun createEngine(state: TelegramEventState) = TelegramEventEngine(state, ecMeanKwhPer100Km)
+
     private fun nextWakeAt(eventDeadlineAtMs: Long?, queueDeadlineAtMs: Long?): Long? {
         return listOfNotNull(eventDeadlineAtMs, queueDeadlineAtMs).minOrNull()
     }
@@ -469,7 +472,7 @@ class TelegramCoordinator internal constructor(
     private fun handle(result: TelegramEventResult, completion: TripCompletionIntent? = null): Boolean {
         val messages = renderTelegramBatch(result.events, ::render)
         if (messages == null) {
-            engine = TelegramEventEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
+            engine = createEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
             return false
         }
         val committedAt = nowMs()
@@ -484,7 +487,7 @@ class TelegramCoordinator internal constructor(
             )
         } catch (error: Exception) {
             if (error is InterruptedException) throw error
-            engine = TelegramEventEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
+            engine = createEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
             throw error
         }
         val eventsByDedupeKey = result.events.associateBy { it.dedupeKey }

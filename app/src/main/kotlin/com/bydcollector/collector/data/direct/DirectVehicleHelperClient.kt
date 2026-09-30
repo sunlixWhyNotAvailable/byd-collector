@@ -25,6 +25,9 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
     @Volatile
     private var cached: IBinder? = null
 
+    // Observe the connection already used by reads; no extra Binder transaction.
+    internal val connectionIdentity: Any? get() = cached
+
     private var kpiListenerBinder: Binder? = null
     private var kpiListener: ((DirectKpiInvalidation) -> Unit)? = null
     private var kpiSubscriptionId = 0L

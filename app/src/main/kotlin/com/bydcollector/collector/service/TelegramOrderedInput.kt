@@ -96,6 +96,12 @@ internal data class TelegramOrderedPollInput(
         return stamps.size == keys.size && stamps.map { it.bootId }.distinct().size == 1
     }
 
+    fun hasCurrentBoot(fieldKey: String): Boolean {
+        val bootId = currentBootId ?: return false
+        val keys = sourceKeys(fieldKey)
+        return keys.isNotEmpty() && keys.all { inputs[it]?.stamp?.bootId == bootId }
+    }
+
     fun sourceStamp(fieldKey: String, freshOnly: Boolean = true): NormalizedSourceStamp? {
         val keys = sourceKeys(fieldKey).filter { !freshOnly || it in freshSourceKeys }
         if (keys.isEmpty()) return null
@@ -237,6 +243,7 @@ internal object TelegramOrderedInput {
 private val TELEGRAM_EVENT_FIELD_KEYS = setOf(
     "gear_auto_mode_raw",
     "odometer_km",
+    "cumulative_energy_kwh",
     "soc",
     "trip_energy_kwh",
     "charge_gun_connected_raw",

@@ -78,6 +78,12 @@ internal class KpiFreshness(private val bootId: String, private val maxAgeMs: Lo
         return detail
     }
 
+    /** Hidden five-minute sampling naturally ages out; it is not a live-source outage. */
+    fun discardExpiryDiagnostics() {
+        expiriesSinceReport.clear()
+        lastDiagnosticMs = Long.MIN_VALUE
+    }
+
     fun clear() {
         fields.clear(); lastRejected.clear(); expiredKeys.clear(); expiriesSinceReport.clear()
         lastDiagnosticMs = Long.MIN_VALUE

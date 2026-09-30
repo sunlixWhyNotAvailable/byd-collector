@@ -63,6 +63,8 @@ Some fields have known interpretation limits: raw `CHARGING_STATE` is unreliable
 
 The Battery category also exports **Discharge power limit** in kW: the permitted limit, not measured power or energy used. The original unitless raw field and its history remain available separately; existing history is not rewritten.
 
+Remaining range in the vehicle-status cards and Telegram is estimated from the remaining battery energy and average consumption in the car's currently retained trip history. If that history is unavailable, the estimate uses lifetime energy and distance counters; if calculation is not possible, it uses the car's own range estimate. The original vehicle range remains unchanged in recorded telemetry and MQTT/InfluxDB exports.
+
 Use `Stop` when collection is no longer needed. Background collection and its vehicle-specific limits are described under [Known limitations](#known-limitations).
 
 ## All data tab
@@ -71,7 +73,7 @@ Use `Stop` when collection is no longer needed. Background collection and its ve
 
 Its compact vehicle-status cards include the remaining percentage for all three perfume slots. A valid zero is shown as zero; unavailable readings stay distinct.
 
-While these cards are visible, supported readings update live from vehicle notifications. Background updates are less frequent, and fields without usable notifications continue to use independent reads. Main and All data collection can remain stopped; unavailable or stale readings are not shown as current values.
+While these cards are visible, supported readings update live from vehicle notifications; fields without usable notifications continue to use independent reads. Hidden cards refresh every five minutes. Initial empty data, switching the vehicle on, returning to the cards, and helper recovery request fresh readings immediately; failed readings retry separately. Main and All data collection can remain stopped; unavailable or stale readings are not shown as current values. This display policy does not slow telemetry recording or exports.
 
 - Reads 23,069 active signatures from the retained 23,083-definition research catalog. Seven high-volume or irrelevant native fields are excluded from both polling and subscriptions; their old data remains available.
 - Saves raw values, descriptions, data quality, and changes in a separate database.

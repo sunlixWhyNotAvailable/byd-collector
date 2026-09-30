@@ -64,6 +64,22 @@ class TelegramOrderedInputTest {
     }
 
     @Test
+    fun rangeInputsRequireCurrentBootAndIncludeCumulativeEnergy() {
+        val cumulativeEnergyKey = "statistic_total_elec_consumption"
+        assertTrue(TelegramOrderedInput.rawSourceKeys.contains(cumulativeEnergyKey))
+        val oldBoot = merge(
+            emptyMap(), listOf(PollReading(cumulativeEnergyKey, "500")),
+            stamp(100, boot = "old"), currentBoot = "old"
+        )
+        assertTrue(oldBoot.hasCurrentBoot("cumulative_energy_kwh"))
+
+        val afterRestart = merge(
+            oldBoot.cursors, emptyList(), stamp(1, boot = "new"), currentBoot = "new"
+        )
+        assertFalse(afterRestart.hasCurrentBoot("cumulative_energy_kwh"))
+    }
+
+    @Test
     fun sparsePowerRetainsBothRawContributorsButRejectsMixedBootComposition() {
         val voltage = "charging_charge_battery_volt"
         val current = "charging_charge_current"

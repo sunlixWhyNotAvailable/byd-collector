@@ -178,13 +178,41 @@ class TelegramSourceEventEngineTest {
         assertEquals(1, engine.state.chargeGunCandidateCount)
     }
 
+    @Test
+    fun rangeDoesNotCombinePriorBootInputsWithCurrentBootSoc() {
+        val seeded = TelegramEventEngine()
+        poll(
+            seeded, 1, "range-old-boot", listOf(
+                gun("2"), voltage("640.0"), current("-10.0"), soc("50.0"),
+                remainingEnergy("10.0"), cumulativeEnergy("1000.0"),
+                odometer("10000"), oemRange("999")
+            ),
+            currentBootId = "old-boot"
+        )
+        poll(seeded, 2, "range-new-boot-1", listOf(
+            gun("2"), voltage("640.0"), current("-10.0"), soc("98.0")
+        ), currentBootId = "new-boot")
+        poll(seeded, 3, "range-new-boot-2", listOf(
+            gun("2"), voltage("640.0"), current("-11.0"), soc("98.0")
+        ), currentBootId = "new-boot")
+        poll(seeded, 4, "range-new-boot-3", listOf(
+            gun("2"), voltage("640.0"), current("-10.0"), soc("99.6")
+        ), currentBootId = "new-boot")
+        val full = poll(seeded, 5, "range-new-boot-4", listOf(
+            gun("2"), voltage("640.0"), current("-10.0"), soc("99.6")
+        ), currentBootId = "new-boot")
+            .events.single { it.type == TelegramEventType.CHARGED_TO_100 }
+        assertEquals("n/a", full.variables["range_km"])
+    }
+
     private fun poll(
         engine: TelegramEventEngine,
         sequence: Long,
         identity: String,
         readings: List<PollReading>,
         origin: PollOrigin = PollOrigin.LIVE,
-        processingAtMs: Long? = null
+        processingAtMs: Long? = null,
+        currentBootId: String = "test-boot"
     ): TelegramEventResult {
         val atMs = sequence * 1_000L
         val timestamp = Instant.ofEpochMilli(atMs).toString()
@@ -193,14 +221,14 @@ class TelegramSourceEventEngineTest {
             timestamp = timestamp,
             source = PollSampleSource(
                 identity = identity,
-                bootId = "test-boot",
+                bootId = currentBootId,
                 capturedElapsedMs = atMs,
                 generatorId = "test-generator",
                 sequence = sequence
             ),
             readings = readings,
             origin = origin,
-            currentBootId = "test-boot",
+            currentBootId = currentBootId,
             config = config,
             nowMs = processingAtMs ?: atMs,
             normalizer = normalizer
@@ -215,4 +243,7 @@ class TelegramSourceEventEngineTest {
     private fun current(decoded: String) = PollReading("charging_charge_current", "0", decoded)
     private fun auxVoltage(decoded: String) = PollReading("ota_battery_voltage", "0", decoded)
     private fun tripEnergy(raw: String) = PollReading("statistic_statistic_this_trip_total_elec_consumption", raw)
+    private fun remainingEnergy(raw: String) = PollReading("power_battery_remain_electricity", raw)
+    private fun cumulativeEnergy(raw: String) = PollReading("statistic_total_elec_consumption", raw)
+    private fun oemRange(raw: String) = PollReading("statistic_elec_driving_range_yun", raw)
 }

@@ -7,6 +7,16 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class KpiFreshnessTest {
+    @Test fun `hidden expiry is discarded without extending source freshness`() {
+        val state = KpiFreshness("boot", 3_000)
+        state.accept(listOf(observation("soc", 80.0, 10_000)), 10_100)
+        assertTrue(state.freshObservations(310_000).isEmpty())
+        state.discardExpiryDiagnostics() // Returning from hidden mode.
+        assertTrue(state.freshObservations(310_001).isEmpty())
+        state.accept(listOf(observation("soc", 79.0, 310_002)), 310_002)
+        assertFalse(state.expiryDiagnostics(310_003)!!.contains("field=soc "))
+    }
+
     @Test fun `expiry evidence is source specific rate limited and cannot revive stale values`() {
         val state = KpiFreshness("boot", 3_000)
         state.accept(listOf(observation("soc", 80.0, 10_000)), 10_100)

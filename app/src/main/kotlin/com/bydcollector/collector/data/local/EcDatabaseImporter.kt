@@ -19,12 +19,21 @@ data class EcImportResult(
     val errorMessage: String? = null
 )
 
+internal object EcDatabaseSource {
+    val defaultCandidates = listOf(
+        File("/storage/emulated/0/energydata/EC_database.db"),
+        File("/sdcard/energydata/EC_database.db")
+    )
+
+    fun findExisting(candidates: List<File>): File? = candidates.firstOrNull { it.exists() && it.isFile }
+}
+
 //imports BYD's energy-consumption sqlite file into the app db without making it the primary telemetry store
 class EcDatabaseImporter(
     private val context: Context,
     private val helper: TelemetryDatabaseHelper,
     private val clock: Clock = SystemClockAdapter(),
-    private val sourceCandidates: List<File> = DEFAULT_SOURCE_CANDIDATES
+    private val sourceCandidates: List<File> = EcDatabaseSource.defaultCandidates
 ) {
     fun importAtSessionStart(sessionId: Long): EcImportResult {
         val timestamp = clock.nowIso()
@@ -64,7 +73,7 @@ class EcDatabaseImporter(
     }
 
     private fun findSourceFile(): File {
-        val existing = sourceCandidates.firstOrNull { it.exists() && it.isFile }
+        val existing = EcDatabaseSource.findExisting(sourceCandidates)
         if (existing != null) return existing
 
         //reports permission separately from missing file so setup guidance can be actionable
@@ -247,10 +256,6 @@ class EcDatabaseImporter(
     }
 
     companion object {
-        private val DEFAULT_SOURCE_CANDIDATES = listOf(
-            File("/storage/emulated/0/energydata/EC_database.db"),
-            File("/sdcard/energydata/EC_database.db")
-        )
         private val FUEL_COLUMN_CANDIDATES = listOf("fuel", "fuel_liters", "fuel_l", "oil")
         private val SAFE_IDENTIFIER = Regex("^[A-Za-z_][A-Za-z0-9_]*$")
     }

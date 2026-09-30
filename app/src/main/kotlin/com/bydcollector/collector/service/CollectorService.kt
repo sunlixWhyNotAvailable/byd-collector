@@ -51,6 +51,11 @@ import com.bydcollector.collector.data.direct.DirectAutoserviceField
 import com.bydcollector.collector.data.direct.DirectAutoserviceSnapshot
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.data.local.TelemetryStore
+import com.bydcollector.collector.data.local.EcCurrentMeanProvider
+import com.bydcollector.collector.data.local.EcMeanStatus
+import com.bydcollector.collector.data.local.EC_MEAN_MAX_AGE_MS
+import com.bydcollector.collector.data.energy.RangeFallbackReason
+import com.bydcollector.collector.data.energy.RangeSource
 import com.bydcollector.collector.data.energy.EnergyReceipt
 import com.bydcollector.collector.data.energy.EnergySessionCoordinator
 import com.bydcollector.collector.data.energy.EnergySessionSeed
@@ -166,6 +171,7 @@ class CollectorService : Service() {
     private lateinit var maintenanceCoordinator: DbMaintenanceCoordinator
     private lateinit var dashboardUiStateStore: DashboardUiStateStore
     private lateinit var dashboardStateProvider: DashboardStateProvider
+    private lateinit var ecCurrentMeanProvider: EcCurrentMeanProvider
     private var mainPollerOwnerMode = DirectHelperOwnerMode.APP_GAP_SPOOL
     private var debugStorageReady = false
     @Volatile private var mainRuntimeStatus = RuntimeActionStatus.STOPPED
@@ -309,6 +315,8 @@ class CollectorService : Service() {
     @Volatile private var kpiFallbackSources = 0
     @Volatile private var kpiFallbackReason = "not_subscribed"
     private var lastKpiDiagnosticMs = Long.MIN_VALUE
+    @Volatile private var ecMeanRefreshRequestedAtElapsedMs = Long.MIN_VALUE
+    private var lastKpiRangeDecision: Pair<RangeSource, RangeFallbackReason?>? = null
     private val kpiVisibilityListener: () -> Unit = {
         signalKpiWorker()
         mainHandler.removeCallbacks(kpiModeTask)
@@ -423,6 +431,7 @@ class CollectorService : Service() {
         if (KpiUiVisibility.visible) publishVehicleKpisNow() else scheduleKpiPublication()
     }
     private val kpiModeTask = Runnable {
+        kpiFreshness.discardExpiryDiagnostics()
         if (!KpiUiVisibility.visible || !kpiInteractive || !kpiPowerOn) cancelKpiFrame()
         if (!kpiInteractive || !kpiPowerOn) {
             mainHandler.removeCallbacks(kpiPublishTask)
@@ -509,6 +518,8 @@ class CollectorService : Service() {
             activate = { scheduleTailscaleActivation() }
         )
         vehicleStateNormalizer = VehicleStateNormalizer()
+        ecCurrentMeanProvider = EcCurrentMeanProvider()
+        if (!startupShutdownSuppressed) requestEcMeanRefresh()
         callbackNormalizer = CallbackNormalizationWorker(
             threadName = "byd-callback-normalizer",
             drainPage = ::normalizeCallbackPage,
@@ -674,6 +685,7 @@ class CollectorService : Service() {
     override fun onDestroy() {
         requireRuntimeOwner()
         running.set(false)
+        closeEcMeanProvider()
         kpiRuntimeGeneration.incrementAndGet()
         kpiLiveMode = false
         kpiInteractive = false
@@ -1975,6 +1987,7 @@ class CollectorService : Service() {
     }
 
     private fun stopRuntimeForUserShutdown() {
+        closeEcMeanProvider()
         CollectorAutoStart.cancelScheduled(applicationContext)
         mainHandler.removeCallbacks(accessSelfCheckTask)
         accessSelfCheckScheduled = false
@@ -2759,8 +2772,28 @@ class CollectorService : Service() {
             "fallback_sources=$kpiFallbackSources fallback_reason=$kpiFallbackReason " +
             "mailbox_snapshots=${kpiMailboxSnapshots.getAndSet(0L)} " +
             "getter_fields=${kpiGetterFields.getAndSet(0L)} ui_publications=${kpiUiPublications.getAndSet(0L)} " +
-            "expiry=${kpiFreshness.expiryDiagnostics(now).orEmpty()}"
+            "expiry=${if (kpiLiveMode) kpiFreshness.expiryDiagnostics(now).orEmpty() else "not_live"}"
         queueKpiDiagnostic("kpi_runtime_summary", detail)
+    }
+
+    private fun requestEcMeanRefresh(): Boolean {
+        if (!::ecCurrentMeanProvider.isInitialized || !ecCurrentMeanProvider.refreshAsync()) return false
+        ecMeanRefreshRequestedAtElapsedMs = SystemClock.elapsedRealtime()
+        return true
+    }
+
+    private fun closeEcMeanProvider() {
+        if (::ecCurrentMeanProvider.isInitialized) ecCurrentMeanProvider.close()
+    }
+
+    private fun ensureEcMeanProviderOpen() {
+        if (!::ecCurrentMeanProvider.isInitialized ||
+            ecCurrentMeanProvider.snapshot().status == EcMeanStatus.CLOSED
+        ) {
+            ecCurrentMeanProvider = EcCurrentMeanProvider()
+            ecMeanRefreshRequestedAtElapsedMs = Long.MIN_VALUE
+            requestEcMeanRefresh()
+        }
     }
 
     private fun queueKpiDiagnostic(event: String, detail: String) {
@@ -2889,11 +2922,21 @@ class CollectorService : Service() {
         if (!running.get() || !kpiPowerOn || !kpiInteractive || settings.isUserShutdownRequested()) return
         val nowMs = SystemClock.elapsedRealtime()
         val observations = kpiFreshness.freshObservations(nowMs)
+        val ecMeanKwhPer100Km = ecCurrentMeanProvider.snapshot().meanKwhPer100Km
+        val rangeEstimate = VehicleKpiMapper.rangeEstimateFromObservations(observations, ecMeanKwhPer100Km)
+        val rangeDecision = rangeEstimate.source to rangeEstimate.fallbackReason
+        if (rangeDecision != lastKpiRangeDecision) {
+            lastKpiRangeDecision = rangeDecision
+            queueKpiDiagnostic(
+                "kpi_range_source",
+                "source=${rangeEstimate.source.name.lowercase()} reason=${rangeEstimate.fallbackReason?.name?.lowercase() ?: "none"}"
+            )
+        }
         lastKpiPublishAtMs = nowMs
         kpiUiPublications.incrementAndGet()
         dashboardUiStateStore.publishVehicleKpis(
-            VehicleKpiMapper.fromObservations(observations, VehicleKpiLanguage.UK),
-            VehicleKpiMapper.fromObservations(observations, VehicleKpiLanguage.EN)
+            VehicleKpiMapper.fromObservations(observations, VehicleKpiLanguage.UK, ecMeanKwhPer100Km),
+            VehicleKpiMapper.fromObservations(observations, VehicleKpiLanguage.EN, ecMeanKwhPer100Km)
         )
         mainHandler.removeCallbacks(kpiStaleTask)
         val remainingMs = kpiFreshness.remainingMs(nowMs)
@@ -2921,6 +2964,7 @@ class CollectorService : Service() {
 
     private fun startKpiWorker() {
         if (kpiWorker?.isAlive == true) return
+        ensureEcMeanProviderOpen()
         if (!kpiVisibilityListenerAttached) {
             androidx.core.content.ContextCompat.registerReceiver(this, kpiScreenReceiver,
                 IntentFilter().apply {
@@ -2954,6 +2998,7 @@ class CollectorService : Service() {
         var callbackWorker: KpiCallbackDrainWorker? = null
         var lastFault: String? = null
         var lastFaultAt = Long.MIN_VALUE
+        var observedEcMeanSnapshot = ecCurrentMeanProvider.snapshot()
         try {
             callbackWorker = KpiCallbackDrainWorker(
                 helper = helper,
@@ -3021,7 +3066,13 @@ class CollectorService : Service() {
                         "KPI power read status=${power.status} ${power.error.orEmpty()}"
                     }
                     if (!isKpiRuntimeCurrent(generation)) break
+                    if (cadence.observeHelper(helper.connectionIdentity)) {
+                        sourceBuffer.resetTransport()
+                        invalidateKpiUiSources()
+                        forceSeed = true
+                    }
                     val on = power.raw > 0
+                    val powerOnEdge = on && !kpiPowerOn
                     mainHandler.post {
                         if (isKpiRuntimeCurrent(generation) &&
                             com.bydcollector.collector.ha.HaRunSession.process.observePower(power.raw.toLong())
@@ -3031,12 +3082,32 @@ class CollectorService : Service() {
                             if (!demand.influx && influxConnection.owned) stopInfluxExport(manualStop = false)
                         }
                     }
+                    // Charging notifications also use this mean while the vehicle is off.
+                    if (on || settings.isTelegramEnabled()) {
+                        val nowElapsed = SystemClock.elapsedRealtime()
+                        val lastRefresh = ecMeanRefreshRequestedAtElapsedMs
+                        if (powerOnEdge || lastRefresh == Long.MIN_VALUE ||
+                            nowElapsed - lastRefresh >= EC_MEAN_MAX_AGE_MS
+                        ) requestEcMeanRefresh()
+                    }
                     if (on != kpiPowerOn) {
                         kpiPowerOn = on
                         mainHandler.post(kpiModeTask)
                         if (on) {
                             cadence.clear()
                             forceSeed = true
+                        }
+                    }
+                    val ecSnapshot = ecCurrentMeanProvider.snapshot()
+                    if (ecSnapshot.meanKwhPer100Km != observedEcMeanSnapshot.meanKwhPer100Km ||
+                        ecSnapshot.status != observedEcMeanSnapshot.status ||
+                        ecSnapshot.sourcePath != observedEcMeanSnapshot.sourcePath
+                    ) {
+                        observedEcMeanSnapshot = ecSnapshot
+                        mainHandler.post {
+                            if (isKpiRuntimeCurrent(generation) &&
+                                kpiFreshness.freshObservations(SystemClock.elapsedRealtime()).isNotEmpty()
+                            ) scheduleKpiPublication()
                         }
                     }
                     val interactive = powerManager.isInteractive
@@ -3070,6 +3141,8 @@ class CollectorService : Service() {
                             val requestElapsed = SystemClock.elapsedRealtime()
                             val sourceGeneration = kpiUiGeneration.get()
                             cadence.markStarted(due, requestElapsed)
+                            // An attempted seed becomes per-field retry, even when the batch fails.
+                            forceSeed = false
                             kpiGetterFields.addAndGet(due.size.toLong())
                             val batch = helper.readKpiBatch(due)
                             if (!isKpiRuntimeCurrent(generation)) break
@@ -3077,16 +3150,22 @@ class CollectorService : Service() {
                                 cadence.clear()
                                 forceSeed = true
                             } else {
-                                check(batch.diagnostics.status == CollectorHelperProtocol.STATUS_OK &&
-                                    batch.results.size == due.size
-                                ) {
-                                    "KPI batch status=${batch.diagnostics.status} ${batch.diagnostics.error.orEmpty()}"
-                                }
                                 val now = SystemClock.elapsedRealtime()
+                                if (batch.diagnostics.status != CollectorHelperProtocol.STATUS_OK ||
+                                    batch.results.size != due.size
+                                ) {
+                                    cadence.markResults(due.zip(batch.results), requestElapsed, now)
+                                    error("KPI batch status=${batch.diagnostics.status} ${batch.diagnostics.error.orEmpty()}")
+                                }
                                 val update = sourceBuffer.acceptPoll(
                                     due.zip(batch.results), requestWall, requestElapsed, now, generation.toString(),
                                     expectedTransportEpoch = transportEpoch
                                 )
+                                val invalidSources = update.observations.asSequence()
+                                    .filter { it.quality != com.bydcollector.collector.data.normalized.NormalizedQuality.OK &&
+                                        it.field.sourceKeys.size == 1 }
+                                    .flatMap { it.field.sourceKeys.asSequence() }.toSet()
+                                cadence.markResults(due.zip(batch.results), requestElapsed, now, invalidSources)
                                 if (update.observations.isNotEmpty() && interactive) {
                                     queueDashboardVehicleKpis(update.observations, sourceGeneration)
                                 }
@@ -5422,7 +5501,8 @@ class CollectorService : Service() {
                 BydCollectorApplication.trips(application).readEnergyRuntimeRow()?.let { row ->
                     com.bydcollector.collector.data.energy.EnergyStateCodec.decodeState(row.stateJson).currentSnapshot
                 }
-            }
+            },
+            ecMeanKwhPer100Km = { ecCurrentMeanProvider.snapshot().meanKwhPer100Km }
         )
     }
 

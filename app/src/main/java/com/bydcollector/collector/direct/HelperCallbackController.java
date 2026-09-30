@@ -33,7 +33,8 @@ import java.util.function.LongSupplier;
 final class HelperCallbackController implements AutoCloseable {
     static final long RECONCILE_MS = 5_000L;
     static final long KPI_RECONCILE_MS = 2_000L;
-    private static final Set<CollectorHelperDaemon.Address> KPI_SOURCES = kpiSources();
+    private static final Set<CollectorHelperDaemon.Address> KPI_SOURCES = kpiSources(NormalizedFieldCatalog.INSTANCE.getKpiSourceKeys());
+    private static final Set<CollectorHelperDaemon.Address> KPI_RECONCILE_SOURCES = kpiSources(NormalizedFieldCatalog.INSTANCE.getKpiReconcileSourceKeys());
     static boolean isKpiSource(CollectorHelperDaemon.Address address) { return KPI_SOURCES.contains(address); }
     static final int MAX_ADDITION = 128;
     static final int MAX_DEVICE_FIDS = 4_096;
@@ -262,7 +263,7 @@ final class HelperCallbackController implements AutoCloseable {
                 CollectorHelperDaemon.Address row = rows.get(i);
                 CacheEntry entry = cache.get(row);
                 if (entry != null && entry.promoted && !entry.needsSeed && !fastPoll(row) &&
-                    now - entry.lastReconcileMs < (KPI_SOURCES.contains(row) ? KPI_RECONCILE_MS : RECONCILE_MS)) {
+                    now - entry.lastReconcileMs < (KPI_RECONCILE_SOURCES.contains(row) ? KPI_RECONCILE_MS : RECONCILE_MS)) {
                     merged[i] = CollectorHelperDaemon.ReadValue.cached(entry.source.rawBits, entry.source);
                 } else {
                     polls.add(row);
@@ -484,8 +485,7 @@ final class HelperCallbackController implements AutoCloseable {
         if (changed) scheduleKpiNotification();
     }
 
-    private static Set<CollectorHelperDaemon.Address> kpiSources() {
-        Set<String> keys = NormalizedFieldCatalog.INSTANCE.getKpiSourceKeys();
+    private static Set<CollectorHelperDaemon.Address> kpiSources(Set<String> keys) {
         Set<CollectorHelperDaemon.Address> rows = new LinkedHashSet<>();
         for (DirectFidEntry entry : DirectFidRegistry.INSTANCE.getEntries()) {
             if (keys.contains(entry.getKey())) {
