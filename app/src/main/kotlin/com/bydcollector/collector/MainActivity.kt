@@ -134,6 +134,8 @@ class MainActivity : ComponentActivity() {
     }
     @Volatile private var refreshInFlight = false
     @Volatile private var foreground = false
+    private val kpiVisibilityOwner = Any()
+    private var kpiViewportVisible = false
     @Volatile private var destroyed = false
     private var shutdownUiRequested = false
     private var shutdownReopenInFlight = false
@@ -239,9 +241,16 @@ class MainActivity : ComponentActivity() {
         override fun onTabSelected(tab: AppTab) {
             if (!navigationSession.isGenerationCurrent(navigationSessionGeneration)) return
             navigationSession.selectTab(tab)
+            updateKpiVisibility()
             if (tab == AppTab.TELEGRAM) syncTelegramUiRuntimeState()
             if (tab == AppTab.TRIPS) loadTripsUi()
             refresh()
+        }
+
+        override fun onKpiViewportVisibilityChanged(visible: Boolean) {
+            if (destroyed || !navigationSession.isGenerationCurrent(navigationSessionGeneration)) return
+            kpiViewportVisible = visible
+            updateKpiVisibility()
         }
 
         override fun onLanguageSelected(language: UiLanguage) {
@@ -827,6 +836,7 @@ class MainActivity : ComponentActivity() {
         foreground = true
         updateRuntime.onUiResumed()
         consumeUpdateHintOpen()
+        updateKpiVisibility()
         scheduleDashboardCountBootstrap(force = false)
         reconcileCutoverArchiveStorageIfNeeded()
         syncTelegramUiRuntimeState()
@@ -949,12 +959,14 @@ class MainActivity : ComponentActivity() {
     private fun consumeUpdateHintOpen() {
         if ((applicationContext as BydCollectorApplication).updateHints.consumeOpenRequest()) {
             navigationSession.selectTab(AppTab.EXTRA)
+            updateKpiVisibility()
             updatePresentationRevision = -1L
         }
     }
 
     override fun onPause() {
         foreground = false
+        updateKpiVisibility()
         mainWindowHasFocus = false
         handler.removeCallbacks(refreshTask)
         handler.removeCallbacks(currentTripRefreshTask)
@@ -970,6 +982,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         destroyed = true
+        com.bydcollector.collector.service.KpiUiVisibility.update(kpiVisibilityOwner, false)
         updateChecks.removeListener(updateCheckListener)
         releaseNotesHistory.removeListener(releaseNotesListener)
         archiveDeleteDispatchStartedAtMs = null
@@ -996,6 +1009,11 @@ class MainActivity : ComponentActivity() {
         handler.removeCallbacks(telegramReconcileTask)
         handler.removeCallbacks(currentTripRefreshTask)
         super.onDestroy()
+    }
+
+    private fun updateKpiVisibility() {
+        com.bydcollector.collector.service.KpiUiVisibility.update(kpiVisibilityOwner,
+            !destroyed && foreground && activeTab == AppTab.ALL_PARAMETERS && kpiViewportVisible)
     }
 
     @SuppressLint("MissingSuperCall")

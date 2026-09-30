@@ -1,6 +1,9 @@
 package com.bydcollector.collector.direct;
 
 import android.os.SystemClock;
+import android.os.IBinder;
+import android.os.Parcel;
+import android.os.RemoteException;
 import com.bydcollector.collector.data.direct.DirectFidEntry;
 import com.bydcollector.collector.data.direct.DirectFidRegistry;
 import com.bydcollector.collector.data.normalized.NormalizedFieldCatalog;
@@ -18,6 +21,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -36,6 +41,9 @@ final class HelperCallbackController implements AutoCloseable {
     private static final long[] RETRY_MS = { 1_000L, 2_000L, 5_000L, 10_000L, 30_000L };
 
     interface Poller { CollectorHelperDaemon.BatchResult poll(List<CollectorHelperDaemon.Address> rows) throws Throwable; }
+    interface KpiInvalidationSender {
+        void send(IBinder listener, long subscriptionId, String bootId, String generation, long sequence) throws Throwable;
+    }
     interface Host {
         boolean appOwns(int stream);
         boolean captureAllowed(int stream);
@@ -48,12 +56,14 @@ final class HelperCallbackController implements AutoCloseable {
     }
 
     private final Object lock = new Object();
+    private final Object kpiLock = new Object();
     private final String bootId;
     private final String generation;
     private final Platform platform;
     private final Host host;
     private final LongSupplier elapsedClock;
     private final LongSupplier wallClock;
+    private final KpiInvalidationSender kpiInvalidationSender;
     private final ScheduledExecutorService[] streamWorkers = new ScheduledExecutorService[3];
     private final ScheduledExecutorService registrationWorker;
     private final ReentrantLock closeLock = new ReentrantLock();
@@ -70,6 +80,11 @@ final class HelperCallbackController implements AutoCloseable {
     private final Set<NativeKey> mainKeys;
     private final Set<NativeKey> secondaryKeys;
     private final Map<NativeKey, List<CollectorHelperDaemon.Address>> scalarAddresses;
+    private final List<CollectorHelperDaemon.Address> kpiRows;
+    private final Set<NativeKey> kpiKeys;
+    private final int missingKpiSourceCount;
+    private final Map<CollectorHelperDaemon.Address, KpiValue> kpiMailbox = new LinkedHashMap<>();
+    private final ThreadPoolExecutor kpiNotificationWorker;
     private final Map<CollectorHelperDaemon.Address, CacheEntry> cache = new LinkedHashMap<>();
     private final Object registrationLock = new Object();
     private ScheduledFuture<?> registrationFuture;
@@ -78,6 +93,14 @@ final class HelperCallbackController implements AutoCloseable {
     private volatile boolean streamWorkersTerminated;
     private volatile boolean restartListener;
     private volatile String retryReason;
+    private KpiSubscriber kpiSubscriber;
+    private long nextKpiSubscriptionId;
+    private long kpiSequence;
+    private int kpiListenerStatus = CollectorHelperProtocol.KPI_LISTENER_IDLE;
+    private String kpiListenerError;
+    private boolean kpiNotificationPending;
+    private boolean kpiNotificationQueued;
+    private boolean kpiNotificationSent;
     private int retryIndex;
     private long callbacksReceived;
     private long queueLossCount;
@@ -94,15 +117,30 @@ final class HelperCallbackController implements AutoCloseable {
     HelperCallbackController(String bootId, String generation,
         List<CollectorHelperDaemon.Address> mainRows, List<CollectorHelperDaemon.Address> secondaryRows,
         Platform platform, Host host, LongSupplier elapsedClock, LongSupplier wallClock) {
+        this(bootId, generation, mainRows, secondaryRows, platform, host, elapsedClock, wallClock,
+            HelperCallbackController::sendBinderInvalidation);
+    }
+
+    HelperCallbackController(String bootId, String generation,
+        List<CollectorHelperDaemon.Address> mainRows, List<CollectorHelperDaemon.Address> secondaryRows,
+        Platform platform, Host host, LongSupplier elapsedClock, LongSupplier wallClock,
+        KpiInvalidationSender kpiInvalidationSender) {
         this.bootId = bootId;
         this.generation = generation;
         this.platform = platform;
         this.host = host;
         this.elapsedClock = elapsedClock;
         this.wallClock = wallClock;
+        this.kpiInvalidationSender = kpiInvalidationSender;
         this.mainKeys = nativeKeys(mainRows);
         this.secondaryKeys = nativeKeys(secondaryRows);
         this.scalarAddresses = scalarAddresses(mainRows, secondaryRows);
+        if (KPI_SOURCES.size() > CollectorHelperProtocol.MAX_KPI_VALUES) {
+            throw new IllegalStateException("canonical KPI source count exceeds helper mailbox capacity");
+        }
+        this.kpiRows = eligibleKpiRows(mainRows, secondaryRows);
+        this.kpiKeys = nativeKeys(kpiRows);
+        this.missingKpiSourceCount = KPI_SOURCES.size() - kpiRows.size();
         queues[CollectorHelperProtocol.STREAM_MAIN] = new TelemetryCallbackQueue(
             CollectorHelperProtocol.STREAM_MAIN, bootId, generation);
         queues[CollectorHelperProtocol.STREAM_SECONDARY] = new TelemetryCallbackQueue(
@@ -114,6 +152,12 @@ final class HelperCallbackController implements AutoCloseable {
             thread.setDaemon(true);
             return thread;
         });
+        kpiNotificationWorker = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<>(1), runnable -> {
+                Thread thread = new Thread(runnable, "byd-helper-kpi-invalidation");
+                thread.setDaemon(true);
+                return thread;
+            }, new ThreadPoolExecutor.AbortPolicy());
         platform.setListener(new Listener() {
             @Override public void changed(int dev, int fid, int type, int rawBits, byte[] bytes) {
                 onCallback(dev, fid, type, rawBits, bytes);
@@ -263,6 +307,183 @@ final class HelperCallbackController implements AutoCloseable {
             polled.groupFailureCount, polled.elapsedMs, merged, polled.error);
     }
 
+    KpiSubscription subscribeKpi(IBinder listener) {
+        if (listener == null) return KpiSubscription.failure(
+            CollectorHelperProtocol.STATUS_INVALID_REQUEST, "KPI invalidation listener is required");
+        KpiSubscriber replaced;
+        long subscriptionId;
+        synchronized (kpiLock) {
+            if (closed) return KpiSubscription.failure(
+                CollectorHelperProtocol.STATUS_INVALID_REQUEST, "helper is closing");
+            subscriptionId = nextKpiSubscriptionId == Long.MAX_VALUE ? 1L : nextKpiSubscriptionId + 1L;
+            IBinder.DeathRecipient death = () -> clearKpiSubscription(subscriptionId);
+            try { listener.linkToDeath(death, 0); }
+            catch (RemoteException error) {
+                return KpiSubscription.failure(
+                    CollectorHelperProtocol.STATUS_INVALID_REQUEST, "KPI listener is already dead");
+            }
+            nextKpiSubscriptionId = subscriptionId;
+            replaced = kpiSubscriber;
+            kpiSubscriber = new KpiSubscriber(subscriptionId, listener, death);
+            kpiMailbox.clear();
+            kpiListenerStatus = !platform.available()
+                ? CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE
+                : missingKpiSourceCount > 0
+                    ? CollectorHelperProtocol.KPI_LISTENER_DEGRADED
+                    : CollectorHelperProtocol.KPI_LISTENER_REGISTERING;
+            kpiListenerError = !platform.available() ? "callback listener platform unavailable"
+                : missingKpiSourceCount > 0 ? "some canonical KPI sources are absent from the helper whitelist" : null;
+            kpiSequence = nextSequence(kpiSequence);
+            kpiNotificationPending = true;
+            kpiNotificationSent = false;
+        }
+        unlinkKpiSubscriber(replaced);
+        scheduleRegistration(0L, true);
+        scheduleKpiNotification();
+        synchronized (kpiLock) {
+            return new KpiSubscription(CollectorHelperProtocol.STATUS_OK, subscriptionId,
+                bootId, generation, kpiListenerStatus, kpiListenerError, null);
+        }
+    }
+
+    KpiSnapshot drainKpi(long subscriptionId) {
+        synchronized (kpiLock) {
+            if (kpiSubscriber == null || kpiSubscriber.id != subscriptionId) {
+                return KpiSnapshot.failure(subscriptionId,
+                    CollectorHelperProtocol.STATUS_INVALID_KPI_SUBSCRIPTION, "KPI subscription is stale");
+            }
+            List<KpiValue> values = new ArrayList<>(kpiMailbox.values().size());
+            for (CollectorHelperDaemon.Address row : kpiRows) {
+                KpiValue value = kpiMailbox.get(row);
+                if (value != null) values.add(value.copy());
+            }
+            kpiNotificationPending = false;
+            kpiNotificationSent = false;
+            return new KpiSnapshot(CollectorHelperProtocol.STATUS_OK, subscriptionId,
+                bootId, generation, kpiSequence, kpiListenerStatus, kpiListenerError, values, null);
+        }
+    }
+
+    KpiActionResult unsubscribeKpi(long subscriptionId) {
+        KpiSubscriber removed;
+        synchronized (kpiLock) {
+            if (kpiSubscriber == null || kpiSubscriber.id != subscriptionId) {
+                return new KpiActionResult(CollectorHelperProtocol.STATUS_INVALID_KPI_SUBSCRIPTION,
+                    "KPI subscription is stale");
+            }
+            removed = kpiSubscriber;
+            kpiSubscriber = null;
+            kpiMailbox.clear();
+            kpiListenerStatus = CollectorHelperProtocol.KPI_LISTENER_IDLE;
+            kpiListenerError = null;
+            kpiNotificationPending = false;
+            kpiNotificationSent = false;
+        }
+        unlinkKpiSubscriber(removed);
+        scheduleRegistration(0L, true);
+        return new KpiActionResult(CollectorHelperProtocol.STATUS_OK, null);
+    }
+
+    private void clearKpiSubscription(long subscriptionId) {
+        KpiSubscriber removed;
+        synchronized (kpiLock) {
+            if (kpiSubscriber == null || kpiSubscriber.id != subscriptionId) return;
+            removed = kpiSubscriber;
+            kpiSubscriber = null;
+            kpiMailbox.clear();
+            kpiListenerStatus = CollectorHelperProtocol.KPI_LISTENER_IDLE;
+            kpiListenerError = null;
+            kpiNotificationPending = false;
+            kpiNotificationSent = false;
+        }
+        unlinkKpiSubscriber(removed);
+        scheduleRegistration(0L, true);
+    }
+
+    private static void unlinkKpiSubscriber(KpiSubscriber subscriber) {
+        if (subscriber != null) subscriber.listener.unlinkToDeath(subscriber.death, 0);
+    }
+
+    private void captureKpi(int dev, int fid, int type, int rawBits, byte[] bytes,
+                            long wall, long elapsed) {
+        NativeKey key = new NativeKey(dev, fid);
+        if (!kpiKeys.contains(key)) return;
+        boolean captured = false;
+        synchronized (kpiLock) {
+            if (closed || kpiSubscriber == null) return;
+            List<CollectorHelperDaemon.Address> rows = scalarAddresses.get(key);
+            if (rows == null) return;
+            long sequence = nextSequence(kpiSequence);
+            for (CollectorHelperDaemon.Address row : rows) {
+                if (!KPI_SOURCES.contains(row)) continue;
+                KpiValue previous = kpiMailbox.get(row);
+                // Concurrent callbacks can acquire this lock out of observation order.
+                if (previous != null && elapsed < previous.observedElapsedMs) continue;
+                boolean oversize = bytes != null && bytes.length > CollectorHelperProtocol.MAX_KPI_RAW_BYTES;
+                kpiMailbox.put(row, new KpiValue(row, oversize ? CollectorHelperProtocol.STATUS_READ_ERROR
+                    : CollectorHelperProtocol.STATUS_OK, type, type != TelemetryCallbackBatch.TYPE_BYTES,
+                    rawBits, oversize ? null : bytes, wall, elapsed, sequence));
+                captured = true;
+            }
+            if (captured) {
+                kpiSequence = sequence;
+                kpiNotificationPending = true;
+            }
+        }
+        if (captured) scheduleKpiNotification();
+    }
+
+    private void scheduleKpiNotification() {
+        synchronized (kpiLock) {
+            if (closed || kpiSubscriber == null || !kpiNotificationPending ||
+                kpiNotificationSent || kpiNotificationQueued) return;
+            kpiNotificationQueued = true;
+        }
+        try { kpiNotificationWorker.execute(this::sendKpiInvalidation); }
+        catch (RuntimeException error) {
+            synchronized (kpiLock) { kpiNotificationQueued = false; }
+            noteKpiRegistration(CollectorHelperProtocol.KPI_LISTENER_FAILED,
+                "KPI invalidation worker unavailable");
+        }
+    }
+
+    private void sendKpiInvalidation() {
+        KpiSubscriber subscriber;
+        long sequence;
+        synchronized (kpiLock) {
+            subscriber = kpiSubscriber;
+            if (closed || subscriber == null || !kpiNotificationPending || kpiNotificationSent) {
+                kpiNotificationQueued = false;
+                return;
+            }
+            sequence = kpiSequence;
+            kpiNotificationSent = true;
+        }
+        try {
+            kpiInvalidationSender.send(subscriber.listener, subscriber.id, bootId, generation, sequence);
+        } catch (Throwable error) {
+            clearKpiSubscription(subscriber.id);
+        } finally {
+            synchronized (kpiLock) { kpiNotificationQueued = false; }
+            scheduleKpiNotification();
+        }
+    }
+
+    private void noteKpiRegistration(int status, String error) {
+        boolean changed = false;
+        synchronized (kpiLock) {
+            if (kpiSubscriber != null &&
+                (kpiListenerStatus != status || !java.util.Objects.equals(kpiListenerError, error))) {
+                kpiListenerStatus = status;
+                kpiListenerError = error;
+                kpiSequence = nextSequence(kpiSequence);
+                kpiNotificationPending = true;
+                changed = true;
+            }
+        }
+        if (changed) scheduleKpiNotification();
+    }
+
     private static Set<CollectorHelperDaemon.Address> kpiSources() {
         Set<String> keys = NormalizedFieldCatalog.INSTANCE.getKpiSourceKeys();
         Set<CollectorHelperDaemon.Address> rows = new LinkedHashSet<>();
@@ -272,6 +493,38 @@ final class HelperCallbackController implements AutoCloseable {
             }
         }
         return Collections.unmodifiableSet(rows);
+    }
+
+    private static List<CollectorHelperDaemon.Address> eligibleKpiRows(
+        List<CollectorHelperDaemon.Address> main, List<CollectorHelperDaemon.Address> secondary
+    ) {
+        Set<CollectorHelperDaemon.Address> allowed = new LinkedHashSet<>(main);
+        allowed.addAll(secondary);
+        List<CollectorHelperDaemon.Address> result = new ArrayList<>();
+        for (CollectorHelperDaemon.Address address : KPI_SOURCES) if (allowed.contains(address)) result.add(address);
+        return Collections.unmodifiableList(result);
+    }
+
+    private static long nextSequence(long value) { return value == Long.MAX_VALUE ? 1L : value + 1L; }
+
+    private static void sendBinderInvalidation(IBinder listener, long subscriptionId,
+                                                String bootId, String generation, long sequence) throws Throwable {
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(CollectorHelperProtocol.KPI_LISTENER_DESCRIPTOR);
+            data.writeLong(subscriptionId);
+            data.writeString(bootId);
+            data.writeString(generation);
+            data.writeLong(sequence);
+            if (!listener.transact(CollectorHelperProtocol.KPI_TX_INVALIDATED, data, reply, 0) ||
+                reply.readInt() != CollectorHelperProtocol.STATUS_OK) {
+                throw new RemoteException("KPI invalidation delivery failed");
+            }
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
     }
 
     private void updateStream(int stream, HelperStreamRuntimeState.StreamView view,
@@ -306,6 +559,7 @@ final class HelperCallbackController implements AutoCloseable {
     private void onCallback(int dev, int fid, int type, int rawBits, byte[] bytes) {
         long wall = wallClock.getAsLong();
         long elapsed = nowElapsed();
+        captureKpi(dev, fid, type, rawBits, bytes, wall, elapsed);
         synchronized (lock) {
             if (closed) return;
             callbacksReceived++;
@@ -346,6 +600,8 @@ final class HelperCallbackController implements AutoCloseable {
         try { streamWorkers[CollectorHelperProtocol.STREAM_MAIN].execute(() -> host.noteError(
             "BYDAuto listener error " + code + ": " + String.valueOf(message))); }
         catch (Throwable ignored) { }
+        noteKpiRegistration(CollectorHelperProtocol.KPI_LISTENER_FAILED,
+            "BYDAuto listener error " + code + ": " + String.valueOf(message));
         restartListener = true;
         retryReason = "listener_error_" + code;
         scheduleRegistration(RETRY_MS[Math.min(retryIndex++, RETRY_MS.length - 1)], false);
@@ -507,6 +763,7 @@ final class HelperCallbackController implements AutoCloseable {
                 catch (Throwable error) {
                     retryReason = bound(describe(error), 512);
                     host.noteError("callback registration failed: " + describe(error));
+                    updateKpiRegistrationStatus(error);
                     scheduleRegistration(RETRY_MS[Math.min(retryIndex++, RETRY_MS.length - 1)], false);
                 }
             }, delayMs, TimeUnit.MILLISECONDS);
@@ -520,12 +777,46 @@ final class HelperCallbackController implements AutoCloseable {
             if (desired[CollectorHelperProtocol.STREAM_MAIN]) target.addAll(mainKeys);
             if (desired[CollectorHelperProtocol.STREAM_SECONDARY]) target.addAll(secondaryKeys);
         }
+        synchronized (kpiLock) {
+            if (kpiSubscriber != null) target.addAll(kpiKeys);
+        }
         if (restartListener) {
             platform.restartListener();
             restartListener = false;
         }
         platform.apply(target);
         synchronized (lock) { retryIndex = 0; retryReason = null; }
+        updateKpiRegistrationStatus(null);
+    }
+
+    private void updateKpiRegistrationStatus(Throwable failure) {
+        int accepted = 0;
+        int failed = 0;
+        for (NativeKey key : kpiKeys) {
+            if (platform.accepts(key)) accepted++;
+            else if (platform.failed(key)) failed++;
+        }
+        int status;
+        String error;
+        if (!platform.available()) {
+            status = CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE;
+            error = "callback listener platform unavailable";
+        } else if (failed > 0 || missingKpiSourceCount > 0) {
+            status = CollectorHelperProtocol.KPI_LISTENER_DEGRADED;
+            error = failure == null
+                ? "callback registration incomplete: failed=" + failed + " missing_whitelist=" + missingKpiSourceCount
+                : describe(failure);
+        } else if (failure != null) {
+            status = CollectorHelperProtocol.KPI_LISTENER_FAILED;
+            error = describe(failure);
+        } else if (accepted == kpiKeys.size()) {
+            status = CollectorHelperProtocol.KPI_LISTENER_READY;
+            error = null;
+        } else {
+            status = CollectorHelperProtocol.KPI_LISTENER_REGISTERING;
+            error = null;
+        }
+        noteKpiRegistration(status, error);
     }
 
     private void clearOwnerChanges(boolean oldMain, boolean oldSecondary, boolean newMain, boolean newSecondary) {
@@ -651,6 +942,16 @@ final class HelperCallbackController implements AutoCloseable {
             boolean interrupted = false;
             if (!streamWorkersShutdown) {
                 closed = true;
+                KpiSubscriber kpiToClose;
+                synchronized (kpiLock) {
+                    kpiToClose = kpiSubscriber;
+                    kpiSubscriber = null;
+                    kpiMailbox.clear();
+                    kpiNotificationPending = false;
+                    kpiNotificationSent = false;
+                }
+                unlinkKpiSubscriber(kpiToClose);
+                kpiNotificationWorker.shutdownNow();
                 synchronized (registrationLock) {
                     if (registrationFuture != null) registrationFuture.cancel(true);
                 }
@@ -886,6 +1187,12 @@ final class HelperCallbackController implements AutoCloseable {
 
         int acceptedCount() { return acceptedCount; }
         int failedCount() { return failedCount; }
+        boolean available() { return manager != null; }
+        boolean accepts(NativeKey key) {
+            Set<Integer> device = accepted.get(key.dev);
+            return device != null && device.contains(key.fid);
+        }
+        boolean failed(NativeKey key) { return failed.contains(key); }
 
         private void refreshDiagnosticCounts() {
             int total = 0;
@@ -903,6 +1210,89 @@ final class HelperCallbackController implements AutoCloseable {
                 if (registered) unregister();
             } catch (Exception error) { throw error; }
             catch (Throwable error) { throw new Exception(error); }
+        }
+    }
+
+    static final class KpiSubscriber {
+        final long id;
+        final IBinder listener;
+        final IBinder.DeathRecipient death;
+        KpiSubscriber(long id, IBinder listener, IBinder.DeathRecipient death) {
+            this.id = id; this.listener = listener; this.death = death;
+        }
+    }
+
+    static final class KpiSubscription {
+        final int status;
+        final long subscriptionId;
+        final String bootId;
+        final String generation;
+        final int listenerStatus;
+        final String listenerError;
+        final String error;
+        KpiSubscription(int status, long subscriptionId, String bootId, String generation,
+                        int listenerStatus, String listenerError, String error) {
+            this.status = status; this.subscriptionId = subscriptionId;
+            this.bootId = bootId; this.generation = generation;
+            this.listenerStatus = listenerStatus; this.listenerError = listenerError; this.error = error;
+        }
+        static KpiSubscription failure(int status, String error) {
+            return new KpiSubscription(status, 0L, null, null,
+                CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE, null, error);
+        }
+    }
+
+    static final class KpiActionResult {
+        final int status;
+        final String error;
+        KpiActionResult(int status, String error) { this.status = status; this.error = error; }
+    }
+
+    static final class KpiValue {
+        final CollectorHelperDaemon.Address address;
+        final int status;
+        final int nativeType;
+        final boolean hasRaw;
+        final int rawBits;
+        final byte[] bytes;
+        final long observedWallMs;
+        final long observedElapsedMs;
+        final long sequence;
+        KpiValue(CollectorHelperDaemon.Address address, int status, int nativeType, boolean hasRaw,
+                 int rawBits, byte[] bytes, long observedWallMs, long observedElapsedMs, long sequence) {
+            this.address = address; this.status = status; this.nativeType = nativeType;
+            this.hasRaw = hasRaw; this.rawBits = rawBits;
+            this.bytes = bytes == null ? null : bytes.clone();
+            this.observedWallMs = observedWallMs; this.observedElapsedMs = observedElapsedMs;
+            this.sequence = sequence;
+        }
+        KpiValue copy() {
+            return new KpiValue(address, status, nativeType, hasRaw, rawBits, bytes,
+                observedWallMs, observedElapsedMs, sequence);
+        }
+    }
+
+    static final class KpiSnapshot {
+        final int status;
+        final long subscriptionId;
+        final String bootId;
+        final String generation;
+        final long sequence;
+        final int listenerStatus;
+        final String listenerError;
+        final List<KpiValue> values;
+        final String error;
+        KpiSnapshot(int status, long subscriptionId, String bootId, String generation, long sequence,
+                    int listenerStatus, String listenerError, List<KpiValue> values, String error) {
+            this.status = status; this.subscriptionId = subscriptionId;
+            this.bootId = bootId; this.generation = generation; this.sequence = sequence;
+            this.listenerStatus = listenerStatus; this.listenerError = listenerError;
+            this.values = values; this.error = error;
+        }
+        static KpiSnapshot failure(long subscriptionId, int status, String error) {
+            return new KpiSnapshot(status, subscriptionId, null, null, 0L,
+                CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE, null,
+                Collections.<KpiValue>emptyList(), error);
         }
     }
 

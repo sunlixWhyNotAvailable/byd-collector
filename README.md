@@ -71,6 +71,8 @@ Use `Stop` when collection is no longer needed. Background collection and its ve
 
 Its compact vehicle-status cards include the remaining percentage for all three perfume slots. A valid zero is shown as zero; unavailable readings stay distinct.
 
+While these cards are visible, supported readings update live from vehicle notifications. Background updates are less frequent, and fields without usable notifications continue to use independent reads. Main and All data collection can remain stopped; unavailable or stale readings are not shown as current values.
+
 - Reads 23,069 active signatures from the retained 23,083-definition research catalog. Seven high-volume or irrelevant native fields are excluded from both polling and subscriptions; their old data remains available.
 - Saves raw values, descriptions, data quality, and changes in a separate database.
 - Helps identify changing fields, but a changing value alone does not prove what the field means.

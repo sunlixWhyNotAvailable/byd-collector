@@ -13,6 +13,20 @@ interface DirectVehicleHelper {
         DirectHelperStopResult(CollectorHelperProtocol.STATUS_INVALID_REQUEST, false, "helper stop is unavailable")
     fun read(entry: DirectFidEntry): DirectHelperReadResult
 
+    /** Registers one bounded, coalesced KPI invalidation consumer independent of the recording streams. */
+    fun subscribeKpi(onInvalidated: (DirectKpiInvalidation) -> Unit): DirectKpiSubscriptionResult =
+        DirectKpiSubscriptionResult(CollectorHelperProtocol.STATUS_INVALID_REQUEST,
+            error = "helper does not support live KPI subscriptions")
+
+    /** Atomically snapshots the latest raw KPI mailbox and acknowledges its pending invalidation. */
+    fun drainKpi(subscriptionId: Long): DirectKpiMailboxSnapshot =
+        DirectKpiMailboxSnapshot(CollectorHelperProtocol.STATUS_INVALID_REQUEST,
+            subscriptionId = subscriptionId, error = "helper does not support live KPI subscriptions")
+
+    fun unsubscribeKpi(subscriptionId: Long): DirectKpiActionResult =
+        DirectKpiActionResult(CollectorHelperProtocol.STATUS_INVALID_REQUEST,
+            error = "helper does not support live KPI subscriptions")
+
     fun readBatch(entries: List<DirectFidEntry>): DirectHelperBatchResult {
         val results = entries.map(::read)
         return DirectHelperBatchResult(
@@ -136,4 +150,54 @@ data class DirectHelperStopResult(
     val error: String? = null
 ) {
     val ok: Boolean = status == 0 && accepted
+}
+
+data class DirectKpiInvalidation(
+    val subscriptionId: Long,
+    val helperBootId: String,
+    val helperGeneration: String,
+    val sequence: Long
+)
+
+data class DirectKpiSubscriptionResult(
+    val status: Int,
+    val subscriptionId: Long = 0L,
+    val helperBootId: String? = null,
+    val helperGeneration: String? = null,
+    val listenerStatus: Int = CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE,
+    val listenerError: String? = null,
+    val error: String? = null
+) {
+    val ok: Boolean = status == CollectorHelperProtocol.STATUS_OK && subscriptionId > 0L
+}
+
+data class DirectKpiRawValue(
+    val tx: Int,
+    val dev: Int,
+    val fid: Int,
+    val status: Int,
+    val nativeType: Int,
+    val rawBits: Int?,
+    val bytes: ByteArray?,
+    val observedWallMs: Long,
+    val observedElapsedMs: Long,
+    val sequence: Long
+)
+
+data class DirectKpiMailboxSnapshot(
+    val status: Int,
+    val subscriptionId: Long,
+    val helperBootId: String? = null,
+    val helperGeneration: String? = null,
+    val sequence: Long = 0L,
+    val listenerStatus: Int = CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE,
+    val listenerError: String? = null,
+    val values: List<DirectKpiRawValue> = emptyList(),
+    val error: String? = null
+) {
+    val ok: Boolean = status == CollectorHelperProtocol.STATUS_OK
+}
+
+data class DirectKpiActionResult(val status: Int, val error: String? = null) {
+    val ok: Boolean = status == CollectorHelperProtocol.STATUS_OK
 }

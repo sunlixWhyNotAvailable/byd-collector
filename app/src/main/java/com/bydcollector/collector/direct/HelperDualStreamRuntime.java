@@ -1,6 +1,7 @@
 package com.bydcollector.collector.direct;
 
 import android.os.Handler;
+import android.os.IBinder;
 import android.os.SystemClock;
 
 import java.util.ArrayDeque;
@@ -279,6 +280,18 @@ final class HelperDualStreamRuntime implements AutoCloseable {
         } catch (Throwable error) {
             return rejected(rows.size(), CollectorHelperProtocol.STATUS_READ_ERROR, describe(error));
         }
+    }
+
+    HelperCallbackController.KpiSubscription subscribeKpi(IBinder listener) {
+        return callbacks.subscribeKpi(listener);
+    }
+
+    HelperCallbackController.KpiSnapshot drainKpi(long subscriptionId) {
+        return callbacks.drainKpi(subscriptionId);
+    }
+
+    HelperCallbackController.KpiActionResult unsubscribeKpi(long subscriptionId) {
+        return callbacks.unsubscribeKpi(subscriptionId);
     }
 
     CollectorHelperDaemon.BatchResult readSecondary(long token, long epoch, String catalogVersion) {

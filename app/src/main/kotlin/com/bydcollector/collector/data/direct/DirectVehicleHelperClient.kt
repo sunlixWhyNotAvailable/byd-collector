@@ -1,6 +1,7 @@
 package com.bydcollector.collector.data.direct
 
 import android.os.DeadObjectException
+import android.os.Binder
 import android.os.IBinder
 import android.os.Parcel
 import android.util.Log
@@ -19,9 +20,20 @@ import java.io.ByteArrayOutputStream
 //wraps the helper binder so autoservice calls stay behind one read-only app-facing interface
 class DirectVehicleHelperClient : DirectVehicleHelper {
     private val lock = Any()
+    private val kpiLock = Any()
 
     @Volatile
     private var cached: IBinder? = null
+
+    private var kpiListenerBinder: Binder? = null
+    private var kpiListener: ((DirectKpiInvalidation) -> Unit)? = null
+    private var kpiSubscriptionId = 0L
+    private var kpiBootId: String? = null
+    private var kpiGeneration: String? = null
+    private var kpiSubscribePending = false
+    private var earlyKpiInvalidation: DirectKpiInvalidation? = null
+    private var kpiHelperBinder: IBinder? = null
+    private var kpiHelperDeath: IBinder.DeathRecipient? = null
 
     override fun isAlive(): Boolean = ownerMode() != null
 
@@ -59,6 +71,242 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
             data.writeInt(entry.dev)
             data.writeInt(entry.fid)
         } ?: DirectHelperReadResult(status = STATUS_NO_BINDER, raw = null, error = "helper binder unavailable")
+    }
+
+    override fun subscribeKpi(onInvalidated: (DirectKpiInvalidation) -> Unit): DirectKpiSubscriptionResult {
+        var early: DirectKpiInvalidation? = null
+        val result = synchronized(kpiLock) {
+            val binder = ensureBinder() ?: run {
+                clearKpiClientState()
+                return@synchronized kpiSubscriptionFailure(STATUS_NO_BINDER, "helper binder unavailable")
+            }
+            clearKpiClientState()
+            val listenerBinder = object : Binder() {
+                override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+                    if (code != CollectorHelperProtocol.KPI_TX_INVALIDATED) return super.onTransact(code, data, reply, flags)
+                    data.enforceInterface(CollectorHelperProtocol.KPI_LISTENER_DESCRIPTOR)
+                    val id = data.readLong()
+                    val boot = requireNotNull(data.readString()) { "KPI invalidation boot id missing" }
+                    val generation = requireNotNull(data.readString()) { "KPI invalidation generation missing" }
+                    val sequence = data.readLong()
+                    require(id > 0L && sequence >= 0L && data.dataAvail() == 0) { "invalid KPI invalidation" }
+                    val invalidation = DirectKpiInvalidation(id, boot, generation, sequence)
+                    val callback = synchronized(kpiLock) {
+                        if (id == kpiSubscriptionId && boot == kpiBootId && generation == kpiGeneration) {
+                            kpiListener
+                        } else {
+                            if (kpiSubscribePending) earlyKpiInvalidation = invalidation
+                            null
+                        }
+                    }
+                    callback?.invoke(invalidation)
+                    reply?.writeInt(CollectorHelperProtocol.STATUS_OK)
+                    return true
+                }
+            }
+            kpiListenerBinder = listenerBinder
+            kpiListener = onInvalidated
+            kpiSubscriptionId = 0L
+            kpiBootId = null
+            kpiGeneration = null
+            kpiSubscribePending = true
+            earlyKpiInvalidation = null
+            val data = Parcel.obtain()
+            val reply = Parcel.obtain()
+            try {
+                val death = IBinder.DeathRecipient { onKpiHelperDeath(binder) }
+                kpiHelperBinder = binder
+                kpiHelperDeath = death
+                binder.linkToDeath(death, 0)
+                data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
+                data.writeStrongBinder(listenerBinder)
+                if (!binder.transact(CollectorHelperProtocol.TX_KPI_SUBSCRIBE, data, reply, 0)) {
+                    cached = null
+                    clearKpiClientState()
+                    return@synchronized kpiSubscriptionFailure(STATUS_TRANSACT_FALSE, "KPI subscribe transact returned false")
+                }
+                val status = reply.readInt()
+                if (status != CollectorHelperProtocol.STATUS_OK) {
+                    val error = reply.readString()
+                    clearKpiClientState()
+                    return@synchronized kpiSubscriptionFailure(status, error ?: "KPI subscribe failed")
+                }
+                val id = reply.readLong()
+                val boot = requireNotNull(reply.readString()) { "KPI subscription boot id missing" }
+                val generation = requireNotNull(reply.readString()) { "KPI subscription generation missing" }
+                val listenerStatus = reply.readInt()
+                val listenerError = reply.readString()
+                require(id > 0L && boot.isNotBlank() && generation.isNotBlank()) { "invalid KPI subscription identity" }
+                require(reply.dataAvail() == 0) { "unexpected KPI subscription reply" }
+                kpiSubscriptionId = id
+                kpiBootId = boot
+                kpiGeneration = generation
+                kpiSubscribePending = false
+                early = earlyKpiInvalidation?.takeIf {
+                    it.subscriptionId == id && it.helperBootId == boot && it.helperGeneration == generation
+                }
+                earlyKpiInvalidation = null
+                DirectKpiSubscriptionResult(status, id, boot, generation, listenerStatus, listenerError)
+            } catch (error: DeadObjectException) {
+                cached = null
+                clearKpiClientState()
+                kpiSubscriptionFailure(STATUS_DEAD_OBJECT, error.message ?: "dead binder")
+            } catch (error: Exception) {
+                cached = null
+                clearKpiClientState()
+                kpiSubscriptionFailure(STATUS_CLIENT_ERROR,
+                    "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+            } finally {
+                data.recycle()
+                reply.recycle()
+            }
+        }
+        early?.let { invalidation -> synchronized(kpiLock) { kpiListener }?.invoke(invalidation) }
+        return result
+    }
+
+    override fun drainKpi(subscriptionId: Long): DirectKpiMailboxSnapshot = synchronized(kpiLock) {
+        if (subscriptionId <= 0L || subscriptionId != kpiSubscriptionId) {
+            return@synchronized kpiSnapshotFailure(subscriptionId, CollectorHelperProtocol.STATUS_INVALID_KPI_SUBSCRIPTION,
+                "KPI subscription is stale")
+        }
+        val binder = ensureBinder() ?: run {
+            clearKpiClientState()
+            return@synchronized kpiSnapshotFailure(subscriptionId, STATUS_NO_BINDER, "helper binder unavailable")
+        }
+        val data = Parcel.obtain()
+        val reply = Parcel.obtain()
+        try {
+            data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
+            data.writeLong(subscriptionId)
+            if (!binder.transact(CollectorHelperProtocol.TX_KPI_DRAIN, data, reply, 0)) {
+                cached = null
+                clearKpiClientState()
+                return@synchronized kpiSnapshotFailure(subscriptionId, STATUS_TRANSACT_FALSE,
+                    "KPI drain transact returned false")
+            }
+            val status = reply.readInt()
+            if (status != CollectorHelperProtocol.STATUS_OK) {
+                val error = reply.readString()
+                if (status == CollectorHelperProtocol.STATUS_INVALID_KPI_SUBSCRIPTION) clearKpiClientState()
+                return@synchronized kpiSnapshotFailure(subscriptionId, status, error ?: "KPI drain failed")
+            }
+            val id = reply.readLong()
+            val boot = requireNotNull(reply.readString()) { "KPI snapshot boot id missing" }
+            val generation = requireNotNull(reply.readString()) { "KPI snapshot generation missing" }
+            val sequence = reply.readLong()
+            val listenerStatus = reply.readInt()
+            val listenerError = reply.readString()
+            val count = reply.readInt()
+            require(id == subscriptionId && boot == kpiBootId && generation == kpiGeneration) {
+                "KPI snapshot identity mismatch"
+            }
+            require(sequence >= 0L && count in 0..CollectorHelperProtocol.MAX_KPI_VALUES) {
+                "invalid KPI snapshot header"
+            }
+            require(reply.dataSize() <= MAX_KPI_REPLY_BYTES) { "oversize KPI snapshot reply" }
+            val values = List(count) {
+                val tx = reply.readInt()
+                val dev = reply.readInt()
+                val fid = reply.readInt()
+                val valueStatus = reply.readInt()
+                val nativeType = reply.readInt()
+                val hasRaw = reply.readInt()
+                require(hasRaw == 0 || hasRaw == 1) { "invalid KPI raw marker" }
+                val raw = if (hasRaw == 1) reply.readInt() else null
+                val bytes = reply.createByteArray()
+                require(bytes == null || bytes.size <= CollectorHelperProtocol.MAX_KPI_RAW_BYTES) {
+                    "oversize KPI raw payload"
+                }
+                val wall = reply.readLong()
+                val elapsed = reply.readLong()
+                val valueSequence = reply.readLong()
+                require(wall >= 0L && elapsed >= 0L && valueSequence in 0L..sequence) {
+                    "invalid KPI source metadata"
+                }
+                DirectKpiRawValue(tx, dev, fid, valueStatus, nativeType, raw, bytes, wall, elapsed, valueSequence)
+            }
+            require(reply.dataAvail() == 0) { "unexpected KPI snapshot data" }
+            DirectKpiMailboxSnapshot(status, id, boot, generation, sequence, listenerStatus, listenerError, values)
+        } catch (error: DeadObjectException) {
+            cached = null
+            clearKpiClientState()
+            kpiSnapshotFailure(subscriptionId, STATUS_DEAD_OBJECT, error.message ?: "dead binder")
+        } catch (error: Exception) {
+            cached = null
+            clearKpiClientState()
+            kpiSnapshotFailure(subscriptionId, STATUS_CLIENT_ERROR,
+                "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+        } finally {
+            data.recycle()
+            reply.recycle()
+        }
+    }
+
+    override fun unsubscribeKpi(subscriptionId: Long): DirectKpiActionResult = synchronized(kpiLock) {
+        if (subscriptionId <= 0L || subscriptionId != kpiSubscriptionId) {
+            return@synchronized DirectKpiActionResult(CollectorHelperProtocol.STATUS_INVALID_KPI_SUBSCRIPTION,
+                "KPI subscription is stale")
+        }
+        val binder = ensureBinder()
+        if (binder == null) {
+            clearKpiClientState()
+            return@synchronized DirectKpiActionResult(STATUS_NO_BINDER, "helper binder unavailable")
+        }
+        val data = Parcel.obtain()
+        val reply = Parcel.obtain()
+        try {
+            data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
+            data.writeLong(subscriptionId)
+            if (!binder.transact(CollectorHelperProtocol.TX_KPI_UNSUBSCRIBE, data, reply, 0)) {
+                cached = null
+                clearKpiClientState()
+                return@synchronized DirectKpiActionResult(STATUS_TRANSACT_FALSE, "KPI unsubscribe transact returned false")
+            }
+            val result = DirectKpiActionResult(reply.readInt(), reply.readString())
+            clearKpiClientState()
+            result
+        } catch (error: DeadObjectException) {
+            cached = null
+            clearKpiClientState()
+            DirectKpiActionResult(STATUS_DEAD_OBJECT, error.message ?: "dead binder")
+        } catch (error: Exception) {
+            cached = null
+            clearKpiClientState()
+            DirectKpiActionResult(STATUS_CLIENT_ERROR, "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+        } finally {
+            data.recycle()
+            reply.recycle()
+        }
+    }
+
+    private fun onKpiHelperDeath(binder: IBinder) {
+        val (callback, invalidation) = synchronized(kpiLock) {
+            if (kpiHelperBinder !== binder) return
+            val callback = kpiListener
+            val invalidation = if (kpiSubscriptionId > 0L) DirectKpiInvalidation(
+                kpiSubscriptionId, kpiBootId.orEmpty(), kpiGeneration.orEmpty(), Long.MAX_VALUE
+            ) else null
+            if (cached === binder) cached = null
+            clearKpiClientState()
+            callback to invalidation
+        }
+        // Wake the existing drain lane; it sees the invalid subscription and reconnects.
+        // No getter, Binder transaction or user callback runs under the state lock.
+        if (invalidation != null) callback?.invoke(invalidation)
+    }
+
+    private fun clearKpiClientState() {
+        kpiHelperDeath?.let { death -> runCatching { kpiHelperBinder?.unlinkToDeath(death, 0) } }
+        kpiHelperBinder = null
+        kpiHelperDeath = null
+        kpiListenerBinder = null
+        kpiListener = null
+        kpiSubscriptionId = 0L
+        kpiBootId = null
+        kpiGeneration = null
+        kpiSubscribePending = false
+        earlyKpiInvalidation = null
     }
 
     override fun readBatch(entries: List<DirectFidEntry>): DirectHelperBatchResult = readBatchInternal(entries, false)
@@ -767,6 +1015,12 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
     private fun stopFailure(status: Int, error: String): DirectHelperStopResult =
         DirectHelperStopResult(status, accepted = false, error)
 
+    private fun kpiSubscriptionFailure(status: Int, error: String): DirectKpiSubscriptionResult =
+        DirectKpiSubscriptionResult(status, error = error)
+
+    private fun kpiSnapshotFailure(subscriptionId: Long, status: Int, error: String): DirectKpiMailboxSnapshot =
+        DirectKpiMailboxSnapshot(status, subscriptionId, error = error)
+
     private fun modeName(mode: Int): String = when (mode) {
         CollectorHelperProtocol.MODE_NATIVE -> "native"
         CollectorHelperProtocol.MODE_NATIVE_WITH_FALLBACK -> "native_with_fallback"
@@ -805,5 +1059,7 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
         private const val STATUS_EMPTY_REPLY = -902
         private const val STATUS_DEAD_OBJECT = -903
         private const val STATUS_CLIENT_ERROR = -904
+        private const val MAX_KPI_REPLY_BYTES =
+            CollectorHelperProtocol.MAX_KPI_VALUES * (CollectorHelperProtocol.MAX_KPI_RAW_BYTES + 64) + 1_024
     }
 }

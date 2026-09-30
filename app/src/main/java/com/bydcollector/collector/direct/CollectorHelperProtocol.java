@@ -8,7 +8,7 @@ public final class CollectorHelperProtocol {
     public static final String SPOOL_MODE_ARG = "spool";
     public static final String LOG_PATH = "/data/local/tmp/bydcollector_helper.log";
     public static final String LOCK_PATH = "/data/local/tmp/bydcollector_helper.lock";
-    public static final int PROTOCOL_VERSION = 15;
+    public static final int PROTOCOL_VERSION = 16;
     // PING's status/version/owner and STOP_OWNER layout is verified for these versions.
     public static final int MIN_STOP_PROTOCOL_VERSION = 13;
     public static final int TX_PING = 1;
@@ -28,6 +28,19 @@ public final class CollectorHelperProtocol {
     public static final int TX_CALLBACK_STATUS = 15;
     public static final int TX_CALLBACK_QUARANTINE = 16;
     public static final int TX_KPI_READ_BATCH = 17;
+    public static final int TX_KPI_SUBSCRIBE = 18;
+    public static final int TX_KPI_UNSUBSCRIBE = 19;
+    public static final int TX_KPI_DRAIN = 20;
+    public static final String KPI_LISTENER_DESCRIPTOR = "com.bydcollector.collector.direct.ICollectorKpiListener";
+    public static final int KPI_TX_INVALIDATED = 1;
+    public static final int KPI_LISTENER_IDLE = 0;
+    public static final int KPI_LISTENER_REGISTERING = 1;
+    public static final int KPI_LISTENER_READY = 2;
+    public static final int KPI_LISTENER_DEGRADED = 3;
+    public static final int KPI_LISTENER_FAILED = 4;
+    public static final int KPI_LISTENER_UNAVAILABLE = 5;
+    public static final int MAX_KPI_VALUES = 24;
+    public static final int MAX_KPI_RAW_BYTES = 4_096;
     public static final int STREAM_MAIN = 1;
     public static final int STREAM_SECONDARY = 2;
     public static final int CONTROL_CLAIM = 1;
@@ -54,6 +67,7 @@ public final class CollectorHelperProtocol {
     public static final int STATUS_REPLAY_PENDING = -915;
     public static final int STATUS_STALE_TOKEN = -916;
     public static final int STATUS_LEASE_EXPIRED = -917;
+    public static final int STATUS_INVALID_KPI_SUBSCRIPTION = -918;
 
     public static final int MODE_REJECTED = 0;
     public static final int MODE_NATIVE = 1;

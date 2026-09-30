@@ -5,6 +5,8 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
 import android.content.ComponentName
 import android.content.Intent
 import android.content.SharedPreferences
@@ -23,6 +25,7 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.service.notification.NotificationListenerService
 import android.util.Log
+import android.view.Choreographer
 import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.BuildConfig
 import com.bydcollector.collector.adb.AdbAuthorizationManager
@@ -69,6 +72,8 @@ import com.bydcollector.collector.data.local.PollReading
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.data.normalized.NormalizedFieldCatalog
 import com.bydcollector.collector.data.normalized.NormalizedSourceKind
+import com.bydcollector.collector.data.normalized.NormalizedSourceOrdering
+import com.bydcollector.collector.data.normalized.NormalizedSourceOrder
 import com.bydcollector.collector.data.normalized.NormalizedSourceStamp
 import com.bydcollector.collector.data.remote.DirectTelemetryClient
 import com.bydcollector.collector.data.remote.DirectBridgeManager
@@ -283,6 +288,38 @@ class CollectorService : Service() {
     private val kpiFreshness = KpiFreshness(
         com.bydcollector.collector.data.polling.LivePollSource.liveBootId, KPI_STALE_AFTER_MS)
     private var kpiPublishScheduled = false
+    private var kpiFrameScheduled = false
+    private val kpiChoreographer by lazy { Choreographer.getInstance() }
+    @Volatile private var kpiDrainWorker: KpiCallbackDrainWorker? = null
+    private val kpiRuntimeGeneration = AtomicLong(0L)
+    private val kpiUiGeneration = AtomicLong(0L)
+    private val kpiWakeLock = java.lang.Object()
+    private var kpiWakeRevision = 0L
+    private val kpiPendingLock = Any()
+    private val pendingKpiObservations = linkedMapOf<String, NormalizedObservation>()
+    private var pendingKpiUiGeneration = 0L
+    private var kpiIngestScheduled = false
+    private var kpiVisibilityListenerAttached = false
+    @Volatile private var kpiInteractive = false
+    @Volatile private var kpiLiveMode = false
+    private val kpiDiagnosticQueued = AtomicBoolean(false)
+    private val kpiMailboxSnapshots = AtomicLong(0L)
+    private val kpiGetterFields = AtomicLong(0L)
+    private val kpiUiPublications = AtomicLong(0L)
+    @Volatile private var kpiFallbackSources = 0
+    @Volatile private var kpiFallbackReason = "not_subscribed"
+    private var lastKpiDiagnosticMs = Long.MIN_VALUE
+    private val kpiVisibilityListener: () -> Unit = {
+        signalKpiWorker()
+        mainHandler.removeCallbacks(kpiModeTask)
+        mainHandler.post(kpiModeTask)
+    }
+    private val kpiScreenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            kpiInteractive = (getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive
+            kpiVisibilityListener()
+        }
+    }
     private val mqttRetryTask = object : Runnable {
         override fun run() {
             mqttRetryScheduled = false
@@ -372,16 +409,45 @@ class CollectorService : Service() {
         override fun run() {
             if (!running.get()) return
             publishDashboardRuntimeFlags()
+            reportKpiDiagnosticsIfDue()
             scheduleDatabaseFootprintRefresh(force = false)
             mainHandler.postDelayed(this, DASHBOARD_RUNTIME_HEARTBEAT_MS)
         }
     }
     private val kpiPublishTask = Runnable {
         kpiPublishScheduled = false
-        publishVehicleKpisNow()
+        scheduleKpiPublication()
+    }
+    private val kpiFrameCallback = Choreographer.FrameCallback {
+        kpiFrameScheduled = false
+        if (KpiUiVisibility.visible) publishVehicleKpisNow() else scheduleKpiPublication()
+    }
+    private val kpiModeTask = Runnable {
+        if (!KpiUiVisibility.visible || !kpiInteractive || !kpiPowerOn) cancelKpiFrame()
+        if (!kpiInteractive || !kpiPowerOn) {
+            mainHandler.removeCallbacks(kpiPublishTask)
+            mainHandler.removeCallbacks(kpiStaleTask)
+            kpiPublishScheduled = false
+        } else scheduleKpiPublication()
+    }
+    private val kpiIngestTask = Runnable {
+        val (generation, observations) = synchronized(kpiPendingLock) {
+            val pending = pendingKpiObservations.values.toList()
+            pendingKpiObservations.clear()
+            kpiIngestScheduled = false
+            pendingKpiUiGeneration to pending
+        }
+        if (observations.isEmpty() || generation != kpiUiGeneration.get() || !running.get() ||
+            !kpiPowerOn || !kpiInteractive || settings.isUserShutdownRequested()
+        ) return@Runnable
+        val nowMs = SystemClock.elapsedRealtime()
+        if (!kpiFreshness.accept(observations, nowMs)) return@Runnable
+        mainHandler.removeCallbacks(kpiStaleTask)
+        mainHandler.postDelayed(kpiStaleTask, kpiFreshness.remainingMs(nowMs))
+        scheduleKpiPublication()
     }
     private val kpiStaleTask = Runnable {
-        publishVehicleKpisNow()
+        if (KpiUiVisibility.visible) scheduleKpiPublication() else publishVehicleKpisNow()
     }
 
     override fun onCreate() {
@@ -608,6 +674,17 @@ class CollectorService : Service() {
     override fun onDestroy() {
         requireRuntimeOwner()
         running.set(false)
+        kpiRuntimeGeneration.incrementAndGet()
+        kpiLiveMode = false
+        kpiInteractive = false
+        cancelKpiFrame()
+        kpiDrainWorker?.closeAndJoin(0L)
+        if (kpiVisibilityListenerAttached) {
+            KpiUiVisibility.removeListener(kpiVisibilityListener)
+            unregisterReceiver(kpiScreenReceiver)
+            kpiVisibilityListenerAttached = false
+        }
+        signalKpiWorker()
         if (::deferredEnergyWorker.isInitialized) deferredEnergyWorker.stopAndJoin(0L)
         kpiWorker?.interrupt()
         getSharedPreferences(CollectorSettings.PREFS_NAME, Context.MODE_PRIVATE)
@@ -893,12 +970,6 @@ class CollectorService : Service() {
                 "normalization_page_oldest_age_ms=${progress?.oldestWallMs?.let { (now - it).coerceAtLeast(0L) }} " +
                 "normalization_last_completion_wall_ms=${progress?.completedWallMs} " +
                 "normalization_page_may_have_more=${progress?.hasMore}")
-        mainHandler.post {
-            if (!running.get() || !kpiPowerOn) return@post
-            kpiFreshness.expiryDiagnostics(SystemClock.elapsedRealtime())?.let {
-                store.recordEvent("kpi_expiry_summary", "KPI source freshness evidence", it)
-            }
-        }
     }
 
     private fun callbackDrain(
@@ -1919,6 +1990,17 @@ class CollectorService : Service() {
         runCatching { (applicationContext as BydCollectorApplication).updateRuntime.shutdown() }
         runCatching { (applicationContext as BydCollectorApplication).updateHints.shutdown() }
         deferredEnergyWorker.requestStopAfterCurrentPage()
+        kpiRuntimeGeneration.incrementAndGet()
+        kpiLiveMode = false
+        kpiInteractive = false
+        cancelKpiFrame()
+        kpiDrainWorker?.closeAndJoin(0L)
+        if (kpiVisibilityListenerAttached) {
+            KpiUiVisibility.removeListener(kpiVisibilityListener)
+            unregisterReceiver(kpiScreenReceiver)
+            kpiVisibilityListenerAttached = false
+        }
+        signalKpiWorker()
         kpiWorker?.interrupt()
         stopMain("user_shutdown")
         stopDebug("user_shutdown")
@@ -1980,8 +2062,15 @@ class CollectorService : Service() {
             }
             val kpiStop = workers.submit<Boolean> {
                 val current = kpiWorker
-                val remaining = remainingShutdownMs(deadlineElapsedMs)
-                runCatching { if (remaining > 0L) current?.join(remaining) }.isSuccess && current?.isAlive != true
+                val currentDrain = kpiDrainWorker
+                val pollRemaining = remainingShutdownMs(deadlineElapsedMs)
+                val pollStopped = runCatching { if (pollRemaining > 0L) current?.join(pollRemaining) }.isSuccess &&
+                    current?.isAlive != true
+                val drainRemaining = remainingShutdownMs(deadlineElapsedMs)
+                val drainStopped = runCatching {
+                    currentDrain?.closeAndJoin(drainRemaining) ?: true
+                }.getOrDefault(false)
+                pollStopped && drainStopped
             }
             val debugStop = workers.submit<Boolean> {
                 val stopped = runCatching {
@@ -2662,34 +2751,146 @@ class CollectorService : Service() {
         )
     }
 
-    private fun queueDashboardVehicleKpis(observations: List<NormalizedObservation>) {
+    private fun reportKpiDiagnosticsIfDue() {
+        val now = SystemClock.elapsedRealtime()
+        if (lastKpiDiagnosticMs != Long.MIN_VALUE && now - lastKpiDiagnosticMs < 30_000L) return
+        lastKpiDiagnosticMs = now
+        val detail = "power_on=$kpiPowerOn interactive=$kpiInteractive live=$kpiLiveMode " +
+            "fallback_sources=$kpiFallbackSources fallback_reason=$kpiFallbackReason " +
+            "mailbox_snapshots=${kpiMailboxSnapshots.getAndSet(0L)} " +
+            "getter_fields=${kpiGetterFields.getAndSet(0L)} ui_publications=${kpiUiPublications.getAndSet(0L)} " +
+            "expiry=${kpiFreshness.expiryDiagnostics(now).orEmpty()}"
+        queueKpiDiagnostic("kpi_runtime_summary", detail)
+    }
+
+    private fun queueKpiDiagnostic(event: String, detail: String) {
+        if (!kpiDiagnosticQueued.compareAndSet(false, true)) return
+        try {
+            dashboardMetricsExecutor.execute {
+                try {
+                    runCatching { store.recordEvent(event, "Independent KPI runtime", detail) }
+                        .onFailure { Log.w(TAG, "KPI diagnostic unavailable", it) }
+                } finally { kpiDiagnosticQueued.set(false) }
+            }
+        } catch (_: RejectedExecutionException) { kpiDiagnosticQueued.set(false) }
+    }
+
+    private fun signalKpiWorker() {
+        synchronized(kpiWakeLock) {
+            kpiWakeRevision++
+            kpiWakeLock.notifyAll()
+        }
+    }
+
+    private fun kpiWakeRevision(): Long = synchronized(kpiWakeLock) { kpiWakeRevision }
+
+    private fun awaitKpiWorkerWake(observedRevision: Long, timeoutMs: Long) {
+        if (timeoutMs <= 0L) return
+        synchronized(kpiWakeLock) {
+            if (kpiWakeRevision == observedRevision) kpiWakeLock.wait(timeoutMs)
+        }
+    }
+
+    private fun invalidateKpiUiSources(): Long {
+        val generation = kpiUiGeneration.incrementAndGet()
+        synchronized(kpiPendingLock) {
+            pendingKpiObservations.clear()
+            pendingKpiUiGeneration = generation
+            kpiIngestScheduled = false
+        }
+        mainHandler.removeCallbacks(kpiIngestTask)
         mainHandler.post {
-            if (!running.get() || !kpiPowerOn || settings.isUserShutdownRequested()) return@post
-            val nowMs = SystemClock.elapsedRealtime()
-            if (!kpiFreshness.accept(observations, nowMs)) return@post
+            if (generation != kpiUiGeneration.get()) return@post
+            kpiFreshness.clear()
+            cancelKpiFrame()
+            mainHandler.removeCallbacks(kpiPublishTask)
             mainHandler.removeCallbacks(kpiStaleTask)
-            mainHandler.postDelayed(kpiStaleTask, kpiFreshness.remainingMs(nowMs))
-            if (lastKpiPublishAtMs == Long.MIN_VALUE || nowMs - lastKpiPublishAtMs >= KPI_PUBLISH_INTERVAL_MS) {
-                mainHandler.removeCallbacks(kpiPublishTask)
-                kpiPublishScheduled = false
-                publishVehicleKpisNow()
-            } else {
-                if (!kpiPublishScheduled) {
-                    kpiPublishScheduled = true
-                    mainHandler.postDelayed(
-                        kpiPublishTask,
-                        (KPI_PUBLISH_INTERVAL_MS - (nowMs - lastKpiPublishAtMs)).coerceAtLeast(0L)
-                    )
+            kpiPublishScheduled = false
+            lastKpiPublishAtMs = Long.MIN_VALUE
+            if (kpiPowerOn) scheduleKpiPublication()
+        }
+        signalKpiWorker()
+        return generation
+    }
+
+    private fun applyKpiSourceUpdate(update: KpiSourceUpdate): Long {
+        val generation = if (update.helperGenerationChanged) invalidateKpiUiSources() else kpiUiGeneration.get()
+        if (update.cadenceChanged) signalKpiWorker()
+        if (update.observations.isNotEmpty() && kpiPowerOn && kpiInteractive) {
+            queueDashboardVehicleKpis(update.observations, generation)
+        }
+        return generation
+    }
+
+    private fun queueDashboardVehicleKpis(
+        observations: List<NormalizedObservation>,
+        sourceGeneration: Long = kpiUiGeneration.get()
+    ) {
+        if (observations.isEmpty() || sourceGeneration != kpiUiGeneration.get() || !kpiPowerOn ||
+            !kpiInteractive || settings.isUserShutdownRequested()
+        ) return
+        synchronized(kpiPendingLock) {
+            if (sourceGeneration != kpiUiGeneration.get()) return
+            if (pendingKpiUiGeneration != sourceGeneration) {
+                pendingKpiObservations.clear()
+                pendingKpiUiGeneration = sourceGeneration
+            }
+            observations.forEach { incoming ->
+                val key = incoming.field.fieldKey
+                val previous = pendingKpiObservations[key]
+                val oldStamp = previous?.sourceStamp
+                val newStamp = incoming.sourceStamp
+                if (oldStamp != null && newStamp != null) {
+                    when (NormalizedSourceOrdering.compare(newStamp, oldStamp, LivePollSource.liveBootId)) {
+                        NormalizedSourceOrder.OLDER, NormalizedSourceOrder.EQUAL -> return@forEach
+                        NormalizedSourceOrder.INCOMPARABLE -> if (newStamp.elapsedMs <= oldStamp.elapsedMs) return@forEach
+                        NormalizedSourceOrder.NEWER -> Unit
+                    }
+                } else if (oldStamp != null && newStamp == null) {
+                    return@forEach
                 }
+                pendingKpiObservations[key] = incoming
+            }
+            if (pendingKpiObservations.isNotEmpty() && !kpiIngestScheduled) {
+                kpiIngestScheduled = true
+                mainHandler.post(kpiIngestTask)
             }
         }
     }
 
+    private fun cancelKpiFrame() {
+        if (kpiFrameScheduled) kpiChoreographer.removeFrameCallback(kpiFrameCallback)
+        kpiFrameScheduled = false
+    }
+
+    private fun scheduleKpiPublication() {
+        if (!running.get() || !kpiPowerOn || !kpiInteractive || settings.isUserShutdownRequested()) return
+        if (KpiUiVisibility.visible) {
+            mainHandler.removeCallbacks(kpiPublishTask)
+            kpiPublishScheduled = false
+            if (!kpiFrameScheduled) {
+                kpiFrameScheduled = true
+                kpiChoreographer.postFrameCallback(kpiFrameCallback)
+            }
+            return
+        }
+        val nowMs = SystemClock.elapsedRealtime()
+        if (lastKpiPublishAtMs == Long.MIN_VALUE || nowMs - lastKpiPublishAtMs >= KPI_PUBLISH_INTERVAL_MS) {
+            mainHandler.removeCallbacks(kpiPublishTask)
+            kpiPublishScheduled = false
+            publishVehicleKpisNow()
+        } else if (!kpiPublishScheduled) {
+            kpiPublishScheduled = true
+            mainHandler.postDelayed(kpiPublishTask, KPI_PUBLISH_INTERVAL_MS - (nowMs - lastKpiPublishAtMs))
+        }
+    }
+
     private fun publishVehicleKpisNow() {
-        if (!kpiPowerOn) return
+        if (!running.get() || !kpiPowerOn || !kpiInteractive || settings.isUserShutdownRequested()) return
         val nowMs = SystemClock.elapsedRealtime()
         val observations = kpiFreshness.freshObservations(nowMs)
         lastKpiPublishAtMs = nowMs
+        kpiUiPublications.incrementAndGet()
         dashboardUiStateStore.publishVehicleKpis(
             VehicleKpiMapper.fromObservations(observations, VehicleKpiLanguage.UK),
             VehicleKpiMapper.fromObservations(observations, VehicleKpiLanguage.EN)
@@ -2701,6 +2902,15 @@ class CollectorService : Service() {
 
     private fun clearDashboardVehicleKpis() {
         if (!::dashboardUiStateStore.isInitialized) return
+        cancelKpiFrame()
+        mainHandler.removeCallbacks(kpiModeTask)
+        val generation = kpiUiGeneration.incrementAndGet()
+        synchronized(kpiPendingLock) {
+            pendingKpiObservations.clear()
+            pendingKpiUiGeneration = generation
+            kpiIngestScheduled = false
+        }
+        mainHandler.removeCallbacks(kpiIngestTask)
         mainHandler.removeCallbacks(kpiPublishTask)
         mainHandler.removeCallbacks(kpiStaleTask)
         kpiPublishScheduled = false
@@ -2711,33 +2921,111 @@ class CollectorService : Service() {
 
     private fun startKpiWorker() {
         if (kpiWorker?.isAlive == true) return
-        val worker = Thread({ runKpiLoop() }, "byd-kpi-reader").apply { isDaemon = true }
+        if (!kpiVisibilityListenerAttached) {
+            androidx.core.content.ContextCompat.registerReceiver(this, kpiScreenReceiver,
+                IntentFilter().apply {
+                    addAction(Intent.ACTION_SCREEN_ON)
+                    addAction(Intent.ACTION_SCREEN_OFF)
+                }, androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED)
+            KpiUiVisibility.addListener(kpiVisibilityListener)
+            kpiVisibilityListenerAttached = true
+        }
+        val generation = kpiRuntimeGeneration.incrementAndGet()
+        val worker = Thread({ runKpiLoop(generation) }, "byd-kpi-reader").apply { isDaemon = true }
         kpiWorker = worker
         worker.start()
+        signalKpiWorker()
     }
 
-    private fun runKpiLoop() {
+    private fun runKpiLoop(generation: Long) {
         val helper = DirectVehicleHelperClient()
         val launcher = DirectTelemetryClient(applicationContext, helper = helper,
             expectedOwnerMode = DirectHelperOwnerMode.APP_GAP_SPOOL, ensureStreamReady = { true })
         val powerEntry = DirectFidRegistry.entries.first { it.key == "bodywork_power_level" }
         val entries = DirectFidRegistry.entries.filter { it.key in NormalizedFieldCatalog.kpiSourceKeys }
-        val normalizer = VehicleStateNormalizer(NormalizedFieldCatalog.kpiFields)
+        val sourceBuffer = KpiLiveSourceBuffer(entries)
+        val cadence = KpiPollCadence()
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        var forceSeed = true
+        val seedRequested = AtomicBoolean(false)
+        val cadenceResetRequested = AtomicBoolean(false)
+        var previousLiveMode = false
+        var helperWasReady = false
+        var callbackWorker: KpiCallbackDrainWorker? = null
         var lastFault: String? = null
         var lastFaultAt = Long.MIN_VALUE
         try {
-            while (running.get() && !settings.isUserShutdownRequested()) {
+            callbackWorker = KpiCallbackDrainWorker(
+                helper = helper,
+                onSubscription = { result ->
+                    if (isKpiRuntimeCurrent(generation)) {
+                        kpiFallbackReason = result.listenerError?.take(256) ?: "listener_${result.listenerStatus}"
+                        val update = sourceBuffer.acceptSubscription(
+                            result.helperBootId, result.helperGeneration, result.listenerStatus
+                        )
+                        if (update.helperGenerationChanged) {
+                            cadenceResetRequested.set(true)
+                            seedRequested.set(true)
+                        }
+                        applyKpiSourceUpdate(update)
+                    }
+                },
+                onSnapshot = { snapshot ->
+                    if (isKpiRuntimeCurrent(generation)) {
+                        kpiMailboxSnapshots.incrementAndGet()
+                        kpiFallbackReason = snapshot.listenerError?.take(256) ?: "listener_${snapshot.listenerStatus}"
+                        val update = sourceBuffer.acceptMailbox(snapshot, SystemClock.elapsedRealtime())
+                        if (update.helperGenerationChanged) {
+                            cadenceResetRequested.set(true)
+                            seedRequested.set(true)
+                        }
+                        applyKpiSourceUpdate(update)
+                    }
+                },
+                onListenerStatus = { status ->
+                    if (isKpiRuntimeCurrent(generation) && sourceBuffer.setListenerStatus(status)) {
+                        signalKpiWorker()
+                    }
+                },
+                onTransportLoss = { reason ->
+                    if (isKpiRuntimeCurrent(generation)) {
+                        kpiFallbackReason = reason.take(256)
+                        if (sourceBuffer.resetTransport()) invalidateKpiUiSources()
+                        cadenceResetRequested.set(true)
+                        seedRequested.set(true)
+                        signalKpiWorker()
+                    }
+                }
+            ).also { it.start() }
+            kpiDrainWorker = callbackWorker
+            while (isKpiRuntimeCurrent(generation)) {
+                val observedWakeRevision = kpiWakeRevision()
                 try {
+                    if (cadenceResetRequested.getAndSet(false)) {
+                        cadence.clear()
+                    }
+                    if (seedRequested.getAndSet(false)) forceSeed = true
                     val launchFailure = launcher.ensureHelperReady()
-                    if (launchFailure != null) error("${launchFailure.category}: ${launchFailure.message}")
+                    if (launchFailure != null) {
+                        if (helperWasReady) callbackWorker?.requestReconnect()
+                        helperWasReady = false
+                        error("${launchFailure.category}: ${launchFailure.message}")
+                    }
+                    if (!helperWasReady) {
+                        helperWasReady = true
+                        // One bounded reconnect signal after the helper becomes available again.
+                        callbackWorker?.requestReconnect()
+                    }
                     val power = helper.read(powerEntry)
                     check(power.status == 0 && power.raw != null) {
                         "KPI power read status=${power.status} ${power.error.orEmpty()}"
                     }
+                    if (!isKpiRuntimeCurrent(generation)) break
                     val on = power.raw > 0
                     mainHandler.post {
-                        if (running.get() && com.bydcollector.collector.ha.HaRunSession.process.observePower(power.raw.toLong())) {
+                        if (isKpiRuntimeCurrent(generation) &&
+                            com.bydcollector.collector.ha.HaRunSession.process.observePower(power.raw.toLong())
+                        ) {
                             val demand = settings.runtimeDemand()
                             if (!demand.mqtt && mqttConnection.owned) stopMqttExport(manualStop = false)
                             if (!demand.influx && influxConnection.owned) stopInfluxExport(manualStop = false)
@@ -2745,51 +3033,105 @@ class CollectorService : Service() {
                     }
                     if (on != kpiPowerOn) {
                         kpiPowerOn = on
-                        if (!on) mainHandler.post {
-                            mainHandler.removeCallbacks(kpiPublishTask)
-                            mainHandler.removeCallbacks(kpiStaleTask)
-                            kpiPublishScheduled = false
+                        mainHandler.post(kpiModeTask)
+                        if (on) {
+                            cadence.clear()
+                            forceSeed = true
                         }
                     }
-                    if (on) {
-                        val batch = helper.readKpiBatch(entries)
-                        check(batch.diagnostics.status == 0 && batch.results.size == entries.size) {
-                            "KPI batch status=${batch.diagnostics.status} ${batch.diagnostics.error.orEmpty()}"
+                    val interactive = powerManager.isInteractive
+                    kpiInteractive = interactive
+                    val liveMode = on && interactive && KpiUiVisibility.visible
+                    kpiLiveMode = liveMode
+                    if (liveMode != previousLiveMode) {
+                        mainHandler.post(kpiModeTask)
+                        if (liveMode) {
+                            cadence.clear()
+                            forceSeed = true
                         }
-                        if (powerManager.isInteractive) {
-                            val snapshot = DirectAutoserviceSnapshot(entries.zip(batch.results).map { (entry, result) ->
-                                DirectAutoserviceField(entry, result.status, result.raw,
-                                    result.raw?.let { DirectValueDecoders.decode(entry, it) }, result.error, result.callbackSource)
-                            }, batch.diagnostics)
-                            val wall = System.currentTimeMillis()
-                            val elapsed = SystemClock.elapsedRealtime()
-                            val stamp = NormalizedSourceStamp(NormalizedSourceKind.POLL, "kpi:$elapsed",
-                                com.bydcollector.collector.data.polling.LivePollSource.liveBootId,
-                                null, null, wall, elapsed)
-                            val observations = normalizer.normalize(0L, Instant.ofEpochMilli(wall).toString(), snapshot.readings)
-                                .map { it.copy(sourceStamp = stamp) }
-                            queueDashboardVehicleKpis(observations)
+                        callbackWorker?.setActive(liveMode)
+                        previousLiveMode = liveMode
+                    }
+                    kpiFallbackSources = entries.count { !sourceBuffer.listenerReady() || !sourceBuffer.callbackProven(it.key) }
+                    if (on) {
+                        val nowElapsed = SystemClock.elapsedRealtime()
+                        val due = cadence.due(
+                            entries = entries,
+                            nowElapsedMs = nowElapsed,
+                            interactive = interactive,
+                            visibleLive = liveMode,
+                            listenerReady = sourceBuffer.listenerReady(),
+                            callbackProven = sourceBuffer::callbackProven,
+                            forceSeed = forceSeed
+                        )
+                        if (due.isNotEmpty()) {
+                            val transportEpoch = sourceBuffer.transportEpoch()
+                            val requestWall = System.currentTimeMillis()
+                            val requestElapsed = SystemClock.elapsedRealtime()
+                            val sourceGeneration = kpiUiGeneration.get()
+                            cadence.markStarted(due, requestElapsed)
+                            kpiGetterFields.addAndGet(due.size.toLong())
+                            val batch = helper.readKpiBatch(due)
+                            if (!isKpiRuntimeCurrent(generation)) break
+                            if (sourceGeneration != kpiUiGeneration.get()) {
+                                cadence.clear()
+                                forceSeed = true
+                            } else {
+                                check(batch.diagnostics.status == CollectorHelperProtocol.STATUS_OK &&
+                                    batch.results.size == due.size
+                                ) {
+                                    "KPI batch status=${batch.diagnostics.status} ${batch.diagnostics.error.orEmpty()}"
+                                }
+                                val now = SystemClock.elapsedRealtime()
+                                val update = sourceBuffer.acceptPoll(
+                                    due.zip(batch.results), requestWall, requestElapsed, now, generation.toString(),
+                                    expectedTransportEpoch = transportEpoch
+                                )
+                                if (update.observations.isNotEmpty() && interactive) {
+                                    queueDashboardVehicleKpis(update.observations, sourceGeneration)
+                                }
+                                forceSeed = false
+                            }
                         }
                     }
                     lastFault = null
-                    Thread.sleep(if (on && powerManager.isInteractive) 1_000L else 2_000L)
+                    val nextPollDelay = if (on) cadence.nextDelayMs(
+                        entries, SystemClock.elapsedRealtime(), interactive, liveMode,
+                        sourceBuffer.listenerReady(), sourceBuffer::callbackProven
+                    ) else Long.MAX_VALUE
+                    val powerCheckDelay = if (on && interactive) 1_000L else 2_000L
+                    awaitKpiWorkerWake(
+                        observedWakeRevision,
+                        minOf(powerCheckDelay, nextPollDelay).coerceAtLeast(1L)
+                    )
                 } catch (interrupted: InterruptedException) {
                     throw interrupted
                 } catch (error: Exception) {
+                    helperWasReady = false
                     val detail = error.diagnosticDetail()
                     val now = SystemClock.elapsedRealtime()
                     if (detail != lastFault || lastFaultAt == Long.MIN_VALUE || now - lastFaultAt >= 30_000L) {
-                        runCatching { store.recordEvent("kpi_reader_error", "Independent KPI read failed", detail) }
+                        kpiFallbackReason = detail.take(256)
+                        queueKpiDiagnostic("kpi_reader_error", detail)
                         lastFault = detail
                         lastFaultAt = now
                     }
-                    Thread.sleep(5_000L)
+                    awaitKpiWorkerWake(observedWakeRevision, if (kpiInteractive) 1_000L else 2_000L)
                 }
             }
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
+        } finally {
+            kpiLiveMode = false
+            kpiInteractive = false
+            callbackWorker?.setActive(false)
+            if (callbackWorker?.closeAndJoin(0L) == true && kpiDrainWorker === callbackWorker) kpiDrainWorker = null
+            if (kpiWorker === Thread.currentThread()) kpiWorker = null
         }
     }
+
+    private fun isKpiRuntimeCurrent(generation: Long): Boolean = running.get() &&
+        generation == kpiRuntimeGeneration.get() && !settings.isUserShutdownRequested()
 
     private fun scheduleDashboardCountBootstrap(force: Boolean) {
         val countGeneration = dashboardUiStateStore.beginCountBootstrap(force) ?: return

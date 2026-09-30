@@ -1,8 +1,10 @@
 package com.bydcollector.collector.direct
 
+import android.os.IBinder
 import com.bydcollector.collector.data.direct.DirectFidRegistry
 import com.bydcollector.collector.data.direct.DirectValueDecoders
 import com.bydcollector.collector.data.local.PollReading
+import com.bydcollector.collector.data.normalized.NormalizedFieldCatalog
 import com.bydcollector.collector.data.normalized.NormalizedSourceInput
 import com.bydcollector.collector.data.normalized.NormalizedSourceKind
 import com.bydcollector.collector.data.normalized.NormalizedSourceStamp
@@ -14,11 +16,145 @@ import org.junit.Test
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 class HelperCallbackControllerTest {
+    @Test fun kpiMailboxKeepsNewerObservationWhenConcurrentCallbackArrivesLate() {
+        val entry = DirectFidRegistry.entries.first { it.key in NormalizedFieldCatalog.kpiSourceKeys }
+        val row = CollectorHelperDaemon.Address(entry.tx, entry.dev, entry.fid)
+        val olderObserved = CountDownLatch(1)
+        val releaseOlder = CountDownLatch(1)
+        val callbackError = AtomicReference<Throwable>()
+        val controller = HelperCallbackController("boot", "generation", listOf(row), emptyList(),
+            HelperCallbackController.Platform(), FakeHost(), {
+                if (Thread.currentThread().name == "older-kpi-callback") {
+                    olderObserved.countDown()
+                    check(releaseOlder.await(2, TimeUnit.SECONDS))
+                    1_000L
+                } else 2_000L
+            }, { 10_000L }) { _, _, _, _, _ -> }
+        val type = if (entry.tx == DirectFidRegistry.TX_GET_FLOAT)
+            TelemetryCallbackBatch.TYPE_FLOAT else TelemetryCallbackBatch.TYPE_INT
+        val older = Thread({
+            runCatching { controller.callbackForTest(entry.dev, entry.fid, type, 10, null) }
+                .exceptionOrNull()?.let(callbackError::set)
+        }, "older-kpi-callback")
+        try {
+            val subscription = controller.subscribeKpi(testKpiListener())
+            older.start()
+            assertTrue(olderObserved.await(2, TimeUnit.SECONDS))
+            controller.callbackForTest(entry.dev, entry.fid, type, 20, null)
+            val newest = controller.drainKpi(subscription.subscriptionId).values.single()
+            releaseOlder.countDown()
+            older.join(2_000)
+            assertFalse(older.isAlive)
+            assertNull(callbackError.get())
+            val retained = controller.drainKpi(subscription.subscriptionId).values.single()
+            assertEquals(20, retained.rawBits)
+            assertEquals(2_000L, retained.observedElapsedMs)
+            assertEquals(newest.sequence, retained.sequence)
+        } finally {
+            releaseOlder.countDown()
+            older.join(2_000)
+            controller.close()
+        }
+    }
+
+    @Test fun kpiMailboxCoalescesAnUnrecordedBurstUntilDrainAcknowledgesIt() {
+        val entry = DirectFidRegistry.entries.first { it.key in NormalizedFieldCatalog.kpiSourceKeys }
+        val row = CollectorHelperDaemon.Address(entry.tx, entry.dev, entry.fid)
+        val invalidations = Collections.synchronizedList(mutableListOf<Long>())
+        val initialInvalidation = CountDownLatch(1)
+        val rearmedInvalidation = CountDownLatch(1)
+        val invalidationCount = AtomicInteger()
+        val appliedTargets = Collections.synchronizedList(mutableListOf<Set<HelperCallbackController.NativeKey>>())
+        val registrationApplied = CountDownLatch(1)
+        val platform = object : HelperCallbackController.Platform() {
+            override fun apply(target: Set<HelperCallbackController.NativeKey>) {
+                appliedTargets += target.toSet()
+                registrationApplied.countDown()
+            }
+        }
+        val host = FakeHost()
+        val controller = HelperCallbackController("boot", "generation", listOf(row), emptyList(),
+            platform, host, { 1_000L }, { 2_000L }) { _, _, _, _, sequence ->
+            invalidations += sequence
+            if (invalidationCount.getAndIncrement() == 0) initialInvalidation.countDown()
+            else rearmedInvalidation.countDown()
+        }
+        try {
+            val subscription = controller.subscribeKpi(testKpiListener())
+            assertEquals(CollectorHelperProtocol.STATUS_OK, subscription.status)
+            assertTrue(registrationApplied.await(2, TimeUnit.SECONDS))
+            assertTrue(appliedTargets.any { HelperCallbackController.NativeKey(entry.dev, entry.fid) in it })
+            assertTrue("initial invalidation was not sent", initialInvalidation.await(2, TimeUnit.SECONDS))
+            val firstInvalidation = invalidations.first()
+
+            val nativeType = if (entry.tx == DirectFidRegistry.TX_GET_FLOAT)
+                TelemetryCallbackBatch.TYPE_FLOAT else TelemetryCallbackBatch.TYPE_INT
+            repeat(140) { index ->
+                controller.callbackForTest(entry.dev, entry.fid, nativeType, 1_000 + index, null)
+            }
+
+            assertEquals("one notification must remain outstanding until drain", 1, invalidations.size)
+            val snapshot = controller.drainKpi(subscription.subscriptionId)
+            assertEquals(CollectorHelperProtocol.STATUS_OK, snapshot.status)
+            assertEquals(1, snapshot.values.size)
+            assertEquals(1_139, snapshot.values.single().rawBits)
+            assertTrue(snapshot.values.single().sequence > firstInvalidation)
+            assertTrue(snapshot.sequence >= snapshot.values.single().sequence)
+            assertTrue("KPI-only events must not enter durable recording", host.batches.isEmpty())
+
+            controller.callbackForTest(entry.dev, entry.fid, nativeType, 2_000, null)
+            assertTrue("drain should re-arm one invalidation", rearmedInvalidation.await(2, TimeUnit.SECONDS))
+            assertEquals(2, invalidations.size)
+            assertEquals(2_000, controller.drainKpi(subscription.subscriptionId).values.single().rawBits)
+
+            host.holdPublishing = true
+            controller.updatePlan(view(true, 1), view(false, 1))
+            repeat(140) { index ->
+                controller.callbackForTest(entry.dev, entry.fid, nativeType, 3_000 + index, null)
+            }
+            assertEquals(3_139, controller.drainKpi(subscription.subscriptionId).values.single().rawBits)
+            controller.flushForTest(CollectorHelperProtocol.STREAM_MAIN)
+            assertEquals("display coalescing must not thin the recording stream", 140,
+                host.batches.single().events.size)
+            assertEquals((3_000..3_139).toList(), host.batches.single().events.map { it.rawBits })
+        } finally {
+            controller.close()
+        }
+    }
+
+    @Test fun kpiSubscriptionRejectsInvalidInputAndOldDeathCannotClearReplacement() {
+        val row = DirectFidRegistry.entries.first { it.key in NormalizedFieldCatalog.kpiSourceKeys }
+            .let { CollectorHelperDaemon.Address(it.tx, it.dev, it.fid) }
+        val controller = HelperCallbackController("boot", "generation", listOf(row), emptyList(),
+            HelperCallbackController.Platform(), FakeHost(), { 1_000L }, { 2_000L }) { _, _, _, _, _ -> }
+        try {
+            assertEquals(CollectorHelperProtocol.STATUS_INVALID_REQUEST, controller.subscribeKpi(null).status)
+            val firstDeaths = Collections.synchronizedList(mutableListOf<IBinder.DeathRecipient>())
+            val secondDeaths = Collections.synchronizedList(mutableListOf<IBinder.DeathRecipient>())
+            val first = controller.subscribeKpi(testKpiListener(firstDeaths))
+            val replacement = controller.subscribeKpi(testKpiListener(secondDeaths))
+            assertEquals(CollectorHelperProtocol.STATUS_OK, replacement.status)
+            assertTrue(replacement.subscriptionId > first.subscriptionId)
+            assertEquals(CollectorHelperProtocol.STATUS_INVALID_KPI_SUBSCRIPTION,
+                controller.drainKpi(first.subscriptionId).status)
+
+            firstDeaths.single().binderDied()
+            assertEquals(CollectorHelperProtocol.STATUS_OK, controller.drainKpi(replacement.subscriptionId).status)
+
+            secondDeaths.single().binderDied()
+            assertEquals(CollectorHelperProtocol.STATUS_INVALID_KPI_SUBSCRIPTION,
+                controller.drainKpi(replacement.subscriptionId).status)
+        } finally {
+            controller.close()
+        }
+    }
+
     @Test fun stuckVendorCleanupCannotExtendCloseDeadlineOrBlockRawDrain() {
         val closeEntered = CountDownLatch(1)
         val releaseClose = CountDownLatch(1)
@@ -644,6 +780,20 @@ class HelperCallbackControllerTest {
             CollectorHelperProtocol.MODE_NATIVE, true, 1, 0, 0, 0, 1,
             Array(rows.size) { CollectorHelperDaemon.ReadValue.ok(raws[it]) }, null)
     }
+
+    private fun testKpiListener(deaths: MutableList<IBinder.DeathRecipient> = mutableListOf()): IBinder =
+        java.lang.reflect.Proxy.newProxyInstance(IBinder::class.java.classLoader, arrayOf(IBinder::class.java)) { _, method, args ->
+            when (method.name) {
+                "linkToDeath" -> { deaths += args!![0] as IBinder.DeathRecipient; null }
+                "unlinkToDeath", "pingBinder", "isBinderAlive", "transact" -> true
+                "queryLocalInterface" -> null
+                "getInterfaceDescriptor" -> "test"
+                "toString" -> "test-kpi-listener"
+                "hashCode" -> System.identityHashCode(deaths)
+                "equals" -> false
+                else -> null
+            }
+        } as IBinder
 
     private class FakeHost : HelperCallbackController.Host {
         val batches = mutableListOf<TelemetryCallbackBatch>()

@@ -342,6 +342,46 @@ public final class CollectorHelperDaemon {
                     if (reply != null) writeBatchReply(reply, result);
                     return true;
                 }
+                if (code == CollectorHelperProtocol.TX_KPI_SUBSCRIBE) {
+                    HelperCallbackController.KpiSubscription result;
+                    try {
+                        IBinder listener = data.readStrongBinder();
+                        if (data.dataAvail() != 0) throw new IllegalArgumentException("unexpected KPI subscribe arguments");
+                        result = runtime.subscribeKpi(listener);
+                    } catch (Throwable error) {
+                        result = HelperCallbackController.KpiSubscription.failure(
+                            CollectorHelperProtocol.STATUS_INVALID_REQUEST, describe(error));
+                    }
+                    if (reply != null) writeKpiSubscriptionReply(reply, result);
+                    return true;
+                }
+                if (code == CollectorHelperProtocol.TX_KPI_DRAIN) {
+                    HelperCallbackController.KpiSnapshot result;
+                    long subscriptionId = 0L;
+                    try {
+                        subscriptionId = data.readLong();
+                        if (data.dataAvail() != 0) throw new IllegalArgumentException("unexpected KPI drain arguments");
+                        result = runtime.drainKpi(subscriptionId);
+                    } catch (Throwable error) {
+                        result = HelperCallbackController.KpiSnapshot.failure(subscriptionId,
+                            CollectorHelperProtocol.STATUS_INVALID_REQUEST, describe(error));
+                    }
+                    if (reply != null) writeKpiSnapshotReply(reply, result);
+                    return true;
+                }
+                if (code == CollectorHelperProtocol.TX_KPI_UNSUBSCRIBE) {
+                    HelperCallbackController.KpiActionResult result;
+                    try {
+                        long subscriptionId = data.readLong();
+                        if (data.dataAvail() != 0) throw new IllegalArgumentException("unexpected KPI unsubscribe arguments");
+                        result = runtime.unsubscribeKpi(subscriptionId);
+                    } catch (Throwable error) {
+                        result = new HelperCallbackController.KpiActionResult(
+                            CollectorHelperProtocol.STATUS_INVALID_REQUEST, describe(error));
+                    }
+                    if (reply != null) writeKpiActionReply(reply, result);
+                    return true;
+                }
                 if (code == CollectorHelperProtocol.TX_WORKER_PENDING) {
                     if (reply != null) {
                         if (!runtime.replayAllowed(CollectorHelperProtocol.STREAM_MAIN)) {
@@ -581,6 +621,58 @@ public final class CollectorHelperDaemon {
             reply.writeInt(value.raw == null ? 0 : 1);
             if (value.raw != null) reply.writeInt(value.raw);
             CallbackValueSource.writeNullable(reply, value.callbackSource);
+        }
+    }
+
+    private static void writeKpiSubscriptionReply(Parcel reply, HelperCallbackController.KpiSubscription result) {
+        reply.writeInt(result.status);
+        if (result.status != CollectorHelperProtocol.STATUS_OK) {
+            reply.writeString(boundError(result.error));
+            return;
+        }
+        reply.writeLong(result.subscriptionId);
+        reply.writeString(result.bootId);
+        reply.writeString(result.generation);
+        reply.writeInt(result.listenerStatus);
+        reply.writeString(boundError(result.listenerError));
+    }
+
+    private static void writeKpiActionReply(Parcel reply, HelperCallbackController.KpiActionResult result) {
+        reply.writeInt(result.status);
+        reply.writeString(boundError(result.error));
+    }
+
+    private static void writeKpiSnapshotReply(Parcel reply, HelperCallbackController.KpiSnapshot result) {
+        reply.writeInt(result.status);
+        if (result.status != CollectorHelperProtocol.STATUS_OK) {
+            reply.writeString(boundError(result.error));
+            return;
+        }
+        if (result.values.size() > CollectorHelperProtocol.MAX_KPI_VALUES) {
+            throw new IllegalStateException("KPI mailbox exceeds its source cap");
+        }
+        reply.writeLong(result.subscriptionId);
+        reply.writeString(result.bootId);
+        reply.writeString(result.generation);
+        reply.writeLong(result.sequence);
+        reply.writeInt(result.listenerStatus);
+        reply.writeString(boundError(result.listenerError));
+        reply.writeInt(result.values.size());
+        for (HelperCallbackController.KpiValue value : result.values) {
+            if (value.bytes != null && value.bytes.length > CollectorHelperProtocol.MAX_KPI_RAW_BYTES) {
+                throw new IllegalStateException("KPI raw payload exceeds its per-source cap");
+            }
+            reply.writeInt(value.address.tx);
+            reply.writeInt(value.address.dev);
+            reply.writeInt(value.address.fid);
+            reply.writeInt(value.status);
+            reply.writeInt(value.nativeType);
+            reply.writeInt(value.hasRaw ? 1 : 0);
+            if (value.hasRaw) reply.writeInt(value.rawBits);
+            reply.writeByteArray(value.bytes);
+            reply.writeLong(value.observedWallMs);
+            reply.writeLong(value.observedElapsedMs);
+            reply.writeLong(value.sequence);
         }
     }
 

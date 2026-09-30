@@ -232,6 +232,7 @@ data class TelegramUiActions(
 
 interface BydCollectorActions {
     fun onTabSelected(tab: AppTab)
+    fun onKpiViewportVisibilityChanged(visible: Boolean) {}
     fun onLanguageSelected(language: UiLanguage)
     fun onDarkThemeSelected(dark: Boolean)
 

@@ -40,6 +40,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -52,6 +53,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.platform.LocalFocusManager
@@ -738,6 +741,9 @@ private fun AllParametersTab(
     session: UiSessionState,
     contentReady: Boolean
 ) {
+    DisposableEffect(actions) {
+        onDispose { actions.onKpiViewportVisibilityChanged(false) }
+    }
     TabScrollColumn(AppTab.ALL_PARAMETERS, session, contentReady) {
         ScreenTitle(strings.allTab, strings.allSubtitle)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -783,7 +789,12 @@ private fun AllParametersTab(
                         NumericInput(state?.debugParameterCount?.toString().orEmpty(), modifier = Modifier.width(60.dp))
                     }
                 }
-            VehicleKpiCard(state?.vehicleKpis, strings, Modifier.weight(2f).height(262.dp))
+            VehicleKpiCard(state?.vehicleKpis, strings, Modifier.weight(2f).height(262.dp)
+                .onGloballyPositioned { coordinates ->
+                    // boundsInWindow is clipped by the scroll viewport and window bounds.
+                    actions.onKpiViewportVisibilityChanged(
+                        coordinates.isAttached && !coordinates.boundsInWindow().isEmpty)
+                })
         }
         DebugDatabaseCard(state, strings, actions, Modifier.fillMaxWidth())
     }
