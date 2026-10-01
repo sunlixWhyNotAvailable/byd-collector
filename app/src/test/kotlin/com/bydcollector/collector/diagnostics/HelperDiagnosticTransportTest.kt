@@ -51,7 +51,7 @@ class HelperDiagnosticTransportTest {
         ))
         val destination = File(root, "snapshot_test").apply { mkdirs() }
         assertTrue(extractHelperDiagnosticArchive(archive, destination).startsWith("partial files=3"))
-        assertEquals("ok", sanitizeDiagnosticSnapshot(destination))
+        assertEquals("ok", sanitizeDiagnosticSnapshot(destination).privacyStatus)
         val json = File(destination, "helper-diagnostics/helper-diagnostics-current.json").readText()
         assertTrue(json.contains("1.2.3.4"))
         assertTrue(json.contains("123"))

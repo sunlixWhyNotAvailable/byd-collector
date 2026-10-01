@@ -2542,6 +2542,8 @@ private fun ExtraTab(
     contentReady: Boolean,
 ) {
     val optionsCardHeight = 312.dp
+    val shareStage by com.bydcollector.collector.diagnostics.DiagnosticLogRecorder.shareStage.collectAsStateWithLifecycle()
+    val logsBusy = diagnosticsBusy || shareStage != null
     TabScrollColumn(AppTab.EXTRA, session, contentReady) {
         ScreenTitle(strings.extraTab, strings.extraSubtitle)
         Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -2567,28 +2569,28 @@ private fun ExtraTab(
                             strings.startLogcat,
                             actions::onStartLogcat,
                             primary = true,
-                            enabled = state?.logRecording != true && !diagnosticsBusy,
+                            enabled = state?.logRecording != true && !logsBusy,
                             modifier = Modifier.weight(1f)
                         )
                         ActionButton(
                             strings.stopLogcat,
                             actions::onStopLogcat,
-                            enabled = state?.logRecording == true && !diagnosticsBusy,
+                            enabled = state?.logRecording == true && !logsBusy,
                             modifier = Modifier.weight(1f)
                         )
                     }
                     Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         ActionButton(
-                            strings.shareLogs,
+                            shareStage?.let { strings.shareLogStages[it.ordinal] } ?: strings.shareLogs,
                             actions::onShareLogs,
                             primary = true,
-                            enabled = !diagnosticsBusy,
+                            enabled = !logsBusy,
                             modifier = Modifier.weight(1f)
                         )
                         ActionButton(
                             strings.clearLogs,
                             onRequestClearLogs,
-                            enabled = !diagnosticsBusy,
+                            enabled = !logsBusy,
                             modifier = Modifier.weight(1f)
                         )
                     }

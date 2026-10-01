@@ -19,6 +19,10 @@ internal class DiagnosticShareSanitizer {
     private val aliases = IdentityKind.entries.associateWith { LinkedHashMap<String, String>() }
 
     fun sanitizeText(text: String): String {
+        // Every masked syntax needs an assignment/URI separator, a VIN API name,
+        // or Android's Location[...] form. Ordinary labels/IDs need no regex pass.
+        if (':' !in text && '=' !in text &&
+            !text.contains("vin", ignoreCase = true) && !text.contains("Location[", ignoreCase = true)) return text
         var sanitized = replaceCookieHeaders(text)
         sanitized = replaceAuthHeaders(sanitized)
         // Android Wi-Fi dumps allow an unquoted SSID containing spaces. Match
@@ -63,11 +67,14 @@ internal class DiagnosticShareSanitizer {
     }
 
     /** Parses exactly one JSON value; trailing non-whitespace is an error. */
-    fun sanitizeJsonLine(line: String): String {
+    fun sanitizeJsonLine(line: String, onTimestamp: ((String?) -> Unit)? = null): String {
         val tokener = JSONTokener(line)
         val value = tokener.nextValue()
         if (tokener.nextClean().code != 0) throw tokener.syntaxError("Trailing data")
-        return jsonText(sanitizeJsonValue(value))
+        val sanitized = sanitizeJsonValue(value)
+        val output = jsonText(sanitized)
+        onTimestamp?.invoke((sanitized as? JSONObject)?.optString("timestamp")?.takeIf(String::isNotBlank))
+        return output
     }
 
     private fun sanitizeJsonValue(value: Any?): Any? = when (value) {

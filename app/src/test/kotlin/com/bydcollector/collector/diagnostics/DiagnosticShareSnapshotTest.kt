@@ -42,7 +42,7 @@ class DiagnosticShareSnapshotTest {
                 "WifiInfo: SSID: Private Home Network, BSSID: aa:bb:cc:dd:ee:ff\n" +
                 "CarPropertyService: getVin() -> L123456789012345X\n")
 
-            assertEquals("ok", sanitizeDiagnosticSnapshot(snapshot))
+            assertEquals("ok", sanitizeDiagnosticSnapshot(snapshot).privacyStatus)
             val zip = File(root, "shared.zip")
             DiagnosticZipWriter.writeLatestZip(zip, snapshot)
             val entries = ZipInputStream(zip.inputStream()).use { input ->
@@ -87,7 +87,7 @@ class DiagnosticShareSnapshotTest {
             val journal = File(snapshot, "events.jsonl")
             journal.writeBytes(("{\"sequence\":1}\n{\"broken\":\n{\"sequence\":2}\n{\"tail\":\"".toByteArray() +
                 byteArrayOf(0xC3.toByte())))
-            assertEquals("partial", sanitizeDiagnosticSnapshot(snapshot))
+            assertEquals("partial", sanitizeDiagnosticSnapshot(snapshot).privacyStatus)
             assertEquals(listOf(1, 2), journal.readLines().map { JSONObject(it).getInt("sequence") })
             assertTrue(File(snapshot, "privacy_status.txt").readText().contains("omitted_records=2"))
 
@@ -109,7 +109,7 @@ class DiagnosticShareSnapshotTest {
                 writeText("{\"huge\":\"" + "x".repeat(256 * 1024) + "\"}\n{\"retained\":true}\n")
             }
             val unsupported = File(snapshot, "private.bin").apply { writeText("fixture-secret") }
-            assertEquals("partial", sanitizeDiagnosticSnapshot(snapshot))
+            assertEquals("partial", sanitizeDiagnosticSnapshot(snapshot).privacyStatus)
             assertFalse(unsupported.exists())
             assertEquals(1, journal.readLines().size)
             assertTrue(JSONObject(journal.readText()).getBoolean("retained"))
@@ -132,7 +132,7 @@ class DiagnosticShareSnapshotTest {
             val trips = File(snapshot, "trips_telegram_evidence.txt").apply {
                 writeText("trip_ref=abcdef\ntruncated=1\n")
             }
-            assertEquals("partial", sanitizeDiagnosticSnapshot(snapshot))
+            assertEquals("partial", sanitizeDiagnosticSnapshot(snapshot).privacyStatus)
             assertTrue(influx.length() <= DiagnosticLogRecorder.INFLUX_EVIDENCE_MAX_BYTES)
             assertTrue(trips.length() <= DiagnosticLogRecorder.TRIPS_TELEGRAM_EVIDENCE_MAX_BYTES)
             val text = influx.readText()
@@ -148,25 +148,26 @@ class DiagnosticShareSnapshotTest {
 
     @Test
     fun timeBoundsUseActualStreamingJournalTimestampsAcrossRotations() {
-        val root = Files.createTempDirectory("collector-share-time-bounds").toFile()
+        val root = Files.createTempDirectory("snapshot_time-bounds").toFile()
         try {
             val operational = File(root, "operational_journal").apply { mkdirs() }
             val maintenance = File(root, "maintenance_journal").apply { mkdirs() }
             File(operational, "operational_events.1.jsonl").apply {
-                writeText(eventAt("2026-09-28T10:00:00Z") + "\n")
+                writeText(eventAt("2026-09-28T13:00:00+03:00") + "\n")
                 setLastModified(1L)
             }
             File(operational, "operational_events.jsonl").apply {
                 writeText(
-                    eventAt("2026-09-28T12:00:00Z") + "\n" +
+                    eventAt("2026-09-28T07:00:00-05:00") + "\n" +
                         "{broken}\n" + eventAt("2026-09-28T11:00:00Z") + "\n"
                 )
                 setLastModified(Long.MAX_VALUE)
             }
             File(maintenance, "operational_events.jsonl").writeText(eventAt("2026-09-28T09:30:00Z") + "\n")
 
-            val operationalBounds = diagnosticJournalTimeBounds(operational)
-            val maintenanceBounds = diagnosticJournalTimeBounds(maintenance)
+            val result = sanitizeDiagnosticSnapshot(root)
+            val operationalBounds = result.journalBounds.getValue("operational_journal")
+            val maintenanceBounds = result.journalBounds.getValue("maintenance_journal")
 
             assertEquals("2026-09-28T10:00:00Z", operationalBounds.firstTimestamp)
             assertEquals("2026-09-28T12:00:00Z", operationalBounds.lastTimestamp)
@@ -183,7 +184,7 @@ class DiagnosticShareSnapshotTest {
 
     @Test
     fun journalTimeBoundsSkipOversizedAndInvalidUtf8RecordsButKeepValidRows() {
-        val root = Files.createTempDirectory("collector-share-time-bounds-limits").toFile()
+        val root = Files.createTempDirectory("snapshot_time-bounds-limits").toFile()
         try {
             val journal = File(root, "operational_journal").apply { mkdirs() }
             File(journal, "operational_events.jsonl").writeBytes(
@@ -193,12 +194,14 @@ class DiagnosticShareSnapshotTest {
                     (eventAt("2026-09-28T11:00:00Z") + "\n").toByteArray()
             )
 
-            val bounds = diagnosticJournalTimeBounds(journal)
+            val bounds = sanitizeDiagnosticSnapshot(root).journalBounds.getValue("operational_journal")
 
             assertEquals("2026-09-28T11:00:00Z", bounds.firstTimestamp)
             assertEquals("2026-09-28T11:00:00Z", bounds.lastTimestamp)
             assertEquals(1, bounds.records)
             assertEquals(2, bounds.invalidRecords)
+            val report = File(root, "privacy_status.txt").readText()
+            assertTrue(report.contains("oversized_records=1 invalid_utf8_records=1 invalid_json_records=0"))
         } finally {
             root.deleteRecursively()
         }
@@ -358,4 +361,42 @@ class DiagnosticShareSnapshotTest {
 
     private fun eventAt(timestamp: String): String =
         JSONObject().put("timestamp", timestamp).put("message", "test").toString()
+
+    @Test
+    fun chunkedRecordReaderPreservesBoundariesAndCompleteUtf8() {
+        val root = Files.createTempDirectory("diagnostic-chunk-boundaries").toFile()
+        try {
+            val rows = listOf("", "а".repeat(8191), "x".repeat(256 * 1024), "tail")
+            val file = File(root, "events.jsonl").apply { writeText(rows.joinToString("\n")) }
+            val actual = mutableListOf<String?>()
+            forEachDiagnosticRecord(file) { actual += it?.toString(Charsets.UTF_8) }
+            assertEquals<List<String?>>(rows, actual)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun suppliedLargeCorpusKeepsEveryValidRecordAndReportsProcessingTime() {
+        // Opt-in local evidence replay; no private logs or machine path enter the repository.
+        val corpus = System.getenv("BYD_DIAGNOSTIC_CORPUS")?.let(::File) ?: return
+        val root = Files.createTempDirectory("snapshot_corpus").toFile()
+        try {
+            val destination = File(root, "operational_journal")
+            corpus.copyRecursively(destination)
+            val expected = corpus.listFiles().orEmpty().filter { it.extension == "jsonl" }
+                .sumOf { file -> file.useLines { it.count() } }
+            val started = System.nanoTime()
+            val result = sanitizeDiagnosticSnapshot(root)
+            val bounds = result.journalBounds.getValue("operational_journal")
+            println("diagnostic_corpus records=${bounds.records} invalid=${bounds.invalidRecords} " +
+                "duration_ms=${(System.nanoTime() - started) / 1_000_000}")
+            assertEquals(expected, bounds.records)
+            assertEquals(0, bounds.invalidRecords)
+            assertEquals(0, bounds.failedFiles)
+            assertEquals("ok", result.privacyStatus)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
 }

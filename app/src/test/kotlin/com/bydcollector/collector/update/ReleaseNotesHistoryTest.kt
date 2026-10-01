@@ -8,6 +8,29 @@ import kotlin.test.*
 class ReleaseNotesHistoryTest {
     private val target = UpdateInfo("v3.1.0", "https://github.com/sunlixWhyNotAvailable/byd-collector/releases/download/v3.1.0/app.apk", "target notes")
 
+    @Test fun updatingFrom311To313IncludesBothNewerReleasesInEachLanguage() {
+        fun notes(version: String) = """
+            ## v$version
+            <!-- bydcollector:release-notes:en -->
+            Changes $version
+            <!-- /bydcollector:release-notes:en -->
+            <!-- bydcollector:release-notes:uk -->
+            Зміни $version
+            <!-- /bydcollector:release-notes:uk -->
+        """.trimIndent()
+        val result = loadReleaseNotesHistory("3.1.1", target.copy(version = "v3.1.3", releaseNotes = notes("3.1.3"))) {
+            ReleaseNotesPage(JSONArray()
+                .put(release("v3.1.1"))
+                .put(release("v3.1.2").put("body", notes("3.1.2")))
+                .put(release("v3.1.3"))
+                .toString(), false)
+        }
+        assertEquals(listOf("v3.1.3", "v3.1.2"), result.entries.map { it.version })
+        assertEquals(listOf("Зміни 3.1.3", "Зміни 3.1.2"), result.entries.map { ReleaseNotesSelector.forVersion(it, true) })
+        assertEquals(listOf("Changes 3.1.3", "Changes 3.1.2"), result.entries.map { ReleaseNotesSelector.forVersion(it, false) })
+        assertFalse(result.incomplete)
+    }
+
     @Test fun paginatesAllPublishedVersionsWithoutUsingListOrderOrRequiringAssets() {
         val calls = mutableListOf<Int>()
         val result = loadReleaseNotesHistory("2.7.9", target) { page ->

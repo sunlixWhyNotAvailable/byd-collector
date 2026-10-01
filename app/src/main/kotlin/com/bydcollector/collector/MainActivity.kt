@@ -2501,7 +2501,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startLogcatRecording() {
-        if (diagnosticsBusy) return
+        if (diagnosticsBusy || DiagnosticLogRecorder.shareStage.value != null) return
         refreshStoreBackedState()
         diagnosticsBusy = true
         val submitted = requestAccessCheck(
@@ -2551,7 +2551,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun stopLogcatRecording() {
-        if (diagnosticsBusy) return
+        if (diagnosticsBusy || DiagnosticLogRecorder.shareStage.value != null) return
         refreshStoreBackedState()
         diagnosticsBusy = true
         val task = Runnable {
@@ -2578,7 +2578,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun shareDiagnosticLogs() {
-        if (diagnosticsBusy) return
+        if (diagnosticsBusy || DiagnosticLogRecorder.shareStage.value != null) return
         diagnosticsBusy = true
         val title = strings(uiLanguage).shareLogs
         val task = Runnable {
@@ -2633,7 +2633,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun clearDiagnosticLogs() {
-        if (diagnosticsBusy) return
+        if (diagnosticsBusy || DiagnosticLogRecorder.shareStage.value != null) return
         diagnosticsBusy = true
         val task = Runnable {
             val result = runCatching { DiagnosticLogRecorder.clearCompleted(applicationContext) }

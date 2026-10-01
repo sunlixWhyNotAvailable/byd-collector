@@ -23,14 +23,14 @@ import com.bydcollector.collector.influx.InfluxRuntimeDiagnosticsProcess
 import com.bydcollector.collector.influx.safeInfluxDiagnosticHost
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.util.sharedOperationalEventExecutor
+import com.bydcollector.collector.util.dispatchOperationalEvent
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONObject
 import org.json.JSONArray
 import java.io.File
 import java.nio.charset.StandardCharsets
-import java.nio.ByteBuffer
-import java.nio.charset.CodingErrorAction
 import java.text.SimpleDateFormat
-import java.time.Instant
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
@@ -43,6 +43,8 @@ import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
 
 data class DiagnosticShutdownLogcatResult(val runToken: String?, val closeError: String?)
+
+enum class DiagnosticShareStage { COLLECTING, SANITIZING, ZIPPING, PREPARING_SHARE }
 
 internal fun ownedLogcatCommand(runToken: String): String {
     require(runToken.matches(Regex("[a-f0-9]{32}"))) { "Invalid logcat ownership token" }
@@ -96,6 +98,8 @@ object DiagnosticLogRecorder {
     internal const val SHARE_HANDOFF_RETENTION_MS = ArchiveShareLeaseRegistry.LEASE_TTL_MS
 
     private val workLock = Any()
+    private val mutableShareStage = MutableStateFlow<DiagnosticShareStage?>(null)
+    val shareStage = mutableShareStage.asStateFlow()
     private val stateLock = Any()
     @Volatile private var adbStream: AdbLocalClient.AdbShellStream? = null
     @Volatile private var activeRunDir: File? = null
@@ -245,6 +249,21 @@ object DiagnosticLogRecorder {
                 )
             ) { "Insufficient storage for diagnostics share" }
             val snapshotDir = createDiagnosticSnapshotDirectory(root, captureStamp)
+            val startedAt = System.nanoTime()
+            var phaseStartedAt = startedAt
+            val timings = linkedMapOf<DiagnosticShareStage, Long>()
+            var outcome = "failed"
+            var zipBytes = 0L
+            fun finishPhase() {
+                val now = System.nanoTime()
+                mutableShareStage.value?.let { timings[it] = TimeUnit.NANOSECONDS.toMillis(now - phaseStartedAt) }
+                phaseStartedAt = now
+            }
+            fun nextPhase(stage: DiagnosticShareStage) {
+                finishPhase()
+                mutableShareStage.value = stage
+            }
+            mutableShareStage.value = DiagnosticShareStage.COLLECTING
             return try {
                 val logcatStatus = writeLogcatSnapshot(root, snapshotDir)
                 val journalStatus = writeOperationalJournalSnapshot(appContext, snapshotDir)
@@ -271,13 +290,19 @@ object DiagnosticLogRecorder {
                     },
                     Charsets.UTF_8
                 )
-                val privacyStatus = sanitizeDiagnosticSnapshot(snapshotDir)
-                val journalTimeBoundsStatus = writeJournalTimeBounds(snapshotDir)
+                nextPhase(DiagnosticShareStage.SANITIZING)
+                val sanitized = sanitizeDiagnosticSnapshot(snapshotDir)
+                val journalTimeBoundsStatus = writeJournalTimeBounds(snapshotDir, sanitized.journalBounds)
+                nextPhase(DiagnosticShareStage.ZIPPING)
                 File(snapshotDir, "diagnostic_info.txt").appendText(
-                    "privacy=$privacyStatus\njournal_time_bounds=$journalTimeBoundsStatus\n",
+                    "privacy=${sanitized.privacyStatus}\njournal_time_bounds=$journalTimeBoundsStatus\n" +
+                        "source_bytes=$sourceSize\n" +
+                        timings.entries.joinToString("") { "${it.key.name.lowercase(Locale.ROOT)}_ms=${it.value}\n" },
                     Charsets.UTF_8
                 )
                 val latestZip = latestZip(appContext).also { writeLatestZip(it, snapshotDir) }
+                zipBytes = latestZip.length()
+                nextPhase(DiagnosticShareStage.PREPARING_SHARE)
                 val handedOff = createDiagnosticShareCopy(latestZip, shareRoot, captureStamp)
                 pruneExpiredDiagnosticShareFiles(
                     shareRoot,
@@ -285,9 +310,25 @@ object DiagnosticLogRecorder {
                     SHARE_HANDOFF_RETENTION_MS,
                     protectedFile = handedOff
                 )
+                outcome = "ready"
                 handedOff
             } finally {
-                snapshotDir.deleteRecursively()
+                try {
+                    snapshotDir.deleteRecursively()
+                } finally {
+                    finishPhase()
+                    val lastStage = mutableShareStage.value
+                    mutableShareStage.value = null
+                    val detail = "outcome=$outcome last_stage=$lastStage source_bytes=$sourceSize zip_bytes=$zipBytes " +
+                        "total_ms=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)} " +
+                        timings.entries.joinToString(" ") { "${it.key.name.lowercase(Locale.ROOT)}_ms=${it.value}" }
+                    val at = timestampIso()
+                    val elapsed = android.os.SystemClock.elapsedRealtime()
+                    // The completed ZIP cannot contain its own compression timing; retain it for the next share.
+                    dispatchOperationalEvent(sharedOperationalEventExecutor) {
+                        application.operationalEventJournal.append(at, elapsed, "diagnostics", "share_timing", detail)
+                    }
+                }
             }
         }
     }
@@ -449,10 +490,10 @@ object DiagnosticLogRecorder {
         }
     }
 
-    private fun writeJournalTimeBounds(snapshotDir: File): String {
+    private fun writeJournalTimeBounds(snapshotDir: File, bounds: Map<String, DiagnosticJournalTimeBounds>): String {
         return runCatching {
-            val operational = diagnosticJournalTimeBounds(File(snapshotDir, "operational_journal"))
-            val maintenance = diagnosticJournalTimeBounds(File(snapshotDir, "maintenance_journal"))
+            val operational = bounds.getValue("operational_journal")
+            val maintenance = bounds.getValue("maintenance_journal")
             val partial = listOf(operational, maintenance).any {
                 it.invalidRecords > 0 || it.failedFiles > 0
             }
@@ -1198,50 +1239,6 @@ internal data class DiagnosticJournalTimeBounds(
     val invalidRecords: Int,
     val failedFiles: Int
 )
-
-internal fun diagnosticJournalTimeBounds(directory: File): DiagnosticJournalTimeBounds {
-    var first: Instant? = null
-    var last: Instant? = null
-    var records = 0
-    var invalid = 0
-    var failedFiles = 0
-    if (!directory.isDirectory) {
-        if (directory.exists()) failedFiles += 1
-    } else {
-        val files = directory.listFiles()
-        if (files == null) failedFiles += 1
-        else files.filter { it.isFile && it.name.endsWith(".jsonl") }.forEach { file ->
-            try {
-                forEachDiagnosticRecord(file) { raw ->
-                    val line = raw?.let {
-                        runCatching {
-                            StandardCharsets.UTF_8.newDecoder()
-                                .onMalformedInput(CodingErrorAction.REPORT)
-                                .onUnmappableCharacter(CodingErrorAction.REPORT)
-                                .decode(ByteBuffer.wrap(it))
-                                .toString()
-                                .removeSuffix("\r")
-                        }.getOrNull()
-                    }
-                    val timestamp = line?.let {
-                        runCatching { JSONObject(it).optString("timestamp").takeIf(String::isNotBlank) }.getOrNull()
-                    }
-                    val instant = timestamp?.let { runCatching { Instant.parse(it) }.getOrNull() }
-                    if (instant == null) {
-                        invalid += 1
-                    } else {
-                        if (first?.let { instant < it } != false) first = instant
-                        if (last?.let { instant > it } != false) last = instant
-                        records += 1
-                    }
-                }
-            } catch (_: Exception) {
-                failedFiles += 1
-            }
-        }
-    }
-    return DiagnosticJournalTimeBounds(first?.toString(), last?.toString(), records, invalid, failedFiles)
-}
 
 internal fun hasDiagnosticShareSpace(usableBytes: Long, sourceBytes: Long, headroomBytes: Long): Boolean {
     if (usableBytes < 0L || sourceBytes < 0L || headroomBytes < 0L) return false
