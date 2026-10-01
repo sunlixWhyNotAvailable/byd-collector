@@ -46,6 +46,10 @@ You can toggle a switch by tapping its label or row; Telegram message switches a
 
 The app is available in English and Ukrainian, with dark and light themes.
 
+`Support` beside the app title opens voluntary development support: scan the QR code,
+open the donation link, copy the link or card number, or share the details through Android.
+No payment is made automatically; you can close the dialog at any time.
+
 <p align="center"><img src="docs/screenshots/en/main.png" alt="BYD Collector Main tab" width="100%"></p>
 
 ## Main tab

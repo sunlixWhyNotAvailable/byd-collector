@@ -1,6 +1,6 @@
 package com.bydcollector.collector.ui.compose
 
-// Widget-scoped port of BYD HUD Preview's editor and controls; no changes to Collector's general palette.
+// BYD HUD editor and controls, also reused by the approved support dialog.
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.*
@@ -76,7 +76,7 @@ internal fun UpdateHintSettingsButton(
     }
 }
 
-private data class Palette(
+internal data class Palette(
     val dark: Boolean,
     val background: Color,
     val surface: Color,
@@ -100,7 +100,7 @@ private data class Palette(
     val disabled: Color
 )
 
-private fun darkPalette() = Palette(
+internal fun darkPalette() = Palette(
     dark = true,
     background = Color(0xFF080D12),
     surface = Color(0xFF0E151D),
@@ -124,7 +124,7 @@ private fun darkPalette() = Palette(
     disabled = Color(0xFF394453)
 )
 
-private fun lightPalette() = Palette(
+internal fun lightPalette() = Palette(
     dark = false,
     background = Color(0xFFEAF1F8),
     surface = Color(0xFFFFFFFF),
@@ -570,7 +570,7 @@ private fun ActionRow(
 }
 
 @Composable
-private fun PreviewButton(
+internal fun PreviewButton(
     text: String,
     palette: Palette,
     primary: Boolean,
@@ -578,6 +578,7 @@ private fun PreviewButton(
     enabled: Boolean = true,
     icon: ImageVector? = null,
     destructive: Boolean = false,
+    highlightOnPress: Boolean = true,
     onClick: () -> Unit = {}
 ) {
     val press = rememberPressFeedback(enabled, releaseHoldMillis = VISUAL_PRESS_HOLD_MS)
@@ -601,7 +602,7 @@ private fun PreviewButton(
                 RoundedCornerShape(7.dp)
             )
             .background(
-                if (press.pressed) {
+                if (press.pressed && highlightOnPress) {
                     if (destructive) palette.red else palette.accent.copy(alpha = if (palette.dark) 0.78f else 0.20f)
                 } else baseBackground
             )
@@ -685,16 +686,16 @@ private fun PreviewIconButton(
     }
 }
 
-private data class PressFeedback(
+internal data class PressFeedback(
     val interactionSource: MutableInteractionSource,
     val pressed: Boolean,
     val modifier: Modifier
 )
 
-private const val VISUAL_PRESS_HOLD_MS = 90L
+internal const val VISUAL_PRESS_HOLD_MS = 90L
 
 @Composable
-private fun rememberPressFeedback(
+internal fun rememberPressFeedback(
     enabled: Boolean = true,
     releaseHoldMillis: Long = 0L
 ): PressFeedback {

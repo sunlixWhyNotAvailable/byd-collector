@@ -164,10 +164,14 @@ fun BydCollectorApp(
         var pendingArchiveDeleteIds by remember { mutableStateOf<List<String>>(emptyList()) }
         var showClearLogsDialog by remember { mutableStateOf(false) }
         var showUpdateHintSettings by remember { mutableStateOf(false) }
+        var showSupportDialog by rememberSaveable { mutableStateOf(false) }
         var showTripsCompressionConfirm by remember { mutableStateOf(false) }
         val tripsCompression by TripCompressionService.state.collectAsStateWithLifecycle()
         LaunchedEffect(updateUiState) {
-            if (updateUiState != UpdateUiState.Hidden) showUpdateHintSettings = false
+            if (updateUiState != UpdateUiState.Hidden) {
+                showUpdateHintSettings = false
+                showSupportDialog = false
+            }
         }
         Box(
             modifier = Modifier
@@ -186,7 +190,8 @@ fun BydCollectorApp(
                         darkTheme = darkTheme,
                         appVersionName = appVersionName,
                         strings = s,
-                        actions = actions
+                        actions = actions,
+                        onSupportClick = { showSupportDialog = true }
                     )
                     DashboardSurface(
                         modifier = Modifier
@@ -316,6 +321,9 @@ fun BydCollectorApp(
                         onClose = { showUpdateHintSettings = false }
                     )
                 }
+                if (showSupportDialog && updateUiState == UpdateUiState.Hidden) {
+                    SupportDialog(p, language, onClose = { showSupportDialog = false })
+                }
                 if (updateUiState != UpdateUiState.Hidden) {
                     //The known update offer owns the top modal layer without cancelling unrelated work.
                     UpdateCheckDialog(
@@ -396,7 +404,8 @@ private fun TopHeader(
     darkTheme: Boolean,
     appVersionName: String,
     strings: UiStrings,
-    actions: BydCollectorActions
+    actions: BydCollectorActions,
+    onSupportClick: () -> Unit
 ) {
     val p = LocalBydPalette.current
     Row(
@@ -415,13 +424,17 @@ private fun TopHeader(
         )
         Spacer(Modifier.width(14.dp))
         Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = "BYD Collector",
-                color = p.text,
-                fontSize = 24.sp,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1
-            )
+            Row(verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                Text(
+                    text = "BYD Collector",
+                    color = p.text,
+                    fontSize = 24.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1
+                )
+                SupportHeaderAction(language, onSupportClick)
+            }
             Text(
                 //keep top bar copy tied to the actual build version
                 text = "${strings.topBarSubtitle} | v$appVersionName",
