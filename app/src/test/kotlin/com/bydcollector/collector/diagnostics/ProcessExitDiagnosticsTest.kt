@@ -10,6 +10,18 @@ import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 class ProcessExitDiagnosticsTest {
+    @Test fun anrKeepsMainStackBeyondTheOldPrefixAndBoundsScanning() {
+        val input = ByteArrayInputStream(("vendor header\n".repeat(3000) +
+            "\"main\" prio=5 tid=1 Blocked\n  at android.database.sqlite.SQLiteConnectionPool.waitForConnection\n" +
+            "\"other\" prio=5\n" + "x".repeat(2 * 1024 * 1024)).toByteArray())
+        val (trace, truncated) = readAnrTrace(input)
+        assertTrue(trace.startsWith("[main thread]\n\"main\""))
+        assertTrue(trace.contains("SQLiteConnectionPool.waitForConnection"))
+        assertTrue(trace.length < 17 * 1024)
+        assertTrue(truncated)
+        assertTrue(input.available() > 0)
+    }
+
     @Test
     fun fatalEvidenceFailureStillDelegatesOriginalExceptionExactlyOnce() {
         val failingThread = Thread("crashing-worker")

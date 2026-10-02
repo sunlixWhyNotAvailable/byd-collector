@@ -184,6 +184,12 @@ class CollectorService : Service() {
     private val debugPollerLock = Any()
     private var normalizedStateChangedCallback: ((Set<String>) -> Unit)? = null
     private val debugStartExecutor = namedSingleThreadExecutor("byd-debug-start")
+    private val startupExecutor = namedSingleThreadExecutor("byd-runtime-start")
+    private val serviceDestroyed = AtomicBoolean(false)
+    private var runtimeInitialized = false // main-handler owned
+    private val pendingStartCommands = mutableListOf<Intent?>()
+    private val mainStartGeneration = AtomicLong(0L)
+    private val mainStartInProgress = AtomicBoolean(false)
     private val maintenanceExecutor = namedSingleThreadExecutor("byd-db-maintenance")
     private val archiveStorageExecutor = namedSingleThreadExecutor("byd-archive-storage")
     @Volatile private var cancelQueuedArchiveWork: (() -> Unit)? = null
@@ -461,6 +467,54 @@ class CollectorService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // Satisfy Android's foreground deadline before touching storage or its locks.
+        createNotificationChannel()
+        startForeground(NOTIFICATION_ID, buildNotification(BuildConfig.COLLECTOR_DISPLAY_NAME))
+        startupExecutor.execute {
+            try {
+                startupPhase("main_store_open") { BydCollectorApplication.store(applicationContext) }
+                if (serviceDestroyed.get()) return@execute
+                startupPhase("trips_store_open") { BydCollectorApplication.trips(applicationContext) }
+                mainHandler.post {
+                    if (serviceDestroyed.get()) return@post
+                    initializeRuntime()
+                    runtimeInitialized = true
+                    val commands = pendingStartCommands.toList()
+                    pendingStartCommands.clear()
+                    commands.forEach { handleStartCommand(it) }
+                }
+            } catch (error: Exception) {
+                recordStartupEvent("storage_start_error", error.diagnosticDetail())
+                mainHandler.post {
+                    if (!serviceDestroyed.get()) {
+                        mainRuntimeStatusRef.set(RuntimeActionStatus.ERROR)
+                        debugRuntimeStatusRef.set(DebugRuntimeStatus.ERROR)
+                        mqttConnection.release()
+                        influxConnection.release()
+                        stopSelf()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun <T> startupPhase(phase: String, action: () -> T): T {
+        val started = SystemClock.elapsedRealtime()
+        recordStartupEvent("startup_phase_begin", "phase=$phase thread=${Thread.currentThread().name}")
+        return try { action() } finally {
+            recordStartupEvent("startup_phase_end", "phase=$phase duration_ms=${SystemClock.elapsedRealtime() - started}")
+        }
+    }
+
+    private fun recordStartupEvent(event: String, detail: String) {
+        // Independent of SQLite, including when opening that SQLite is the failing operation.
+        runCatching {
+            (applicationContext as BydCollectorApplication).operationalEventJournal.tryAppend(
+                java.time.Instant.now().toString(), SystemClock.elapsedRealtime(), "runtime_start", event, detail)
+        }
+    }
+
+    private fun initializeRuntime() {
         val application = applicationContext as BydCollectorApplication
         val startupShutdownSuppressed = CollectorSettings(applicationContext).isUserShutdownRequested()
         if (!startupShutdownSuppressed) application.updateRuntime.start("collector_service")
@@ -587,6 +641,20 @@ class CollectorService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (!runtimeInitialized) {
+            if (intent?.action == ACTION_SHUTDOWN) {
+                check(CollectorSettings(applicationContext).setUserShutdownRequested(true)) {
+                    "Could not persist Shutdown during storage initialization"
+                }
+                pendingStartCommands.clear()
+            }
+            pendingStartCommands += intent?.let(::Intent)
+            return if (CollectorSettings(applicationContext).isUserShutdownRequested()) START_NOT_STICKY else START_STICKY
+        }
+        return handleStartCommand(intent)
+    }
+
+    private fun handleStartCommand(intent: Intent?): Int {
         val stickyRestart = intent?.action == null
         val action = intent?.action ?: "sticky_restart"
         val forceKeepAliveStatusCheck = intent?.getBooleanExtra(EXTRA_FORCE_KEEP_ALIVE_STATUS_CHECK, false) == true
@@ -684,6 +752,23 @@ class CollectorService : Service() {
 
     override fun onDestroy() {
         requireRuntimeOwner()
+        serviceDestroyed.set(true)
+        mainStartGeneration.incrementAndGet()
+        pendingStartCommands.clear()
+        // Do not interrupt an in-progress SQLite transaction; its stale result is fenced below.
+        startupExecutor.shutdown()
+        if (!runtimeInitialized) {
+            debugStartExecutor.shutdownNow()
+            maintenanceExecutor.shutdownNow()
+            archiveStorageExecutor.shutdownNow()
+            tailscaleExecutor.shutdownNow()
+            dashboardMetricsExecutor.shutdownNow()
+            dashboardCountExecutor.shutdownNow()
+            shutdownMqttExecutor(interrupt = true)
+            shutdownInfluxExecutor()
+            super.onDestroy()
+            return
+        }
         running.set(false)
         closeEcMeanProvider()
         kpiRuntimeGeneration.incrementAndGet()
@@ -1581,47 +1666,68 @@ class CollectorService : Service() {
             publishDashboardRuntimeFlags()
             return
         }
+        if (!mainStartInProgress.compareAndSet(false, true)) return
+        val startGeneration = mainStartGeneration.get()
         setMainRuntime(RuntimeActionStatus.STARTING)
         val ownerMode = DirectHelperOwnerMode.APP_GAP_SPOOL
         if (mainPollerOwnerMode != ownerMode) poller = createTelemetryPoller(ownerMode)
         mqttRuntimeActive.set(false)
-        val openedSessionId = store.openSession()
-        sessionId = openedSessionId
-        try {
-            //imports the car energy database opportunistically; telemetry polling must survive import failure
-            val importResult = store.importEcDatabaseAtSessionStart(openedSessionId)
-            if (importResult.ok && importResult.insertedCount > 0) {
-                dashboardUiStateStore.incrementMainRowCounts(ecRows = importResult.insertedCount.toLong())
+        startupExecutor.execute {
+            try {
+                (applicationContext as BydCollectorApplication).withDatabaseRead {
+                    if (!mainStartStillCurrent(startGeneration)) return@withDatabaseRead
+                    val startingStore = store
+                    val opened = startupPhase("main_session_open") { startingStore.openSession() }
+                    var accepted = false
+                    try {
+                        if (!mainStartStillCurrent(startGeneration)) return@withDatabaseRead
+                        runCatching {
+                            startupPhase("ec_import") { startingStore.importEcDatabaseAtSessionStart(opened) }
+                        }.onSuccess { result ->
+                            if (result.ok && result.insertedCount > 0) {
+                                dashboardUiStateStore.incrementMainRowCounts(ecRows = result.insertedCount.toLong())
+                            }
+                        }.onFailure { error ->
+                            startingStore.recordEvent("ec_import_error", "EC_database.db import failed before polling", error.diagnosticDetail())
+                        }
+                        runOnRuntimeOwnerBlocking {
+                            if (mainStartStillCurrent(startGeneration)) {
+                                sessionId = opened
+                                tripRuntime.resume()
+                                check(callbackNormalizer.start()) { "Main previous normalizer has not stopped" }
+                                check(mainCallbackIntake.start()) { "Main previous callback consumer has not stopped" }
+                                check(poller.start(opened)) { "Main previous worker has not stopped" }
+                                accepted = true
+                                mainPollingRunning.set(true)
+                                setMainRuntime(RuntimeActionStatus.RUNNING)
+                                publishDashboardRuntimeFlags()
+                                flushPendingMqttAsync(force = false)
+                            }
+                        }
+                    } finally {
+                        if (!accepted) startingStore.endSession(opened, "polling_start_cancelled")
+                    }
+                }
+            } catch (error: RuntimeException) {
+                recordStartupEvent("main_start_error", error.diagnosticDetail())
+                mainHandler.post {
+                    if (mainStartStillCurrent(startGeneration)) handleMainStartFailure(error)
+                }
+            } finally {
+                mainStartInProgress.set(false)
+                mainHandler.post {
+                    if (startGeneration != mainStartGeneration.get() && mainStartStillCurrent(mainStartGeneration.get())) {
+                        startMainIfNeeded()
+                    }
+                }
             }
-        } catch (error: RuntimeException) {
-            store.recordEvent(
-                "ec_import_error",
-                "EC_database.db import failed before polling",
-                "${error::class.java.simpleName}: ${error.message ?: "no message"}"
-            )
         }
-        tripRuntime.resume()
-        //The activity owns the desired/manual flags. Recheck immediately before touching the poller
-        //so a delayed start cannot revive a runtime the user just stopped.
-        if (
-            !settings.isPollingEnabled() ||
-            settings.isMainManuallyStopped() ||
-            maintenanceBlocksRuntimeStart()
-        ) {
-            runCatching { store.endSession(openedSessionId, "polling_start_cancelled") }
-            sessionId = null
-            tripRuntime.pause("polling_start_cancelled")
-            setMainRuntime(RuntimeActionStatus.STOPPED)
-            return
-        }
-        check(callbackNormalizer.start()) { "Main previous normalizer has not stopped" }
-        check(mainCallbackIntake.start()) { "Main previous callback consumer has not stopped" }
-        check(poller.start(openedSessionId)) { "Main previous worker has not stopped" }
-        mainPollingRunning.set(true)
-        setMainRuntime(RuntimeActionStatus.RUNNING)
-        publishDashboardRuntimeFlags()
-        flushPendingMqttAsync(force = false)
     }
+
+    private fun mainStartStillCurrent(generation: Long): Boolean =
+        generation == mainStartGeneration.get() && !serviceDestroyed.get() && running.get() &&
+            !settings.isUserShutdownRequested() && settings.isPollingEnabled() &&
+            !settings.isMainManuallyStopped() && !maintenanceBlocksRuntimeStart()
 
     private fun startDebugIfNeeded(reason: String) {
         if (settings.isUserShutdownRequested()) return
@@ -2303,6 +2409,7 @@ class CollectorService : Service() {
     }
 
     private fun stopMain(reason: String) {
+        mainStartGeneration.incrementAndGet()
         mainHandler.removeCallbacks(mainStartRetryTask)
         mainStartRetryScheduled = false
         if (reason == "user_shutdown") {
@@ -3436,6 +3543,7 @@ class CollectorService : Service() {
         }
 
         cancelMqttRetry()
+        mainStartGeneration.incrementAndGet()
         cancelInfluxRetry("maintenance")
         cancelTelegramTick()
         mainHandler.removeCallbacks(mainStartRetryTask)
@@ -5508,6 +5616,11 @@ class CollectorService : Service() {
     }
 
     private fun handleForegroundServiceTimeout(startId: Int, fgsType: Int?) {
+        if (!runtimeInitialized) {
+            recordStartupEvent("foreground_service_timeout", "start_id=$startId storage_initializing=true")
+            stopSelf(startId)
+            return
+        }
         store.recordEvent(
             "foreground_service_timeout",
             "Foreground service timeout; stopping collection",

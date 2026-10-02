@@ -59,11 +59,14 @@ internal object ProcessExitDiagnostics {
                         .put("description", exit.description?.take(1024) ?: JSONObject.NULL)
                     try {
                         exit.traceInputStream?.use { trace ->
-                            val prefix = readExitTracePrefix(trace)
+                            val anr = exit.reason == ApplicationExitInfo.REASON_ANR
+                            val prefix = if (anr) readAnrTrace(trace) else readExitTracePrefix(trace)
                             // Native tombstones are protobuf on API31+. Do not label this as a
                             // decoded stack or hide its strings in base64 from Share redaction.
                             val native = exit.reason == ApplicationExitInfo.REASON_CRASH_NATIVE && Build.VERSION.SDK_INT >= 31
-                            detail.put("trace_status", if (prefix.second) "prefix_truncated" else "available")
+                            detail.put("trace_status", if (prefix.second) {
+                                if (anr) "selected_sections" else "prefix_truncated"
+                            } else "available")
                                 .put("trace_format", if (native) "protobuf_utf8_projection" else "utf8")
                                 .put("trace_prefix", prefix.first)
                         } ?: detail.put("trace_status", "unavailable")
@@ -86,6 +89,17 @@ internal object ProcessExitDiagnostics {
             }
         }
     }
+}
+
+/** Keep the blocking main stack even when vendor headers consume the old 16 KiB prefix. */
+internal fun readAnrTrace(input: InputStream): Pair<String, Boolean> {
+    val (trace, scanTruncated) = readExitTracePrefix(input, 1024 * 1024)
+    val main = Regex("(?m)^\"main\"[^\\r\\n]*").find(trace)
+    if (main == null) return ("[main thread not found within bounded scan]\n" + trace.take(16 * 1024)) to true
+    val nextThread = Regex("(?m)^\"").find(trace, main.range.last + 1)?.range?.first ?: trace.length
+    val stack = trace.substring(main.range.first, nextThread)
+    val selected = "[main thread]\n${stack.take(12 * 1024)}\n[trace header]\n${trace.take(minOf(main.range.first, 4 * 1024))}"
+    return selected to (scanTruncated || selected.length < trace.length || stack.length > 12 * 1024)
 }
 
 internal class FatalEvidenceHandler(

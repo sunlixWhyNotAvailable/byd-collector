@@ -50,6 +50,8 @@ object DirectBridgeManager {
             if (helperAlive && !replacementPending) {
                 return DirectBridgeResult(ok = true, message = "Direct helper already running")
             }
+            recordLifecycle(appContext, "helper_launch_requested",
+                "replacement_pending=$replacementPending helper_alive=$helperAlive installed_update_ms=$updateTime")
             fun execShell(command: String, timeoutMs: Int): AdbShellResult =
                 shellRunner?.invoke(command, timeoutMs)
                     ?: adbClient.execShell(command, timeoutMs = timeoutMs)
@@ -111,12 +113,23 @@ object DirectBridgeManager {
                             return DirectBridgeResult(false, "Could not confirm the installed helper version")
                         }
                     }
+                    recordLifecycle(appContext, "helper_launch_confirmed",
+                        "replacement=$replacementPending installed_update_ms=$updateTime")
                     return DirectBridgeResult(ok = true, message = "Direct helper started")
                 }
             }
+            recordLifecycle(appContext, "helper_launch_timeout", "installed_update_ms=$updateTime")
             return DirectBridgeResult(ok = false, message = "Direct helper did not register Binder service after launch")
         } finally {
             launchLock.unlock()
+        }
+    }
+
+    private fun recordLifecycle(context: Context, event: String, detail: String) {
+        runCatching {
+            (context.applicationContext as com.bydcollector.collector.BydCollectorApplication)
+                .operationalEventJournal.tryAppend(java.time.Instant.now().toString(),
+                    android.os.SystemClock.elapsedRealtime(), "helper_lifecycle", event, detail)
         }
     }
 

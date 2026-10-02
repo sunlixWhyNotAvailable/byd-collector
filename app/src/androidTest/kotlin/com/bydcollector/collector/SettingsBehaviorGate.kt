@@ -335,6 +335,14 @@ internal object SettingsBehaviorGate {
                 "replacement did not follow stop→absence→launch→ping order: $events"
             }
             check(!settings.helperReplacementPending(updateTime)) { "successful ping did not confirm the installed update" }
+            events.clear()
+            val recovered = DirectBridgeManager.ensureRunning(
+                context, AdbLocalClient(File(context.filesDir, "unused_helper_update_test_keys")), helper,
+                shellRunner = { _, _ -> error("confirmed helper must survive repeated recovery") }
+            )
+            check(recovered.ok && events == listOf("launch_ping")) {
+                "repeated recovery replaced the confirmed helper: $events"
+            }
         }
     }
 

@@ -53,6 +53,7 @@ internal object RuntimeBoundaryGate {
             settings.setInfluxPort(influxSocket.localPort)
             settings.setInfluxDatabase("runtime_boundary_test")
             settings.setInfluxAlternativeHost(null)
+            verifyStorageStartupDoesNotBlockMain(test, app, settings)
             for (profile in com.bydcollector.collector.ui.DashboardLoadProfile.entries) {
                 val args = options("dashboard").apply { putString("profile", profile.name); putString("language", "UK") }
                 ctx.contentResolver.openTypedAssetFileDescriptor(RuntimeEndpoint.uri, "application/vnd.bydcollector.query", args)!!.use { fd ->
@@ -115,7 +116,7 @@ internal object RuntimeBoundaryGate {
             check(shell("pidof ${RuntimeEndpoint.UI_PACKAGE}").trim().let { it.isNotEmpty() && it != clientPid })
             check(HaRunSession.process.allows(HaExportChannel.MQTT, false))
             check(HaRunSession.process.allows(HaExportChannel.INFLUX, false))
-            return "PASS: native IPC snapshots; shell caller rejected; UI force-stop/relaunch; owner PID and both manual grants retained"
+            return "PASS: blocked storage leaves main responsive; Stop fences pending Main start; native IPC snapshots; shell caller rejected; UI force-stop/relaunch; owner PID and both manual grants retained"
         } finally {
             mqttSocket.close()
             influxSocket.close()
@@ -131,6 +132,61 @@ internal object RuntimeBoundaryGate {
             } }
             check(edit.commit())
             HaRunSession.process.clear()
+        }
+    }
+
+    private fun verifyStorageStartupDoesNotBlockMain(
+        test: Instrumentation, app: BydCollectorApplication, settings: CollectorSettings
+    ) {
+        val ctx = test.targetContext
+        val main = android.os.Handler(android.os.Looper.getMainLooper())
+        fun mainBarrier() {
+            val barrier = java.util.concurrent.FutureTask { true }
+            check(main.post(barrier))
+            check(barrier.get(2, java.util.concurrent.TimeUnit.SECONDS)) { "Storage blocked Android main thread" }
+        }
+        fun awaitState(message: String, condition: () -> Boolean) {
+            val deadline = android.os.SystemClock.elapsedRealtime() + 5_000
+            while (!condition()) {
+                check(android.os.SystemClock.elapsedRealtime() < deadline) { message }
+                Thread.sleep(20)
+            }
+        }
+        settings.setUserShutdownRequested(false)
+        app.withExclusiveDatabaseMaintenance {
+            ctx.startForegroundService(com.bydcollector.collector.service.CollectorService.startIntent(ctx))
+            awaitState("Storage initialization did not use a background worker") {
+                Thread.getAllStackTraces().any { (thread, stack) ->
+                    thread.name == "byd-runtime-start" && stack.any { it.className.endsWith("BydCollectorApplication") && it.methodName == "store" }
+                }
+            }
+            mainBarrier()
+        }
+        awaitState("Runtime did not initialize after storage became available") {
+            com.bydcollector.collector.service.CollectorService.isRunning()
+        }
+        mainBarrier()
+        app.withExclusiveDatabaseMaintenance {
+            settings.setMainManuallyStopped(false)
+            settings.setPollingEnabled(true)
+            ctx.startForegroundService(com.bydcollector.collector.service.CollectorService.startIntent(ctx))
+            awaitState("Main start did not enter preparation") {
+                com.bydcollector.collector.service.CollectorService.mainRuntimeStatus() ==
+                    com.bydcollector.collector.ui.RuntimeActionStatus.STARTING
+            }
+            settings.setMainManuallyStopped(true)
+            settings.setPollingEnabled(false)
+            ctx.startService(com.bydcollector.collector.service.CollectorService.stopIntent(ctx))
+            awaitState("Stop did not cancel blocked Main start") {
+                com.bydcollector.collector.service.CollectorService.mainRuntimeStatus() ==
+                    com.bydcollector.collector.ui.RuntimeActionStatus.STOPPED
+            }
+            mainBarrier()
+        }
+        Thread.sleep(200)
+        mainBarrier()
+        check(!com.bydcollector.collector.service.CollectorService.isMainPollingRunning()) {
+            "Delayed storage preparation revived stopped collection"
         }
     }
 }
