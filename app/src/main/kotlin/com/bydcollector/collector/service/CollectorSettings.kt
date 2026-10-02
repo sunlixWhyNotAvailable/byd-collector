@@ -45,10 +45,11 @@ class CollectorSettings(
         val sharedCategories: Boolean
     )
 
-    private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val prefs = com.bydcollector.collector.runtime.RuntimePreferences.get(context)
     private val secretStore = KeystoreSecretStore(context)
 
     init {
+        if (!com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) {
         migrateLegacyLocationCategories()
         migrateTripEndDelayToSeconds()
         migrateTelegramBuiltInTemplates()
@@ -56,7 +57,13 @@ class CollectorSettings(
         migrateLegacySecret(KEY_MQTT_PASSWORD, SECRET_MQTT_PASSWORD, KEY_MQTT_ENABLED)
         migrateLegacySecret(KEY_INFLUX_USERNAME, SECRET_INFLUX_USERNAME, KEY_INFLUX_ENABLED)
         migrateLegacySecret(KEY_INFLUX_PASSWORD, SECRET_INFLUX_PASSWORD, KEY_INFLUX_ENABLED)
+        }
     }
+
+    private fun haAllowed(channel: HaExportChannel, autoStart: Boolean): Boolean = autoStart ||
+        if (com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) {
+            com.bydcollector.collector.runtime.RuntimeClient.state.getBoolean("manual${channel.name}")
+        } else HaRunSession.process.allows(channel, false)
 
     fun isAutoStartEnabled(): Boolean = prefs.getBoolean(KEY_AUTO_START, false)
 
@@ -66,9 +73,9 @@ class CollectorSettings(
         return RuntimeDemand(
             main = (isAutoStartEnabled() || resumed.main) && !isMainManuallyStopped(),
             debug = (isDebugAutoStartEnabled() || resumed.debug) && !isDebugManuallyStopped(),
-            mqtt = HaRunSession.process.allows(HaExportChannel.MQTT, isMqttAutoStartEnabled()) &&
+            mqtt = haAllowed(HaExportChannel.MQTT, isMqttAutoStartEnabled()) &&
                 !isMqttManuallyStopped(),
-            influx = HaRunSession.process.allows(HaExportChannel.INFLUX, isInfluxAutoStartEnabled()) &&
+            influx = haAllowed(HaExportChannel.INFLUX, isInfluxAutoStartEnabled()) &&
                 !isInfluxManuallyStopped(),
             telegram = isTelegramEnabled(),
             keepAlive = keepAliveConfig().anyEnabled
@@ -298,7 +305,7 @@ class CollectorSettings(
     }
 
     fun isMqttEnabled(): Boolean = prefs.getBoolean(KEY_MQTT_ENABLED, false) &&
-        HaRunSession.process.allows(HaExportChannel.MQTT, isMqttAutoStartEnabled()) && !isMqttManuallyStopped()
+        haAllowed(HaExportChannel.MQTT, isMqttAutoStartEnabled()) && !isMqttManuallyStopped()
 
     fun setMqttEnabled(enabled: Boolean) {
         if (prefs.getBoolean(KEY_MQTT_ENABLED, false) == enabled && (enabled || !prefs.contains(KEY_TASK_REMOVED_MQTT))) return
@@ -438,7 +445,7 @@ class CollectorSettings(
     }
 
     fun isInfluxEnabled(): Boolean = prefs.getBoolean(KEY_INFLUX_ENABLED, false) &&
-        HaRunSession.process.allows(HaExportChannel.INFLUX, isInfluxAutoStartEnabled()) && !isInfluxManuallyStopped()
+        haAllowed(HaExportChannel.INFLUX, isInfluxAutoStartEnabled()) && !isInfluxManuallyStopped()
 
     fun setInfluxEnabled(enabled: Boolean) {
         if (prefs.getBoolean(KEY_INFLUX_ENABLED, false) == enabled && (enabled || !prefs.contains(KEY_TASK_REMOVED_INFLUX))) return
@@ -1517,7 +1524,7 @@ class CollectorSettings(
         }
 
         fun isDbMaintenanceRunning(context: Context): Boolean {
-            val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val prefs = com.bydcollector.collector.runtime.RuntimePreferences.get(context)
             val operation = DbMaintenanceOperation.fromKey(prefs.getString(KEY_DB_MAINTENANCE_OPERATION, null))
             return operation != null && prefs.getBoolean(KEY_DB_MAINTENANCE_RUNNING, false)
         }

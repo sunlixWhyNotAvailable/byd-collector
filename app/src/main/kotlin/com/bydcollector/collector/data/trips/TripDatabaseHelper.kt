@@ -12,6 +12,15 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
     null,
     DATABASE_VERSION
 ) {
+    override fun getWritableDatabase(): SQLiteDatabase {
+        check(!com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) { "UI cannot own Trips SQLite" }
+        return super.getWritableDatabase()
+    }
+
+    override fun getReadableDatabase(): SQLiteDatabase {
+        check(!com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) { "UI cannot own Trips SQLite" }
+        return super.getReadableDatabase()
+    }
     private val databasePath = context.applicationContext.getDatabasePath(databaseName)
 
     /** Resolves the file without opening SQLite; required while preparing a snapshot/candidate. */

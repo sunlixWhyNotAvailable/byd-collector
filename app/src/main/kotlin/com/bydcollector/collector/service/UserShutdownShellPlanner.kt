@@ -161,6 +161,10 @@ internal object UserShutdownShellPlanner {
         append("shutdown_write_evidence 'phase=pre_force_stop_verified' || exit 103; ")
         append("shutdown_package_generation_matches || { shutdown_write_evidence 'result=error phase=app_generation_changed'; exit 110; }; ")
         append("${generationCurrent(token)} || { shutdown_write_evidence 'result=cancelled phase=explicit_reopen_before_force_stop'; exit 0; }; ")
+        if (packageName == "com.bydcollector.collector") {
+            append("am force-stop 'com.bydcollector.collector.ui' >/dev/null 2>&1 || { shutdown_write_evidence 'result=error phase=ui_force_stop_failed'; exit 113; }; ")
+            append("pidof 'com.bydcollector.collector.ui' >/dev/null 2>&1 && { shutdown_write_evidence 'result=error phase=ui_still_present'; exit 114; }; ")
+        }
         append("am force-stop '$packageName' >/dev/null 2>&1 || { shutdown_write_evidence 'result=error phase=force_stop_command_failed'; exit 104; }; ")
         append("for shutdown_i in 1 2 3 4 5; do pidof \"\$shutdown_package\" >/dev/null 2>&1 || break; sleep 0.2; done; ")
         append("if pidof \"\$shutdown_package\" >/dev/null 2>&1; then ")

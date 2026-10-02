@@ -11,7 +11,7 @@ import java.security.UnrecoverableKeyException
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 
-class KeystoreSecretStore(context: Context) {
+class KeystoreSecretStore(private val context: Context) {
     private val preferences = context.applicationContext.getSharedPreferences(
         PREFERENCES_NAME,
         Context.MODE_PRIVATE
@@ -20,22 +20,34 @@ class KeystoreSecretStore(context: Context) {
     /** Writes one independently encrypted payload and reports whether it was persisted. */
     fun write(name: String, value: String): Boolean {
         requireValidName(name)
+        if (com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) return remote("write", name, value).getBoolean("ok")
         return synchronized(STORE_LOCK) { writeLocked(name, value) }
     }
 
     /** Returns null when the secret is absent, malformed, or no longer decryptable. */
     fun read(name: String): String? {
         requireValidName(name)
+        if (com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) return remote("read", name).getString("value")
         return synchronized(STORE_LOCK) { readLocked(name) }
     }
 
     fun clear(name: String): Boolean {
         requireValidName(name)
+        if (com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) return remote("clear", name).getBoolean("ok")
         return synchronized(STORE_LOCK) { removePayloadLocked(payloadKey(name)) }
     }
 
     /** Clears every encrypted payload while retaining the shared Keystore key. */
-    fun clearAll(): Boolean = synchronized(STORE_LOCK) { clearAllPayloadsLocked() }
+    fun clearAll(): Boolean {
+        check(!com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) { "UI cannot clear all runtime secrets" }
+        return synchronized(STORE_LOCK) { clearAllPayloadsLocked() }
+    }
+
+    private fun remote(operation: String, name: String, value: String? = null) =
+        com.bydcollector.collector.runtime.RuntimeEndpoint.call(context, "secret.$operation", android.os.Bundle().apply {
+            putString("name", name)
+            value?.let { putString("value", it) }
+        })
 
     private fun writeLocked(name: String, value: String): Boolean {
         return try {

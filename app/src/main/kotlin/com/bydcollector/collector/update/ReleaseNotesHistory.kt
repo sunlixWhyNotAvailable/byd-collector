@@ -3,13 +3,13 @@ package com.bydcollector.collector.update
 import com.bydcollector.collector.BuildConfig
 import org.json.JSONArray
 
-data class ReleaseNotesEntry(val version: String, val body: String)
+data class ReleaseNotesEntry(val version: String, val body: String) : java.io.Serializable
 
 data class ReleaseNotesHistory(
     val entries: List<ReleaseNotesEntry>,
     val loading: Boolean = false,
     val incomplete: Boolean = false
-)
+) : java.io.Serializable
 
 internal data class ReleaseNotesPage(val json: String, val hasNext: Boolean)
 
@@ -80,10 +80,19 @@ class ReleaseNotesHistorySession(
     private var generation = 0L
 
     fun snapshot(info: UpdateInfo): ReleaseNotesHistory? = synchronized(lock) {
+        if (BuildConfig.RUNTIME_CLIENT) return com.bydcollector.collector.runtime.RuntimeClient.history
+            ?.takeIf { com.bydcollector.collector.runtime.RuntimeClient.historyTarget == info }
         history.takeIf { target == info }
     }
 
     fun request(info: UpdateInfo) {
+        if (BuildConfig.RUNTIME_CLIENT) {
+            if (snapshot(info) == null) com.bydcollector.collector.runtime.RuntimeClient.control("history", android.os.Bundle().apply {
+                putString("version", info.version); putString("url", info.downloadUrl)
+                putString("notes", info.releaseNotes); putString("type", info.downloadContentType)
+            })
+            return
+        }
         val token = synchronized(lock) {
             if (target == info && history != null) return
             target = info

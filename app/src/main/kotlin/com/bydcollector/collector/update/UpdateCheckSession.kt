@@ -26,7 +26,7 @@ class UpdateCheckSession(
         val availableResultId: Long?,
         val generation: Long = 0L,
         val completion: Completion? = null
-    )
+    ) : java.io.Serializable
 
     /** Immutable physical-check outcome, independent from UI visibility/dismissal. */
     data class Completion(
@@ -34,7 +34,7 @@ class UpdateCheckSession(
         val generation: Long,
         val result: UpdateCheckResult,
         val completedAtElapsedMs: Long
-    )
+    ) : java.io.Serializable
 
     private val lock = Any()
     private val listeners = mutableSetOf<() -> Unit>()
@@ -52,6 +52,7 @@ class UpdateCheckSession(
     private val completions = mutableListOf<Completion>()
 
     fun snapshot(): Snapshot = synchronized(lock) {
+        if (com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) return com.bydcollector.collector.runtime.RuntimeClient.update
         Snapshot(
             uiState = uiState,
             inFlight = inFlight,
@@ -140,6 +141,10 @@ class UpdateCheckSession(
 
     /** Hides current presentation for the download handoff without cancelling the check. */
     fun clearPresentation() {
+        if (com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) {
+            com.bydcollector.collector.runtime.RuntimeClient.control("updateClear")
+            return
+        }
         dismiss()
     }
 

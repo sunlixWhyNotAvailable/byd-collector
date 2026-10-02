@@ -67,7 +67,7 @@ data class DbMaintenanceRuntimeStatus(
     val startedAtMs: Long = 0L,
     val updatedAtMs: Long = 0L,
     val cancelAvailable: Boolean = false
-)
+) : java.io.Serializable
 
 data class DbMaintenanceUiState(
     val operation: DbMaintenanceOperation,
@@ -98,7 +98,7 @@ data class MainArchivePreflight(
     val telegramStatePresent: Boolean = false,
     val telegramStorageWarning: String? = null,
     val warning: String? = null
-) {
+) : java.io.Serializable {
     val blocksAutomaticCutover: Boolean
         get() = warning != null || telegramPending > 0L || mqttPending > 0L || influxPending > 0L || telegramStatePresent
 }

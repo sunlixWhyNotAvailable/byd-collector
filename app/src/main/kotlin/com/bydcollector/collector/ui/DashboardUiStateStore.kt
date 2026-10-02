@@ -62,6 +62,7 @@ data class DashboardDebugPollState(
 class DashboardUiStateStore(
     private val clock: () -> Long = { SystemClock.elapsedRealtime() }
 ) {
+    internal var onRuntimeChanged: () -> Unit = {}
     private val lock = Any() //Serializes cache reads, writes, and generation checks.
     private var nextGeneration = 0L
     private val chrome = MutableStateFlow<CachedDashboardState?>(null)
@@ -378,11 +379,13 @@ class DashboardUiStateStore(
     }
 
     private fun updateAllLocked(transform: (DashboardState) -> DashboardState) {
+        onRuntimeChanged()
         updateFlowLocked(chrome, transform)
         tabs.values.forEach { flow -> updateFlowLocked(flow, transform) }
     }
 
     private fun updateTargetsLocked(targetTabs: Set<AppTab>, includeChrome: Boolean) {
+        onRuntimeChanged()
         if (includeChrome) updateFlowLocked(chrome, ::applyRuntimeOverlays)
         targetTabs.forEach { tab -> updateFlowLocked(tabs.getValue(tab), ::applyRuntimeOverlays) }
     }
@@ -397,6 +400,7 @@ class DashboardUiStateStore(
     }
 
     private fun applyRuntimeOverlays(source: DashboardState): DashboardState {
+        if (com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) return source
         var state = source.copy(vehicleKpis = localizedVehicleKpis.getValue(selectedKpiLanguage))
         rowCounts?.let { counts ->
             state = state.copy(
@@ -487,6 +491,11 @@ class DashboardUiStateStore(
         ))
         return state
     }
+
+    internal fun snapshotForClient(source: DashboardState, language: VehicleKpiLanguage): DashboardState =
+        synchronized(lock) {
+            applyRuntimeOverlays(source).copy(vehicleKpis = localizedVehicleKpis.getValue(language))
+        }
 
     private fun nextGenerationLocked(): Long {
         check(nextGeneration < Long.MAX_VALUE) { "dashboard UI generation overflow" }

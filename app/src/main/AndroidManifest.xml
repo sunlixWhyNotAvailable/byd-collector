@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <permission android:name="com.bydcollector.collector.permission.RUNTIME"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="com.bydcollector.collector.permission.RUNTIME" />
+
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission
@@ -20,6 +24,7 @@
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
     <queries>
+        <package android:name="com.bydcollector.collector.ui" />
         <package android:name="com.bydhud.app" />
         <package android:name="com.byd.extend" />
     </queries>
@@ -34,16 +39,29 @@
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
 
+        <provider
+            android:name="com.bydcollector.collector.runtime.RuntimeEndpointProvider"
+            android:authorities="com.bydcollector.collector.runtime"
+            android:exported="true"
+            android:permission="com.bydcollector.collector.permission.RUNTIME" />
+
+        <service android:name="com.bydcollector.collector.runtime.RuntimeJobsService"
+            android:exported="false" android:stopWithTask="false"
+            android:foregroundServiceType="dataSync" />
+
         <activity
+            android:name="com.bydcollector.collector.runtime.RuntimeLauncherActivity"
+            android:excludeFromRecents="true"
+            android:exported="false" />
+        <activity-alias
             android:name="com.bydcollector.collector.MainActivity"
-            android:autoRemoveFromRecents="false"
-            android:excludeFromRecents="false"
+            android:targetActivity="com.bydcollector.collector.runtime.RuntimeLauncherActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-        </activity>
+        </activity-alias>
 
         <service
             android:name="com.bydcollector.collector.service.CollectorService"

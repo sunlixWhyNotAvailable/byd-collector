@@ -1,5 +1,7 @@
 package com.bydcollector.collector
 
+import com.bydcollector.collector.runtime.RuntimeClient
+
 import android.app.Application
 import android.content.Context
 import android.os.SystemClock
@@ -87,7 +89,11 @@ class BydCollectorApplication : Application() {
             }
         }
     }
-    val dashboardUiStateStore by lazy { DashboardUiStateStore() }
+    val dashboardUiStateStore by lazy { DashboardUiStateStore().apply {
+        if (!BuildConfig.RUNTIME_CLIENT) onRuntimeChanged = {
+            com.bydcollector.collector.runtime.RuntimeEndpoint.changed(this@BydCollectorApplication)
+        }
+    } }
     val navigationSession by lazy { UiSessionState() }
     private val updateCheckExecutorDelegate = lazy { namedSingleThreadExecutor("byd-update-check") }
     private val historicalEnergyExecutorDelegate = lazy { namedSingleThreadExecutor("byd-historical-energy") }
@@ -138,12 +144,21 @@ class BydCollectorApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        // The separate UI UID is never a runtime recovery or storage owner.
+        if (BuildConfig.RUNTIME_CLIENT) {
+            com.bydcollector.collector.runtime.RuntimeClient.initialize(this)
+            return
+        }
         runCatching {
             ProcessExitDiagnostics.install(this, operationalEventJournal) {
                 if (maintenanceDiagnosticsDelegate.isInitialized()) maintenanceDiagnostics.cachedSnapshot().detail else "maintenance=inactive"
             }
         }.onFailure { android.util.Log.w("BYDCollectorExit", "Exit evidence initialization failed", it) }
         CollectorSettings.resetCollectionAfterProcessDeath(this)
+        sharedOperationalEventExecutor.execute {
+            runCatching { com.bydcollector.collector.runtime.RuntimeJobsService.recover(this) }
+                .onFailure { android.util.Log.e("CollectorRuntime", "Background task recovery failed", it) }
+        }
         // A Messenger bind can create only this Application. Normal runtime entry
         // points start update timing explicitly; IPC must not start checks or collection.
     }
@@ -162,6 +177,10 @@ class BydCollectorApplication : Application() {
     }
 
     internal fun recordUpdateEvent(message: String, detail: String? = null) {
+        if (BuildConfig.RUNTIME_CLIENT) {
+            dispatchOperationalEvent(sharedOperationalEventExecutor) { store().recordEvent("update", message, detail) }
+            return
+        }
         val timestamp = Instant.now().toString()
         val elapsedMs = SystemClock.elapsedRealtime()
         dispatchOperationalEvent(sharedOperationalEventExecutor) {
@@ -422,7 +441,7 @@ class BydCollectorApplication : Application() {
     fun telegramStoreOrNull(): TelegramStore? = telegramStore.takeIf { telegramStorageError == null }
 
     @Synchronized
-    fun telegramStorageError(): String? = telegramStorageError
+    fun telegramStorageError(): String? = if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.state.getString("telegramStorageError") else telegramStorageError
 
     /** Returns the already-open Trips store without opening or recovering its files. */
     @Synchronized
@@ -469,7 +488,7 @@ class BydCollectorApplication : Application() {
         }
     }
 
-    fun isDebugStorageReady(): Boolean = debugStorageReady == true
+    fun isDebugStorageReady(): Boolean = if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.state.getBoolean("debugReady") else debugStorageReady == true
 
     fun setDebugStorageReadyAfterMaintenance(ready: Boolean) {
         debugStorageReady = ready.takeIf { it }
@@ -509,6 +528,10 @@ class BydCollectorApplication : Application() {
     }
 
     private fun store(): TelemetryStore {
+        if (BuildConfig.RUNTIME_CLIENT) return synchronized(this) {
+            telemetryStore ?: TelemetryStore(this, TelemetryDatabaseHelper(this),
+                operationalEventJournal = operationalEventJournal).also { telemetryStore = it }
+        }
         withDatabaseRead { telemetryStore }?.let { return it }
         return withExclusiveDatabaseMaintenance {
             synchronized(this) {
@@ -537,6 +560,7 @@ class BydCollectorApplication : Application() {
     @Synchronized
     private fun trips(): TripStore {
         tripsStore?.let { return it }
+        if (BuildConfig.RUNTIME_CLIENT) return TripStore(TripDatabaseHelper(this)).also { tripsStore = it }
         TripCompression.recoverBeforeOpen(applicationContext)
         return TripStore(TripDatabaseHelper(applicationContext)).also { store ->
             check(store.verify()) { "Trips database is not safe to open" }

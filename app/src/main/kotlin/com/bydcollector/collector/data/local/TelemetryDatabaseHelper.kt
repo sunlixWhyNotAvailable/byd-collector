@@ -12,6 +12,16 @@ class TelemetryDatabaseHelper(
     databaseName: String = DATABASE_NAME
 ) : SQLiteOpenHelper(appContext, databaseName, null, DATABASE_VERSION) {
 
+    override fun getWritableDatabase(): SQLiteDatabase {
+        check(!BuildConfig.RUNTIME_CLIENT) { "UI cannot own telemetry SQLite" }
+        return super.getWritableDatabase()
+    }
+
+    override fun getReadableDatabase(): SQLiteDatabase {
+        check(!BuildConfig.RUNTIME_CLIENT) { "UI cannot own telemetry SQLite" }
+        return super.getReadableDatabase()
+    }
+
     override fun onConfigure(db: SQLiteDatabase) {
         db.setForeignKeyConstraintsEnabled(true)
     }

@@ -43,7 +43,7 @@ data class TripSession(
     val quality: String = QUALITY_OK,
     val telegramEligible: Boolean = false,
     val telegramEnqueued: Boolean = false
-) {
+) : java.io.Serializable {
     companion object {
         const val STATE_OPEN = "open"
         const val STATE_CLOSED = "closed"
@@ -83,7 +83,7 @@ data class RoutePoint(
     val quality: String = "ok",
     val isFirst: Boolean = false,
     val isFinal: Boolean = false
-) {
+) : java.io.Serializable {
     init {
         require(sequence >= 0L) { "Route sequence must be non-negative" }
         if (kind == KIND_VALID || kind == KIND_UNTRUSTED) {
@@ -123,14 +123,14 @@ data class TripSummary(
     val energyUncoveredMs: Long? = null,
     val energyPartial: Boolean? = null,
     val energyObservedAt: String? = null
-)
+) : java.io.Serializable
 
 data class TripDayGroup(
     val year: Int,
     val month: Int,
     val day: Int,
     val trips: List<TripSummary>
-) {
+) : java.io.Serializable {
     val tripCount: Int get() = trips.size
 }
 

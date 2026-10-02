@@ -30,7 +30,7 @@ data class TripCompressionState(
     val beforeBytes: Long = 0L,
     val afterBytes: Long = 0L,
     val error: String? = null
-)
+) : java.io.Serializable
 
 /** Runs lossless Trips compression outside the UI while keeping the source database live. */
 class TripCompressionService : Service() {
@@ -309,7 +309,13 @@ class TripCompressionService : Service() {
 
         val state: StateFlow<TripCompressionState> = _state.asStateFlow()
 
+        internal fun displaySnapshot(value: TripCompressionState) {
+            check(BuildConfig.RUNTIME_CLIENT)
+            _state.value = value
+        }
+
         fun start(context: Context): Boolean {
+            if (BuildConfig.RUNTIME_CLIENT) return com.bydcollector.collector.runtime.RuntimeClient.control("compress").getBoolean("accepted")
             val token = synchronized(LOCK) {
                 if (activeToken != null || _state.value.running) return false
                 nextToken += 1L
@@ -347,6 +353,7 @@ class TripCompressionService : Service() {
         }
 
         fun dismissResult(): Boolean = synchronized(LOCK) {
+            if (BuildConfig.RUNTIME_CLIENT) return com.bydcollector.collector.runtime.RuntimeClient.control("compressDismiss").getBoolean("accepted")
             if (activeToken != null || _state.value.running) return@synchronized false
             _state.value = TripCompressionState()
             true

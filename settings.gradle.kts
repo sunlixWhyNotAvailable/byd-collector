@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "BYDCollector"
 include(":app")
+include(":collector-ui")

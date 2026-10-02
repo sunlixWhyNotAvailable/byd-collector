@@ -41,7 +41,10 @@ object AdbAuthorizationManager {
     @Volatile
     private var runtimeSnapshot = AccessRuntimeSnapshot()
 
-    fun currentSnapshot(): AccessRuntimeSnapshot = runtimeSnapshot
+    fun currentSnapshot(): AccessRuntimeSnapshot = if (com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) {
+        val snapshot = com.bydcollector.collector.runtime.RuntimeClient.state
+        AccessRuntimeSnapshot(snapshot.getBoolean("accessPermissions"), snapshot.getBoolean("accessAdb"))
+    } else runtimeSnapshot
 
     fun request(
         context: Context,

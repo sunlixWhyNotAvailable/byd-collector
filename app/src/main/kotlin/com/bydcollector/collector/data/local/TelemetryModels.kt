@@ -54,7 +54,7 @@ data class CollectorEvent(
     val category: String,
     val message: String,
     val detail: String?
-)
+) : java.io.Serializable
 
 data class HealthSnapshot(
     val running: Boolean,
@@ -93,7 +93,7 @@ data class TelemetryRowCounts(
     val ecRowCount: Long,
     val normalizedCurrentCount: Long,
     val normalizedHistoryCount: Long
-)
+) : java.io.Serializable
 
 enum class HealthSnapshotDetail {
     SUMMARY,

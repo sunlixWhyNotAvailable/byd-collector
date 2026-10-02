@@ -7,25 +7,24 @@ plugins {
 android {
     namespace = "com.bydcollector.collector"
     compileSdk = 35
-
     defaultConfig {
-        applicationId = "com.bydcollector.collector"
-        testInstrumentationRunner = "com.bydcollector.collector.NativeSqliteInstrumentation"
+        applicationId = "com.bydcollector.collector.ui"
         minSdk = 26
         targetSdk = 29
         versionCode = 295
         versionName = "3.1.4"
-        manifestPlaceholders["collectorLabel"] = "BYD Collector"
         buildConfigField("String", "COLLECTOR_DISPLAY_NAME", "\"BYD Collector\"")
         buildConfigField("String", "COLLECTOR_DATABASE_NAME", "\"bydcollector_telemetry.db\"")
         buildConfigField("String", "UPDATE_RELEASES_API_URL", "\"https://api.github.com/repos/sunlixWhyNotAvailable/byd-collector/releases/latest\"")
         buildConfigField("String", "ACTION_PREFIX", "\"com.bydcollector.collector\"")
-        buildConfigField("boolean", "RUNTIME_CLIENT", "false")
+        buildConfigField("boolean", "RUNTIME_CLIENT", "true")
         buildConfigField("String", "RUNTIME_REVISION", "\"${rootProject.extra["runtimeRevision"]}\"")
     }
-
-    testBuildType = "performance"
-
+    sourceSets.getByName("main") {
+        java.srcDirs("../app/src/main/java", "../app/src/main/kotlin")
+        res.srcDirs("../app/src/main/res")
+        assets.srcDirs("../app/src/main/assets")
+    }
     buildTypes {
         create("performance") {
             initWith(getByName("release"))
@@ -35,38 +34,17 @@ android {
             signingConfig = signingConfigs.getByName("debug")
         }
     }
-
     buildFeatures {
         buildConfig = true
         compose = true
     }
-
-    testOptions {
-        unitTests.isIncludeAndroidResources = true
-    }
-
-    lint {
-        disable += "ExpiredTargetSdkVersion"
-    }
-
+    lint { disable += "ExpiredTargetSdkVersion" }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-
-    kotlinOptions {
-        jvmTarget = "17"
-    }
+    kotlinOptions { jvmTarget = "17" }
 }
-
-val bundledUi = tasks.register<Copy>("bundleRuntimeUi") {
-    dependsOn(":collector-ui:assemblePerformance")
-    from(project(":collector-ui").layout.buildDirectory.file("outputs/apk/performance/collector-ui-performance.apk"))
-    into(layout.buildDirectory.dir("generated/runtimeUiAssets"))
-    rename { "collector-ui.apk" }
-}
-android.sourceSets.getByName("main").assets.srcDir(layout.buildDirectory.dir("generated/runtimeUiAssets"))
-tasks.named("preBuild") { dependsOn(bundledUi) }
 
 dependencies {
     implementation("org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5")
@@ -81,7 +59,4 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("org.osmdroid:osmdroid-android:6.1.20")
     debugImplementation("androidx.compose.ui:ui-tooling")
-
-    testImplementation(kotlin("test"))
-    testImplementation("org.json:json:20240303")
 }

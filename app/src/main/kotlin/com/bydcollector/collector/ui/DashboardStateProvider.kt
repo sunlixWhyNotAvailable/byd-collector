@@ -58,6 +58,13 @@ class DashboardStateProvider(
         previous: DashboardState? = null,
         vehicleKpiLanguage: VehicleKpiLanguage = VehicleKpiLanguage.UK
     ): DashboardState {
+        if (com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) {
+            com.bydcollector.collector.runtime.RuntimePreferences.refresh(context)
+            return com.bydcollector.collector.runtime.RuntimeReads.read(context, "dashboard", android.os.Bundle().apply {
+                putString("profile", profile.name)
+                putString("language", vehicleKpiLanguage.name)
+            })
+        }
         val maintenanceStatus = settings.dbMaintenanceStatus()
         val mainMaintenanceRunning = maintenanceStatus.running &&
             maintenanceStatus.operation == DbMaintenanceOperation.ARCHIVE

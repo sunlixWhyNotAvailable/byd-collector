@@ -5,7 +5,7 @@ enum class CallbackQueuePhase { UNKNOWN, HEALTHY, CATCHING_UP, WAITING, ERROR }
 data class CallbackQueueState(
     val phase: CallbackQueuePhase,
     val reason: String? = null
-)
+) : java.io.Serializable
 
 /** Tracks only batches observed in-flight by the existing callback download path. */
 class CallbackQueueStatusTracker(

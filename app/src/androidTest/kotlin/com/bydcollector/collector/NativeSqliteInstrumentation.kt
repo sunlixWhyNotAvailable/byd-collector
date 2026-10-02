@@ -48,6 +48,7 @@ class NativeSqliteInstrumentation : Instrumentation() {
     private var shutdownLifecycleFixture = false
     private var fixtureLanguage = "uk"
     private var workerReplayFixture: String? = null
+    private var runtimeBoundaryFixture = false
 
     override fun onCreate(arguments: Bundle?) {
         super.onCreate(arguments)
@@ -58,6 +59,7 @@ class NativeSqliteInstrumentation : Instrumentation() {
         shutdownLifecycleFixture = arguments?.getString("shutdownLifecycleFixture") == "true"
         fixtureLanguage = arguments?.getString("language") ?: "uk"
         workerReplayFixture = arguments?.getString("workerReplayFixture")
+        runtimeBoundaryFixture = arguments?.getString("runtimeBoundary") == "true"
         start()
     }
 
@@ -72,6 +74,12 @@ class NativeSqliteInstrumentation : Instrumentation() {
                     WorkerReplayParcelGate.run(File(targetContext.cacheDir, "${prefix}_worker_replay"), File(path))
                 } finally { cleanupTestFiles() }
             }
+            finish(if (result.isSuccess) Activity.RESULT_OK else Activity.RESULT_CANCELED,
+                Bundle().apply { putString("stream", result.getOrElse { it.stackTraceToString() }) })
+            return
+        }
+        if (runtimeBoundaryFixture) {
+            val result = runCatching { RuntimeBoundaryGate.run(this) }
             finish(if (result.isSuccess) Activity.RESULT_OK else Activity.RESULT_CANCELED,
                 Bundle().apply { putString("stream", result.getOrElse { it.stackTraceToString() }) })
             return

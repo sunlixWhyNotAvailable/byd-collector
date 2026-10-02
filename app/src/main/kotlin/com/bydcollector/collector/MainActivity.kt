@@ -1,5 +1,9 @@
 package com.bydcollector.collector
 
+import com.bydcollector.collector.runtime.*
+import org.json.JSONObject
+import org.json.JSONArray
+
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
@@ -99,6 +103,74 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 //coordinates the user-facing compose shell while CollectorService owns long-running vehicle work
 class MainActivity : ComponentActivity() {
+    private val runtimeJobCallbacks = mutableMapOf<String, (Boolean) -> Unit>()
+    private val presentedRuntimeJobs = mutableSetOf<String>()
+    private var lastRuntimeMetadataAt = 0L
+    private val runtimeObserver = object : android.database.ContentObserver(Handler(Looper.getMainLooper())) {
+        override fun onChange(selfChange: Boolean) { if (foreground && !destroyed) refresh(force = false) }
+    }
+
+    private fun submitRuntimeJob(kind: String, args: JSONObject = JSONObject()): String? = runCatching {
+        RuntimeEndpoint.call(this, "job.submit", Bundle().apply {
+            putString("kind", kind); putString("args", args.toString())
+        }).getString("id") ?: error("Runtime did not accept the task")
+    }.onFailure {
+        actionUiState = actionUiState.copy(mqttTest = false, influxTest = false, adbGrant = false)
+        diagnosticsBusy = false
+        Toast.makeText(this, it.message ?: "Runtime task failed", Toast.LENGTH_LONG).show()
+    }.getOrNull()
+
+    private fun consumeRuntimeJobs(json: String) {
+        val array = JSONArray(json)
+        val jobs = (0 until array.length()).map(array::getJSONObject)
+        val active = jobs.filter { it.optString("status") in setOf("queued", "running") }
+        diagnosticsBusy = active.any { it.getString("kind").startsWith("log") }
+        actionUiState = actionUiState.copy(mqttTest = active.any { it.getString("kind") == "mqttTest" },
+            influxTest = active.any { it.getString("kind") == "influxTest" })
+        active.firstOrNull { it.getString("kind") == "updateDownload" }?.let { job ->
+            val args = job.getJSONObject("args")
+            updateUiState = UpdateUiState.Downloading(UpdateInfo(args.getString("version"), args.getString("url"), ""), job.optInt("progress"))
+        }
+        jobs.filter { it !in active && !it.optBoolean("presented") }.forEach { job ->
+            val id = job.getString("id")
+            if (id in presentedRuntimeJobs) return@forEach
+            val kind = job.getString("kind")
+            val success = job.getString("status") == "complete"
+            val result = job.optJSONObject("result") ?: JSONObject()
+            val delivered = runCatching {
+                if (success && (result.has("uri") || result.has("uris"))) {
+                    RuntimeEndpoint.call(this, "job.prepare", Bundle().apply { putString("id", id) })
+                }
+                if (success && (kind == "logShare" || kind == "archiveShare")) {
+                    val uris = if (kind == "logShare") arrayListOf(Uri.parse(result.getString("uri")))
+                    else result.getJSONArray("uris").let { list -> ArrayList((0 until list.length()).map { Uri.parse(list.getString(it)) }) }
+                    val share = Intent(if (uris.size == 1) Intent.ACTION_SEND else Intent.ACTION_SEND_MULTIPLE).apply {
+                        type = "application/zip"
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        if (uris.size == 1) putExtra(Intent.EXTRA_STREAM, uris[0])
+                        else putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                        clipData = android.content.ClipData.newRawUri("BYD Collector", uris.first()).also { clip ->
+                            uris.drop(1).forEach { clip.addItem(android.content.ClipData.Item(it)) }
+                        }
+                    }
+                    startActivity(Intent.createChooser(share, "BYD Collector"))
+                } else if (success && kind == "updateDownload") {
+                    startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(result.getString("uri")),
+                        "application/vnd.android.package-archive").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                    updateRuntime.onInstallerLaunched()
+                    updateUiState = UpdateUiState.Hidden
+                } else if (kind != "access") {
+                    val message = if (success) result.optString("message").ifBlank { "$kind: OK" } else job.optString("error")
+                    Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+                    if (kind == "updateDownload") updateUiState = UpdateUiState.Error(message)
+                }
+                runtimeJobCallbacks.remove(id)?.invoke(success)
+                RuntimeEndpoint.call(this, "job.presented", Bundle().apply { putString("id", id) })
+            }
+            if (delivered.isSuccess) presentedRuntimeJobs += id
+            else Log.w(TAG, "Runtime result presentation failed", delivered.exceptionOrNull())
+        }
+    }
     private lateinit var store: TelemetryStore
     private lateinit var settings: CollectorSettings
     private lateinit var settingsPreferences: SharedPreferences
@@ -127,7 +199,7 @@ class MainActivity : ComponentActivity() {
     private val overlayPermissionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         runtimePermissionRequestInFlight = false
         if (!destroyed && ::settings.isInitialized) {
-            recordUpdateEvent("overlay_permission_returned", "allowed=${Settings.canDrawOverlays(this)}")
+            recordUpdateEvent("overlay_permission_returned", "allowed=${(if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.state.getBoolean("overlay") else Settings.canDrawOverlays(this))}")
             updateRuntime.onPresentationAccessChanged()
             maybeContinueStartupAccessFlow()
         }
@@ -256,7 +328,8 @@ class MainActivity : ComponentActivity() {
         override fun onLanguageSelected(language: UiLanguage) {
             uiLanguage = language
             settings.setUiLanguageCode(language.code)
-            (applicationContext as BydCollectorApplication).updateHints.refresh(darkTheme)
+            if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("hintStyle", Bundle().apply { putBoolean("dark", darkTheme) })
+            else (applicationContext as BydCollectorApplication).updateHints.refresh(darkTheme)
             dashboardUiStateStore.selectVehicleKpiLanguage(language.vehicleKpiLanguage())
             val previousTelegram = telegramUiState
             if (previousTelegram.config.messages[TelegramMessageType.TRIP_SUMMARY]?.usesDefaultTemplate == true) {
@@ -276,7 +349,8 @@ class MainActivity : ComponentActivity() {
 
         override fun onDarkThemeSelected(dark: Boolean) {
             darkTheme = dark
-            (applicationContext as BydCollectorApplication).updateHints.refresh(dark)
+            if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("hintStyle", Bundle().apply { putBoolean("dark", dark) })
+            else (applicationContext as BydCollectorApplication).updateHints.refresh(dark)
         }
 
         override fun onStartMain() {
@@ -316,7 +390,8 @@ class MainActivity : ComponentActivity() {
                     detail = "source=ui control=main_auto_start tab=$activeTab"
                 )
                 if (enabled) {
-                    CollectorAutoStart.scheduleWatchdog(applicationContext, settings, currentStore())
+                    if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("watchdog")
+                    else CollectorAutoStart.scheduleWatchdog(applicationContext, settings, currentStore())
                 }
                 refresh()
             }
@@ -349,6 +424,13 @@ class MainActivity : ComponentActivity() {
             pendingMaintenanceOperation = null
             pendingMainArchivePreflight = null
             stateProvider.invalidateArchiveStorageSnapshot()
+            if (BuildConfig.RUNTIME_CLIENT) {
+                runCatching {
+                    if (operation == DbMaintenanceOperation.ARCHIVE) CollectorServiceController.archiveDatabase(this@MainActivity)
+                    else CollectorServiceController.archiveDebugDatabase(this@MainActivity)
+                }.onFailure(::postMaintenanceLaunchFailure)
+                return
+            }
             val runningStatus = DbMaintenanceRuntimeStatus(
                 operation = operation,
                 running = true,
@@ -477,7 +559,8 @@ class MainActivity : ComponentActivity() {
                     detail = "source=ui control=debug_auto_start tab=$activeTab"
                 )
                 if (enabled) {
-                    CollectorAutoStart.scheduleWatchdog(applicationContext, settings, currentStore())
+                    if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("watchdog")
+                    else CollectorAutoStart.scheduleWatchdog(applicationContext, settings, currentStore())
                 }
                 refresh()
             }
@@ -520,6 +603,10 @@ class MainActivity : ComponentActivity() {
             if (actionUiState.mqttTest || !validateMqttDraft(mqttDraft.editingProfile)) return
             val selected = mqttDraft.editingProfile
             actionUiState = actionUiState.copy(mqttTest = true)
+            if (BuildConfig.RUNTIME_CLIENT) {
+                if (saveMqttDraft()) submitRuntimeJob("mqttTest", JSONObject().put("profile", selected.name))
+                return
+            }
             runMqttChannelAction("MQTT test") { actionStore ->
                 HaMqttActions.testConnection(actionStore, settings, profile = selected)
             }
@@ -527,7 +614,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onToggleMqttAutoStart(enabled: Boolean) {
             if (!enabled && CollectorService.mqttConnection.owned && !CollectorService.mqttConnection.stopping &&
-                !settings.isMqttManuallyStopped()) HaRunSession.process.start(HaExportChannel.MQTT)
+                !settings.isMqttManuallyStopped()) if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("grantMqtt") else HaRunSession.process.start(HaExportChannel.MQTT)
             if (enabled) settings.setMqttManuallyStopped(false)
             settings.setMqttAutoStartEnabled(enabled)
             refresh()
@@ -579,6 +666,10 @@ class MainActivity : ComponentActivity() {
             if (actionUiState.influxTest || !validateInfluxDraft(influxDraft.editingProfile)) return
             val selected = influxDraft.editingProfile
             actionUiState = actionUiState.copy(influxTest = true)
+            if (BuildConfig.RUNTIME_CLIENT) {
+                if (saveInfluxDraft()) submitRuntimeJob("influxTest", JSONObject().put("profile", selected.name))
+                return
+            }
             runInfluxChannelAction("Influx test", clearAction = { it.copy(influxTest = false) }) { actionStore ->
                 InfluxActions.testConnection(actionStore, settings, profile = selected)
             }
@@ -586,7 +677,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onToggleInfluxAutoStart(enabled: Boolean) {
             if (!enabled && CollectorService.influxConnection.owned && !CollectorService.influxConnection.stopping &&
-                !settings.isInfluxManuallyStopped()) HaRunSession.process.start(HaExportChannel.INFLUX)
+                !settings.isInfluxManuallyStopped()) if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("grantInflux") else HaRunSession.process.start(HaExportChannel.INFLUX)
             if (enabled) settings.setInfluxManuallyStopped(false)
             settings.setInfluxAutoStartEnabled(enabled)
             refresh()
@@ -637,7 +728,8 @@ class MainActivity : ComponentActivity() {
         override fun onToggleUpdateHint(enabled: Boolean) {
             settings.setUpdateHintEnabled(enabled)
             updateHintEnabled = settings.isUpdateHintEnabled()
-            (applicationContext as BydCollectorApplication).updateHints.refresh(darkTheme)
+            if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("hintStyle", Bundle().apply { putBoolean("dark", darkTheme) })
+            else (applicationContext as BydCollectorApplication).updateHints.refresh(darkTheme)
             if (enabled) maybeRequestOverlayAccess(userInitiated = true)
             updateRuntime.onPresentationAccessChanged()
         }
@@ -645,7 +737,8 @@ class MainActivity : ComponentActivity() {
         override fun onUpdateHintAppearanceChanged(appearance: UpdateHintAppearance) {
             settings.setUpdateHintAppearance(appearance)
             updateHintAppearance = settings.updateHintAppearance()
-            (applicationContext as BydCollectorApplication).updateHints.refresh(darkTheme)
+            if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("hintStyle", Bundle().apply { putBoolean("dark", darkTheme) })
+            else (applicationContext as BydCollectorApplication).updateHints.refresh(darkTheme)
         }
 
         override fun onDismissUpdateDialog() {
@@ -670,7 +763,8 @@ class MainActivity : ComponentActivity() {
             handler.removeCallbacks(startupAdbSelfCheckTask)
             startupAdbSelfCheckPosted = false
             handler.removeCallbacks(telegramReconcileTask)
-            CollectorAutoStart.cancelScheduled(applicationContext)
+            if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("cancelWatchdog")
+            else CollectorAutoStart.cancelScheduled(applicationContext)
             updateRuntime.shutdown()
             updateUiGeneration += 1L
             updateUiState = UpdateUiState.Hidden
@@ -703,7 +797,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        CollectorService.influxRuntimeDiagnostics.attachJournal(applicationContext)
+        if (!BuildConfig.RUNTIME_CLIENT) CollectorService.influxRuntimeDiagnostics.attachJournal(applicationContext)
         navigationSessionGeneration = navigationSession.captureGeneration()
         settings = CollectorSettings(applicationContext)
         val restoredShutdownInThisProcess = savedInstanceState?.getInt("shutdownOwnerPid") == android.os.Process.myPid()
@@ -712,9 +806,9 @@ class MainActivity : ComponentActivity() {
         uiLanguage = UiLanguage.fromCode(settings.uiLanguageCode())
         updateHintEnabled = settings.isUpdateHintEnabled()
         updateHintAppearance = settings.updateHintAppearance()
-        settingsPreferences = getSharedPreferences(CollectorSettings.PREFS_NAME, MODE_PRIVATE)
+        settingsPreferences = RuntimePreferences.get(applicationContext)
         settingsPreferences.registerOnSharedPreferenceChangeListener(settingsChangeListener)
-        if (!CollectorService.isMaintenanceRunningInProcess() && !DatabaseMaintenanceService.isRunning()) {
+        if (!BuildConfig.RUNTIME_CLIENT && !CollectorService.isMaintenanceRunningInProcess() && !DatabaseMaintenanceService.isRunning()) {
             settings.recoverInterruptedDbMaintenanceIfNeeded("activity_start")
         }
         updateChecks.addListener(updateCheckListener)
@@ -827,8 +921,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        if (BuildConfig.RUNTIME_CLIENT) contentResolver.registerContentObserver(RuntimeEndpoint.uri, false, runtimeObserver)
         updateRuntime.onUiVisible()
-        if (!settings.isUserShutdownRequested()) CollectorServiceController.start(this)
+        if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("attach")
+        else if (!settings.isUserShutdownRequested()) CollectorServiceController.start(this)
     }
 
     override fun onResume() {
@@ -896,6 +992,25 @@ class MainActivity : ComponentActivity() {
             observeShutdownPhase()
             return
         }
+        if (BuildConfig.RUNTIME_CLIENT) {
+            shutdownReopenInFlight = true
+            diagnosticsExecutor.execute {
+                val result = runCatching { RuntimeEndpoint.call(this, "reopen").getBoolean("reopened") }
+                runOnUiThread {
+                    shutdownReopenInFlight = false
+                    if (!destroyed) {
+                        if (result.getOrDefault(false)) {
+                            shutdownUiRequested = false
+                            startupAccessFlowCompleted = false
+                            updateRuntime.start("explicit_reopen")
+                            maybeContinueStartupAccessFlow()
+                            refresh()
+                        } else showShutdownFailure(result.exceptionOrNull()?.message ?: "Runtime recovery failed")
+                    }
+                }
+            }
+            return
+        }
         shutdownReopenInFlight = true
         // Cancelling the detached finalizer needs local ADB; never block Activity creation on it.
         diagnosticsExecutor.execute {
@@ -957,7 +1072,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun consumeUpdateHintOpen() {
-        if ((applicationContext as BydCollectorApplication).updateHints.consumeOpenRequest()) {
+        if ((if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("hintOpen").getBoolean("opened") else (applicationContext as BydCollectorApplication).updateHints.consumeOpenRequest())) {
             navigationSession.selectTab(AppTab.EXTRA)
             updateKpiVisibility()
             updatePresentationRevision = -1L
@@ -974,6 +1089,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
+        if (BuildConfig.RUNTIME_CLIENT) contentResolver.unregisterContentObserver(runtimeObserver)
         if (!isChangingConfigurations && !settings.isUserShutdownRequested()) {
             updateRuntime.onUiHidden()
         }
@@ -982,7 +1098,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         destroyed = true
-        com.bydcollector.collector.service.KpiUiVisibility.update(kpiVisibilityOwner, false)
+        if (BuildConfig.RUNTIME_CLIENT) contentResolver.unregisterContentObserver(runtimeObserver)
+        if (BuildConfig.RUNTIME_CLIENT) runCatching { RuntimeClient.visibility(ui = false, kpi = false) }
+        else com.bydcollector.collector.service.KpiUiVisibility.update(kpiVisibilityOwner, false)
         updateChecks.removeListener(updateCheckListener)
         releaseNotesHistory.removeListener(releaseNotesListener)
         archiveDeleteDispatchStartedAtMs = null
@@ -990,7 +1108,7 @@ class MainActivity : ComponentActivity() {
         diagnosticsBusy = false
         //asks the watchdog path to recover service work if the user closes only the activity
         if (
-            ::settings.isInitialized &&
+            !BuildConfig.RUNTIME_CLIENT && ::settings.isInitialized &&
             !settings.isUserShutdownRequested() &&
             !CollectorSettings.isDbMaintenanceRunning(applicationContext)
         ) {
@@ -1012,6 +1130,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun updateKpiVisibility() {
+        if (BuildConfig.RUNTIME_CLIENT) {
+            RuntimeClient.visibility(kpi = !destroyed && foreground && activeTab == AppTab.ALL_PARAMETERS && kpiViewportVisible)
+            return
+        }
         com.bydcollector.collector.service.KpiUiVisibility.update(kpiVisibilityOwner,
             !destroyed && foreground && activeTab == AppTab.ALL_PARAMETERS && kpiViewportVisible)
     }
@@ -1053,6 +1175,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun shareArchives(ids: List<String>) {
+        if (BuildConfig.RUNTIME_CLIENT) { submitRuntimeJob("archiveShare", JSONObject().put("ids", JSONArray(ids))); return }
         if (!archiveShareInFlight.compareAndSet(false, true)) return
         val requestedIds = ids.toList()
         if (CollectorService.isArchiveStorageActive()) {
@@ -1196,6 +1319,7 @@ class MainActivity : ComponentActivity() {
                 handler.postDelayed(cancel, DASHBOARD_COUNT_BUDGET_MS)
                 runCatching {
                     android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+                    if (BuildConfig.RUNTIME_CLIENT) return@runCatching RuntimeReads.read<DashboardRowCounts>(this@MainActivity, "counts")
                     val application = applicationContext as BydCollectorApplication
                     val main = application.tryTelemetryStoreRead { it.dashboardRowCounts(cancellation) }
                         ?: return@runCatching null
@@ -1268,7 +1392,8 @@ class MainActivity : ComponentActivity() {
         maintenancePreflightInFlight = true
         val task = Runnable {
             val result = runCatching {
-                withTelemetryStoreRead { preflightStore ->
+                if (BuildConfig.RUNTIME_CLIENT) RuntimeReads.read<MainArchivePreflight>(this, "mainPreflight")
+                else withTelemetryStoreRead { preflightStore ->
                     StorageFormatCutoverCoordinator.readMainPreflight(preflightStore.databaseFile())
                 }
             }
@@ -1328,12 +1453,13 @@ class MainActivity : ComponentActivity() {
                 val groups = trips.queryHierarchy()
                 val routes = requestedRouteId?.let { id -> mapOf(id to trips.queryRoutePoints(id)) }.orEmpty()
                 val availableCurrentTrip = trips.loadOpenSession()?.let { TripsUiMapper.current(it, requestedLanguage) }
-                val tripsBytes = sqliteFootprintBytes(trips.databaseFile)
-                runCatching { sqliteFootprintBytes(DirectDebugDatabaseResolver.databaseFile(this@MainActivity)) }
+                val remoteBytes = if (BuildConfig.RUNTIME_CLIENT) RuntimeReads.read<LongArray>(this@MainActivity, "footprints") else null
+                val tripsBytes = remoteBytes?.get(2) ?: sqliteFootprintBytes(trips.databaseFile)
+                runCatching { remoteBytes?.get(1) ?: sqliteFootprintBytes(DirectDebugDatabaseResolver.databaseFile(this@MainActivity)) }
                     .getOrNull()
                     ?.let { debugBytes ->
                         dashboardUiStateStore.publishDatabaseFootprints(
-                            sqliteFootprintBytes(getDatabasePath(com.bydcollector.collector.data.local.TelemetryDatabaseHelper.DATABASE_NAME)),
+                            remoteBytes?.get(0) ?: sqliteFootprintBytes(getDatabasePath(com.bydcollector.collector.data.local.TelemetryDatabaseHelper.DATABASE_NAME)),
                             debugBytes,
                             tripsBytes
                         )
@@ -1341,7 +1467,7 @@ class MainActivity : ComponentActivity() {
                 TripsLoadResult(
                     years = TripsUiMapper.years(groups, requestedLanguage, routes),
                     refreshedRouteId = requestedRouteId,
-                    databasePath = trips.databaseFile.absolutePath,
+                    databasePath = if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.state.getString("tripPath").orEmpty() else trips.databaseFile.absolutePath,
                     databaseSizeBytes = tripsBytes,
                     availableCurrentTrip = availableCurrentTrip
                 )
@@ -1551,20 +1677,29 @@ class MainActivity : ComponentActivity() {
             intervalMs = DASHBOARD_CHROME_REFRESH_INTERVAL_MS,
             nowMs = nowMs
         )
-        if (!tabDue && !chromeDue) return
+        if (!tabDue && !chromeDue && !BuildConfig.RUNTIME_CLIENT) return
         if (refreshInFlight) {
             if (force) forcedRefreshPending = true
             return
         }
 
         refreshInFlight = true
-        val tabGeneration = if (tabDue) dashboardUiStateStore.beginTabRefresh(tab) else null
-        val chromeGeneration = if (chromeDue) dashboardUiStateStore.beginChromeRefresh() else null
+        val tabGeneration = if (tabDue || (BuildConfig.RUNTIME_CLIENT && profile != null)) dashboardUiStateStore.beginTabRefresh(tab) else null
+        val chromeGeneration = if (chromeDue || BuildConfig.RUNTIME_CLIENT) dashboardUiStateStore.beginChromeRefresh() else null
         val kpiLanguage = uiLanguage.vehicleKpiLanguage()
         dashboardExecutor.execute {
+            val runtimeJobs = if (BuildConfig.RUNTIME_CLIENT && nowMs - lastRuntimeMetadataAt >= 1_000L) runCatching {
+                RuntimeClient.refresh()
+                RuntimePreferences.refresh(this@MainActivity)
+                RuntimeClient.refreshUpdates()
+                lastRuntimeMetadataAt = nowMs
+                RuntimeReads.read<String>(this@MainActivity, "jobs")
+            } else null
             val tabResult = if (tabGeneration != null && profile != null) {
                 runCatching {
-                    stateProvider.load(
+                    if (BuildConfig.RUNTIME_CLIENT && !tabDue) RuntimeReads.read<DashboardState>(this@MainActivity, "dashboard", Bundle().apply {
+                        putString("profile", profile.name); putString("language", kpiLanguage.name); putBoolean("cached", true)
+                    }) else stateProvider.load(
                         profile = profile,
                         previous = dashboardUiStateStore.currentTab(tab),
                         vehicleKpiLanguage = kpiLanguage
@@ -1577,7 +1712,9 @@ class MainActivity : ComponentActivity() {
                 val reusableTabState = tabResult?.getOrNull()
                     ?.takeIf { profile?.healthDetail != null }
                 reusableTabState?.let { Result.success(it) } ?: runCatching {
-                    stateProvider.load(
+                    if (BuildConfig.RUNTIME_CLIENT && !chromeDue) RuntimeReads.read<DashboardState>(this@MainActivity, "dashboard", Bundle().apply {
+                        putString("profile", DashboardLoadProfile.CHROME.name); putString("language", kpiLanguage.name); putBoolean("cached", true)
+                    }) else stateProvider.load(
                         profile = DashboardLoadProfile.CHROME,
                         previous = dashboardUiStateStore.currentChrome(),
                         vehicleKpiLanguage = kpiLanguage
@@ -1589,6 +1726,7 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 refreshInFlight = false
                 if (destroyed) return@runOnUiThread
+                runtimeJobs?.onSuccess { syncUpdateCheckUi(); syncReleaseNotesUi(); consumeRuntimeJobs(it) }
                 if (tabGeneration != null && tabResult != null) {
                     tabResult
                         .onSuccess { state ->
@@ -1750,7 +1888,7 @@ class MainActivity : ComponentActivity() {
                 )
             },
             Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                data = Uri.parse("package:$packageName")
+                data = Uri.parse("package:${if (BuildConfig.RUNTIME_CLIENT) RuntimeEndpoint.OWNER_PACKAGE else packageName}")
             },
             Intent(Settings.ACTION_SETTINGS)
         )
@@ -1829,14 +1967,14 @@ class MainActivity : ComponentActivity() {
     private fun maybeRequestOverlayAccess(userInitiated: Boolean): Boolean {
         if (destroyed || !foreground || !mainWindowHasFocus || !settings.isUpdateHintEnabled()) return false
         if (runtimePermissionRequestInFlight) return true
-        if (Settings.canDrawOverlays(this)) return false
+        if ((if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.state.getBoolean("overlay") else Settings.canDrawOverlays(this))) return false
         val prefs = getSharedPreferences(STARTUP_SETUP_PREFS, MODE_PRIVATE)
         if (!userInitiated && prefs.getBoolean(KEY_OVERLAY_PERMISSION_SETUP_CONSUMED, false)) return false
         // Persist before opening Settings so denial/recreation is not another prompt.
         prefs.edit().putBoolean(KEY_OVERLAY_PERMISSION_SETUP_CONSUMED, true).apply()
         runtimePermissionRequestInFlight = true
         return try {
-            overlayPermissionLauncher.launch(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+            overlayPermissionLauncher.launch(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${if (BuildConfig.RUNTIME_CLIENT) RuntimeEndpoint.OWNER_PACKAGE else packageName}")))
             recordUpdateEvent("overlay_permission_requested", "source=${if (userInitiated) "toggle" else "visible_startup"}")
             true
         } catch (error: RuntimeException) {
@@ -1847,6 +1985,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun maybeRunStartupLocationPermission(): Boolean {
+        if (BuildConfig.RUNTIME_CLIENT) return false // The owner launcher requests its own location permission.
         val prefs = getSharedPreferences(STARTUP_SETUP_PREFS, MODE_PRIVATE)
         if (prefs.getBoolean(KEY_LOCATION_PERMISSION_SETUP_CONSUMED, false)) return false
         if (
@@ -1928,6 +2067,11 @@ class MainActivity : ComponentActivity() {
         afterComplete: (() -> Unit)? = null,
         onTerminal: (() -> Unit)? = null
     ): Boolean {
+        if (BuildConfig.RUNTIME_CLIENT) {
+            val id = submitRuntimeJob("access", JSONObject().put("source", source).put("mode", mode.name)) ?: return false
+            runtimeJobCallbacks[id] = { success -> if (success) afterComplete?.invoke(); onTerminal?.invoke() }
+            return true
+        }
         return AdbAuthorizationManager.request(
             context = applicationContext,
             store = currentStore(),
@@ -1990,6 +2134,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startUpdateDownload(info: UpdateInfo) {
+        if (BuildConfig.RUNTIME_CLIENT) {
+            submitRuntimeJob("updateDownload", JSONObject().put("version", info.version).put("url", info.downloadUrl)
+                .put("notes", info.releaseNotes).put("contentType", info.downloadContentType))
+            return
+        }
         updateRuntime.onInstallStarted()
         updateChecks.clearPresentation()
         updatePresentationRevision = updateChecks.snapshot().revision
@@ -2501,6 +2650,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startLogcatRecording() {
+        if (BuildConfig.RUNTIME_CLIENT) { submitRuntimeJob("logStart"); return }
         if (diagnosticsBusy || DiagnosticLogRecorder.shareStage.value != null) return
         refreshStoreBackedState()
         diagnosticsBusy = true
@@ -2551,6 +2701,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun stopLogcatRecording() {
+        if (BuildConfig.RUNTIME_CLIENT) { submitRuntimeJob("logStop"); return }
         if (diagnosticsBusy || DiagnosticLogRecorder.shareStage.value != null) return
         refreshStoreBackedState()
         diagnosticsBusy = true
@@ -2578,6 +2729,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun shareDiagnosticLogs() {
+        if (BuildConfig.RUNTIME_CLIENT) { submitRuntimeJob("logShare"); return }
         if (diagnosticsBusy || DiagnosticLogRecorder.shareStage.value != null) return
         diagnosticsBusy = true
         val title = strings(uiLanguage).shareLogs
@@ -2633,6 +2785,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun clearDiagnosticLogs() {
+        if (BuildConfig.RUNTIME_CLIENT) { submitRuntimeJob("logClear"); return }
         if (diagnosticsBusy || DiagnosticLogRecorder.shareStage.value != null) return
         diagnosticsBusy = true
         val task = Runnable {

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="com.bydcollector.collector.permission.RUNTIME" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <queries><package android:name="com.bydcollector.collector" /></queries>
+    <application
+        android:name="com.bydcollector.collector.BydCollectorApplication"
+        android:allowBackup="false"
+        android:icon="@drawable/collector_launcher_icon"
+        android:label="BYD Collector"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme">
+        <!-- No launcher duplication and no collection, export, or recovery service. -->
+        <activity
+            android:name="com.bydcollector.collector.MainActivity"
+            android:autoRemoveFromRecents="false"
+            android:excludeFromRecents="false"
+            android:exported="true"
+            android:permission="com.bydcollector.collector.permission.RUNTIME" />
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/update_file_paths" />
+        </provider>
+    </application>
+</manifest>

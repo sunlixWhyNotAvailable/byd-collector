@@ -8,7 +8,7 @@ data class HaConnectionState(
     val owned: Boolean = false,
     val activeRoute: HaEndpointProfile? = null,
     val stopping: Boolean = false
-)
+) : java.io.Serializable
 
 /** One accepted Start through completed Stop, independent of transport status/backoff. */
 class HaConnectionOwnership {
@@ -24,4 +24,8 @@ class HaConnectionOwnership {
     fun beginStop() = current.update { it.copy(owned = true, stopping = true) }
     fun stopSubmissionFailed() = current.update { it.copy(stopping = false) }
     fun release() { current.value = HaConnectionState() }
+    internal fun displaySnapshot(snapshot: HaConnectionState) {
+        check(com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT)
+        current.value = snapshot
+    }
 }

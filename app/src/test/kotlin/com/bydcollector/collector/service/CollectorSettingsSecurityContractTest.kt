@@ -64,21 +64,6 @@ class CollectorSettingsSecurityContractTest {
     }
 
     @Test
-    fun recentsRemovalIsNotWiredToStopOrShutdown() {
-        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
-        val removal = service.substringAfter("override fun onTaskRemoved(").substringBefore("override fun onTimeout(")
-        assertTrue(removal.contains("rememberTaskRemoval()"))
-        assertTrue(removal.contains("scheduleRestartAfterTaskRemoved"))
-        listOf("stopMain(", "stopDebug(", "shutdownByUser(", "setPollingEnabled(false)", "stopSelf(").forEach {
-            assertFalse(removal.contains(it), "Task removal must not dispatch $it")
-        }
-        val manifest = listOf(File("src/main/AndroidManifest.xml"), File("app/src/main/AndroidManifest.xml"))
-            .first { it.isFile }.readText()
-        assertTrue(manifest.contains("android:excludeFromRecents=\"false\""))
-        assertTrue(manifest.contains("android:stopWithTask=\"false\""))
-    }
-
-    @Test
     fun secondaryOnlyTaskRecoveryUsesRetainedDemandInsteadOfAutostartOnly() {
         val prefs = InMemorySharedPreferences(mapOf(CollectorSettings.KEY_DEBUG_POLLING_ENABLED to true))
         CollectorSettings.rememberTaskRemoval(prefs, "boot-a", RuntimeDemand(debug = true), true)

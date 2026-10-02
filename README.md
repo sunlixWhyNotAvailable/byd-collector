@@ -25,7 +25,9 @@ You need Android 8.0 or newer, a compatible DiLink system, permission to install
 6. Start collection on `Main` and check its status and readings. Enable automatic start if wanted.
 7. Configure only the integrations you need and test each connection before using it.
 
-Without ADB authorization, fresh telemetry cannot be collected, but stored data and settings remain accessible. Authorization and background permissions may need restoring after a tablet reset or firmware update.
+The first launch uses local ADB to install the matching bundled interface component. There is still one launcher icon. The interface runs separately from collection and integrations; removing its Recents card does not stop accepted background work. Databases, credentials, and services remain in the original app. Use Stop or Shutdown to stop work deliberately.
+
+After the interface is installed, stored data and settings remain accessible without ADB authorization, but fresh telemetry cannot be collected. Authorization and background permissions may need restoring after a tablet reset or firmware update. Uninstalling the original app deletes its data; uninstalling only the interface does not.
 
 ## Everyday use
 

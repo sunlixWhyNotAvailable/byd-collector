@@ -5,6 +5,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.hardware.display.DisplayManager
+import com.bydcollector.collector.BuildConfig
+import com.bydcollector.collector.runtime.RuntimeClient
+import android.os.Bundle
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -60,11 +63,12 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
     }
 
     init {
-        app.updateChecks.addListener(checkListener)
+        if (!BuildConfig.RUNTIME_CLIENT) app.updateChecks.addListener(checkListener)
     }
 
     // Explicit normal entry points call this; a coordination-only service bind does not.
     fun start(source: String) {
+        if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.control("updateStart"); return }
         if (settings.isUserShutdownRequested()) return
         val firstEntry = !started
         val wasSleeping = wakePolicy.sleeping
@@ -144,6 +148,7 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
     }
 
     fun onUiVisible() {
+        if (BuildConfig.RUNTIME_CLIENT) { ownUiVisible = true; RuntimeClient.visibility(ui = true); return }
         ownUiVisible = true
         cancelHintPresentation("own_ui_visible")
         start("activity")
@@ -151,22 +156,26 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
     }
 
     fun onUiHidden() {
+        if (BuildConfig.RUNTIME_CLIENT) { ownUiVisible = false; RuntimeClient.visibility(ui = false); return }
         ownUiVisible = false
         presentPendingHint()
         if (started) applyAction(UpdateAutoCheckRuntime.onBackground(enabled()))
     }
 
     fun onUiResumed() {
+        if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.control("updateResume"); return }
         if (awaitingInstallerReturn) onInstallFinished()
         presentPendingHint()
     }
 
     /** Reuses the cached result after permission/lifecycle changes; no HTTP check. */
     fun onPresentationAccessChanged() {
+        if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.control("updateAccess"); return }
         presentPendingHint()
     }
 
     fun onOfferPresented(resultId: Long) {
+        if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.control("offer", Bundle().apply { putLong("result", resultId) }); return }
         if (!ownUiVisible || !started || installing || wakePolicy.sleeping || settings.isUserShutdownRequested()) return
         val snapshot = app.updateChecks.snapshot()
         if (presentation.markPresented(snapshot, resultId)) {
@@ -223,12 +232,14 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
     }
 
     fun onAutoCheckEnabledChanged() {
+        if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.control("updateAuto"); return }
         handler.removeCallbacks(timer)
         if (!settings.isUpdateAutoCheckEnabled()) app.updateChecks.invalidateAutomatic()
         if (started) applyAction(UpdateAutoCheckRuntime.onAutoCheckEnabledChanged(enabled()))
     }
 
     fun request(manual: Boolean): Boolean {
+        if (BuildConfig.RUNTIME_CLIENT) return RuntimeClient.control("updateRequest", Bundle().apply { putBoolean("manual", manual) }).getBoolean("accepted")
         if (!started || installing || settings.isUserShutdownRequested() || (!manual && !enabled())) return false
         // A completed worker may be waiting for its posted listener. Consume it
         // before a user action/new timer can start another check in the same generation.
@@ -252,6 +263,7 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
     }
 
     fun dismissOffer() {
+        if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.control("updateDismiss"); return }
         val wasAvailable = app.updateChecks.dismiss()
         if (wasAvailable) {
             UpdateAutoCheckRuntime.onDismissed()
@@ -261,6 +273,7 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
     }
 
     fun shutdown() {
+        if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.control("updateShutdown"); return }
         started = false
         installing = false
         awaitingInstallerReturn = false
@@ -281,6 +294,7 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
     }
 
     fun onInstallStarted() {
+        if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.control("installStart"); return }
         installing = true
         awaitingInstallerReturn = false
         handler.removeCallbacks(timer)
@@ -289,10 +303,12 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
     }
 
     fun onInstallerLaunched() {
+        if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.control("installLaunched"); return }
         if (installing) awaitingInstallerReturn = true
     }
 
     fun onInstallFinished() {
+        if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.control("installFinish"); return }
         installing = false
         awaitingInstallerReturn = false
         if (started) applyAction(UpdateAutoCheckRuntime.onTimerElapsed(enabled(), ownUiVisible))

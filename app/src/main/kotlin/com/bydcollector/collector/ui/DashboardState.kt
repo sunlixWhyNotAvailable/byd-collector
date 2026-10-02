@@ -133,7 +133,7 @@ data class DashboardState(
         if (influxEnabled) RuntimeActionStatus.RUNNING else RuntimeActionStatus.STOPPED,
     val mainCallbackQueue: CallbackQueueState? = null,
     val secondaryCallbackQueue: CallbackQueueState? = null
-)
+) : java.io.Serializable
 
 /** One logical archive backed by zero or more physical raw, temporary, and ZIP entries. */
 internal data class ArchiveStorageRow(
@@ -240,7 +240,7 @@ data class VehicleKpis(
     val remainingRangeKm: String = "-",
     val batteryTempC: String = "-",
     val cellVoltageDeltaMv: String = "-"
-)
+) : java.io.Serializable
 
 data class DashboardRowCounts(
     val pollCount: Long,
@@ -249,6 +249,6 @@ data class DashboardRowCounts(
     val normalizedCurrentCount: Long,
     val normalizedHistoryCount: Long,
     val debugReadingCount: Long
-)
+) : java.io.Serializable
 
 const val UNKNOWN_DASHBOARD_COUNT = -1L

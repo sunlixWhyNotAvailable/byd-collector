@@ -164,11 +164,14 @@ internal object SettingsBehaviorGate {
                 settings.setMqttEnabled(true)
                 settings.setInfluxEnabled(true)
                 check(!settings.runtimeDemand().any)
-                check(settings.runtimeDemand(includeEnabledExports = true) == RuntimeDemand(mqtt = true, influx = true))
+                com.bydcollector.collector.ha.HaRunSession.process.start(com.bydcollector.collector.ha.HaExportChannel.MQTT)
+                com.bydcollector.collector.ha.HaRunSession.process.start(com.bydcollector.collector.ha.HaExportChannel.INFLUX)
+                check(settings.runtimeDemand() == RuntimeDemand(mqtt = true, influx = true))
                 settings.setMqttManuallyStopped(true)
-                check(settings.runtimeDemand(includeEnabledExports = true) == RuntimeDemand(influx = true))
+                check(settings.runtimeDemand() == RuntimeDemand(influx = true))
                 settings.setInfluxManuallyStopped(true)
-                check(!settings.runtimeDemand(includeEnabledExports = true).any)
+                check(!settings.runtimeDemand().any)
+                com.bydcollector.collector.ha.HaRunSession.process.clear()
                 check(!settings.isAutoStartEnabled() && !settings.isDebugAutoStartEnabled())
             }
         },

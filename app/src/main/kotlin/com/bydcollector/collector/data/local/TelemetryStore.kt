@@ -690,6 +690,12 @@ class TelemetryStore(
     }
 
     override fun recordEvent(category: String, message: String, detail: String?) {
+        if (com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) {
+            com.bydcollector.collector.runtime.RuntimeEndpoint.call(context, "event", android.os.Bundle().apply {
+                putString("category", category); putString("message", message); putString("detail", detail)
+            })
+            return
+        }
         val timestamp = clock.nowIso()
         val logLine = buildString {
             append(category).append(": ").append(message)

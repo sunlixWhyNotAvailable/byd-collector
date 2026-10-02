@@ -769,16 +769,8 @@ class CollectorService : Service() {
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        store.recordEvent("task_removed", "Collector task removed from recents")
-        if (settings.isUserShutdownRequested()) {
-            super.onTaskRemoved(rootIntent)
-            return
-        }
-        // Removing the UI is not Stop. Preserve manual work if DiLink also kills the APP.
-        if (!settings.rememberTaskRemoval()) {
-            store.recordEvent("task_removed_recovery_error", "Could not persist task-removal recovery")
-        }
-        CollectorAutoStart.scheduleRestartAfterTaskRemoved(applicationContext, settings, store)
+        // The visible task belongs to another UID. Closing our transient launcher
+        // must not reset, checkpoint, or schedule a second collection session.
         super.onTaskRemoved(rootIntent)
     }
 
@@ -1981,6 +1973,7 @@ class CollectorService : Service() {
     }
 
     private fun stopRuntimeForUserShutdown() {
+        com.bydcollector.collector.runtime.RuntimeJobsService.cancelForShutdown(this)
         closeEcMeanProvider()
         CollectorAutoStart.cancelScheduled(applicationContext)
         mainHandler.removeCallbacks(accessSelfCheckTask)
@@ -5619,8 +5612,9 @@ class CollectorService : Service() {
             elapsedRealtimeMs = { SystemClock.elapsedRealtime() }
         )
 
-        fun isRunning(): Boolean = running.get()
-        fun isUserShutdownInProgress(): Boolean = userShutdownCoordinatorActive.get()
+        private fun clientFlag(name: String) = com.bydcollector.collector.runtime.RuntimeClient.state.getBoolean(name)
+        fun isRunning(): Boolean = if (BuildConfig.RUNTIME_CLIENT) clientFlag("running") else running.get()
+        fun isUserShutdownInProgress(): Boolean = if (BuildConfig.RUNTIME_CLIENT) clientFlag("shutdown") else userShutdownCoordinatorActive.get()
 
         /** Clears stale shutdown suppression only after an explicit launcher open cancels shell finalization. */
         fun clearShutdownForExplicitReopen(context: Context, onPreviousFailure: (String) -> Unit = {}): Boolean {
@@ -5714,15 +5708,16 @@ class CollectorService : Service() {
                 userShutdownCoordinatorActive.set(false)
             }
         }
-        fun isMainPollingRunning(): Boolean = mainPollingRunning.get()
-        fun isDebugRunning(): Boolean = debugRunning.get()
-        fun mainRuntimeStatus(): RuntimeActionStatus = mainRuntimeStatusRef.get()
-        fun debugRuntimeStatus(): DebugRuntimeStatus = debugRuntimeStatusRef.get()
-        fun mqttRuntimeStatus(): RuntimeActionStatus = mqttRuntimeStatusRef.get()
-        fun influxRuntimeStatus(): RuntimeActionStatus = influxRuntimeStatusRef.get()
-        fun isMaintenanceRunningInProcess(): Boolean = maintenanceRunningInProcess.get() ||
-            DbMaintenanceCoordinator.currentOperation() != null
-        fun isArchiveStorageActive(): Boolean = archiveStorageOperations.isActive()
+        fun isMainPollingRunning(): Boolean = if (BuildConfig.RUNTIME_CLIENT) clientFlag("main") else mainPollingRunning.get()
+        fun isDebugRunning(): Boolean = if (BuildConfig.RUNTIME_CLIENT) clientFlag("debug") else debugRunning.get()
+        private fun clientStatus(name: String) = com.bydcollector.collector.runtime.RuntimeClient.state.getString(name) ?: "STOPPED"
+        fun mainRuntimeStatus(): RuntimeActionStatus = if (BuildConfig.RUNTIME_CLIENT) RuntimeActionStatus.valueOf(clientStatus("mainStatus")) else mainRuntimeStatusRef.get()
+        fun debugRuntimeStatus(): DebugRuntimeStatus = if (BuildConfig.RUNTIME_CLIENT) DebugRuntimeStatus.valueOf(clientStatus("debugStatus")) else debugRuntimeStatusRef.get()
+        fun mqttRuntimeStatus(): RuntimeActionStatus = if (BuildConfig.RUNTIME_CLIENT) RuntimeActionStatus.valueOf(clientStatus("mqttStatus")) else mqttRuntimeStatusRef.get()
+        fun influxRuntimeStatus(): RuntimeActionStatus = if (BuildConfig.RUNTIME_CLIENT) RuntimeActionStatus.valueOf(clientStatus("influxStatus")) else influxRuntimeStatusRef.get()
+        fun isMaintenanceRunningInProcess(): Boolean = if (BuildConfig.RUNTIME_CLIENT) clientFlag("maintenance") else
+            maintenanceRunningInProcess.get() || DbMaintenanceCoordinator.currentOperation() != null
+        fun isArchiveStorageActive(): Boolean = if (BuildConfig.RUNTIME_CLIENT) clientFlag("archive") else archiveStorageOperations.isActive()
 
         fun startIntent(context: Context, forceKeepAliveStatusCheck: Boolean = false): Intent =
             Intent(context, CollectorService::class.java).apply {

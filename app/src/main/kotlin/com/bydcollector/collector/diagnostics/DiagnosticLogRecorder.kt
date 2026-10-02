@@ -100,6 +100,10 @@ object DiagnosticLogRecorder {
     private val workLock = Any()
     private val mutableShareStage = MutableStateFlow<DiagnosticShareStage?>(null)
     val shareStage = mutableShareStage.asStateFlow()
+    internal fun displayShareStage(value: DiagnosticShareStage?) {
+        check(BuildConfig.RUNTIME_CLIENT)
+        mutableShareStage.value = value
+    }
     private val stateLock = Any()
     @Volatile private var adbStream: AdbLocalClient.AdbShellStream? = null
     @Volatile private var activeRunDir: File? = null
@@ -108,6 +112,7 @@ object DiagnosticLogRecorder {
     private var captureGeneration = 0L
 
     fun isRecording(): Boolean {
+        if (BuildConfig.RUNTIME_CLIENT) return com.bydcollector.collector.runtime.RuntimeClient.state.getBoolean("recording")
         synchronized(stateLock) {
             val current = adbStream
             if (current?.isAlive == true) return true

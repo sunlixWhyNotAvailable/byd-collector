@@ -8,6 +8,10 @@ import com.bydcollector.collector.data.energy.EnergyRuntimeStorage
 import com.bydcollector.collector.data.energy.EnergySnapshot
 import com.bydcollector.collector.data.energy.EnergyStateCodec
 import java.time.Instant
+import com.bydcollector.collector.BuildConfig
+import com.bydcollector.collector.runtime.RuntimeReads
+import com.bydcollector.collector.runtime.RuntimeClient
+import android.os.Bundle
 
 class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyRuntimeStorage {
     /** Serializes all TripStore access; Step 8 leases this monitor for cutover. */
@@ -222,7 +226,8 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
     @Synchronized
     fun openSessions(): List<TripSession> = querySessions("state = ?", arrayOf(TripSession.STATE_OPEN))
     @Synchronized
-    fun loadOpenSession(): TripSession? = openSessions().firstOrNull()
+    fun loadOpenSession(): TripSession? = if (BuildConfig.RUNTIME_CLIENT)
+        RuntimeReads.read(RuntimeClient.context, "openTrip") else openSessions().firstOrNull()
     @Synchronized
     fun updateSession(session: TripSession) = upsertSession(session)
 
@@ -533,6 +538,10 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
 
     @Synchronized
     fun queryHierarchy(includeZeroMotion: Boolean = false): List<TripDayGroup> {
+        if (BuildConfig.RUNTIME_CLIENT) {
+            require(!includeZeroMotion) { "UI hierarchy excludes zero-motion sessions" }
+            return RuntimeReads.read(RuntimeClient.context, "tripHierarchy")
+        }
         val rows = querySummaries(
             if (includeZeroMotion) "WHERE state = 'closed'" else "WHERE state = 'closed' AND movement_observed = 1",
             emptyArray()
@@ -552,7 +561,9 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
     }
 
     @Synchronized
-    fun queryRoutePoints(tripId: String): List<RoutePoint> = buildList { forEachRoutePoint(tripId, ::add) }
+    fun queryRoutePoints(tripId: String): List<RoutePoint> = if (BuildConfig.RUNTIME_CLIENT)
+        RuntimeReads.read(RuntimeClient.context, "tripRoute", Bundle().apply { putString("trip", tripId) })
+        else buildList { forEachRoutePoint(tripId, ::add) }
 
     /** Streams one selected route while retaining strict raw/chunk exclusivity checks. */
     @Synchronized
@@ -563,6 +574,12 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
     /** Streams one route tail without materializing its verified prefix. */
     @Synchronized
     internal fun forEachRoutePointFrom(tripId: String, firstSequence: Long, consumer: (RoutePoint) -> Unit) {
+        if (BuildConfig.RUNTIME_CLIENT) {
+            RuntimeReads.read<List<RoutePoint>>(RuntimeClient.context, "tripRoute", Bundle().apply {
+                putString("trip", tripId); putLong("first", firstSequence)
+            }).forEach(consumer)
+            return
+        }
         require(firstSequence >= 0L) { "Route sequence must be non-negative" }
         val db = readableDb
         val hasChunks = chunkCount(db, tripId) != 0L
@@ -587,7 +604,9 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
     internal fun allSessions(): List<TripSession> = querySessions("1 = 1", emptyArray())
 
     @Synchronized
-    internal fun session(tripId: String): TripSession? = querySessions("trip_id = ?", arrayOf(tripId)).firstOrNull()
+    internal fun session(tripId: String): TripSession? = if (BuildConfig.RUNTIME_CLIENT)
+        RuntimeReads.read(RuntimeClient.context, "tripSession", Bundle().apply { putString("trip", tripId) })
+        else querySessions("trip_id = ?", arrayOf(tripId)).firstOrNull()
 
     /** Returns the newest closed session without materializing trip history. */
     @Synchronized

@@ -32,7 +32,7 @@ data class ArchiveStorageItemState(
     val updatedAtMs: Long,
     val completedAtMs: Long? = null,
     val error: String? = null
-)
+) : java.io.Serializable
 
 data class ArchiveStorageItemsReconciliation(
     val itemStates: List<ArchiveStorageItemState>,
@@ -56,7 +56,7 @@ data class ArchiveStorageEntry(
     val status: ArchiveEntryStatus,
     val deletable: Boolean,
     val completed: Boolean = status == ArchiveEntryStatus.COMPRESSED_ZIP
-)
+) : java.io.Serializable
 
 data class ArchiveStorageSnapshot(
     val archiveRootPath: String,
@@ -66,7 +66,7 @@ data class ArchiveStorageSnapshot(
     val archiveLimitBytes: Long,
     val entries: List<ArchiveStorageEntry>,
     val tripsDatabaseSizeBytes: Long = 0L
-) {
+) : java.io.Serializable {
     /** Physical working files are visible, but never consume the completed-archive quota. */
     val processingBytes: Long
         get() = entries.filterNot { it.completed }.sumOf { it.sizeBytes }
@@ -87,7 +87,7 @@ data class ArchiveStorageJobStatus(
     val phase: ArchiveStorageItemPhase? = null,
     val error: String? = null,
     val updatedAtMs: Long = 0L
-)
+) : java.io.Serializable
 
 enum class ArchiveStorageAdmissionKind {
     ACCEPTED,
