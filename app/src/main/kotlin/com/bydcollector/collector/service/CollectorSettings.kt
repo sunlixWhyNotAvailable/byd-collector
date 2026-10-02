@@ -6,6 +6,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import com.bydcollector.collector.update.UpdateHintAppearance
 import com.bydcollector.collector.data.local.TelemetryStore
+import com.bydcollector.collector.data.polling.LivePollSource
 import com.bydcollector.collector.telegram.TelegramBuiltInTemplates
 import com.bydcollector.collector.telegram.TelegramEventType
 import com.bydcollector.collector.telegram.TelegramNavigatorMask
@@ -61,9 +62,10 @@ class CollectorSettings(
 
     fun runtimeDemand(): RuntimeDemand {
         if (isUserShutdownRequested()) return RuntimeDemand()
+        val resumed = taskRemovalDemand(prefs, LivePollSource.liveBootId)
         return RuntimeDemand(
-            main = isAutoStartEnabled() && !isMainManuallyStopped(),
-            debug = isDebugAutoStartEnabled() && !isDebugManuallyStopped(),
+            main = (isAutoStartEnabled() || resumed.main) && !isMainManuallyStopped(),
+            debug = (isDebugAutoStartEnabled() || resumed.debug) && !isDebugManuallyStopped(),
             mqtt = HaRunSession.process.allows(HaExportChannel.MQTT, isMqttAutoStartEnabled()) &&
                 !isMqttManuallyStopped(),
             influx = HaRunSession.process.allows(HaExportChannel.INFLUX, isInfluxAutoStartEnabled()) &&
@@ -71,6 +73,35 @@ class CollectorSettings(
             telegram = isTelegramEnabled(),
             keepAlive = keepAliveConfig().anyEnabled
         )
+    }
+
+    fun rememberTaskRemoval(): Boolean = rememberTaskRemoval(
+        prefs, LivePollSource.liveBootId,
+        RuntimeDemand(
+            main = isPollingEnabled() && !isMainManuallyStopped(),
+            debug = isDebugPollingEnabled() && !isDebugManuallyStopped(),
+            mqtt = isMqttEnabled(), influx = isInfluxEnabled()
+        ), HaRunSession.process.observedPowerOn()
+    )
+
+    fun observeHaPower(raw: Long?): Boolean {
+        val newSession = HaRunSession.process.observePower(raw)
+        if (raw == null || raw < 0 || prefs.getString(KEY_TASK_REMOVED_BOOT, null) != LivePollSource.liveBootId) {
+            return newSession
+        }
+        val on = raw > 0
+        if (newSession || !prefs.contains(KEY_TASK_REMOVED_POWER) ||
+            prefs.getBoolean(KEY_TASK_REMOVED_POWER, false) != on
+        ) {
+            prefs.edit().apply {
+                putBoolean(KEY_TASK_REMOVED_POWER, on)
+                if (newSession) {
+                    remove(KEY_TASK_REMOVED_MQTT)
+                    remove(KEY_TASK_REMOVED_INFLUX)
+                }
+            }.apply()
+        }
+        return newSession
     }
 
     fun hasActiveAccessWork(): Boolean {
@@ -93,7 +124,9 @@ class CollectorSettings(
     fun isUserShutdownRequested(): Boolean = prefs.getBoolean(KEY_USER_SHUTDOWN, false)
 
     fun setUserShutdownRequested(enabled: Boolean): Boolean {
-        val persisted = prefs.edit().putBoolean(KEY_USER_SHUTDOWN, enabled).commit()
+        val persisted = prefs.edit().putBoolean(KEY_USER_SHUTDOWN, enabled).apply {
+            if (enabled) remove(KEY_TASK_REMOVED_BOOT)
+        }.commit()
         if (!persisted) return false
         recordEvent(
             category = if (enabled) "user_shutdown_enabled" else "user_shutdown_cleared",
@@ -180,7 +213,9 @@ class CollectorSettings(
     fun isPollingEnabled(): Boolean = prefs.getBoolean(KEY_POLLING_ENABLED, false)
 
     fun setPollingEnabled(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_POLLING_ENABLED, enabled).apply()
+        prefs.edit().putBoolean(KEY_POLLING_ENABLED, enabled).apply {
+            if (!enabled) remove(KEY_TASK_REMOVED_MAIN)
+        }.apply()
         recordEvent(
             category = if (enabled) "polling_enabled" else "polling_disabled",
             message = "Polling ${if (enabled) "enabled" else "disabled"}"
@@ -223,8 +258,10 @@ class CollectorSettings(
     fun isDebugPollingEnabled(): Boolean = prefs.getBoolean(KEY_DEBUG_POLLING_ENABLED, false)
 
     fun setDebugPollingEnabled(enabled: Boolean) {
-        if (isDebugPollingEnabled() == enabled) return
-        prefs.edit().putBoolean(KEY_DEBUG_POLLING_ENABLED, enabled).apply()
+        if (isDebugPollingEnabled() == enabled && (enabled || !prefs.contains(KEY_TASK_REMOVED_DEBUG))) return
+        prefs.edit().putBoolean(KEY_DEBUG_POLLING_ENABLED, enabled).apply {
+            if (!enabled) remove(KEY_TASK_REMOVED_DEBUG)
+        }.apply()
         recordEvent(
             category = if (enabled) "debug_polling_enabled" else "debug_polling_disabled",
             message = "Debug polling ${if (enabled) "enabled" else "disabled"}"
@@ -264,8 +301,10 @@ class CollectorSettings(
         HaRunSession.process.allows(HaExportChannel.MQTT, isMqttAutoStartEnabled()) && !isMqttManuallyStopped()
 
     fun setMqttEnabled(enabled: Boolean) {
-        if (prefs.getBoolean(KEY_MQTT_ENABLED, false) == enabled) return
-        prefs.edit().putBoolean(KEY_MQTT_ENABLED, enabled).apply()
+        if (prefs.getBoolean(KEY_MQTT_ENABLED, false) == enabled && (enabled || !prefs.contains(KEY_TASK_REMOVED_MQTT))) return
+        prefs.edit().putBoolean(KEY_MQTT_ENABLED, enabled).apply {
+            if (!enabled) remove(KEY_TASK_REMOVED_MQTT)
+        }.apply()
         recordEvent(
             category = if (enabled) "mqtt_enabled" else "mqtt_disabled",
             message = "MQTT ${if (enabled) "enabled" else "disabled"}"
@@ -402,8 +441,10 @@ class CollectorSettings(
         HaRunSession.process.allows(HaExportChannel.INFLUX, isInfluxAutoStartEnabled()) && !isInfluxManuallyStopped()
 
     fun setInfluxEnabled(enabled: Boolean) {
-        if (prefs.getBoolean(KEY_INFLUX_ENABLED, false) == enabled) return
-        prefs.edit().putBoolean(KEY_INFLUX_ENABLED, enabled).apply()
+        if (prefs.getBoolean(KEY_INFLUX_ENABLED, false) == enabled && (enabled || !prefs.contains(KEY_TASK_REMOVED_INFLUX))) return
+        prefs.edit().putBoolean(KEY_INFLUX_ENABLED, enabled).apply {
+            if (!enabled) remove(KEY_TASK_REMOVED_INFLUX)
+        }.apply()
         recordEvent(
             category = if (enabled) "influx_enabled" else "influx_disabled",
             message = "InfluxDB export ${if (enabled) "enabled" else "disabled"}"
@@ -1184,16 +1225,57 @@ class CollectorSettings(
     private fun migrateTelegramBuiltInTemplates() = migrateTelegramBuiltInTemplates(prefs)
 
     companion object {
-        /** Process start precedes any new Activity Start intent; do not reuse a dead manual owner. */
-        fun resetCollectionAfterProcessDeath(context: Context) {
-            resetCollectionAfterProcessDeath(context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE))
+        private const val KEY_TASK_REMOVED_BOOT = "task_removed_boot_id"
+        private const val KEY_TASK_REMOVED_MAIN = "task_removed_main"
+        private const val KEY_TASK_REMOVED_DEBUG = "task_removed_secondary"
+        private const val KEY_TASK_REMOVED_MQTT = "task_removed_mqtt"
+        private const val KEY_TASK_REMOVED_INFLUX = "task_removed_influx"
+        private const val KEY_TASK_REMOVED_POWER = "task_removed_power_on"
+
+        internal fun rememberTaskRemoval(
+            prefs: SharedPreferences, bootId: String, demand: RuntimeDemand, powerOn: Boolean?
+        ): Boolean = prefs.edit().apply {
+            putString(KEY_TASK_REMOVED_BOOT, bootId)
+            putBoolean(KEY_TASK_REMOVED_MAIN, demand.main)
+            putBoolean(KEY_TASK_REMOVED_DEBUG, demand.debug)
+            putBoolean(KEY_TASK_REMOVED_MQTT, demand.mqtt)
+            putBoolean(KEY_TASK_REMOVED_INFLUX, demand.influx)
+            if (powerOn == null) remove(KEY_TASK_REMOVED_POWER) else putBoolean(KEY_TASK_REMOVED_POWER, powerOn)
+        }.commit()
+
+        internal fun taskRemovalDemand(prefs: SharedPreferences, bootId: String): RuntimeDemand {
+            if (prefs.getBoolean(KEY_USER_SHUTDOWN, false) || bootId.isBlank() ||
+                prefs.getString(KEY_TASK_REMOVED_BOOT, null) != bootId
+            ) return RuntimeDemand()
+            fun active(saved: String, enabled: String, stopped: String) =
+                prefs.getBoolean(saved, false) && prefs.getBoolean(enabled, false) && !prefs.getBoolean(stopped, false)
+            return RuntimeDemand(
+                main = active(KEY_TASK_REMOVED_MAIN, KEY_POLLING_ENABLED, KEY_MAIN_MANUAL_STOP),
+                debug = active(KEY_TASK_REMOVED_DEBUG, KEY_DEBUG_POLLING_ENABLED, KEY_DEBUG_MANUAL_STOP),
+                mqtt = active(KEY_TASK_REMOVED_MQTT, KEY_MQTT_ENABLED, KEY_MQTT_MANUAL_STOP),
+                influx = active(KEY_TASK_REMOVED_INFLUX, KEY_INFLUX_ENABLED, KEY_INFLUX_MANUAL_STOP)
+            )
         }
 
-        internal fun resetCollectionAfterProcessDeath(prefs: SharedPreferences) {
+        /** Ordinary cold starts follow AutoStart; a removed task may resume work in the same boot. */
+        fun resetCollectionAfterProcessDeath(context: Context) {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val resumed = taskRemovalDemand(prefs, LivePollSource.liveBootId)
+            HaRunSession.process.restoreAfterTaskRemoval(
+                resumed.mqtt, resumed.influx,
+                if (resumed.mqtt || resumed.influx) {
+                    if (prefs.contains(KEY_TASK_REMOVED_POWER)) prefs.getBoolean(KEY_TASK_REMOVED_POWER, false) else null
+                } else null
+            )
+            resetCollectionAfterProcessDeath(prefs, LivePollSource.liveBootId)
+        }
+
+        internal fun resetCollectionAfterProcessDeath(prefs: SharedPreferences, bootId: String = "") {
+            val resumed = taskRemovalDemand(prefs, bootId)
             val allowed = !prefs.getBoolean(KEY_USER_SHUTDOWN, false)
-            val main = allowed && prefs.getBoolean(KEY_AUTO_START, false) &&
+            val main = allowed && (prefs.getBoolean(KEY_AUTO_START, false) || resumed.main) &&
                 !prefs.getBoolean(KEY_MAIN_MANUAL_STOP, false)
-            val secondary = allowed && prefs.getBoolean(KEY_DEBUG_AUTO_START, false) &&
+            val secondary = allowed && (prefs.getBoolean(KEY_DEBUG_AUTO_START, false) || resumed.debug) &&
                 !prefs.getBoolean(KEY_DEBUG_MANUAL_STOP, false)
             if (prefs.getBoolean(KEY_POLLING_ENABLED, false) != main ||
                 prefs.getBoolean(KEY_DEBUG_POLLING_ENABLED, false) != secondary

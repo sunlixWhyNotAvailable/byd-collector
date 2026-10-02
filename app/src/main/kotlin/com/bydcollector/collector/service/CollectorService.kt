@@ -774,17 +774,11 @@ class CollectorService : Service() {
             super.onTaskRemoved(rootIntent)
             return
         }
-        val demand = settings.runtimeDemand()
-        if (!demand.main) {
-            settings.setPollingEnabled(false)
-            stopMain("task_removed")
-        }
-        if (!demand.debug) {
-            settings.setDebugPollingEnabled(false)
-            stopDebug("task_removed")
+        // Removing the UI is not Stop. Preserve manual work if DiLink also kills the APP.
+        if (!settings.rememberTaskRemoval()) {
+            store.recordEvent("task_removed_recovery_error", "Could not persist task-removal recovery")
         }
         CollectorAutoStart.scheduleRestartAfterTaskRemoved(applicationContext, settings, store)
-        stopIfNoActiveRuntime()
         super.onTaskRemoved(rootIntent)
     }
 
@@ -1291,7 +1285,7 @@ class CollectorService : Service() {
 
     private fun reconcileDebugRuntime() {
         if (maintenanceBlocksRuntimeStart(debugRuntime = true)) return
-        if (!settings.isDebugAutoStartEnabled() || settings.isDebugManuallyStopped()) {
+        if (!settings.runtimeDemand().debug) {
             stopIfNoActiveRuntime()
             return
         }
@@ -1307,7 +1301,7 @@ class CollectorService : Service() {
         resetCollectionToAutoStartDemand: Boolean = false
     ) {
         val demand = settings.runtimeDemand()
-        // A dead APP cannot retain manual ownership through a sticky restart.
+        // AutoStart plus same-boot work explicitly retained when the task was removed.
         if (resetCollectionToAutoStartDemand) {
             settings.setPollingEnabled(demand.main)
             settings.setDebugPollingEnabled(demand.debug)
@@ -3075,7 +3069,7 @@ class CollectorService : Service() {
                     val powerOnEdge = on && !kpiPowerOn
                     mainHandler.post {
                         if (isKpiRuntimeCurrent(generation) &&
-                            com.bydcollector.collector.ha.HaRunSession.process.observePower(power.raw.toLong())
+                            settings.observeHaPower(power.raw.toLong())
                         ) {
                             val demand = settings.runtimeDemand()
                             if (!demand.mqtt && mqttConnection.owned) stopMqttExport(manualStop = false)

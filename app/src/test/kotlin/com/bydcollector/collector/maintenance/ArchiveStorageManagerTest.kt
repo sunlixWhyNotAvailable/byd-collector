@@ -398,7 +398,7 @@ class ArchiveStorageManagerTest {
     }
 
     @Test
-    fun retentionCountsRawBytesButNeverSelectsRawDirectoriesForDeletion() {
+    fun rawAndTemporaryBytesAreVisibleButCannotEvictCompletedArchives() {
         val root = createTempDirectory().toFile()
         val main = File(root, "bydcollector_telemetry.db").apply { writeText("active") }
         val archiveRoot = File(root, "db_archive").apply { mkdirs() }
@@ -409,12 +409,99 @@ class ArchiveStorageManagerTest {
             File(this, main.name).writeText("raw database")
         }
         val manager = manager(archiveRoot, main)
+        val tmp = File(archiveRoot, "${raw.name}.zip.tmp").apply { writeText("partial compressed bytes") }
+        val limit = oldest.length() + newest.length()
 
-        assertEquals(1, manager.enforceRetention(limitBytes = oldest.length() + newest.length()))
+        val snapshot = manager.snapshot(limit)
+        assertEquals(limit, snapshot.archiveBytes)
+        assertEquals(File(raw, main.name).length() + tmp.length(), snapshot.processingBytes)
+        assertEquals(4, snapshot.entries.size)
+        assertEquals(0, manager.enforceRetention(limitBytes = limit))
 
-        assertFalse(oldest.exists())
+        assertTrue(oldest.exists())
         assertTrue(newest.exists())
         assertTrue(raw.exists())
+        assertTrue(tmp.exists())
+    }
+
+    @Test
+    fun onlyFinalizedZipEntersQuotaAndRawPlusZipIsNotCountedTwice() {
+        val root = createTempDirectory().toFile()
+        try {
+            val main = File(root, "bydcollector_telemetry.db").apply { writeText("active") }
+            val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+            val old = archive(archiveRoot, "bydcollector_telemetry_20260706_010000.zip", 1_000L)
+            val raw = rawArchive(archiveRoot, main.name)
+            val manager = manager(archiveRoot, main)
+            val observed = mutableSetOf<ArchiveStorageItemPhase>()
+            assertTrue(manager.compressRawArchiveDirectory(raw) { status ->
+                val snapshot = manager.snapshot(Long.MAX_VALUE)
+                observed += status.phase!!
+                if (status.phase == ArchiveStorageItemPhase.READY) {
+                    val zip = File(archiveRoot, "${raw.name}.zip")
+                    assertEquals(old.length() + zip.length(), snapshot.archiveBytes)
+                    assertEquals(0L, snapshot.processingBytes)
+                } else {
+                    assertEquals(old.length(), snapshot.archiveBytes, "phase=${status.phase}")
+                    assertTrue(snapshot.processingBytes > 0)
+                }
+            })
+            assertTrue(ArchiveStorageItemPhase.FINALIZING in observed)
+            assertTrue(ArchiveStorageItemPhase.READY in observed)
+        } finally { root.deleteRecursively() }
+    }
+
+    @Test
+    fun unfinishedZipCannotConsumeQuotaOrReplaceNewestCompletedArchiveProtection() {
+        for (representation in listOf("raw", "tmp")) {
+            val root = createTempDirectory().toFile()
+            try {
+                val main = File(root, "bydcollector_telemetry.db").apply { writeText("active") }
+                val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+                val old = archive(archiveRoot, "bydcollector_telemetry_20260707_010000.zip", 1_000L)
+                val newestReady = archive(archiveRoot, "bydcollector_telemetry_20260707_020000.zip", 2_000L)
+                val pending = archive(archiveRoot, "bydcollector_telemetry_20260707_030000.zip", 3_000L)
+                if (representation == "raw") {
+                    File(archiveRoot, pending.name.removeSuffix(".zip")).apply {
+                        mkdirs(); File(this, main.name).writeText("still finalizing")
+                    }
+                } else File(archiveRoot, "${pending.name}.tmp").writeText("unfinished")
+                val manager = manager(archiveRoot, main)
+                assertEquals(old.length() + newestReady.length(), manager.snapshot(0L).archiveBytes)
+                assertEquals(1, manager.enforceRetention(0L))
+                assertFalse(old.exists())
+                assertTrue(newestReady.exists())
+                assertTrue(pending.exists())
+            } finally { root.deleteRecursively() }
+        }
+    }
+
+    @Test
+    fun lowDiskSpaceBeforeOrDuringCompressionKeepsSourceAndOldArchives() {
+        for (failAtCheck in listOf(1, 2)) {
+            val root = createTempDirectory().toFile()
+            try {
+                val main = File(root, "bydcollector_telemetry.db").apply { writeText("active") }
+                val archiveRoot = File(root, "db_archive").apply { mkdirs() }
+                val old = archive(archiveRoot, "bydcollector_telemetry_20260706_010000.zip", 1_000L)
+                val raw = rawArchive(archiveRoot, main.name)
+                var checks = 0
+                val manager = ArchiveStorageManager(
+                    archiveRoot, main, File(root, "bydcollector_secondary.db"),
+                    archivedDatabaseVerifier = { _, _, _ -> null },
+                    usableSpaceBytes = { if (++checks >= failAtCheck) 0L else Long.MAX_VALUE }
+                )
+                val statuses = mutableListOf<ArchiveStorageJobStatus>()
+                assertFalse(manager.compressRawArchiveDirectory(raw, statuses::add))
+                assertEquals("archive_insufficient_space", statuses.last().error)
+                assertEquals("Not enough free space; source database retained", statuses.last().messageEn)
+                assertEquals("db", File(raw, main.name).readText())
+                assertTrue(old.exists())
+                assertFalse(File(archiveRoot, "${raw.name}.zip").exists())
+                assertFalse(File(archiveRoot, "${raw.name}.zip.tmp").exists())
+                assertEquals(old.length(), manager.snapshot(Long.MAX_VALUE).archiveBytes)
+            } finally { root.deleteRecursively() }
+        }
     }
 
     @Test

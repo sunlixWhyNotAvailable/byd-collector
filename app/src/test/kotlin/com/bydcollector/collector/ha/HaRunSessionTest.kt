@@ -4,6 +4,21 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class HaRunSessionTest {
+    @Test fun taskRemovalRecoveryRetainsThePowerBoundaryAndOnlyActiveChannels() {
+        val recreated = HaRunSession()
+        recreated.restoreAfterTaskRemoval(mqtt = true, influx = false, lastPowerOn = false)
+        assertTrue(recreated.allows(HaExportChannel.MQTT, false))
+        assertFalse(recreated.allows(HaExportChannel.INFLUX, false))
+        assertTrue(recreated.observePower(2))
+        assertFalse(recreated.allows(HaExportChannel.MQTT, false))
+        recreated.restoreAfterTaskRemoval(mqtt = false, influx = true, lastPowerOn = true)
+        assertFalse(recreated.observePower(2))
+        assertTrue(recreated.allows(HaExportChannel.INFLUX, false))
+        assertFalse(recreated.observePower(0))
+        assertTrue(recreated.observePower(2))
+        assertFalse(recreated.allows(HaExportChannel.INFLUX, false))
+    }
+
     @Test fun manualPermissionEndsAtNextPowerOnNotPowerOff() {
         val session = HaRunSession()
         val channel = HaExportChannel.MQTT

@@ -166,6 +166,8 @@ Telemetry and trips are stored locally. `Storage` shows database sizes, existing
 
 The archive limit applies to completed Main/All data archives, **not active databases or trip history**. Automatic cleanup removes older eligible archives while protecting the newest archive of each type. Main and trip history can continue growing.
 
+Only finalized ZIP sizes count toward that limit. Raw databases and temporary ZIPs are shown separately as `In progress`; they occupy physical disk space but cannot trigger deletion of older archives. Compression checks free disk space separately and retains the source database on failure, without deleting old archives to make room.
+
 <p align="center"><img src="docs/screenshots/en/storage.png" alt="BYD Collector storage and database archives" width="100%"></p>
 
 ### Archive confirmation and progress
@@ -200,6 +202,8 @@ Confirmation and progress when deleting selected archives:
 In `Options`, configure service recovery and, if needed, Wi-Fi/cellular recovery, Bluetooth recovery, or optional Tailscale activation. These restore Android services and connections, not vehicle controls. Notification access used for service recovery is not used to read notification contents.
 
 Automatic-start switches on the collection and integration tabs control their respective functions. Use `Shutdown` to stop operation until you open the app again.
+
+The app appears in Android's recent apps. Swiping away its card closes only the interface, not already-started collection or exports, even with automatic start disabled. If Android also kills the process, recovery can resume the work retained at card removal within the same tablet boot; this does not enable automatic start after a reboot or override Stop/Shutdown. Firmware restrictions can still interrupt background work.
 
 Collection can continue with the vehicle off on supported firmware, but uninterrupted recording is not guaranteed. Android may stop processes, and a tablet reboot interrupts collection. Recovery depends on the vehicle and firmware.
 

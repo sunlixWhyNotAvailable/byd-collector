@@ -45,7 +45,8 @@ class ArchiveStorageManager(
             "archive_verification_failed"
         }
     },
-    private val isArchiveInUse: (String) -> Boolean = { false }
+    private val isArchiveInUse: (String) -> Boolean = { false },
+    private val usableSpaceBytes: () -> Long = { archiveRoot.usableSpace }
 ) {
     fun snapshot(limitBytes: Long): ArchiveStorageSnapshot {
         check(archiveRoot.isDirectory || archiveRoot.mkdirs() || archiveRoot.isDirectory) { "Cannot open archive directory" }
@@ -57,7 +58,7 @@ class ArchiveStorageManager(
             mainDatabaseSizeBytes = sqliteFootprintBytes(mainDatabaseFile),
             debugDatabaseSizeBytes = sqliteFootprintBytes(debugDatabaseFileProvider()),
             tripsDatabaseSizeBytes = sqliteFootprintBytes(tripsDatabaseFile),
-            archiveBytes = entries.sumOf { it.sizeBytes },
+            archiveBytes = entries.filter { it.completed }.sumOf { it.sizeBytes },
             archiveLimitBytes = limitBytes,
             entries = entries
         )
@@ -107,6 +108,7 @@ class ArchiveStorageManager(
                 check(zipMatchesRawDirectory(target, directory)) { "archive_zip_mismatch" }
             } else {
                 tmp.delete()
+                checkCompressionSpace()
                 onStatus(status(
                     ArchiveStorageJobMode.COMPRESS, 2, 4,
                     "Готуємо архів", "Preparing archive", directory.name,
@@ -228,7 +230,7 @@ class ArchiveStorageManager(
         limitBytes: Long,
         onStatus: (ArchiveStorageJobStatus) -> Unit = {}
     ): Int {
-        val entries = snapshot(limitBytes).entries.filter { it.deletable }
+        val entries = snapshot(limitBytes).entries.filter { it.completed && it.deletable }
         val candidates = entries.filter {
             it.status == ArchiveEntryStatus.COMPRESSED_ZIP && !isArchiveInUse(archiveBaseName(it.id))
         }
@@ -378,7 +380,12 @@ class ArchiveStorageManager(
             createdAtMs = file.lastModified().takeIf { it > 0L } ?: clock(),
             sizeBytes = sizeOf(file),
             status = status,
-            deletable = isDeletableArchive(file)
+            deletable = isDeletableArchive(file),
+            // Rename follows ZIP verification; raw cleanup completes the operation.
+            // State-free historical ZIPs keep their existing treatment.
+            completed = status == ArchiveEntryStatus.COMPRESSED_ZIP &&
+                !File(archiveRoot, archiveBaseName(id)).exists() &&
+                !File(archiveRoot, "$id.tmp").exists()
         )
     }
 
@@ -620,6 +627,8 @@ class ArchiveStorageManager(
     private fun archiveBaseName(id: String): String = id.removeSuffix(".zip")
 
     private fun zipDirectory(directory: File, zip: ZipOutputStream) {
+        val buffer = ByteArray(64 * 1024)
+        var bytesUntilSpaceCheck = 0L
         directory.walkTopDown()
             .filter { it != directory }
             .sortedBy { it.absolutePath }
@@ -631,11 +640,25 @@ class ArchiveStorageManager(
                 } else {
                     zip.putNextEntry(ZipEntry(entryName))
                     BufferedInputStream(FileInputStream(file)).use { input ->
-                        input.copyTo(zip)
+                        while (true) {
+                            check(!Thread.currentThread().isInterrupted) { "archive_compression_interrupted" }
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            if (bytesUntilSpaceCheck <= 0L) {
+                                checkCompressionSpace()
+                                bytesUntilSpaceCheck = 1024L * 1024L
+                            }
+                            zip.write(buffer, 0, count)
+                            bytesUntilSpaceCheck -= count
+                        }
                     }
                     zip.closeEntry()
                 }
             }
+    }
+
+    private fun checkCompressionSpace() {
+        check(usableSpaceBytes() >= COMPRESSION_FREE_SPACE_RESERVE_BYTES) { "archive_insufficient_space" }
     }
 
     private fun archiveChild(id: String): File? {
@@ -707,8 +730,16 @@ class ArchiveStorageManager(
             mode = ArchiveStorageJobMode.COMPRESS,
             stepIndex = 0,
             stepCount = 4,
-            messageUk = if (verificationFailed) "Перевірку не завершено; raw архів збережено" else "ZIP не створено; raw архів збережено",
-            messageEn = if (verificationFailed) "Archive verification failed; raw retained" else "ZIP failed; raw archive retained",
+            messageUk = when {
+                error == "archive_insufficient_space" -> "Недостатньо вільного місця; вихідну базу збережено"
+                verificationFailed -> "Перевірку не завершено; raw архів збережено"
+                else -> "ZIP не створено; raw архів збережено"
+            },
+            messageEn = when {
+                error == "archive_insufficient_space" -> "Not enough free space; source database retained"
+                verificationFailed -> "Archive verification failed; raw retained"
+                else -> "ZIP failed; raw archive retained"
+            },
             itemId = itemId,
             phase = ArchiveStorageItemPhase.FAILED,
             error = error,
@@ -723,6 +754,7 @@ class ArchiveStorageManager(
         private const val DEBUG_ARCHIVE_FAMILY = "bydcollector_secondary"
         private const val MAX_VERIFICATION_MARKER_BYTES = 256L
         const val ARCHIVE_VERIFICATION_MARKER = ".archive-verification"
+        internal const val COMPRESSION_FREE_SPACE_RESERVE_BYTES = 16L * 1024L * 1024L
 
         fun isSecondaryArchiveName(name: String): Boolean =
             name.startsWith(DEBUG_ARCHIVE_PREFIX) || name.startsWith(LEGACY_DEBUG_ARCHIVE_PREFIX)

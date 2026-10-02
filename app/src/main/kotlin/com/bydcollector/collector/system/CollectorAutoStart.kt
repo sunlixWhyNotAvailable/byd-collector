@@ -327,7 +327,7 @@ object CollectorAutoStart {
         if (demand.main) {
             ensurePollingEnabled(settings)
         }
-        // Cold recovery follows AutoStart for both streams; live manual collection is unchanged.
+        // Cold recovery includes same-boot work retained after task removal; live work is unchanged.
         if (!CollectorService.isRunning()) {
             settings.setPollingEnabled(demand.main)
             settings.setDebugPollingEnabled(demand.debug)

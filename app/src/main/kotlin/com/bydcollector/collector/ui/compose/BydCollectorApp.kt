@@ -3364,6 +3364,13 @@ private fun StorageTab(
                             StatusPill(strings.archiveCalculating, StatusKind.WAITING, compact = true)
                         }
                         StatusPill(archiveUsageText(snapshot, strings), archiveUsageKind(snapshot), compact = true)
+                        if ((snapshot?.processingBytes ?: 0L) > 0L) {
+                            StatusPill(
+                                (if (strings.step == "Крок") "В обробці: " else "In progress: ") +
+                                    UiSizeFormatter.bytes(snapshot!!.processingBytes, strings),
+                                StatusKind.WAITING, compact = true
+                            )
+                        }
                         Text(
                             String.format(strings.archiveCountShortTemplate, entries.size),
                             color = LocalBydPalette.current.muted,

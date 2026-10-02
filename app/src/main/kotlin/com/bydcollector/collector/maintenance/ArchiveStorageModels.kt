@@ -54,7 +54,8 @@ data class ArchiveStorageEntry(
     val createdAtMs: Long,
     val sizeBytes: Long,
     val status: ArchiveEntryStatus,
-    val deletable: Boolean
+    val deletable: Boolean,
+    val completed: Boolean = status == ArchiveEntryStatus.COMPRESSED_ZIP
 )
 
 data class ArchiveStorageSnapshot(
@@ -66,6 +67,10 @@ data class ArchiveStorageSnapshot(
     val entries: List<ArchiveStorageEntry>,
     val tripsDatabaseSizeBytes: Long = 0L
 ) {
+    /** Physical working files are visible, but never consume the completed-archive quota. */
+    val processingBytes: Long
+        get() = entries.filterNot { it.completed }.sumOf { it.sizeBytes }
+
     val activeDatabaseSizeBytes: Long
         get() = mainDatabaseSizeBytes + debugDatabaseSizeBytes + tripsDatabaseSizeBytes
 }

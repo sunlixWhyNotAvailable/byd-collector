@@ -14,6 +14,89 @@ import kotlin.test.assertTrue
 
 class CollectorSettingsSecurityContractTest {
     @Test
+    fun taskRemovalRetainsOnlyRequestedWorkWithinTheSameBootAndStopStillWins() {
+        val channels = listOf(
+            CollectorSettings.KEY_POLLING_ENABLED to CollectorSettings.KEY_MAIN_MANUAL_STOP,
+            CollectorSettings.KEY_DEBUG_POLLING_ENABLED to CollectorSettings.KEY_DEBUG_MANUAL_STOP,
+            CollectorSettings.KEY_MQTT_ENABLED to CollectorSettings.KEY_MQTT_MANUAL_STOP,
+            CollectorSettings.KEY_INFLUX_ENABLED to CollectorSettings.KEY_INFLUX_MANUAL_STOP
+        )
+        for (mask in 0..15) {
+            val requested = channels.indices.map { mask and (1 shl it) != 0 }
+            val demand = RuntimeDemand(main = requested[0], debug = requested[1], mqtt = requested[2], influx = requested[3])
+            for (stoppedIndex in -1..3) {
+                val prefs = InMemorySharedPreferences(channels.mapIndexed { index, keys ->
+                    listOf(keys.first to requested[index], keys.second to (index == stoppedIndex))
+                }.flatten().toMap())
+                assertTrue(CollectorSettings.rememberTaskRemoval(prefs, "boot-a", demand, false))
+                val expected = demand.copy(
+                    main = requested[0] && stoppedIndex != 0,
+                    debug = requested[1] && stoppedIndex != 1,
+                    mqtt = requested[2] && stoppedIndex != 2,
+                    influx = requested[3] && stoppedIndex != 3
+                )
+                assertEquals(expected, CollectorSettings.taskRemovalDemand(prefs, "boot-a"))
+                CollectorSettings.resetCollectionAfterProcessDeath(prefs, "boot-a")
+                assertEquals(expected.main, prefs.getBoolean(CollectorSettings.KEY_POLLING_ENABLED, false))
+                assertEquals(expected.debug, prefs.getBoolean(CollectorSettings.KEY_DEBUG_POLLING_ENABLED, false))
+                assertEquals(RuntimeDemand(), CollectorSettings.taskRemovalDemand(prefs, "boot-b"))
+                assertEquals(RuntimeDemand(), CollectorSettings.taskRemovalDemand(prefs, ""))
+                prefs.putDirect(CollectorSettings.KEY_USER_SHUTDOWN, true)
+                assertEquals(RuntimeDemand(), CollectorSettings.taskRemovalDemand(prefs, "boot-a"))
+                CollectorSettings.resetCollectionAfterProcessDeath(prefs, "boot-a")
+                assertFalse(prefs.getBoolean(CollectorSettings.KEY_POLLING_ENABLED, true))
+                assertFalse(prefs.getBoolean(CollectorSettings.KEY_DEBUG_POLLING_ENABLED, true))
+            }
+        }
+    }
+
+    @Test
+    fun rebootDoesNotTurnRemovedManualWorkIntoAutostart() {
+        val prefs = InMemorySharedPreferences(mapOf(
+            CollectorSettings.KEY_POLLING_ENABLED to true,
+            CollectorSettings.KEY_DEBUG_POLLING_ENABLED to true,
+            CollectorSettings.KEY_DEBUG_AUTO_START to true
+        ))
+        CollectorSettings.rememberTaskRemoval(prefs, "before-reboot", RuntimeDemand(main = true, debug = true), true)
+        CollectorSettings.resetCollectionAfterProcessDeath(prefs, "after-reboot")
+        assertFalse(prefs.getBoolean(CollectorSettings.KEY_POLLING_ENABLED, true))
+        assertTrue(prefs.getBoolean(CollectorSettings.KEY_DEBUG_POLLING_ENABLED, false))
+    }
+
+    @Test
+    fun recentsRemovalIsNotWiredToStopOrShutdown() {
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val removal = service.substringAfter("override fun onTaskRemoved(").substringBefore("override fun onTimeout(")
+        assertTrue(removal.contains("rememberTaskRemoval()"))
+        assertTrue(removal.contains("scheduleRestartAfterTaskRemoved"))
+        listOf("stopMain(", "stopDebug(", "shutdownByUser(", "setPollingEnabled(false)", "stopSelf(").forEach {
+            assertFalse(removal.contains(it), "Task removal must not dispatch $it")
+        }
+        val manifest = listOf(File("src/main/AndroidManifest.xml"), File("app/src/main/AndroidManifest.xml"))
+            .first { it.isFile }.readText()
+        assertTrue(manifest.contains("android:excludeFromRecents=\"false\""))
+        assertTrue(manifest.contains("android:stopWithTask=\"false\""))
+    }
+
+    @Test
+    fun secondaryOnlyTaskRecoveryUsesRetainedDemandInsteadOfAutostartOnly() {
+        val prefs = InMemorySharedPreferences(mapOf(CollectorSettings.KEY_DEBUG_POLLING_ENABLED to true))
+        CollectorSettings.rememberTaskRemoval(prefs, "boot-a", RuntimeDemand(debug = true), true)
+        CollectorSettings.resetCollectionAfterProcessDeath(prefs, "boot-a")
+        assertFalse(prefs.getBoolean(CollectorSettings.KEY_DEBUG_AUTO_START, false))
+        assertTrue(prefs.getBoolean(CollectorSettings.KEY_DEBUG_POLLING_ENABLED, false))
+        assertEquals(listOf(RuntimeRecoveryAction.DEBUG),
+            CollectorSettings.taskRemovalDemand(prefs, "boot-a").recoveryActions())
+
+        val service = sourceFile("com/bydcollector/collector/service/CollectorService.kt").readText()
+        val reconcile = service.substringAfter("private fun reconcileDebugRuntime()")
+            .substringBefore("private fun reconcilePersistedRuntime(")
+        assertTrue(reconcile.contains("if (!settings.runtimeDemand().debug)"))
+        assertFalse(reconcile.contains("isDebugAutoStartEnabled()"))
+        assertTrue(reconcile.contains("startDebugIfNeeded("))
+    }
+
+    @Test
     fun processDeathReconcilesBothStreamsWithoutRevivingManualOrStoppedCollection() {
         for (autoMain in listOf(false, true)) for (autoSecondary in listOf(false, true)) {
             for (stopMain in listOf(false, true)) for (stopSecondary in listOf(false, true)) {
