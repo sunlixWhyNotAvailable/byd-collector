@@ -33,6 +33,14 @@ The interface supports English and Ukrainian, with dark and light themes.
 
 Screenshots show the Preview interface with demonstration data; values and statuses are illustrative.
 
+<!--
+Approved modal/overlay screenshots captured on 2026-10-02: 12 views per locale,
+dark theme, com.bydcollector.uipreview, demonstration data only. Long dialogs are
+scroll-stitched without repeating fixed controls. Existing tab screenshots are unchanged.
+Installed Preview APK SHA-256: 19CF07802C2122D0BFFBD855D1D6C3FC498E463177172383D2FE109429771A01.
+Update dialogs, background-work prompts, log clearing, donation and HA menus are excluded.
+-->
+
 ### Main collection and vehicle status
 
 Use `Main` for regular collection. Its Start/Stop controls and automatic-start setting are independent of the secondary collector.
@@ -57,14 +65,35 @@ Start and stop it independently. It can use substantial storage, so stop it when
 
 `Trips` shows sessions from vehicle power-on to power-off, with distance, time, battery information, and GPS routes. Sessions without movement are hidden from the ordinary list.
 
-- Open a trip to view its metrics and route, or use `Current trip` for the active session.
-- The flag on a current trip marks the latest trusted coordinate. `Last known position` means it may no longer be the vehicle's current location.
 - Routes use OpenStreetMap and can be coloured by speed or consumption; colour thresholds are configurable. Gray consumption sections mean missing data, not zero.
 - Energy used, recovered energy, and battery net are shown separately. Average consumption uses the net balance and can be negative.
 - GPS interference, poor reception, or rejected position jumps can leave gaps. Maps need internet access.
 - Route compression reduces storage without removing trips or route points. It is not deletion or database archiving.
 
 <p align="center"><img src="docs/screenshots/en/trips.png" alt="BYD Collector trip history" width="100%"></p>
+
+#### Route details and current trip
+
+Open a trip to view its metrics and route, or use `Current trip` for the active session. The flag on a current trip marks the latest trusted coordinate. `Last known position` means it may no longer be the vehicle's current location.
+
+<details>
+<summary>Route, current trip, and compression screenshots</summary>
+
+The maps below are synthetic Preview illustrations, not real OpenStreetMap routes or vehicle recordings.
+
+Completed trip, coloured by consumption:
+
+<p align="center"><a href="docs/screenshots/en/trip-route.png"><img src="docs/screenshots/en/trip-route.png" alt="Completed demo trip with consumption colours and endpoint legend" width="100%"></a></p>
+
+Current trip, coloured by speed, with metrics and the current-position flag:
+
+<p align="center"><a href="docs/screenshots/en/current-trip.png"><img src="docs/screenshots/en/current-trip.png" alt="Current demo trip with metrics and current-position flag" width="100%"></a></p>
+
+Route compression confirmation:
+
+<p align="center"><a href="docs/screenshots/en/trips-compress.png"><img src="docs/screenshots/en/trips-compress.png" alt="Trips database compression confirmation" width="840"></a></p>
+
+</details>
 
 ## Optional integrations
 
@@ -109,6 +138,23 @@ Pending messages survive app restarts and telemetry database archiving, and fail
 
 <p align="center"><img src="docs/screenshots/en/telegram.png" alt="BYD Collector Telegram notification settings" width="100%"></p>
 
+#### Example: trip summary template
+
+Use the `{}` button beside the trip summary template to choose a variable to insert into the message. Open `Send location` in the same section to choose whether to include a location and which navigator links to use.
+
+<details>
+<summary>Trip summary: variables and location settings</summary>
+
+The complete variable picker for the trip summary template:
+
+<p align="center"><a href="docs/screenshots/en/telegram-variables.png"><img src="docs/screenshots/en/telegram-variables.png" alt="Complete trip summary template variable list, stitched from scrolling captures" width="840"></a></p>
+
+Location and navigator settings. Enable the navigators whose links you want to receive:
+
+<p align="center"><a href="docs/screenshots/en/telegram-location.png"><img src="docs/screenshots/en/telegram-location.png" alt="Trip summary location and navigator settings" width="780"></a></p>
+
+</details>
+
 ## Storage and archives
 
 Telemetry and trips are stored locally. `Storage` shows database sizes, existing archives, and the archive-size limit.
@@ -118,16 +164,36 @@ Telemetry and trips are stored locally. `Storage` shows database sizes, existing
 - **Share or delete an existing archive:** select it in Storage. Deletion requires confirmation.
 - **Reduce route storage:** use compression on Trips; it preserves the route points.
 
-Archiving preserves the selected database and starts a fresh one. It temporarily pauses that collector and its related exports; the other collector continues. Read the confirmation and pending-export warnings, keep enough free space, and do not interrupt the operation. Progress or errors appear with the archive.
-
 The archive limit applies to completed Main/All data archives, **not active databases or trip history**. Automatic cleanup removes older eligible archives while protecting the newest archive of each type. Main and trip history can continue growing.
 
 <p align="center"><img src="docs/screenshots/en/storage.png" alt="BYD Collector storage and database archives" width="100%"></p>
+
+### Archive confirmation and progress
+
+Archiving preserves the selected database and starts a fresh one. It temporarily pauses that collector and its related exports; the other collector continues. Read the confirmation and pending-export warnings, keep enough free space, and do not interrupt the operation. Progress or errors appear with the archive.
 
 <p align="center">
   <a href="docs/screenshots/en/archive.png"><img src="docs/screenshots/en/archive.png" alt="BYD Collector database archive confirmation" width="49%"></a>
   <a href="docs/screenshots/en/archive-done.png"><img src="docs/screenshots/en/archive-done.png" alt="BYD Collector completed database archive" width="49%"></a>
 </p>
+
+<details>
+<summary>Archive progress, secondary database, and deletion</summary>
+
+An intermediate step of Main database archiving:
+
+<p align="center"><a href="docs/screenshots/en/archive-progress.png"><img src="docs/screenshots/en/archive-progress.png" alt="Main database archiving progress" width="840"></a></p>
+
+Secondary database archive confirmation:
+
+<p align="center"><a href="docs/screenshots/en/archive-secondary.png"><img src="docs/screenshots/en/archive-secondary.png" alt="Secondary database archive confirmation" width="840"></a></p>
+
+Confirmation and progress when deleting selected archives:
+
+<p align="center"><a href="docs/screenshots/en/archive-delete.png"><img src="docs/screenshots/en/archive-delete.png" alt="Selected archive deletion confirmation" width="660"></a></p>
+<p align="center"><a href="docs/screenshots/en/archive-delete-progress.png"><img src="docs/screenshots/en/archive-delete-progress.png" alt="Selected archive deletion progress" width="660"></a></p>
+
+</details>
 
 ## Background operation and updates
 
@@ -140,6 +206,27 @@ Collection can continue with the vehicle off on supported firmware, but uninterr
 Update checks can run in the background and retry when the network returns. Use Options for a manual check. The optional update hint appears above other apps and requires Android's display-over-other-apps permission. Without it, ordinary in-app update offers and collection still work.
 
 <p align="center"><img src="docs/screenshots/en/options.png" alt="BYD Collector options and runtime settings" width="100%"></p>
+
+### Update hint widget
+
+The gear beside `New version hint widget` opens its appearance settings with a 1:1 preview: transparency, corner rounding, border width and colour, and widget size. The border-colour button opens a separate colour picker. The on-screen hint itself is a separate overlay; tapping it opens the update details.
+
+<details>
+<summary>Widget appearance, colour picker, and on-screen hint</summary>
+
+All appearance controls and the 1:1 sample; the controls have been scroll-stitched into one image:
+
+<p align="center"><a href="docs/screenshots/en/update-hint-settings.png"><img src="docs/screenshots/en/update-hint-settings.png" alt="Complete update hint widget appearance settings with sample" width="100%"></a></p>
+
+Border-colour picker:
+
+<p align="center"><a href="docs/screenshots/en/update-hint-color.png"><img src="docs/screenshots/en/update-hint-color.png" alt="Widget border-colour picker" width="560"></a></p>
+
+The actual on-screen hint, cropped from an emulator capture (demonstration version number):
+
+<p align="center"><a href="docs/screenshots/en/update-hint-overlay.png"><img src="docs/screenshots/en/update-hint-overlay.png" alt="Actual update hint overlay" width="660"></a></p>
+
+</details>
 
 ## Troubleshooting
 
