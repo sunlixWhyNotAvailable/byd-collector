@@ -26,6 +26,7 @@ import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
 import com.bydcollector.collector.maintenance.StorageFormat
 import com.bydcollector.collector.maintenance.StorageCutoverJournal
+import com.bydcollector.collector.mqtt.HaDiscoveryBuilder
 import com.bydcollector.collector.mqtt.HaMqttConfig
 import com.bydcollector.collector.security.KeystoreSecretStore
 import com.bydcollector.collector.util.dispatchOperationalEvent
@@ -298,6 +299,10 @@ class CollectorSettings(
             clientId = mqttClientId(),
             topicPrefix = mqttTopicPrefix(),
             discoveryPrefix = mqttDiscoveryPrefix(),
+            deviceId = mqttDeviceId(),
+            deviceIdentifier = mqttDeviceIdentifier(),
+            deviceName = mqttDeviceName(),
+            deviceModel = mqttDeviceModel(),
             enabledCategories = mqttEnabledCategories(),
             alternativeHost = mqttAlternativeHost(),
             alternativePort = mqttAlternativePort()
@@ -409,6 +414,58 @@ class CollectorSettings(
         prefs.edit().putString(
             KEY_MQTT_DISCOVERY_PREFIX,
             discoveryPrefix.trim('/').ifBlank { HaMqttConfig.DEFAULT_DISCOVERY_PREFIX }
+        ).apply()
+    }
+
+    fun mqttDeviceId(): String {
+        return prefs.getString(KEY_MQTT_DEVICE_ID, HaDiscoveryBuilder.DEVICE_ID)
+            ?.ifBlank { HaDiscoveryBuilder.DEVICE_ID }
+            ?: HaDiscoveryBuilder.DEVICE_ID
+    }
+
+    fun setMqttDeviceId(deviceId: String) {
+        prefs.edit().putString(
+            KEY_MQTT_DEVICE_ID,
+            deviceId.ifBlank { HaDiscoveryBuilder.DEVICE_ID }
+        ).apply()
+    }
+
+    fun mqttDeviceIdentifier(): String {
+        return prefs.getString(KEY_MQTT_DEVICE_IDENTIFIER, HaDiscoveryBuilder.DEVICE_IDENTIFIER)
+            ?.ifBlank { HaDiscoveryBuilder.DEVICE_IDENTIFIER }
+            ?: HaDiscoveryBuilder.DEVICE_IDENTIFIER
+    }
+
+    fun setMqttDeviceIdentifier(deviceIdentifier: String) {
+        prefs.edit().putString(
+            KEY_MQTT_DEVICE_IDENTIFIER,
+            deviceIdentifier.ifBlank { HaDiscoveryBuilder.DEVICE_IDENTIFIER }
+        ).apply()
+    }
+
+    fun mqttDeviceName(): String {
+        return prefs.getString(KEY_MQTT_DEVICE_NAME, HaDiscoveryBuilder.DEVICE_NAME)
+            ?.ifBlank { HaDiscoveryBuilder.DEVICE_NAME }
+            ?: HaDiscoveryBuilder.DEVICE_NAME
+    }
+
+    fun setMqttDeviceName(deviceName: String) {
+        prefs.edit().putString(
+            KEY_MQTT_DEVICE_NAME,
+            deviceName.ifBlank { HaDiscoveryBuilder.DEVICE_NAME }
+        ).apply()
+    }
+
+    fun mqttDeviceModel(): String {
+        return prefs.getString(KEY_MQTT_DEVICE_MODEL, HaDiscoveryBuilder.DEVICE_MODEL)
+            ?.ifBlank { HaDiscoveryBuilder.DEVICE_MODEL }
+            ?: HaDiscoveryBuilder.DEVICE_MODEL
+    }
+
+    fun setMqttDeviceModel(deviceModel: String) {
+        prefs.edit().putString(
+            KEY_MQTT_DEVICE_MODEL,
+            deviceModel.ifBlank { HaDiscoveryBuilder.DEVICE_MODEL }
         ).apply()
     }
 
@@ -1368,6 +1425,10 @@ class CollectorSettings(
         const val KEY_MQTT_CLIENT_ID = "mqttClientId"
         const val KEY_MQTT_TOPIC_PREFIX = "mqttTopicPrefix"
         const val KEY_MQTT_DISCOVERY_PREFIX = "mqttDiscoveryPrefix"
+        const val KEY_MQTT_DEVICE_ID = "mqttDeviceId"
+        const val KEY_MQTT_DEVICE_IDENTIFIER = "mqttDeviceIdentifier"
+        const val KEY_MQTT_DEVICE_NAME = "mqttDeviceName"
+        const val KEY_MQTT_DEVICE_MODEL = "mqttDeviceModel"
         const val KEY_MQTT_CATEGORIES = "mqttCategories"
         const val KEY_MQTT_LOCATION = "mqttLocation"
         const val KEY_INFLUX_ENABLED = "influxEnabled"

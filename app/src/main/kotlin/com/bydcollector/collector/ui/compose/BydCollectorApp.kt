@@ -1975,6 +1975,14 @@ private fun CredentialGridMqtt(
             TextInput(strings.discoveryPrefix, draft.discoveryPrefix, { actions.onMqttDraftChanged(draft.copy(discoveryPrefix = it)) }, Modifier.weight(1f), enabled = enabled)
             Spacer(Modifier.weight(1f))
         }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextInput(strings.deviceId, draft.deviceId, { actions.onMqttDraftChanged(draft.copy(deviceId = it)) }, Modifier.weight(1f), enabled = enabled)
+            TextInput(strings.deviceIdentifier, draft.deviceIdentifier, { actions.onMqttDraftChanged(draft.copy(deviceIdentifier = it)) }, Modifier.weight(1f), enabled = enabled)
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextInput(strings.deviceName, draft.deviceName, { actions.onMqttDraftChanged(draft.copy(deviceName = it)) }, Modifier.weight(1f), enabled = enabled)
+            TextInput(strings.deviceModel, draft.deviceModel, { actions.onMqttDraftChanged(draft.copy(deviceModel = it)) }, Modifier.weight(1f), enabled = enabled)
+        }
     }
 }
 

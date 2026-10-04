@@ -9,6 +9,8 @@ import org.json.JSONObject
 object HaDiscoveryBuilder {
     const val DEVICE_ID = "byd_sealion_07"
     const val DEVICE_IDENTIFIER = "bydcollector_sealion_07"
+    const val DEVICE_NAME = "BYD Sea Lion 07"
+    const val DEVICE_MODEL = "Sea Lion 07"
 
     fun discoveryMessages(
         config: HaMqttConfig,
@@ -16,6 +18,7 @@ object HaDiscoveryBuilder {
     ): List<HaMqttMessage> {
         val topicPrefix = config.normalizedTopicPrefix()
         val discoveryPrefix = config.normalizedDiscoveryPrefix()
+        val deviceId = config.deviceId
         val availabilityTopic = "$topicPrefix/status"
 
         //publishes only fields that are enabled and safe for ha entity semantics
@@ -23,10 +26,10 @@ object HaDiscoveryBuilder {
         val publishable = publishableFields
             .map { field ->
                 val stateTopic = "$topicPrefix/state/${field.category.mqttKey}"
-                val discoveryTopic = "$discoveryPrefix/${field.entityPlatform}/$DEVICE_ID/${field.fieldKey}/config"
+                val discoveryTopic = "$discoveryPrefix/${field.entityPlatform}/$deviceId/${field.fieldKey}/config"
                 HaMqttMessage(
                     topic = discoveryTopic,
-                    payload = discoveryPayload(field, stateTopic, availabilityTopic),
+                    payload = discoveryPayload(field, stateTopic, availabilityTopic, config),
                     retained = true,
                     qos = 1
                 )
@@ -37,7 +40,7 @@ object HaDiscoveryBuilder {
         if (!legacySunroof) return publishable
 
         val tombstone = HaMqttMessage(
-            topic = "$discoveryPrefix/binary_sensor/$DEVICE_ID/bodywork_sunroof_windoblind_position/config",
+            topic = "$discoveryPrefix/binary_sensor/$deviceId/bodywork_sunroof_windoblind_position/config",
             payload = "",
             retained = true,
             qos = 1
@@ -48,18 +51,19 @@ object HaDiscoveryBuilder {
     private fun discoveryPayload(
         field: NormalizedFieldDefinition,
         stateTopic: String,
-        availabilityTopic: String
+        availabilityTopic: String,
+        config: HaMqttConfig
     ): String {
         val payload = JSONObject()
             .put("name", field.displayName)
-            .put("unique_id", "${DEVICE_ID}_${field.fieldKey}")
+            .put("unique_id", "${config.deviceId}_${field.fieldKey}")
             .put("state_topic", stateTopic)
             .put("availability_topic", availabilityTopic)
             .put("availability_template", "{{ value_json.availability }}")
             .put("payload_available", "online")
             .put("payload_not_available", "offline")
             .put("value_template", valueTemplate(field))
-            .put("device", deviceJson())
+            .put("device", deviceJson(config))
 
         if (field.entityPlatform == "binary_sensor") {
             //binary sensors need explicit true/false payloads because ha templates otherwise treat strings loosely
@@ -83,11 +87,11 @@ object HaDiscoveryBuilder {
         }
     }
 
-    private fun deviceJson(): JSONObject {
+    private fun deviceJson(config: HaMqttConfig): JSONObject {
         return JSONObject()
-            .put("identifiers", JSONArray().put(DEVICE_IDENTIFIER))
-            .put("name", "BYD Sea Lion 07")
+            .put("identifiers", JSONArray().put(config.deviceIdentifier))
+            .put("name", config.deviceName)
             .put("manufacturer", "BYD")
-            .put("model", "Sea Lion 07")
+            .put("model", config.deviceModel)
     }
 }

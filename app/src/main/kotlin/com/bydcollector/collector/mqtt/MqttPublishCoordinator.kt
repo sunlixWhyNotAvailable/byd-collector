@@ -51,8 +51,8 @@ class MqttPublishCoordinator(
         validateEnabled(config)?.let { return it }
 
         //queues discovery before state so a failed initial connection retains complete restart work
-        enqueueBuildResult(messageFactory.discoveryMessages(config), DISCOVERY_PRIORITY)?.let { return it }
-        enqueueBuildResult(messageFactory.fullResyncMessages(config), STATE_PRIORITY)?.let { return it }
+        enqueueBuildResult(messageFactory.discoveryMessages(config), DISCOVERY_PRIORITY, config)?.let { return it }
+        enqueueBuildResult(messageFactory.fullResyncMessages(config), STATE_PRIORITY, config)?.let { return it }
         return flushPendingInternal(force = true, allowFullResyncAfterSuccess = false)
     }
 
@@ -72,28 +72,28 @@ class MqttPublishCoordinator(
         if (!config.discoveryEnabled) {
             return MqttActionResult.fail("ha_discovery_disabled", "Home Assistant MQTT discovery is disabled")
         }
-        return enqueueBuildResult(messageFactory.discoveryMessages(config), DISCOVERY_PRIORITY)
+        return enqueueBuildResult(messageFactory.discoveryMessages(config), DISCOVERY_PRIORITY, config)
             ?: flushPending(force)
     }
 
     fun queueFullResyncAndFlush(force: Boolean = true): MqttActionResult {
         val config = runtimeConfig(capture = true)
         validateEnabled(config)?.let { return it }
-        return enqueueBuildResult(messageFactory.fullResyncMessages(config), STATE_PRIORITY)
+        return enqueueBuildResult(messageFactory.fullResyncMessages(config), STATE_PRIORITY, config)
             ?: flushPending(force)
     }
 
     fun queueStatusAndFlush(status: HaMqttStatus, force: Boolean = false): MqttActionResult {
         val config = runtimeConfig(capture = true)
         validateEnabled(config)?.let { return it }
-        return enqueueBuildResult(messageFactory.statusMessage(config, status), STATUS_PRIORITY)
+        return enqueueBuildResult(messageFactory.statusMessage(config, status), STATUS_PRIORITY, config)
             ?: flushPending(force)
     }
 
     fun queueChangedCategoriesAndFlush(categories: Set<String>, force: Boolean = false): MqttActionResult {
         val config = runtimeConfig(capture = true)
         validateEnabled(config)?.let { return it }
-        return enqueueBuildResult(messageFactory.changedCategoryMessages(config, categories), STATE_PRIORITY)
+        return enqueueBuildResult(messageFactory.changedCategoryMessages(config, categories), STATE_PRIORITY, config)
             ?: flushPending(force)
     }
 
@@ -188,7 +188,7 @@ class MqttPublishCoordinator(
         retryStateStore.recordRetrySuccess(clock.nowIso())
         if (hadPreviousFailure && allowFullResyncAfterSuccess) {
             //after reconnect, resync everything because retained topics may have gone stale during outage
-            return enqueueBuildResult(messageFactory.fullResyncMessages(runtimeConfig()), STATE_PRIORITY)
+            return enqueueBuildResult(messageFactory.fullResyncMessages(runtimeConfig()), STATE_PRIORITY, config)
                 ?: flushPendingInternal(force = true, allowFullResyncAfterSuccess = false)
         }
         return MqttActionResult.ok()
@@ -196,7 +196,8 @@ class MqttPublishCoordinator(
 
     private fun enqueueBuildResult(
         buildResult: MqttMessageBuildResult,
-        fallbackPriority: Int
+        fallbackPriority: Int,
+        config: HaMqttConfig
     ): MqttActionResult? {
         return when (buildResult) {
             is MqttMessageBuildResult.Failure -> MqttActionResult.fail(buildResult.category, buildResult.message)
@@ -206,7 +207,7 @@ class MqttPublishCoordinator(
                     outbox.upsertPending(
                         message = message,
                         targetType = targetType(message),
-                        priority = priorityFor(message, fallbackPriority)
+                        priority = priorityFor(message, fallbackPriority, config)
                     )
                 }
                 null
@@ -311,8 +312,8 @@ class MqttPublishCoordinator(
         }
     }
 
-    private fun priorityFor(message: HaMqttMessage, fallbackPriority: Int): Int {
-        if (isLegacySunroofTombstone(message)) return LEGACY_SUNROOF_TOMBSTONE_PRIORITY
+    private fun priorityFor(message: HaMqttMessage, fallbackPriority: Int, config: HaMqttConfig): Int {
+        if (isLegacySunroofTombstone(message, config)) return LEGACY_SUNROOF_TOMBSTONE_PRIORITY
         return when (targetType(message)) {
             "discovery" -> DISCOVERY_PRIORITY
             "status" -> STATUS_PRIORITY
@@ -321,9 +322,9 @@ class MqttPublishCoordinator(
         }
     }
 
-    private fun isLegacySunroofTombstone(message: HaMqttMessage): Boolean {
+    private fun isLegacySunroofTombstone(message: HaMqttMessage, config: HaMqttConfig): Boolean {
         return message.retained && message.payload.isEmpty() && message.topic.endsWith(
-            "/binary_sensor/${HaDiscoveryBuilder.DEVICE_ID}/bodywork_sunroof_windoblind_position/config"
+            "/binary_sensor/${config.deviceId}/bodywork_sunroof_windoblind_position/config"
         )
     }
 

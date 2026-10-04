@@ -19,6 +19,10 @@ data class MqttDraft(
     val clientId: String = "",
     val topicPrefix: String = "",
     val discoveryPrefix: String = "",
+    val deviceId: String = "",
+    val deviceIdentifier: String = "",
+    val deviceName: String = "",
+    val deviceModel: String = "",
     val alternativeHost: String = "",
     val alternativePort: String = "",
     val editingProfile: HaEndpointProfile = HaEndpointProfile.PRIMARY

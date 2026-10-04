@@ -13,6 +13,10 @@ data class HaMqttConfig(
     val clientId: String,
     val topicPrefix: String,
     val discoveryPrefix: String,
+    val deviceId: String = HaDiscoveryBuilder.DEVICE_ID,
+    val deviceIdentifier: String = HaDiscoveryBuilder.DEVICE_IDENTIFIER,
+    val deviceName: String = HaDiscoveryBuilder.DEVICE_NAME,
+    val deviceModel: String = HaDiscoveryBuilder.DEVICE_MODEL,
     val enabledCategories: Set<String>,
     /** Optional alternative host; a non-blank host requires [alternativePort]. */
     val alternativeHost: String? = null,
