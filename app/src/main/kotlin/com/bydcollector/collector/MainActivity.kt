@@ -822,6 +822,10 @@ class MainActivity : ComponentActivity() {
             clientId = settings.mqttClientId(),
             topicPrefix = settings.mqttTopicPrefix(),
             discoveryPrefix = settings.mqttDiscoveryPrefix(),
+            deviceId = settings.mqttDeviceId(),
+            deviceIdentifier = settings.mqttDeviceIdentifier(),
+            deviceName = settings.mqttDeviceName(),
+            deviceModel = settings.mqttDeviceModel(),
             alternativeHost = settings.mqttAlternativeHost().orEmpty(),
             alternativePort = settings.mqttAlternativePort()?.toString().orEmpty()
         )
@@ -2280,6 +2284,10 @@ class MainActivity : ComponentActivity() {
         settings.setMqttClientId(mqttDraft.clientId)
         settings.setMqttTopicPrefix(mqttDraft.topicPrefix)
         settings.setMqttDiscoveryPrefix(mqttDraft.discoveryPrefix)
+        settings.setMqttDeviceId(mqttDraft.deviceId)
+        settings.setMqttDeviceIdentifier(mqttDraft.deviceIdentifier)
+        settings.setMqttDeviceName(mqttDraft.deviceName)
+        settings.setMqttDeviceModel(mqttDraft.deviceModel)
         val stored = usernameStored && passwordStored
         if (!stored) {
             mqttDraft = mqttDraft.copy(
