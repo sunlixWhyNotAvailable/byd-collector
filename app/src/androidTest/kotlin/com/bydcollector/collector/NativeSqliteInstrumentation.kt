@@ -149,7 +149,12 @@ class NativeSqliteInstrumentation : Instrumentation() {
             return
         }
         val tests = SettingsBehaviorGate.cases(targetContext, prefix) +
-            StorageBehaviorGate.cases(targetContext, prefix) + listOf(
+            StorageBehaviorGate.cases(targetContext, prefix) +
+            BoundedRowCountNativeGate.cases() +
+            InfluxPendingSummaryNativeGate.cases() +
+            NormalizationCatalogCacheNativeGate.cases(targetContext, prefix) +
+            DashboardMetricsNativeGate.cases(targetContext) +
+            CallbackContentionGate.cases(targetContext, prefix) + listOf(
             "main_compact_callback_transactions" to { mainCallbackTransactions(false) },
             "main_legacy_additive_upgrade" to { mainCallbackTransactions(true) },
             "secondary_callback_transactions" to ::secondaryCallbackTransactions,

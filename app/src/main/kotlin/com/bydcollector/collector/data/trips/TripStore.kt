@@ -534,6 +534,16 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
 
     @Synchronized
     fun verify(): Boolean = readableDb.rawQuery("PRAGMA quick_check", null).use { it.moveToFirst() && it.getString(0) == "ok" }
+
+    @Synchronized
+    internal fun validateStartup(recoveredAfterReplacement: Boolean) {
+        check(schemaVersion() == TripDatabaseHelper.DATABASE_VERSION) { "Trips database schema is not ready" }
+        if (recoveredAfterReplacement) {
+            check(verify()) { "Trips database integrity check failed after recovery" }
+            check(verifyForeignKeys()) { "Trips database foreign key check failed after recovery" }
+        }
+    }
+
     val databaseFile get() = helper.databaseFile
 
     @Synchronized

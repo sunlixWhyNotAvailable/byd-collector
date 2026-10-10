@@ -46,6 +46,7 @@ object CollectorAutoStart {
         }
         val demand = prepareRuntimeDemand(settings)
         if (!demand.any) {
+            (appContext.applicationContext as BydCollectorApplication).startDashboardMetrics()
             store.recordEvent("boot_auto_start_skipped", "No runtime channel is eligible for recovery", action)
             cancelRetry(appContext)
             cancelWatchdog(appContext)
@@ -199,7 +200,10 @@ object CollectorAutoStart {
         }
         if (CollectorSettings.isDbMaintenanceRunning(appContext)) return
         val demand = prepareRuntimeDemand(settings)
-        if (!demand.any) return
+        if (!demand.any) {
+            (appContext.applicationContext as BydCollectorApplication).startDashboardMetrics()
+            return
+        }
         if (CollectorService.isRunning()) {
             requestServiceReconcile(appContext, demand, store, "foreground_auto_start_recovery")
             return

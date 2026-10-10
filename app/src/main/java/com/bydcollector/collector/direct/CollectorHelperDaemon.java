@@ -33,6 +33,8 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 //runs as shell app_process so the app can read autoservice through a narrow binder bridge
 public final class CollectorHelperDaemon {
@@ -145,6 +147,9 @@ public final class CollectorHelperDaemon {
         helperDiagnostics.mode("app");
         final Object readLock = new Object();
         final Handler mainHandler = new Handler(Looper.myLooper());
+        final HelperRequestGate requestGate = new HelperRequestGate();
+        final AtomicBoolean ownerStopAttemptRunning = new AtomicBoolean();
+        final AtomicBoolean ownerStopComplete = new AtomicBoolean();
         final String mainCatalogVersion = loadMainCatalogVersion();
         final String secondaryCatalogVersion = loadSecondaryCatalogVersion();
         final String legacyWorkerCatalogVersion = loadLegacyWorkerCatalogVersion();
@@ -196,6 +201,10 @@ public final class CollectorHelperDaemon {
                     return false;
                 }
                 data.enforceInterface(CollectorHelperProtocol.DESCRIPTOR);
+                boolean trackedTransaction = code != CollectorHelperProtocol.TX_STOP_OWNER &&
+                    code != CollectorHelperProtocol.TX_PING;
+                if (trackedTransaction && !requestGate.enter(isStopDrainTransaction(code))) return false;
+                try {
                 if (code == CollectorHelperProtocol.TX_STREAM_CONTROL) {
                     HelperStreamRuntimeState.ControlResult result;
                     try {
@@ -492,6 +501,8 @@ public final class CollectorHelperDaemon {
                         ? CollectorHelperProtocol.OWNER_MODE_APP_GAP_SPOOL
                         : CollectorHelperProtocol.OWNER_MODE_APP;
                     boolean accepted = expectedOwnerMode == actualOwnerMode;
+                    boolean firstRequest = accepted && requestGate.stopAccepting();
+                    if (firstRequest) runtime.beginShutdown();
                     if (reply != null) {
                         reply.writeInt(
                             accepted
@@ -502,14 +513,58 @@ public final class CollectorHelperDaemon {
                         reply.writeString(accepted ? null : "owner mode mismatch");
                     }
                     if (accepted) {
-                        //allows the synchronous Binder reply to leave the shell process before its main looper exits
-                        mainHandler.postDelayed(() -> {
-                            mainHandler.getLooper().quitSafely();
-                        }, 100L);
+                        if (!ownerStopComplete.get() && ownerStopAttemptRunning.compareAndSet(false, true)) {
+                            Thread stopThread = new Thread(() -> {
+                                boolean stopped = false;
+                                try {
+                                    //Let Binder return the accepted request before teardown starts.
+                                    Thread.sleep(100L);
+                                    if (!requestGate.awaitIdleAndSeal(5_000L)) {
+                                        helperDiagnostics.error(
+                                            "helper stop remains pending; admitted Binder work did not quiesce and owner lock was retained");
+                                        return;
+                                    }
+                                    stopped = resources.closeForStop();
+                                    if (!stopped) {
+                                        helperDiagnostics.error(
+                                            "helper stop remains pending; owner lock retained until telemetry writers and spool tails are safe");
+                                        return;
+                                    }
+                                    ownerStopComplete.set(true);
+                                } catch (InterruptedException error) {
+                                    Thread.currentThread().interrupt();
+                                    helperDiagnostics.error("helper stop interrupted; owner lock retained");
+                                } catch (Throwable error) {
+                                    recordDiagnosticError(helperDiagnostics,
+                                        "helper stop teardown failed; owner lock retained: " + describe(error));
+                                } finally {
+                                    if (!stopped) requestGate.reopenDrainAdmission();
+                                    ownerStopAttemptRunning.set(false);
+                                }
+                                if (stopped) {
+                                    try { helperDiagnostics.close(); }
+                                    catch (Throwable error) {
+                                        System.err.println("WARN: helper diagnostics close failed after safe stop: " + describe(error));
+                                    }
+                                    System.exit(0);
+                                }
+                            }, "byd-helper-stop");
+                            stopThread.setDaemon(true);
+                            try {
+                                stopThread.start();
+                            } catch (Throwable error) {
+                                ownerStopAttemptRunning.set(false);
+                                recordDiagnosticError(helperDiagnostics,
+                                    "helper stop worker could not start; owner lock retained: " + describe(error));
+                            }
+                        }
                     }
                     return true;
                 }
                 return false;
+                } finally {
+                    if (trackedTransaction) requestGate.leave();
+                }
             }
         };
         helperBinder.attachInterface(null, CollectorHelperProtocol.DESCRIPTOR);
@@ -991,6 +1046,19 @@ public final class CollectorHelperDaemon {
         return current.getClass().getSimpleName() + ": " + (current.getMessage() == null ? "no message" : current.getMessage());
     }
 
+    static boolean isStopDrainTransaction(int code) {
+        return code == CollectorHelperProtocol.TX_CALLBACK_PENDING_PAGE ||
+            code == CollectorHelperProtocol.TX_CALLBACK_ACK ||
+            code == CollectorHelperProtocol.TX_CALLBACK_STATUS ||
+            code == CollectorHelperProtocol.TX_CALLBACK_QUARANTINE ||
+            code == CollectorHelperProtocol.TX_SECONDARY_STATUS ||
+            code == CollectorHelperProtocol.TX_SECONDARY_PENDING_PAGE ||
+            code == CollectorHelperProtocol.TX_SECONDARY_ACK ||
+            code == CollectorHelperProtocol.TX_SECONDARY_QUARANTINE ||
+            code == CollectorHelperProtocol.TX_WORKER_PENDING ||
+            code == CollectorHelperProtocol.TX_WORKER_ACK;
+    }
+
     private static void prepareMainLooper() {
         try {
             Looper.prepareMainLooper();
@@ -1440,6 +1508,66 @@ public final class CollectorHelperDaemon {
         }
     }
 
+    static final class HelperRequestGate {
+        private final Object lock = new Object();
+        private boolean stopping;
+        private int active;
+
+        boolean enter(boolean drainOperation) {
+            synchronized (lock) {
+                if (closing || (stopping && !drainOperation)) return false;
+                active++;
+                return true;
+            }
+        }
+
+        void leave() {
+            synchronized (lock) {
+                if (active <= 0) throw new IllegalStateException("helper request gate underflow");
+                active--;
+                if (active == 0) lock.notifyAll();
+            }
+        }
+
+        boolean stopAccepting() {
+            synchronized (lock) {
+                boolean firstRequest = !stopping;
+                stopping = true;
+                if (active == 0) lock.notifyAll();
+                return firstRequest;
+            }
+        }
+
+        boolean awaitIdleAndSeal(long timeoutMs) {
+            long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(Math.max(0L, timeoutMs));
+            synchronized (lock) {
+                while (active != 0) {
+                    long remaining = deadline - System.nanoTime();
+                    if (remaining <= 0L) return false;
+                    long millis = TimeUnit.NANOSECONDS.toMillis(remaining);
+                    int nanos = (int) (remaining - TimeUnit.MILLISECONDS.toNanos(millis));
+                    try {
+                        lock.wait(millis, nanos);
+                    } catch (InterruptedException error) {
+                        Thread.currentThread().interrupt();
+                        return false;
+                    }
+                }
+                closing = true;
+                return true;
+            }
+        }
+
+        void reopenDrainAdmission() {
+            synchronized (lock) {
+                if (stopping) closing = false;
+                lock.notifyAll();
+            }
+        }
+
+        private boolean closing;
+    }
+
     private static final class OwnerLock {
         private final RandomAccessFile file;
         private final FileChannel channel;
@@ -1482,48 +1610,50 @@ public final class CollectorHelperDaemon {
         }
 
         @Override public synchronized void close() {
-            if (closed) return;
-            closed = true;
+            closeForStop();
+        }
+
+        synchronized boolean closeForStop() {
+            if (closed) return true;
             boolean callbackTransportSafeToClose = true;
+            boolean runtimeWritersStopped = true;
             try {
                 if (runtime != null) {
-                    runtime.close();
+                    runtimeWritersStopped = runtime.closeAndAwait(5_000L);
                     callbackTransportSafeToClose = runtime.callbackWorkersStopped();
                 }
             } catch (Throwable error) {
                 recordDiagnosticError(diagnostics, "helper runtime teardown failed: " + describe(error));
-                callbackTransportSafeToClose = runtime == null || runtime.callbackWorkersStopped();
+                callbackTransportSafeToClose = false;
+                runtimeWritersStopped = false;
             }
+            if (!runtimeWritersStopped || !callbackTransportSafeToClose) {
+                recordDiagnosticError(diagnostics,
+                    "helper stop is waiting for callback and telemetry writer teardown; owner lock and spools retained");
+                return false;
+            }
+
+            try {
+                if (callbackSpoolBinder != null && !callbackSpoolBinder.closeAndReport()) {
+                    recordDiagnosticError(diagnostics,
+                        "callback shutdown tail remains in memory; owner lock and callback spools retained for retry");
+                    return false;
+                }
+            } catch (Throwable error) {
+                recordDiagnosticError(diagnostics, "callback spool teardown failed; owner lock retained: " + describe(error));
+                return false;
+            }
+
             try {
                 if (workerSpool != null) workerSpool.close();
-            } catch (Throwable error) {
-                recordDiagnosticError(diagnostics, "helper spool teardown failed: " + describe(error));
-            }
-            try {
                 if (secondarySpoolBinder != null) secondarySpoolBinder.close();
             } catch (Throwable error) {
-                recordDiagnosticError(diagnostics, "secondary spool teardown failed: " + describe(error));
+                recordDiagnosticError(diagnostics, "helper spool teardown failed; owner lock retained: " + describe(error));
+                return false;
             }
-            if (callbackTransportSafeToClose) {
-                try {
-                    if (callbackSpoolBinder != null && !callbackSpoolBinder.closeAndReport()) {
-                        recordDiagnosticError(diagnostics,
-                            "callback shutdown tail could not be durably persisted; loss was recorded as shutdown_spill");
-                    }
-                } catch (Throwable error) {
-                    recordDiagnosticError(diagnostics, "callback spool teardown failed: " + describe(error));
-                }
-            } else {
-                recordDiagnosticError(diagnostics,
-                    "callback workers exceeded shutdown wait; callback spool and owner lock retained until helper process exit");
-            }
-            if (callbackTransportSafeToClose) {
-                try {
-                    ownerLock.close();
-                } catch (Throwable error) {
-                    recordDiagnosticError(diagnostics, "helper owner teardown failed: " + describe(error));
-                }
-            }
+            // Keep the lock through process exit so no replacement overlaps this Binder owner.
+            closed = true;
+            return true;
         }
     }
 }

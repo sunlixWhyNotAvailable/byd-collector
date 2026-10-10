@@ -56,7 +56,9 @@ class DashboardStateProvider(
     fun load(
         profile: DashboardLoadProfile,
         previous: DashboardState? = null,
-        vehicleKpiLanguage: VehicleKpiLanguage = VehicleKpiLanguage.UK
+        vehicleKpiLanguage: VehicleKpiLanguage = VehicleKpiLanguage.UK,
+        readStorage: Boolean = true,
+        includePollHealth: Boolean = true
     ): DashboardState {
         if (com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) {
             if (profile != DashboardLoadProfile.INITIAL) com.bydcollector.collector.runtime.RuntimePreferences.refresh(context)
@@ -72,7 +74,7 @@ class DashboardStateProvider(
             maintenanceStatus.operation == DbMaintenanceOperation.DEBUG_ARCHIVE
         val application = context.applicationContext as BydCollectorApplication
         return when {
-            profile.readsTelemetryStore && !mainMaintenanceRunning -> {
+            readStorage && profile.readsTelemetryStore && !mainMaintenanceRunning -> {
                 application.withTelemetryStoreRead { currentStore ->
                     loadSnapshot(
                         profile,
@@ -80,7 +82,9 @@ class DashboardStateProvider(
                         vehicleKpiLanguage,
                         mainMaintenanceRunning,
                         debugMaintenanceRunning,
-                        currentStore
+                        currentStore,
+                        readStorage,
+                        includePollHealth
                     )
                 }
             }
@@ -90,7 +94,9 @@ class DashboardStateProvider(
                 vehicleKpiLanguage,
                 mainMaintenanceRunning,
                 debugMaintenanceRunning,
-                null
+                null,
+                readStorage,
+                includePollHealth
             )
         }
     }
@@ -102,7 +108,9 @@ class DashboardStateProvider(
         vehicleKpiLanguage: VehicleKpiLanguage,
         mainMaintenanceRunning: Boolean,
         debugMaintenanceRunning: Boolean,
-        store: TelemetryStore?
+        store: TelemetryStore?,
+        readStorage: Boolean,
+        includePollHealth: Boolean
     ): DashboardState {
         val serviceRunning = CollectorService.isRunning()
         val mainPollingRunning = CollectorService.isMainPollingRunning()
@@ -110,11 +118,12 @@ class DashboardStateProvider(
         val nowMs = SystemClock.elapsedRealtime()
         val healthDetailLoaded = profile.healthDetail?.takeIf { store != null }
         val health = if (healthDetailLoaded != null) {
-            loadHealthSnapshot(store!!, mainPollingRunning, healthDetailLoaded, nowMs)
+            if (includePollHealth) loadHealthSnapshot(store!!, mainPollingRunning, healthDetailLoaded, nowMs)
+            else store!!.healthSnapshot(mainPollingRunning, healthDetailLoaded, includeCounts = false, includePollHealth = false)
         } else {
             maintenanceHealthSnapshot(mainPollingRunning)
         }
-        val debugStatusRequested = profile.readsDebugStatus && !debugMaintenanceRunning
+        val debugStatusRequested = readStorage && profile.readsDebugStatus && !debugMaintenanceRunning
         val loadedDebugStatus = if (debugStatusRequested && BydCollectorApplication.isDebugStorageReady(context)) {
             // This snapshot may hold Main's gate; never wait for the sibling DB.
             (context.applicationContext as BydCollectorApplication).trySecondaryDatabaseRead {
@@ -155,7 +164,7 @@ class DashboardStateProvider(
         val influxStateLoaded = integrationSettingsLoaded && store != null
         val influxState = when {
             mainMaintenanceRunning -> maintenanceInfluxState()
-            profile == DashboardLoadProfile.INITIAL -> initialInfluxState(influxConfig?.enabled == true)
+            profile == DashboardLoadProfile.INITIAL || !readStorage -> initialInfluxState(influxConfig?.enabled == true)
             influxStateLoaded -> store!!.influxExportState()
             else -> maintenanceInfluxState()
         }
@@ -433,16 +442,6 @@ class DashboardStateProvider(
         return maintenanceInfluxState().copy(status = if (enabled) "enabled" else "stopped")
     }
 
-    private fun formatTrailingTimestamp(status: String?): String? {
-        val value = status ?: return null
-        val marker = " at "
-        val index = value.lastIndexOf(marker)
-        if (index < 0) return value
-        val timestamp = value.substring(index + marker.length)
-        val localTime = DisplayTimeFormatter.formatNullable(timestamp) ?: timestamp
-        return value.substring(0, index + marker.length) + localTime
-    }
-
     private fun formatLeadingTimestamp(status: String?): String? {
         val value = status ?: return null
         val separator = value.indexOf(' ')
@@ -511,5 +510,15 @@ class DashboardStateProvider(
 
     companion object {
         private const val TAG = "DashboardStateProvider"
+
+        internal fun formatTrailingTimestamp(status: String?): String? {
+            val value = status ?: return null
+            val marker = " at "
+            val index = value.lastIndexOf(marker)
+            if (index < 0) return value
+            val timestamp = value.substring(index + marker.length)
+            val localTime = DisplayTimeFormatter.formatNullable(timestamp) ?: timestamp
+            return value.substring(0, index + marker.length) + localTime
+        }
     }
 }

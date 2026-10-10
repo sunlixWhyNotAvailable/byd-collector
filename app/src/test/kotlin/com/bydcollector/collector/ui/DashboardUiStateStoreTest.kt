@@ -138,8 +138,8 @@ class DashboardUiStateStoreTest {
         assertNull(store.chromeState.value)
         store.seed(initial)
 
-        assertEquals(initial, store.chromeState.value?.state)
-        assertEquals(AppTab.entries.size, AppTab.entries.count { store.currentTab(it) == initial })
+        assertEquals(initial, store.chromeState.value?.state?.withoutFreshness())
+        assertEquals(AppTab.entries.size, AppTab.entries.count { store.currentTab(it)?.withoutFreshness() == initial })
         assertEquals(100L, store.chromeState.value?.loadedAtElapsedMs)
         assertEquals(
             store.chromeState.value?.generation,
@@ -159,9 +159,9 @@ class DashboardUiStateStoreTest {
 
         store.seed(second)
 
-        assertEquals(first, store.currentChrome())
-        assertEquals(refreshed, store.currentTab(AppTab.MAIN))
-        assertEquals(first, store.currentTab(AppTab.EXTRA))
+        assertEquals(first, store.currentChrome()?.withoutFreshness())
+        assertEquals(refreshed, store.currentTab(AppTab.MAIN)?.withoutFreshness())
+        assertEquals(first, store.currentTab(AppTab.EXTRA)?.withoutFreshness())
     }
 
     @Test
@@ -190,12 +190,12 @@ class DashboardUiStateStoreTest {
         now = 900L
         assertTrue(store.failTab(AppTab.STORAGE, generation, "offline"))
         val failed = store.tabState(AppTab.STORAGE).value ?: error("missing cached state")
-        assertEquals(previous, failed.state)
+        assertEquals(previous, failed.state.withoutFreshness())
         assertEquals(500L, failed.loadedAtElapsedMs)
         assertEquals("offline", failed.lastError)
         assertFalse(failed.inFlight)
         assertFalse(store.publishTab(AppTab.STORAGE, generation, dashboardState("late")))
-        assertEquals(previous, store.currentTab(AppTab.STORAGE))
+        assertEquals(previous, store.currentTab(AppTab.STORAGE)?.withoutFreshness())
     }
 
     @Test
@@ -208,9 +208,9 @@ class DashboardUiStateStoreTest {
         val generation = store.beginTabRefresh(AppTab.MAIN)
         assertTrue(store.publishTab(AppTab.MAIN, generation, main))
 
-        assertEquals(chrome, store.chromeState.value?.state)
-        assertEquals(main, store.tabState(AppTab.MAIN).value?.state)
-        assertEquals(chrome, store.tabState(AppTab.EXTRA).value?.state)
+        assertEquals(chrome, store.chromeState.value?.state?.withoutFreshness())
+        assertEquals(main, store.tabState(AppTab.MAIN).value?.state?.withoutFreshness())
+        assertEquals(chrome, store.tabState(AppTab.EXTRA).value?.state?.withoutFreshness())
         assertNotSame(store.chromeState, store.tabState(AppTab.MAIN))
     }
 
@@ -223,9 +223,9 @@ class DashboardUiStateStoreTest {
         store.markTabStale(AppTab.EXTRA)
 
         val marked = store.tabState(AppTab.EXTRA).value ?: error("missing cached state")
-        assertEquals(previous, marked.state)
+        assertEquals(previous, marked.state.withoutFreshness())
         assertEquals(0L, marked.loadedAtElapsedMs)
-        assertEquals(previous, store.currentTab(AppTab.EXTRA))
+        assertEquals(previous, store.currentTab(AppTab.EXTRA)?.withoutFreshness())
         assertNull(store.chromeState.value?.lastError)
     }
 
@@ -258,8 +258,6 @@ class DashboardUiStateStoreTest {
             countGeneration,
             DashboardRowCounts(10L, 11L, 12L, 13L, 14L, 15L)
         )
-        store.incrementMainRowCounts(pollRows = 1L, normalizedHistoryRows = 2L)
-        store.incrementDebugReadingCount(3L)
         store.publishVehicleKpis(
             uk = VehicleKpis(socPercent = "88%", odometerKm = "1 234 км"),
             en = VehicleKpis(socPercent = "88%", odometerKm = "1 234 km")
@@ -293,9 +291,9 @@ class DashboardUiStateStoreTest {
         assertTrue(store.publishTab(AppTab.ALL_PARAMETERS, generation, dashboardState("stale")))
         val state = store.currentTab(AppTab.ALL_PARAMETERS) ?: error("missing state")
 
-        assertEquals(11L, state.pollCount)
-        assertEquals(16L, state.normalizedHistoryCount)
-        assertEquals(18L, state.debugReadingCount)
+        assertEquals(10L, state.pollCount)
+        assertEquals(14L, state.normalizedHistoryCount)
+        assertEquals(15L, state.debugReadingCount)
         assertEquals("88%", state.vehicleKpis.socPercent)
         assertEquals("1 234 км", state.vehicleKpis.odometerKm)
         assertEquals("runtime-ok", state.mqttStatus)
@@ -323,6 +321,19 @@ class DashboardUiStateStoreTest {
     }
 
     @Test
+    fun latePollRestoreCannotReplaceLiveProducerEvenWithoutUiSeed() {
+        val store = DashboardUiStateStore { 1L }
+        val restored = DashboardMainPollState(1L, "old", null, null, "old status", 10L, 2)
+        val live = restored.copy(activeSessionId = 2L, lastSuccessAt = "new", lastPollStatus = "new status")
+        store.publishMainPollState(live)
+        store.restoreMainPollState(restored)
+        assertEquals(live, store.mainPollSnapshot())
+        store.seed(dashboardState("UI opened"))
+        assertEquals("new", store.currentChrome()?.lastSuccessAt)
+        assertEquals(2L, store.currentChrome()?.activeSessionId)
+    }
+
+    @Test
     fun storageCutoverInvalidatesCountsAndAllowsOneRecount() {
         val store = DashboardUiStateStore { 1L }
         store.seed(dashboardState("initial"))
@@ -331,11 +342,214 @@ class DashboardUiStateStoreTest {
         assertNull(store.beginCountBootstrap())
 
         store.invalidateRowCounts()
-        store.incrementMainRowCounts(pollRows = 1L, valueRows = 1L)
-        store.incrementDebugReadingCount(1L)
 
+        assertEquals(UNKNOWN_DASHBOARD_COUNT, store.rowCountSnapshot().pollCount)
+        assertEquals(UNKNOWN_DASHBOARD_COUNT, store.rowCountSnapshot().debugReadingCount)
         assertTrue(store.beginCountBootstrap() != null)
         assertNull(store.beginCountBootstrap())
+    }
+
+    @Test
+    fun staleSnapshotKeepsOnlyTheNewerQueueGroupsAndAcceptsOtherFields() {
+        val callbackQueue = CallbackQueueState(CallbackQueuePhase.HEALTHY, null)
+        val secondaryQueue = CallbackQueueState(CallbackQueuePhase.CATCHING_UP, "pending_head_age")
+        val current = dashboardState("cached").copy(
+            pollCount = 44L,
+            valueRowCount = 45L,
+            ecRowCount = 46L,
+            normalizedCurrentCount = 47L,
+            normalizedHistoryCount = 48L,
+            debugReadingCount = 49L,
+            mqttStatus = "cached integration status",
+            influxExportedRowsTotal = 67L,
+            mainCallbackQueue = callbackQueue,
+            secondaryCallbackQueue = secondaryQueue,
+            mqttPendingCount = 21L,
+            influxPendingRows = 34L,
+            influxOldestPendingAt = "cached-oldest",
+            freshness = DashboardSnapshotFreshness(
+                ownerStartedAtElapsedMs = 100L,
+                ownerIncarnationId = "owner-a",
+                ownerStorageGeneration = 2L,
+                ownerRevision = 10L,
+                ownerMeasuredAtElapsedMs = 120L,
+                callbackQueueRevision = 5L,
+                callbackQueueMeasuredAtElapsedMs = 115L,
+                rowCountRevision = 2L,
+                rowCountMeasuredAtElapsedMs = 111L,
+                rowCountStorageGeneration = 2L,
+                queueMetricsRevision = 8L,
+                queueMetricsMeasuredAtElapsedMs = 118L,
+                integrationRevision = 7L,
+                integrationMeasuredAtElapsedMs = 116L,
+                integrationStorageGeneration = 2L
+            )
+        )
+        val incoming = dashboardState("delayed IPC").copy(
+            lastSuccessAt = "new tab measurement",
+            mqttEnabled = true,
+            influxEnabled = true,
+            mqttStatus = "new tab integration status",
+            mainCallbackQueue = CallbackQueueState(CallbackQueuePhase.ERROR, "stale"),
+            secondaryCallbackQueue = null,
+            mqttPendingCount = 1L,
+            influxPendingRows = 2L,
+            influxOldestPendingAt = "stale-oldest",
+            freshness = current.freshness.copy(
+                ownerRevision = 9L,
+                ownerMeasuredAtElapsedMs = 119L,
+                callbackQueueRevision = 4L,
+                callbackQueueMeasuredAtElapsedMs = 114L,
+                rowCountRevision = 1L,
+                rowCountMeasuredAtElapsedMs = 110L,
+                rowCountStorageGeneration = 1L,
+                queueMetricsRevision = 7L,
+                queueMetricsMeasuredAtElapsedMs = 117L,
+                integrationRevision = 6L,
+                integrationMeasuredAtElapsedMs = 113L,
+                integrationStorageGeneration = 2L
+            )
+        )
+
+        val merged = mergeDashboardFreshQueueOverlay(current, incoming)
+
+        assertEquals(callbackQueue, merged.mainCallbackQueue)
+        assertEquals(secondaryQueue, merged.secondaryCallbackQueue)
+        assertEquals(21L, merged.mqttPendingCount)
+        assertEquals(34L, merged.influxPendingRows)
+        assertEquals("cached-oldest", merged.influxOldestPendingAt)
+        assertEquals(44L, merged.pollCount)
+        assertEquals(45L, merged.valueRowCount)
+        assertEquals(46L, merged.ecRowCount)
+        assertEquals(47L, merged.normalizedCurrentCount)
+        assertEquals(48L, merged.normalizedHistoryCount)
+        assertEquals(49L, merged.debugReadingCount)
+        assertEquals("cached integration status", merged.mqttStatus)
+        assertTrue(merged.mqttEnabled)
+        assertTrue(merged.influxEnabled)
+        assertEquals(67L, merged.influxExportedRowsTotal)
+        assertEquals("new tab measurement", merged.lastSuccessAt)
+        assertEquals(5L, merged.freshness.callbackQueueRevision)
+        assertEquals(2L, merged.freshness.rowCountRevision)
+        assertEquals(8L, merged.freshness.queueMetricsRevision)
+        assertEquals(7L, merged.freshness.integrationRevision)
+        assertEquals(10L, merged.freshness.ownerRevision)
+    }
+
+    @Test
+    fun newerOwnerIncarnationWinsEvenWhenItsGroupRevisionIsLower() {
+        val oldOwner = dashboardState("old owner").copy(
+            mqttPendingCount = 90L,
+            mainCallbackQueue = CallbackQueueState(CallbackQueuePhase.ERROR, "old"),
+            freshness = DashboardSnapshotFreshness(
+                ownerStartedAtElapsedMs = 100L,
+                ownerIncarnationId = "owner-old",
+                ownerStorageGeneration = 9L,
+                callbackQueueRevision = 100L,
+                queueMetricsRevision = 100L
+            )
+        )
+        val newOwner = dashboardState("new owner").copy(
+            mqttPendingCount = 3L,
+            mainCallbackQueue = CallbackQueueState(CallbackQueuePhase.HEALTHY, null),
+            freshness = DashboardSnapshotFreshness(
+                ownerStartedAtElapsedMs = 200L,
+                ownerIncarnationId = "owner-new",
+                ownerStorageGeneration = 0L,
+                callbackQueueRevision = 1L,
+                queueMetricsRevision = 1L
+            )
+        )
+        val active = mergeDashboardFreshQueueOverlay(oldOwner, newOwner)
+        val delayedOld = oldOwner.copy(lastSuccessAt = "unrelated old tab fields")
+
+        val merged = mergeDashboardFreshQueueOverlay(active, delayedOld)
+
+        assertEquals(newOwner.mainCallbackQueue, active.mainCallbackQueue)
+        assertEquals(3L, active.mqttPendingCount)
+        assertEquals(newOwner.mainCallbackQueue, merged.mainCallbackQueue)
+        assertEquals(3L, merged.mqttPendingCount)
+        assertEquals("unrelated old tab fields", merged.lastSuccessAt)
+        assertEquals("owner-new", merged.freshness.ownerIncarnationId)
+    }
+
+    @Test
+    fun equalMeasurementStampsKeepPublishedGroupPayloads() {
+        val freshness = DashboardSnapshotFreshness(
+            ownerStartedAtElapsedMs = 200L,
+            ownerIncarnationId = "owner-current",
+            rowCountRevision = 2L,
+            rowCountMeasuredAtElapsedMs = 20L,
+            queueMetricsRevision = 3L,
+            queueMetricsMeasuredAtElapsedMs = 30L,
+            integrationRevision = 4L,
+            integrationMeasuredAtElapsedMs = 40L
+        )
+        val current = dashboardState("cached").copy(
+            pollCount = 10L,
+            mqttPendingCount = 11L,
+            influxPendingRows = 12L,
+            mqttStatus = "published integration status",
+            freshness = freshness
+        )
+        val conflictingDuplicate = dashboardState("duplicate").copy(
+            lastSuccessAt = "new tab field",
+            pollCount = 20L,
+            mqttPendingCount = 21L,
+            influxPendingRows = 22L,
+            mqttStatus = "conflicting duplicate status",
+            freshness = freshness
+        )
+
+        val merged = mergeDashboardFreshQueueOverlay(current, conflictingDuplicate)
+
+        assertEquals(10L, merged.pollCount)
+        assertEquals(11L, merged.mqttPendingCount)
+        assertEquals(12L, merged.influxPendingRows)
+        assertEquals("published integration status", merged.mqttStatus)
+        assertEquals("new tab field", merged.lastSuccessAt)
+    }
+
+    @Test
+    fun cachedReadsDoNotRenewIndependentQueueOrIntegrationMeasurements() {
+        var now = 10L
+        val store = DashboardUiStateStore { now }
+        val initial = dashboardState("initial")
+        val countGeneration = store.beginCountBootstrap() ?: error("count bootstrap did not start")
+        now = 50L
+        assertTrue(store.publishRowCountBaseline(countGeneration, DashboardRowCounts(1L, 2L, 3L, 4L, 5L, 6L)))
+        val storageGeneration = store.storageGenerationSnapshot()
+        assertTrue(store.publishQueueMetrics(7L, 8L, "oldest", 55L, storageGeneration))
+        assertTrue(store.publishIntegrationRuntime(dashboardState("integration"), 60L, storageGeneration))
+
+        now = 500L
+        val snapshot = store.snapshotForClient(initial, VehicleKpiLanguage.EN)
+
+        assertEquals(50L, snapshot.freshness.rowCountMeasuredAtElapsedMs)
+        assertEquals(60L, snapshot.freshness.integrationMeasuredAtElapsedMs)
+        assertEquals(55L, snapshot.freshness.queueMetricsMeasuredAtElapsedMs)
+        assertEquals(7L, snapshot.mqttPendingCount)
+        assertEquals(8L, snapshot.influxPendingRows)
+        assertFalse(store.publishQueueMetrics(99L, 99L, null, 70L, storageGeneration - 1L))
+        assertFalse(store.publishIntegrationRuntime(dashboardState("stale"), 59L, storageGeneration))
+
+        val queueRevision = store.queueMetricsRevisionSnapshot()
+        store.invalidateQueueMetrics()
+        assertFalse(store.publishQueueMetrics(99L, 99L, null, 70L, storageGeneration, queueRevision))
+        val queueInvalidated = store.snapshotForClient(initial, VehicleKpiLanguage.EN)
+        assertEquals(UNKNOWN_DASHBOARD_COUNT, queueInvalidated.mqttPendingCount)
+        assertEquals(UNKNOWN_DASHBOARD_COUNT, queueInvalidated.influxPendingRows)
+        assertEquals(50L, queueInvalidated.freshness.rowCountMeasuredAtElapsedMs)
+        assertEquals(60L, queueInvalidated.freshness.integrationMeasuredAtElapsedMs)
+
+        store.invalidateRowCounts()
+        val invalidated = store.snapshotForClient(initial, VehicleKpiLanguage.EN)
+        assertEquals(UNKNOWN_DASHBOARD_COUNT, invalidated.pollCount)
+        assertEquals(UNKNOWN_DASHBOARD_COUNT, invalidated.mqttPendingCount)
+        assertEquals(UNKNOWN_DASHBOARD_COUNT, invalidated.influxPendingRows)
+        assertTrue(invalidated.freshness.ownerStorageGeneration > storageGeneration)
+        assertEquals(60L, invalidated.freshness.integrationMeasuredAtElapsedMs)
+        assertEquals(storageGeneration, invalidated.freshness.integrationStorageGeneration)
     }
 
     private fun dashboardState(marker: String): DashboardState {
@@ -350,9 +564,9 @@ class DashboardUiStateStoreTest {
             lastError = null,
             lastErrorAt = null,
             lastPollStatus = null,
-            pollCount = 0L,
-            valueRowCount = 0L,
-            ecRowCount = 0L,
+            pollCount = UNKNOWN_DASHBOARD_COUNT,
+            valueRowCount = UNKNOWN_DASHBOARD_COUNT,
+            ecRowCount = UNKNOWN_DASHBOARD_COUNT,
             lastEcImport = null,
             lastEcImportStatus = null,
             elapsedMs = null,
@@ -381,7 +595,7 @@ class DashboardUiStateStoreTest {
             debugParameterCount = 0,
             debugDatabasePath = marker,
             debugDatabaseSizeBytes = 0L,
-            debugReadingCount = 0L,
+            debugReadingCount = UNKNOWN_DASHBOARD_COUNT,
             debugLastReadingAt = null,
             debugLastErrorAt = null,
             debugLastError = null,
@@ -411,7 +625,7 @@ class DashboardUiStateStoreTest {
             mqttStatus = "disabled",
             mqttLastError = null,
             mqttLastPublishedAt = null,
-            mqttPendingCount = 0L,
+            mqttPendingCount = UNKNOWN_DASHBOARD_COUNT,
             mqttRetryFailureCount = 0,
             mqttNextRetryAt = null,
             mqttRetryLastFailureAt = null,
@@ -428,19 +642,22 @@ class DashboardUiStateStoreTest {
             influxVehicleId = "",
             influxEnabledCategories = emptySet(),
             influxStatus = "stopped",
-            influxPendingRows = 0L,
+            influxPendingRows = UNKNOWN_DASHBOARD_COUNT,
             influxOldestPendingAt = null,
             influxNextRetryAt = null,
             influxLastSuccessAt = null,
             influxLastErrorAt = null,
             influxLastError = null,
             influxExportedRowsTotal = 0L,
-            normalizedCurrentCount = 0L,
-            normalizedHistoryCount = 0L,
+            normalizedCurrentCount = UNKNOWN_DASHBOARD_COUNT,
+            normalizedHistoryCount = UNKNOWN_DASHBOARD_COUNT,
             permissionsGranted = false,
             adbAuthorized = false,
             vehicleKpis = VehicleKpis(),
             recentEvents = listOf(CollectorEvent(1L, marker, "test", marker, null))
         )
     }
+
+    private fun DashboardState.withoutFreshness(): DashboardState =
+        copy(freshness = DashboardSnapshotFreshness())
 }

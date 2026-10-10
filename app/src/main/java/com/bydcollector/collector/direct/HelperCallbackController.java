@@ -1009,6 +1009,8 @@ final class HelperCallbackController implements AutoCloseable {
 
     boolean streamWorkersTerminated() { return streamWorkersTerminated; }
 
+    boolean registrationWorkerStopped() { return registrationWorker.isTerminated(); }
+
     private static ScheduledExecutorService newStreamWorker(String streamName) {
         return Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "byd-helper-callback-" + streamName);

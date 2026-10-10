@@ -1,5 +1,12 @@
 package com.bydcollector.collector.keepalive;
 
+import android.content.Context;
+import android.net.wifi.WifiManager;
+import android.telephony.SubscriptionManager;
+import android.telephony.TelephonyManager;
+
+import com.bydcollector.collector.direct.HelperWakeLockPlatform;
+
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.InputStream;
@@ -8,7 +15,14 @@ import java.nio.charset.StandardCharsets;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.util.Locale;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.regex.Matcher;
@@ -21,6 +35,7 @@ public final class KeepAliveDaemon {
     private static final long LOG_MAX_BYTES = 1_048_576L;
     private static final int COMMAND_OUTPUT_MAX_BYTES = 65_536;
     private static final long OUTPUT_DRAIN_TIMEOUT_MS = 1_000L;
+    private static final long RADIO_STATE_READ_TIMEOUT_MS = 1_500L;
     private static final long BLUETOOTH_VERIFY_DELAY_MS = 1_000L;
     private static final int BLUETOOTH_VERIFY_ATTEMPTS = 5;
     private static final String USER_SHUTDOWN_COMMAND = "settings get global bydcollector_user_shutdown";
@@ -32,6 +47,22 @@ public final class KeepAliveDaemon {
     private static final String RECOVER_COLLECTOR_COMMAND =
             "am broadcast --include-stopped-packages -a com.bydcollector.collector.action.KEEP_ALIVE_RECOVERY " +
                     "-n com.bydcollector.collector/com.bydcollector.collector.system.KeepAliveRecoveryReceiver";
+    private static final ThreadPoolExecutor RADIO_STATE_READER = new ThreadPoolExecutor(
+            1,
+            1,
+            0L,
+            TimeUnit.MILLISECONDS,
+            new SynchronousQueue<>(),
+            new ThreadFactory() {
+                @Override public Thread newThread(Runnable task) {
+                    Thread thread = new Thread(task, "byd-keepalive-radio-state");
+                    thread.setDaemon(true);
+                    return thread;
+                }
+            },
+            new ThreadPoolExecutor.AbortPolicy()
+    );
+    private static volatile RadioManagers radioManagers;
     //limits the shell delegate to fixed maintenance commands instead of accepting arbitrary app input
     private static final String[] ALLOWED_COMMANDS = new String[]{
             "settings get global bydcollector_keep_wifi",
@@ -91,11 +122,11 @@ public final class KeepAliveDaemon {
         boolean recoverCollectorService = isEnabled("settings get global bydcollector_recover_collector_service");
 
         if (keepWifi) {
-            runAndLog("wifi_enable_requested", "svc wifi enable");
+            keepRadioAlive("wifi", "svc wifi enable", readWifiEnabled());
         }
 
         if (keepMobileData) {
-            runAndLog("mobile_data_enable_requested", "svc data enable");
+            keepRadioAlive("mobile_data", "svc data enable", readMobileDataEnabled());
         }
 
         if (keepBluetooth) {
@@ -342,6 +373,95 @@ public final class KeepAliveDaemon {
         }
     }
 
+    private static void keepRadioAlive(String name, String command, Boolean enabled) {
+        if (!shouldEnableRadio(enabled)) {
+            log(name + "_already_enabled");
+            return;
+        }
+        if (enabled == null) log(name + "_state_unavailable; retaining enable recovery");
+        runAndLog(name + "_enable_requested", command);
+    }
+
+    static Boolean readWifiEnabled() {
+        return readRadioState(KeepAliveDaemon::queryWifiEnabled);
+    }
+
+    private static Boolean queryWifiEnabled() throws Exception {
+        RadioManagers managers = radioManagers();
+        return managers.wifiManager == null ? null : managers.wifiManager.isWifiEnabled();
+    }
+
+    static Boolean readMobileDataEnabled() {
+        return readRadioState(KeepAliveDaemon::queryMobileDataEnabled);
+    }
+
+    private static Boolean queryMobileDataEnabled() throws Exception {
+        RadioManagers managers = radioManagers();
+        if (managers.telephonyManager == null) return null;
+        int subId = SubscriptionManager.getDefaultDataSubscriptionId();
+        if (subId == SubscriptionManager.INVALID_SUBSCRIPTION_ID) return null;
+        TelephonyManager defaultDataManager = managers.telephonyManager.createForSubscriptionId(subId);
+        return defaultDataManager.isDataEnabled();
+    }
+
+    static Boolean readRadioState(Callable<Boolean> readEnabled) {
+        final Future<Boolean> read;
+        try {
+            read = RADIO_STATE_READER.submit(() -> readStateOrUnavailable(readEnabled));
+        } catch (RejectedExecutionException error) {
+            log("radio_state_read_unavailable reason=reader_busy");
+            return null;
+        }
+
+        try {
+            return read.get(RADIO_STATE_READ_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException error) {
+            read.cancel(true);
+            log("radio_state_read_unavailable reason=timeout");
+            return null;
+        } catch (InterruptedException error) {
+            read.cancel(true);
+            Thread.currentThread().interrupt();
+            log("radio_state_read_unavailable reason=interrupted");
+            return null;
+        } catch (ExecutionException error) {
+            Throwable failure = error.getCause();
+            log("radio_state_read_unavailable reason=" +
+                    (failure == null ? "reader_failed" : failure.getClass().getSimpleName()));
+            return null;
+        }
+    }
+
+    static Boolean readStateOrUnavailable(Callable<Boolean> readEnabled) {
+        try {
+            return readEnabled.call();
+        } catch (Exception error) {
+            return null;
+        }
+    }
+
+    static boolean shouldEnableRadio(Boolean enabled) {
+        return !Boolean.TRUE.equals(enabled);
+    }
+
+    private static RadioManagers radioManagers() throws Exception {
+        RadioManagers current = radioManagers;
+        if (current != null) return current;
+        synchronized (KeepAliveDaemon.class) {
+            current = radioManagers;
+            if (current == null) {
+                Context context = HelperWakeLockPlatform.createShellContext();
+                current = new RadioManagers(
+                        context,
+                        context.getSystemService(WifiManager.class),
+                        context.getSystemService(TelephonyManager.class)
+                );
+                radioManagers = current;
+            }
+        }
+        return current;
+    }
+
     private static OwnerLock acquireSingleOwnerLock() {
         try {
             //keeps one daemon loop active so repeated reconciles do not stack shell work
@@ -371,6 +491,19 @@ public final class KeepAliveDaemon {
             this.output = output == null ? "" : output;
             this.error = error == null ? "" : error;
             this.elapsedMs = elapsedMs;
+        }
+    }
+
+    private static final class RadioManagers {
+        //Keep the attribution context alive with the cached system-service managers.
+        private final Context shellContext;
+        private final WifiManager wifiManager;
+        private final TelephonyManager telephonyManager;
+
+        private RadioManagers(Context shellContext, WifiManager wifiManager, TelephonyManager telephonyManager) {
+            this.shellContext = shellContext;
+            this.wifiManager = wifiManager;
+            this.telephonyManager = telephonyManager;
         }
     }
 

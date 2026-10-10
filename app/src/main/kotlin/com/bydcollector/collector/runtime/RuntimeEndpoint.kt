@@ -103,6 +103,7 @@ class RuntimeEndpointProvider : ContentProvider() {
                         val store = com.bydcollector.collector.BydCollectorApplication.store(ctx)
                         check(settings.storageCutoverJournal() == null) { "Storage cutover still pending" }
                         com.bydcollector.collector.system.CollectorAutoStart.recoverFromForeground(ctx, settings, store)
+                        if (!settings.runtimeDemand().any) app.startDashboardMetrics()
                     }
                     Bundle().apply { putBoolean("reopened", reopened) }
                 }

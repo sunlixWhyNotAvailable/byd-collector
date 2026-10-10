@@ -101,6 +101,135 @@ data class CallbackNormalizationCommit(
     val duplicate: Boolean
 )
 
+internal data class CurrentPollHealthSnapshot(
+    val activeSessionId: Long?,
+    val lastSuccessAt: String?,
+    val lastError: String?,
+    val lastErrorAt: String?,
+    val lastPollStatus: String?,
+    val elapsedMs: Long?,
+    val requestCount: Int?,
+    val historyMayBeIncomplete: Boolean,
+    val available: Boolean = true
+)
+
+internal data class PollHealthRow(
+    val pollId: Long,
+    val timestamp: String,
+    val ok: Boolean?,
+    val errors: String?,
+    val errorCategory: String?,
+    val errorMessage: String?,
+    val elapsedMs: Long?,
+    val requestCount: Int?
+)
+
+internal data class PollHealthCache(
+    val snapshot: CurrentPollHealthSnapshot,
+    val latestPollId: Long?,
+    val lastSuccessPollId: Long?,
+    val lastErrorPollId: Long?,
+    val lastErrorAtPollId: Long?,
+    val successMayBeMissing: Boolean,
+    val errorMayBeMissing: Boolean,
+    val errorAtMayBeMissing: Boolean
+) {
+    fun merge(row: PollHealthRow): PollHealthCache {
+        val previous = snapshot
+        val updatesLatest = latestPollId == null || row.pollId > latestPollId
+        val updatesSuccess = row.ok == true && (lastSuccessPollId == null || row.pollId > lastSuccessPollId)
+        val updatesError = row.ok == false && row.errors != null &&
+            (lastErrorPollId == null || row.pollId > lastErrorPollId)
+        val updatesErrorAt = row.ok == false && (lastErrorAtPollId == null || row.pollId > lastErrorAtPollId)
+        if (!updatesLatest && !updatesSuccess && !updatesError && !updatesErrorAt) return this
+
+        val nextSuccessMayBeMissing = successMayBeMissing && !updatesSuccess
+        val nextErrorMayBeMissing = errorMayBeMissing && !updatesError
+        val nextErrorAtMayBeMissing = errorAtMayBeMissing && !updatesErrorAt
+        return copy(
+            snapshot = previous.copy(
+                lastSuccessAt = if (updatesSuccess) row.timestamp else previous.lastSuccessAt,
+                lastError = if (updatesError) row.errors else previous.lastError,
+                lastErrorAt = if (updatesErrorAt) row.timestamp else previous.lastErrorAt,
+                lastPollStatus = if (updatesLatest) row.toStatus() else previous.lastPollStatus,
+                elapsedMs = if (updatesLatest) row.elapsedMs else previous.elapsedMs,
+                requestCount = if (updatesLatest) row.requestCount else previous.requestCount,
+                historyMayBeIncomplete = nextSuccessMayBeMissing || nextErrorMayBeMissing || nextErrorAtMayBeMissing
+            ),
+            latestPollId = if (updatesLatest) row.pollId else latestPollId,
+            lastSuccessPollId = if (updatesSuccess) row.pollId else lastSuccessPollId,
+            lastErrorPollId = if (updatesError) row.pollId else lastErrorPollId,
+            lastErrorAtPollId = if (updatesErrorAt) row.pollId else lastErrorAtPollId,
+            successMayBeMissing = nextSuccessMayBeMissing,
+            errorMayBeMissing = nextErrorMayBeMissing,
+            errorAtMayBeMissing = nextErrorAtMayBeMissing
+        )
+    }
+
+    companion object {
+        fun empty(sessionId: Long?): PollHealthCache = PollHealthCache(
+            snapshot = CurrentPollHealthSnapshot(
+                activeSessionId = sessionId,
+                lastSuccessAt = null,
+                lastError = null,
+                lastErrorAt = null,
+                lastPollStatus = null,
+                elapsedMs = null,
+                requestCount = null,
+                historyMayBeIncomplete = false
+            ),
+            latestPollId = null,
+            lastSuccessPollId = null,
+            lastErrorPollId = null,
+            lastErrorAtPollId = null,
+            successMayBeMissing = false,
+            errorMayBeMissing = false,
+            errorAtMayBeMissing = false
+        )
+
+        fun fromRecentPage(
+            sessionId: Long,
+            newestFirstRows: List<PollHealthRow>,
+            pageLimit: Int,
+            globalPageFilled: Boolean = newestFirstRows.size >= pageLimit
+        ): PollHealthCache {
+            require(pageLimit > 0)
+            val latest = newestFirstRows.firstOrNull()
+            val success = newestFirstRows.firstOrNull { it.ok == true }
+            val latestFailure = newestFirstRows.firstOrNull { it.ok == false }
+            val error = newestFirstRows.firstOrNull { it.ok == false && it.errors != null }
+            val successMayBeMissing = globalPageFilled && success == null
+            val errorMayBeMissing = globalPageFilled && error == null
+            val errorAtMayBeMissing = globalPageFilled && latestFailure == null
+            return PollHealthCache(
+                snapshot = CurrentPollHealthSnapshot(
+                    activeSessionId = sessionId,
+                    lastSuccessAt = success?.timestamp,
+                    lastError = error?.errors,
+                    lastErrorAt = latestFailure?.timestamp,
+                    lastPollStatus = latest?.toStatus(),
+                    elapsedMs = latest?.elapsedMs,
+                    requestCount = latest?.requestCount,
+                    historyMayBeIncomplete = successMayBeMissing || errorMayBeMissing || errorAtMayBeMissing
+                ),
+                latestPollId = latest?.pollId,
+                lastSuccessPollId = success?.pollId,
+                lastErrorPollId = error?.pollId,
+                lastErrorAtPollId = latestFailure?.pollId,
+                successMayBeMissing = successMayBeMissing,
+                errorMayBeMissing = errorMayBeMissing,
+                errorAtMayBeMissing = errorAtMayBeMissing
+            )
+        }
+    }
+}
+
+private fun PollHealthRow.toStatus(): String = if (ok == true) {
+    "ok at $timestamp"
+} else {
+    "Polling error: ${PollingErrorSummaries.summary(errorCategory, errorMessage)} at $timestamp"
+}
+
 //central sqlite facade that keeps raw polls, normalized state, mqtt outbox, and influx cursors consistent
 class TelemetryStore(
     private val context: Context,
@@ -131,14 +260,26 @@ class TelemetryStore(
         nowMs = { java.time.OffsetDateTime.parse(clock.nowIso()).toInstant().toEpochMilli() }
     )
     private val influxCursorInitializer = InfluxCursorInitializer()
+    private val influxPendingSummaryReader = BoundedInfluxPendingSummaryReader()
     private val compactV2 by lazy { helper.isCompactV2() }
+    private val dashboardRowCountReader = BoundedIdRowCountReader(
+        listOf(
+            BoundedIdRowCountTable("polls", "polls", "id"),
+            BoundedIdRowCountTable("poll_values", "poll_values", "poll_id"),
+            BoundedIdRowCountTable("raw_callback_events", "raw_callback_events", "id"),
+            BoundedIdRowCountTable("normalized_history", "vehicle_state_history", "id")
+        )
+    )
     private val decodedValueIds = Collections.synchronizedMap(
         object : LinkedHashMap<String, Long>(DECODED_VALUE_CACHE_SIZE, 0.75f, true) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean =
                 size > DECODED_VALUE_CACHE_SIZE
         }
     )
+    private val pollHealthLock = Any()
+    @Volatile private var pollHealthCache: PollHealthCache? = null
     @Volatile private var pollValueColumnsEnsuredForCatalogVersionId: Long? = null
+    private val normalizedCatalogImportLock = Any()
     @Volatile private var normalizedCatalogEnsured = false
     private val closed = AtomicBoolean(false)
 
@@ -227,7 +368,9 @@ class TelemetryStore(
     @Synchronized
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
+        synchronized(pollHealthLock) { pollHealthCache = null }
         influxCursorInitializer.clear()
+        influxPendingSummaryReader.clear()
         helper.close()
     }
 
@@ -261,11 +404,15 @@ class TelemetryStore(
 
     fun ensureNormalizedCatalogImported() {
         if (normalizedCatalogEnsured) return
-        normalizedStore.upsertCatalog()
-        normalizedCatalogEnsured = true
+        synchronized(normalizedCatalogImportLock) {
+            if (normalizedCatalogEnsured) return
+            normalizedStore.upsertCatalog()
+            normalizedCatalogEnsured = true
+        }
     }
 
     fun applyNormalizedObservations(observations: List<NormalizedObservation>): NormalizedWriteSummary {
+        if (observations.isEmpty()) return NormalizedWriteSummary(0, 0, 0)
         ensureNormalizedCatalogImported()
         return normalizedStore.applyObservations(observations)
     }
@@ -278,15 +425,20 @@ class TelemetryStore(
     override fun currentState(categories: Set<String>?): List<StoredNormalizedState> = normalizedCurrentState(categories)
 
     fun dashboardRowCounts(cancellationSignal: CancellationSignal? = null): TelemetryRowCounts {
+        val appendOnlyCounts = dashboardRowCountReader.refresh(helper.readableDatabase, cancellationSignal)
+        val pollCount = appendOnlyCounts.getValue("polls")
+        val pollValueCount = appendOnlyCounts.getValue("poll_values")
+        val callbackCount = appendOnlyCounts.getValue("raw_callback_events")
         return TelemetryRowCounts(
-            pollCount = scalarLong("SELECT COUNT(*) FROM polls", cancellationSignal),
-            valueRowCount = scalarLong(
-                "SELECT (SELECT COUNT(*) FROM poll_values) + (SELECT COUNT(*) FROM raw_callback_events)",
-                cancellationSignal
-            ),
+            pollCount = pollCount,
+            valueRowCount = if (pollValueCount < 0L || callbackCount < 0L) {
+                BoundedIdRowCountReader.UNKNOWN_ROW_COUNT
+            } else {
+                pollValueCount + callbackCount
+            },
             ecRowCount = scalarLong("SELECT COUNT(*) FROM ec_energy_consumption", cancellationSignal),
             normalizedCurrentCount = scalarLong("SELECT COUNT(*) FROM vehicle_state_current", cancellationSignal),
-            normalizedHistoryCount = scalarLong("SELECT COUNT(*) FROM vehicle_state_history", cancellationSignal)
+            normalizedHistoryCount = appendOnlyCounts.getValue("normalized_history")
         )
     }
 
@@ -369,6 +521,7 @@ class TelemetryStore(
         if (pending.isEmpty()) {
             return CallbackNormalizationPageResult(0, emptyList(), emptyNormalizedSummary(), hasMore = false)
         }
+        val decodedInputs = pending.map(::callbackEventInput)
         val db = helper.writableDatabase
         val applied = mutableListOf<NormalizedObservation>()
         var summary = emptyNormalizedSummary()
@@ -377,10 +530,10 @@ class TelemetryStore(
         db.beginTransaction()
         try {
             val cached = loadNormalizedSourceInputs(db)
-            pending.forEach { event ->
+            pending.forEachIndexed { index, event ->
                 callbackRawStore.requireMainEventInTransaction(db, event.id)
                 if (!callbackRawStore.isNormalizedInTransaction(db, event.id)) {
-                    callbackEventInput(event)?.let { input ->
+                    decodedInputs[index]?.let { input ->
                         if (mergeNormalizedSourceInput(db, cached, input)) {
                             val observations = normalizer.normalizeSparse(cached, setOf(input.reading.rawKey))
                             applied += observations
@@ -569,6 +722,7 @@ class TelemetryStore(
                 put("import_quality", "production")
             }
         )
+        synchronized(pollHealthLock) { pollHealthCache = PollHealthCache.empty(sessionId) }
         recordEvent("service_start", "Collection service started", "session_id=$sessionId")
         return sessionId
     }
@@ -585,6 +739,7 @@ class TelemetryStore(
             emptyArray()
         )
         if (updated > 0) {
+            synchronized(pollHealthLock) { pollHealthCache = null }
             recordEvent(
                 "session_recovered",
                 "Closed stale open collection sessions",
@@ -613,7 +768,7 @@ class TelemetryStore(
     }
 
     fun endSession(sessionId: Long, reason: String = "stopped") {
-        helper.writableDatabase.update(
+        val updated = helper.writableDatabase.update(
             "collection_sessions",
             ContentValues().apply {
                 put("ended_at", clock.nowIso())
@@ -622,6 +777,11 @@ class TelemetryStore(
             "id = ?",
             arrayOf(sessionId.toString())
         )
+        if (updated > 0) {
+            synchronized(pollHealthLock) {
+                if (pollHealthCache?.snapshot?.activeSessionId == sessionId) pollHealthCache = null
+            }
+        }
         recordEvent("service_stop", "Collection service stopped", "session_id=$sessionId reason=$reason")
     }
 
@@ -643,6 +803,7 @@ class TelemetryStore(
         }
         val committed = checkNotNull(inserted)
         decodedValueIds.putAll(committed.decodedIds)
+        recordCommittedPollHealth(sessionId, committed.pollId, input)
         return committed.pollId
     }
 
@@ -682,7 +843,9 @@ class TelemetryStore(
             db.endTransaction()
         }
         decodedValueIds.putAll(decodedIdsToCache)
-        return checkNotNull(result)
+        val committed = checkNotNull(result)
+        if (committed.inserted) recordCommittedPollHealth(sessionId, committed.pollId, input)
+        return committed
     }
 
     fun recordEvent(category: String, message: String) {
@@ -997,6 +1160,20 @@ class TelemetryStore(
 
     override fun pendingCount(): Long = safeScalarLong("SELECT COUNT(*) FROM mqtt_outbox")
 
+    /** Cancellable owner-side count that propagates SQLite failures instead of reporting false zero. */
+    internal fun refreshMqttPendingCount(cancellationSignal: CancellationSignal?): Long {
+        val db = helper.readableDatabase
+        val cursor = if (cancellationSignal == null) {
+            db.rawQuery("SELECT COUNT(*) FROM mqtt_outbox", emptyArray())
+        } else {
+            db.rawQuery("SELECT COUNT(*) FROM mqtt_outbox", emptyArray(), cancellationSignal)
+        }
+        cursor.use {
+            check(it.moveToFirst()) { "MQTT outbox count returned no row" }
+            return it.getLong(0)
+        }
+    }
+
     /**
      * Reads both pre-sidecar Telegram tables under one Main read transaction.
      * The extra row detects an outbox that exceeded the established 1,000-row bound
@@ -1200,43 +1377,23 @@ class TelemetryStore(
     }
 
     override fun pendingInfluxSummary(fieldKeys: Set<String>): InfluxPendingSummary {
-        if (fieldKeys.isEmpty()) return InfluxPendingSummary(rows = 0, oldestObservedAt = null)
+        if (fieldKeys.isEmpty()) return InfluxPendingSummary(rows = 0, oldestObservedAt = null, complete = true)
         ensureInfluxCursors(fieldKeys)
-        val placeholders = fieldKeys.joinToString(",") { "?" }
-        val sql = if (compactV2) {
-            """
-            SELECT COUNT(*), MIN(history.observed_at_ms)
-            FROM vehicle_state_history AS history
-            INNER JOIN normalized_history_field_catalog AS field ON field.id = history.field_id
-            INNER JOIN influx_export_cursor AS export_cursor ON export_cursor.field_key = field.field_key
-            WHERE field.field_key IN ($placeholders)
-              AND history.id > export_cursor.last_exported_history_id
-            """.trimIndent()
-        } else {
-            """
-            SELECT COUNT(*), MIN(history.observed_at)
-            FROM vehicle_state_history history
-            JOIN influx_export_cursor cursor ON cursor.field_key = history.field_key
-            WHERE history.field_key IN ($placeholders)
-              AND history.id > cursor.last_exported_history_id
-            """.trimIndent()
-        }
-        helper.readableDatabase.rawQuery(
-            sql,
-            fieldKeys.toTypedArray()
-        ).use { cursor ->
-            if (!cursor.moveToFirst()) return InfluxPendingSummary(rows = 0, oldestObservedAt = null)
-            return InfluxPendingSummary(
-                rows = cursor.getLong(0),
-                oldestObservedAt = if (cursor.isNull(1)) {
-                    null
-                } else if (compactV2) {
-                    normalizedIsoTime(cursor.getLong(1))
-                } else {
-                    cursor.getString(1)
-                }
-            )
-        }
+        return influxPendingSummaryReader.summary(helper.readableDatabase, compactV2, fieldKeys)
+    }
+
+    internal fun refreshInfluxPendingSummary(
+        fieldKeys: Set<String>,
+        cancellationSignal: CancellationSignal? = null
+    ): InfluxPendingSummary {
+        if (fieldKeys.isEmpty()) return InfluxPendingSummary(rows = 0, oldestObservedAt = null, complete = true)
+        ensureInfluxCursors(fieldKeys)
+        return influxPendingSummaryReader.refresh(
+            helper.readableDatabase,
+            compactV2,
+            fieldKeys,
+            cancellationSignal
+        )
     }
 
     override fun pendingInfluxRows(
@@ -1514,7 +1671,8 @@ class TelemetryStore(
     fun healthSnapshot(
         running: Boolean,
         detail: HealthSnapshotDetail = HealthSnapshotDetail.FULL,
-        includeCounts: Boolean = detail == HealthSnapshotDetail.FULL
+        includeCounts: Boolean = detail == HealthSnapshotDetail.FULL,
+        includePollHealth: Boolean = true
     ): HealthSnapshot {
         val includeIntegrations = detail != HealthSnapshotDetail.SUMMARY
         val includeFullDetails = detail == HealthSnapshotDetail.FULL
@@ -1529,16 +1687,19 @@ class TelemetryStore(
                 lastError = null
             )
         }
-        val activeSessionId = if (running) safeActiveSessionId() else null
-        val activePollScope = ActivePollSessionScope.from(running = running, activeSessionId = activeSessionId)
+        val pollHealth = if (includePollHealth) {
+            currentPollHealth(running)
+        } else {
+            PollHealthCache.empty(null).snapshot
+        }
         //uses safe queries because the dashboard must keep rendering through migrations and partial failures
         return HealthSnapshot(
             running = running,
-            activeSessionId = activeSessionId,
-            lastSuccessAt = activePollScope.lastSuccessAtSql()?.let { safeScalarString(it) },
-            lastError = activePollScope.lastErrorSql()?.let { safeScalarString(it) },
-            lastErrorAt = activePollScope.lastErrorAtSql()?.let { safeScalarString(it) },
-            lastPollStatus = activePollScope.lastPollStatusSql()?.let { safeLastPollStatus(it) },
+            activeSessionId = pollHealth.activeSessionId,
+            lastSuccessAt = pollHealth.lastSuccessAt,
+            lastError = pollHealth.lastError,
+            lastErrorAt = pollHealth.lastErrorAt,
+            lastPollStatus = pollHealth.lastPollStatus,
             pollCount = if (includeCounts) safeScalarLong("SELECT COUNT(*) FROM polls") else UNKNOWN_COUNT,
             valueRowCount = if (includeCounts) {
                 safeScalarLong("SELECT (SELECT COUNT(*) FROM poll_values) + (SELECT COUNT(*) FROM raw_callback_events)")
@@ -1557,8 +1718,8 @@ class TelemetryStore(
             mqttRetryLastSuccessAt = mqttRetryState.lastSuccessAt,
             lastEcImport = if (includeFullDetails) safeScalarString("SELECT ts FROM ec_import_runs ORDER BY id DESC LIMIT 1") else null,
             lastEcImportStatus = if (includeFullDetails) safeLastEcImportStatus() else null,
-            elapsedMs = if (includeFullDetails) activePollScope.elapsedMsSql()?.let { safeScalarLongOrNull(it) } else null,
-            requestCount = if (includeFullDetails) activePollScope.requestCountSql()?.let { safeScalarLongOrNull(it) }?.toInt() else null,
+            elapsedMs = if (includeFullDetails) pollHealth.elapsedMs else null,
+            requestCount = if (includeFullDetails) pollHealth.requestCount else null,
             databasePath = databaseFile().absolutePath,
             databaseSizeBytes = sqliteFootprintBytes(databaseFile()),
             latestSoc = if (includeFullDetails) safeLatestReading(listOf("statistic_1014_1145045040_5", "statistic_1014_1134559272_5", "SOC", "soc")) else null,
@@ -1567,6 +1728,112 @@ class TelemetryStore(
             recentEvents = if (includeFullDetails) safeRecentEvents() else emptyList()
         )
     }
+
+    internal fun currentPollHealth(running: Boolean): CurrentPollHealthSnapshot {
+        if (!running) return PollHealthCache.empty(null).snapshot
+
+        synchronized(pollHealthLock) {
+            val sessionId = try {
+                activeSessionId()
+            } catch (error: Throwable) {
+                Log.w(TAG, "active poll session query failed", error)
+                return unavailablePollHealth(null)
+            } ?: return PollHealthCache.empty(null).snapshot
+
+            pollHealthCache?.takeIf { it.snapshot.activeSessionId == sessionId }?.let { return it.snapshot }
+
+            val restored = try {
+                restorePollHealth(sessionId)
+            } catch (error: Throwable) {
+                Log.w(TAG, "active poll health restore failed", error)
+                null
+            } ?: return unavailablePollHealth(sessionId)
+
+            val stillActiveSessionId = try {
+                activeSessionId()
+            } catch (error: Throwable) {
+                Log.w(TAG, "active poll session recheck failed", error)
+                return unavailablePollHealth(sessionId)
+            }
+            if (stillActiveSessionId != sessionId) {
+                return if (stillActiveSessionId == null) {
+                    PollHealthCache.empty(null).snapshot
+                } else {
+                    unavailablePollHealth(stillActiveSessionId)
+                }
+            }
+
+            pollHealthCache = restored
+            return restored.snapshot
+        }
+    }
+
+    private fun restorePollHealth(sessionId: Long): PollHealthCache {
+        val rows = helper.readableDatabase.rawQuery(
+            """
+            SELECT id, session_id, ts, ok, errors, error_category, error_message, elapsed_ms, request_count
+            FROM polls
+            ORDER BY id DESC
+            LIMIT $POLL_HEALTH_RECENT_PAGE_LIMIT
+            """.trimIndent(),
+            emptyArray()
+        ).use { cursor ->
+            var globalRowsScanned = 0
+            val filteredRows = buildList {
+                while (cursor.moveToNext()) {
+                    globalRowsScanned += 1
+                    if (cursor.getLong(1) == sessionId) {
+                        add(
+                            PollHealthRow(
+                                pollId = cursor.getLong(0),
+                                timestamp = cursor.getString(2),
+                                ok = if (cursor.isNull(3)) null else cursor.getInt(3) == 1,
+                                errors = cursor.getNullableString(4),
+                                errorCategory = cursor.getNullableString(5),
+                                errorMessage = cursor.getNullableString(6),
+                                elapsedMs = if (cursor.isNull(7)) null else cursor.getLong(7),
+                                requestCount = if (cursor.isNull(8)) null else cursor.getInt(8)
+                            )
+                        )
+                    }
+                }
+            }
+            filteredRows to (globalRowsScanned >= POLL_HEALTH_RECENT_PAGE_LIMIT)
+        }
+        return PollHealthCache.fromRecentPage(
+            sessionId,
+            rows.first,
+            POLL_HEALTH_RECENT_PAGE_LIMIT,
+            globalPageFilled = rows.second
+        )
+    }
+
+    private fun recordCommittedPollHealth(sessionId: Long, pollId: Long, input: PersistedPollInput) {
+        val row = PollHealthRow(
+            pollId = pollId,
+            timestamp = input.timestamp,
+            ok = input.ok,
+            errors = input.errors.truncateForStorage(MAX_ERROR_TEXT_LENGTH),
+            errorCategory = input.errorCategory,
+            errorMessage = input.errorMessage.truncateForStorage(MAX_ERROR_TEXT_LENGTH),
+            elapsedMs = input.elapsedMs,
+            requestCount = input.requestCount
+        )
+        synchronized(pollHealthLock) {
+            val current = pollHealthCache?.takeIf { it.snapshot.activeSessionId == sessionId }
+                ?: runCatching { restorePollHealth(sessionId) }
+                    .onFailure { error -> Log.w(TAG, "post-commit poll health restore failed", error) }
+                    .getOrNull()
+                ?: return
+            pollHealthCache = current.merge(row)
+        }
+    }
+
+    private fun unavailablePollHealth(sessionId: Long?): CurrentPollHealthSnapshot =
+        PollHealthCache.empty(sessionId).snapshot.copy(
+            historyMayBeIncomplete = true,
+            available = false
+        )
 
     private fun safeMqttPendingCount(): Long = runCatching {
         pendingCount()
@@ -1676,12 +1943,6 @@ class TelemetryStore(
         "SELECT id FROM collection_sessions WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1"
     )
 
-    private fun safeActiveSessionId(): Long? = runCatching {
-        activeSessionId()
-    }.onFailure { error ->
-        Log.w(TAG, "active session query failed", error)
-    }.getOrNull()
-
     private fun safeLatestReading(keys: List<String>): String? = runCatching {
         latestReading(keys)
     }.onFailure { error ->
@@ -1693,29 +1954,6 @@ class TelemetryStore(
     }.onFailure { error ->
         Log.w(TAG, "recent events query failed", error)
     }.getOrDefault(emptyList())
-
-    private fun safeLastPollStatus(sql: String): String? = runCatching {
-        lastPollStatus(sql)
-    }.onFailure { error ->
-        Log.w(TAG, "last poll status query failed", error)
-    }.getOrNull()
-
-    private fun lastPollStatus(sql: String): String? {
-        helper.readableDatabase.rawQuery(
-            sql,
-            emptyArray()
-        ).use { cursor ->
-            if (!cursor.moveToFirst()) return null
-            val ts = cursor.getString(0)
-            return if (cursor.getInt(1) == 1) {
-                "ok at $ts"
-            } else {
-                val category = cursor.getString(2)
-                val message = cursor.getString(3)
-                "Polling error: ${PollingErrorSummaries.summary(category, message)} at $ts"
-            }
-        }
-    }
 
     private fun safeLastEcImportStatus(): String? = runCatching {
         lastEcImportStatus()
@@ -2141,6 +2379,7 @@ class TelemetryStore(
         private const val TAG = "BYDCollectorEvent"
         private const val MAX_ERROR_TEXT_LENGTH = 2_048
         private const val MAX_RAW_RESPONSE_BODY_LENGTH = 4_096
+        private const val POLL_HEALTH_RECENT_PAGE_LIMIT = 128
         private const val UNKNOWN_COUNT = -1L
         private const val DECODED_VALUE_CACHE_SIZE = 2_048
         private const val TELEGRAM_MAX_PENDING = 1_000L

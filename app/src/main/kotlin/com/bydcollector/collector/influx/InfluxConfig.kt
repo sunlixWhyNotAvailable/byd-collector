@@ -1,6 +1,7 @@
 package com.bydcollector.collector.influx
 
 import com.bydcollector.collector.ha.HaEndpointProfile
+import com.bydcollector.collector.data.normalized.NormalizedFieldCatalog
 
 data class InfluxConfig(
     val enabled: Boolean,
@@ -72,3 +73,10 @@ data class InfluxConfig(
         }
     }
 }
+
+/** The single source of truth for fields selected by both queue accounting and export. */
+internal fun influxEffectiveFields(config: InfluxConfig): Set<String> =
+    NormalizedFieldCatalog.fields
+        .filter { field -> config.isCategoryEnabled(field.category.mqttKey) }
+        .map { field -> field.fieldKey }
+        .toSet()

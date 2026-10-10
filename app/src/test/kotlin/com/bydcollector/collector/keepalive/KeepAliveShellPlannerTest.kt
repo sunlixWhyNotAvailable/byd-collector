@@ -2,6 +2,8 @@ package com.bydcollector.collector.keepalive
 
 import java.io.ByteArrayInputStream
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -95,6 +97,58 @@ class KeepAliveShellPlannerTest {
         assertEquals(null, KeepAliveDaemon.parseBluetoothEnabled("  enabled: true\n  state: TURNING_ON"))
         assertEquals(null, KeepAliveDaemon.parseBluetoothEnabled("  enabled: true"))
         assertEquals(null, KeepAliveDaemon.parseBluetoothEnabled("Bluetooth manager unavailable"))
+    }
+
+    @Test
+    fun radioRecoverySuppressesOnlyTrustedEnabledState() {
+        assertFalse(KeepAliveDaemon.shouldEnableRadio(KeepAliveDaemon.readStateOrUnavailable { true }))
+        assertTrue(KeepAliveDaemon.shouldEnableRadio(KeepAliveDaemon.readStateOrUnavailable { false }))
+        assertTrue(KeepAliveDaemon.shouldEnableRadio(KeepAliveDaemon.readStateOrUnavailable { null }))
+        assertTrue(KeepAliveDaemon.shouldEnableRadio(
+            KeepAliveDaemon.readStateOrUnavailable { throw IllegalStateException("radio state unavailable") }
+        ))
+    }
+
+    @Test
+    fun radioReadTimeoutDoesNotQueueOrReuseTimedOutMeasurement() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val blockedReaderFinished = CountDownLatch(1)
+
+        try {
+            assertNull(KeepAliveDaemon.readRadioState {
+                entered.countDown()
+                try {
+                    while (release.count > 0L) {
+                        try {
+                            release.await()
+                        } catch (_: InterruptedException) {
+                            // Model a platform binder call that does not stop when its caller times out.
+                        }
+                    }
+                    true
+                } finally {
+                    blockedReaderFinished.countDown()
+                }
+            })
+            assertTrue(entered.await(1, TimeUnit.SECONDS))
+
+            val rejectionStartedAt = System.nanoTime()
+            assertNull(KeepAliveDaemon.readRadioState { true })
+            val rejectionMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - rejectionStartedAt)
+            assertTrue(rejectionMs < 1_000, "busy reader should reject without waiting or queueing")
+        } finally {
+            release.countDown()
+        }
+
+        assertTrue(blockedReaderFinished.await(2, TimeUnit.SECONDS))
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+        var freshReading: Boolean? = null
+        while (freshReading == null && System.nanoTime() < deadline) {
+            freshReading = KeepAliveDaemon.readRadioState { true }
+            if (freshReading == null) Thread.sleep(10)
+        }
+        assertEquals(true, freshReading, "the released reader should supply a new measurement")
     }
 
     @Test

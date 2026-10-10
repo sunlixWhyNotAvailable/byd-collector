@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -45,6 +46,7 @@ final class HelperDualStreamRuntime implements AutoCloseable {
     private final Runnable tick = this::tick;
 
     private volatile boolean closed;
+    private volatile boolean ownerStopDrainAllowed;
     private volatile boolean callbackWorkersStopped;
     private boolean wakeAutonomous;
     private boolean mainInFlight;
@@ -333,11 +335,17 @@ final class HelperDualStreamRuntime implements AutoCloseable {
     }
 
     boolean replayAllowed(int stream) {
-        return state.replayAllowed(stream, SystemClock.elapsedRealtime());
+        long now = SystemClock.elapsedRealtime();
+        return ownerStopDrainAllowed
+            ? state.replayAllowedDuringShutdown(stream)
+            : state.replayAllowed(stream, now);
     }
 
     int authorizeCallbackTransport(long token, int stream, long epoch) {
-        return state.authorizeReplay(token, stream, epoch, SystemClock.elapsedRealtime());
+        long now = SystemClock.elapsedRealtime();
+        return ownerStopDrainAllowed
+            ? state.authorizeReplayDuringShutdown(token, stream, epoch, now)
+            : state.authorizeReplay(token, stream, epoch, now);
     }
 
     /** Passive STEP2 ownership seam used by the future callback listener; it performs no capture. */
@@ -672,17 +680,52 @@ final class HelperDualStreamRuntime implements AutoCloseable {
     }
 
     @Override public void close() {
+        closeAndAwait(5_000L);
+    }
+
+    void beginShutdown() {
+        ownerStopDrainAllowed = true;
+        stopNewWork();
+    }
+
+    private void stopNewWork() {
         closed = true;
         ownerHandler.removeCallbacks(tick);
-        callbackWorkersStopped = callbacks.closeAndAwait(5_000L);
-        vendor.close();
-        orchestration.shutdownNow();
-        persistence.shutdownNow();
-        maintainWakeLock(false);
         synchronized (monitor) { monitor.notifyAll(); }
     }
 
+    boolean closeAndAwait(long timeoutMs) {
+        long budget = TimeUnit.MILLISECONDS.toNanos(Math.max(0L, timeoutMs));
+        long deadline = System.nanoTime() + budget;
+        stopNewWork();
+        maintainWakeLock(false);
+        callbackWorkersStopped = callbacks.closeAndAwait(remainingMillis(deadline));
+        if (!callbackWorkersStopped || !callbacks.registrationWorkerStopped()) return false;
+
+        vendor.close();
+        orchestration.shutdown();
+        if (!awaitTermination(orchestration, deadline)) return false;
+        persistence.shutdown();
+        return awaitTermination(persistence, deadline);
+    }
+
     boolean callbackWorkersStopped() { return callbackWorkersStopped; }
+
+    private static long remainingMillis(long deadlineNanos) {
+        return Math.max(0L, TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()));
+    }
+
+    private static boolean awaitTermination(ExecutorService executor, long deadlineNanos) {
+        if (executor.isTerminated()) return true;
+        long remaining = deadlineNanos - System.nanoTime();
+        if (remaining <= 0L) return false;
+        try {
+            return executor.awaitTermination(remaining, TimeUnit.NANOSECONDS);
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
 
     private interface CheckCurrent { boolean ok(); }
     interface VendorCall<T> { T run() throws Throwable; }

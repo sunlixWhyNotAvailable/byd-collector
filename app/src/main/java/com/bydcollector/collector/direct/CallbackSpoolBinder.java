@@ -348,24 +348,21 @@ public final class CallbackSpoolBinder implements AutoCloseable {
                 catch (RuntimeException error) {
                     if (failure == null) failure = error;
                     else failure.addSuppressed(error);
-                } finally { spool(stream).close(); }
+                }
             }
         }
         if (failure != null) throw failure;
+        if (persisted) {
+            main.close();
+            secondary.close();
+        }
         return persisted;
     }
 
     private boolean closeStream(int stream) {
         while (!live[stream].isEmpty()) {
-            LiveRecord retained = live[stream].peekFirst();
             CallbackSpool.AppendResult result = spillLocked(stream);
             if (result == CallbackSpool.AppendResult.SUCCESS || result == CallbackSpool.AppendResult.DUPLICATE) continue;
-            try {
-                TelemetryCallbackBatch batch = TelemetryCallbackBatch.decode(retained.bytes);
-                TelemetryCallbackBatch.Event first = batch.events.get(0);
-                TelemetryCallbackBatch.Event last = batch.events.get(batch.events.size() - 1);
-                spool(stream).recordLoss(batch.events.size(), first.receivedWallMs, last.receivedWallMs, "shutdown_spill");
-            } catch (Exception ignored) { }
             return false;
         }
         return true;

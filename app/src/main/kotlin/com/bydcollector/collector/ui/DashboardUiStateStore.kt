@@ -8,6 +8,7 @@ import com.bydcollector.collector.ui.compose.AppTab
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.UUID
 
 data class CachedDashboardState(
     val state: DashboardState,
@@ -59,11 +60,19 @@ data class DashboardDebugPollState(
     val lastSessionId: Long?
 )
 
+private data class DashboardQueueMetrics(
+    val mqttPendingCount: Long,
+    val influxPendingRows: Long,
+    val influxOldestPendingAt: String?
+)
+
 class DashboardUiStateStore(
     private val clock: () -> Long = { SystemClock.elapsedRealtime() }
 ) {
     internal var onRuntimeChanged: () -> Unit = {}
     private val lock = Any() //Serializes cache reads, writes, and generation checks.
+    private val ownerStartedAtElapsedMs = clock()
+    private val ownerIncarnationId = UUID.randomUUID().toString()
     private var nextGeneration = 0L
     private val chrome = MutableStateFlow<CachedDashboardState?>(null)
     private val tabs = AppTab.entries.associateWith {
@@ -75,9 +84,28 @@ class DashboardUiStateStore(
         VehicleKpiLanguage.UK to VehicleKpis(),
         VehicleKpiLanguage.EN to VehicleKpis()
     )
-    private var rowCounts: DashboardRowCounts? = null
+    private var rowCounts = DashboardRowCounts(
+        UNKNOWN_DASHBOARD_COUNT, UNKNOWN_DASHBOARD_COUNT, UNKNOWN_DASHBOARD_COUNT,
+        UNKNOWN_DASHBOARD_COUNT, UNKNOWN_DASHBOARD_COUNT, UNKNOWN_DASHBOARD_COUNT
+    )
     private var countBootstrapInFlight = false
     private var countBootstrapGeneration = 0L
+    private var ownerStorageGeneration = 0L
+    private var ownerRevision = 0L
+    private var ownerMeasuredAtElapsedMs = 0L
+    private var callbackQueueRevision = 0L
+    private var callbackQueueMeasuredAtElapsedMs = 0L
+    private var rowCountRevision = 0L
+    private var rowCountMeasuredAtElapsedMs = 0L
+    private var rowCountStorageGeneration = 0L
+    private var queueMetricsRevision = 0L
+    private var queueMetricsMeasuredAtElapsedMs = 0L
+    private var queueMetrics = DashboardQueueMetrics(
+        UNKNOWN_DASHBOARD_COUNT, UNKNOWN_DASHBOARD_COUNT, null
+    )
+    private var integrationRevision = 0L
+    private var integrationMeasuredAtElapsedMs = 0L
+    private var integrationStorageGeneration = 0L
     private var initialHydrationStarted = false
     private var runtimeFlags: DashboardRuntimeFlags? = null
     private var accessStatus: Pair<Boolean, Boolean>? = null
@@ -98,7 +126,7 @@ class DashboardUiStateStore(
             val emptyTabs = AppTab.entries.filter { tabs.getValue(it).value == null }
             if (chrome.value != null && emptyTabs.isEmpty()) return
 
-            val seeded = applyRuntimeOverlays(initial)
+            val seeded = mergeLatestQueueOverlayLocked(applyRuntimeOverlays(initial))
             val generation = nextGenerationLocked()
             val loadedAtElapsedMs = clock()
             if (chrome.value == null) {
@@ -147,6 +175,14 @@ class DashboardUiStateStore(
     fun currentChrome(): DashboardState? = synchronized(lock) { chrome.value?.state }
 
     fun currentTab(tab: AppTab): DashboardState? = synchronized(lock) { tabs.getValue(tab).value?.state }
+
+    internal fun rowCountSnapshot(): DashboardRowCounts = synchronized(lock) { rowCounts }
+
+    /** Captured before a bounded count read and checked again before its result is published. */
+    fun storageGenerationSnapshot(): Long = synchronized(lock) { ownerStorageGeneration }
+
+    /** Category changes fence an in-flight queue read without invalidating unrelated storage metrics. */
+    fun queueMetricsRevisionSnapshot(): Long = synchronized(lock) { queueMetricsRevision }
 
     fun markTabStale(tab: AppTab) {
         synchronized(lock) {
@@ -198,6 +234,7 @@ class DashboardUiStateStore(
 
     fun invalidateRowCounts() {
         synchronized(lock) {
+            ownerStorageGeneration = nextRevision(ownerStorageGeneration, "dashboard storage generation")
             rowCounts = DashboardRowCounts(
                 pollCount = UNKNOWN_DASHBOARD_COUNT,
                 valueRowCount = UNKNOWN_DASHBOARD_COUNT,
@@ -209,6 +246,18 @@ class DashboardUiStateStore(
             countBootstrapInFlight = false
             check(countBootstrapGeneration < Long.MAX_VALUE) { "dashboard count generation overflow" }
             countBootstrapGeneration += 1L
+            rowCountRevision = nextRevision(rowCountRevision, "dashboard row-count revision")
+            rowCountMeasuredAtElapsedMs = clock()
+            rowCountStorageGeneration = ownerStorageGeneration
+            queueMetrics = DashboardQueueMetrics(
+                mqttPendingCount = UNKNOWN_DASHBOARD_COUNT,
+                influxPendingRows = UNKNOWN_DASHBOARD_COUNT,
+                influxOldestPendingAt = null
+            )
+            queueMetricsRevision = nextRevision(queueMetricsRevision, "dashboard queue-metrics revision")
+            queueMetricsMeasuredAtElapsedMs = rowCountMeasuredAtElapsedMs
+            touchOwnerLocked(rowCountMeasuredAtElapsedMs)
+            updateAllLocked(::applyRuntimeOverlays)
         }
     }
 
@@ -218,11 +267,23 @@ class DashboardUiStateStore(
         true
     }
 
-    fun publishRowCountBaseline(generation: Long, counts: DashboardRowCounts): Boolean {
+    fun publishRowCountBaseline(
+        generation: Long,
+        counts: DashboardRowCounts,
+        measuredAtElapsedMs: Long = clock(),
+        expectedStorageGeneration: Long = storageGenerationSnapshot()
+    ): Boolean {
         return synchronized(lock) {
-            if (!countBootstrapInFlight || generation != countBootstrapGeneration) return@synchronized false
+            if (expectedStorageGeneration != ownerStorageGeneration ||
+                !countBootstrapInFlight || generation != countBootstrapGeneration
+            ) return@synchronized false
             rowCounts = counts
             countBootstrapInFlight = false
+            rowCountRevision = nextRevision(rowCountRevision, "dashboard row-count revision")
+            rowCountMeasuredAtElapsedMs = measuredAtElapsedMs
+            rowCountStorageGeneration = ownerStorageGeneration
+            touchOwnerLocked(rowCountMeasuredAtElapsedMs)
+            updateAllLocked(::applyRuntimeOverlays)
             true
         }
     }
@@ -235,36 +296,26 @@ class DashboardUiStateStore(
         }
     }
 
-    fun incrementMainRowCounts(
-        pollRows: Long = 0L,
-        valueRows: Long = 0L,
-        ecRows: Long = 0L,
-        normalizedCurrentRows: Long = 0L,
-        normalizedHistoryRows: Long = 0L
-    ) {
+    fun invalidateQueueMetrics() {
         synchronized(lock) {
-            val current = rowCounts ?: return
-            rowCounts = current.copy(
-                pollCount = incrementKnownCount(current.pollCount, pollRows),
-                valueRowCount = incrementKnownCount(current.valueRowCount, valueRows),
-                ecRowCount = incrementKnownCount(current.ecRowCount, ecRows),
-                normalizedCurrentCount = incrementKnownCount(current.normalizedCurrentCount, normalizedCurrentRows),
-                normalizedHistoryCount = incrementKnownCount(current.normalizedHistoryCount, normalizedHistoryRows)
+            queueMetrics = DashboardQueueMetrics(
+                mqttPendingCount = UNKNOWN_DASHBOARD_COUNT,
+                influxPendingRows = UNKNOWN_DASHBOARD_COUNT,
+                influxOldestPendingAt = null
             )
-        }
-    }
-
-    fun incrementDebugReadingCount(rows: Long) {
-        if (rows == 0L) return
-        synchronized(lock) {
-            val current = rowCounts ?: return
-            rowCounts = current.copy(debugReadingCount = incrementKnownCount(current.debugReadingCount, rows))
+            queueMetricsRevision = nextRevision(queueMetricsRevision, "dashboard queue-metrics revision")
+            queueMetricsMeasuredAtElapsedMs = clock()
+            touchOwnerLocked(queueMetricsMeasuredAtElapsedMs)
+            updateAllLocked(::applyRuntimeOverlays)
         }
     }
 
     fun publishRuntimeFlags(flags: DashboardRuntimeFlags) {
         synchronized(lock) {
             runtimeFlags = flags
+            callbackQueueRevision = nextRevision(callbackQueueRevision, "dashboard callback-queue revision")
+            callbackQueueMeasuredAtElapsedMs = clock()
+            touchOwnerLocked(callbackQueueMeasuredAtElapsedMs)
             updateAllLocked(::applyRuntimeOverlays)
         }
     }
@@ -273,6 +324,7 @@ class DashboardUiStateStore(
     fun publishAccessStatus(permissionsGranted: Boolean, adbAuthorized: Boolean) {
         synchronized(lock) {
             accessStatus = permissionsGranted to adbAuthorized
+            touchOwnerLocked()
             updateAllLocked(::applyRuntimeOverlays)
         }
     }
@@ -280,6 +332,18 @@ class DashboardUiStateStore(
     fun publishMainPollState(state: DashboardMainPollState) {
         synchronized(lock) {
             mainPollState = state
+            touchOwnerLocked()
+            updateTargetsLocked(setOf(AppTab.MAIN), includeChrome = true)
+        }
+    }
+
+    internal fun mainPollSnapshot(): DashboardMainPollState? = synchronized(lock) { mainPollState }
+
+    internal fun restoreMainPollState(state: DashboardMainPollState) {
+        synchronized(lock) {
+            if (mainPollState != null) return
+            mainPollState = state
+            touchOwnerLocked()
             updateTargetsLocked(setOf(AppTab.MAIN), includeChrome = true)
         }
     }
@@ -287,14 +351,48 @@ class DashboardUiStateStore(
     fun publishDebugPollState(state: DashboardDebugPollState) {
         synchronized(lock) {
             debugPollState = state
+            touchOwnerLocked()
             updateTargetsLocked(setOf(AppTab.ALL_PARAMETERS), includeChrome = false)
         }
     }
 
-    fun publishIntegrationRuntime(state: DashboardState) {
-        synchronized(lock) {
+    fun publishIntegrationRuntime(
+        state: DashboardState,
+        measuredAtElapsedMs: Long = clock(),
+        expectedStorageGeneration: Long = storageGenerationSnapshot()
+    ): Boolean {
+        return synchronized(lock) {
+            if (expectedStorageGeneration != ownerStorageGeneration) return@synchronized false
+            if (measuredAtElapsedMs < integrationMeasuredAtElapsedMs) return@synchronized false
             integrationRuntimeState = state
+            integrationRevision = nextRevision(integrationRevision, "dashboard integration revision")
+            integrationMeasuredAtElapsedMs = measuredAtElapsedMs
+            integrationStorageGeneration = ownerStorageGeneration
+            touchOwnerLocked(measuredAtElapsedMs)
             updateTargetsLocked(setOf(AppTab.MAIN, AppTab.HA), includeChrome = true)
+            true
+        }
+    }
+
+    /** Queue depth is measured independently from sender/export status snapshots. */
+    fun publishQueueMetrics(
+        mqttPendingCount: Long,
+        influxPendingRows: Long,
+        influxOldestPendingAt: String?,
+        measuredAtElapsedMs: Long = clock(),
+        expectedStorageGeneration: Long = storageGenerationSnapshot(),
+        expectedQueueMetricsRevision: Long? = null
+    ): Boolean {
+        return synchronized(lock) {
+            if (expectedStorageGeneration != ownerStorageGeneration) return@synchronized false
+            if (expectedQueueMetricsRevision != null && expectedQueueMetricsRevision != queueMetricsRevision) return@synchronized false
+            if (measuredAtElapsedMs < queueMetricsMeasuredAtElapsedMs) return@synchronized false
+            queueMetrics = DashboardQueueMetrics(mqttPendingCount, influxPendingRows, influxOldestPendingAt)
+            queueMetricsRevision = nextRevision(queueMetricsRevision, "dashboard queue-metrics revision")
+            queueMetricsMeasuredAtElapsedMs = measuredAtElapsedMs
+            touchOwnerLocked(measuredAtElapsedMs)
+            updateTargetsLocked(setOf(AppTab.MAIN, AppTab.HA), includeChrome = true)
+            true
         }
     }
 
@@ -303,6 +401,7 @@ class DashboardUiStateStore(
             mainDatabaseSizeBytes = mainBytes
             debugDatabaseSizeBytes = debugBytes
             tripsDatabaseSizeBytes = tripsBytes
+            touchOwnerLocked()
             updateTargetsLocked(
                 setOf(AppTab.MAIN, AppTab.ALL_PARAMETERS, AppTab.STORAGE),
                 includeChrome = true
@@ -330,8 +429,9 @@ class DashboardUiStateStore(
             if (!isCurrentGeneration(tab, current, generation)) {
                 false
             } else {
+                val incoming = mergeLatestQueueOverlayLocked(applyRuntimeOverlays(state))
                 flow.value = CachedDashboardState(
-                    state = applyRuntimeOverlays(state),
+                    state = incoming,
                     // Re-reading a remote cache must not postpone the next real load.
                     loadedAtElapsedMs = if (dataRefreshed) clock() else current?.loadedAtElapsedMs ?: 0L,
                     generation = generation,
@@ -403,7 +503,7 @@ class DashboardUiStateStore(
     private fun applyRuntimeOverlays(source: DashboardState): DashboardState {
         if (com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) return source
         var state = source.copy(vehicleKpis = localizedVehicleKpis.getValue(selectedKpiLanguage))
-        rowCounts?.let { counts ->
+        rowCounts.let { counts ->
             state = state.copy(
                 pollCount = counts.pollCount,
                 valueRowCount = counts.valueRowCount,
@@ -455,6 +555,13 @@ class DashboardUiStateStore(
                 influxExportedRowsTotal = runtime.influxExportedRowsTotal
             )
         }
+        queueMetrics.let { metrics ->
+            state = state.copy(
+                mqttPendingCount = metrics.mqttPendingCount,
+                influxPendingRows = metrics.influxPendingRows,
+                influxOldestPendingAt = metrics.influxOldestPendingAt
+            )
+        }
         //Settings/service flags are the newest producer-owned truth and must win over a slightly older
         //integration snapshot loaded from SQLite.
         runtimeFlags?.let { flags ->
@@ -490,13 +597,50 @@ class DashboardUiStateStore(
             debugDatabaseSizeBytes = debugDatabaseSizeBytes ?: state.archiveStorageSnapshot.debugDatabaseSizeBytes,
             tripsDatabaseSizeBytes = tripsDatabaseSizeBytes ?: state.archiveStorageSnapshot.tripsDatabaseSizeBytes
         ))
-        return state
+        return state.copy(freshness = DashboardSnapshotFreshness(
+            ownerStartedAtElapsedMs = ownerStartedAtElapsedMs,
+            ownerIncarnationId = ownerIncarnationId,
+            ownerStorageGeneration = ownerStorageGeneration,
+            ownerRevision = ownerRevision,
+            ownerMeasuredAtElapsedMs = ownerMeasuredAtElapsedMs,
+            callbackQueueRevision = callbackQueueRevision,
+            callbackQueueMeasuredAtElapsedMs = callbackQueueMeasuredAtElapsedMs,
+            rowCountRevision = rowCountRevision,
+            rowCountMeasuredAtElapsedMs = rowCountMeasuredAtElapsedMs,
+            rowCountStorageGeneration = rowCountStorageGeneration,
+            queueMetricsRevision = queueMetricsRevision,
+            queueMetricsMeasuredAtElapsedMs = queueMetricsMeasuredAtElapsedMs,
+            integrationRevision = integrationRevision,
+            integrationMeasuredAtElapsedMs = integrationMeasuredAtElapsedMs,
+            integrationStorageGeneration = integrationStorageGeneration
+        ))
     }
 
     internal fun snapshotForClient(source: DashboardState, language: VehicleKpiLanguage): DashboardState =
         synchronized(lock) {
-            applyRuntimeOverlays(source).copy(vehicleKpis = localizedVehicleKpis.getValue(language))
+            mergeLatestQueueOverlayLocked(applyRuntimeOverlays(source))
+                .copy(vehicleKpis = localizedVehicleKpis.getValue(language))
         }
+
+    private fun mergeLatestQueueOverlayLocked(incoming: DashboardState): DashboardState {
+        val currentStates = buildList {
+            chrome.value?.state?.let(::add)
+            tabs.values.forEach { flow -> flow.value?.state?.let(::add) }
+        }
+        return currentStates.fold(incoming) { merged, current ->
+            mergeDashboardFreshQueueOverlay(current, merged)
+        }
+    }
+
+    private fun touchOwnerLocked(measuredAtElapsedMs: Long = clock()) {
+        ownerRevision = nextRevision(ownerRevision, "dashboard owner revision")
+        ownerMeasuredAtElapsedMs = maxOf(ownerMeasuredAtElapsedMs, measuredAtElapsedMs)
+    }
+
+    private fun nextRevision(value: Long, name: String): Long {
+        check(value < Long.MAX_VALUE) { "$name overflow" }
+        return value + 1L
+    }
 
     private fun nextGenerationLocked(): Long {
         check(nextGeneration < Long.MAX_VALUE) { "dashboard UI generation overflow" }
@@ -504,7 +648,140 @@ class DashboardUiStateStore(
         return nextGeneration
     }
 
-    private fun incrementKnownCount(current: Long, delta: Long): Long {
-        return if (current == UNKNOWN_DASHBOARD_COUNT) current else current + delta
-    }
 }
+
+/** Keep the freshest independently measured owner groups while accepting other fields from [incoming]. */
+internal fun mergeDashboardFreshQueueOverlay(current: DashboardState, incoming: DashboardState): DashboardState {
+    val currentFreshness = current.freshness
+    val incomingFreshness = incoming.freshness
+    val ownerOrder = compareOwnerIncarnation(currentFreshness, incomingFreshness)
+    val sameOwner = ownerOrder == 0
+    val generationOrder = compareValues(
+        currentFreshness.ownerStorageGeneration,
+        incomingFreshness.ownerStorageGeneration
+    )
+    val currentOwnerSnapshotIsNewer = ownerOrder > 0 || (sameOwner && generationOrder > 0)
+    val mergedFreshness = incomingFreshness.copy(
+        ownerStartedAtElapsedMs = if (currentOwnerSnapshotIsNewer) currentFreshness.ownerStartedAtElapsedMs else incomingFreshness.ownerStartedAtElapsedMs,
+        ownerIncarnationId = if (currentOwnerSnapshotIsNewer) currentFreshness.ownerIncarnationId else incomingFreshness.ownerIncarnationId,
+        ownerStorageGeneration = if (currentOwnerSnapshotIsNewer) currentFreshness.ownerStorageGeneration else incomingFreshness.ownerStorageGeneration,
+        ownerRevision = when {
+            !sameOwner -> if (currentOwnerSnapshotIsNewer) currentFreshness.ownerRevision else incomingFreshness.ownerRevision
+            else -> maxOf(currentFreshness.ownerRevision, incomingFreshness.ownerRevision)
+        },
+        ownerMeasuredAtElapsedMs = when {
+            !sameOwner -> if (currentOwnerSnapshotIsNewer) currentFreshness.ownerMeasuredAtElapsedMs else incomingFreshness.ownerMeasuredAtElapsedMs
+            else -> maxOf(currentFreshness.ownerMeasuredAtElapsedMs, incomingFreshness.ownerMeasuredAtElapsedMs)
+        }
+    )
+    var merged = incoming.copy(freshness = mergedFreshness)
+    if (isFreshGroupNewer(
+            currentFreshness, incomingFreshness,
+            currentFreshness.rowCountStorageGeneration, incomingFreshness.rowCountStorageGeneration,
+            currentFreshness.rowCountRevision, incomingFreshness.rowCountRevision,
+            currentFreshness.rowCountMeasuredAtElapsedMs, incomingFreshness.rowCountMeasuredAtElapsedMs
+        )) {
+        merged = merged.copy(
+            pollCount = current.pollCount,
+            valueRowCount = current.valueRowCount,
+            ecRowCount = current.ecRowCount,
+            normalizedCurrentCount = current.normalizedCurrentCount,
+            normalizedHistoryCount = current.normalizedHistoryCount,
+            debugReadingCount = current.debugReadingCount,
+            freshness = merged.freshness.copy(
+                rowCountRevision = currentFreshness.rowCountRevision,
+                rowCountMeasuredAtElapsedMs = currentFreshness.rowCountMeasuredAtElapsedMs,
+                rowCountStorageGeneration = currentFreshness.rowCountStorageGeneration
+            )
+        )
+    }
+    if (isFreshGroupNewer(
+            currentFreshness, incomingFreshness,
+            currentFreshness.integrationStorageGeneration, incomingFreshness.integrationStorageGeneration,
+            currentFreshness.integrationRevision, incomingFreshness.integrationRevision,
+            currentFreshness.integrationMeasuredAtElapsedMs, incomingFreshness.integrationMeasuredAtElapsedMs
+        )) {
+        merged = merged.copy(
+            mqttStatus = current.mqttStatus,
+            mqttLastError = current.mqttLastError,
+            mqttLastPublishedAt = current.mqttLastPublishedAt,
+            mqttRetryFailureCount = current.mqttRetryFailureCount,
+            mqttNextRetryAt = current.mqttNextRetryAt,
+            mqttRetryLastFailureAt = current.mqttRetryLastFailureAt,
+            mqttRetryLastSuccessAt = current.mqttRetryLastSuccessAt,
+            influxStatus = current.influxStatus,
+            influxNextRetryAt = current.influxNextRetryAt,
+            influxLastSuccessAt = current.influxLastSuccessAt,
+            influxLastErrorAt = current.influxLastErrorAt,
+            influxLastError = current.influxLastError,
+            influxExportedRowsTotal = current.influxExportedRowsTotal,
+            freshness = merged.freshness.copy(
+                integrationRevision = currentFreshness.integrationRevision,
+                integrationMeasuredAtElapsedMs = currentFreshness.integrationMeasuredAtElapsedMs,
+                integrationStorageGeneration = currentFreshness.integrationStorageGeneration
+            )
+        )
+    }
+    if (isFreshGroupNewer(
+            currentFreshness, incomingFreshness,
+            currentFreshness.ownerStorageGeneration, incomingFreshness.ownerStorageGeneration,
+            currentFreshness.callbackQueueRevision, incomingFreshness.callbackQueueRevision,
+            currentFreshness.callbackQueueMeasuredAtElapsedMs, incomingFreshness.callbackQueueMeasuredAtElapsedMs
+        )) {
+        merged = merged.copy(
+            mainCallbackQueue = current.mainCallbackQueue,
+            secondaryCallbackQueue = current.secondaryCallbackQueue,
+            freshness = merged.freshness.copy(
+                callbackQueueRevision = currentFreshness.callbackQueueRevision,
+                callbackQueueMeasuredAtElapsedMs = currentFreshness.callbackQueueMeasuredAtElapsedMs
+            )
+        )
+    }
+    if (isFreshGroupNewer(
+            currentFreshness, incomingFreshness,
+            currentFreshness.ownerStorageGeneration, incomingFreshness.ownerStorageGeneration,
+            currentFreshness.queueMetricsRevision, incomingFreshness.queueMetricsRevision,
+            currentFreshness.queueMetricsMeasuredAtElapsedMs, incomingFreshness.queueMetricsMeasuredAtElapsedMs
+        )) {
+        merged = merged.copy(
+            mqttPendingCount = current.mqttPendingCount,
+            influxPendingRows = current.influxPendingRows,
+            influxOldestPendingAt = current.influxOldestPendingAt,
+            freshness = merged.freshness.copy(
+                queueMetricsRevision = currentFreshness.queueMetricsRevision,
+                queueMetricsMeasuredAtElapsedMs = currentFreshness.queueMetricsMeasuredAtElapsedMs
+            )
+        )
+    }
+    return merged
+}
+
+private fun isFreshGroupNewer(
+    current: DashboardSnapshotFreshness,
+    incoming: DashboardSnapshotFreshness,
+    currentStorageGeneration: Long,
+    incomingStorageGeneration: Long,
+    currentRevision: Long,
+    incomingRevision: Long,
+    currentMeasuredAtElapsedMs: Long,
+    incomingMeasuredAtElapsedMs: Long
+): Boolean {
+    val ownerOrder = compareOwnerIncarnation(current, incoming)
+    if (ownerOrder != 0) return ownerOrder > 0
+    val generationOrder = compareValues(currentStorageGeneration, incomingStorageGeneration)
+    if (generationOrder != 0) return generationOrder > 0
+    val revisionOrder = compareValues(currentRevision, incomingRevision)
+    if (revisionOrder != 0) return revisionOrder > 0
+    if (currentMeasuredAtElapsedMs != incomingMeasuredAtElapsedMs) {
+        return currentMeasuredAtElapsedMs > incomingMeasuredAtElapsedMs
+    }
+    // A non-empty equal stamp denotes one measurement; keep its already-published payload on ties.
+    return currentRevision > 0L || currentMeasuredAtElapsedMs > 0L || currentStorageGeneration > 0L
+}
+
+private fun compareOwnerIncarnation(
+    current: DashboardSnapshotFreshness,
+    incoming: DashboardSnapshotFreshness
+): Int = compareValues(current.ownerStartedAtElapsedMs, incoming.ownerStartedAtElapsedMs)
+    .takeIf { it != 0 }
+    ?: compareValues(current.ownerIncarnationId, incoming.ownerIncarnationId)

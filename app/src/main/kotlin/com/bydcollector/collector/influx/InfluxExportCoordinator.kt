@@ -2,7 +2,6 @@ package com.bydcollector.collector.influx
 
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
-import com.bydcollector.collector.data.normalized.NormalizedFieldCatalog
 import com.bydcollector.collector.ha.HaEndpointProfile
 import java.time.OffsetDateTime
 import java.util.Locale
@@ -23,9 +22,6 @@ class InfluxExportCoordinator(
     @Volatile private var sessionConnection: InfluxConfig? = null
     private var lastDiagnosticGate: String? = null
     @Volatile private var terminalFailure = false
-    private var pendingSnapshot: InfluxPendingSummary? = null
-    private var pendingFields: Set<String> = emptySet()
-    private var pendingMeasuredAtMs = 0L
 
     @Volatile
     private var currentRoute: HaEndpointProfile? = null
@@ -68,7 +64,6 @@ class InfluxExportCoordinator(
     }
 
     fun endSession() {
-        pendingSnapshot = null
         sessionConnection = null
         currentRoute = null
         diagnostic("influx_session_ended", mapOf("frozen" to "false", "actual_route" to "none"))
@@ -105,15 +100,16 @@ class InfluxExportCoordinator(
             diagnosticValidationGate(it)
             return it
         }
-        val fieldKeys = effectiveFields(config)
+        val fieldKeys = influxEffectiveFields(config)
         store.ensureInfluxCursors(fieldKeys)
         val pending = pendingSummary(fieldKeys)
         val state = store.influxExportState()
         if (pass.cancelled()) return InfluxActionResult.ok("influx work superseded")
-        val preservesFailure = pending.rows > 0L && state.status == STATUS_BACKOFF && !state.nextRetryAt.isNullOrBlank()
+        val pendingMayRemain = pendingMayRemain(pending)
+        val preservesFailure = pendingMayRemain && state.status == STATUS_BACKOFF && !state.nextRetryAt.isNullOrBlank()
         store.updateInfluxExportState(
             status = when {
-                pending.rows == 0L -> STATUS_IDLE
+                !pendingMayRemain -> STATUS_IDLE
                 preservesFailure -> STATUS_BACKOFF
                 else -> STATUS_SCHEDULED
             },
@@ -121,7 +117,7 @@ class InfluxExportCoordinator(
             pendingRows = pending.rows,
             oldestPendingAt = pending.oldestObservedAt,
             nextRetryAt = when {
-                pending.rows == 0L -> null
+                !pendingMayRemain -> null
                 !state.nextRetryAt.isNullOrBlank() -> state.nextRetryAt
                 else -> plusSeconds(clock.nowIso(), SUCCESS_BATCH_INTERVAL_SECONDS)
             },
@@ -137,7 +133,7 @@ class InfluxExportCoordinator(
         if (terminalFailure) return null
         val config = runtimeConfig(configProvider())
         if (validate(config) != null) return null
-        val fieldKeys = effectiveFields(config)
+        val fieldKeys = influxEffectiveFields(config)
         if (fieldKeys.isEmpty()) {
             diagnosticGate("no_categories")
             return null
@@ -154,7 +150,7 @@ class InfluxExportCoordinator(
         cancelInFlight()
         return try {
             val config = configProvider()
-            val fieldKeys = effectiveFields(config)
+            val fieldKeys = influxEffectiveFields(config)
             store.ensureInfluxCursors(fieldKeys)
             val pending = pendingSummary(fieldKeys)
             val state = store.influxExportState()
@@ -184,7 +180,6 @@ class InfluxExportCoordinator(
         val result = try { action() }
         catch (error: CancellationException) { throw error }
         catch (error: RuntimeException) {
-            pendingSnapshot = null // A partially persisted cursor must be reconciled on the next Start.
             if (!isCurrent() || generation != cancellationGeneration.get()) return InfluxActionResult.ok("influx work superseded")
             InfluxActionResult.fail("influx_export_exception", "${error::class.java.simpleName}: ${error.message ?: "no message"}".take(512))
         }
@@ -215,7 +210,7 @@ class InfluxExportCoordinator(
             return it
         }
         val state = store.influxExportState()
-        val fieldKeys = effectiveFields(config)
+        val fieldKeys = influxEffectiveFields(config)
         if (fieldKeys.isEmpty()) {
             diagnosticGate("no_categories")
             store.updateInfluxExportState(
@@ -239,13 +234,13 @@ class InfluxExportCoordinator(
         }
         store.ensureInfluxCursors(fieldKeys)
         // Queue statistics are not delivery authority; every batch still reads the durable cursors.
-        var pendingBefore = pendingSummary(fieldKeys)
+        val pendingBefore = pendingSummary(fieldKeys)
 
-        val batchLimit = nextBatchLimit(pendingBefore.rows)
+        val batchLimit = nextBatchLimit(pendingBefore)
         val rows = timedDatabasePhase("select_batch") { store.pendingInfluxRows(fieldKeys, batchLimit) }
         if (pass.cancelled()) return InfluxActionResult.ok("influx work superseded")
         if (rows.isEmpty()) {
-            pendingSnapshot = InfluxPendingSummary(0, null)
+            currentBatchSize = REALTIME_BATCH_LIMIT
             diagnosticGate("no_work")
             store.updateInfluxExportState(
                 status = STATUS_IDLE,
@@ -260,8 +255,6 @@ class InfluxExportCoordinator(
             )
             return InfluxActionResult.ok("nothing pending")
         }
-        pendingBefore = pendingBefore.copy(rows = maxOf(pendingBefore.rows, rows.size.toLong()))
-        pendingSnapshot = pendingBefore
 
         store.updateInfluxExportState(
             status = STATUS_EXPORTING,
@@ -293,7 +286,7 @@ class InfluxExportCoordinator(
                     }
                 }
             }
-            val pendingAfter = pendingAfterBatch(fieldKeys, batch)
+            val pendingAfter = pendingAfterBatch(fieldKeys)
             batch.failure?.let { failure ->
                 val pendingAfterFailure = pendingAfter
                 if (isTransientFailure(failure)) {
@@ -310,7 +303,7 @@ class InfluxExportCoordinator(
                     mode = modeFor(pendingAfter.rows),
                     pendingRows = pendingAfter.rows,
                     oldestPendingAt = pendingAfter.oldestObservedAt,
-                    nextRetryAt = if (!stopped && pendingAfter.rows > 0L) {
+                    nextRetryAt = if (!stopped && pendingMayRemain(pendingAfter)) {
                         plusSeconds(exportedAt, SUCCESS_BATCH_INTERVAL_SECONDS)
                     } else {
                         null
@@ -327,16 +320,16 @@ class InfluxExportCoordinator(
             }
 
             if (batch.exportedRows > 0) {
-                rampBatchSize(pendingAfter.rows)
-            } else if (influxDesiredBatchLimit(pendingAfter.rows) == REALTIME_BATCH_LIMIT) {
+                rampBatchSize(pendingAfter)
+            } else if (pendingAfter.complete && influxDesiredBatchLimit(pendingAfter.rows) == REALTIME_BATCH_LIMIT) {
                 currentBatchSize = REALTIME_BATCH_LIMIT
             }
             store.updateInfluxExportState(
-                status = if (pendingAfter.rows > 0L) STATUS_SCHEDULED else STATUS_IDLE,
+                status = if (pendingMayRemain(pendingAfter)) STATUS_SCHEDULED else STATUS_IDLE,
                 mode = modeFor(pendingAfter.rows),
                 pendingRows = pendingAfter.rows,
                 oldestPendingAt = pendingAfter.oldestObservedAt,
-                nextRetryAt = if (pendingAfter.rows > 0L) {
+                nextRetryAt = if (pendingMayRemain(pendingAfter)) {
                     plusSeconds(exportedAt, SUCCESS_BATCH_INTERVAL_SECONDS)
                 } else {
                     null
@@ -369,27 +362,23 @@ class InfluxExportCoordinator(
         }
     }
 
-    private fun pendingSummary(fields: Set<String>): InfluxPendingSummary {
-        val now = clock.elapsedRealtimeMs()
-        pendingSnapshot?.let { cached ->
-            if (fields == pendingFields && now - pendingMeasuredAtMs in 0 until PENDING_RECOUNT_INTERVAL_MS) return cached
+    private fun pendingSummary(fields: Set<String>): InfluxPendingSummary =
+        timedDatabasePhase("queue_summary") { store.pendingInfluxSummary(fields) }
+
+    private fun pendingAfterBatch(fields: Set<String>): InfluxPendingSummary {
+        // The durable cursor query decides whether any work remains; summary completeness
+        // decides whether the total can be shown exactly.
+        val summary = pendingSummary(fields)
+        val head = timedDatabasePhase("pending_head") { store.pendingInfluxRows(fields, 1).firstOrNull() }
+        if (head == null) return InfluxPendingSummary(rows = 0L, oldestObservedAt = null, complete = true)
+        if (!summary.complete || summary.rows <= 0L || summary.oldestObservedAt == null) {
+            return InfluxPendingSummary(rows = UNKNOWN_PENDING_COUNT, oldestObservedAt = null, complete = false)
         }
-        return timedDatabasePhase("queue_recount") { store.pendingInfluxSummary(fields) }.also {
-            pendingSnapshot = it
-            pendingFields = fields.toSet()
-            pendingMeasuredAtMs = clock.elapsedRealtimeMs()
-        }
+        return summary
     }
 
-    private fun pendingAfterBatch(fields: Set<String>, batch: BatchExportResult): InfluxPendingSummary {
-        // Never infer an empty queue from cached statistics: new history can arrive during HTTP.
-        val head = timedDatabasePhase("pending_head") { store.pendingInfluxRows(fields, 1).firstOrNull() }
-        val remaining = (pendingSnapshot?.rows ?: 0L) - batch.exportedRows - batch.poisonRows
-        return InfluxPendingSummary(
-            rows = if (head == null) 0L else maxOf(1L, remaining),
-            oldestObservedAt = head?.observedAt
-        ).also { pendingSnapshot = it }
-    }
+    private fun pendingMayRemain(summary: InfluxPendingSummary): Boolean =
+        !summary.complete || summary.rows > 0L
 
     private inline fun <T> timedDatabasePhase(phase: String, action: () -> T): T {
         val started = System.nanoTime()
@@ -432,15 +421,11 @@ class InfluxExportCoordinator(
         )
     }
 
-    private fun effectiveFields(config: InfluxConfig): Set<String> {
-        return NormalizedFieldCatalog.fields
-            .filter { field -> config.isCategoryEnabled(field.category.mqttKey) }
-            .map { field -> field.fieldKey }
-            .toSet()
-    }
-
-    private fun nextBatchLimit(pendingRows: Long): Int {
-        val desired = influxDesiredBatchLimit(pendingRows)
+    private fun nextBatchLimit(pending: InfluxPendingSummary): Int {
+        if (!pending.complete) {
+            return (currentBatchSize ?: REALTIME_BATCH_LIMIT).also { currentBatchSize = it }
+        }
+        val desired = influxDesiredBatchLimit(pending.rows)
         if (desired == REALTIME_BATCH_LIMIT) {
             currentBatchSize = REALTIME_BATCH_LIMIT
             return REALTIME_BATCH_LIMIT
@@ -450,8 +435,9 @@ class InfluxExportCoordinator(
         return next
     }
 
-    private fun rampBatchSize(pendingRows: Long) {
-        val desired = influxDesiredBatchLimit(pendingRows)
+    private fun rampBatchSize(pending: InfluxPendingSummary) {
+        if (!pending.complete) return
+        val desired = influxDesiredBatchLimit(pending.rows)
         if (desired == REALTIME_BATCH_LIMIT) {
             currentBatchSize = REALTIME_BATCH_LIMIT
             return
@@ -890,7 +876,7 @@ class InfluxExportCoordinator(
         const val FAILURE_RETRY_INTERVAL_SECONDS = 30L
         const val MAX_HTTP_WRITES_PER_PASS = 64
         const val MAX_POISON_EXAMPLES = 5
-        const val PENDING_RECOUNT_INTERVAL_MS = 30_000L
+        const val UNKNOWN_PENDING_COUNT = -1L
         const val STATUS_IDLE = "idle"
         const val STATUS_SCHEDULED = "scheduled"
         const val STATUS_EXPORTING = "exporting"

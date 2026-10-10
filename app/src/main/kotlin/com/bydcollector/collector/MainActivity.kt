@@ -14,7 +14,6 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
-import android.os.CancellationSignal
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
@@ -36,7 +35,6 @@ import com.bydcollector.collector.data.trips.RoutePoint
 import com.bydcollector.collector.data.trips.TripSession
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseResolver
-import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
 import com.bydcollector.collector.influx.InfluxActionResult
 import com.bydcollector.collector.influx.InfluxConfig
@@ -65,7 +63,6 @@ import com.bydcollector.collector.system.CollectorAutoStart
 import com.bydcollector.collector.telegram.TelegramPayloadLimitState
 import com.bydcollector.collector.ui.DashboardState
 import com.bydcollector.collector.ui.DashboardLoadProfile
-import com.bydcollector.collector.ui.DashboardRowCounts
 import com.bydcollector.collector.ui.DashboardStateProvider
 import com.bydcollector.collector.ui.DashboardUiStateStore
 import com.bydcollector.collector.ui.UiSessionState
@@ -190,7 +187,6 @@ class MainActivity : ComponentActivity() {
     private lateinit var dashboardUiStateStore: DashboardUiStateStore
     private val handler = Handler(Looper.getMainLooper())
     private val dashboardExecutor = namedSingleThreadExecutor("byd-ui-dash")
-    private val dashboardCountExecutor = namedSingleThreadExecutor("byd-ui-counts")
     private val diagnosticsExecutor = namedSingleThreadExecutor("byd-diagnostics")
     private val mqttCleanupExecutor = namedSingleThreadExecutor("byd-mqtt-identities")
     private val updateExecutor = namedSingleThreadExecutor("byd-update")
@@ -922,7 +918,6 @@ class MainActivity : ComponentActivity() {
         if (dashboardUiStateStore.currentChrome() == null) {
             dashboardUiStateStore.seed(stateProvider.loadInitial())
         }
-        scheduleDashboardCountBootstrap(force = false)
         setContent {
             val renderedOfferResultId = updateOfferResultId
             val chromeSnapshot by dashboardUiStateStore.chromeState.collectAsStateWithLifecycle()
@@ -1029,7 +1024,6 @@ class MainActivity : ComponentActivity() {
         updateRuntime.onUiResumed()
         consumeUpdateHintOpen()
         updateKpiVisibility()
-        scheduleDashboardCountBootstrap(force = false)
         reconcileCutoverArchiveStorageIfNeeded()
         syncTelegramUiRuntimeState()
         if (activeTab == AppTab.TRIPS) loadTripsUi()
@@ -1221,7 +1215,6 @@ class MainActivity : ComponentActivity() {
             CollectorAutoStart.scheduleRestartAfterUiClosed(applicationContext, settings, currentStore())
         }
         dashboardExecutor.shutdownNow()
-        dashboardCountExecutor.shutdownNow()
         diagnosticsExecutor.shutdownNow()
         mqttCleanupExecutor.shutdownNow()
         updateExecutor.shutdownNow()
@@ -1415,47 +1408,6 @@ class MainActivity : ComponentActivity() {
             store,
             eventExecutor = dashboardExecutor
         )
-    }
-
-    private fun scheduleDashboardCountBootstrap(force: Boolean) {
-        val countGeneration = dashboardUiStateStore.beginCountBootstrap(force) ?: return
-        runCatching {
-            dashboardCountExecutor.execute {
-                val cancellation = CancellationSignal()
-                val cancel = Runnable(cancellation::cancel)
-                handler.postDelayed(cancel, DASHBOARD_COUNT_BUDGET_MS)
-                runCatching {
-                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
-                    if (BuildConfig.RUNTIME_CLIENT) return@runCatching RuntimeReads.read<DashboardRowCounts>(this@MainActivity, "counts")
-                    val application = applicationContext as BydCollectorApplication
-                    val main = application.tryTelemetryStoreRead { it.dashboardRowCounts(cancellation) }
-                        ?: return@runCatching null
-                    val debug = if (BydCollectorApplication.isDebugStorageReady(applicationContext)) {
-                        application.trySecondaryDatabaseRead {
-                            DirectDebugStore(applicationContext).use { it.dashboardReadingCount(cancellation) }
-                        } ?: return@runCatching null
-                    } else 0L
-                    DashboardRowCounts(
-                        pollCount = main.pollCount,
-                        valueRowCount = main.valueRowCount,
-                        ecRowCount = main.ecRowCount,
-                        normalizedCurrentCount = main.normalizedCurrentCount,
-                        normalizedHistoryCount = main.normalizedHistoryCount,
-                        debugReadingCount = debug
-                    )
-                }.also { handler.removeCallbacks(cancel) }.onSuccess { counts ->
-                    if (counts != null) dashboardUiStateStore.publishRowCountBaseline(countGeneration, counts)
-                    else dashboardUiStateStore.failCountBootstrap(countGeneration)
-                }
-                    .onFailure { error ->
-                        dashboardUiStateStore.failCountBootstrap(countGeneration)
-                        Log.w(TAG, "Dashboard row-count bootstrap failed", error)
-                    }
-            }
-        }.onFailure { error ->
-            dashboardUiStateStore.failCountBootstrap(countGeneration)
-            Log.w(TAG, "Dashboard row-count bootstrap rejected", error)
-        }
     }
 
     private fun hydrateDashboardTabsOnce() {
@@ -2999,7 +2951,6 @@ class MainActivity : ComponentActivity() {
 }
 
 internal const val DASHBOARD_REFRESH_HEARTBEAT_MS = 1_000L
-internal const val DASHBOARD_COUNT_BUDGET_MS = 2_000L
 internal const val CURRENT_TRIP_REFRESH_MS = 1_000L
 //Chrome/status fields are producer-fed while the service runs. Activity entry, resume, tab changes,
 //and explicit actions still force a reconciliation; the foreground heartbeat does not reread SQLite.

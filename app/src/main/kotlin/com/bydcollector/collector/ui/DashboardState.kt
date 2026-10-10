@@ -137,7 +137,27 @@ data class DashboardState(
     val influxRuntimeStatus: RuntimeActionStatus =
         if (influxEnabled) RuntimeActionStatus.RUNNING else RuntimeActionStatus.STOPPED,
     val mainCallbackQueue: CallbackQueueState? = null,
-    val secondaryCallbackQueue: CallbackQueueState? = null
+    val secondaryCallbackQueue: CallbackQueueState? = null,
+    val freshness: DashboardSnapshotFreshness = DashboardSnapshotFreshness()
+) : java.io.Serializable
+
+/** Measurement stamps travel with owner snapshots so a delayed IPC result cannot revive old queues. */
+data class DashboardSnapshotFreshness(
+    val ownerStartedAtElapsedMs: Long = -1L,
+    val ownerIncarnationId: String? = null,
+    val ownerStorageGeneration: Long = 0L,
+    val ownerRevision: Long = 0L,
+    val ownerMeasuredAtElapsedMs: Long = 0L,
+    val callbackQueueRevision: Long = 0L,
+    val callbackQueueMeasuredAtElapsedMs: Long = 0L,
+    val rowCountRevision: Long = 0L,
+    val rowCountMeasuredAtElapsedMs: Long = 0L,
+    val rowCountStorageGeneration: Long = 0L,
+    val queueMetricsRevision: Long = 0L,
+    val queueMetricsMeasuredAtElapsedMs: Long = 0L,
+    val integrationRevision: Long = 0L,
+    val integrationMeasuredAtElapsedMs: Long = 0L,
+    val integrationStorageGeneration: Long = 0L
 ) : java.io.Serializable
 
 /** One logical archive backed by zero or more physical raw, temporary, and ZIP entries. */

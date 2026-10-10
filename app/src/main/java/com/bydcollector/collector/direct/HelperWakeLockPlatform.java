@@ -2,13 +2,14 @@ package com.bydcollector.collector.direct;
 
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.os.Process;
 
 import java.lang.reflect.Method;
 
 /** Android attribution adapter for the shell-owned autonomous helper wake lock. */
-final class HelperWakeLockPlatform {
+public final class HelperWakeLockPlatform {
     private static final int SHELL_UID = 2000;
     private static final String SHELL_PACKAGE = "com.android.shell";
     private static final String WAKE_LOCK_TAG = "BYDCollector:autonomous_spool";
@@ -16,9 +17,12 @@ final class HelperWakeLockPlatform {
     private HelperWakeLockPlatform() {
     }
 
-    static HelperWakeLockController.HeldLock acquireShellPartialWakeLock() throws Throwable {
+    public static Context createShellContext() throws Exception {
         if (Process.myUid() != SHELL_UID) {
             throw new SecurityException("autonomous helper must run as shell UID 2000");
+        }
+        if (Looper.getMainLooper() == null && Looper.myLooper() == null) {
+            Looper.prepareMainLooper();
         }
 
         Class<?> threadClass = Class.forName("android.app.ActivityThread");
@@ -54,6 +58,11 @@ final class HelperWakeLockPlatform {
         if (!SHELL_PACKAGE.equals(opPackageName)) {
             throw new SecurityException("unexpected shell context attribution");
         }
+        return shellContext;
+    }
+
+    static HelperWakeLockController.HeldLock acquireShellPartialWakeLock() throws Throwable {
+        Context shellContext = createShellContext();
 
         PowerManager powerManager = shellContext.getSystemService(PowerManager.class);
         if (powerManager == null) throw new IllegalStateException("power service unavailable");

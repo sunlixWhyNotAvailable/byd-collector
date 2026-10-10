@@ -16,7 +16,17 @@ internal class DiagnosticShareSanitizer {
         ACCOUNT_ID("ACCOUNT_ID")
     }
 
+    private data class KeyClassification(
+        val sensitive: Boolean,
+        val identity: IdentityKind?,
+        val coordinate: Boolean
+    )
+
     private val aliases = IdentityKind.entries.associateWith { LinkedHashMap<String, String>() }
+    private val keyClassifications = object : LinkedHashMap<String, KeyClassification>(KEY_CACHE_LIMIT, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, KeyClassification>?): Boolean =
+            size > KEY_CACHE_LIMIT
+    }
 
     fun sanitizeText(text: String): String {
         // Every masked syntax needs an assignment/URI separator, a VIN API name,
@@ -38,8 +48,9 @@ internal class DiagnosticShareSanitizer {
             val key = match.groups["key"]?.value.orEmpty()
             val token = match.groups["value"]?.value.orEmpty()
             val prefix = match.groups["prefix"]?.value.orEmpty()
-            when (val identity = identityKind(key)) {
-                null -> if (isCoordinateKey(key)) {
+            val classification = classifyJsonKey(key)
+            when (val identity = classification.identity) {
+                null -> if (classification.coordinate) {
                     if (numericToken(token) != null) prefix + replaceMaskedToken(token, REDACTED_COORDINATE) else match.value
                 } else prefix + replaceMaskedToken(token, REDACTED)
                 else -> prefix + replaceMaskedToken(token, alias(identity, token))
@@ -79,25 +90,24 @@ internal class DiagnosticShareSanitizer {
 
     private fun sanitizeJsonValue(value: Any?): Any? = when (value) {
         is JSONObject -> {
-            val output = JSONObject()
             val keys = value.keys()
             while (keys.hasNext()) {
                 val key = keys.next()
                 val original = value.get(key)
+                val classification = classifyJsonKey(key)
                 val replacement = when {
-                    isSensitiveKey(key) -> if (original === JSONObject.NULL) JSONObject.NULL else REDACTED
-                    identityKind(key) != null -> identityValue(identityKind(key)!!, original)
-                    isCoordinateKey(key) -> coordinateValue(original)
+                    classification.sensitive -> if (original === JSONObject.NULL) JSONObject.NULL else REDACTED
+                    classification.identity != null -> identityValue(classification.identity, original)
+                    classification.coordinate -> coordinateValue(original)
                     else -> sanitizeJsonValue(original)
                 }
-                output.put(key, replacement)
+                if (replacement !== original) value.put(key, replacement)
             }
-            output
+            value
         }
         is JSONArray -> {
-            val output = JSONArray()
-            for (index in 0 until value.length()) output.put(sanitizeJsonValue(value.get(index)))
-            output
+            for (index in 0 until value.length()) value.put(index, sanitizeJsonValue(value.get(index)))
+            value
         }
         is String -> sanitizeText(value)
         else -> value
@@ -153,16 +163,21 @@ internal class DiagnosticShareSanitizer {
         return raw.toDoubleOrNull()?.takeIf(Double::isFinite)
     }
 
-    private fun isSensitiveKey(key: String): Boolean = normalize(key) in SENSITIVE_KEYS
-
-    private fun identityKind(key: String): IdentityKind? = when (normalize(key)) {
-        in VIN_KEYS -> IdentityKind.VIN
-        in CHAT_ID_KEYS -> IdentityKind.CHAT_ID
-        in ACCOUNT_ID_KEYS -> IdentityKind.ACCOUNT_ID
-        else -> null
+    private fun classifyJsonKey(key: String): KeyClassification {
+        keyClassifications[key]?.let { return it }
+        val normalized = normalize(key)
+        val identity = when (normalized) {
+            in VIN_KEYS -> IdentityKind.VIN
+            in CHAT_ID_KEYS -> IdentityKind.CHAT_ID
+            in ACCOUNT_ID_KEYS -> IdentityKind.ACCOUNT_ID
+            else -> null
+        }
+        return KeyClassification(
+            sensitive = normalized in SENSITIVE_KEYS,
+            identity = identity,
+            coordinate = normalized in COORDINATE_KEYS
+        ).also { keyClassifications[key] = it }
     }
-
-    private fun isCoordinateKey(key: String): Boolean = normalize(key) in COORDINATE_KEYS
 
     private fun normalize(key: String): String = key.lowercase(Locale.US).filter(Char::isLetterOrDigit)
 
@@ -190,6 +205,7 @@ internal class DiagnosticShareSanitizer {
     companion object {
         private const val REDACTED = "[redacted]"
         private const val REDACTED_COORDINATE = "[redacted-coordinate]"
+        private const val KEY_CACHE_LIMIT = 256
         private val SENSITIVE_KEYS = setOf(
             "password", "passwd", "mqttpassword", "influxpassword",
             "bottoken", "telegrambottoken", "apikey", "accesstoken",

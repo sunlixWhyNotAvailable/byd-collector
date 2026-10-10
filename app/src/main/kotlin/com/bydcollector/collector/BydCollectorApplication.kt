@@ -63,6 +63,7 @@ class BydCollectorApplication : Application() {
     internal val secondaryDatabaseMaintenanceGate = DatabaseMaintenanceGate()
     // The cutover journal is shared by both database families.
     private val storageCutoverLock = ReentrantLock(true)
+    private val tripsStoreLock = ReentrantLock(true)
     // Only file barriers and archive's runtime-stop boundary share this lock, not ongoing collection.
     internal val tripsFileOperationLock = ReentrantLock(true)
     internal val operationalEventJournal by lazy { OperationalEventJournal(applicationContext) }
@@ -99,6 +100,7 @@ class BydCollectorApplication : Application() {
     val navigationSession by lazy { UiSessionState() }
     private val updateCheckExecutorDelegate = lazy { namedSingleThreadExecutor("byd-update-check") }
     private val historicalEnergyExecutorDelegate = lazy { namedSingleThreadExecutor("byd-historical-energy") }
+    private val dashboardMetricsWorkerDelegate = lazy(LazyThreadSafetyMode.SYNCHRONIZED) { DashboardMetricsWorker(this) }
     private val telegramDeliveryRuntimeDelegate = lazy { TelegramDeliveryRuntime() }
     private val historicalEnergyScheduled = AtomicBoolean(false)
     private val historicalEnergyFinished = AtomicBoolean(false)
@@ -166,10 +168,17 @@ class BydCollectorApplication : Application() {
     }
 
     override fun onTerminate() {
+        if (dashboardMetricsWorkerDelegate.isInitialized()) dashboardMetricsWorkerDelegate.value.close()
         if (updateCheckExecutorDelegate.isInitialized()) updateCheckExecutorDelegate.value.shutdownNow()
         if (historicalEnergyExecutorDelegate.isInitialized()) historicalEnergyExecutorDelegate.value.shutdownNow()
         if (telegramDeliveryRuntimeDelegate.isInitialized()) telegramDeliveryRuntime.close()
-        tripsStore?.close()
+        tripsFileOperationLock.withLock {
+            tripsStoreLock.withLock {
+                val current = tripsStore
+                tripsStore = null
+                current?.close()
+            }
+        }
         telemetryStore?.close()
         telegramStore?.close()
         if (archiveStorageSnapshotCacheDelegate.isInitialized()) {
@@ -397,6 +406,22 @@ class BydCollectorApplication : Application() {
     internal fun <T : Any> tryTelemetryStoreRead(action: (TelemetryStore) -> T): T? =
         databaseMaintenanceGate.tryRead { StoreReadResult(telemetryStore?.let(action)) }?.value
 
+    internal fun startDashboardMetrics() {
+        if (!BuildConfig.RUNTIME_CLIENT) dashboardMetricsWorkerDelegate.value.start()
+    }
+
+    internal fun requestDashboardMetricsRefresh() {
+        if (!BuildConfig.RUNTIME_CLIENT && dashboardMetricsWorkerDelegate.isInitialized()) {
+            dashboardMetricsWorkerDelegate.value.requestDashboardMetricsRefresh()
+        }
+    }
+
+    internal fun stopDashboardMetrics() {
+        if (!BuildConfig.RUNTIME_CLIENT && dashboardMetricsWorkerDelegate.isInitialized()) {
+            dashboardMetricsWorkerDelegate.value.stop()
+        }
+    }
+
     fun <T> withSecondaryDatabaseRead(action: () -> T): T = secondaryDatabaseMaintenanceGate.withRead(action)
 
     internal fun <T : Any> trySecondaryDatabaseRead(action: () -> T): T? = secondaryDatabaseMaintenanceGate.tryRead(action)
@@ -446,8 +471,7 @@ class BydCollectorApplication : Application() {
     fun telegramStorageError(): String? = if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.state.getString("telegramStorageError") else telegramStorageError
 
     /** Returns the already-open Trips store without opening or recovering its files. */
-    @Synchronized
-    internal fun tripsStoreOrNull(): TripStore? = tripsStore
+    internal fun tripsStoreOrNull(): TripStore? = tripsStoreLock.withLock { tripsStore }
 
     @Synchronized
     fun markTelegramStorageUnavailable(mainStore: TelemetryStore, error: Throwable) {
@@ -559,14 +583,22 @@ class BydCollectorApplication : Application() {
         val endpoints: Map<Instant, List<HistoricalPollEndpoint>>
     )
 
-    @Synchronized
-    private fun trips(): TripStore {
-        tripsStore?.let { return it }
-        if (BuildConfig.RUNTIME_CLIENT) return TripStore(TripDatabaseHelper(this)).also { tripsStore = it }
-        TripCompression.recoverBeforeOpen(applicationContext)
-        return TripStore(TripDatabaseHelper(applicationContext)).also { store ->
-            check(store.verify()) { "Trips database is not safe to open" }
+    private fun trips(): TripStore = tripsStoreLock.withLock {
+        tripsStore?.let { return@withLock it }
+        if (BuildConfig.RUNTIME_CLIENT) {
+            return@withLock TripStore(TripDatabaseHelper(this)).also { tripsStore = it }
+        }
+
+        val recovered = TripCompression.recoverBeforeOpen(applicationContext)
+        val store = TripStore(TripDatabaseHelper(applicationContext))
+        try {
+            store.validateStartup(recovered)
+            if (recovered) TripCompression.completeRecoveryAfterValidation(applicationContext)
             tripsStore = store
+            store
+        } catch (failure: Throwable) {
+            runCatching { store.close() }.exceptionOrNull()?.let(failure::addSuppressed)
+            throw failure
         }
     }
 

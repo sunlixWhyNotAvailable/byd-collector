@@ -1937,7 +1937,7 @@ private fun MqttCard(
             connectionStopping = connection.stopping,
             cleanupInFlight = actionUiState.mqttCleanup
         )
-        ChannelQueueRow(strings, "${state?.mqttPendingCount ?: 0L} ${strings.messages}",
+        ChannelQueueRow(strings, "${formatCount(state?.mqttPendingCount ?: -1L)} ${strings.messages}",
             state?.mqttAutoStartEnabled == true, actions::onToggleMqttAutoStart)
         CategoryGrid(strings.mqttCategories, state?.mqttEnabledCategories.orEmpty(), enabled = controls.edit, strings = strings) { category ->
             actions.onToggleMqttCategory(category, !state?.mqttEnabledCategories.orEmpty().contains(category))
@@ -1980,7 +1980,7 @@ private fun InfluxCard(
             connectionOwned = connection.owned,
             connectionStopping = connection.stopping
         )
-        ChannelQueueRow(strings, "${state?.influxPendingRows ?: 0L} ${strings.points}",
+        ChannelQueueRow(strings, "${formatCount(state?.influxPendingRows ?: -1L)} ${strings.points}",
             state?.influxAutoStartEnabled == true, actions::onToggleInfluxAutoStart)
         CategoryGrid(
             strings.influxCategories,
@@ -4032,7 +4032,7 @@ private fun Modifier.clickableNoRipple(
 private fun Modifier.borderSafe(color: androidx.compose.ui.graphics.Color): Modifier =
     this.then(Modifier.border(1.dp, color, Rounded8))
 
-private fun formatCount(value: Long): String {
+internal fun formatCount(value: Long): String {
     return if (value < 0L) "-" else "%,d".format(Locale.US, value).replace(",", " ")
 }
 

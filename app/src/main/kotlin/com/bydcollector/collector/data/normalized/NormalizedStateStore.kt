@@ -15,10 +15,20 @@ class NormalizedStateStore(
     private val helper: TelemetryDatabaseHelper,
     private val clock: Clock = SystemClockAdapter()
 ) {
+    private data class CatalogIdentity(val normalizerId: String, val catalogVersion: String)
+
     private val compactV2 by lazy { helper.isCompactV2() }
+    private val catalogCacheLock = Any()
+    private var catalogCacheGeneration = 0L
+    private var committedCatalogIdentities: Map<String, CatalogIdentity>? = null
 
     fun upsertCatalog(fields: List<NormalizedFieldDefinition> = NormalizedFieldCatalog.fields) {
+        val cacheGeneration = synchronized(catalogCacheLock) {
+            committedCatalogIdentities = null
+            ++catalogCacheGeneration
+        }
         val db = helper.writableDatabase
+        val hadOuterTransaction = db.inTransaction()
         db.beginTransaction()
         try {
             val activeFieldKeys = fields.mapTo(mutableSetOf()) { it.fieldKey }
@@ -30,9 +40,25 @@ class NormalizedStateStore(
         } finally {
             db.endTransaction()
         }
+        if (!hadOuterTransaction) {
+            val committed = fields.associate { field ->
+                field.fieldKey to CatalogIdentity(field.normalizerId, NormalizedFieldCatalog.CATALOG_VERSION)
+            }
+            synchronized(catalogCacheLock) {
+                if (cacheGeneration == catalogCacheGeneration) {
+                    committedCatalogIdentities = committed
+                } else {
+                    // An overlapping transaction may have committed after this one;
+                    // leave the cache cold until a later uncontended catalog write.
+                    committedCatalogIdentities = null
+                    ++catalogCacheGeneration
+                }
+            }
+        }
     }
 
     fun applyObservations(observations: List<NormalizedObservation>): NormalizedWriteSummary {
+        if (observations.isEmpty()) return NormalizedWriteSummary(0, 0, 0)
         val db = helper.writableDatabase
         var result: NormalizedWriteSummary? = null
         db.beginTransaction()
@@ -262,14 +288,16 @@ class NormalizedStateStore(
 
     private fun StoredNormalizedState.compactHistoryFieldId(db: SQLiteDatabase): Long {
         val unitValue = unit.orEmpty()
-        val catalogIdentity = db.rawQuery(
+        val catalogIdentity = synchronized(catalogCacheLock) {
+            committedCatalogIdentities?.get(fieldKey)
+        } ?: db.rawQuery(
             "SELECT normalizer_id, catalog_version FROM normalized_field_catalog WHERE field_key = ? LIMIT 1",
             arrayOf(fieldKey)
         ).use { cursor ->
             check(cursor.moveToFirst()) { "Missing normalized field catalog row: $fieldKey" }
-            cursor.getString(0) to cursor.getString(1)
+            CatalogIdentity(cursor.getString(0), cursor.getString(1))
         }
-        val args = arrayOf(fieldKey, category, valueType, unitValue, sourceKeys, catalogIdentity.first, catalogIdentity.second)
+        val args = arrayOf(fieldKey, category, valueType, unitValue, sourceKeys, catalogIdentity.normalizerId, catalogIdentity.catalogVersion)
         db.rawQuery(
             """
             SELECT id
@@ -291,8 +319,8 @@ class NormalizedStateStore(
                 put("value_type", valueType)
                 put("unit", unitValue)
                 put("source_keys", sourceKeys)
-                put("normalizer_id", catalogIdentity.first)
-                put("catalog_version", catalogIdentity.second)
+                put("normalizer_id", catalogIdentity.normalizerId)
+                put("catalog_version", catalogIdentity.catalogVersion)
             }
         )
     }

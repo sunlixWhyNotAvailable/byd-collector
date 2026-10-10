@@ -32,25 +32,40 @@ class CallbackSpoolTest {
         }
     }
 
-    @Test fun shutdownReportsUnpersistedTailWhenCapacityPreventsSpill() {
+    @Test fun shutdownRetainsLiveTailAndRetriesAfterCapacityReturns() {
         val mainRoot = Files.createTempDirectory("callback-shutdown-full-main").toFile()
         val secondaryRoot = Files.createTempDirectory("callback-shutdown-full-secondary").toFile()
+        val mainSpool = CallbackSpool.openForTest(mainRoot, 32 * 1024L)
+        val secondarySpool = CallbackSpool.openForTest(secondaryRoot, 32 * 1024L)
         try {
-            val transport = CallbackSpoolBinder(CallbackSpool.openForTest(mainRoot, 12 * 1024L),
-                CallbackSpool.openForTest(secondaryRoot, 12 * 1024L))
-            assertEquals(CallbackSpool.AppendResult.SUCCESS, transport.deliver(batch(1, 1, 5_000), true))
+            val oldBatch = batch(1, 1, 19_000)
+            val retainedTail = batch(2, 2, 6_000)
+            val transport = CallbackSpoolBinder(mainSpool, secondarySpool)
+            assertEquals(CallbackSpool.AppendResult.SUCCESS, transport.deliver(retainedTail, true))
+            assertTrue(transport.liveRetainedBytes(1) > 0)
+            assertEquals(CallbackSpool.AppendResult.SUCCESS, mainSpool.append(oldBatch))
+            val oldDescriptor = mainSpool.oldest()!!
             val secondary = TelemetryCallbackBatch("boot", "gen", 2, 1, 1, batch(1, 1).events)
             assertEquals(CallbackSpool.AppendResult.SUCCESS, transport.deliver(secondary, true))
+
             assertFalse(transport.closeAndReport())
             assertTrue(transport.liveRetainedBytes(1) > 0)
-            CallbackSpool.openForTest(mainRoot, 12 * 1024L).use { spool ->
-                assertEquals("shutdown_spill", spool.status().loss!!.reason)
-                assertNull(spool.oldest())
+            assertEquals(oldBatch.identity(), mainSpool.oldest()!!.identity)
+            assertNull(mainSpool.status().loss)
+            assertEquals(CallbackSpool.AckResult.RELEASED, mainSpool.acknowledge(oldDescriptor))
+            assertTrue(transport.closeAndReport())
+
+            CallbackSpool.openForTest(mainRoot, 32 * 1024L).use { spool ->
+                assertEquals(retainedTail.identity(), spool.oldest()!!.identity)
+                assertArrayEquals(retainedTail.encode(), spool.readSlice(
+                    spool.oldest()!!, 0, CallbackSpool.MAX_SLICE_BYTES))
             }
-            CallbackSpool.openForTest(secondaryRoot, 12 * 1024L).use { spool ->
+            CallbackSpool.openForTest(secondaryRoot, 32 * 1024L).use { spool ->
                 assertEquals(secondary.identity(), spool.oldest()!!.identity)
             }
         } finally {
+            mainSpool.close()
+            secondarySpool.close()
             mainRoot.deleteRecursively()
             secondaryRoot.deleteRecursively()
         }

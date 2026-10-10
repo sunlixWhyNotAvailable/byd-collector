@@ -5,6 +5,11 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 
 class ChannelStatusFormatterTest {
+    @Test fun unknownQueueCountsUseTheExistingDashFormat() {
+        assertEquals("-", formatCount(-1L))
+        assertEquals("1 234", formatCount(1_234L))
+    }
+
     @Test fun buttonsAndFieldsAgreeDuringRetriesAndAfterTerminalCleanup() {
         for (runtime in RuntimeActionStatus.entries) {
             val owned = ChannelStatusFormatter.controls(runtime, owned = true, stopping = false, testing = false)

@@ -231,9 +231,27 @@ internal class TripCompression(
         private const val SPACE_RESERVE = 16L * 1024L * 1024L
 
         /** Must run before SQLiteOpenHelper is allowed to create/open the canonical Trips file. */
-        fun recoverBeforeOpen(context: Context, databaseName: String = TripDatabaseHelper.DATABASE_NAME) {
+        fun recoverBeforeOpen(context: Context, databaseName: String = TripDatabaseHelper.DATABASE_NAME): Boolean {
             require(databaseName == File(databaseName).name) { "Invalid Trips database name" }
-            recoverFiles(Files(context.getDatabasePath(databaseName)))
+            return recoverFiles(Files(context.getDatabasePath(databaseName)), deferCleanupUntilValidation = true)
+        }
+
+        /** Keep the recovery journal until the caller has validated the opened database. */
+        fun completeRecoveryAfterValidation(context: Context, databaseName: String = TripDatabaseHelper.DATABASE_NAME) {
+            require(databaseName == File(databaseName).name) { "Invalid Trips database name" }
+            val files = Files(context.getDatabasePath(databaseName))
+            val phase = readPhase(files) ?: return
+            check(phase == PREPARED || phase == COMMITTED) { "Unknown Trips replacement journal; files retained" }
+            // A verified database remains usable if obsolete backup cleanup needs another retry.
+            runCatching {
+                if (phase == COMMITTED) cleanupCommitted(files)
+                else {
+                    deleteIfPresent(files.journal)
+                    syncDirectory(files.active.parentFile!!)
+                }
+                cleanupWorkingFiles(files)
+                deleteIfPresent(files.journalTemp)
+            }
         }
 
         private class Files(val active: File) {
@@ -244,7 +262,7 @@ internal class TripCompression(
             val journalTemp = File(journal.path + ".tmp")
         }
 
-        private fun recoverFiles(files: Files) {
+        private fun recoverFiles(files: Files, deferCleanupUntilValidation: Boolean = false): Boolean {
             val phase = readPhase(files)
             when (phase) {
                 null -> {
@@ -271,15 +289,18 @@ internal class TripCompression(
                 }
                 else -> error("Unknown Trips replacement journal; files retained")
             }
-            runCatching {
-                if (phase == COMMITTED) cleanupCommitted(files)
-                else if (phase == PREPARED) {
-                    deleteIfPresent(files.journal)
-                    syncDirectory(files.active.parentFile!!)
+            if (!deferCleanupUntilValidation || phase == null) {
+                runCatching {
+                    if (phase == COMMITTED) cleanupCommitted(files)
+                    else if (phase == PREPARED) {
+                        deleteIfPresent(files.journal)
+                        syncDirectory(files.active.parentFile!!)
+                    }
+                    cleanupWorkingFiles(files)
+                    deleteIfPresent(files.journalTemp)
                 }
-                cleanupWorkingFiles(files)
-                deleteIfPresent(files.journalTemp)
             }
+            return phase != null
         }
 
         private fun readPhase(files: Files): String? = try {

@@ -78,7 +78,8 @@ data class InfluxExportStateSnapshot(
 
 data class InfluxPendingSummary(
     val rows: Long,
-    val oldestObservedAt: String?
+    val oldestObservedAt: String?,
+    val complete: Boolean = true
 )
 
 data class InfluxCursor(

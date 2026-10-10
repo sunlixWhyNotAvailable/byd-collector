@@ -157,6 +157,16 @@ final class HelperStreamRuntimeState {
             : CollectorHelperProtocol.STATUS_LEASE_EXPIRED;
     }
 
+    /** Keeps credentialed spool draining available after explicit helper stop fences producers. */
+    synchronized int authorizeReplayDuringShutdown(long token, int stream, long epoch, long nowMs) {
+        ControlResult invalid = validate(token, stream(stream), stream, epoch, nowMs, false);
+        return invalid == null ? CollectorHelperProtocol.STATUS_OK : invalid.status;
+    }
+
+    synchronized boolean replayAllowedDuringShutdown(int stream) {
+        return controllerToken != 0L && stream(stream) != null;
+    }
+
     synchronized boolean replayAllowed(int stream, long nowMs) {
         StreamState state = stream(stream);
         if (state == null) return false;

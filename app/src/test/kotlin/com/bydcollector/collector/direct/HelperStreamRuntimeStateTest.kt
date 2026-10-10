@@ -100,6 +100,24 @@ class HelperStreamRuntimeStateTest {
     }
 
     @Test
+    fun explicitOwnerStopAllowsOnlyCurrentControllerEpochToDrainAfterLeaseExpiry() {
+        val state = HelperStreamRuntimeState()
+        val claim = state.claim("owner-stop", HelperStreamRuntimeState.DESIRED_MAIN, 0)
+
+        assertEquals(CollectorHelperProtocol.STATUS_LEASE_EXPIRED,
+            state.authorizeReplay(claim.controllerToken, CollectorHelperProtocol.STREAM_MAIN,
+                claim.mainEpoch, HelperStreamRuntimeState.LEASE_MS))
+        assertEquals(CollectorHelperProtocol.STATUS_OK,
+            state.authorizeReplayDuringShutdown(claim.controllerToken, CollectorHelperProtocol.STREAM_MAIN,
+                claim.mainEpoch, 60_000))
+        assertEquals(CollectorHelperProtocol.STATUS_STALE_TOKEN,
+            state.authorizeReplayDuringShutdown(claim.controllerToken, CollectorHelperProtocol.STREAM_MAIN,
+                claim.mainEpoch + 1, 60_000))
+        assertTrue(state.replayAllowedDuringShutdown(CollectorHelperProtocol.STREAM_SECONDARY))
+        assertTrue(!state.replayAllowedDuringShutdown(99))
+    }
+
+    @Test
     fun expiredPendingPauseUnsticksAndResumesFallback() {
         val state = HelperStreamRuntimeState()
         val claim = state.claim("app", 2, 0)

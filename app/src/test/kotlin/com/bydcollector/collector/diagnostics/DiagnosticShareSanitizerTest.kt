@@ -85,6 +85,24 @@ class DiagnosticShareSanitizerTest {
     }
 
     @Test
+    fun evictedKeyClassificationsAreRecomputedWithoutLosingRedactionOrAliases() {
+        val sanitizer = DiagnosticShareSanitizer()
+        val vin = "L123456789012345X"
+        val first = JSONObject(sanitizer.sanitizeJsonLine("""{"password":"cache-secret","vin":"$vin"}"""))
+
+        repeat(300) { index -> sanitizer.sanitizeJsonLine("""{"technical_$index":$index}""") }
+
+        val afterEviction = sanitizer.sanitizeJsonLine("""{"password":"cache-secret","vin":"$vin"}""")
+        val second = JSONObject(afterEviction)
+        assertEquals("[redacted]", first.getString("password"))
+        assertEquals("[redacted]", second.getString("password"))
+        assertEquals("[VIN-1]", first.getString("vin"))
+        assertEquals("[VIN-1]", second.getString("vin"))
+        assertFalse(afterEviction.contains("cache-secret"))
+        assertFalse(afterEviction.contains(vin))
+    }
+
+    @Test
     fun preservesTechnicalValuesAndDoesNotUseGenericHeuristics() {
         val sanitizer = DiagnosticShareSanitizer()
         val text = sanitizer.sanitizeText(
@@ -135,6 +153,22 @@ class DiagnosticShareSanitizerTest {
         assertTrue(output.getBoolean("ok"))
         assertTrue(output.isNull("none"))
         assertEquals("3", sanitizer.sanitizeJsonLine("3"))
+    }
+
+    @Test
+    fun sanitizesNestedObjectsAndArraysWhilePreservingUnrelatedValues() {
+        val output = JSONObject(DiagnosticShareSanitizer().sanitizeJsonLine(
+            """{"payload":[{"password":"secret","count":3,"vehicle_vin":"L123456789012345X","nested":[true,null,{"latitude":50.1}]}]}"""
+        ))
+        val record = output.getJSONArray("payload").getJSONObject(0)
+        val nested = record.getJSONArray("nested")
+
+        assertEquals("[redacted]", record.getString("password"))
+        assertEquals(3, record.getInt("count"))
+        assertEquals("[VIN-1]", record.getString("vehicle_vin"))
+        assertTrue(nested.getBoolean(0))
+        assertTrue(nested.isNull(1))
+        assertEquals("[redacted-coordinate]", nested.getJSONObject(2).getString("latitude"))
     }
 
     @Test

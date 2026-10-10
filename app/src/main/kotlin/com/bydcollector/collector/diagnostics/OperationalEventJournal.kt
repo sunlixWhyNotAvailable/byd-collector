@@ -3,7 +3,9 @@ package com.bydcollector.collector.diagnostics
 import android.content.Context
 import android.os.Process
 import org.json.JSONObject
+import java.io.EOFException
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
@@ -62,18 +64,76 @@ class OperationalEventJournal internal constructor(
         FileOutputStream(active, true).use { output -> output.write(bytes) }
     }
 
-    fun snapshotTo(target: File): Int = lock.withLock {
+    fun snapshotTo(target: File): Int {
         check(target.isDirectory || target.mkdirs()) {
             "Failed to create operational journal snapshot: ${target.absolutePath}"
         }
-        var copied = 0
-        segmentFiles().forEach { source ->
-            if (!source.isFile) return@forEach
-            source.copyTo(File(target, source.name), overwrite = true)
-            copied += 1
+        check(target.canonicalFile != root.canonicalFile) {
+            "Operational journal snapshot target must not be the journal directory"
         }
-        copied
+        val sources = lock.withLock {
+            val opened = mutableListOf<SnapshotSegment>()
+            try {
+                segmentFiles().forEach { source ->
+                    if (source.isFile) {
+                        val input = FileInputStream(source)
+                        try {
+                            opened += SnapshotSegment(source.name, input.channel.size(), input)
+                        } catch (error: Throwable) {
+                            try { input.close() }
+                            catch (closeError: Throwable) { if (error !== closeError) error.addSuppressed(closeError) }
+                            throw error
+                        }
+                    }
+                }
+                opened.toList()
+            } catch (error: Throwable) {
+                closeSnapshotSegments(opened, error)
+                throw error
+            }
+        }
+        var copied = 0
+        var failure: Throwable? = null
+        try {
+            sources.forEach { source ->
+                FileOutputStream(File(target, source.name), false).use { output ->
+                    val buffer = ByteArray(SNAPSHOT_BUFFER_BYTES)
+                    var remaining = source.byteCount
+                    while (remaining > 0L) {
+                        val read = source.input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
+                        if (read < 0) throw EOFException("Operational journal segment was truncated: ${source.name}")
+                        if (read == 0) continue
+                        output.write(buffer, 0, read)
+                        remaining -= read
+                    }
+                }
+                copied += 1
+            }
+        } catch (error: Throwable) {
+            failure = error
+        }
+        failure = closeSnapshotSegments(sources, failure)
+        failure?.let { throw it }
+        return copied
     }
+
+    private fun closeSnapshotSegments(
+        sources: List<SnapshotSegment>,
+        failure: Throwable?
+    ): Throwable? {
+        var result = failure
+        sources.forEach { source ->
+            try {
+                source.input.close()
+            } catch (error: Throwable) {
+                if (result == null) result = error
+                else if (result !== error) result.addSuppressed(error)
+            }
+        }
+        return result
+    }
+
+    private data class SnapshotSegment(val name: String, val byteCount: Long, val input: FileInputStream)
 
     fun clear(): Int = lock.withLock {
         var removed = 0
@@ -118,6 +178,7 @@ class OperationalEventJournal internal constructor(
         internal const val MAINTENANCE_DIR = "maintenance_journal"
         internal const val MAINTENANCE_MAX_FILE_BYTES = 2L * 1024L * 1024L
         internal const val RETAINED_ROTATIONS = 3
+        private const val SNAPSHOT_BUFFER_BYTES = 16 * 1024
         private const val MAX_CATEGORY_CHARS = 512
         private const val MAX_MESSAGE_CHARS = 16_384
         private const val MAX_DETAIL_CHARS = 32_768

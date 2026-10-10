@@ -85,58 +85,54 @@ class CallbackRawStore(
     fun pendingNormalization(limit: Int): List<StoredCallbackEvent> {
         require(limit in 1..MAX_PENDING_PAGE) { "callback normalization page must be 1..$MAX_PENDING_PAGE" }
         val db = database()
-        var result: List<StoredCallbackEvent>? = null
-        db.beginTransactionNonExclusive()
-        try {
-            result = db.rawQuery(
-                """
-                SELECT e.id, e.batch_id, e.boot_id, e.helper_generation, e.stream, e.epoch,
-                       b.batch_sequence, e.event_sequence, e.device, e.fid, e.native_type,
-                       e.raw_bits, e.raw_bytes, e.received_wall_ms, e.received_elapsed_ms,
-                       e.source_wall_ms, e.quality, b.delivery
-                FROM raw_callback_events e
-                JOIN raw_callback_batches b ON b.id = e.batch_id
-                LEFT JOIN raw_callback_normalization_receipts r ON r.event_id = e.id
-                WHERE r.event_id IS NULL AND e.stream = ? AND e.id > ?
-                ORDER BY e.id
-                LIMIT ?
-                """.trimIndent(),
-                arrayOf(MAIN_STREAM.toString(), normalizationScanFloor.toString(), limit.toString())
-            ).use { cursor ->
-                buildList {
-                    while (cursor.moveToNext()) {
-                        add(
-                            StoredCallbackEvent(
-                                id = cursor.getLong(0),
-                                batchId = cursor.getLong(1),
-                                bootId = cursor.getString(2),
-                                helperGeneration = cursor.getString(3),
-                                stream = cursor.getInt(4),
-                                epoch = cursor.getLong(5),
-                                batchSequence = cursor.getLong(6),
-                                eventSequence = cursor.getLong(7),
-                                device = cursor.getInt(8),
-                                fid = cursor.getInt(9),
-                                nativeType = cursor.getInt(10),
-                                rawBits = cursor.getInt(11),
-                                rawBytes = if (cursor.isNull(12)) null else cursor.getBlob(12),
-                                receivedWallMs = cursor.getLong(13),
-                                receivedElapsedMs = cursor.getLong(14),
-                                sourceWallMs = if (cursor.isNull(15)) null else cursor.getLong(15),
-                                quality = cursor.getString(16),
-                                delivery = CallbackDelivery.entries.first { it.storageValue == cursor.getString(17) }
-                            )
+        val capturedMainFence = maxMainEventId(db).coerceAtLeast(normalizationScanFloor)
+        val result = db.rawQuery(
+            """
+            SELECT e.id, e.batch_id, e.boot_id, e.helper_generation, e.stream, e.epoch,
+                   b.batch_sequence, e.event_sequence, e.device, e.fid, e.native_type,
+                   e.raw_bits, e.raw_bytes, e.received_wall_ms, e.received_elapsed_ms,
+                   e.source_wall_ms, e.quality, b.delivery
+            FROM raw_callback_events e
+            JOIN raw_callback_batches b ON b.id = e.batch_id
+            LEFT JOIN raw_callback_normalization_receipts r ON r.event_id = e.id
+            WHERE r.event_id IS NULL AND e.stream = ? AND e.id > ? AND e.id <= ?
+            ORDER BY e.id
+            LIMIT ?
+            """.trimIndent(),
+            arrayOf(
+                MAIN_STREAM.toString(), normalizationScanFloor.toString(),
+                capturedMainFence.toString(), limit.toString()
+            )
+        ).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) {
+                    add(
+                        StoredCallbackEvent(
+                            id = cursor.getLong(0),
+                            batchId = cursor.getLong(1),
+                            bootId = cursor.getString(2),
+                            helperGeneration = cursor.getString(3),
+                            stream = cursor.getInt(4),
+                            epoch = cursor.getLong(5),
+                            batchSequence = cursor.getLong(6),
+                            eventSequence = cursor.getLong(7),
+                            device = cursor.getInt(8),
+                            fid = cursor.getInt(9),
+                            nativeType = cursor.getInt(10),
+                            rawBits = cursor.getInt(11),
+                            rawBytes = if (cursor.isNull(12)) null else cursor.getBlob(12),
+                            receivedWallMs = cursor.getLong(13),
+                            receivedElapsedMs = cursor.getLong(14),
+                            sourceWallMs = if (cursor.isNull(15)) null else cursor.getLong(15),
+                            quality = cursor.getString(16),
+                            delivery = CallbackDelivery.entries.first { it.storageValue == cursor.getString(17) }
                         )
-                    }
+                    )
                 }
             }
-            normalizationScanFloor = result!!.firstOrNull()?.id?.minus(1L)
-                ?: maxMainEventId(db).coerceAtLeast(normalizationScanFloor)
-            db.setTransactionSuccessful()
-        } finally {
-            db.endTransaction()
         }
-        return checkNotNull(result)
+        normalizationScanFloor = result.firstOrNull()?.id?.minus(1L) ?: capturedMainFence
+        return result
     }
 
     private fun maxMainEventId(db: SQLiteDatabase): Long = db.rawQuery(

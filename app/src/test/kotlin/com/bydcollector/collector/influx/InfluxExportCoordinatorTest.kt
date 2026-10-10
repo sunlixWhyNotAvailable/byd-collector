@@ -10,18 +10,74 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class InfluxExportCoordinatorTest {
-    @Test fun backlogRecountIsAmortizedButNewRowsAndExpiredStatisticsAreStillRead() {
-        val store = FakeInfluxStore((1L..10_000L).map { row(it, "soc") })
-        val clock = FakeClock()
-        val coordinator = InfluxExportCoordinator(store, FakeInfluxClient(), { config() }, clock)
-        repeat(3) { assertTrue(coordinator.runOneCycle(force = true).ok) }
-        assertEquals(1, store.summaryCalls)
-        assertEquals(4_000L, store.influxExportState().pendingRows)
-        store.addRow(row(10_001, "soc"))
-        clock.elapsedMs += 30_000
+    @Test
+    fun sharedFieldSelectorUsesEnabledNormalizedCategories() {
+        val battery = influxEffectiveFields(config().copy(enabledCategories = setOf("battery")))
+        val motion = influxEffectiveFields(config().copy(enabledCategories = setOf("motion")))
+
+        assertTrue("soc" in battery)
+        assertFalse("speed_kmh" in battery)
+        assertTrue("speed_kmh" in motion)
+        assertFalse("soc" in motion)
+    }
+
+    @Test
+    fun incompleteQueueSummaryStillUploadsWithRealtimeBatchAndStaysUnknown() {
+        val store = FakeInfluxStore((1L..650L).map { row(it, "soc") }).apply {
+            summaryComplete = false
+        }
+        val client = FakeInfluxClient()
+        val coordinator = coordinator(store, client)
+
         assertTrue(coordinator.runOneCycle(force = true).ok)
-        assertEquals(2, store.summaryCalls)
-        assertEquals(3_701L, store.influxExportState().pendingRows)
+
+        assertEquals(listOf(300), store.pendingBatchLimits)
+        assertEquals(300, client.writtenLines.single().size)
+        assertEquals(300L, store.cursor("soc").lastExportedHistoryId)
+        assertEquals(-1L, store.influxExportState().pendingRows)
+        assertEquals("2026-06-15T12:00:01Z", store.influxExportState().nextRetryAt)
+        assertEquals(2, store.summaryCalls) // fresh pre-send and post-ACK owner summaries
+    }
+
+    @Test
+    fun incompleteSummaryRetainsPreviouslyEstablishedCatchUpBatchSize() {
+        val store = FakeInfluxStore((1L..10_000L).map { row(it, "soc") }).apply {
+            afterPendingSummary = { if (summaryCalls == 2) summaryComplete = false }
+        }
+        val client = FakeInfluxClient()
+        val coordinator = coordinator(store, client)
+
+        assertTrue(coordinator.runOneCycle(force = true).ok)
+        assertTrue(coordinator.runOneCycle(force = true).ok)
+
+        assertEquals(listOf(2_000, 2_000), store.pendingBatchLimits)
+        assertEquals(listOf(2_000, 2_000), client.writtenLines.map { it.size })
+        assertEquals(4_000L, store.cursor("soc").lastExportedHistoryId)
+        assertEquals(-1L, store.influxExportState().pendingRows)
+    }
+
+    @Test
+    fun unknownSummaryWithNoDurableRowsDrainsToExactZero() {
+        val store = FakeInfluxStore(emptyList()).apply { summaryComplete = false }
+        val result = coordinator(store, FakeInfluxClient()).runOneCycle(force = true)
+
+        assertTrue(result.ok)
+        assertEquals(0, store.influxExportState().pendingRows)
+        assertEquals("idle", store.influxExportState().status)
+        assertEquals(null, store.influxExportState().nextRetryAt)
+    }
+
+    @Test
+    fun unknownSummaryDoesNotAcknowledgeHttpFailureOrInventRemainingOne() {
+        val store = FakeInfluxStore(listOf(row(10, "soc"))).apply { summaryComplete = false }
+        val client = FakeInfluxClient(writeResult = InfluxActionResult.fail("influx_error", "offline"))
+
+        assertFalse(coordinator(store, client).startExport().ok)
+
+        assertEquals(0, store.cursor("soc").lastExportedHistoryId)
+        assertEquals(-1L, store.influxExportState().pendingRows)
+        assertEquals("backoff", store.influxExportState().status)
+        assertEquals("2026-06-15T12:00:30Z", store.influxExportState().nextRetryAt)
     }
 
     @Test fun actualHttpFailoverUsesAlternativePortAndKeepsWorkingRoute() {
@@ -278,20 +334,20 @@ class InfluxExportCoordinatorTest {
         assertFalse(demand.settle(second, represented = true).followUpDemand)
         assertEquals(11L, store.cursor("soc").lastExportedHistoryId)
         assertEquals(2, client.writtenLines.size)
-        assertEquals(1, store.summaryCalls)
+        assertEquals(4, store.summaryCalls)
     }
 
     @Test
-    fun successfulCycleAndRepeatedSchedulingReuseOneAggregate() {
+    fun successfulCycleUsesOwnerSummaryAndRepeatedSchedulingDoesNotRescan() {
         val store = FakeInfluxStore((1L..350L).map { row(it, "soc") })
         val coordinator = coordinator(store, FakeInfluxClient())
 
         assertTrue(coordinator.runOneCycle().ok)
         assertEquals(50L, store.influxExportState().pendingRows)
-        assertEquals(1, store.summaryCalls)
+        assertEquals(2, store.summaryCalls)
         val ensuresAfterCycle = store.ensureCalls
         repeat(5) { assertEquals(1_000L, coordinator.retryDelayMs()) }
-        assertEquals(1, store.summaryCalls)
+        assertEquals(2, store.summaryCalls)
         assertEquals(ensuresAfterCycle, store.ensureCalls)
     }
 
@@ -321,10 +377,10 @@ class InfluxExportCoordinatorTest {
         val coordinator = coordinator(store, client)
 
         assertFalse(coordinator.runOneCycle().ok)
-        assertEquals(1, store.summaryCalls)
+        assertEquals(2, store.summaryCalls)
         assertEquals(30_000L, coordinator.retryDelayMs())
         assertTrue(coordinator.runOneCycle().ok)
-        assertEquals(1, store.summaryCalls)
+        assertEquals(2, store.summaryCalls)
         assertEquals(0L, store.cursor("soc").lastExportedHistoryId)
         assertEquals(1, client.writtenLines.size)
         assertEquals("offline", store.influxExportState().lastError)
@@ -1378,6 +1434,7 @@ class InfluxExportCoordinatorTest {
         val influxEvents = mutableListOf<InfluxEvent>()
         var summaryCalls = 0
         var ensureCalls = 0
+        var summaryComplete = true
         var afterPendingSummary: ((InfluxPendingSummary) -> Unit)? = null
         var afterPendingHead: ((List<InfluxPendingHistoryRow>) -> Unit)? = null
         private var state = InfluxExportStateSnapshot(
@@ -1404,10 +1461,16 @@ class InfluxExportCoordinatorTest {
             val pending = rows.filter { row ->
                 fieldKeys.contains(row.fieldKey) && row.id > cursor(row.fieldKey).lastExportedHistoryId
             }
-            return InfluxPendingSummary(
-                rows = pending.size.toLong(),
-                oldestObservedAt = pending.minByOrNull { it.id }?.observedAt
-            ).also { afterPendingSummary?.invoke(it) }
+            val summary = if (summaryComplete) {
+                InfluxPendingSummary(
+                    rows = pending.size.toLong(),
+                    oldestObservedAt = pending.minByOrNull { it.id }?.observedAt,
+                    complete = true
+                )
+            } else {
+                InfluxPendingSummary(rows = -1L, oldestObservedAt = null, complete = false)
+            }
+            return summary.also { afterPendingSummary?.invoke(it) }
         }
 
         override fun pendingInfluxRows(fieldKeys: Set<String>, limit: Int): List<InfluxPendingHistoryRow> {

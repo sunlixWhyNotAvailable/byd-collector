@@ -2,8 +2,12 @@ package com.bydcollector.collector.diagnostics
 
 import org.json.JSONObject
 import java.io.File
+import java.io.RandomAccessFile
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -162,5 +166,93 @@ class OperationalEventJournalTest {
             root.deleteRecursively()
             snapshot.deleteRecursively()
         }
+    }
+
+    @Test
+    fun appendCanProceedDuringSnapshotCopyAndSnapshotKeepsItsCapturedPrefix() {
+        val root = Files.createTempDirectory("bydcollector-event-journal-snapshot-source").toFile()
+        val snapshot = Files.createTempDirectory("bydcollector-event-journal-snapshot-copy").toFile()
+        try {
+            val journal = OperationalEventJournal(
+                root = root,
+                maxFileBytes = 256L * 1024L * 1024L,
+                retainedRotations = 3,
+                bootId = "boot-snapshot-race",
+                pid = 19
+            )
+            val active = File(root, OperationalEventJournal.ACTIVE_FILE_NAME)
+            RandomAccessFile(active, "rw").use { file ->
+                file.setLength(SNAPSHOT_RACE_SOURCE_BYTES)
+                file.seek(0)
+                file.write("captured-prefix".toByteArray(Charsets.UTF_8))
+            }
+            val capturedBytes = active.length()
+            val snapshotFailure = AtomicReference<Throwable?>()
+            val snapshotDone = CountDownLatch(1)
+            val snapshotWorker = thread(name = "operational-journal-snapshot-gate") {
+                try {
+                    assertEquals(1, journal.snapshotTo(snapshot))
+                } catch (error: Throwable) {
+                    snapshotFailure.set(error)
+                } finally {
+                    snapshotDone.countDown()
+                }
+            }
+            var appendWorker: Thread? = null
+
+            try {
+                val copy = File(snapshot, active.name)
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+                var copyInProgress = false
+                while (System.nanoTime() < deadline && snapshotDone.count > 0) {
+                    val length = copy.length()
+                    if (length > 0L && length < capturedBytes) {
+                        copyInProgress = true
+                        break
+                    }
+                    Thread.sleep(1)
+                }
+                assertTrue(copyInProgress, "snapshot copy did not expose a partial target within the gate timeout")
+
+                val appendFailure = AtomicReference<Throwable?>()
+                val appendDone = CountDownLatch(1)
+                val appendDuringCopy = AtomicBoolean(false)
+                val appender = thread(name = "operational-journal-append-gate") {
+                    try {
+                        journal.append("2026-10-10T10:00:00Z", 2, "snapshot_race", "append", null)
+                        appendDuringCopy.set(snapshotDone.count > 0)
+                    } catch (error: Throwable) {
+                        appendFailure.set(error)
+                    } finally {
+                        appendDone.countDown()
+                    }
+                }
+                appendWorker = appender
+                val appendedWhileCopying = appendDone.await(5, TimeUnit.SECONDS) && appendDuringCopy.get()
+
+                assertTrue(!appender.isAlive, "journal append did not finish")
+                assertTrue(appendedWhileCopying, "append waited for the full snapshot copy")
+                appendFailure.get()?.let { throw AssertionError("concurrent journal append failed", it) }
+                assertTrue(snapshotDone.await(15, TimeUnit.SECONDS), "snapshot copy did not finish")
+                snapshotFailure.get()?.let { throw AssertionError("concurrent journal snapshot failed", it) }
+                assertEquals(capturedBytes, copy.length(), "snapshot must copy only the captured source prefix")
+                val prefix = ByteArray("captured-prefix".length)
+                copy.inputStream().use { assertEquals(prefix.size, it.read(prefix)) }
+                assertTrue(prefix.contentEquals("captured-prefix".toByteArray(Charsets.UTF_8)))
+                assertTrue(active.length() > capturedBytes, "append was not persisted to the active journal")
+            } finally {
+                appendWorker?.join(5_000)
+                snapshotWorker.join(15_000)
+            }
+            assertTrue(!snapshotWorker.isAlive, "journal snapshot did not finish")
+            snapshotFailure.get()?.let { throw AssertionError("concurrent journal snapshot failed", it) }
+        } finally {
+            root.deleteRecursively()
+            snapshot.deleteRecursively()
+        }
+    }
+
+    companion object {
+        private const val SNAPSHOT_RACE_SOURCE_BYTES = 128L * 1024L * 1024L
     }
 }

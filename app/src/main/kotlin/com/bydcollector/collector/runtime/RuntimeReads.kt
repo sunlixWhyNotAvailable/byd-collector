@@ -7,7 +7,6 @@ import android.os.Looper
 import android.os.ParcelFileDescriptor
 import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseResolver
-import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.trips.TripDatabaseHelper
 import com.bydcollector.collector.maintenance.StorageFormatCutoverCoordinator
@@ -36,7 +35,7 @@ internal object RuntimeReads {
     private val snapshots = mutableMapOf<DashboardLoadProfile, DashboardState>()
 
     fun open(context: Context, operation: String, args: Bundle): ParcelFileDescriptor {
-        require(operation in setOf("dashboard", "counts", "mainPreflight", "tripHierarchy", "tripSession",
+        require(operation in setOf("dashboard", "mainPreflight", "tripHierarchy", "tripSession",
             "openTrip", "tripRoute", "footprints", "updates", "jobs", "mqttCleanupGroups")) { "Unknown runtime query" }
         val pipe = ParcelFileDescriptor.createReliablePipe()
         val timeout = Runnable { runCatching { pipe[1].closeWithError("Runtime query timed out") } }
@@ -108,27 +107,11 @@ internal object RuntimeReads {
                 val provider = dashboard ?: DashboardStateProvider(context, { BydCollectorApplication.store(context) },
                     CollectorSettings(context)).also { dashboard = it }
                 val source = snapshots[profile]?.takeIf { args.getBoolean("cached") }
-                    ?: provider.load(profile, snapshots[profile], language).also { snapshots[profile] = it }
+                    ?: provider.load(profile, snapshots[profile], language, readStorage = false)
+                        .also { snapshots[profile] = it }
                 app.dashboardUiStateStore.snapshotForClient(
                     source, language
                 ).copy(logRecording = com.bydcollector.collector.diagnostics.DiagnosticLogRecorder.isRecording())
-            }
-            "counts" -> {
-                val cancellation = android.os.CancellationSignal()
-                val cancel = Runnable { cancellation.cancel() }
-                main.postDelayed(cancel, 2_000L)
-                try {
-                    val counts = app.tryTelemetryStoreRead { it.dashboardRowCounts(cancellation) }
-                        ?: error("Database busy")
-                    val secondary = if (app.isDebugStorageReady()) app.trySecondaryDatabaseRead {
-                        DirectDebugStore(context).use { it.dashboardReadingCount(cancellation) }
-                    } else 0L
-                    DashboardRowCounts(counts.pollCount, counts.valueRowCount, counts.ecRowCount,
-                        counts.normalizedCurrentCount, counts.normalizedHistoryCount, secondary ?: UNKNOWN_DASHBOARD_COUNT)
-                        .also { snapshot -> app.dashboardUiStateStore.beginCountBootstrap(force = true)?.let {
-                            app.dashboardUiStateStore.publishRowCountBaseline(it, snapshot)
-                        } }
-                } finally { main.removeCallbacks(cancel) }
             }
             "mainPreflight" -> app.withTelemetryStoreRead {
                 StorageFormatCutoverCoordinator.readMainPreflight(it.databaseFile())

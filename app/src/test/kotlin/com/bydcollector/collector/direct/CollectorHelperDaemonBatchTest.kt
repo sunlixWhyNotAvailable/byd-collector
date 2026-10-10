@@ -10,11 +10,46 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class CollectorHelperDaemonBatchTest {
+    @Test
+    fun stopGateKeepsOnlyDrainRequestsOpenUntilCloseSeal() {
+        val gate = CollectorHelperDaemon.HelperRequestGate()
+
+        listOf(
+            CollectorHelperProtocol.TX_CALLBACK_PENDING_PAGE,
+            CollectorHelperProtocol.TX_CALLBACK_ACK,
+            CollectorHelperProtocol.TX_CALLBACK_STATUS,
+            CollectorHelperProtocol.TX_SECONDARY_PENDING_PAGE,
+            CollectorHelperProtocol.TX_SECONDARY_ACK,
+            CollectorHelperProtocol.TX_WORKER_PENDING,
+            CollectorHelperProtocol.TX_WORKER_ACK
+        ).forEach { assertTrue(CollectorHelperDaemon.isStopDrainTransaction(it)) }
+        assertFalse(CollectorHelperDaemon.isStopDrainTransaction(CollectorHelperProtocol.TX_STREAM_CONTROL))
+        assertFalse(CollectorHelperDaemon.isStopDrainTransaction(CollectorHelperProtocol.TX_READ_BATCH))
+
+        assertTrue(gate.enter(false))
+        assertTrue(gate.stopAccepting())
+        assertFalse(gate.awaitIdleAndSeal(0L))
+        assertTrue(gate.enter(true))
+        assertFalse(gate.enter(false))
+        assertFalse(gate.stopAccepting())
+
+        gate.leave()
+        gate.leave()
+        assertTrue(gate.awaitIdleAndSeal(100L))
+        assertFalse(gate.enter(true))
+        gate.reopenDrainAdmission()
+        assertTrue(gate.enter(true))
+        assertFalse(gate.enter(false))
+        gate.leave()
+        assertTrue(gate.awaitIdleAndSeal(100L))
+    }
+
     @Test
     fun nativeGroupsPreserveRequestOrderDuplicatesAndFloatBits() {
         val rows = listOf(

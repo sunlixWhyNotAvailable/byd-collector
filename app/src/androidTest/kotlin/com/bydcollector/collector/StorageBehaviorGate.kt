@@ -33,14 +33,50 @@ internal object StorageBehaviorGate {
         "diagnostic_event_does_not_wait_for_sqlite" to { eventDuringWriteLock(context, prefix) },
         "diagnostic_close_serializes_active_and_queued_writers" to { diagnosticClose(context, prefix) },
         "per_database_maintenance_keeps_sibling_commits_live" to { maintenanceIsolation(context, prefix) },
+        "dashboard_ipc_uses_prepared_state_during_storage_lock" to { preparedDashboardDuringStorageLock(context) },
         "archive_storage_default_verifier_compact_families" to { archiveStorageDefaultVerifier(context, prefix) },
         "archive_cold_cache_stays_visible_during_zip" to { archiveColdCache(context, prefix) },
         "archive_busy_full_and_create_failure_preserve_evidence" to { archiveFailureSafety(context, prefix) },
+        "trips_startup_validation_is_strict_after_recovery" to { tripsStartupValidation(context, prefix) },
         "trip_completion_atomic_close_and_exact_ack" to { tripCompletion(context, prefix) },
         "telegram_atomic_outbox_state_and_delivery" to { telegramTransactions(context, prefix) },
         "mqtt_outbox_compact_and_legacy_migration" to { mqttOutboxMigration(context, prefix) },
         "mqtt_publication_journal_reopen_epoch_receipt_and_archive_isolation" to { mqttPublicationJournal(context, prefix) }
     )
+
+    private fun preparedDashboardDuringStorageLock(context: Context) {
+        val app = context.applicationContext as BydCollectorApplication
+        val reader = java.util.concurrent.Executors.newSingleThreadExecutor()
+        try {
+            app.databaseMaintenanceGate.withExclusive {
+                app.secondaryDatabaseMaintenanceGate.withExclusive {
+                    val expectedCounts = app.dashboardUiStateStore.rowCountSnapshot()
+                    val profiles = com.bydcollector.collector.ui.DashboardLoadProfile.entries
+                    for (profile in profiles) {
+                        val result = reader.submit<Any> {
+                            val args = android.os.Bundle().apply {
+                                putString("profile", profile.name)
+                                putString("language", "UK")
+                            }
+                            val descriptor = com.bydcollector.collector.runtime.RuntimeReads.open(context, "dashboard", args)
+                            java.io.ObjectInputStream(android.os.ParcelFileDescriptor.AutoCloseInputStream(descriptor)).use {
+                                it.readObject().also { descriptor.checkError() }
+                            }
+                        }.get(2, TimeUnit.SECONDS)
+                        check(result is com.bydcollector.collector.ui.DashboardState)
+                        check(result.pollCount == expectedCounts.pollCount &&
+                            result.valueRowCount == expectedCounts.valueRowCount &&
+                            result.debugReadingCount == expectedCounts.debugReadingCount) {
+                            "UI snapshot replaced the owner row counts"
+                        }
+                    }
+                }
+            }
+        } finally {
+            reader.shutdownNow()
+            check(reader.awaitTermination(5, TimeUnit.SECONDS))
+        }
+    }
 
     private fun mqttOutboxMigration(context: Context, prefix: String) {
         fun fixture(compact: Boolean) {
@@ -471,12 +507,14 @@ internal object StorageBehaviorGate {
             injectedFailure { store.insertWorkerPoll(session, identity, input, parameters) }
             check(count(db, "polls") == 0L && count(db, "poll_values") == 0L)
             check(count(db, "telemetry_worker_imports") == 0L)
+            check(store.currentPollHealth(true).lastSuccessAt == null)
             db.execSQL("DROP TRIGGER injected_failure")
             val inserted = store.insertWorkerPoll(session, identity, input, parameters)
             check(inserted.inserted)
             pollId = inserted.pollId
             val duplicate = store.insertWorkerPoll(session, identity, input, parameters)
             check(!duplicate.inserted && duplicate.pollId == pollId)
+            check(store.currentPollHealth(true).lastSuccessAt == input.timestamp)
             check(count(db, "polls") == 1L && count(db, "telemetry_worker_imports") == 1L)
             awaitEventWriter()
         }
@@ -485,6 +523,7 @@ internal object StorageBehaviorGate {
             val result = store.insertWorkerPoll(1L, identity, input, store.getActiveCatalogParameters())
             check(!result.inserted && result.pollId == pollId)
             check(count(reopened.readableDatabase, "polls") == 1L)
+            check(store.currentPollHealth(true).lastSuccessAt == input.timestamp)
         }
     }
 
@@ -650,6 +689,93 @@ internal object StorageBehaviorGate {
             val next = store.closeSessionWithCompletion(null, intent.copy(identity = "next"))!!
             check(next.sequence > sequence)
         }
+    }
+
+    private fun tripsStartupValidation(context: Context, prefix: String) {
+        fun journal(name: String) = File(context.getDatabasePath(name).parentFile, "$name.compression-journal")
+        fun expectStartupFailure(store: TripStore, message: String) {
+            val failure = runCatching { store.validateStartup(recoveredAfterReplacement = true) }.exceptionOrNull()
+            check(failure is IllegalStateException && failure.message.orEmpty().contains(message)) {
+                "Expected recovered Trips startup failure '$message', got $failure"
+            }
+        }
+
+        val checkName = "${prefix}_trips_check.db"
+        check(!TripCompression.recoverBeforeOpen(context, checkName)) { "Fresh Trips files unexpectedly reported recovery" }
+        val checkHelper = TripDatabaseHelper(context, checkName)
+        TripStore(checkHelper).use { store ->
+            store.validateStartup(recoveredAfterReplacement = false)
+            store.upsertSession(TripSession("check-trip", startedAt = "2026-10-10T00:00:00Z"))
+            checkHelper.writableDatabase.apply {
+                execSQL("PRAGMA ignore_check_constraints = ON")
+                execSQL("UPDATE trip_sessions SET movement_observed = 2 WHERE trip_id = 'check-trip'")
+                execSQL("PRAGMA ignore_check_constraints = OFF")
+            }
+        }
+        TripStore(TripDatabaseHelper(context, checkName)).use { ordinaryOpen ->
+            ordinaryOpen.validateStartup(recoveredAfterReplacement = false)
+            check(!ordinaryOpen.verify()) { "Fixture must fail quick_check while ordinary startup skips it" }
+        }
+        val checkJournal = journal(checkName)
+        checkJournal.writeText("COMMITTED", Charsets.US_ASCII)
+        check(TripCompression.recoverBeforeOpen(context, checkName)) { "Committed Trips journal was not reported as recovery" }
+        TripStore(TripDatabaseHelper(context, checkName)).use { recoveredOpen ->
+            expectStartupFailure(recoveredOpen, "integrity check")
+        }
+        check(checkJournal.isFile) { "Failed recovered validation discarded its retry marker" }
+        check(TripCompression.recoverBeforeOpen(context, checkName)) { "Retry did not retain the recovered Trips marker" }
+        TripStore(TripDatabaseHelper(context, checkName)).use { retryOpen ->
+            expectStartupFailure(retryOpen, "integrity check")
+        }
+        check(checkJournal.isFile) { "Repeated validation failure discarded its retry marker" }
+        check(checkJournal.delete()) { "Could not clean the Trips integrity test journal" }
+
+        val foreignKeyName = "${prefix}_trips_fk.db"
+        check(!TripCompression.recoverBeforeOpen(context, foreignKeyName)) { "Fresh Trips files unexpectedly reported recovery" }
+        val foreignKeyHelper = TripDatabaseHelper(context, foreignKeyName)
+        TripStore(foreignKeyHelper).use { store ->
+            store.validateStartup(recoveredAfterReplacement = false)
+            foreignKeyHelper.writableDatabase.apply {
+                execSQL("PRAGMA foreign_keys = OFF")
+                execSQL("INSERT INTO route_points(trip_id, sequence, kind, observed_at, quality) VALUES('missing-trip', 0, 'gap', '2026-10-10T00:00:00Z', 'missing')")
+                execSQL("PRAGMA foreign_keys = ON")
+            }
+        }
+        TripStore(TripDatabaseHelper(context, foreignKeyName)).use { ordinaryOpen ->
+            ordinaryOpen.validateStartup(recoveredAfterReplacement = false)
+            check(ordinaryOpen.verify()) { "Foreign-key fixture should pass SQLite quick_check" }
+            check(!ordinaryOpen.verifyForeignKeys()) { "Foreign-key fixture should fail foreign_key_check" }
+        }
+        val foreignKeyJournal = journal(foreignKeyName)
+        foreignKeyJournal.writeText("COMMITTED", Charsets.US_ASCII)
+        check(TripCompression.recoverBeforeOpen(context, foreignKeyName)) { "Committed Trips journal was not reported as recovery" }
+        TripStore(TripDatabaseHelper(context, foreignKeyName)).use { recoveredOpen ->
+            expectStartupFailure(recoveredOpen, "foreign key check")
+        }
+        check(foreignKeyJournal.isFile) { "Failed foreign-key validation discarded its retry marker" }
+        check(foreignKeyJournal.delete()) { "Could not clean the Trips foreign-key test journal" }
+
+        val validName = "${prefix}_trips_recovery_valid.db"
+        TripStore(TripDatabaseHelper(context, validName)).use { store ->
+            store.validateStartup(recoveredAfterReplacement = false)
+        }
+        val validJournal = journal(validName)
+        validJournal.writeText("COMMITTED", Charsets.US_ASCII)
+        check(TripCompression.recoverBeforeOpen(context, validName)) { "Valid committed Trips journal was not reported as recovery" }
+        TripStore(TripDatabaseHelper(context, validName)).use { store ->
+            store.validateStartup(recoveredAfterReplacement = true)
+            val blockedBackup = File(context.getDatabasePath(validName).path + ".compression-backup.db")
+            check(blockedBackup.mkdir())
+            try {
+                TripCompression.completeRecoveryAfterValidation(context, validName)
+                check(validJournal.isFile) { "Failed cleanup discarded the recovery marker" }
+            } finally {
+                check(blockedBackup.delete())
+            }
+            TripCompression.completeRecoveryAfterValidation(context, validName)
+        }
+        check(!validJournal.exists()) { "Validated Trips recovery journal was not finalized" }
+        check(!TripCompression.recoverBeforeOpen(context, validName)) { "Successful validation left a recovery marker" }
     }
 
     private fun telegramTransactions(context: Context, prefix: String) {

@@ -10,6 +10,8 @@ import com.bydcollector.collector.data.callback.CallbackRawStore
 import com.bydcollector.collector.data.direct.DirectBatchDiagnostics
 import com.bydcollector.collector.data.direct.DirectHelperReadResult
 import com.bydcollector.collector.data.local.Clock
+import com.bydcollector.collector.data.local.BoundedIdRowCountReader
+import com.bydcollector.collector.data.local.BoundedIdRowCountTable
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import com.bydcollector.collector.direct.SecondaryTelemetrySpool
 import com.bydcollector.collector.direct.TelemetryCallbackBatch
@@ -18,6 +20,41 @@ import java.io.Closeable
 import java.io.File
 import java.time.Instant
 import java.time.OffsetDateTime
+
+/** Count state can outlive a short-lived store without retaining its SQLite handle. */
+internal class DirectDebugRowCountState {
+    private var compactProfile: Boolean? = null
+    private var reader: BoundedIdRowCountReader? = null
+
+    @Synchronized
+    fun reset() {
+        compactProfile = null
+        reader = null
+    }
+
+    @Synchronized
+    fun readingCount(db: SQLiteDatabase, cancellationSignal: CancellationSignal? = null): Long {
+        val compact = DirectDebugDatabaseHelper.isCompactV2(db)
+        if (reader == null || compactProfile != compact) {
+            compactProfile = compact
+            reader = BoundedIdRowCountReader(
+                buildList {
+                    add(BoundedIdRowCountTable("readings", "debug_direct_readings", "id"))
+                    if (compact) add(BoundedIdRowCountTable("callbacks", "raw_callback_events", "id"))
+                }
+            )
+        }
+        val counts = checkNotNull(reader).refresh(db, cancellationSignal)
+        val readings = counts.getValue("readings")
+        if (!compact) return readings
+        val callbacks = counts.getValue("callbacks")
+        return if (readings < 0L || callbacks < 0L) {
+            BoundedIdRowCountReader.UNKNOWN_ROW_COUNT
+        } else {
+            readings + callbacks
+        }
+    }
+}
 
 data class DirectDebugObserved(
     val status: Int,
@@ -106,6 +143,7 @@ class DirectDebugStore(
 ) : Closeable {
     private val helperDelegate = lazy { helper ?: DirectDebugDatabaseHelper(context) }
     private val helper by helperDelegate
+    private val dashboardReadingCountState = DirectDebugRowCountState()
     private val callbackRawStore = CallbackRawStore(
         database = { helperDelegate.value.writableDatabase },
         nowMs = { OffsetDateTime.parse(clock.nowIso()).toInstant().toEpochMilli() }
@@ -435,14 +473,13 @@ class DirectDebugStore(
         return result
     }
 
-    fun dashboardReadingCount(cancellationSignal: CancellationSignal? = null): Long = scalarLong(
-        if (DirectDebugDatabaseHelper.isCompactV2(helper.readableDatabase)) {
-            "SELECT (SELECT COUNT(*) FROM debug_direct_readings) + (SELECT COUNT(*) FROM raw_callback_events)"
-        } else {
-            "SELECT COUNT(*) FROM debug_direct_readings"
-        },
-        cancellationSignal
-    )
+    fun dashboardReadingCount(cancellationSignal: CancellationSignal? = null): Long =
+        dashboardReadingCount(dashboardReadingCountState, cancellationSignal)
+
+    internal fun dashboardReadingCount(
+        countState: DirectDebugRowCountState,
+        cancellationSignal: CancellationSignal? = null
+    ): Long = countState.readingCount(helper.readableDatabase, cancellationSignal)
 
     fun status(readingCount: Long = UNKNOWN_READING_COUNT): DirectDebugStatus {
         val db = helper.readableDatabase
