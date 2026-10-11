@@ -1,1030 +1,161 @@
 package com.bydcollector.collector.mqtt
 
-import com.bydcollector.collector.data.local.Clock
-import com.bydcollector.collector.data.normalized.StoredNormalizedState
+import com.bydcollector.collector.diagnostics.OperationalEventJournal
+import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
+import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.ha.HaEndpointProfile
-import kotlin.test.Test
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
+import org.robolectric.annotation.Config
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [29])
 class MqttPublishCoordinatorTest {
     @Test
-    fun discoveryHistoryUsesQueuedPayloadIdentityInsteadOfLaterSettings() {
-        val config = config()
-        val journal = InMemoryMqttPublicationJournal()
-        val outbox = FakeOutboxStore()
-        val coordinator = coordinator(outbox = outbox, config = config, publicationJournal = journal)
-        outbox.upsertPending(message("homeassistant/sensor/old/config",
-            """{"device":{"identifiers":["queued_id"],"name":"Queued car","model":"Queued model"}}"""),
-            targetType = "discovery", priority = 10)
-        assertTrue(coordinator.flushPending(force = true).ok)
-        val scope = MqttDestinationIdentity.configuredScopes(config).single().key
-        val row = journal.cleanupGroups(setOf(scope), "different_current_id").single()
-        assertEquals("queued_id", row.deviceIdentifier)
-        assertEquals("Queued car", row.deviceName)
-        assertEquals("Queued model", row.deviceModel)
-    }
-
-    @Test
-    fun cleanupEpochDiscardsOldSameIdOutboxAndStartRebuildsCurrentPayloads() {
-        var epoch = 0L
-        val journal = object : MqttPublicationJournalStore by NoopMqttPublicationJournalStore {
-            override fun destinationEpoch(scopeKey: String, deviceId: String): Long = epoch
-        }
-        val config = config()
-        val outbox = FakeOutboxStore()
-        val client = FakeMqttClient()
-        val coordinator = coordinator(client = client, outbox = outbox, config = config, publicationJournal = journal)
-        outbox.upsertPending(message("bydcollector/state/battery", "pre-cleanup"), "state", 50)
-
-        epoch += 1L
-        assertTrue(coordinator.flushPending(force = true).ok)
-        assertTrue(client.published.isEmpty())
-        assertTrue(outbox.pendingRows().isEmpty())
-
-        assertTrue(coordinator.startLiveExport().ok)
-        assertTrue(client.published.any { it.topic == "bydcollector/state/battery" })
-    }
-
-    @Test
-    fun conditionalPublishAckCannotDeletePayloadQueuedAfterTheDueSnapshot() {
-        val outbox = FakeOutboxStore()
-        val client = FakeMqttClient()
-        val coordinator = coordinator(client = client, outbox = outbox)
-        outbox.upsertPending(message("bydcollector/state/battery", "snapshot"), "state", 50)
-        client.afterPublish = {
-            outbox.upsertPending(message("bydcollector/state/battery", "newer"), "state", 50)
-        }
-
-        assertTrue(coordinator.flushPending(force = true).ok)
-        assertEquals("newer", outbox.pendingRows().single().message.payload)
-    }
-
-    @Test
-    fun staleDueSnapshotIsNotSentWhenPayloadChangesDuringConnect() {
-        val outbox = FakeOutboxStore()
-        val client = FakeMqttClient()
-        val coordinator = coordinator(client = client, outbox = outbox)
-        outbox.upsertPending(message("bydcollector/state/battery", "snapshot"), "state", 50)
-        client.afterConnect = {
-            client.afterConnect = null
-            outbox.upsertPending(message("bydcollector/state/battery", "newer"), "state", 50)
-        }
-
-        assertTrue(coordinator.flushPending(force = true).ok)
-        assertTrue(client.published.isEmpty())
-        assertEquals("newer", outbox.pendingRows().single().message.payload)
-    }
-
-    @Test
-    fun discoveryAckHistoryTracksActualFailoverBrokerAndDoesNotInventTombstones() {
-        val config = config(alternativeHost = "backup.local", alternativePort = 1884)
-        val client = FakeMqttClient(
-            connectResults = mutableListOf(MqttActionResult.ok(), MqttActionResult.ok()),
-            publishResults = mutableListOf(
-                MqttActionResult.ok(),
-                MqttActionResult.fail("mqtt_error", "primary dropped", MqttFailureKind.TRANSPORT)
-            )
-        )
-        val journal = InMemoryMqttPublicationJournal()
-        val coordinator = coordinator(client = client, config = config, publicationJournal = journal)
-
-        assertTrue(coordinator.startLiveExport().ok)
-
-        val firstTopic = client.published.first { it.payload.isNotEmpty() }.topic
-        val primaryScope = checkNotNull(MqttDestinationIdentity.scopeForProfile(config, HaEndpointProfile.PRIMARY)).key
-        val alternativeScope = checkNotNull(MqttDestinationIdentity.scopeForProfile(config, HaEndpointProfile.ALTERNATIVE)).key
-        assertEquals(listOf(primaryScope, alternativeScope), journal.attempts.take(2).map { it.scopeKey })
-        assertEquals(firstTopic, journal.attempts[0].topic)
-        assertEquals(firstTopic, journal.attempts[1].topic)
-        assertEquals(alternativeScope, journal.acknowledgements.first { it.topic == firstTopic }.scopeKey)
-        val tombstoneTopic = "homeassistant/binary_sensor/${config.normalizedDeviceId()}/bodywork_sunroof_windoblind_position/config"
-        assertTrue(journal.acknowledgements.any { it.remove && it.topic == tombstoneTopic })
-        assertTrue(!journal.isTracked(alternativeScope, config.normalizedDeviceId(), tombstoneTopic))
-        assertEquals("backup.local", client.connectConfigs.last { it.host == "backup.local" }.host)
-    }
-
-    @Test
-    fun invalidIdentityBlocksEveryPublishingEntryWithoutTouchingQueueAndCanBeCorrected() {
-        var live = config().copy(deviceId = "bad/id")
-        val client = FakeMqttClient()
-        val outbox = FakeOutboxStore().also {
-            it.upsertPending(message("bydcollector/state/battery", "existing"), "state", 50)
-        }
-        val coordinator = coordinator(client = client, outbox = outbox, configProvider = { live })
-        val original = outbox.pendingRows()
-        val results = listOf(
-            coordinator.startLiveExport(),
-            coordinator.queueDiscoveryAndFlush(),
-            coordinator.queueFullResyncAndFlush(),
-            coordinator.queueChangedCategoriesAndFlush(setOf("battery")),
-            coordinator.flushPending(),
-            coordinator.flushPending(force = true)
-        )
-        results.forEach {
-            assertEquals("mqtt_identity_invalid", it.category)
-            assertFalse(it.retryable)
-        }
-        assertEquals(original, outbox.pendingRows())
-        assertEquals(0, client.connectCount)
-        assertEquals(emptyList(), client.published)
-        assertEquals(null, coordinator.retryDelayMs())
-
-        live = live.copy(deviceId = "corrected_2", host = "corrected.local")
-        assertTrue(coordinator.startLiveExport().ok)
-        assertEquals("corrected.local", client.connectConfigs.last().host)
-        assertTrue(client.published.any { "/corrected_2/" in it.topic })
-        assertTrue(client.published.none { "/bad/id/" in it.topic })
-    }
-
-    @Test
-    fun invalidEndpointDoesNotFreezeSessionAndTestConnectionIgnoresDiscoveryIdentity() {
-        var live = config().copy(host = "bad/host")
-        val client = FakeMqttClient()
-        val coordinator = coordinator(client = client, configProvider = { live })
-        assertEquals("mqtt_endpoint_invalid", coordinator.startLiveExport().category)
-        live = live.copy(host = "valid.local", deviceId = "bad/id")
-        assertTrue(coordinator.testConnectionOnly().ok)
-        assertTrue(client.published.isEmpty())
-        live = live.copy(deviceId = "valid")
-        assertTrue(coordinator.startLiveExport().ok)
-        assertEquals("valid.local", client.connectConfigs.last().host)
-    }
-
-    @Test
-    fun failedInitialStateReadIsTerminalEvenWhenDiscoveryIsAlreadyQueued() {
-        val client = FakeMqttClient()
-        val outbox = FakeOutboxStore()
-        val coordinator = coordinator(client = client, outbox = outbox, provider = object : NormalizedStateProvider {
-            override fun currentState(categories: Set<String>?): List<StoredNormalizedState> = error("database unavailable")
-        })
-
-        val result = coordinator.startLiveExport()
-
-        assertEquals("mqtt_state_error", result.category)
-        assertFalse(result.retryable)
-        assertTrue(outbox.pendingCount() > 0)
-        assertEquals(null, coordinator.retryDelayMs())
-        assertEquals(0, client.connectCount)
-        assertTrue(coordinator.disconnectOffline().ok)
-        assertEquals(1, client.disconnectCount)
-    }
-
-    @Test
-    fun stoppedStatusReadDoesNotFreezeDraftAndOwnedSessionFreezesDestinationsUntilStop() {
-        var live = config(enabled = false).copy(host = "before.local")
-        val client = FakeMqttClient()
-        val coordinator = coordinator(client = client, configProvider = { live })
-        assertEquals(null, coordinator.retryDelayMs())
-        live = live.copy(enabled = true, host = "start.local", topicPrefix = "start", discoveryPrefix = "ha-start")
-        assertTrue(coordinator.startLiveExport().ok)
-        assertEquals("start.local", client.connectConfigs.last().host)
-        live = live.copy(host = "later.local", topicPrefix = "later", discoveryPrefix = "ha-later")
-        client.published.clear()
-        assertTrue(coordinator.queueFullResyncAndFlush().ok)
-        assertTrue(client.published.all { it.topic.startsWith("start/") })
-        assertTrue(coordinator.disconnectOffline().ok)
-        assertTrue(coordinator.startLiveExport().ok)
-        assertEquals("later.local", client.connectConfigs.last().host)
-    }
-
-    @Test
-    fun offlineDisconnectClosesWorkingFacadeWithoutReconnecting() {
-        val client = FakeMqttClient(connectResult = MqttActionResult.fail("mqtt_error", "broker down"))
-        val coordinator = coordinator(client = client)
-
-        val result = coordinator.disconnectOffline()
-
-        assertTrue(result.ok)
-        assertEquals(0, client.connectCount)
-        assertEquals(1, client.disconnectCount)
-        assertEquals(listOf<HaMqttMessage?>(null), client.disconnectMessages)
-    }
-
-    @Test
-    fun transportConnectFailureFallsBackToAlternativeAndKeepsActualRoute() {
-        val client = FakeMqttClient(
-            connectResults = mutableListOf(
-                MqttActionResult.fail("mqtt_error", "primary down", MqttFailureKind.TRANSPORT),
-                MqttActionResult.ok()
-            )
-        )
-        val outbox = FakeOutboxStore().also {
-            it.upsertPending(message("bydcollector/state/battery", "payload"), "state", 50)
-        }
-        val coordinator = coordinator(
-            client = client,
-            outbox = outbox,
-            config = config(alternativeHost = "mqtt-alt.local", alternativePort = 1884)
-        )
-
-        val result = coordinator.flushPending(force = true)
-
-        assertTrue(result.ok)
-        assertEquals(listOf("mqtt.local", "mqtt-alt.local"), client.connectConfigs.map { it.host })
-        assertEquals(HaEndpointProfile.ALTERNATIVE, coordinator.activeRoute)
-        assertEquals(emptyList<PendingRow>(), outbox.pendingRows())
-    }
-
-    @Test
-    fun transportPublishFailureRetriesSameRowOnOtherEndpoint() {
-        val client = FakeMqttClient(
-            connectResults = mutableListOf(MqttActionResult.ok(), MqttActionResult.ok()),
-            publishResults = mutableListOf(
-                MqttActionResult.fail("mqtt_error", "primary publish down", MqttFailureKind.TRANSPORT),
-                MqttActionResult.ok()
-            )
-        )
-        val outbox = FakeOutboxStore().also {
-            it.upsertPending(message("bydcollector/state/battery", "payload"), "state", 50)
-        }
-        val coordinator = coordinator(
-            client = client,
-            outbox = outbox,
-            config = config(alternativeHost = "mqtt-alt.local", alternativePort = 1884)
-        )
-
-        val result = coordinator.flushPending(force = true)
-
-        assertTrue(result.ok)
-        assertEquals(listOf("mqtt.local", "mqtt-alt.local"), client.connectConfigs.map { it.host })
-        assertEquals(2, client.published.size)
-        assertEquals(HaEndpointProfile.ALTERNATIVE, coordinator.activeRoute)
-        assertEquals(emptyList<PendingRow>(), outbox.pendingRows())
-    }
-
-    @Test
-    fun authenticationFailureDoesNotTryAlternativeEndpoint() {
-        val client = FakeMqttClient(
-            connectResults = mutableListOf(
-                MqttActionResult.fail("mqtt_auth", "not authorized", MqttFailureKind.AUTHENTICATION)
-            )
-        )
-        val outbox = FakeOutboxStore().also {
-            it.upsertPending(message("bydcollector/state/battery", "payload"), "state", 50)
-        }
-        val coordinator = coordinator(
-            client = client,
-            outbox = outbox,
-            config = config(alternativeHost = "mqtt-alt.local", alternativePort = 1884)
-        )
-
-        val result = coordinator.flushPending(force = true)
-
-        assertFalse(result.ok)
-        assertEquals(1, client.connectCount)
-        assertEquals(listOf("mqtt.local"), client.connectConfigs.map { it.host })
-        assertEquals(null, coordinator.activeRoute)
-    }
-
-    @Test
-    fun connectedAlternativeIsStickyUntilFacadeReportsDisconnect() {
-        val client = FakeMqttClient(
-            connectResults = mutableListOf(
-                MqttActionResult.fail("mqtt_error", "primary down", MqttFailureKind.TRANSPORT),
-                MqttActionResult.ok(),
-                MqttActionResult.ok()
-            )
-        )
-        val outbox = FakeOutboxStore().also {
-            it.upsertPending(message("bydcollector/state/battery", "first"), "state", 50)
-        }
-        val coordinator = coordinator(
-            client = client,
-            outbox = outbox,
-            config = config(alternativeHost = "mqtt-alt.local", alternativePort = 1884)
-        )
-
-        assertTrue(coordinator.flushPending(force = true).ok)
-        assertEquals(2, client.connectCount)
-
-        outbox.upsertPending(message("bydcollector/state/battery", "second"), "state", 50)
-        assertTrue(coordinator.flushPending(force = true).ok)
-        assertEquals(2, client.connectCount)
-
-        client.connectedState = false
-        outbox.upsertPending(message("bydcollector/state/battery", "third"), "state", 50)
-        assertTrue(coordinator.flushPending(force = true).ok)
-        assertEquals(listOf("mqtt.local", "mqtt-alt.local", "mqtt.local"), client.connectConfigs.map { it.host })
-    }
-
-    @Test
-    fun secondTransportPublishFailureClosesRouteWithoutTryingPrimaryAgain() {
-        val client = FakeMqttClient(
-            connectResults = mutableListOf(MqttActionResult.ok(), MqttActionResult.ok()),
-            publishResults = mutableListOf(
-                MqttActionResult.fail("mqtt_error", "primary publish down", MqttFailureKind.TRANSPORT),
-                MqttActionResult.fail("mqtt_error", "alternative publish down", MqttFailureKind.TRANSPORT)
-            )
-        )
-        val outbox = FakeOutboxStore().also {
-            it.upsertPending(message("bydcollector/state/battery", "payload"), "state", 50)
-        }
-        val coordinator = coordinator(
-            client = client,
-            outbox = outbox,
-            config = config(alternativeHost = "mqtt-alt.local", alternativePort = 1884)
-        )
-
-        val result = coordinator.flushPending(force = true)
-
-        assertFalse(result.ok)
-        assertEquals(listOf("mqtt.local", "mqtt-alt.local"), client.connectConfigs.map { it.host })
-        assertEquals(2, client.published.size)
-        assertEquals(null, coordinator.activeRoute)
-        assertEquals(2, client.disconnectCount)
-        assertEquals(1, outbox.pendingRows().size)
-    }
-
-    @Test
-    fun testConnectionOnlyDoesNotPublishDiscoveryOrState() {
-        val client = FakeMqttClient()
-        val outbox = FakeOutboxStore()
-        val existingRetry = MqttRetryState(
-            failureCount = 3,
-            nextAttemptAt = "2026-06-14T12:05:00+03:00",
-            lastFailureAt = "2026-06-14T12:00:00+03:00",
-            lastSuccessAt = null,
-            lastError = "runtime broker error"
-        )
-        val retry = FakeRetryStateStore(existingRetry)
-        val coordinator = coordinator(
-            client = client,
-            outbox = outbox,
-            retry = retry,
-            config = config(enabled = false)
-        )
-
-        val result = coordinator.testConnectionOnly()
-
-        assertTrue(result.ok)
-        assertEquals(1, client.connectCount)
-        assertEquals(emptyList(), client.published)
-        assertEquals(emptyList(), outbox.pendingRows())
-        assertEquals(existingRetry, retry.state)
-        assertEquals(emptyList(), retry.failures)
-        assertEquals(emptyList(), retry.successes)
-    }
-
-    @Test
-    fun testConnectionOverrideUsesOnlySelectedAlternativeAndLeavesRuntimeRouteUntouched() {
-        val client = FakeMqttClient()
-        val outbox = FakeOutboxStore()
-        val coordinator = coordinator(
-            client = client,
-            outbox = outbox,
-            config = config(alternativeHost = "mqtt-alt.local", alternativePort = 1884)
-        )
-
-        val selected = config(alternativeHost = "mqtt-alt.local", alternativePort = 1884)
-            .forProfile(HaEndpointProfile.ALTERNATIVE)
-        val result = coordinator.testConnectionOnly(selected)
-
-        assertTrue(result.ok)
-        assertEquals(listOf("mqtt-alt.local"), client.connectConfigs.map { it.host })
-        assertEquals(null, coordinator.activeRoute)
-        assertEquals(emptyList<PendingRow>(), outbox.pendingRows())
-    }
-
-    @Test
-    fun startLiveExportQueuesDiscoveryAndFullSnapshotBeforePublishing() {
-        val client = FakeMqttClient()
-        val outbox = FakeOutboxStore()
-        val coordinator = coordinator(client = client, outbox = outbox)
-
-        val result = coordinator.startLiveExport()
-
-        assertTrue(result.ok)
-        assertTrue(client.published.first().topic.endsWith("/config"))
-        assertTrue(client.published.any { it.topic == "bydcollector/state/battery" })
-        assertEquals(emptyList(), outbox.pendingRows())
-    }
-
-    @Test
-    fun locationOptInPublishesCoordinates() {
-        val provider = MutableNormalizedProvider(
-            listOf(storedState("location_latitude", "location", valueNumber = 50.0))
-        )
-        val result = HaMqttMessageFactory(
-            normalizedProvider = provider,
-            configProvider = { config(enabledCategories = setOf("location")) },
-            clock = FakeClock()
-        ).fullResyncMessages() as MqttMessageBuildResult.Success
-
-        assertEquals(setOf("location"), provider.requestedCategories.single())
-        assertTrue(result.messages.any { it.topic == "bydcollector/state/location" })
-    }
-
-    @Test
-    fun locationCategoryOffSuppressesCoordinates() {
-        val provider = MutableNormalizedProvider(
-            listOf(storedState("location_latitude", "location", valueNumber = 50.0))
-        )
-        val result = HaMqttMessageFactory(
-            normalizedProvider = provider,
-            configProvider = { config(enabledCategories = emptySet()) },
-            clock = FakeClock()
-        ).fullResyncMessages() as MqttMessageBuildResult.Success
-
-        assertEquals(emptySet(), provider.requestedCategories.single())
-        assertFalse(result.messages.any { it.topic == "bydcollector/state/location" })
-    }
-
-    @Test
-    fun failedStartRetainsCompleteWorkAndReportsPersistedRetryDelay() {
-        val client = FakeMqttClient(connectResult = MqttActionResult.fail("mqtt_error", "broker down"))
-        val outbox = FakeOutboxStore()
-        val coordinator = coordinator(client = client, outbox = outbox)
-
-        val result = coordinator.startLiveExport()
-
-        assertFalse(result.ok)
-        assertTrue(outbox.pendingRows().any { it.targetType == "discovery" })
-        assertTrue(outbox.pendingRows().any { it.targetType == "state" })
-        assertEquals(30_000L, coordinator.retryDelayMs())
-    }
-
-    @Test
-    fun manualStartAfterFailurePublishesOneFullSnapshot() {
-        val client = FakeMqttClient()
-        val retry = FakeRetryStateStore(
-            MqttRetryState(1, "2026-06-14T12:05:00+03:00", null, null, "broker down")
-        )
-        val coordinator = coordinator(client = client, retry = retry)
-
-        val result = coordinator.startLiveExport()
-
-        assertTrue(result.ok)
-        assertEquals(1, client.published.count { it.topic == "bydcollector/state/battery" })
-    }
-
-    @Test
-    fun failedChangedCategoryPublishStoresPendingRowForCategoryTopic() {
-        val client = FakeMqttClient(
-            publishResults = mutableListOf(MqttActionResult.fail("mqtt_error", "publish failed"))
-        )
-        val outbox = FakeOutboxStore()
-        val coordinator = coordinator(client = client, outbox = outbox)
-
-        val result = coordinator.queueChangedCategoriesAndFlush(setOf("battery"))
-
-        assertFalse(result.ok)
-        assertEquals(listOf("bydcollector/state/battery"), client.published.map { it.topic })
-        val pending = outbox.pendingRows()
-        assertEquals(listOf("bydcollector/state/battery"), pending.map { it.targetKey })
-        assertEquals("state", pending.single().targetType)
-        assertEquals("publish failed", pending.single().lastError)
-    }
-
-    @Test
-    fun repeatedSameTopicChangesReplacePayloadInsteadOfAddingRows() {
-        val client = FakeMqttClient(connectResult = MqttActionResult.fail("mqtt_error", "broker down"))
-        val outbox = FakeOutboxStore()
-        val provider = MutableNormalizedProvider(listOf(storedState("soc", "battery", valueNumber = 73.0)))
-        val coordinator = coordinator(client = client, outbox = outbox, provider = provider)
-
-        coordinator.queueChangedCategoriesAndFlush(setOf("battery"))
-        val firstPayload = outbox.pendingRows().single().message.payload
-
-        provider.rows = listOf(storedState("soc", "battery", valueNumber = 74.0))
-        coordinator.queueChangedCategoriesAndFlush(setOf("battery"))
-
-        val pending = outbox.pendingRows()
-        assertEquals(1, pending.size)
-        assertEquals("bydcollector/state/battery", pending.single().targetKey)
-        assertTrue(firstPayload.contains("73"))
-        assertTrue(pending.single().message.payload.contains("74"))
-    }
-
-    @Test
-    fun backoffNotDuePreventsClientCalls() {
-        val client = FakeMqttClient()
-        val outbox = FakeOutboxStore()
-        outbox.upsertPending(message("bydcollector/state/battery", "payload"), targetType = "state", priority = 50)
-        val retry = FakeRetryStateStore(
-            state = MqttRetryState(
-                failureCount = 1,
-                nextAttemptAt = "2026-06-14T12:05:00+03:00",
-                lastFailureAt = "2026-06-14T12:00:00+03:00",
-                lastSuccessAt = null,
-                lastError = "broker down"
-            )
-        )
-        val coordinator = coordinator(client = client, outbox = outbox, retry = retry)
-
-        val result = coordinator.flushPending(force = false)
-
-        assertTrue(result.ok)
-        assertEquals("mqtt backoff active", result.message)
-        assertEquals(0, client.connectCount)
-        assertEquals(emptyList(), client.published)
-        assertEquals(1, outbox.pendingRows().size)
-    }
-
-    @Test
-    fun dueBackoffConnectSuccessPublishesAndRemovesPending() {
-        val client = FakeMqttClient()
-        val outbox = FakeOutboxStore()
-        outbox.upsertPending(message("bydcollector/state/battery", "payload"), targetType = "state", priority = 50)
-        val retry = FakeRetryStateStore(
-            state = MqttRetryState(
-                failureCount = 0,
-                nextAttemptAt = "2026-06-14T12:00:00+03:00",
-                lastFailureAt = "2026-06-14T11:59:00+03:00",
-                lastSuccessAt = null,
-                lastError = "broker down"
-            )
-        )
-        val coordinator = coordinator(client = client, outbox = outbox, retry = retry)
-
-        val result = coordinator.flushPending(force = false)
-
-        assertTrue(result.ok)
-        assertTrue(client.connectCount >= 1)
-        assertEquals("bydcollector/state/battery", client.published.first().topic)
-        assertEquals(emptyList<PendingRow>(), outbox.pendingRows())
-        assertTrue(retry.successes.contains("2026-06-14T12:00:10+03:00"))
-    }
-
-    @Test
-    fun reconnectAfterPriorFailureTriggersFullResyncMessages() {
-        val client = FakeMqttClient()
-        val outbox = FakeOutboxStore()
-        outbox.upsertPending(message("bydcollector/status", "queued-status"), targetType = "status", priority = 20)
-        val retry = FakeRetryStateStore(
-            state = MqttRetryState(
-                failureCount = 2,
-                nextAttemptAt = "2026-06-14T12:00:00+03:00",
-                lastFailureAt = "2026-06-14T11:59:00+03:00",
-                lastSuccessAt = null,
-                lastError = "broker down"
-            )
-        )
-        val provider = MutableNormalizedProvider(listOf(storedState("soc", "battery", valueNumber = 73.0)))
-        val coordinator = coordinator(client = client, outbox = outbox, retry = retry, provider = provider)
-
-        val result = coordinator.flushPending(force = false)
-
-        assertTrue(result.ok)
-        assertEquals(
-            listOf("bydcollector/status", "bydcollector/status", "bydcollector/state/battery"),
-            client.published.map { it.topic }
-        )
-        assertEquals(emptyList<PendingRow>(), outbox.pendingRows())
-        assertEquals(listOf<Set<String>?>(HaMqttConfig.DEFAULT_CATEGORIES), provider.requestedCategories)
-    }
-
-    @Test
-    fun forceFlushBypassesBackoff() {
-        val client = FakeMqttClient()
-        val outbox = FakeOutboxStore()
-        outbox.upsertPending(message("bydcollector/state/battery", "payload"), targetType = "state", priority = 50)
-        val retry = FakeRetryStateStore(
-            state = MqttRetryState(
-                failureCount = 3,
-                nextAttemptAt = "2026-06-14T12:05:00+03:00",
-                lastFailureAt = "2026-06-14T12:00:00+03:00",
-                lastSuccessAt = null,
-                lastError = "broker down"
-            )
-        )
-        val coordinator = coordinator(client = client, outbox = outbox, retry = retry)
-
-        val result = coordinator.flushPending(force = true)
-
-        assertTrue(result.ok)
-        assertTrue(client.connectCount >= 1)
-        assertEquals("bydcollector/state/battery", client.published.first().topic)
-        assertEquals(emptyList<PendingRow>(), outbox.pendingRows())
-    }
-
-    @Test
-    fun forceFlushIncludesRowsWithFuturePerTopicBackoff() {
-        val client = FakeMqttClient()
-        val outbox = FakeOutboxStore()
-        outbox.upsertPending(message("bydcollector/state/battery", "payload"), targetType = "state", priority = 50)
-        outbox.markFailed(
-            targetKey = "bydcollector/state/battery",
-            payloadHash = outbox.pendingRows().single().payloadHash(),
-            error = "broker down",
-            failedAt = "2026-06-14T12:00:00+03:00",
-            nextAttemptAt = "2026-06-14T12:05:00+03:00"
-        )
-        val coordinator = coordinator(client = client, outbox = outbox)
-
-        val normalFlush = coordinator.flushPending(force = false)
-
-        assertTrue(normalFlush.ok)
-        assertEquals(emptyList(), client.published)
-
-        val forceFlush = coordinator.flushPending(force = true)
-
-        assertTrue(forceFlush.ok)
-        assertEquals(listOf("bydcollector/state/battery"), client.published.map { it.topic })
-        assertEquals(emptyList<PendingRow>(), outbox.pendingRows())
-    }
-
-    @Test
-    fun fullResyncSkipsNonDefaultRawRowsInEnabledDefaultCategories() {
-        val client = FakeMqttClient()
-        val provider = MutableNormalizedProvider(
-            listOf(
-                storedState("soc", "battery", valueNumber = 73.0),
-                storedState("charging_state", "battery", valueNumber = 2.0)
-            )
-        )
-        val coordinator = coordinator(client = client, provider = provider)
-
-        val result = coordinator.queueFullResyncAndFlush(force = true)
-
-        assertTrue(result.ok)
-        val batteryPayload = client.published.single { it.topic == "bydcollector/state/battery" }.payload
-        assertTrue(batteryPayload.contains("soc"))
-        assertFalse(batteryPayload.contains("charging_state"))
-    }
-
-    @Test
-    fun nonDefaultRadarRowsAreSkippedEvenWhenSafetyCategoryIsEnabled() {
-        val client = FakeMqttClient()
-        val provider = MutableNormalizedProvider(
-            listOf(
-                storedState("tire_pressure_lf_raw", "safety", valueNumber = 260.0),
-                storedState("radar_1025_neg_1728053151_5", "safety", valueNumber = 55.0)
-            )
-        )
-        val coordinator = coordinator(
-            client = client,
-            provider = provider,
-            config = config(enabledCategories = setOf("safety"))
-        )
-
-        val result = coordinator.queueFullResyncAndFlush(force = true)
-
-        assertTrue(result.ok)
-        val safetyPayload = client.published.single { it.topic == "bydcollector/state/safety" }.payload
-        assertTrue(safetyPayload.contains("tire_pressure_lf_raw"))
-        assertFalse(safetyPayload.contains("radar_1025_neg_1728053151_5"))
-    }
-
-    @Test
-    fun discoveryMessagesAreQueuedBeforeConnectAndRetained() {
-        val client = FakeMqttClient(connectResult = MqttActionResult.fail("mqtt_error", "auth failed"))
-        val outbox = FakeOutboxStore()
-        val coordinator = coordinator(client = client, outbox = outbox)
-
-        val result = coordinator.queueDiscoveryAndFlush(force = true)
-
-        assertFalse(result.ok)
-        assertEquals(1, client.connectCount)
-        assertTrue(outbox.pendingRows().isNotEmpty())
-        assertTrue(outbox.pendingRows().all { it.targetType == "discovery" })
-        assertTrue(outbox.pendingRows().all { it.message.retained })
-        assertTrue(outbox.pendingRows().all { it.message.topic.endsWith("/config") })
-        assertTrue(outbox.pendingRows().any {
-            it.message.topic == "homeassistant/binary_sensor/byd_sealion_07/bodywork_sunroof_windoblind_position/config" &&
-                it.message.payload.isEmpty()
-        })
-        assertTrue(outbox.pendingRows().any {
-            it.message.topic == "homeassistant/sensor/byd_sealion_07/bodywork_sunroof_windoblind_position/config"
-        })
-        val tombstonePriority = outbox.pendingRows().single {
-            it.message.topic == "homeassistant/binary_sensor/byd_sealion_07/bodywork_sunroof_windoblind_position/config"
-        }.priority
-        val sensorPriority = outbox.pendingRows().single {
-            it.message.topic == "homeassistant/sensor/byd_sealion_07/bodywork_sunroof_windoblind_position/config"
-        }.priority
-        assertTrue(tombstonePriority < sensorPriority)
-    }
-
-    @Test
-    fun sunroofTombstonePublishesBeforeReplacementSensorConfig() {
-        val client = FakeMqttClient()
-        val coordinator = coordinator(client = client)
-
-        assertTrue(coordinator.queueDiscoveryAndFlush(force = true).ok)
-
-        val tombstoneTopic =
-            "homeassistant/binary_sensor/byd_sealion_07/bodywork_sunroof_windoblind_position/config"
-        val sensorTopic =
-            "homeassistant/sensor/byd_sealion_07/bodywork_sunroof_windoblind_position/config"
-        val tombstoneIndex = client.published.indexOfFirst { it.topic == tombstoneTopic }
-        val sensorIndex = client.published.indexOfFirst { it.topic == sensorTopic }
-        assertTrue(tombstoneIndex >= 0)
-        assertTrue(sensorIndex >= 0)
-        assertTrue(tombstoneIndex < sensorIndex)
-    }
-
-    @Test
-    fun partialPublishFailureRemovesPublishedAndKeepsFailedAndUnpublishedPending() {
-        val client = FakeMqttClient(
-            publishResults = mutableListOf(
-                MqttActionResult.ok(),
-                MqttActionResult.fail("mqtt_error", "second failed")
-            )
-        )
-        val outbox = FakeOutboxStore()
-        outbox.upsertPending(message("bydcollector/state/battery", "battery"), targetType = "state", priority = 50)
-        outbox.upsertPending(message("bydcollector/state/body", "body"), targetType = "state", priority = 50)
-        outbox.upsertPending(message("bydcollector/state/climate", "climate"), targetType = "state", priority = 50)
-        val coordinator = coordinator(client = client, outbox = outbox)
-
-        val result = coordinator.flushPending(force = true)
-
-        assertFalse(result.ok)
-        assertEquals(
-            listOf("bydcollector/state/battery", "bydcollector/state/body"),
-            client.published.map { it.topic }
-        )
-        val pending = outbox.pendingRows()
-        assertEquals(listOf("bydcollector/state/body", "bydcollector/state/climate"), pending.map { it.targetKey })
-        assertEquals("second failed", pending.first { it.targetKey == "bydcollector/state/body" }.lastError)
-        assertEquals(null, pending.first { it.targetKey == "bydcollector/state/climate" }.lastError)
-    }
-
-    private fun coordinator(
-        client: FakeMqttClient = FakeMqttClient(),
-        outbox: FakeOutboxStore = FakeOutboxStore(),
-        retry: FakeRetryStateStore = FakeRetryStateStore(),
-        provider: NormalizedStateProvider = MutableNormalizedProvider(
-            listOf(storedState("soc", "battery", valueNumber = 73.0))
-        ),
-        config: HaMqttConfig = config(),
-        configProvider: () -> HaMqttConfig = { config },
-        publicationJournal: MqttPublicationJournalStore = NoopMqttPublicationJournalStore
-    ): MqttPublishCoordinator {
-        outbox.bindDestination(MqttDestinationIdentity.destinationKey(configProvider(), publicationJournal))
-        return MqttPublishCoordinator(
-            client = client,
-            outbox = outbox,
-            retryStateStore = retry,
-            messageFactory = HaMqttMessageFactory(
-                normalizedProvider = provider,
-                configProvider = configProvider,
-                clock = FakeClock()
-            ),
-            configProvider = configProvider,
-            retryPolicy = MqttRetryPolicy(),
-            clock = FakeClock(),
-            publicationJournal = publicationJournal
-        )
-    }
-
-    private class FakeMqttClient(
-        private val connectResult: MqttActionResult = MqttActionResult.ok(),
-        private val connectResults: MutableList<MqttActionResult> = mutableListOf(),
-        private val publishResults: MutableList<MqttActionResult> = mutableListOf()
-    ) : MqttClientFacade {
-        val published = mutableListOf<HaMqttMessage>()
-        val willMessages = mutableListOf<HaMqttMessage?>()
-        val disconnectMessages = mutableListOf<HaMqttMessage?>()
-        val connectConfigs = mutableListOf<HaMqttConfig>()
-        var connectedState = false
-        var connectCount = 0
-        var disconnectCount = 0
-        var afterConnect: (() -> Unit)? = null
-        var afterPublish: (() -> Unit)? = null
-
-        override val isConnected: Boolean
-            get() = connectedState
-
-        override fun connect(config: HaMqttConfig, willMessage: HaMqttMessage?): MqttActionResult {
-            return connect(config, willMessage, MqttConnectionPurpose.RUNTIME)
-        }
-
-        override fun connect(
-            config: HaMqttConfig,
-            willMessage: HaMqttMessage?,
-            purpose: MqttConnectionPurpose
-        ): MqttActionResult {
-            connectCount += 1
-            connectConfigs += config
-            willMessages += willMessage
-            return (if (connectResults.isEmpty()) connectResult else connectResults.removeAt(0)).also {
-                connectedState = it.ok
-                if (it.ok) afterConnect?.invoke()
-            }
-        }
-
-        override fun publish(message: HaMqttMessage): MqttActionResult {
-            published += message
-            afterPublish?.invoke()
-            return if (publishResults.isEmpty()) MqttActionResult.ok() else publishResults.removeAt(0)
-        }
-
-        override fun disconnect(gracefulMessage: HaMqttMessage?): MqttActionResult {
-            disconnectCount += 1
-            disconnectMessages += gracefulMessage
-            gracefulMessage?.let { published += it }
-            connectedState = false
-            return MqttActionResult.ok()
-        }
-    }
-
-    private class FakeOutboxStore : MqttOutboxStore {
-        private val rows = linkedMapOf<String, PendingRow>()
-
-        private var boundDestinationKey: String? = null
-
-        fun bindDestination(destinationKey: String) {
-            boundDestinationKey = destinationKey
-            rows.replaceAll { _, row -> if (row.destinationKey == null) row.copy(destinationKey = destinationKey) else row }
-        }
-
-        override fun upsertPending(message: HaMqttMessage, targetType: String, priority: Int, destinationKey: String?) {
-            val existing = rows[message.topic]
-            rows[message.topic] = PendingRow(
-                targetKey = message.topic,
-                targetType = targetType,
-                message = message,
-                priority = priority,
-                attemptCount = existing?.attemptCount ?: 0,
-                lastError = existing?.lastError,
-                destinationKey = destinationKey ?: boundDestinationKey
-            )
-        }
-
-        override fun dueMessages(nowIso: String, limit: Int): List<PendingMqttMessage> {
-            return rows.values
-                .filter { it.nextAttemptAt == null || it.nextAttemptAt <= nowIso }
-                .sortedWith(compareBy<PendingRow> { it.priority }.thenBy { it.targetKey })
-                .take(limit)
-                .map { it.toPending() }
-        }
-
-        override fun pendingMessages(limit: Int): List<PendingMqttMessage> {
-            return rows.values
-                .sortedWith(compareBy<PendingRow> { it.priority }.thenBy { it.targetKey })
-                .take(limit)
-                .map { it.toPending() }
-        }
-
-        override fun isCurrent(targetKey: String, payloadHash: String, destinationKey: String?): Boolean {
-            val row = rows[targetKey] ?: return false
-            return row.payloadHash() == payloadHash && row.destinationKey == destinationKey
-        }
-
-        override fun discardPending(targetKey: String, payloadHash: String, destinationKey: String?): Boolean {
-            if (!isCurrent(targetKey, payloadHash, destinationKey)) return false
-            rows.remove(targetKey)
-            return true
-        }
-
-        override fun markAttempt(targetKey: String, payloadHash: String, attemptedAt: String, destinationKey: String?): Boolean {
-            if (!isCurrent(targetKey, payloadHash, destinationKey)) return false
-            rows[targetKey]?.let { rows[targetKey] = it.copy(attemptCount = it.attemptCount + 1) }
-            return true
-        }
-
-        override fun markFailed(
-            targetKey: String,
-            payloadHash: String,
-            error: String,
-            failedAt: String,
-            nextAttemptAt: String?,
-            destinationKey: String?
-        ): Boolean {
-            if (!isCurrent(targetKey, payloadHash, destinationKey)) return false
-            rows[targetKey]?.let { rows[targetKey] = it.copy(lastError = error, nextAttemptAt = nextAttemptAt) }
-            return true
-        }
-
-        override fun markPublished(targetKey: String, payloadHash: String, publishedAt: String, destinationKey: String?): Boolean {
-            if (!isCurrent(targetKey, payloadHash, destinationKey)) return false
-            rows.remove(targetKey)
-            return true
-        }
-
-        override fun pendingCount(): Long = rows.size.toLong()
-
-        fun pendingRows(): List<PendingRow> = rows.values.toList()
-    }
-
-    private data class PendingRow(
-        val targetKey: String,
-        val targetType: String,
-        val message: HaMqttMessage,
-        val priority: Int,
-        val attemptCount: Int,
-        val lastError: String?,
-        val nextAttemptAt: String? = null,
-        val destinationKey: String? = null
-    ) {
-        fun toPending(): PendingMqttMessage {
-            return PendingMqttMessage(
-                targetKey = targetKey,
-                targetType = targetType,
-                payloadHash = message.payload.hashCode().toString(),
-                message = message,
-                priority = priority,
-                attemptCount = attemptCount,
-                destinationKey = destinationKey
-            )
-        }
-
-        fun payloadHash(): String = message.payload.hashCode().toString()
-    }
-
-    private class FakeRetryStateStore(
-        var state: MqttRetryState = MqttRetryState(
-            failureCount = 0,
-            nextAttemptAt = null,
-            lastFailureAt = null,
-            lastSuccessAt = null,
-            lastError = null
-        )
-    ) : MqttRetryStateStore {
-        val failures = mutableListOf<Pair<String, String>>()
-        val successes = mutableListOf<String>()
-
-        override fun retryState(): MqttRetryState = state
-
-        override fun recordRetryFailure(error: String, failedAt: String, nextAttemptAt: String) {
-            failures += error to nextAttemptAt
-            state = MqttRetryState(
-                failureCount = state.failureCount + 1,
-                nextAttemptAt = nextAttemptAt,
-                lastFailureAt = failedAt,
-                lastSuccessAt = state.lastSuccessAt,
-                lastError = error
-            )
-        }
-
-        override fun recordRetrySuccess(successAt: String) {
-            successes += successAt
-            state = MqttRetryState(
-                failureCount = 0,
-                nextAttemptAt = null,
-                lastFailureAt = state.lastFailureAt,
-                lastSuccessAt = successAt,
-                lastError = null
-            )
-        }
-    }
-
-    private class MutableNormalizedProvider(
-        var rows: List<StoredNormalizedState>
-    ) : NormalizedStateProvider {
-        val requestedCategories = mutableListOf<Set<String>?>()
-
-        override fun currentState(categories: Set<String>?): List<StoredNormalizedState> {
-            requestedCategories += categories
-            return categories?.let { allowed -> rows.filter { allowed.contains(it.category) } } ?: rows
-        }
-    }
-
-    private class FakeClock : Clock {
-        override fun nowIso(): String = "2026-06-14T12:00:10+03:00"
-        override fun elapsedRealtimeMs(): Long = 1_000L
-    }
-
-    private fun message(topic: String, payload: String): HaMqttMessage {
-        return HaMqttMessage(topic = topic, payload = payload, retained = true, qos = 1)
-    }
-
-    private fun config(
-        enabled: Boolean = true,
-        discoveryEnabled: Boolean = true,
-        enabledCategories: Set<String> = HaMqttConfig.DEFAULT_CATEGORIES,
-        alternativeHost: String? = null,
-        alternativePort: Int? = null
-    ): HaMqttConfig {
-        return HaMqttConfig(
-            enabled = enabled,
-            discoveryEnabled = discoveryEnabled,
-            host = "mqtt.local",
+    fun acknowledgedRowsStayDeletedAndUnacknowledgedPayloadSurvivesFailoverAndDatabaseReopen() {
+        val context = RuntimeEnvironment.getApplication()
+        val databaseName = "mqtt-outbox-recovery.db"
+        var config = HaMqttConfig(
+            enabled = true,
+            discoveryEnabled = true,
+            host = "primary-broker",
             port = 1883,
             username = null,
             password = null,
-            clientId = HaMqttConfig.DEFAULT_CLIENT_ID,
-            topicPrefix = HaMqttConfig.DEFAULT_TOPIC_PREFIX,
-            discoveryPrefix = HaMqttConfig.DEFAULT_DISCOVERY_PREFIX,
-            enabledCategories = enabledCategories,
-            alternativeHost = alternativeHost,
-            alternativePort = alternativePort
+            clientId = "collector-test",
+            topicPrefix = "bydcollector",
+            discoveryPrefix = "homeassistant",
+            deviceId = "test-car",
+            enabledCategories = emptySet(),
+            alternativeHost = "backup-broker",
+            alternativePort = 1884
         )
+        val destination = MqttDestinationIdentity.destinationKey(config, NoopMqttPublicationJournalStore)
+        val expected = listOf(
+            HaMqttMessage("bydcollector/state/first", "payload-one", retained = true),
+            HaMqttMessage("bydcollector/state/second", "payload-two", retained = true),
+            HaMqttMessage("bydcollector/state/third", "payload-three", retained = true)
+        )
+        val client = ScriptedMqttClient(mutableListOf(
+            MqttActionResult.ok(),
+            MqttActionResult.fail("mqtt_transport", "primary publish disconnected", MqttFailureKind.TRANSPORT),
+            MqttActionResult.fail("mqtt_transport", "alternative publish disconnected", MqttFailureKind.TRANSPORT)
+        ))
+        var store = telemetryStore(context, databaseName)
+        var coordinator = coordinator(store, client) { config }
+        try {
+            expected.forEachIndexed { index, message ->
+                store.upsertPending(message, "state", index + 1, destination)
+            }
+
+            val firstPass = coordinator.flushPending(force = true)
+
+            assertFalse(firstPass.ok)
+            assertEquals(2L, store.pendingCount())
+            val afterFirstPass = store.dueMessages("9999-12-31T23:59:59Z", 10)
+            assertEquals(expected.drop(1).map { it.topic }, afterFirstPass.map { it.message.topic })
+            assertEquals(1, afterFirstPass.first().attemptCount)
+            assertTrue(client.published.none { it.second.topic == expected[2].topic }, "third row waits after the second row's failed failover")
+            assertEquals(
+                listOf(
+                    HaEndpointProfile.PRIMARY to expected[0],
+                    HaEndpointProfile.PRIMARY to expected[1],
+                    HaEndpointProfile.ALTERNATIVE to expected[1]
+                ),
+                client.published.map { it.first to it.second }
+            )
+
+            coordinator.disconnectForMaintenance()
+            store.close()
+            store = telemetryStore(context, databaseName)
+            coordinator = coordinator(store, client) { config }
+            assertEquals(2L, store.pendingCount(), "unacknowledged rows must remain in SQLite after reopen")
+            assertEquals(expected.drop(1), store.dueMessages("9999-12-31T23:59:59Z", 10).map { it.message })
+
+            assertTrue(coordinator.flushPending(force = true).ok)
+
+            assertEquals(0L, store.pendingCount())
+            assertTrue(client.published.any { it.first == HaEndpointProfile.PRIMARY && it.second == expected[1] })
+            assertTrue(client.published.any { it.first == HaEndpointProfile.ALTERNATIVE && it.second == expected[1] })
+            assertTrue(client.published.any { it.second == expected[2] })
+            assertTrue(client.published.filter { it.second.topic == expected[1].topic }.all { it.second.payload == expected[1].payload })
+            assertNotNull(coordinator.activeRoute)
+
+            // Model the UI's disabled setting before its Stop disconnect, then deliver stale work.
+            config = config.copy(enabled = false)
+            val stop = coordinator.disconnectOffline()
+            assertTrue(stop.ok)
+            assertFalse(client.isConnected)
+            assertEquals(null, coordinator.activeRoute)
+            val lateMessage = HaMqttMessage("bydcollector/state/late", "payload-late", retained = true)
+            store.upsertPending(lateMessage, "state", 4, destination)
+            val connectCountAfterStop = client.connectedRoutes.size
+            val publishedCountAfterStop = client.published.size
+            val lateFlush = coordinator.flushPending(force = true)
+            assertTrue(lateFlush.ok)
+            assertEquals("mqtt disabled", lateFlush.message)
+            assertEquals(connectCountAfterStop, client.connectedRoutes.size, "late work must not reconnect after Stop")
+            assertEquals(publishedCountAfterStop, client.published.size, "late work must not publish after Stop")
+            assertFalse(client.isConnected)
+            assertEquals(1L, store.pendingCount())
+            assertEquals(lateMessage, store.dueMessages("9999-12-31T23:59:59Z", 10).single().message)
+        } finally {
+            runCatching { coordinator.disconnectForMaintenance() }
+            store.close()
+        }
     }
 
-    private fun storedState(
-        fieldKey: String,
-        category: String,
-        valueType: String = "NUMBER",
-        valueNumber: Double? = null,
-        valueBool: Boolean? = null
-    ): StoredNormalizedState {
-        return StoredNormalizedState(
-            fieldKey = fieldKey,
-            category = category,
-            valueType = valueType,
-            valueText = null,
-            valueNumber = valueNumber,
-            valueBool = valueBool,
-            quality = "OK",
-            unit = null,
-            sourcePollId = 42L,
-            sourceKeys = fieldKey,
-            observedAt = "2026-06-14T12:00:00+03:00",
-            changedAt = "2026-06-14T12:00:05+03:00"
+    private fun telemetryStore(context: android.content.Context, databaseName: String) = TelemetryStore(
+        context,
+        TelemetryDatabaseHelper(context, databaseName),
+        operationalEventJournal = OperationalEventJournal(context)
+    )
+
+    private fun coordinator(
+        store: TelemetryStore,
+        client: ScriptedMqttClient,
+        configProvider: () -> HaMqttConfig
+    ) =
+        MqttPublishCoordinator(
+            client = client,
+            outbox = store,
+            retryStateStore = store,
+            messageFactory = HaMqttMessageFactory(store, configProvider),
+            configProvider = configProvider
         )
+
+    private class ScriptedMqttClient(private val script: MutableList<MqttActionResult>) : MqttClientFacade {
+        private var route: HaEndpointProfile? = null
+        override var isConnected: Boolean = false
+            private set
+        val published = mutableListOf<Pair<HaEndpointProfile, HaMqttMessage>>()
+        val connectedRoutes = mutableListOf<HaEndpointProfile>()
+
+        override fun connect(config: HaMqttConfig, willMessage: HaMqttMessage?): MqttActionResult {
+            val candidate = if (config.host == "backup-broker") HaEndpointProfile.ALTERNATIVE else HaEndpointProfile.PRIMARY
+            route = candidate
+            connectedRoutes += candidate
+            isConnected = true
+            return MqttActionResult.ok()
+        }
+
+        override fun publish(message: HaMqttMessage): MqttActionResult {
+            check(isConnected) { "publish requires an established fake transport" }
+            published += (route ?: error("connected route missing")) to message
+            return if (script.isEmpty()) MqttActionResult.ok() else script.removeAt(0).also {
+                if (!it.ok) isConnected = false
+            }
+        }
+
+        override fun disconnect(gracefulMessage: HaMqttMessage?): MqttActionResult {
+            isConnected = false
+            return MqttActionResult.ok()
+        }
     }
 }

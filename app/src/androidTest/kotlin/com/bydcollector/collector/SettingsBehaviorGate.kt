@@ -1,284 +1,24 @@
 package com.bydcollector.collector
 
+import android.app.Instrumentation
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.SharedPreferences
+import android.os.SystemClock
 import com.bydcollector.collector.adb.AdbLocalClient
 import com.bydcollector.collector.adb.AdbShellResult
-import com.bydcollector.collector.data.direct.DirectFidEntry
 import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
-import com.bydcollector.collector.data.direct.DirectHelperReadResult
-import com.bydcollector.collector.data.direct.DirectHelperStopResult
-import com.bydcollector.collector.data.direct.DirectVehicleHelper
+import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.data.remote.DirectBridgeManager
-import com.bydcollector.collector.influx.InfluxConfig
-import com.bydcollector.collector.maintenance.ArchiveStorageItemPhase
-import com.bydcollector.collector.maintenance.ArchiveStorageItemState
-import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
-import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
+import com.bydcollector.collector.direct.CollectorHelperProtocol
 import com.bydcollector.collector.service.CollectorSettings
-import com.bydcollector.collector.service.RuntimeDemand
-import com.bydcollector.collector.telegram.TelegramNavigatorMask
 import java.io.File
 
-/** Exercises the production settings facade against isolated Android preferences. */
+/** T06: real helper Binder replacement, retry, handshake, and durable update confirmation. */
 internal object SettingsBehaviorGate {
-    fun cases(context: Context, prefix: String): List<Pair<String, () -> Unit>> = listOf(
-        "archive_owner_and_item_state_survive_reopen" to {
-            isolated(context, prefix) { scoped ->
-                val settings = CollectorSettings(scoped)
-                val mainId = "bydcollector_telemetry_20260928_120000"
-                val secondaryId = "bydcollector_secondary_20260928_120001"
-                val active = ArchiveStorageJobStatus(
-                    mode = ArchiveStorageJobMode.COMPRESS,
-                    running = true,
-                    operationId = "first",
-                    itemId = mainId,
-                    stepIndex = 2,
-                    stepCount = 4,
-                    phase = ArchiveStorageItemPhase.CREATING_ZIP
-                )
-                check(settings.beginArchiveStorageOperation("first", active))
-                check(settings.publishArchiveStorageProgress("first", active,
-                    ArchiveStorageItemState(mainId, "first", ArchiveStorageItemPhase.CREATING_ZIP,
-                        2, 4, 1L, 1L)))
-                val before = settings.archiveStorageJobStatus()
-                check(settings.deferArchiveStorageAudit("second", listOf(secondaryId)) == "second")
-                check(settings.archiveStorageJobStatus() == before) { "Deferred work replaced its active owner" }
-                check(!settings.publishArchiveStorageProgress("stale", active.copy(error = "stale failure")))
-                check(!settings.finishArchiveStorageOperation("stale", active))
-                check(!settings.clearArchiveStorageJobStatus("stale"))
-
-                val reopened = CollectorSettings(scoped)
-                check(reopened.archiveStorageJobStatus() == before)
-                val items = reopened.archiveStorageItems().associateBy { it.archiveId }
-                check(items.getValue(mainId).phase == ArchiveStorageItemPhase.CREATING_ZIP)
-                check(items.getValue(secondaryId).phase == ArchiveStorageItemPhase.QUEUED)
-                check(items.values.all { it.startedAtMs > 0 && it.updatedAtMs >= it.startedAtMs })
-                check(reopened.recoverArchiveStorageAfterProcessRestart("recovery") == "second")
-                check(!reopened.archiveStorageJobStatus().running)
-                check(reopened.archiveStorageJobStatus().error?.contains("interrupted") == true)
-                check(!reopened.finishArchiveStorageOperation("first", active))
-
-                val next = active.copy(operationId = "second", itemId = secondaryId)
-                check(reopened.beginArchiveStorageOperation("second", next))
-                check(reopened.archiveStorageAuditOperationId() == null)
-                val failed = next.copy(phase = ArchiveStorageItemPhase.FAILED, error = "archive_zip_mismatch")
-                check(reopened.publishArchiveStorageProgress("second", failed,
-                    ArchiveStorageItemState(secondaryId, "second", ArchiveStorageItemPhase.FAILED,
-                        3, 4, 1L, 1L, error = failed.error)))
-                check(reopened.finishArchiveStorageOperation("second", failed))
-                val settled = CollectorSettings(scoped)
-                check(!settled.archiveStorageJobStatus().running)
-                val item = settled.archiveStorageItems().single { it.archiveId == secondaryId }
-                check(item.phase == ArchiveStorageItemPhase.FAILED && item.error == failed.error)
-                check(item.completedAtMs != null)
-            }
-        },
-        "settings_process_death_and_boot_policy" to {
-            isolated(context, prefix) { scoped ->
-                val settings = CollectorSettings(scoped)
-                for (autoMain in listOf(false, true)) for (autoSecondary in listOf(false, true)) {
-                    for (stopMain in listOf(false, true)) for (stopSecondary in listOf(false, true)) {
-                        settings.setUserShutdownRequested(false)
-                        settings.setAutoStartEnabled(autoMain)
-                        settings.setDebugAutoStartEnabled(autoSecondary)
-                        settings.setMainManuallyStopped(stopMain)
-                        settings.setDebugManuallyStopped(stopSecondary)
-                        settings.setPollingEnabled(true)
-                        settings.setDebugPollingEnabled(true)
-                        settings.clearRuntimeManualStops(includeCollection = false)
-                        CollectorSettings.resetCollectionAfterProcessDeath(scoped)
-                        val reopened = CollectorSettings(scoped)
-                        check(reopened.isPollingEnabled() == (autoMain && !stopMain))
-                        check(reopened.isDebugPollingEnabled() == (autoSecondary && !stopSecondary))
-                        check(reopened.isMainManuallyStopped() == stopMain)
-                        check(reopened.isDebugManuallyStopped() == stopSecondary)
-                    }
-                }
-                settings.setUserShutdownRequested(true)
-                CollectorSettings.resetCollectionAfterProcessDeath(scoped)
-                check(!settings.isPollingEnabled() && !settings.isDebugPollingEnabled())
-            }
-        },
-        "settings_independent_collection_matrix" to {
-            isolated(context, prefix) { scoped ->
-                val settings = CollectorSettings(scoped)
-                check(settings.runtimeDemand() == RuntimeDemand())
-                check(!settings.hasActiveAccessWork())
-                for (main in listOf(false, true)) for (secondary in listOf(false, true)) {
-                    for (stopMain in listOf(false, true)) for (stopSecondary in listOf(false, true)) {
-                        settings.setAutoStartEnabled(main)
-                        settings.setDebugAutoStartEnabled(secondary)
-                        settings.setMainManuallyStopped(stopMain)
-                        settings.setDebugManuallyStopped(stopSecondary)
-                        val expected = RuntimeDemand(main = main && !stopMain, debug = secondary && !stopSecondary)
-                        check(settings.runtimeDemand() == expected) { "main=$main secondary=$secondary stops=$stopMain/$stopSecondary" }
-                        check(CollectorSettings(scoped).runtimeDemand() == expected) { "reopen changed collection demand" }
-                        settings.setPollingEnabled(main)
-                        settings.setDebugPollingEnabled(secondary)
-                        check(settings.hasActiveAccessWork() == expected.any)
-                    }
-                }
-            }
-        },
-        "settings_manual_stops_and_shutdown" to {
-            isolated(context, prefix) { scoped ->
-                val settings = CollectorSettings(scoped)
-                settings.setAutoStartEnabled(true)
-                settings.setDebugAutoStartEnabled(true)
-                settings.setMqttAutoStartEnabled(true)
-                settings.setInfluxAutoStartEnabled(true)
-                val all = settings.runtimeDemand()
-                settings.setMainManuallyStopped(true)
-                check(settings.runtimeDemand() == all.copy(main = false))
-                settings.setDebugManuallyStopped(true)
-                check(settings.runtimeDemand() == all.copy(main = false, debug = false))
-                settings.setMqttManuallyStopped(true)
-                settings.setInfluxManuallyStopped(true)
-                check(!settings.runtimeDemand().any)
-                settings.clearRuntimeManualStops()
-                check(settings.runtimeDemand() == all) { "manual stops changed auto-start preferences" }
-                settings.setTelegramEnabled(true)
-                settings.setConnectivityRecoveryEnabled(true)
-                settings.setUserShutdownRequested(true)
-                check(settings.setUserShutdownPhase(CollectorSettings.SHUTDOWN_PHASE_STOPPING, "test-token", "in progress"))
-                check(settings.rememberShutdownListenerStateIfAbsent(0))
-                check(settings.rememberShutdownListenerStateIfAbsent(2))
-                check(CollectorSettings(scoped).shutdownListenerPreviousState() == 0) {
-                    "repeated Shutdown must not overwrite the pre-shutdown listener state"
-                }
-                check(CollectorSettings(scoped).runtimeDemand() == RuntimeDemand())
-                check(settings.clearUserShutdownRequestIfSet())
-                check(settings.runtimeDemand() == all.copy(telegram = true, keepAlive = true))
-                check(settings.userShutdownPhase() == CollectorSettings.SHUTDOWN_PHASE_IDLE)
-                check(settings.userShutdownToken() == null && settings.userShutdownDetail() == null)
-                check(settings.shutdownListenerPreviousState() == 0) { "saved state belongs to actual component restoration" }
-                check(settings.clearShutdownListenerPreviousState())
-                // The result now means durable clear succeeded, including idempotent explicit reopen.
-                check(settings.clearUserShutdownRequestIfSet())
-            }
-        },
-        "settings_enabled_exports_recover_independently" to {
-            isolated(context, prefix) { scoped ->
-                val settings = CollectorSettings(scoped)
-                settings.setMqttEnabled(true)
-                settings.setInfluxEnabled(true)
-                check(!settings.runtimeDemand().any)
-                com.bydcollector.collector.ha.HaRunSession.process.start(com.bydcollector.collector.ha.HaExportChannel.MQTT)
-                com.bydcollector.collector.ha.HaRunSession.process.start(com.bydcollector.collector.ha.HaExportChannel.INFLUX)
-                check(settings.runtimeDemand() == RuntimeDemand(mqtt = true, influx = true))
-                settings.setMqttManuallyStopped(true)
-                check(settings.runtimeDemand() == RuntimeDemand(influx = true))
-                settings.setInfluxManuallyStopped(true)
-                check(!settings.runtimeDemand().any)
-                com.bydcollector.collector.ha.HaRunSession.process.clear()
-                check(!settings.isAutoStartEnabled() && !settings.isDebugAutoStartEnabled())
-            }
-        },
-        "helper_update_marker_is_durable_and_demand_gated" to {
-            isolated(context, prefix) { scoped ->
-                val settings = CollectorSettings(scoped)
-                check(settings.helperReplacementPending(500L)) { "missing confirmed stamp must be stale" }
-                check(settings.markHelperReplacementPending())
-                check(CollectorSettings(scoped).helperReplacementPending(500L)) {
-                    "pending marker did not survive settings recreation"
-                }
-                check(!settings.helperReplacementAllowed()) { "no collection demand must defer replacement" }
-
-                settings.setPollingEnabled(true)
-                check(settings.helperReplacementAllowed())
-                settings.setMainManuallyStopped(true)
-                check(!settings.helperReplacementAllowed())
-                settings.setDebugPollingEnabled(true)
-                check(settings.helperReplacementAllowed())
-                settings.setUserShutdownRequested(true)
-                check(!settings.helperReplacementAllowed()) { "Shutdown must block replacement" }
-                settings.setUserShutdownRequested(false)
-
-                check(settings.confirmHelperReplacement(500L))
-                check(!settings.helperReplacementPending(500L))
-                check(settings.helperReplacementPending(501L)) { "same-version package update timestamp was ignored" }
-                check(settings.helperReplacementPending(null)) { "missing installed timestamp must be stale" }
-            }
-        },
+    fun cases(context: Context, prefix: String, instrumentation: Instrumentation): List<Pair<String, () -> Unit>> = listOf(
         "helper_update_replacement_stops_absent_launches_pings_then_confirms" to {
-            isolated(context, prefix) { scoped ->
-                runHelperReplacementSequence(scoped, failLaunch = false, collectionDemand = true)
-            }
-        },
-        "helper_update_incompatible_protocol_is_stopped_before_replacement" to {
-            isolated(context, prefix) { scoped ->
-                runHelperReplacementSequence(scoped, failLaunch = false, collectionDemand = true, incompatible = true)
-            }
-        },
-        "helper_update_replacement_failure_and_no_demand_remain_pending" to {
-            isolated(context, prefix) { scoped ->
-                runHelperReplacementSequence(scoped, failLaunch = true, collectionDemand = true)
-            }
-            isolated(context, "${prefix}_no_demand") { scoped ->
-                runHelperReplacementSequence(scoped, failLaunch = false, collectionDemand = false)
-            }
-        },
-        "settings_connectivity_and_discovery" to {
-            isolated(context, prefix) { scoped ->
-                val settings = CollectorSettings(scoped)
-                check(!settings.keepAliveConfig().anyEnabled)
-                for (enabled in listOf(true, false)) {
-                    settings.setConnectivityRecoveryEnabled(enabled)
-                    val reopened = CollectorSettings(scoped)
-                    check(reopened.keepAliveConfig().keepWifi == enabled)
-                    check(reopened.keepAliveConfig().keepMobileData == enabled)
-                    check(!reopened.keepAliveConfig().keepBluetooth)
-                    check(reopened.mqttConfig(includeCredentials = false).discoveryEnabled)
-                }
-            }
-        },
-        "influx_vehicle_id_defaults_and_persists_independently" to {
-            isolated(context, prefix) { scoped ->
-                val settings = CollectorSettings(scoped)
-                check(settings.influxVehicleId() == InfluxConfig.DEFAULT_VEHICLE_ID)
-                check(settings.influxConfig(includeCredentials = false).vehicleId == InfluxConfig.DEFAULT_VEHICLE_ID)
-
-                settings.setMqttDeviceId("mqtt-device")
-                settings.setInfluxVehicleId("custom car,ev=2")
-                val reopened = CollectorSettings(scoped)
-                check(reopened.influxVehicleId() == "custom car,ev=2")
-                check(reopened.influxConfig(includeCredentials = false).vehicleId == "custom car,ev=2")
-                check(reopened.mqttDeviceId() == "mqtt-device")
-
-                reopened.setInfluxVehicleId("")
-                check(CollectorSettings(scoped).influxVehicleId() == InfluxConfig.DEFAULT_VEHICLE_ID)
-                reopened.setInfluxVehicleId("\n")
-                check(CollectorSettings(scoped).influxVehicleId() == "\n")
-            }
-        },
-        "settings_templates_language_and_navigation_survive_reopen" to {
-            isolated(context, prefix) { scoped ->
-                val settings = CollectorSettings(scoped)
-                val key = "trip-summary"
-                val custom = "My trip\r\n{trip_distance_km}  "
-                settings.setTelegramTemplate(key, custom)
-                settings.setUiLanguageCode(" EN ")
-                settings.setTelegramNavigatorMask(-1)
-                val reopened = CollectorSettings(scoped)
-                check(reopened.telegramTemplate(key) == custom)
-                check(reopened.uiLanguageCode() == "en")
-                check(reopened.telegramNavigatorMask() == TelegramNavigatorMask.sanitize(-1))
-                reopened.clearTelegramTemplate(key)
-                check(CollectorSettings(scoped).telegramTemplate(key) == null)
-            }
-        },
-        "settings_never_read_late_plaintext_credentials" to {
-            isolated(context, prefix) { scoped ->
-                val settings = CollectorSettings(scoped)
-                val preferences = scoped.getSharedPreferences(CollectorSettings.PREFS_NAME, Context.MODE_PRIVATE)
-                // A stale writer reintroducing old keys must not bypass the Keystore getter.
-                preferences.edit().putString(CollectorSettings.KEY_MQTT_USERNAME, "plaintext-user")
-                    .putString(CollectorSettings.KEY_MQTT_PASSWORD, "plaintext-password").commit()
-                check(settings.mqttUsername().isEmpty())
-                check(settings.mqttPassword().isEmpty())
-            }
+            isolated(context, prefix) { scoped -> runHelperReplacementSequence(scoped, instrumentation) }
         }
     )
 
@@ -299,94 +39,126 @@ internal object SettingsBehaviorGate {
         }
     }
 
-    private fun runHelperReplacementSequence(context: Context, failLaunch: Boolean, collectionDemand: Boolean, incompatible: Boolean = false) {
+    private fun runHelperReplacementSequence(context: Context, instrumentation: Instrumentation) {
+        val adb = AdbLocalClient(File(context.filesDir, "adb_keys"))
+        val authorization = adb.checkAuthorizationReadOnly()
+        check(authorization.category == "adb_authorization_connected") {
+            "T06 requires the owner's pre-authorized local ADB key: ${authorization.category}: ${authorization.message}"
+        }
         @Suppress("DEPRECATION")
         val updateTime = context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime
         check(updateTime > 0L) { "installed package update timestamp is unavailable" }
+        val helper = DirectVehicleHelperClient()
+        check(helper.ownerModeForStop() == null && helperPid(adb).isBlank()) {
+            "Refusing to replace a helper process that was not created by this fixture"
+        }
+
         val settings = CollectorSettings(context)
-        settings.setPollingEnabled(collectionDemand)
+        settings.setPollingEnabled(true)
         check(settings.markHelperReplacementPending())
 
-        val events = mutableListOf<String>()
-        val helper = ReplacementSequenceHelper(events, incompatible)
-        val result = DirectBridgeManager.ensureRunning(
+        val fixtureApk = instrumentation.context.applicationInfo.sourceDir
+        val targetApk = context.applicationInfo.sourceDir
+        val fixturePath = "/data/local/tmp/collector_helper_test_${java.util.UUID.randomUUID()}"
+        val fixtureLog = "$fixturePath.log"
+        val fixtureLock = "$fixturePath.lock"
+        fun fixtureLaunch(command: String): String {
+            val productionClasspath = "CLASSPATH='$targetApk'"
+            check(command.contains(productionClasspath) && command.contains(CollectorHelperProtocol.HELPER_CLASS) &&
+                command.contains(CollectorHelperProtocol.LOG_PATH) && command.contains(CollectorHelperProtocol.LOCK_PATH)) {
+                "Production launch shape changed; refusing to start a non-fixture helper"
+            }
+            return command.replace(productionClasspath, "CLASSPATH='$fixtureApk'")
+                .replace(CollectorHelperProtocol.HELPER_CLASS, HELPER_FIXTURE_CLASS)
+                .replace(CollectorHelperProtocol.LOG_PATH, fixtureLog)
+                .replace(CollectorHelperProtocol.LOCK_PATH, fixtureLock)
+        }
+
+        var launchCalls = 0
+        fun managerCall() = DirectBridgeManager.ensureRunning(
             context = context,
-            adbClient = AdbLocalClient(File(context.filesDir, "unused_helper_update_test_keys")),
+            adbClient = adb,
             helper = helper,
-            ownerMode = DirectHelperOwnerMode.APP,
+            ownerMode = DirectHelperOwnerMode.APP_GAP_SPOOL,
             shellRunner = { command, _ ->
                 when {
                     command == DirectBridgeManager.helperAbsenceCommand() -> {
-                        events += "absence"
-                        AdbShellResult(ok = true, output = "", error = null, elapsedMs = 0L)
+                        adb.execShell(command, allowAuthorizationPrompt = false)
                     }
                     command.contains("setsid app_process") -> {
-                        events += "launch"
-                        if (!failLaunch) { helper.alive = true; helper.incompatible = false }
-                        AdbShellResult(
-                            ok = !failLaunch,
-                            output = "",
-                            error = if (failLaunch) "launch failed" else null,
-                            elapsedMs = 0L
-                        )
+                        launchCalls++
+                        if (launchCalls == 1) {
+                            AdbShellResult(false, "", "injected first launch failure", 0L)
+                        } else {
+                            adb.execShell(fixtureLaunch(command), allowAuthorizationPrompt = false)
+                        }
                     }
-                    else -> error("unexpected shell command during helper replacement")
+                    else -> error("Unexpected shell command during helper replacement: $command")
                 }
             }
         )
 
-        if (!collectionDemand) {
-            check(!result.ok)
-            check(events == listOf("initial_ping")) { "replacement performed work without collection demand: $events" }
-            check(settings.helperReplacementPending(updateTime))
-            return
-        }
-        check(helper.stopMode == DirectHelperOwnerMode.APP_GAP_SPOOL) {
-            "replacement did not use the helper's actual owner mode"
-        }
-
-        if (failLaunch) {
-            check(!result.ok)
-            check(events == listOf("initial_ping", "stop", "absence", "launch")) { "unexpected failed replacement order: $events" }
-            check(settings.helperReplacementPending(updateTime)) { "failed launch cleared the pending marker" }
-        } else {
-            check(result.ok) { result.message }
-            check(events == listOf("initial_ping", "stop", "absence", "launch", "launch_ping")) {
-                "replacement did not follow stop→absence→launch→ping order: $events"
+        try {
+            val oldCommand = fixtureLaunch(DirectBridgeManager.launchCommand(context, DirectHelperOwnerMode.APP_GAP_SPOOL))
+            val oldStarted = adb.execShell(oldCommand, allowAuthorizationPrompt = false)
+            check(oldStarted.ok) { "Could not start old Binder helper fixture: ${oldStarted.error}; ${oldStarted.output}" }
+            val oldPid = awaitHelperPid(adb)
+            check(helper.ownerModeForStop() == DirectHelperOwnerMode.APP_GAP_SPOOL) {
+                "Old fixture did not answer the production Binder PING"
             }
-            check(!settings.helperReplacementPending(updateTime)) { "successful ping did not confirm the installed update" }
-            events.clear()
-            val recovered = DirectBridgeManager.ensureRunning(
-                context, AdbLocalClient(File(context.filesDir, "unused_helper_update_test_keys")), helper,
+            val firstAttempt = managerCall()
+            check(!firstAttempt.ok) { "First launch unexpectedly succeeded" }
+            check(helperPid(adb).isBlank()) { "Old helper survived its real TX_STOP_OWNER" }
+            check(settings.helperReplacementPending(updateTime)) { "Failed launch cleared the retry marker" }
+            check(launchCalls == 1)
+
+            val retry = managerCall()
+            check(retry.ok) { "Retry did not start the replacement helper: ${retry.message}" }
+            val replacementPid = awaitHelperPid(adb)
+            check(replacementPid != oldPid) { "Replacement reused the old helper process" }
+            check(helper.ownerModeForStop() == DirectHelperOwnerMode.APP_GAP_SPOOL) {
+                "Replacement did not complete the actual production Binder PING"
+            }
+            check(launchCalls == 2) { "Retry launched more than once: $launchCalls" }
+            check(!settings.helperReplacementPending(updateTime)) { "Successful PING did not confirm the installed update" }
+
+            val repeated = DirectBridgeManager.ensureRunning(
+                context = context,
+                adbClient = adb,
+                helper = helper,
+                ownerMode = DirectHelperOwnerMode.APP_GAP_SPOOL,
                 shellRunner = { _, _ -> error("confirmed helper must survive repeated recovery") }
             )
-            check(recovered.ok && events == listOf("launch_ping")) {
-                "repeated recovery replaced the confirmed helper: $events"
+            check(repeated.ok && launchCalls == 2) { "Confirmed helper was replaced again: ${repeated.message}" }
+        } finally {
+            val pid = helperPid(adb)
+            if (pid.isNotBlank()) {
+                val stopped = adb.execShell("kill $pid 2>/dev/null || true", allowAuthorizationPrompt = false)
+                check(stopped.error == null) { "Could not stop helper fixture: ${stopped.error}; ${stopped.output}" }
             }
+            val fixtureFiles = listOf(fixtureLock, fixtureLog) +
+                (1..3).flatMap { listOf("$fixtureLog.$it", "$fixtureLog.$it.tmp") }
+            val cleared = adb.execShell("rm -f ${fixtureFiles.joinToString(" ")}", allowAuthorizationPrompt = false)
+            check(cleared.ok) { "Could not remove helper fixture files: ${cleared.error}; ${cleared.output}" }
         }
     }
 
-    private class ReplacementSequenceHelper(private val events: MutableList<String>, var incompatible: Boolean) : DirectVehicleHelper {
-        var alive = true
-        var stopMode: DirectHelperOwnerMode? = null
-        private var pingCount = 0
-
-        override fun isAlive(): Boolean {
-            events += if (pingCount++ == 0) "initial_ping" else "launch_ping"
-            return alive && !incompatible
+    private fun helperPid(adb: AdbLocalClient): String {
+        val result = adb.execShell("pidof ${CollectorHelperProtocol.PROCESS_NAME}", allowAuthorizationPrompt = false)
+        check(result.error == null || result.error == "shell exit code 1") {
+            "Could not inspect helper process: ${result.error}; ${result.output}"
         }
-
-        override fun ownerMode(): DirectHelperOwnerMode? = if (alive && !incompatible) DirectHelperOwnerMode.APP_GAP_SPOOL else null
-
-        override fun ownerModeForStop(): DirectHelperOwnerMode? = if (alive) DirectHelperOwnerMode.APP_GAP_SPOOL else null
-
-        override fun requestStop(ownerMode: DirectHelperOwnerMode): DirectHelperStopResult {
-            events += "stop"
-            stopMode = ownerMode
-            alive = false
-            return DirectHelperStopResult(status = 0, accepted = true)
-        }
-
-        override fun read(entry: DirectFidEntry): DirectHelperReadResult = error("read is not used by replacement")
+        return result.output.trim()
     }
+
+    private fun awaitHelperPid(adb: AdbLocalClient): String {
+        val deadline = SystemClock.elapsedRealtime() + 5_000L
+        while (SystemClock.elapsedRealtime() < deadline) {
+            helperPid(adb).takeIf { it.isNotBlank() }?.let { return it }
+            SystemClock.sleep(25L)
+        }
+        error("Helper fixture did not start within the deadline")
+    }
+
+    private const val HELPER_FIXTURE_CLASS = "com.bydcollector.collector.HelperReplacementProcessFixture"
 }

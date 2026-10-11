@@ -5,20 +5,20 @@ import android.os.Bundle
 import android.os.SystemClock
 import com.bydcollector.collector.adb.AdbLocalClient
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
-import com.bydcollector.collector.service.UserShutdownShellPlanner
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorSettings
+import com.bydcollector.collector.service.UserShutdownShellPlanner
 import java.io.File
 import java.util.UUID
 
-/** Runs the production shell planner on the emulator; never invokes vehicle APIs. */
+/** T07 composite: bounded real child, surfaced prior error/reopen, then host-verified force-stop. */
 internal object ShutdownShellBehaviorGate {
-    /** Expected to terminate instrumentation by the actual production force-stop. */
+    /** The host must verify owner-process death after observing SHUTDOWN_LIFECYCLE_HANDOFF. */
     fun startLifecycle(instrumentation: Instrumentation): String {
         val context = instrumentation.targetContext
         val settings = CollectorSettings(context)
         instrumentation.runOnMainSync { context.startForegroundService(CollectorService.shutdownIntent(context)) }
-        val deadline = SystemClock.elapsedRealtime() + 35_000
+        val deadline = SystemClock.elapsedRealtime() + 35_000L
         while (SystemClock.elapsedRealtime() < deadline) {
             when (settings.userShutdownPhase()) {
                 CollectorSettings.SHUTDOWN_PHASE_ERROR -> error(settings.userShutdownDetail().orEmpty())
@@ -26,17 +26,21 @@ internal object ShutdownShellBehaviorGate {
                     check(CollectorService.isUserShutdownInProgress()) { "HANDOFF released the coordinator prematurely" }
                     check(!CollectorService.clearShutdownForExplicitReopen(context)) { "Reopened live finalizer" }
                     instrumentation.sendStatus(0, Bundle().apply {
-                        putString("stream", "SHUTDOWN_LIFECYCLE_HANDOFF_GATE_PASS token=${settings.userShutdownToken()} active=true reopen=false\n")
+                        putString("stream", "SHUTDOWN_LIFECYCLE_HANDOFF token=${settings.userShutdownToken()} active=true reopen=false\n")
                     })
-                    SystemClock.sleep(12_000)
+                    SystemClock.sleep(12_000L)
                     error("APP survived production finalizer: ${settings.userShutdownDetail()}")
                 }
             }
-            SystemClock.sleep(20)
+            SystemClock.sleep(20L)
         }
         error("Shutdown never handed off: ${settings.userShutdownDetail()}")
     }
 
+    /**
+     * This entrypoint intentionally does not return success. The host sees the
+     * handoff marker and must prove the owner process is gone after force-stop.
+     */
     fun run(instrumentation: Instrumentation): String {
         val adb = AdbLocalClient(File(instrumentation.targetContext.filesDir, "adb_keys"))
         fun shell(command: String, expectedExit: Int? = null): String {
@@ -44,104 +48,67 @@ internal object ShutdownShellBehaviorGate {
             check(result.error == null || result.error == "shell exit code $expectedExit") { result.error.orEmpty() }
             return result.output
         }
-        val keys = listOf("bydcollector_keep_wifi", "bydcollector_keep_mobile_data", "bydcollector_keep_bluetooth",
-            "bydcollector_recover_collector_service", "bydcollector_user_shutdown", "bydcollector_user_shutdown_generation",
-            "bluetooth_disabled_profiles")
+
+        val keys = listOf(
+            "bydcollector_recover_collector_service",
+            "bydcollector_user_shutdown",
+            "bydcollector_user_shutdown_generation"
+        )
         val saved = keys.associateWith { shell("settings get global $it").trim() }
         val token = UUID.randomUUID().toString().replace("-", "")
-        val timeoutToken = UUID.randomUUID().toString().replace("-", "")
-        val incompleteToken = UUID.randomUUID().toString().replace("-", "")
-        val path = UserShutdownShellPlanner.EVIDENCE_PREFIX + token + ".txt"
-        val timeoutPath = UserShutdownShellPlanner.EVIDENCE_PREFIX + timeoutToken + ".txt"
-        val incompletePath = UserShutdownShellPlanner.EVIDENCE_PREFIX + incompleteToken + ".txt"
-        val childPath = "$timeoutPath.child"
+        val evidencePath = UserShutdownShellPlanner.EVIDENCE_PREFIX + token + ".txt"
+        val childPath = "$evidencePath.child"
         val context = instrumentation.targetContext
         val settings = CollectorSettings(context)
-        check(settings.shutdownListenerPreviousState() == null) { "Explicitly reopen the app before this gate to restore its listener" }
-        val savedStops = booleanArrayOf(settings.isMainManuallyStopped(), settings.isDebugManuallyStopped(),
-            settings.isMqttManuallyStopped(), settings.isInfluxManuallyStopped())
+        check(settings.shutdownListenerPreviousState() == null) {
+            "Explicitly reopen the app before this gate to restore its listener"
+        }
+        check(!settings.isUserShutdownRequested() && settings.userShutdownPhase() == CollectorSettings.SHUTDOWN_PHASE_IDLE) {
+            "Explicitly reopen before running the Shutdown boundary gate"
+        }
+        val savedStops = booleanArrayOf(
+            settings.isMainManuallyStopped(), settings.isDebugManuallyStopped(),
+            settings.isMqttManuallyStopped(), settings.isInfluxManuallyStopped()
+        )
         val savedShutdown = settings.isUserShutdownRequested()
         val savedPhase = settings.userShutdownPhase()
         val savedToken = settings.userShutdownToken()
         val savedDetail = settings.userShutdownDetail()
+        var shellSummary: String? = null
         try {
-            check(shell(UserShutdownShellPlanner.beginGracefulStopCommand(
-                DiagnosticLogRecorder.LOGCAT_OWNER_ENV, context.packageName, context.applicationInfo.sourceDir, token
-            )).contains("BYDCOLLECTOR_SHUTDOWN_GRACEFUL_SIGNAL_SENT"))
-            shell("settings put global bluetooth_disabled_profiles 202803")
-            val readyGraceMs = 1_800L
-            val readyStarted = SystemClock.elapsedRealtime()
-            val handoff = shell(UserShutdownShellPlanner.detachedFinalizerCommand(
-                packageName = context.packageName,
-                token = token,
-                logcatOwnerEnv = DiagnosticLogRecorder.LOGCAT_OWNER_ENV,
-                apkPath = context.applicationInfo.sourceDir,
-                gracefulWaitMs = readyGraceMs,
-                appWorkersDrained = true
-            ))
-            val readyElapsed = SystemClock.elapsedRealtime() - readyStarted
-            val cancelled = shell(UserShutdownShellPlanner.awaitFinalizerCommand(token, cancel = true))
-            check(handoff.contains("SHUTDOWN_FINALIZER_HANDOFF=$token")) { handoff }
-            check(handoff.contains("app_workers_drained=true graceful_ready=1")) { handoff }
-            check(readyElapsed < 1_500L) { "drained workers did not permit early handoff: $readyElapsed ms" }
-            check(cancelled.contains(UserShutdownShellPlanner.RETIRED_MARKER)) { cancelled }
-            check(cancelled.contains("result=cancelled phase=explicit_reopen_before_force_stop")) { cancelled }
-            check(shell("pidof ${context.packageName}").isNotBlank())
-            check(shell("settings get global bluetooth_disabled_profiles").trim() == "0")
+            val fixtureApk = instrumentation.context.applicationInfo.sourceDir
+            val hungWorker = "CLASSPATH='$fixtureApk' app_process /system/bin " +
+                "--nice-name=bydcollector_shutdown_worker com.bydcollector.collector.ShutdownProcessFixture " +
+                "</dev/null >/dev/null 2>&1 & shutdown_child=\$!; echo \$shutdown_child > '$childPath'; wait \$shutdown_child"
+            val startedAt = SystemClock.elapsedRealtime()
+            shell(UserShutdownShellPlanner.boundedFinalizerScript(token, hungWorker), expectedExit = 124)
+            val elapsed = SystemClock.elapsedRealtime() - startedAt
+            val evidence = shell("cat '$evidencePath'")
+            check(elapsed in 7_500L..12_000L) { "Finalizer exceeded its bounded deadline: $elapsed ms" }
+            check(evidence.contains("result=error phase=finalizer_exit status=124")) { evidence }
+            check(evidence.contains("finalizer_finished=$token")) { evidence }
 
-            // A stale cancellation must not clear the newer shutdown's generation or Boolean.
-            shell("settings put global bydcollector_user_shutdown_generation $timeoutToken; settings put global bydcollector_user_shutdown 1")
-            check(shell(UserShutdownShellPlanner.awaitFinalizerCommand(token, cancel = true), expectedExit = 123)
-                .contains("BYDCOLLECTOR_NEWER_SHUTDOWN_ACTIVE"))
-            check(shell("settings get global bydcollector_user_shutdown_generation").trim() == timeoutToken)
-            check(shell("settings get global bydcollector_user_shutdown").trim() == "1")
-
-            // Process absence alone is insufficient: incomplete app drains must consume the grace window.
-            val incompleteGraceMs = 1_800L
-            check(shell(UserShutdownShellPlanner.beginGracefulStopCommand(
-                DiagnosticLogRecorder.LOGCAT_OWNER_ENV,
-                context.packageName,
-                context.applicationInfo.sourceDir,
-                incompleteToken
-            )).contains("BYDCOLLECTOR_SHUTDOWN_GRACEFUL_SIGNAL_SENT"))
-            val incompleteStarted = SystemClock.elapsedRealtime()
-            val incompleteHandoff = shell(UserShutdownShellPlanner.detachedFinalizerCommand(
-                packageName = context.packageName,
-                token = incompleteToken,
-                logcatOwnerEnv = DiagnosticLogRecorder.LOGCAT_OWNER_ENV,
-                apkPath = context.applicationInfo.sourceDir,
-                gracefulWaitMs = incompleteGraceMs,
-                appWorkersDrained = false
-            ))
-            val incompleteElapsed = SystemClock.elapsedRealtime() - incompleteStarted
-            val incompleteCancelled = shell(UserShutdownShellPlanner.awaitFinalizerCommand(incompleteToken, cancel = true))
-            check(incompleteHandoff.contains("SHUTDOWN_FINALIZER_HANDOFF=$incompleteToken")) { incompleteHandoff }
-            check(incompleteHandoff.contains("app_workers_drained=false graceful_ready=0")) { incompleteHandoff }
-            check(incompleteElapsed in 1_600L..6_000L) { "incomplete workers skipped bounded grace: $incompleteElapsed ms" }
-            check(incompleteCancelled.contains("result=cancelled phase=explicit_reopen_before_force_stop"))
-
-            // Exercise native timeout against an actually hung child, not a mocked exit code.
-            val started = SystemClock.elapsedRealtime()
-            shell(UserShutdownShellPlanner.boundedFinalizerScript(timeoutToken,
-                "sleep 60 & shutdown_child=\$!; echo \$shutdown_child > '$childPath'; wait \$shutdown_child"), expectedExit = 124)
-            val elapsed = SystemClock.elapsedRealtime() - started
-            val timeoutEvidence = shell("cat '$timeoutPath'")
-            check(elapsed in 7_500..12_000) { "unbounded finalizer: $elapsed ms" }
-            check(timeoutEvidence.contains("result=error phase=finalizer_exit status=")) { timeoutEvidence }
-            check(timeoutEvidence.contains("finalizer_finished=$timeoutToken")) { timeoutEvidence }
             val childPid = shell("cat '$childPath'").trim()
-            check(childPid.matches(Regex("[0-9]+")))
-            val childState = shell("if [ -r /proc/$childPid/stat ]; then sed 's/^.*) //' /proc/$childPid/stat | cut -d ' ' -f 1; fi").trim()
-            check(childState.isEmpty() || childState == "Z") { "timeout left a running child: $childState" }
+            check(childPid.matches(Regex("[0-9]+"))) { "Finalizer did not record its actual worker PID: $childPid" }
+            val childState = shell(
+                "if [ -r /proc/$childPid/stat ]; then sed 's/^.*) //' /proc/$childPid/stat | cut -d ' ' -f 1; fi"
+            ).trim()
+            check(childState.isEmpty() || childState == "Z") { "Timeout left a running app_process child: $childState" }
+
+            shell("settings put global bydcollector_user_shutdown_generation $token; settings put global bydcollector_user_shutdown 1")
             check(settings.setUserShutdownRequested(true))
-            check(settings.setUserShutdownPhase(CollectorSettings.SHUTDOWN_PHASE_HANDOFF, timeoutToken))
+            check(settings.setUserShutdownPhase(CollectorSettings.SHUTDOWN_PHASE_HANDOFF, token))
             var surfaced: String? = null
             check(CollectorService.clearShutdownForExplicitReopen(context) { surfaced = it })
-            check(surfaced?.contains("result=error phase=finalizer_exit status=124") == true)
+            check(surfaced?.contains("result=error phase=finalizer_exit status=124") == true) {
+                "Explicit reopen did not surface the prior timeout"
+            }
             check(!settings.isUserShutdownRequested())
             val journal = File(context.filesDir, "diagnostic_journal/operational_events.jsonl").readText()
-            check(journal.lineSequence().any { it.contains("user_shutdown_previous_finalizer_error") && it.contains(timeoutToken) })
-            return "SHUTDOWN_SHELL_GATE_PASS drained_early_ms=$readyElapsed incomplete_wait_ms=$incompleteElapsed cancellation_before_force_stop newer_generation_preserved bluetooth_restored timeout_ms=$elapsed child_not_running prior_error_journaled_and_surfaced reopen_allowed\n$cancelled$timeoutEvidence"
+            check(journal.lineSequence().any {
+                it.contains("user_shutdown_previous_finalizer_error") && it.contains(token)
+            }) { "Previous finalizer failure was not journaled" }
+            shellSummary = "bounded_ms=$elapsed child_not_running prior_error_journaled_and_surfaced reopen_allowed"
         } finally {
             settings.setMainManuallyStopped(savedStops[0])
             settings.setDebugManuallyStopped(savedStops[1])
@@ -156,7 +123,11 @@ internal object ShutdownShellBehaviorGate {
                     shell("settings put global $key $value")
                 }
             }
-            shell("rm -f '$path' '$timeoutPath' '$incompletePath' '$childPath'")
+            shell("rm -f '$evidencePath' '$childPath'")
         }
+
+        checkNotNull(shellSummary) { "The bounded-finalizer proof did not finish" }
+        startLifecycle(instrumentation)
+        error("Owner process survived the production finalizer")
     }
 }

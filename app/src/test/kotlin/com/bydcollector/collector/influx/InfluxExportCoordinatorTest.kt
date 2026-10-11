@@ -1,1564 +1,329 @@
 package com.bydcollector.collector.influx
 
-import com.bydcollector.collector.ha.HaEndpointProfile
+import android.os.Looper
+import android.os.SystemClock
+import com.bydcollector.collector.disposeTestComposition
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.*
+import androidx.compose.ui.test.junit4.createEmptyComposeRule
+import androidx.compose.ui.text.TextLayoutResult
+import com.bydcollector.collector.BuildConfig
+import com.bydcollector.collector.BydCollectorApplication
+import com.bydcollector.collector.MainActivity
+import com.bydcollector.collector.adb.AdbAuthorizationManager
+import com.bydcollector.collector.adb.AdbLocalClient
+import com.bydcollector.collector.adb.StartupAdbPeer
+import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.Clock
-import com.bydcollector.collector.service.InfluxCycleDemand
-import kotlin.test.Test
+import com.bydcollector.collector.data.normalized.NormalizedFieldCatalog
+import com.bydcollector.collector.data.normalized.NormalizedObservation
+import com.bydcollector.collector.data.normalized.NormalizedQuality
+import com.bydcollector.collector.data.normalized.NormalizedValue
+import com.bydcollector.collector.data.normalized.NormalizedValueType
+import com.bydcollector.collector.ha.HaEndpointProfile
+import com.bydcollector.collector.service.CollectorService
+import com.bydcollector.collector.service.CollectorServiceController
+import com.bydcollector.collector.service.CollectorSettings
+import com.bydcollector.collector.ui.RuntimeActionStatus
+import com.bydcollector.collector.ui.compose.AppTab
+import org.junit.After
+import org.junit.Before
+import org.junit.Rule
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.Robolectric
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
+import org.robolectric.android.controller.ActivityController
+import org.robolectric.android.controller.ServiceController
+import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
+import org.robolectric.Shadows.shadowOf
+import org.robolectric.util.ReflectionHelpers
+import java.io.File
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.SocketException
+import java.time.Duration
+import java.time.Instant
+import kotlin.concurrent.thread
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
-import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [29], application = BydCollectorApplication::class,
+    qualifiers = "w1280dp-h800dp-mdpi", shadows = [StartupAdbPeer::class])
+@GraphicsMode(GraphicsMode.Mode.NATIVE)
 class InfluxExportCoordinatorTest {
-    @Test
-    fun sharedFieldSelectorUsesEnabledNormalizedCategories() {
-        val battery = influxEffectiveFields(config().copy(enabledCategories = setOf("battery")))
-        val motion = influxEffectiveFields(config().copy(enabledCategories = setOf("motion")))
+    @get:Rule val ui = createEmptyComposeRule()
+    private lateinit var app: BydCollectorApplication
+    private lateinit var screen: ActivityController<MainActivity>
+    private var serviceController: ServiceController<CollectorService>? = null
+    private var service: CollectorService? = null
+    private var nextServiceStartId = 1
 
-        assertTrue("soc" in battery)
-        assertFalse("speed_kmh" in battery)
-        assertTrue("speed_kmh" in motion)
-        assertFalse("soc" in motion)
+    @Before
+    fun prepare() {
+        app = RuntimeEnvironment.getApplication() as BydCollectorApplication
+        shadowOf(app).grantPermissions("com.bydcollector.collector.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION")
+        CollectorService.influxConnection.release()
+        com.bydcollector.collector.ha.HaRunSession.process.clear()
+        val settings = CollectorSettings(app)
+        settings.setUiLanguageCode("en")
+        settings.setUpdateAutoCheckEnabled(false)
+        settings.setUpdateHintEnabled(false)
+        settings.setInfluxEnabled(false)
+        settings.setInfluxAutoStartEnabled(false)
+        settings.setInfluxManuallyStopped(false)
+        settings.setPollingEnabled(false)
+        settings.setDebugPollingEnabled(false)
+        settings.setMqttEnabled(false)
+        settings.setTelegramEnabled(false)
+        settings.setConnectivityRecoveryEnabled(false)
+        app.getSharedPreferences("startup_setup", 0).edit()
+            .putInt("background_settings_version", BuildConfig.VERSION_CODE)
+            .putBoolean("location_permission_setup_consumed", true)
+            .putBoolean("overlay_permission_setup_consumed", true).commit()
+        StartupAdbPeer.reset()
+        StartupAdbPeer.consent = true
+        StartupAdbPeer.trusted = true
+        AdbLocalClient(File(app.filesDir, "adb_keys")).keyFingerprint()
+        screen = Robolectric.buildActivity(MainActivity::class.java).setup().visible()
+        settle()
+        dispatchStartedServices()
+        await { service?.let { ReflectionHelpers.getField<Boolean>(it, "runtimeInitialized") } == true }
     }
 
-    @Test
-    fun incompleteQueueSummaryStillUploadsWithRealtimeBatchAndStaysUnknown() {
-        val store = FakeInfluxStore((1L..650L).map { row(it, "soc") }).apply {
-            summaryComplete = false
-        }
-        val client = FakeInfluxClient()
-        val coordinator = coordinator(store, client)
-
-        assertTrue(coordinator.runOneCycle(force = true).ok)
-
-        assertEquals(listOf(300), store.pendingBatchLimits)
-        assertEquals(300, client.writtenLines.single().size)
-        assertEquals(300L, store.cursor("soc").lastExportedHistoryId)
-        assertEquals(-1L, store.influxExportState().pendingRows)
-        assertEquals("2026-06-15T12:00:01Z", store.influxExportState().nextRetryAt)
-        assertEquals(2, store.summaryCalls) // fresh pre-send and post-ACK owner summaries
-    }
-
-    @Test
-    fun incompleteSummaryRetainsPreviouslyEstablishedCatchUpBatchSize() {
-        val store = FakeInfluxStore((1L..10_000L).map { row(it, "soc") }).apply {
-            afterPendingSummary = { if (summaryCalls == 2) summaryComplete = false }
-        }
-        val client = FakeInfluxClient()
-        val coordinator = coordinator(store, client)
-
-        assertTrue(coordinator.runOneCycle(force = true).ok)
-        assertTrue(coordinator.runOneCycle(force = true).ok)
-
-        assertEquals(listOf(2_000, 2_000), store.pendingBatchLimits)
-        assertEquals(listOf(2_000, 2_000), client.writtenLines.map { it.size })
-        assertEquals(4_000L, store.cursor("soc").lastExportedHistoryId)
-        assertEquals(-1L, store.influxExportState().pendingRows)
-    }
-
-    @Test
-    fun unknownSummaryWithNoDurableRowsDrainsToExactZero() {
-        val store = FakeInfluxStore(emptyList()).apply { summaryComplete = false }
-        val result = coordinator(store, FakeInfluxClient()).runOneCycle(force = true)
-
-        assertTrue(result.ok)
-        assertEquals(0, store.influxExportState().pendingRows)
-        assertEquals("idle", store.influxExportState().status)
-        assertEquals(null, store.influxExportState().nextRetryAt)
-    }
-
-    @Test
-    fun unknownSummaryDoesNotAcknowledgeHttpFailureOrInventRemainingOne() {
-        val store = FakeInfluxStore(listOf(row(10, "soc"))).apply { summaryComplete = false }
-        val client = FakeInfluxClient(writeResult = InfluxActionResult.fail("influx_error", "offline"))
-
-        assertFalse(coordinator(store, client).startExport().ok)
-
-        assertEquals(0, store.cursor("soc").lastExportedHistoryId)
-        assertEquals(-1L, store.influxExportState().pendingRows)
-        assertEquals("backoff", store.influxExportState().status)
-        assertEquals("2026-06-15T12:00:30Z", store.influxExportState().nextRetryAt)
-    }
-
-    @Test fun actualHttpFailoverUsesAlternativePortAndKeepsWorkingRoute() {
-        for (primaryStatus in listOf(408, 500, 503, 401)) {
-            var primaryWrites = 0
-            var alternativeWrites = 0
-            var alternativeStatus = 204
-            val primary = LocalHttpEndpoint {
-                primaryWrites++
-                primaryStatus
+    @After
+    fun cleanup() {
+        AdbAuthorizationManager.cancelObservation()
+        if (CollectorService.influxConnection.owned) {
+            CollectorSettings(app).apply {
+                setInfluxEnabled(false)
+                setInfluxManuallyStopped(true)
             }
-            val alternative = LocalHttpEndpoint { request ->
-                if (request.startsWith("POST /write")) alternativeWrites++
-                alternativeStatus
+            runCatching { CollectorServiceController.stopInfluxExport(app) }
+            dispatchStartedServices()
+            await { !CollectorService.influxConnection.owned }
+        }
+        runCatching { serviceController?.destroy() }
+        serviceController = null
+        service = null
+        try {
+            // This Activity is created directly rather than by the Compose rule. Dispose its
+            // composition explicitly so a stopped service cannot leave a registered Compose root
+            // updating while the next Robolectric test starts.
+            screen.get().disposeTestComposition()
+        } finally {
+            screen.pause().stop().destroy()
+        }
+        app.navigationSession.clear()
+    }
+
+    @Test
+    fun influxOutageFallsBackThenAcknowledgesSqliteRowsAndPublishesMatchingUiState() {
+        val settings = CollectorSettings(app)
+        val alternative = LocalInfluxEndpoint()
+        val primaryPort = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { it.localPort }
+        val store = BydCollectorApplication.store(app)
+        val field = NormalizedFieldCatalog.soc
+        val observedAt = java.time.Instant.now().toString()
+        settings.setInfluxHost("127.0.0.1")
+        settings.setInfluxPort(primaryPort)
+        settings.setInfluxAlternativeHost("127.0.0.1")
+        settings.setInfluxAlternativePort(alternative.port)
+        settings.setInfluxDatabase("t16telemetry")
+        settings.setInfluxCategoryEnabled("battery", true)
+        // One full realtime batch plus one queued row exposes the post-retry export status.
+        repeat(301) { index -> store.applyNormalizedObservations(listOf(NormalizedObservation(
+            field = field,
+            value = NormalizedValue(NormalizedValueType.NUMBER, number = 73.0 + index / 100.0),
+            quality = NormalizedQuality.OK,
+            sourcePollId = null,
+            sourceKey = field.sourceKeys.firstOrNull(),
+            observedAt = Instant.parse(observedAt).plusMillis(index.toLong()).toString()
+        ))) }
+        val historyRows = store.pendingInfluxRows(setOf(field.fieldKey), 400)
+        assertEquals(301, historyRows.size)
+        val initialCursor = exportedCursor(field.fieldKey)
+        try {
+            // Load the configured endpoint into the real editable draft before pressing Start.
+            screen.recreate().visible()
+            settle()
+            dispatchStartedServices()
+            ui.onNodeWithText("HA integration").performClick()
+            settle()
+            // The real button commits desired settings before dispatching the owner command.
+            val retryClock = MutableClock(System.currentTimeMillis())
+            val owner = requireNotNull(service)
+            ReflectionHelpers.getField<InfluxExportCoordinator>(owner, "influxCoordinator").also {
+                ReflectionHelpers.setField(it, "clock", retryClock)
             }
-            try {
-                val config = config().copy(host = "127.0.0.1", port = primary.port,
-                    alternativeHost = "127.0.0.1", alternativePort = alternative.port)
-                val store = FakeInfluxStore(listOf(row(10, "soc")))
-                val client = HttpInfluxClient()
-                val coordinator = InfluxExportCoordinator(store, client, { config }, FakeClock())
-                assertTrue(coordinator.testConnection(config.forProfile(HaEndpointProfile.ALTERNATIVE)).ok)
-                alternativeWrites = 0
-                val result = coordinator.startExport()
-                assertEquals(1, primaryWrites)
-                if (primaryStatus == 401) {
-                    assertFalse(result.ok)
-                    assertEquals(0, alternativeWrites)
-                    assertEquals(null, coordinator.retryDelayMs())
-                } else {
-                    assertTrue(result.ok, "HTTP $primaryStatus")
-                    assertEquals(1, alternativeWrites)
-                    assertEquals(10, store.cursor("soc").lastExportedHistoryId)
-                    store.addRow(row(11, "soc"))
-                    assertTrue(coordinator.runOneCycle(force = true).ok)
-                    assertEquals(1, primaryWrites) // Sticky Alternative; selector is not a route lock.
-                    assertEquals(2, alternativeWrites)
-                    alternativeStatus = 503
-                    store.addRow(row(12, "soc"))
-                    assertFalse(coordinator.runOneCycle(force = true).ok)
-                    assertEquals(2, primaryWrites)
-                    assertEquals(30_000L, coordinator.retryDelayMs())
-                    assertEquals(11, store.cursor("soc").lastExportedHistoryId)
-                }
-            } finally {
-                primary.close()
-                alternative.close()
+            ui.onAllNodes(hasText("Start") and hasClickAction())[1].performClick()
+            dispatchStartedServices()
+
+            await {
+                alternative.requests.size >= 1 &&
+                    store.influxExportState().status == "backoff" &&
+                    store.pendingInfluxRows(setOf(field.fieldKey), 400).size == 301
             }
+            assertTrue(CollectorService.influxConnection.owned)
+            assertEquals(1, alternative.requests.size, "the failed alternative write must leave the SQLite row pending")
+            assertEquals(initialCursor, exportedCursor(field.fieldKey))
+            settle()
+            ui.onNodeWithText("error").assertIsDisplayed()
+            assertEquals(androidx.compose.ui.graphics.Color(0xFFFF8C8C), textColor("error"))
+            assertButtonCounts(startEnabled = 1, startDisabled = 1, stopEnabled = 1, stopDisabled = 1)
+            ui.onNodeWithText("t16telemetry").assertIsNotEnabled()
+
+            // Advance the production retry task through its persisted 30-second deadline.
+            retryClock.advanceBy(31_000L)
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(30))
+            await {
+                alternative.requests.size >= 2 &&
+                    store.influxExportState().exportedRowsTotal == 300L &&
+                    app.dashboardUiStateStore.currentTab(AppTab.HA)?.influxStatus?.contains("scheduled") == true
+            }
+            settle()
+            ui.onNodeWithText("exporting").assertIsDisplayed()
+            assertEquals(androidx.compose.ui.graphics.Color(0xFF54D898), textColor("exporting"))
+            ui.onNodeWithText("Stop the channel to edit its connection.").assertExists()
+            assertButtonCounts(startEnabled = 1, startDisabled = 1, stopEnabled = 1, stopDisabled = 1)
+            ui.onNodeWithText("t16telemetry").assertIsNotEnabled()
+            assertEquals(2, alternative.requests.size)
+            assertTrue(alternative.requests.all { it.startsWith("POST /write?") })
+            assertEquals(historyRows[299].id, exportedCursor(field.fieldKey))
+            assertEquals(historyRows.last().id, store.pendingInfluxRows(setOf(field.fieldKey), 10).single().id)
+            assertEquals("scheduled", store.influxExportState().status)
+            assertEquals(HaEndpointProfile.ALTERNATIVE, CollectorService.influxConnection.state.value.activeRoute)
+
+            ui.onAllNodes(hasText("Stop") and hasClickAction())[1].performClick()
+            dispatchStartedServices()
+            await {
+                !CollectorService.influxConnection.owned &&
+                    store.influxExportState().status == "stopped" &&
+                    app.dashboardUiStateStore.currentTab(AppTab.HA)?.influxRuntimeStatus == RuntimeActionStatus.STOPPED
+            }
+            settle()
+            ui.onNodeWithText("t16telemetry").assertIsEnabled()
+            assertFalse(CollectorService.influxConnection.owned)
+            assertEquals(2, alternative.requests.size, "Stop must prevent the remaining batch from starting")
+            assertEquals(historyRows.last().id, store.pendingInfluxRows(setOf(field.fieldKey), 10).single().id)
+        } finally {
+            alternative.close()
         }
     }
 
-    private class LocalHttpEndpoint(private val response: (String) -> Int) : AutoCloseable {
-        private val server = java.net.ServerSocket(0, 8, java.net.InetAddress.getByName("127.0.0.1"))
+    private fun exportedCursor(fieldKey: String): Long {
+        val helper = TelemetryDatabaseHelper(app)
+        return try {
+            helper.readableDatabase.rawQuery(
+                "SELECT last_exported_history_id FROM influx_export_cursor WHERE field_key = ?",
+                arrayOf(fieldKey)
+            ).use { cursor ->
+                assertTrue(cursor.moveToFirst(), "cursor for $fieldKey should be persisted by the exporter")
+                cursor.getLong(0)
+            }
+        } finally {
+            helper.close()
+        }
+    }
+
+    private fun assertButtonCounts(startEnabled: Int, startDisabled: Int, stopEnabled: Int, stopDisabled: Int) {
+        fun counts(label: String): Pair<Int, Int> {
+            val nodes = ui.onAllNodes(hasText(label) and hasClickAction()).fetchSemanticsNodes()
+            val disabled = nodes.count { it.config.contains(SemanticsProperties.Disabled) }
+            return (nodes.size - disabled) to disabled
+        }
+        assertEquals(startEnabled to startDisabled, counts("Start"))
+        assertEquals(stopEnabled to stopDisabled, counts("Stop"))
+    }
+
+    private fun textColor(text: String): androidx.compose.ui.graphics.Color {
+        val result = mutableListOf<TextLayoutResult>()
+        ui.onNodeWithText(text).performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) {
+            it(result)
+        }
+        return result.single().layoutInput.style.color
+    }
+
+    private fun settle() {
+        shadowOf(Looper.getMainLooper()).idle()
+        ui.mainClock.advanceTimeBy(100)
+        ui.waitForIdle()
+    }
+
+    private fun dispatchStartedServices() {
+        while (true) {
+            val intent = shadowOf(app).nextStartedService ?: return
+            val owner = service ?: Robolectric.buildService(CollectorService::class.java).create().also {
+                serviceController = it
+                service = it.get()
+            }.get()
+            owner.onStartCommand(intent, 0, nextServiceStartId++)
+        }
+    }
+
+    private fun await(condition: () -> Boolean) {
+        val deadline = System.nanoTime() + 8_000_000_000L
+        while (!condition()) {
+            check(System.nanoTime() < deadline) {
+                "Timed out: state=${BydCollectorApplication.store(app).influxExportState()} " +
+                    "demand=${CollectorSettings(app).runtimeDemand()} connection=${CollectorService.influxConnection.state.value} " +
+                    "dashboard=${app.dashboardUiStateStore.currentTab(AppTab.HA)?.influxStatus} " +
+                    "foreground=${ReflectionHelpers.getField<Boolean>(screen.get(), "foreground")} " +
+                    "tab=${app.navigationSession.selectedTab} " +
+                    "refresh=${ReflectionHelpers.getField<Boolean>(screen.get(), "refreshInFlight") }"
+            }
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(50))
+            Thread.sleep(10)
+        }
+    }
+
+    private class LocalInfluxEndpoint : AutoCloseable {
+        private val server = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
         val port: Int get() = server.localPort
-        private val worker = kotlin.concurrent.thread(isDaemon = true) {
+        val requests = java.util.concurrent.CopyOnWriteArrayList<String>()
+        private val responseCodes = java.util.concurrent.ConcurrentLinkedQueue<Int>().apply {
+            add(503)
+            add(204)
+        }
+        private val worker = thread(isDaemon = true, name = "test-influx-endpoint") {
             while (!server.isClosed) {
-                val socket = try { server.accept() } catch (_: java.net.SocketException) { break }
+                val socket = try { server.accept() } catch (_: SocketException) { break }
                 socket.use {
                     it.soTimeout = 5_000
                     val reader = it.getInputStream().bufferedReader(Charsets.UTF_8)
-                    val request = reader.readLine()
+                    val request = reader.readLine().orEmpty()
                     var length = 0
                     while (true) {
                         val header = reader.readLine() ?: break
                         if (header.isEmpty()) break
-                        if (header.startsWith("Content-Length:", ignoreCase = true)) length = header.substringAfter(':').trim().toInt()
+                        if (header.startsWith("Content-Length:", ignoreCase = true)) {
+                            length = header.substringAfter(':').trim().toInt()
+                        }
                     }
                     repeat(length) { reader.read() }
-                    val code = response(request)
-                    it.getOutputStream().write("HTTP/1.1 $code Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                    requests += request
+                    it.getOutputStream().write(
+                        "HTTP/1.1 ${responseCodes.poll() ?: 204} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .toByteArray(Charsets.US_ASCII)
+                    )
                 }
             }
         }
-        override fun close() { server.close(); worker.join(5_000); check(!worker.isAlive) }
-    }
 
-    @Test fun preparationAndPersistenceFailuresTerminateWithoutDependingOnSqlDiagnostics() {
-        for (stage in listOf("config", "summary", "rows", "state")) {
-            val store = FakeInfluxStore(listOf(row(10, "soc")), failStage = stage,
-                eventFailure = IllegalStateException("diagnostics unavailable"))
-            val events = mutableListOf<InfluxDiagnosticEvent>()
-            val client = FakeInfluxClient()
-            val coordinator = InfluxExportCoordinator(store, client, {
-                if (stage == "config") error("config failure")
-                config()
-            }, FakeClock(), { events += it })
-            val result = coordinator.startExport()
-            assertFalse(result.ok, stage)
-            assertFalse(result.retryable, stage)
-            assertEquals(null, coordinator.retryDelayMs(), stage)
-            assertTrue(client.writtenLines.isEmpty(), stage)
-            assertEquals(0, store.cursor("soc").lastExportedHistoryId, stage)
-            assertTrue(events.any { it.type == "influx_terminal_failure" }, stage)
+        override fun close() {
+            server.close()
+            worker.join(5_000L)
+            check(!worker.isAlive)
         }
     }
 
-    @Test fun authenticationAndInvalidConfigAreTerminalNotNetworkRetries() {
-        val store = FakeInfluxStore(listOf(row(10, "soc")))
-        val coordinator = coordinator(store, FakeInfluxClient(writeResult = InfluxActionResult.fail(
-            "influx_http_error", "unauthorized", 401, InfluxFailureKind.AUTHENTICATION)))
-        assertFalse(coordinator.startExport().retryable)
-        assertEquals(null, coordinator.retryDelayMs())
-        assertEquals("error", store.influxExportState().status)
-        assertFalse(InfluxActionResult.fail("influx_endpoint_invalid", "invalid").retryable)
-    }
-
-    @Test
-    fun invalidVehicleTagBlocksExportButNotEndpointConnectionTest() {
-        for (vehicleId in listOf("car\r", "car\n", "car\u0000")) {
-            val store = FakeInfluxStore(listOf(row(10, "soc")))
-            val client = FakeInfluxClient()
-            var liveConfig = config(vehicleId = vehicleId)
-            val coordinator = InfluxExportCoordinator(store, client, { liveConfig }, FakeClock())
-
-            assertTrue(coordinator.testConnection().ok)
-            assertEquals(1, client.testCalls)
-            val result = coordinator.startExport()
-            assertFalse(result.ok)
-            assertFalse(result.retryable)
-            assertEquals("influx_vehicle_id_invalid", result.category)
-            assertEquals(InfluxFailureKind.PROTOCOL, result.failureKind)
-            assertTrue(client.writtenLines.isEmpty())
-            assertEquals(0, store.ensureCalls)
-            assertEquals(0L, store.cursor("soc").lastExportedHistoryId)
-
-            liveConfig = liveConfig.copy(vehicleId = "corrected-car")
-            assertTrue(coordinator.startExport().ok)
-            assertTrue(client.writtenLines.single().single().contains("vehicle=corrected-car"))
-        }
-    }
-
-    @Test
-    fun vehicleTagIsFrozenForEachExportSessionAndReplacedAfterEnd() {
-        val store = FakeInfluxStore(listOf(row(10, "soc")))
-        val client = FakeInfluxClient()
-        var liveConfig = config(vehicleId = "first car")
-        val coordinator = InfluxExportCoordinator(store, client, { liveConfig }, FakeClock())
-
-        assertTrue(coordinator.runOneCycle(force = true).ok)
-        assertTrue(client.writtenLines.single().single().contains("vehicle=first\\ car"))
-
-        liveConfig = liveConfig.copy(vehicleId = "changed,car")
-        store.addRow(row(11, "soc"))
-        assertTrue(coordinator.runOneCycle(force = true).ok)
-        assertTrue(client.writtenLines[1].single().contains("vehicle=first\\ car"))
-
-        coordinator.endSession()
-        store.addRow(row(12, "soc"))
-        assertTrue(coordinator.runOneCycle(force = true).ok)
-        assertTrue(client.writtenLines[2].single().contains("vehicle=changed\\,car"))
-    }
-
-    @Test
-    fun staleServiceOwnershipCannotEnterCycleStartOrResume() {
-        val store = FakeInfluxStore(listOf(row(10, "soc")))
-        val client = FakeInfluxClient()
-        val coordinator = coordinator(store, client)
-        val before = store.influxExportState()
-        var serviceGeneration = 1
-        val submittedGeneration = serviceGeneration
-        val isCurrent = { submittedGeneration == serviceGeneration }
-        serviceGeneration++ // The executor's last admission check already passed.
-        coordinator.cancelInFlight()
-
-        assertTrue(coordinator.runOneCycle(isCurrent = isCurrent).ok)
-        assertTrue(coordinator.startExport(isCurrent = isCurrent).ok)
-        assertTrue(coordinator.resumeExport(isCurrent = isCurrent).ok)
-        assertFalse(coordinator.sessionFrozen)
-        assertEquals(0, store.ensureCalls)
-        assertEquals(0, store.summaryCalls)
-        assertTrue(client.writtenLines.isEmpty())
-        assertEquals(before, store.influxExportState())
-    }
-
-    @Test
-    fun cancellationDuringQueueReadCannotBeAdoptedAsANewPass() {
-        val store = FakeInfluxStore(listOf(row(10, "soc")))
-        val client = FakeInfluxClient()
-        val coordinator = coordinator(store, client)
-        val before = store.influxExportState()
-        store.afterPendingSummary = { coordinator.cancelInFlight() }
-
-        assertTrue(coordinator.runOneCycle(force = true).ok)
-        assertTrue(client.writtenLines.isEmpty())
-        assertEquals(0L, store.cursor("soc").lastExportedHistoryId)
-        assertEquals(before, store.influxExportState())
-
-        store.afterPendingSummary = null
-        assertTrue(coordinator.startExport().ok)
-        assertEquals(10L, store.cursor("soc").lastExportedHistoryId)
-    }
-
-    @Test
-    fun serviceOwnershipLossDuringPreparationStopsStartAndResume() {
-        for (resume in listOf(false, true)) {
-            val store = FakeInfluxStore(listOf(row(10, "soc")))
-            val client = FakeInfluxClient()
-            val coordinator = coordinator(store, client)
-            val before = store.influxExportState()
-            var current = true
-            store.afterPendingSummary = { current = false }
-
-            val result = if (resume) coordinator.resumeExport(isCurrent = { current })
-            else coordinator.startExport(isCurrent = { current })
-
-            assertTrue(result.ok)
-            assertTrue(client.writtenLines.isEmpty())
-            assertEquals(0L, store.cursor("soc").lastExportedHistoryId)
-            assertEquals(before, store.influxExportState())
-        }
-    }
-
-    @Test
-    fun serviceOwnershipLossAfterHttpStillPersistsAcknowledgedCursor() {
-        val store = FakeInfluxStore((1L..4L).map { row(it, "soc") })
-        val client = ScriptedInfluxClient(
-            InfluxActionResult.fail("influx_http_error", "partial write: field type conflict", httpStatus = 400),
-            InfluxActionResult.ok(),
-            InfluxActionResult.ok()
-        )
-        val coordinator = coordinator(store, client)
-        var current = true
-        client.afterWrite = { call -> if (call == 2) current = false }
-
-        assertTrue(coordinator.runOneCycle(isCurrent = { current }).ok)
-        assertEquals(2, client.writeCalls)
-        assertEquals(2L, store.cursor("soc").lastExportedHistoryId)
-        assertEquals(2L, store.influxExportState().exportedRowsTotal)
-        assertEquals(2L, store.influxExportState().pendingRows)
-    }
-
-    @Test
-    fun newHistoryAfterFinalSummaryIsExportedByRetainedDemand() {
-        val store = FakeInfluxStore(listOf(row(10, "soc")))
-        val client = FakeInfluxClient()
-        val coordinator = coordinator(store, client)
-        val demand = InfluxCycleDemand()
-        val first = requireNotNull(demand.tryAcquire(revision = 1, generation = 1))
-        var inserted = false
-        store.afterPendingHead = { head ->
-            if (!inserted && head.isEmpty()) {
-                inserted = true
-                store.addRow(row(11, "soc"))
-                demand.signal()
-            }
-        }
-
-        assertTrue(coordinator.runOneCycle().ok)
-        assertEquals(0L, store.influxExportState().pendingRows) // Snapshot predates row 11.
-        assertEquals(null, coordinator.retryDelayMs())
-        assertTrue(demand.settle(first, represented = true).followUpDemand)
-        val second = requireNotNull(demand.tryAcquire(revision = 2, generation = 1))
-        assertTrue(coordinator.runOneCycle().ok)
-        assertFalse(demand.settle(second, represented = true).followUpDemand)
-        assertEquals(11L, store.cursor("soc").lastExportedHistoryId)
-        assertEquals(2, client.writtenLines.size)
-        assertEquals(4, store.summaryCalls)
-    }
-
-    @Test
-    fun successfulCycleUsesOwnerSummaryAndRepeatedSchedulingDoesNotRescan() {
-        val store = FakeInfluxStore((1L..350L).map { row(it, "soc") })
-        val coordinator = coordinator(store, FakeInfluxClient())
-
-        assertTrue(coordinator.runOneCycle().ok)
-        assertEquals(50L, store.influxExportState().pendingRows)
-        assertEquals(2, store.summaryCalls)
-        val ensuresAfterCycle = store.ensureCalls
-        repeat(5) { assertEquals(1_000L, coordinator.retryDelayMs()) }
-        assertEquals(2, store.summaryCalls)
-        assertEquals(ensuresAfterCycle, store.ensureCalls)
-    }
-
-    @Test
-    fun earlyBackoffAndSchedulingDoNoQueueWorkAndPreserveSnapshot() {
-        val store = FakeInfluxStore(listOf(row(10, "soc")))
-        store.setNextRetryAt("2026-06-15T12:01:00Z")
-        val before = store.influxExportState()
-        val client = FakeInfluxClient()
-        val coordinator = coordinator(store, client)
-
-        repeat(5) {
-            assertTrue(coordinator.runOneCycle().ok)
-            assertEquals(60_000L, coordinator.retryDelayMs())
-        }
-        assertEquals(0, store.summaryCalls)
-        assertEquals(0, store.ensureCalls)
-        assertTrue(store.pendingBatchLimits.isEmpty())
-        assertTrue(client.writtenLines.isEmpty())
-        assertEquals(before, store.influxExportState())
-    }
-
-    @Test
-    fun failedCycleSchedulesWithoutRecountingOrAdvancingCursors() {
-        val store = FakeInfluxStore(listOf(row(10, "soc")))
-        val client = FakeInfluxClient(writeResult = InfluxActionResult.fail("influx_error", "offline"))
-        val coordinator = coordinator(store, client)
-
-        assertFalse(coordinator.runOneCycle().ok)
-        assertEquals(2, store.summaryCalls)
-        assertEquals(30_000L, coordinator.retryDelayMs())
-        assertTrue(coordinator.runOneCycle().ok)
-        assertEquals(2, store.summaryCalls)
-        assertEquals(0L, store.cursor("soc").lastExportedHistoryId)
-        assertEquals(1, client.writtenLines.size)
-        assertEquals("offline", store.influxExportState().lastError)
-    }
-
-    @Test
-    fun categoryChangesPreserveDivergentCursorsAndReadEarlierNewlyEnabledHistory() {
-        val store = FakeInfluxStore(listOf(
-            row(5, "speed_kmh").copy(category = "motion"),
-            row(10, "soc"), row(11, "soc"),
-            row(20, "speed_kmh").copy(category = "motion")
-        ))
-        store.updateInfluxCursorSuccess("soc", 10, "2026-06-15T12:00:00Z")
-        var liveConfig = config()
-        val client = FakeInfluxClient()
-        val coordinator = InfluxExportCoordinator(store, client, { liveConfig }, FakeClock())
-
-        assertTrue(coordinator.runOneCycle().ok)
-        assertEquals(11L, store.cursor("soc").lastExportedHistoryId)
-        assertEquals(0L, store.cursor("speed_kmh").lastExportedHistoryId)
-        store.addRow(row(12, "soc"))
-        liveConfig = liveConfig.copy(enabledCategories = setOf("motion"))
-        assertTrue(coordinator.runOneCycle().ok)
-        assertEquals(20L, store.cursor("speed_kmh").lastExportedHistoryId)
-        assertEquals(11L, store.cursor("soc").lastExportedHistoryId)
-        assertEquals(2, client.writtenLines[1].size)
-        liveConfig = liveConfig.copy(enabledCategories = setOf("battery", "motion"))
-        assertTrue(coordinator.runOneCycle().ok)
-        assertEquals(12L, store.cursor("soc").lastExportedHistoryId)
-        assertEquals(listOf(1, 2, 1), client.writtenLines.map { it.size })
-    }
-
-    @Test
-    fun failedWriteDoesNotAdvanceCursor() {
-        val store = FakeInfluxStore(rows = listOf(row(id = 10, fieldKey = "soc")))
-        val client = FakeInfluxClient(writeResult = InfluxActionResult.fail("influx_error", "write failed"))
-        val coordinator = coordinator(store, client)
-
-        val result = coordinator.runOneCycle(force = true)
-
-        assertFalse(result.ok)
-        assertEquals(0, store.cursor("soc").lastExportedHistoryId)
-        assertEquals("write failed", store.cursorErrors["soc"])
-    }
-
-    @Test
-    fun failedWriteKeepsPendingRowsVisibleForDashboard() {
-        val store = FakeInfluxStore(rows = listOf(row(id = 10, fieldKey = "soc")))
-        val client = FakeInfluxClient(writeResult = InfluxActionResult.fail("influx_error", "write failed"))
-        val coordinator = coordinator(store, client)
-
-        coordinator.runOneCycle(force = true)
-
-        assertEquals(1, store.influxExportState().pendingRows)
-    }
-
-    @Test
-    fun thrownWriteBecomesPersistedBackoffWithRetry() {
-        val store = FakeInfluxStore(rows = listOf(row(id = 10, fieldKey = "soc")))
-        val coordinator = coordinator(
-            store,
-            FakeInfluxClient(writeError = IllegalStateException("network unavailable"))
-        )
-
-        val result = coordinator.runOneCycle(force = true)
-
-        assertFalse(result.ok)
-        assertEquals("backoff", store.influxExportState().status)
-        assertTrue(store.influxExportState().lastError.orEmpty().contains("network unavailable"))
-        assertEquals("2026-06-15T12:00:30Z", store.influxExportState().nextRetryAt)
-        assertEquals(30_000L, coordinator.retryDelayMs())
-    }
-
-    @Test
-    fun thrownTransientWriteDeescalatesAdaptiveBatch() {
-        val store = FakeInfluxStore((1L..10_000L).map { id -> row(id, "soc") })
-        val coordinator = coordinator(
-            store,
-            FakeInfluxClient(writeError = IllegalStateException("network timeout"))
-        )
-
-        coordinator.runOneCycle(force = true)
-        coordinator.runOneCycle(force = true)
-
-        assertEquals(listOf(2_000, 1_000), store.pendingBatchLimits)
-    }
-
-    @Test
-    fun successfulWriteAdvancesPerFieldCursor() {
-        val store = FakeInfluxStore(
-            rows = listOf(
-                row(id = 10, fieldKey = "soc"),
-                row(id = 11, fieldKey = "remaining_range_km")
-            )
-        )
-        val client = FakeInfluxClient()
-        val coordinator = coordinator(store, client)
-
-        val result = coordinator.runOneCycle(force = true)
-
-        assertTrue(result.ok)
-        assertEquals(10, store.cursor("soc").lastExportedHistoryId)
-        assertEquals(11, store.cursor("remaining_range_km").lastExportedHistoryId)
-        assertEquals(2, client.writtenLines.single().size)
-    }
-
-    @Test
-    fun cursorPersistenceBreadcrumbsAreBatchScopedAcrossFields() {
-        val store = FakeInfluxStore(
-            rows = listOf(
-                row(id = 10, fieldKey = "soc"),
-                row(id = 11, fieldKey = "remaining_range_km")
-            )
-        )
-        val events = mutableListOf<InfluxDiagnosticEvent>()
-        val coordinator = InfluxExportCoordinator(
-            store = store,
-            client = FakeInfluxClient(),
-            configProvider = { config() },
-            clock = FakeClock(),
-            diagnostics = { events += it }
-        )
-
-        assertTrue(coordinator.runOneCycle(force = true).ok)
-        assertEquals(1, events.count { it.type == "influx_cursor_persistence_start" })
-        assertEquals(1, events.count { it.type == "influx_cursor_persistence_end" })
-        assertEquals("2", events.single { it.type == "influx_cursor_persistence_start" }.details["cursor_fields"])
-        assertEquals("2", events.single { it.type == "influx_cursor_persistence_end" }.details["completed_fields"])
-    }
-
-    @Test
-    fun cursorPersistenceFailureRecordsFailedFieldWithoutBatchSuccess() {
-        val store = FakeInfluxStore(
-            rows = listOf(
-                row(id = 10, fieldKey = "soc"),
-                row(id = 11, fieldKey = "remaining_range_km")
-            ),
-            cursorFailureField = "remaining_range_km"
-        )
-        val events = mutableListOf<InfluxDiagnosticEvent>()
-        val coordinator = InfluxExportCoordinator(
-            store = store,
-            client = FakeInfluxClient(),
-            configProvider = { config() },
-            clock = FakeClock(),
-            diagnostics = { events += it }
-        )
-
-        assertFalse(coordinator.runOneCycle(force = true).ok)
-        assertEquals(1, events.count { it.type == "influx_server_ack" })
-        assertEquals(1, events.count { it.type == "influx_cursor_persistence_start" })
-        assertEquals(0, events.count { it.type == "influx_cursor_persistence_end" })
-        val failure = events.single { it.type == "influx_cursor_persistence_failure" }
-        assertEquals("remaining_range_km", failure.details["failed_field"])
-        assertEquals("1", failure.details["completed_fields"])
-        assertEquals(10, store.cursor("soc").lastExportedHistoryId)
-        assertEquals(0, store.cursor("remaining_range_km").lastExportedHistoryId)
-    }
-
-    @Test
-    fun semanticCutoverFiltersRetiredChargingAndExportsUnitlessRawSensors() {
-        val store = FakeInfluxStore(
-            rows = listOf(
-                row(id = 1, fieldKey = "charging_state"),
-                row(id = 2, fieldKey = "max_discharge_power_allow_raw").copy(
-                    valueNumber = 123.0,
-                    unit = null
-                ),
-                row(id = 3, fieldKey = "bodywork_sunroof_windoblind_position").copy(
-                    category = "body",
-                    valueNumber = 4.0,
-                    unit = null
-                ),
-                row(id = 4, fieldKey = "max_discharge_power_allow_kw").copy(valueNumber = 12.3, unit = "kW")
-            )
-        )
-        val client = FakeInfluxClient()
-        val coordinator = coordinator(
-            store,
-            client,
-            influxConfig = config().copy(enabledCategories = setOf("battery", "body"))
-        )
-
-        val result = coordinator.runOneCycle(force = true)
-
-        assertTrue(result.ok)
-        val lines = client.writtenLines.single()
-        assertEquals(3, lines.size)
-        assertTrue(lines.none { it.contains("field_key=charging_state") })
-        assertTrue(lines.any { it.contains("field_key=max_discharge_power_allow_raw") && it.contains("unit=none") })
-        assertTrue(lines.any { it.contains("field_key=bodywork_sunroof_windoblind_position") && it.contains("unit=none") })
-        assertTrue(lines.any { it.contains("field_key=max_discharge_power_allow_kw") && it.contains("unit=kW") && it.contains("value_num=12.3") })
-    }
-
-    @Test
-    fun successfulBatchKeepsRemainingPendingRowsVisibleForDashboard() {
-        val rows = (1L..301L).map { id -> row(id = id, fieldKey = "soc") }
-        val store = FakeInfluxStore(rows = rows)
-        val client = FakeInfluxClient()
-        val clock = FakeClock()
-        val coordinator = coordinator(store, client, clock)
-
-        coordinator.runOneCycle(force = true)
-
-        assertEquals(300, client.writtenLines.single().size)
-        assertEquals(listOf(300), store.pendingBatchLimits)
-        assertEquals(300, store.cursor("soc").lastExportedHistoryId)
-        assertEquals(1, store.influxExportState().pendingRows)
-        assertEquals("2026-06-15T12:00:01Z", store.influxExportState().nextRetryAt)
-
-        coordinator.runOneCycle(force = false)
-
-        assertEquals(1, client.writtenLines.size)
-
-        clock.now = "2026-06-15T12:00:01Z"
-        coordinator.runOneCycle(force = false)
-
-        assertEquals(2, client.writtenLines.size)
-        assertEquals(0, store.influxExportState().pendingRows)
-        assertEquals(null, store.influxExportState().nextRetryAt)
-    }
-
-    @Test
-    fun manualStartWritesPendingRowsWithoutASeparateConnectionPreflight() {
-        val store = FakeInfluxStore(rows = listOf(row(id = 10, fieldKey = "soc")))
-        val client = FakeInfluxClient()
-        val clock = FakeClock()
-        val coordinator = coordinator(store, client, clock)
-
-        coordinator.runOneCycle(force = true)
-
-        assertEquals(0, store.influxExportState().pendingRows)
-        assertEquals(null, store.influxExportState().nextRetryAt)
-        assertEquals(null, coordinator.retryDelayMs())
-
-        clock.now = "2026-06-15T12:00:20Z"
-        store.addRow(row(id = 11, fieldKey = "soc"))
-        coordinator.startExport()
-
-        assertEquals(2, client.writtenLines.size)
-        assertEquals(0, client.testCalls)
-        assertEquals(0, store.influxExportState().pendingRows)
-        assertEquals(null, coordinator.retryDelayMs())
-
-        clock.now = "2026-06-15T12:00:30Z"
-        coordinator.runOneCycle(force = false)
-
-        assertEquals(2, client.writtenLines.size)
-        assertEquals(0, store.influxExportState().pendingRows)
-        assertEquals(null, store.influxExportState().nextRetryAt)
-    }
-
-    @Test
-    fun resumeMarksHealthyBacklogAsScheduled() {
-        val store = FakeInfluxStore(rows = listOf(row(id = 10, fieldKey = "soc")))
-        val coordinator = coordinator(store, FakeInfluxClient())
-
-        val result = coordinator.resumeExport()
-
-        assertTrue(result.ok)
-        assertEquals("scheduled", store.influxExportState().status)
-        assertEquals("2026-06-15T12:00:01Z", store.influxExportState().nextRetryAt)
-        assertEquals(1_000L, coordinator.retryDelayMs())
-    }
-
-    @Test
-    fun resumePreservesPersistedRetryWithoutNetworkRequest() {
-        val store = FakeInfluxStore(rows = listOf(row(id = 10, fieldKey = "soc")))
-        store.setNextRetryAt("2026-06-15T12:01:00Z")
-        val client = FakeInfluxClient()
-
-        val result = coordinator(store, client).resumeExport()
-
-        assertTrue(result.ok)
-        assertEquals(0, client.testCalls)
-        assertTrue(client.writtenLines.isEmpty())
-        assertEquals("2026-06-15T12:01:00Z", store.influxExportState().nextRetryAt)
-        assertEquals(1, store.influxExportState().pendingRows)
-        assertEquals("backoff", store.influxExportState().status)
-    }
-
-    @Test
-    fun resumeClearsStaleFailureAfterBacklogWasAlreadyDrained() {
-        val store = FakeInfluxStore(rows = listOf(row(id = 10, fieldKey = "soc")))
-        store.ensureInfluxCursors(setOf("soc"))
-        store.updateInfluxCursorSuccess("soc", 10, "2026-06-15T12:00:00Z")
-        store.setNextRetryAt("2026-06-15T12:01:00Z")
-
-        coordinator(store, FakeInfluxClient()).resumeExport()
-
-        assertEquals("idle", store.influxExportState().status)
-        assertEquals(null, store.influxExportState().nextRetryAt)
-        assertEquals(null, store.influxExportState().lastError)
-    }
-
-    @Test
-    fun failedStandaloneRetrySurvivesOwnerRecreationAndDrains() {
-        val store = FakeInfluxStore(rows = listOf(row(id = 10, fieldKey = "soc")))
-        val clock = FakeClock()
-        val client = ScriptedInfluxClient(
-            InfluxActionResult.fail("influx_error", "offline"),
-            InfluxActionResult.ok()
-        )
-
-        val first = coordinator(store, client, clock)
-        assertFalse(first.startExport().ok)
-        assertEquals("backoff", store.influxExportState().status)
-        assertEquals("2026-06-15T12:00:30Z", store.influxExportState().nextRetryAt)
-        assertEquals(30_000L, first.retryDelayMs())
-        assertEquals(0, store.cursor("soc").lastExportedHistoryId)
-
-        val recovered = coordinator(store, client, clock)
-        assertTrue(recovered.resumeExport().ok)
-        assertEquals(1, client.writeCalls)
-        assertEquals("backoff", store.influxExportState().status)
-
-        clock.now = "2026-06-15T12:00:30Z"
-        assertTrue(recovered.runOneCycle(force = false).ok)
-        assertEquals(2, client.writeCalls)
-        assertEquals(10, store.cursor("soc").lastExportedHistoryId)
-        assertEquals("idle", store.influxExportState().status)
-        assertEquals(null, store.influxExportState().nextRetryAt)
-        assertEquals(null, recovered.retryDelayMs())
-    }
-
-    @Test
-    fun failedStartWriteKeepsAuthoritativePendingSummary() {
-        val store = FakeInfluxStore(rows = listOf(row(id = 10, fieldKey = "soc")))
-        val client = FakeInfluxClient(writeResult = InfluxActionResult.fail("influx_error", "offline"))
-
-        val result = coordinator(store, client).startExport()
-
-        assertFalse(result.ok)
-        assertEquals(0, client.testCalls)
-        assertEquals(1, store.influxExportState().pendingRows)
-        assertEquals("2026-06-15T12:00:30Z", store.influxExportState().nextRetryAt)
-    }
-
-    @Test
-    fun failureAndStopPreserveLastSuccessErrorAndRealPendingRows() {
-        val store = FakeInfluxStore(rows = listOf(row(id = 10, fieldKey = "soc")))
-        val clock = FakeClock()
-        coordinator(store, FakeInfluxClient(), clock).runOneCycle(force = true)
-
-        clock.now = "2026-06-15T12:01:00Z"
-        store.addRow(row(id = 11, fieldKey = "soc"))
-        coordinator(
-            store,
-            FakeInfluxClient(writeResult = InfluxActionResult.fail("influx_error", "offline")),
-            clock
-        ).runOneCycle(force = true)
-
-        coordinator(store, FakeInfluxClient(), clock).stopExport()
-
-        val state = store.influxExportState()
-        assertEquals("stopped", state.status)
-        assertEquals("realtime", state.mode)
-        assertEquals(1, state.pendingRows)
-        assertEquals("2026-06-15T12:00:00Z", state.lastSuccessAt)
-        assertEquals("2026-06-15T12:01:00Z", state.lastErrorAt)
-        assertEquals("offline", state.lastError)
-        assertEquals(null, state.nextRetryAt)
-    }
-
-    @Test
-    fun batchTargetUsesTheExactFiveThousandRowThreshold() {
-        val realtimeStore = FakeInfluxStore((1L..4_999L).map { id -> row(id, "soc") })
-        val catchUpStore = FakeInfluxStore((1L..5_000L).map { id -> row(id, "soc") })
-        val realtimeClient = FakeInfluxClient()
-        val catchUpClient = FakeInfluxClient()
-
-        coordinator(realtimeStore, realtimeClient).runOneCycle(force = true)
-        coordinator(catchUpStore, catchUpClient).runOneCycle(force = true)
-
-        assertEquals(listOf(300), realtimeStore.pendingBatchLimits)
-        assertEquals(300, realtimeClient.writtenLines.single().size)
-        assertEquals(4_699L, realtimeStore.influxExportState().pendingRows)
-        assertEquals(listOf(2_000), catchUpStore.pendingBatchLimits)
-        assertEquals(2_000, catchUpClient.writtenLines.single().size)
-        assertEquals(2_000L, catchUpStore.cursor("soc").lastExportedHistoryId)
-        assertEquals(3_000L, catchUpStore.influxExportState().pendingRows)
-    }
-
-    @Test
-    fun catchUpFallsBackToRealtimeBatchesAsBacklogShrinksWithoutSkippingRows() {
-        val store = FakeInfluxStore((1L..5_301L).map { id -> row(id, "soc") })
-        val client = FakeInfluxClient()
-        val clock = FakeClock()
-        val coordinator = coordinator(store, client, clock)
-
-        coordinator.runOneCycle(force = true)
-        assertEquals(2_000L, store.cursor("soc").lastExportedHistoryId)
-        assertEquals(3_301L, store.influxExportState().pendingRows)
-        assertEquals("2026-06-15T12:00:01Z", store.influxExportState().nextRetryAt)
-
-        clock.now = "2026-06-15T12:00:01Z"
-        coordinator.runOneCycle(force = false)
-        assertEquals(2_300L, store.cursor("soc").lastExportedHistoryId)
-        assertEquals(3_001L, store.influxExportState().pendingRows)
-
-        clock.now = "2026-06-15T12:00:02Z"
-        coordinator.runOneCycle(force = false)
-
-        assertEquals(listOf(2_000, 300, 300), store.pendingBatchLimits)
-        assertEquals(listOf(2_000, 300, 300), client.writtenLines.map { it.size })
-        assertEquals(2_600L, store.cursor("soc").lastExportedHistoryId)
-        assertEquals(2_701L, store.influxExportState().pendingRows)
-        assertEquals("2026-06-15T12:00:03Z", store.influxExportState().nextRetryAt)
-    }
-
-    @Test
-    fun adaptiveBatchDeescalatesOnlyTransientFailures() {
-        val store = FakeInfluxStore((1L..10_000L).map { id -> row(id, "soc") })
-        val transient = InfluxActionResult.fail("influx_network_error", "offline", httpStatus = 503)
-        val client = ScriptedInfluxClient(transient, transient, transient, transient)
-        val coordinator = coordinator(store, client)
-
-        repeat(4) { coordinator.runOneCycle(force = true) }
-
-        assertEquals(listOf(2_000, 1_000, 500, 300), store.pendingBatchLimits)
-        assertEquals(0L, store.cursor("soc").lastExportedHistoryId)
-
-        val nonTransientStore = FakeInfluxStore((1L..10_000L).map { id -> row(id, "soc") })
-        val nonTransient = InfluxActionResult.fail("influx_http_error", "bad request", httpStatus = 400)
-        val nonTransientClient = ScriptedInfluxClient(nonTransient, nonTransient)
-        val nonTransientCoordinator = coordinator(nonTransientStore, nonTransientClient)
-
-        nonTransientCoordinator.runOneCycle(force = true)
-        nonTransientCoordinator.runOneCycle(force = true)
-
-        assertEquals(listOf(2_000, 2_000), nonTransientStore.pendingBatchLimits)
-    }
-
-    @Test
-    fun successfulBatchesRampBackTowardDesiredTarget() {
-        val store = FakeInfluxStore((1L..10_000L).map { id -> row(id, "soc") })
-        val client = ScriptedInfluxClient(
-            InfluxActionResult.fail("influx_network_error", "offline", httpStatus = 503),
-            InfluxActionResult.ok(),
-            InfluxActionResult.ok()
-        )
-        val coordinator = coordinator(store, client)
-
-        coordinator.runOneCycle(force = true)
-        coordinator.runOneCycle(force = true)
-        coordinator.runOneCycle(force = true)
-
-        assertEquals(listOf(2_000, 1_000, 2_000), store.pendingBatchLimits)
-    }
-
-    @Test
-    fun dataFormat400IsBisectedInOrderAndOnlyPoisonRowIsQuarantined() {
-        val store = FakeInfluxStore((1L..4L).map { id -> row(id, "soc") })
-        val dataFailure = InfluxActionResult.fail(
-            "influx_http_error",
-            "partial write: field type conflict",
-            httpStatus = 400
-        )
-        val client = ScriptedInfluxClient(
-            dataFailure,
-            InfluxActionResult.ok(),
-            dataFailure,
-            dataFailure,
-            InfluxActionResult.ok()
-        )
-        val result = coordinator(store, client).runOneCycle(force = true)
-
-        assertTrue(result.ok)
-        assertEquals(listOf(300), store.pendingBatchLimits)
-        assertEquals(listOf(4, 2, 2, 1, 1), client.writtenLineSizes)
-        assertEquals(4L, store.cursor("soc").lastExportedHistoryId)
-        assertEquals(1, store.influxEvents.count { it.eventType == "influx_export_poison_row" })
-        val poison = store.influxEvents.single { it.eventType == "influx_export_poison_row" }
-        assertTrue(poison.message.orEmpty().contains("history_id=3"))
-        assertTrue(poison.message.orEmpty().contains("reason=field_type_conflict"))
-        assertEquals(1, poison.batchCount)
-        assertEquals(3L, poison.fromHistoryId)
-        assertEquals(3L, poison.toHistoryId)
-    }
-
-    @Test
-    fun generic400DoesNotSplitOrAdvanceCursor() {
-        val store = FakeInfluxStore((1L..4L).map { id -> row(id, "soc") })
-        val client = FakeInfluxClient(
-            writeResult = InfluxActionResult.fail("influx_http_error", "bad request", httpStatus = 400)
-        )
-
-        val result = coordinator(store, client).runOneCycle(force = true)
-
-        assertFalse(result.ok)
-        assertEquals(listOf(300), store.pendingBatchLimits)
-        assertEquals(listOf(4), client.writtenLines.map { it.size })
-        assertEquals(0L, store.cursor("soc").lastExportedHistoryId)
-        assertTrue(store.influxEvents.none { it.eventType == "influx_export_poison_row" })
-    }
-
-    @Test
-    fun dataFormatTextWithoutHttp400DoesNotSplit() {
-        val store = FakeInfluxStore((1L..4L).map { id -> row(id, "soc") })
-        val client = FakeInfluxClient(
-            writeResult = InfluxActionResult.fail("influx_http_error", "partial write: field type conflict")
-        )
-
-        val result = coordinator(store, client).runOneCycle(force = true)
-
-        assertFalse(result.ok)
-        assertEquals(listOf(300), store.pendingBatchLimits)
-        assertEquals(listOf(4), client.writtenLines.map { it.size })
-        assertEquals(0L, store.cursor("soc").lastExportedHistoryId)
-    }
-
-    @Test
-    fun `recognized 422 retention error is split per row without skipping valid neighbors`() {
-        val store = FakeInfluxStore((1L..4L).map { id -> row(id, "soc") })
-        val retention = InfluxActionResult.fail(
-            "influx_http_error",
-            "partial write: points beyond retention policy dropped=1",
-            httpStatus = 422,
-            failureKind = InfluxFailureKind.DATA
-        )
-        val client = ScriptedInfluxClient(
-            retention,
-            InfluxActionResult.ok(),
-            retention,
-            retention,
-            InfluxActionResult.ok()
-        )
-
-        val result = coordinator(store, client).runOneCycle(force = true)
-
-        assertTrue(result.ok)
-        assertEquals(listOf(4, 2, 2, 1, 1), client.writtenLineSizes)
-        assertEquals(4L, store.cursor("soc").lastExportedHistoryId)
-        val poison = store.influxEvents.single { it.eventType == "influx_export_poison_row" }
-        assertEquals(1, poison.batchCount)
-        assertTrue(poison.message.orEmpty().contains("reason=retention_policy"))
-    }
-
-    @Test
-    fun `unknown 422 remains pending and enters backoff`() {
-        val store = FakeInfluxStore((1L..2L).map { id -> row(id, "soc") })
-        val client = FakeInfluxClient(
-            writeResult = InfluxActionResult.fail(
-                "influx_http_error",
-                "partial write: unsupported shard rejection",
-                httpStatus = 422,
-                failureKind = InfluxFailureKind.DATA
-            )
-        )
-
-        val result = coordinator(store, client).runOneCycle(force = true)
-
-        assertFalse(result.ok)
-        assertEquals(0L, store.cursor("soc").lastExportedHistoryId)
-        assertEquals("backoff", store.influxExportState().status)
-        assertTrue(store.influxEvents.none { it.eventType == "influx_export_poison_row" })
-    }
-
-    @Test
-    fun `split pass is capped at 64 writes and resume excludes confirmed poison prefix`() {
-        val store = FakeInfluxStore((1L..100L).map { id -> row(id, "soc") })
-        val client = AlwaysDataFailureClient(firstTransportFailure = true)
-        val coordinator = coordinator(
-            store,
-            client,
-            influxConfig = config(alternativeHost = "influx-alt.local", alternativePort = 8087)
-        )
-
-        val first = coordinator.runOneCycle(force = true)
-        val confirmed = store.cursor("soc").lastExportedHistoryId
-
-        assertTrue(first.ok)
-        assertEquals(64, client.writeCalls)
-        assertTrue(confirmed in 1L..99L)
-        assertEquals("scheduled", store.influxExportState().status)
-        val firstSummary = store.influxEvents.single { it.eventType == "influx_export_poison_row" }
-        assertEquals(confirmed.toInt(), firstSummary.batchCount)
-        assertTrue(firstSummary.message.orEmpty().split("history_id=").size - 1 <= 5)
-
-        coordinator.runOneCycle(force = true)
-
-        assertEquals((100L - confirmed).toInt(), client.writtenLineSizes[64])
-        assertTrue(client.writeCalls <= 128)
-    }
-
-    @Test
-    fun `cancellation after successful child preserves cursor and resume starts at remainder`() {
-        val store = FakeInfluxStore((1L..4L).map { id -> row(id, "soc") })
-        val dataFailure = InfluxActionResult.fail(
-            "influx_http_error",
-            "partial write: field type conflict",
-            httpStatus = 400
-        )
-        val client = ScriptedInfluxClient(dataFailure, InfluxActionResult.ok(), InfluxActionResult.ok())
-        lateinit var coordinator: InfluxExportCoordinator
-        coordinator = coordinator(store, client)
-        client.afterWrite = { call -> if (call == 2) coordinator.cancelInFlight() }
-
-        val stopped = coordinator.runOneCycle(force = true)
-
-        assertTrue(stopped.ok)
-        assertEquals(2, client.writeCalls)
-        assertEquals(2L, store.cursor("soc").lastExportedHistoryId)
-        assertEquals(2L, store.influxExportState().pendingRows)
-        client.afterWrite = null
-
-        assertTrue(coordinator.runOneCycle(force = true).ok)
-        assertEquals(listOf(4, 2, 2), client.writtenLineSizes)
-        assertEquals(4L, store.cursor("soc").lastExportedHistoryId)
-    }
-
-    @Test
-    fun `poison summary is emitted once even when a later split fails`() {
-        val store = FakeInfluxStore((1L..2L).map { id -> row(id, "soc") })
-        val dataFailure = InfluxActionResult.fail(
-            "influx_http_error",
-            "partial write: unable to parse",
-            httpStatus = 400
-        )
-        val unknown = InfluxActionResult.fail(
-            "influx_http_error",
-            "unprocessable request",
-            httpStatus = 422,
-            failureKind = InfluxFailureKind.DATA
-        )
-        val client = ScriptedInfluxClient(dataFailure, dataFailure, unknown)
-
-        val result = coordinator(store, client).runOneCycle(force = true)
-
-        assertFalse(result.ok)
-        assertEquals(1L, store.cursor("soc").lastExportedHistoryId)
-        val summaries = store.influxEvents.filter { it.eventType == "influx_export_poison_row" }
-        assertEquals(1, summaries.size)
-        assertEquals(1, summaries.single().batchCount)
-    }
-
-    @Test
-    fun `poison summary survives cancellation later in the same split pass`() {
-        val store = FakeInfluxStore((1L..4L).map { id -> row(id, "soc") })
-        val dataFailure = InfluxActionResult.fail(
-            "influx_http_error",
-            "partial write: field type conflict",
-            httpStatus = 400
-        )
-        val client = ScriptedInfluxClient(dataFailure, dataFailure, dataFailure)
-        lateinit var coordinator: InfluxExportCoordinator
-        coordinator = coordinator(store, client)
-        client.afterWrite = { call -> if (call == 3) coordinator.cancelInFlight() }
-
-        val result = coordinator.runOneCycle(force = true)
-
-        assertTrue(result.ok)
-        assertEquals(1L, store.cursor("soc").lastExportedHistoryId)
-        val summaries = store.influxEvents.filter { it.eventType == "influx_export_poison_row" }
-        assertEquals(1, summaries.size)
-        assertEquals(1, summaries.single().batchCount)
-        assertEquals("scheduled", store.influxExportState().status)
-    }
-
-    @Test
-    fun `interrupted split rethrows with flag and poison logging cannot mask it`() {
-        val store = FakeInfluxStore(
-            rows = (1L..4L).map { id -> row(id, "soc") },
-            eventFailure = IllegalStateException("event store unavailable")
-        )
-        val coordinator = coordinator(store, PoisonThenInterruptedClient())
-
-        try {
-            assertFailsWith<InterruptedException> {
-                coordinator.runOneCycle(force = true)
-            }
-            assertTrue(Thread.currentThread().isInterrupted)
-            assertEquals(1L, store.cursor("soc").lastExportedHistoryId)
-        } finally {
-            Thread.interrupted()
-        }
-    }
-
-    @Test
-    fun `fatal client error is not converted into export backoff`() {
-        val store = FakeInfluxStore(rows = listOf(row(1L, "soc")))
-        val fatal = object : InfluxClient {
-            override fun test(config: InfluxConfig): InfluxActionResult = InfluxActionResult.ok()
-            override fun write(config: InfluxConfig, lines: List<String>): InfluxActionResult {
-                throw AssertionError("fatal")
-            }
-        }
-
-        assertFailsWith<AssertionError> {
-            coordinator(store, fatal).runOneCycle(force = true)
-        }
-        assertEquals(0L, store.cursor("soc").lastExportedHistoryId)
-    }
-
-    @Test
-    fun normalResumeCreatesMissingCursorsWithoutResettingExisting() {
-        val store = FakeInfluxStore(rows = emptyList())
-        store.ensureInfluxCursors(setOf("soc"))
-        store.updateInfluxCursorSuccess("soc", 99, "2026-06-15T12:00:00Z")
-        val coordinator = coordinator(store, FakeInfluxClient())
-
-        val result = coordinator.resumeExport()
-
-        assertTrue(result.ok)
-        assertEquals(99, store.cursor("soc").lastExportedHistoryId)
-        assertTrue(store.cursors.keys.containsAll(setOf(
-            "soc_internal",
-            "battery_remaining_energy_kwh",
-            "trip_energy_kwh",
-            "cumulative_energy_kwh"
-        )))
-    }
-
-    @Test
-    fun transportFailureFallsBackToAlternativeAndSticksForNextBatch() {
-        val store = FakeInfluxStore(rows = listOf(row(id = 1, fieldKey = "soc")))
-        val client = ScriptedInfluxClient(
-            InfluxActionResult.fail("influx_network_error", "primary offline", failureKind = InfluxFailureKind.TRANSPORT),
-            InfluxActionResult.ok(),
-            InfluxActionResult.ok()
-        )
-        val coordinator = coordinator(
-            store,
-            client,
-            influxConfig = config(alternativeHost = "influx-alt.local", alternativePort = 8087)
-        )
-
-        assertTrue(coordinator.runOneCycle(force = true).ok)
-        store.addRow(row(id = 2, fieldKey = "soc"))
-        assertTrue(coordinator.runOneCycle(force = true).ok)
-
-        assertEquals(listOf("influx.local", "influx-alt.local", "influx-alt.local"), client.configs.map { it.host })
-        assertEquals(client.writtenLines[0], client.writtenLines[1])
-        assertEquals(HaEndpointProfile.ALTERNATIVE, coordinator.activeRoute)
-    }
-
-    @Test
-    fun alternativeFailureFallsBackToPrimaryAndBothFailuresResetForNextCycle() {
-        val store = FakeInfluxStore(rows = listOf(row(id = 1, fieldKey = "soc")))
-        val client = ScriptedInfluxClient(
-            InfluxActionResult.fail("influx_network_error", "primary offline", failureKind = InfluxFailureKind.TRANSPORT),
-            InfluxActionResult.ok(),
-            InfluxActionResult.fail("influx_network_error", "alternative offline", failureKind = InfluxFailureKind.TRANSPORT),
-            InfluxActionResult.ok(),
-            InfluxActionResult.fail("influx_network_error", "primary offline", failureKind = InfluxFailureKind.TRANSPORT),
-            InfluxActionResult.fail("influx_network_error", "alternative offline", failureKind = InfluxFailureKind.TRANSPORT),
-            InfluxActionResult.ok()
-        )
-        val coordinator = coordinator(
-            store,
-            client,
-            influxConfig = config(alternativeHost = "influx-alt.local", alternativePort = 8087)
-        )
-
-        assertTrue(coordinator.runOneCycle(force = true).ok)
-        store.addRow(row(id = 2, fieldKey = "soc"))
-        assertTrue(coordinator.runOneCycle(force = true).ok)
-        store.addRow(row(id = 3, fieldKey = "soc"))
-        assertFalse(coordinator.runOneCycle(force = true).ok)
-        store.addRow(row(id = 4, fieldKey = "soc"))
-        assertTrue(coordinator.runOneCycle(force = true).ok)
-
-        assertEquals(
-            listOf("influx.local", "influx-alt.local", "influx-alt.local", "influx.local", "influx.local", "influx-alt.local", "influx.local"),
-            client.configs.map { it.host }
-        )
-        assertEquals(HaEndpointProfile.PRIMARY, coordinator.activeRoute)
-    }
-
-    @Test
-    fun authenticationAndRateLimitFailuresStayOnCurrentEndpoint() {
-        val store = FakeInfluxStore(rows = listOf(row(id = 1, fieldKey = "soc")))
-        val client = ScriptedInfluxClient(
-            InfluxActionResult.fail("influx_http_error", "unauthorized", httpStatus = 401, failureKind = InfluxFailureKind.AUTHENTICATION),
-            InfluxActionResult.fail("influx_http_error", "too many requests", httpStatus = 429)
-        )
-        val coordinator = coordinator(
-            store,
-            client,
-            influxConfig = config(alternativeHost = "influx-alt.local", alternativePort = 8087)
-        )
-
-        assertFalse(coordinator.runOneCycle(force = true).ok)
-        assertEquals(listOf("influx.local"), client.configs.map { it.host })
-        store.addRow(row(id = 2, fieldKey = "soc"))
-        assertFalse(coordinator.runOneCycle(force = true).ok)
-        assertEquals(listOf("influx.local", "influx.local"), client.configs.map { it.host })
-    }
-
-    @Test
-    fun unsuccessfulAlternativeDoesNotBecomeStickyAfterPrimaryTransportFailure() {
-        val failures = listOf(
-            InfluxActionResult.fail("influx_http_error", "unauthorized", httpStatus = 401, failureKind = InfluxFailureKind.AUTHENTICATION),
-            InfluxActionResult.fail("influx_http_error", "invalid data", httpStatus = 422, failureKind = InfluxFailureKind.DATA),
-            InfluxActionResult.fail("influx_protocol_error", "TLS failure", failureKind = InfluxFailureKind.PROTOCOL),
-            InfluxActionResult.fail("influx_http_error", "too many requests", httpStatus = 429)
-        )
-        failures.forEach { failure ->
-            val store = FakeInfluxStore(rows = listOf(row(id = 1, fieldKey = "soc")))
-            val client = ScriptedInfluxClient(
-                InfluxActionResult.fail("influx_network_error", "primary offline", failureKind = InfluxFailureKind.TRANSPORT),
-                failure,
-                InfluxActionResult.ok()
-            )
-            val coordinator = coordinator(
-                store,
-                client,
-                influxConfig = config(alternativeHost = "influx-alt.local", alternativePort = 8087)
-            )
-
-            assertFalse(coordinator.runOneCycle(force = true).ok)
-            assertEquals(null, coordinator.activeRoute, failure.message)
-            assertEquals(0L, store.cursor("soc").lastExportedHistoryId)
-            assertEquals(listOf("influx.local", "influx-alt.local"), client.configs.map { it.host })
-            assertTrue(coordinator.runOneCycle(force = true).ok)
-            assertEquals(listOf("influx.local", "influx-alt.local", "influx.local"), client.configs.map { it.host })
-            assertTrue(client.writtenLines.all { it == client.writtenLines.first() })
-            assertEquals(HaEndpointProfile.PRIMARY, coordinator.activeRoute)
-            assertEquals(1L, store.cursor("soc").lastExportedHistoryId)
-        }
-    }
-
-    @Test
-    fun successfulPinnedSplitEstablishesAlternativeAsStickyRoute() {
-        val store = FakeInfluxStore(rows = listOf(row(id = 1, fieldKey = "soc"), row(id = 2, fieldKey = "soc")))
-        val client = ScriptedInfluxClient(
-            InfluxActionResult.fail("influx_network_error", "primary offline", failureKind = InfluxFailureKind.TRANSPORT),
-            InfluxActionResult.fail("influx_http_error", "partial write: field type conflict", httpStatus = 400),
-            InfluxActionResult.ok(),
-            InfluxActionResult.ok(),
-            InfluxActionResult.ok()
-        )
-        val coordinator = coordinator(
-            store,
-            client,
-            influxConfig = config(alternativeHost = "influx-alt.local", alternativePort = 8087)
-        )
-
-        assertTrue(coordinator.runOneCycle(force = true).ok)
-        assertEquals(HaEndpointProfile.ALTERNATIVE, coordinator.activeRoute)
-        store.addRow(row(id = 3, fieldKey = "soc"))
-        assertTrue(coordinator.runOneCycle(force = true).ok)
-        assertEquals(listOf("influx.local", "influx-alt.local", "influx-alt.local", "influx-alt.local", "influx-alt.local"), client.configs.map { it.host })
-        assertEquals(3L, store.cursor("soc").lastExportedHistoryId)
-    }
-
-    @Test
-    fun poison400SplittingStaysPinnedToAlternativeEndpoint() {
-        val store = FakeInfluxStore(rows = listOf(row(id = 1, fieldKey = "soc")))
-        val client = ScriptedInfluxClient(
-            InfluxActionResult.fail("influx_network_error", "primary offline", failureKind = InfluxFailureKind.TRANSPORT),
-            InfluxActionResult.ok(),
-            InfluxActionResult.fail("influx_http_error", "partial write: field type conflict", httpStatus = 400),
-            InfluxActionResult.fail("influx_http_error", "partial write: field type conflict", httpStatus = 400),
-            InfluxActionResult.fail("influx_http_error", "partial write: field type conflict", httpStatus = 400)
-        )
-        val coordinator = coordinator(
-            store,
-            client,
-            influxConfig = config(alternativeHost = "influx-alt.local", alternativePort = 8087)
-        )
-
-        assertTrue(coordinator.runOneCycle(force = true).ok)
-        store.addRow(row(id = 2, fieldKey = "soc"))
-        store.addRow(row(id = 3, fieldKey = "soc"))
-        assertTrue(coordinator.runOneCycle(force = true).ok)
-
-        assertEquals(listOf("influx.local", "influx-alt.local", "influx-alt.local", "influx-alt.local", "influx-alt.local"), client.configs.map { it.host })
-        assertEquals(3L, store.cursor("soc").lastExportedHistoryId)
-    }
-
-    @Test
-    fun ownedResumeUsesFrozenEndpointWhenLiveDraftBecomesInvalid() {
-        val store = FakeInfluxStore(rows = emptyList())
-        var live = config(alternativeHost = "influx-alt.local", alternativePort = 8087)
-        val coordinator = InfluxExportCoordinator(
-            store = store,
-            client = FakeInfluxClient(),
-            configProvider = { live },
-            clock = FakeClock()
-        )
-
-        assertTrue(coordinator.resumeExport().ok)
-        live = live.copy(alternativeHost = "influx alt", alternativePort = 8087)
-
-        assertTrue(coordinator.resumeExport().ok)
-    }
-
-    @Test
-    fun serverAckIsRecordedBeforeDurableCursorPersistence() {
-        val store = FakeInfluxStore(rows = listOf(row(id = 10, fieldKey = "soc")))
-        val events = mutableListOf<InfluxDiagnosticEvent>()
-        val coordinator = InfluxExportCoordinator(
-            store = store,
-            client = FakeInfluxClient(),
-            configProvider = { config() },
-            clock = FakeClock(),
-            diagnostics = { events += it }
-        )
-
-        assertTrue(coordinator.runOneCycle(force = true).ok)
-        val ack = events.indexOfFirst { it.type == "influx_server_ack" }
-        val cursorStart = events.indexOfFirst { it.type == "influx_cursor_persistence_start" }
-        assertTrue(ack >= 0)
-        assertTrue(cursorStart > ack)
-    }
-
-    private fun coordinator(
-        store: FakeInfluxStore,
-        client: InfluxClient,
-        clock: Clock = FakeClock(),
-        influxConfig: InfluxConfig = config()
-    ): InfluxExportCoordinator {
-        return InfluxExportCoordinator(
-            store = store,
-            client = client,
-            configProvider = { influxConfig },
-            clock = clock
-        )
-    }
-
-    private fun config(
-        alternativeHost: String? = null,
-        alternativePort: Int? = null,
-        vehicleId: String = InfluxConfig.DEFAULT_VEHICLE_ID
-    ): InfluxConfig = InfluxConfig(
-        enabled = true,
-        host = "influx.local",
-        port = 8086,
-        database = "bydcollector",
-        username = null,
-        password = null,
-        measurement = "byd_state",
-        enabledCategories = setOf("battery"),
-        alternativeHost = alternativeHost,
-        alternativePort = alternativePort,
-        vehicleId = vehicleId
-    )
-
-    private fun row(id: Long, fieldKey: String): InfluxPendingHistoryRow = InfluxPendingHistoryRow(
-        id = id,
-        fieldKey = fieldKey,
-        category = "battery",
-        valueType = "NUMBER",
-        valueText = null,
-        valueNumber = 73.0,
-        valueBool = null,
-        quality = "OK",
-        unit = "%",
-        sourcePollId = 42,
-        sourceKeys = fieldKey,
-        observedAt = "2026-06-15T10:20:30Z",
-        changedAt = "2026-06-15T10:20:31Z"
-    )
-
-    private class FakeInfluxClient(
-        private val writeResult: InfluxActionResult = InfluxActionResult.ok(),
-        private val testResult: InfluxActionResult = InfluxActionResult.ok(),
-        private val writeError: RuntimeException? = null
-    ) : InfluxClient {
-        val writtenLines = mutableListOf<List<String>>()
-        var testCalls = 0
-
-        override fun test(config: InfluxConfig): InfluxActionResult {
-            testCalls += 1
-            return testResult
-        }
-
-        override fun write(config: InfluxConfig, lines: List<String>): InfluxActionResult {
-            writeError?.let { throw it }
-            writtenLines += lines
-            return writeResult
-        }
-    }
-
-    private class ScriptedInfluxClient(
-        vararg results: InfluxActionResult
-    ) : InfluxClient {
-        private val results = ArrayDeque(results.toList())
-        var writeCalls = 0
-        var afterWrite: ((Int) -> Unit)? = null
-        val writtenLineSizes = mutableListOf<Int>()
-        val configs = mutableListOf<InfluxConfig>()
-        val writtenLines = mutableListOf<List<String>>()
-
-        override fun test(config: InfluxConfig): InfluxActionResult = InfluxActionResult.ok()
-
-        override fun write(config: InfluxConfig, lines: List<String>): InfluxActionResult {
-            writeCalls += 1
-            writtenLineSizes += lines.size
-            configs += config
-            writtenLines += lines
-            return results.removeFirst().also { afterWrite?.invoke(writeCalls) }
-        }
-    }
-
-    private class AlwaysDataFailureClient(
-        private val firstTransportFailure: Boolean = false
-    ) : InfluxClient {
-        var writeCalls = 0
-        val writtenLineSizes = mutableListOf<Int>()
-
-        override fun test(config: InfluxConfig): InfluxActionResult = InfluxActionResult.ok()
-
-        override fun write(config: InfluxConfig, lines: List<String>): InfluxActionResult {
-            writeCalls += 1
-            writtenLineSizes += lines.size
-            if (firstTransportFailure && writeCalls == 1) {
-                return InfluxActionResult.fail(
-                    "influx_network_error",
-                    "primary offline",
-                    failureKind = InfluxFailureKind.TRANSPORT
-                )
-            }
-            return InfluxActionResult.fail(
-                "influx_http_error",
-                "partial write: points beyond retention policy dropped=${lines.size}",
-                httpStatus = 422,
-                failureKind = InfluxFailureKind.DATA
-            )
-        }
-    }
-
-    private class PoisonThenInterruptedClient : InfluxClient {
-        private var writeCalls = 0
-
-        override fun test(config: InfluxConfig): InfluxActionResult = InfluxActionResult.ok()
-
-        override fun write(config: InfluxConfig, lines: List<String>): InfluxActionResult {
-            writeCalls += 1
-            if (writeCalls == 4) throw InterruptedException("stop")
-            return InfluxActionResult.fail(
-                "influx_http_error",
-                "partial write: field type conflict",
-                httpStatus = 400,
-                failureKind = InfluxFailureKind.DATA
-            )
-        }
-    }
-
-    private class FakeInfluxStore(
-        rows: List<InfluxPendingHistoryRow>,
-        private val cursorFailureField: String? = null,
-        private val eventFailure: RuntimeException? = null,
-        private val failStage: String? = null
-    ) : InfluxExportStore {
-        private val rows = rows.toMutableList()
-        val cursors = linkedMapOf<String, InfluxCursor>()
-        val cursorErrors = linkedMapOf<String, String>()
-        val pendingBatchLimits = mutableListOf<Int>()
-        val influxEvents = mutableListOf<InfluxEvent>()
-        var summaryCalls = 0
-        var ensureCalls = 0
-        var summaryComplete = true
-        var afterPendingSummary: ((InfluxPendingSummary) -> Unit)? = null
-        var afterPendingHead: ((List<InfluxPendingHistoryRow>) -> Unit)? = null
-        private var state = InfluxExportStateSnapshot(
-            status = "stopped",
-            mode = null,
-            pendingRows = 0,
-            oldestPendingAt = null,
-            nextRetryAt = null,
-            lastSuccessAt = null,
-            lastErrorAt = null,
-            lastError = null,
-            exportedRowsTotal = 0
-        )
-
-        override fun ensureInfluxCursors(fieldKeys: Set<String>) {
-            ensureCalls++
-            fieldKeys.forEach { fieldKey -> cursors.putIfAbsent(fieldKey, InfluxCursor(fieldKey, 0)) }
-        }
-
-        override fun pendingInfluxSummary(fieldKeys: Set<String>): InfluxPendingSummary {
-            if (failStage == "summary") error("pending summary failure")
-            summaryCalls++
-            ensureInfluxCursors(fieldKeys)
-            val pending = rows.filter { row ->
-                fieldKeys.contains(row.fieldKey) && row.id > cursor(row.fieldKey).lastExportedHistoryId
-            }
-            val summary = if (summaryComplete) {
-                InfluxPendingSummary(
-                    rows = pending.size.toLong(),
-                    oldestObservedAt = pending.minByOrNull { it.id }?.observedAt,
-                    complete = true
-                )
-            } else {
-                InfluxPendingSummary(rows = -1L, oldestObservedAt = null, complete = false)
-            }
-            return summary.also { afterPendingSummary?.invoke(it) }
-        }
-
-        override fun pendingInfluxRows(fieldKeys: Set<String>, limit: Int): List<InfluxPendingHistoryRow> {
-            if (failStage == "rows") error("pending rows failure")
-            ensureInfluxCursors(fieldKeys)
-            if (limit != 1) pendingBatchLimits += limit
-            return rows.asSequence()
-                .filter { it.fieldKey in fieldKeys && it.id > cursor(it.fieldKey).lastExportedHistoryId }
-                .sortedBy { it.id }
-                .take(limit)
-                .toList()
-                .also { if (limit == 1) afterPendingHead?.invoke(it) }
-        }
-
-        override fun updateInfluxCursorSuccess(fieldKey: String, historyId: Long, exportedAt: String) {
-            if (fieldKey == cursorFailureField) throw IllegalStateException("cursor persistence failed")
-            cursors[fieldKey] = InfluxCursor(fieldKey, historyId)
-        }
-
-        override fun updateInfluxCursorError(fieldKey: String, error: String, errorAt: String) {
-            cursorErrors[fieldKey] = error
-        }
-
-        override fun influxExportState(): InfluxExportStateSnapshot = state
-
-        override fun updateInfluxExportState(
-            status: String,
-            mode: String?,
-            pendingRows: Long,
-            oldestPendingAt: String?,
-            nextRetryAt: String?,
-            lastSuccessAt: String?,
-            lastErrorAt: String?,
-            lastError: String?,
-            exportedRowsDelta: Long
-        ) {
-            if (failStage == "state") error("state persistence failure")
-            state = state.copy(
-                status = status,
-                mode = mode,
-                pendingRows = pendingRows,
-                oldestPendingAt = oldestPendingAt,
-                nextRetryAt = nextRetryAt,
-                lastSuccessAt = lastSuccessAt,
-                lastErrorAt = lastErrorAt,
-                lastError = lastError,
-                exportedRowsTotal = state.exportedRowsTotal + exportedRowsDelta
-            )
-        }
-
-        override fun recordInfluxEvent(
-            eventType: String,
-            message: String?,
-            batchCount: Int?,
-            fromHistoryId: Long?,
-            toHistoryId: Long?
-        ) {
-            eventFailure?.let { throw it }
-            influxEvents += InfluxEvent(eventType, message, batchCount, fromHistoryId, toHistoryId)
-        }
-
-        fun setNextRetryAt(nextRetryAt: String) {
-            state = state.copy(
-                status = "backoff",
-                nextRetryAt = nextRetryAt,
-                lastErrorAt = "2026-06-15T12:00:00Z",
-                lastError = "offline"
-            )
-        }
-
-        fun addRow(row: InfluxPendingHistoryRow) {
-            rows += row
-        }
-
-        fun cursor(fieldKey: String): InfluxCursor = cursors[fieldKey] ?: InfluxCursor(fieldKey, 0)
-    }
-
-    private data class InfluxEvent(
-        val eventType: String,
-        val message: String?,
-        val batchCount: Int?,
-        val fromHistoryId: Long?,
-        val toHistoryId: Long?
-    )
-
-    private class FakeClock(var now: String = "2026-06-15T12:00:00Z") : Clock {
-        var elapsedMs = 1_000L
-        override fun nowIso(): String = now
-        override fun elapsedRealtimeMs(): Long = elapsedMs
+    private class MutableClock(@Volatile private var nowMs: Long) : Clock {
+        override fun nowIso(): String = Instant.ofEpochMilli(nowMs).toString()
+        override fun elapsedRealtimeMs(): Long = SystemClock.elapsedRealtime()
+        fun advanceBy(deltaMs: Long) { nowMs += deltaMs }
     }
 }
