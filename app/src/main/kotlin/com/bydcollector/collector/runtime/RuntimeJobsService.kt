@@ -184,9 +184,9 @@ class RuntimeJobsService : Service() {
                 }
             }
             "updateDownload" -> {
+                val info = updateInfo(job)
+                app.releaseNotesHistory.request(info)
                 RuntimeControl.call(this, "installStart", android.os.Bundle())
-                val info = UpdateInfo(args.getString("version"), args.getString("url"), "",
-                    args.optString("contentType").takeIf { it.isNotBlank() })
                 val downloader = UpdateDownloader(this)
                 val downloadId = job.optLong("downloadId", -1L).takeIf { it > 0 } ?: downloader.enqueue(info)
                 change(this, job.getString("id")) { it.put("downloadId", downloadId) }
@@ -320,13 +320,38 @@ class RuntimeJobsService : Service() {
 
         fun snapshot(context: Context): String = synchronized(LOCK) {
             JSONArray(load(context).filterNot { it.optBoolean("presented") }.map { item ->
-                JSONObject(item.toString()).apply { optJSONObject("args")?.remove("notes") }
+                JSONObject(item.toString()).apply {
+                    if (optString("status") !in setOf("queued", "running")) optJSONObject("args")?.remove("notes")
+                }
             }).toString()
+        }
+
+        internal fun updateInfo(job: JSONObject): UpdateInfo = job.getJSONObject("args").let { args ->
+            UpdateInfo(args.getString("version"), args.getString("url"), args.optString("notes"),
+                args.optString("contentType").takeIf { it.isNotBlank() })
+        }
+
+        internal fun activeUpdateInfo(context: Context): UpdateInfo? = synchronized(LOCK) {
+            load(context).firstOrNull {
+                it.optString("kind") == "updateDownload" && it.optString("status") in setOf("queued", "running")
+            }?.let(::updateInfo)
         }
 
         fun presented(context: Context, id: String) {
             require(id.length <= 64)
             change(context, id) { check(it.getString("status") !in setOf("queued", "running")); it.put("presented", true) }
+        }
+
+        fun dismissUpdateDialog(context: Context, id: String) {
+            require(id.length in 1..64)
+            if (com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) {
+                RuntimeEndpoint.call(context, "job.dismissUpdate", android.os.Bundle().apply { putString("id", id) })
+                return
+            }
+            change(context, id) {
+                check(it.getString("kind") == "updateDownload")
+                it.put("dialogDismissed", true)
+            }
         }
 
         fun prepareResult(context: Context, id: String) = synchronized(LOCK) {

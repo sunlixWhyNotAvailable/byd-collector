@@ -98,7 +98,8 @@ internal object RuntimeReads {
             }
             "updates" -> {
                 val check = app.updateChecks.snapshot()
-                val target = (check.uiState as? com.bydcollector.collector.update.UpdateUiState.Available)?.info
+                val target = RuntimeJobsService.activeUpdateInfo(context)
+                    ?: (check.uiState as? com.bydcollector.collector.update.UpdateUiState.Available)?.info
                 RuntimeUpdateSnapshot(check, target, target?.let(app.releaseNotesHistory::snapshot))
             }
             "dashboard" -> synchronized(lock) {

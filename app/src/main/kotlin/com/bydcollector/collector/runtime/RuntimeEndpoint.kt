@@ -113,6 +113,10 @@ class RuntimeEndpointProvider : ContentProvider() {
                     RuntimeJobsService.presented(ctx, requireNotNull(extras.getString("id")))
                     Bundle()
                 }
+                "job.dismissUpdate" -> {
+                    RuntimeJobsService.dismissUpdateDialog(ctx, requireNotNull(extras.getString("id")))
+                    Bundle()
+                }
                 "job.prepare" -> {
                     RuntimeJobsService.prepareResult(ctx, requireNotNull(extras.getString("id")))
                     Bundle()

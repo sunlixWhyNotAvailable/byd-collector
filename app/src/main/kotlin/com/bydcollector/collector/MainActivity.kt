@@ -96,6 +96,7 @@ import com.bydcollector.collector.update.UpdateCheckSession
 import com.bydcollector.collector.update.UpdateDownloader
 import com.bydcollector.collector.update.UpdateInfo
 import com.bydcollector.collector.update.UpdateUiState
+import com.bydcollector.collector.runtime.RuntimeJobsService
 import com.bydcollector.collector.util.dispatchOperationalEvent
 import com.bydcollector.collector.util.diagnosticDetail
 import com.bydcollector.collector.util.namedSingleThreadExecutor
@@ -108,6 +109,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 class MainActivity : ComponentActivity() {
     private val runtimeJobCallbacks = mutableMapOf<String, (Boolean) -> Unit>()
     private val presentedRuntimeJobs = mutableSetOf<String>()
+    private val dismissedUpdateJobs = mutableSetOf<String>()
+    private var updateDownloadJobId: String? = null
     private var lastRuntimeMetadataAt = 0L
     private val runtimeObserver = object : android.database.ContentObserver(Handler(Looper.getMainLooper())) {
         override fun onChange(selfChange: Boolean) { if (foreground && !destroyed) refresh(force = false) }
@@ -133,8 +136,10 @@ class MainActivity : ComponentActivity() {
             mqttCleanup = active.any { it.getString("kind") == "mqttCleanup" },
             influxTest = active.any { it.getString("kind") == "influxTest" })
         active.firstOrNull { it.getString("kind") == "updateDownload" }?.let { job ->
-            val args = job.getJSONObject("args")
-            updateUiState = UpdateUiState.Downloading(UpdateInfo(args.getString("version"), args.getString("url"), ""), job.optInt("progress"))
+            updateDownloadJobId = job.getString("id")
+            if (job.optBoolean("dialogDismissed") || updateDownloadJobId in dismissedUpdateJobs) return@let
+            updateUiState = UpdateUiState.Downloading(RuntimeJobsService.updateInfo(job), job.optInt("progress"))
+            syncReleaseNotesUi()
         }
         jobs.filter { it !in active && !it.optBoolean("presented") }.forEach { job ->
             val id = job.getString("id")
@@ -171,7 +176,10 @@ class MainActivity : ComponentActivity() {
                 } else if (kind != "access") {
                     val message = if (success) result.optString("message").ifBlank { "$kind: OK" } else job.optString("error")
                     Toast.makeText(this, message, Toast.LENGTH_LONG).show()
-                    if (kind == "updateDownload") updateUiState = UpdateUiState.Error(message)
+                    if (kind == "updateDownload" && !job.optBoolean("dialogDismissed") && id !in dismissedUpdateJobs) {
+                        updateDownloadJobId = id
+                        updateUiState = UpdateUiState.Error(message)
+                    }
                 }
                 runtimeJobCallbacks.remove(id)?.invoke(success)
                 RuntimeEndpoint.call(this, "job.presented", Bundle().apply { putString("id", id) })
@@ -765,6 +773,12 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onDismissUpdateDialog() {
+            updateDownloadJobId?.let { id ->
+                // Fence an already-read progress snapshot before persisting the dismissal.
+                dismissedUpdateJobs += id
+                runCatching { RuntimeJobsService.dismissUpdateDialog(this@MainActivity, id) }
+                    .onFailure { Log.w(TAG, "Could not persist update dialog dismissal", it) }
+            }
             updateRuntime.dismissOffer()
             updatePresentationRevision = updateChecks.snapshot().revision
             updateUiGeneration += 1L
@@ -2213,7 +2227,10 @@ class MainActivity : ComponentActivity() {
     private fun startUpdateDownload(info: UpdateInfo) {
         if (BuildConfig.RUNTIME_CLIENT) {
             submitRuntimeJob("updateDownload", JSONObject().put("version", info.version).put("url", info.downloadUrl)
-                .put("notes", info.releaseNotes).put("contentType", info.downloadContentType))
+                .put("notes", info.releaseNotes).put("contentType", info.downloadContentType))?.let { id ->
+                updateDownloadJobId = id
+                updateUiState = UpdateUiState.Downloading(info, 0)
+            }
             return
         }
         updateRuntime.onInstallStarted()

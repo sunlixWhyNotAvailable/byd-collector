@@ -8,6 +8,9 @@ import androidx.compose.ui.test.performClick
 import com.bydcollector.collector.BuildConfig
 import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.MainActivity
+import com.bydcollector.collector.runtime.RuntimeJobsService
+import com.bydcollector.collector.runtime.RuntimeReads
+import com.bydcollector.collector.runtime.RuntimeUpdateSnapshot
 import com.bydcollector.collector.disposeTestComposition
 import com.bydcollector.collector.adb.AdbAuthorizationManager
 import com.bydcollector.collector.adb.AdbLocalClient
@@ -31,6 +34,8 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 import java.io.File
 import java.time.Duration
+import org.json.JSONArray
+import org.json.JSONObject
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = BydCollectorApplication::class,
@@ -53,6 +58,8 @@ class UpdateRuntimeBehaviorTest {
     private var screenDestroyed = false
 
     @Before fun prepare() {
+        // Drive Compose frames explicitly; the live dashboard keeps scheduling background refreshes.
+        ui.mainClock.autoAdvance = false
         app = RuntimeEnvironment.getApplication() as BydCollectorApplication
         settings = CollectorSettings(app)
         preferences = app.getSharedPreferences(CollectorSettings.PREFS_NAME, 0)
@@ -88,6 +95,8 @@ class UpdateRuntimeBehaviorTest {
                 if (!screenStopped) screen.pause().stop()
                 screen.destroy()
             }
+            app.updateRuntime.shutdown()
+            RuntimeJobsService::class.java.getDeclaredField("cached").apply { isAccessible = true }.set(null, null)
             if (::checksDelegate.isInitialized) previousChecksDelegate?.let { checksDelegate.set(app, it) }
             if (::historyDelegate.isInitialized) previousHistoryDelegate?.let { historyDelegate.set(app, it) }
             if (::preferences.isInitialized) {
@@ -168,6 +177,7 @@ class UpdateRuntimeBehaviorTest {
             screen.start().resume().visible()
             screenStopped = false
             settle()
+            screen.get().disposeTestComposition()
             screen.recreate().visible()
             settle()
             assertEquals(2, checkCount, "Recreated Activity must reuse the process-owned result")
@@ -202,9 +212,94 @@ class UpdateRuntimeBehaviorTest {
         }
     }
 
+    @Test fun closedDownloadStaysHiddenAcrossProgressAndRecreationWithoutCancellingJob() {
+        settings.setUpdateAutoCheckEnabled(false)
+        val session = UpdateCheckSession(dispatch = { it() }, checker = { error("No check expected") })
+        checksDelegate.set(app, lazyOf(session))
+        screen = Robolectric.buildActivity(MainActivity::class.java).setup().visible()
+        val id = RuntimeJobsService.submit(app, "updateDownload", JSONObject()
+            .put("version", "3.2.3").put("url", "https://example.test/update.apk").put("notes", "Release notes"))
+        val staleProgress = JSONArray(RuntimeJobsService.snapshot(app))
+            .apply { getJSONObject(0).put("progress", 70) }.toString()
+        consumeJobs(RuntimeJobsService.snapshot(app))
+        ui.onNodeWithText("Close").assertIsDisplayed().performClick()
+        settle()
+        consumeJobs(staleProgress)
+        ui.onNodeWithText("Close").assertDoesNotExist()
+
+        // Reload the real persisted job, not a preconfigured dismissal mock.
+        RuntimeJobsService::class.java.getDeclaredField("cached").apply { isAccessible = true }.set(null, null)
+        val persisted = JSONArray(RuntimeJobsService.snapshot(app)).getJSONObject(0)
+        assertEquals(id, persisted.getString("id"))
+        assertEquals("queued", persisted.getString("status"))
+        assertTrue(persisted.getBoolean("dialogDismissed"))
+        assertFalse(persisted.optBoolean("presented"), "Close must not consume the eventual installer result")
+        screen.get().disposeTestComposition()
+        screen.recreate().visible()
+        consumeJobs(RuntimeJobsService.snapshot(app))
+        ui.onNodeWithText("Close").assertDoesNotExist()
+
+        val failed = JSONArray().put(persisted.put("status", "error").put("error", "Download failed")).toString()
+        consumeJobs(failed)
+        ui.onNodeWithText("Close").assertDoesNotExist()
+        // A later, distinct update must not inherit this job's dismissal.
+        consumeJobs(JSONArray().put(JSONObject().put("id", "next-update").put("kind", "updateDownload")
+            .put("status", "running").put("args", persisted.getJSONObject("args"))).toString())
+        ui.onNodeWithText("Close").assertIsDisplayed()
+    }
+
+    private fun consumeJobs(json: String) {
+        MainActivity::class.java.getDeclaredMethod("consumeRuntimeJobs", String::class.java)
+            .apply { isAccessible = true }.invoke(screen.get(), json)
+        settle()
+    }
+
+    @Test fun downloadKeepsTargetAndIntermediateNotesAfterOfferClearsAndUiRecreates() {
+        settings.setUpdateAutoCheckEnabled(false)
+        val info = UpdateInfo("3.2.5", "https://example.test/update.apk", "Target release notes",
+            "application/vnd.android.package-archive")
+        val history = ReleaseNotesHistory(listOf(ReleaseNotesEntry(info.version, info.releaseNotes),
+            ReleaseNotesEntry("3.2.4", "Intermediate release notes")))
+        var historyLoads = 0
+        val session = UpdateCheckSession(dispatch = { it() }, checker = { UpdateCheckResult.Available(info) })
+        val notes = ReleaseNotesHistorySession(dispatch = { it() }, loader = { _, _ -> historyLoads++; history })
+        checksDelegate.set(app, lazyOf(session))
+        historyDelegate.set(app, lazyOf(notes))
+        session.request(manual = false)
+        screen = Robolectric.buildActivity(MainActivity::class.java).setup().visible()
+        settle()
+        ui.onNodeWithText("Target release notes").assertIsDisplayed()
+        ui.onNodeWithText("Intermediate release notes").assertIsDisplayed()
+
+        RuntimeJobsService.submit(app, "updateDownload", JSONObject().put("version", info.version)
+            .put("url", info.downloadUrl).put("notes", info.releaseNotes).put("contentType", info.downloadContentType))
+        app.updateRuntime.onInstallStarted()
+        settle()
+        assertEquals(UpdateUiState.Hidden, session.snapshot().uiState)
+        val transported = RuntimeReads::class.java.getDeclaredMethod("query", android.content.Context::class.java,
+            String::class.java, android.os.Bundle::class.java).apply { isAccessible = true }
+            .invoke(RuntimeReads, app, "updates", android.os.Bundle()) as RuntimeUpdateSnapshot
+        assertEquals(info, transported.target)
+        assertEquals(history, transported.history)
+        consumeJobs(RuntimeJobsService.snapshot(app))
+        ui.onNodeWithText("Downloading update...").assertIsDisplayed()
+        ui.onNodeWithText("Target release notes").assertIsDisplayed()
+        ui.onNodeWithText("Intermediate release notes").assertIsDisplayed()
+        screen.get().disposeTestComposition()
+        screen.recreate().visible()
+        consumeJobs(JSONArray(RuntimeJobsService.snapshot(app)).apply { getJSONObject(0).put("progress", 80) }.toString())
+        ui.onNodeWithText("Target release notes").assertIsDisplayed()
+        ui.onNodeWithText("Intermediate release notes").assertIsDisplayed()
+        assertEquals(1, historyLoads, "Download and UI recreation reuse the already loaded release history")
+    }
+
     private fun settle() {
-        shadowOf(Looper.getMainLooper()).idle()
-        ui.mainClock.advanceTimeBy(100L)
+        repeat(3) {
+            shadowOf(Looper.getMainLooper()).idle()
+            androidx.compose.runtime.snapshots.Snapshot.sendApplyNotifications()
+            ui.mainClock.advanceTimeBy(100L)
+            ui.waitForIdle()
+        }
         shadowOf(Looper.getMainLooper()).idle()
     }
 }
