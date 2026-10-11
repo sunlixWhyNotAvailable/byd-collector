@@ -240,7 +240,9 @@ public final class CollectorHelperDaemon {
                 if (code == CollectorHelperProtocol.TX_CALLBACK_PENDING_PAGE ||
                     code == CollectorHelperProtocol.TX_CALLBACK_ACK ||
                     code == CollectorHelperProtocol.TX_CALLBACK_STATUS ||
-                    code == CollectorHelperProtocol.TX_CALLBACK_QUARANTINE) {
+                    code == CollectorHelperProtocol.TX_CALLBACK_QUARANTINE ||
+                    code == CollectorHelperProtocol.TX_CALLBACK_AWAIT ||
+                    code == CollectorHelperProtocol.TX_CALLBACK_CANCEL_WAIT) {
                     long token;
                     int stream;
                     long epoch;
@@ -253,7 +255,9 @@ public final class CollectorHelperDaemon {
                             CollectorHelperProtocol.STATUS_INVALID_REQUEST, describe(error));
                         return true;
                     }
-                    int access = runtime.authorizeCallbackTransport(token, stream, epoch);
+                    // Cancellation only removes the exact listener, even after its lease expired.
+                    int access = code == CollectorHelperProtocol.TX_CALLBACK_CANCEL_WAIT
+                        ? CollectorHelperProtocol.STATUS_OK : runtime.authorizeCallbackTransport(token, stream, epoch);
                     if (access != CollectorHelperProtocol.STATUS_OK) {
                         CallbackSpoolBinder.writeUnavailable(code, reply, access,
                             access == CollectorHelperProtocol.STATUS_REPLAY_PENDING
@@ -1047,7 +1051,8 @@ public final class CollectorHelperDaemon {
     }
 
     static boolean isStopDrainTransaction(int code) {
-        return code == CollectorHelperProtocol.TX_CALLBACK_PENDING_PAGE ||
+        return code == CollectorHelperProtocol.TX_CALLBACK_CANCEL_WAIT ||
+            code == CollectorHelperProtocol.TX_CALLBACK_PENDING_PAGE ||
             code == CollectorHelperProtocol.TX_CALLBACK_ACK ||
             code == CollectorHelperProtocol.TX_CALLBACK_STATUS ||
             code == CollectorHelperProtocol.TX_CALLBACK_QUARANTINE ||

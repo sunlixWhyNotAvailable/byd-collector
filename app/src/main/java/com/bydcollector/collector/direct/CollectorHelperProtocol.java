@@ -8,7 +8,7 @@ public final class CollectorHelperProtocol {
     public static final String SPOOL_MODE_ARG = "spool";
     public static final String LOG_PATH = "/data/local/tmp/bydcollector_helper.log";
     public static final String LOCK_PATH = "/data/local/tmp/bydcollector_helper.lock";
-    public static final int PROTOCOL_VERSION = 16;
+    public static final int PROTOCOL_VERSION = 17;
     // PING's status/version/owner and STOP_OWNER layout is verified for these versions.
     public static final int MIN_STOP_PROTOCOL_VERSION = 13;
     public static final int TX_PING = 1;
@@ -31,6 +31,10 @@ public final class CollectorHelperProtocol {
     public static final int TX_KPI_SUBSCRIBE = 18;
     public static final int TX_KPI_UNSUBSCRIBE = 19;
     public static final int TX_KPI_DRAIN = 20;
+    public static final int TX_CALLBACK_AWAIT = 21;
+    public static final int TX_CALLBACK_CANCEL_WAIT = 22;
+    public static final String CALLBACK_LISTENER_DESCRIPTOR = "com.bydcollector.collector.direct.ICallbackReadyListener";
+    public static final int CALLBACK_TX_READY = 1;
     public static final String KPI_LISTENER_DESCRIPTOR = "com.bydcollector.collector.direct.ICollectorKpiListener";
     public static final int KPI_TX_INVALIDATED = 1;
     public static final int KPI_LISTENER_IDLE = 0;

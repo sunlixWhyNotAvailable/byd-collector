@@ -28,6 +28,7 @@ data class CallbackIntakeStatus(
 class CallbackIntakeWorker(
     private val threadName: String,
     private val drain: () -> CallbackDrainResult,
+    private val armBatchReady: (() -> Unit) -> AutoCloseable,
     private val ready: () -> Boolean = { true },
     private val onStatus: (CallbackIntakeStatus) -> Unit = {},
     private val onStopped: () -> Unit = {},
@@ -37,6 +38,7 @@ class CallbackIntakeWorker(
     private val queueStatusTracker: CallbackQueueStatusTracker = CallbackQueueStatusTracker()
 ) {
     private val lock = Any()
+    private val dataReady = Object()
     private val running = AtomicBoolean(false)
     @Volatile private var worker: Thread? = null
 
@@ -74,6 +76,7 @@ class CallbackIntakeWorker(
             running.set(false)
             worker
         }
+        synchronized(dataReady) { dataReady.notifyAll() }
         current?.interrupt()
         if (timeoutMs > 0 && current != null && current !== Thread.currentThread()) current.join(timeoutMs)
         val stopped = current?.isAlive != true
@@ -84,6 +87,7 @@ class CallbackIntakeWorker(
     /** Stops after the active callback batch has committed and been acknowledged. */
     fun requestStopAfterCurrentBatch() {
         synchronized(lock) { running.set(false) }
+        synchronized(dataReady) { dataReady.notifyAll() }
     }
 
     fun awaitStopped(timeoutMs: Long): Boolean {
@@ -264,7 +268,20 @@ class CallbackIntakeWorker(
                     CallbackDrainKind.PROGRESS -> {
                         backoffIndex = 0
                     }
-                    CallbackDrainKind.EMPTY -> sleepMs(EMPTY_WAIT_MS)
+                    CallbackDrainKind.EMPTY -> {
+                        try {
+                            waitForBatch()
+                            backoffIndex = 0
+                        } catch (error: InterruptedException) {
+                            throw error
+                        } catch (error: Exception) {
+                            val failed = faultResult(error)
+                            record(failed)
+                            report(CallbackIntakeCondition.FAULT, failed)
+                            sleepMs(BACKOFF_MS[backoffIndex])
+                            backoffIndex = (backoffIndex + 1).coerceAtMost(BACKOFF_MS.lastIndex)
+                        }
+                    }
                     CallbackDrainKind.PENDING, CallbackDrainKind.FAULT -> {
                         sleepMs(BACKOFF_MS[backoffIndex])
                         backoffIndex = (backoffIndex + 1).coerceAtMost(BACKOFF_MS.lastIndex)
@@ -279,6 +296,24 @@ class CallbackIntakeWorker(
             report(CallbackIntakeCondition.STOPPED, latestResult, force = true)
             runCatching(onStopped)
         }
+    }
+
+    private fun waitForBatch() {
+        var signaled = false
+        val subscription = armBatchReady {
+            synchronized(dataReady) { signaled = true; dataReady.notifyAll() }
+        }
+        try {
+            // A lost advisory wake or changed lease cannot strand retained data indefinitely.
+            val deadline = System.nanoTime() + SUMMARY_INTERVAL_NANOS
+            synchronized(dataReady) {
+                while (running.get() && !signaled) {
+                    val remaining = deadline - System.nanoTime()
+                    if (remaining <= 0L) break
+                    java.util.concurrent.TimeUnit.NANOSECONDS.timedWait(dataReady, remaining)
+                }
+            }
+        } finally { subscription.close() }
     }
 
     private fun faultResult(error: Throwable) = CallbackDrainResult(

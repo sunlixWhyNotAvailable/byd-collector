@@ -1,6 +1,8 @@
 package com.bydcollector.collector.direct;
 
 import android.os.Parcel;
+import android.os.IBinder;
+import android.os.RemoteException;
 import java.util.ArrayDeque;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -18,6 +20,7 @@ public final class CallbackSpoolBinder implements AutoCloseable {
     };
     private final AtomicLongArray retainedLiveBytes = new AtomicLongArray(3);
     private final Object[] streamLocks = { null, new Object(), new Object() };
+    private final ReadyWaiter[] waiters = new ReadyWaiter[3];
     private final ScheduledExecutorService ageFlush = Executors.newSingleThreadScheduledExecutor(task -> {
         Thread thread = new Thread(task, "byd-callback-memory-flush");
         thread.setDaemon(true);
@@ -54,9 +57,48 @@ public final class CallbackSpoolBinder implements AutoCloseable {
 
     /** Called off the vendor callback thread after queue batching. */
     CallbackSpool.AppendResult deliver(TelemetryCallbackBatch batch, boolean appOwnsStream) {
+        CallbackSpool.AppendResult result;
+        ReadyWaiter waiter;
         synchronized (streamLock(batch.stream)) {
-            return deliverLocked(batch, appOwnsStream);
+            result = deliverLocked(batch, appOwnsStream);
+            waiter = takeWaiterLocked(batch.stream);
         }
+        // Advisory wake only: payload and ACK stay in the existing transport.
+        notifyReady(waiter);
+        return result;
+    }
+
+    private ReadyWaiter takeWaiterLocked(int stream) {
+        ReadyWaiter waiter = waiters[stream];
+        waiters[stream] = null;
+        if (waiter != null) {
+            try { waiter.listener.unlinkToDeath(waiter.death, 0); }
+            catch (RuntimeException ignored) { /* A dead listener may already be unlinked. */ }
+        }
+        return waiter;
+    }
+
+    private void cancelWaiter(int stream, IBinder listener) {
+        synchronized (streamLock(stream)) {
+            if (waiters[stream] != null && waiters[stream].listener.equals(listener)) takeWaiterLocked(stream);
+        }
+    }
+
+    private static void notifyReady(ReadyWaiter waiter) {
+        if (waiter == null) return;
+        Parcel data = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(CollectorHelperProtocol.CALLBACK_LISTENER_DESCRIPTOR);
+            waiter.listener.transact(CollectorHelperProtocol.CALLBACK_TX_READY, data, null, IBinder.FLAG_ONEWAY);
+        } catch (RemoteException | RuntimeException ignored) {
+            // Data remains retained; reconnect or the bounded liveness check drains it.
+        } finally { data.recycle(); }
+    }
+
+    private static final class ReadyWaiter {
+        final IBinder listener;
+        final IBinder.DeathRecipient death;
+        ReadyWaiter(IBinder listener, IBinder.DeathRecipient death) { this.listener = listener; this.death = death; }
     }
 
     private CallbackSpool.AppendResult deliverLocked(TelemetryCallbackBatch batch, boolean appOwnsStream) {
@@ -191,6 +233,28 @@ public final class CallbackSpoolBinder implements AutoCloseable {
 
     private boolean transactLocked(int code, int stream, Parcel data, Parcel reply) throws Exception {
             CallbackSpool spool = spool(stream);
+            if (code == CollectorHelperProtocol.TX_CALLBACK_AWAIT || code == CollectorHelperProtocol.TX_CALLBACK_CANCEL_WAIT) {
+                IBinder listener = data.readStrongBinder();
+                if (listener == null || data.dataAvail() != 0) throw new IllegalArgumentException("invalid callback listener");
+                boolean ready = false;
+                if (code == CollectorHelperProtocol.TX_CALLBACK_CANCEL_WAIT) {
+                    cancelWaiter(stream, listener);
+                } else {
+                    if (closed) throw new IllegalStateException("callback transport is closing");
+                    takeWaiterLocked(stream);
+                    // Queue check and listener installation share the producer lock: no lost wake.
+                    ready = !live[stream].isEmpty() || spool.oldest() != null;
+                    if (!ready) {
+                        IBinder.DeathRecipient death = () -> cancelWaiter(stream, listener);
+                        listener.linkToDeath(death, 0);
+                        waiters[stream] = new ReadyWaiter(listener, death);
+                    }
+                }
+                reply.writeInt(CollectorHelperProtocol.STATUS_OK);
+                reply.writeString(null);
+                reply.writeInt(ready ? 1 : 0);
+                return true;
+            }
             if (code == CollectorHelperProtocol.TX_CALLBACK_STATUS) {
                 CallbackSpool.Status status = spool.status();
                 reply.writeInt(CollectorHelperProtocol.STATUS_OK);
@@ -265,7 +329,9 @@ public final class CallbackSpoolBinder implements AutoCloseable {
 
     static void writeUnavailable(int code, Parcel reply, int status, String error) {
         if (reply == null) return;
-        if (code == CollectorHelperProtocol.TX_CALLBACK_PENDING_PAGE) {
+        if (code == CollectorHelperProtocol.TX_CALLBACK_AWAIT || code == CollectorHelperProtocol.TX_CALLBACK_CANCEL_WAIT) {
+            reply.writeInt(status); reply.writeString(error); reply.writeInt(0);
+        } else if (code == CollectorHelperProtocol.TX_CALLBACK_PENDING_PAGE) {
             reply.writeInt(status); reply.writeString(error); writeDescriptor(reply, null);
             reply.writeLong(0L); reply.writeByteArray(new byte[0]);
         } else if (code == CollectorHelperProtocol.TX_CALLBACK_ACK || code == CollectorHelperProtocol.TX_CALLBACK_QUARANTINE) {
@@ -343,13 +409,16 @@ public final class CallbackSpoolBinder implements AutoCloseable {
         boolean persisted = true;
         RuntimeException failure = null;
         for (int stream = 1; stream <= 2; stream++) {
+            ReadyWaiter waiter;
             synchronized (streamLock(stream)) {
+                waiter = takeWaiterLocked(stream);
                 try { persisted &= closeStream(stream); }
                 catch (RuntimeException error) {
                     if (failure == null) failure = error;
                     else failure.addSuppressed(error);
                 }
             }
+            notifyReady(waiter);
         }
         if (failure != null) throw failure;
         if (persisted) {

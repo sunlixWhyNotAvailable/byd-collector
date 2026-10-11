@@ -1002,11 +1002,13 @@ class CollectorService : Service() {
     private fun createCallbackIntake(stream: Int): CallbackIntakeWorker {
         // Each intake owns its Binder client: a slow getter or the other stream cannot hold its lock.
         val queueStatus = CallbackQueueStatusTracker()
-        val drain = callbackDrain(DirectVehicleHelperClient(), stream, queueStatus)
+        val helper = DirectVehicleHelperClient()
+        val drain = callbackDrain(helper, stream, queueStatus)
         return CallbackIntakeWorker(
             threadName = "byd-callback-intake-$stream",
             ready = { DirectStreamController.credentials(stream) != null },
             drain = { drain.drain(maxBatches = 1) },
+            armBatchReady = { wake -> helper.awaitCallbackBatch(stream, wake) },
             onStatus = { summary ->
                 queueCallbackDiagnostic(stream, summary.detail +
                     (summary.fault?.let { "\n${it.diagnosticDetail()}" } ?: ""))

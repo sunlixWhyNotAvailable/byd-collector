@@ -528,6 +528,54 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
         }
     }
 
+    /** One-shot batch wake; the atomic helper-side queue check also covers attach/reconnect. */
+    fun awaitCallbackBatch(stream: Int, onReady: () -> Unit): AutoCloseable = synchronized(lock) {
+        val owner = checkNotNull(DirectStreamController.credentials(stream)) { "Callback stream is not claimed" }
+        val binder = checkNotNull(ensureBinder()) { "helper binder unavailable" }
+        val pending = java.util.concurrent.atomic.AtomicBoolean(true)
+        fun wake() { pending.set(false); onReady() }
+        val listener = object : Binder() {
+            override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+                if (code != CollectorHelperProtocol.CALLBACK_TX_READY) return super.onTransact(code, data, reply, flags)
+                data.enforceInterface(CollectorHelperProtocol.CALLBACK_LISTENER_DESCRIPTOR)
+                require(data.dataAvail() == 0) { "invalid callback wake" }
+                wake()
+                return true
+            }
+        }
+        val death = IBinder.DeathRecipient {
+            if (cached === binder) cached = null
+            wake()
+        }
+        fun exchange(transaction: Int): Boolean {
+            val data = Parcel.obtain(); val reply = Parcel.obtain()
+            try {
+                writeCallbackCredentials(data, owner.controllerToken, stream, owner.epoch)
+                data.writeStrongBinder(listener)
+                check(binder.transact(transaction, data, reply, 0)) { "callback wait transaction rejected" }
+                val status = reply.readInt(); val error = reply.readString(); val ready = reply.readInt()
+                check(status == CollectorHelperProtocol.STATUS_OK) { error ?: "callback wait failed: $status" }
+                require(ready in 0..1 && reply.dataAvail() == 0) { "invalid callback wait reply" }
+                return ready == 1
+            } finally { data.recycle(); reply.recycle() }
+        }
+        val closed = java.util.concurrent.atomic.AtomicBoolean(false)
+        val subscription = AutoCloseable {
+            if (closed.compareAndSet(false, true)) {
+                runCatching { binder.unlinkToDeath(death, 0) }
+                if (pending.getAndSet(false)) runCatching { exchange(CollectorHelperProtocol.TX_CALLBACK_CANCEL_WAIT) }
+            }
+        }
+        try {
+            binder.linkToDeath(death, 0)
+            if (exchange(CollectorHelperProtocol.TX_CALLBACK_AWAIT)) wake()
+            subscription
+        } catch (error: Exception) {
+            subscription.close()
+            throw error
+        }
+    }
+
     fun callbackSpoolStatus(stream: Int): CallbackSpoolStatus = synchronized(lock) {
         val owner = DirectStreamController.credentials(stream)
             ?: return@synchronized CallbackSpoolStatus(CollectorHelperProtocol.STATUS_STALE_TOKEN, error = "Callback stream is not claimed")

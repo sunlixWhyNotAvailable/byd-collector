@@ -25,6 +25,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongSupplier;
@@ -66,6 +67,9 @@ final class HelperCallbackController implements AutoCloseable {
     private final LongSupplier wallClock;
     private final KpiInvalidationSender kpiInvalidationSender;
     private final ScheduledExecutorService[] streamWorkers = new ScheduledExecutorService[3];
+    private final ScheduledFuture<?>[] flushTasks = new ScheduledFuture<?>[3];
+    private final long[] flushDeadlines = { Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE };
+    private final long[] flushTokens = new long[3];
     private final ScheduledExecutorService registrationWorker;
     private final ReentrantLock closeLock = new ReentrantLock();
     private final TelemetryCallbackQueue[] queues = new TelemetryCallbackQueue[3];
@@ -165,12 +169,6 @@ final class HelperCallbackController implements AutoCloseable {
             }
             @Override public void error(int code, String message) { onListenerError(code, message); }
         });
-        for (int stream = CollectorHelperProtocol.STREAM_MAIN;
-             stream <= CollectorHelperProtocol.STREAM_SECONDARY; stream++) {
-            final int selectedStream = stream;
-            streamWorkers[stream].scheduleWithFixedDelay(
-                () -> maintenance(selectedStream), 100L, 100L, TimeUnit.MILLISECONDS);
-        }
     }
 
     void updatePlan(HelperStreamRuntimeState.StreamView main, HelperStreamRuntimeState.StreamView secondary) {
@@ -204,6 +202,9 @@ final class HelperCallbackController implements AutoCloseable {
                 desiredUnion(desired[CollectorHelperProtocol.STREAM_MAIN], desired[CollectorHelperProtocol.STREAM_SECONDARY]));
             lastMainView = main;
             lastSecondaryView = secondary;
+            // Lease loss must spill retained RAM even when no new callback arrives.
+            scheduleFlushLocked(CollectorHelperProtocol.STREAM_MAIN, 0L);
+            scheduleFlushLocked(CollectorHelperProtocol.STREAM_SECONDARY, 0L);
         }
         for (TelemetryCallbackBatch batch : displaced) submitBatch(batch);
         if (unionChanged) scheduleRegistration(0L, true);
@@ -572,6 +573,7 @@ final class HelperCallbackController implements AutoCloseable {
             long sequence = eventSequence[stream]++;
             if (bytes != null && bytes.length > TelemetryCallbackBatch.MAX_BYTES - 2048) {
                 queues[stream].noteLoss(wall, "oversize_callback");
+                scheduleFlushLocked(stream, 0L);
                 return;
             }
             TelemetryCallbackBatch.Event event = new TelemetryCallbackBatch.Event(
@@ -585,6 +587,7 @@ final class HelperCallbackController implements AutoCloseable {
                 //Plan changes drain under the same lock, so this indicates an internal fencing defect.
                 queues[stream].noteRejected(event, "epoch_fence");
             }
+            scheduleFlushLocked(stream, queues[stream].nextFlushDelayMs(elapsed));
         }
     }
 
@@ -607,8 +610,28 @@ final class HelperCallbackController implements AutoCloseable {
         scheduleRegistration(RETRY_MS[Math.min(retryIndex++, RETRY_MS.length - 1)], false);
     }
 
+    private void scheduleFlushLocked(int stream, long delayMs) {
+        if (closed || delayMs < 0L) return;
+        // New callbacks must not turn a blocked full queue's retry into per-event work.
+        if (fenceActive[stream] || host.publishingHeld(stream)) delayMs = Math.max(100L, delayMs);
+        long deadline = nowElapsed() + delayMs;
+        if (flushTasks[stream] != null && flushDeadlines[stream] <= deadline) return;
+        if (flushTasks[stream] != null) flushTasks[stream].cancel(false);
+        long token = ++flushTokens[stream];
+        flushDeadlines[stream] = deadline;
+        flushTasks[stream] = streamWorkers[stream].schedule(() -> {
+            synchronized (lock) {
+                if (token != flushTokens[stream]) return;
+                flushTasks[stream] = null;
+                flushDeadlines[stream] = Long.MAX_VALUE;
+            }
+            maintenance(stream);
+        }, delayMs, TimeUnit.MILLISECONDS);
+    }
+
     private void maintenance(int stream) {
         if (closed) return;
+        boolean retry = false;
         try {
             TelemetryCallbackBatch batch;
             TelemetryCallbackQueue.Loss loss;
@@ -622,7 +645,18 @@ final class HelperCallbackController implements AutoCloseable {
             if (batch != null) deliverBatch(batch);
             if (!host.appOwns(stream) && host.liveBytes(stream) > 0L) host.spill(stream);
         } catch (Throwable error) {
+            retry = true;
             if (!closed) host.noteError("callback maintenance failed: " + describe(error));
+        } finally {
+            synchronized (lock) {
+                long delay = queues[stream].nextFlushDelayMs(nowElapsed());
+                // Timed retries are only for actual pending work or a blocked writer.
+                if (retry || (!host.appOwns(stream) && host.liveBytes(stream) > 0L) ||
+                    (delay >= 0L && (fenceActive[stream] || host.publishingHeld(stream)))) {
+                    delay = 100L;
+                }
+                scheduleFlushLocked(stream, delay);
+            }
         }
     }
 
@@ -966,6 +1000,10 @@ final class HelperCallbackController implements AutoCloseable {
 
                 List<TelemetryCallbackBatch> pending = new ArrayList<>();
                 synchronized (lock) {
+                    for (int stream = 1; stream <= 2; stream++) {
+                        ++flushTokens[stream];
+                        if (flushTasks[stream] != null) flushTasks[stream].cancel(false);
+                    }
                     captureEnabled[CollectorHelperProtocol.STREAM_MAIN] = false;
                     captureEnabled[CollectorHelperProtocol.STREAM_SECONDARY] = false;
                     fenceActive[CollectorHelperProtocol.STREAM_MAIN] = true;
@@ -1012,11 +1050,13 @@ final class HelperCallbackController implements AutoCloseable {
     boolean registrationWorkerStopped() { return registrationWorker.isTerminated(); }
 
     private static ScheduledExecutorService newStreamWorker(String streamName) {
-        return Executors.newSingleThreadScheduledExecutor(runnable -> {
+        ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1, runnable -> {
             Thread thread = new Thread(runnable, "byd-helper-callback-" + streamName);
             thread.setDaemon(true);
             return thread;
         });
+        executor.setRemoveOnCancelPolicy(true);
+        return executor;
     }
 
     interface Listener {

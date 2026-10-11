@@ -76,6 +76,13 @@ public final class TelemetryCallbackQueue {
         return drain();
     }
 
+    /** No timer is needed for an empty queue without pending loss metadata. */
+    synchronized long nextFlushDelayMs(long nowElapsedMs) {
+        if (loss != null || events.size() >= TelemetryCallbackBatch.MAX_EVENTS) return 0L;
+        if (events.isEmpty()) return -1L;
+        return Math.max(0L, TelemetryCallbackBatch.FLUSH_MS - (nowElapsedMs - firstElapsedMs));
+    }
+
     public synchronized TelemetryCallbackBatch drain() {
         if (events.isEmpty()) return null;
         List<TelemetryCallbackBatch.Event> selected = new ArrayList<>(
