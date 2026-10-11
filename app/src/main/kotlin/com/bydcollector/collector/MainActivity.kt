@@ -89,6 +89,10 @@ import com.bydcollector.collector.ui.compose.TripsUiMapper
 import com.bydcollector.collector.ui.compose.TripYearUi
 import com.bydcollector.collector.ui.compose.UiLanguage
 import com.bydcollector.collector.ui.compose.strings
+import com.bydcollector.collector.ui.compose.runtimeJobMessage
+import com.bydcollector.collector.ui.compose.operationFailureMessage
+import com.bydcollector.collector.ui.compose.operationFailureDetail
+import com.bydcollector.collector.ui.compose.connectionTestMessage
 import com.bydcollector.collector.update.UpdateRuntime
 import com.bydcollector.collector.update.UpdateHintAppearance
 import com.bydcollector.collector.update.UpdateApkVerifier
@@ -124,7 +128,8 @@ class MainActivity : ComponentActivity() {
         actionUiState = actionUiState.copy(mqttTest = false,
             mqttCleanup = actionUiState.mqttCleanup && kind != "mqttCleanup", influxTest = false, adbGrant = false)
         diagnosticsBusy = false
-        Toast.makeText(this, it.message ?: "Runtime task failed", Toast.LENGTH_LONG).show()
+        recordOperationalEvent("runtime_job_submit_failed", "Runtime task submission failed", "$kind: ${it.diagnosticDetail()}")
+        Toast.makeText(this, operationFailureMessage(strings(uiLanguage), kind, it.message.orEmpty()), Toast.LENGTH_LONG).show()
     }.getOrNull()
 
     private fun consumeRuntimeJobs(json: String) {
@@ -171,14 +176,13 @@ class MainActivity : ComponentActivity() {
                     updateUiState = UpdateUiState.Hidden
                 } else if (kind == "mqttCleanup") {
                     refreshMqttCleanupGroups()
-                    val s = strings(uiLanguage)
-                    Toast.makeText(this, if (success) s.haIdentity.mqttCleanupSuccess else "${s.haIdentity.mqttCleanupFailed}\n${job.optString("error")}", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, runtimeJobMessage(strings(uiLanguage), kind, success, result, job.optString("error")), Toast.LENGTH_LONG).show()
                 } else if (kind != "access") {
-                    val message = if (success) result.optString("message").ifBlank { "$kind: OK" } else job.optString("error")
+                    val message = runtimeJobMessage(strings(uiLanguage), kind, success, result, job.optString("error"))
                     Toast.makeText(this, message, Toast.LENGTH_LONG).show()
                     if (kind == "updateDownload" && !job.optBoolean("dialogDismissed") && id !in dismissedUpdateJobs) {
                         updateDownloadJobId = id
-                        updateUiState = UpdateUiState.Error(message)
+                        updateUiState = UpdateUiState.Error(job.optString("error"))
                     }
                 }
                 runtimeJobCallbacks.remove(id)?.invoke(success)
@@ -604,7 +608,7 @@ class MainActivity : ComponentActivity() {
             settings.setMqttEnabled(true)
             runCatching { CollectorServiceController.startMqttExport(this@MainActivity) }.onFailure { error ->
                 if (!CollectorService.mqttConnection.owned) settings.setMqttEnabled(false)
-                Toast.makeText(this@MainActivity, "MQTT: ${error.message}", Toast.LENGTH_LONG).show()
+                showOperationFailure("mqttStart", error)
             }
             refresh()
         }
@@ -614,7 +618,7 @@ class MainActivity : ComponentActivity() {
             settings.setMqttManuallyStopped(true)
             settings.setMqttEnabled(false)
             runCatching { CollectorServiceController.stopMqttExport(this@MainActivity) }.onFailure { error ->
-                Toast.makeText(this@MainActivity, "MQTT: ${error.message}", Toast.LENGTH_LONG).show()
+                showOperationFailure("mqttStop", error)
             }
             refresh()
         }
@@ -628,7 +632,7 @@ class MainActivity : ComponentActivity() {
                 else actionUiState = actionUiState.copy(mqttTest = false)
                 return
             }
-            runMqttChannelAction("MQTT test") { actionStore ->
+            runMqttChannelAction("MQTT") { actionStore ->
                 HaMqttActions.testConnection(actionStore, settings, profile = selected)
             }
         }
@@ -678,7 +682,7 @@ class MainActivity : ComponentActivity() {
             settings.setInfluxEnabled(true)
             runCatching { CollectorServiceController.startInfluxExport(this@MainActivity) }.onFailure { error ->
                 if (!CollectorService.influxConnection.owned) settings.setInfluxEnabled(false)
-                Toast.makeText(this@MainActivity, "InfluxDB: ${error.message}", Toast.LENGTH_LONG).show()
+                showOperationFailure("influxStart", error)
             }
             refresh()
         }
@@ -688,7 +692,7 @@ class MainActivity : ComponentActivity() {
             settings.setInfluxManuallyStopped(true)
             settings.setInfluxEnabled(false)
             runCatching { CollectorServiceController.stopInfluxExport(this@MainActivity) }.onFailure { error ->
-                Toast.makeText(this@MainActivity, "InfluxDB: ${error.message}", Toast.LENGTH_LONG).show()
+                showOperationFailure("influxStop", error)
             }
             refresh()
         }
@@ -701,7 +705,7 @@ class MainActivity : ComponentActivity() {
                 if (saveInfluxDraft()) submitRuntimeJob("influxTest", JSONObject().put("profile", selected.name))
                 return
             }
-            runInfluxChannelAction("Influx test", clearAction = { it.copy(influxTest = false) }) { actionStore ->
+            runInfluxChannelAction("InfluxDB", clearAction = { it.copy(influxTest = false) }) { actionStore ->
                 InfluxActions.testConnection(actionStore, settings, profile = selected)
             }
         }
@@ -1084,7 +1088,12 @@ class MainActivity : ComponentActivity() {
 
     private fun showShutdownFailure(detail: String) {
         val label = if (uiLanguage == UiLanguage.UK) "Завершення роботи не виконане" else "Shutdown did not complete"
-        Toast.makeText(this, "$label: $detail", Toast.LENGTH_LONG).show()
+        Toast.makeText(this, "$label\n${operationFailureDetail(strings(uiLanguage), detail)}", Toast.LENGTH_LONG).show()
+    }
+
+    private fun showOperationFailure(kind: String, error: Throwable) {
+        recordOperationalEvent("ui_action_failed", "UI action failed", error.diagnosticDetail("action=$kind"))
+        Toast.makeText(this, operationFailureMessage(strings(uiLanguage), kind, error.message.orEmpty()), Toast.LENGTH_LONG).show()
     }
 
     private fun reopenAfterExplicitLauncherEntry(entry: Intent?) {
@@ -1110,7 +1119,11 @@ class MainActivity : ComponentActivity() {
                             updateRuntime.start("explicit_reopen")
                             maybeContinueStartupAccessFlow()
                             refresh()
-                        } else showShutdownFailure(result.exceptionOrNull()?.message ?: "Runtime recovery failed")
+                        } else {
+                            val detail = result.exceptionOrNull()?.message ?: "Runtime recovery failed"
+                            recordOperationalEvent("runtime_reopen_failed", "Runtime recovery failed", detail)
+                            showShutdownFailure(detail)
+                        }
                     }
                 }
             }
@@ -1160,7 +1173,7 @@ class MainActivity : ComponentActivity() {
                                         detail = "Reopen storage/runtime recovery failed: ${error::class.java.simpleName}: ${error.message}")
                                     val label = if (uiLanguage == UiLanguage.UK) "Відновлення після Shutdown не завершене"
                                         else "Recovery after Shutdown did not complete"
-                                    Toast.makeText(this, "$label: ${error.message}", Toast.LENGTH_LONG).show()
+                                    Toast.makeText(this, "$label\n${operationFailureDetail(strings(uiLanguage), error.message.orEmpty())}", Toast.LENGTH_LONG).show()
                                 }
                             }
                         }
@@ -1995,7 +2008,7 @@ class MainActivity : ComponentActivity() {
 
         Toast.makeText(
             this,
-            "Open DiLink Settings -> General -> Disable background Apps -> ${BuildConfig.COLLECTOR_DISPLAY_NAME} = OFF",
+            strings(uiLanguage).backgroundSetupBody,
             Toast.LENGTH_LONG
         ).show()
         return false
@@ -2369,7 +2382,10 @@ class MainActivity : ComponentActivity() {
                 if (destroyed || generation != mqttCleanupRequestGeneration) return@runOnUiThread
                 mqttCleanupUiState = result.fold(
                     onSuccess = { MqttCleanupUiState(groups = it) },
-                    onFailure = { mqttCleanupUiState.copy(loading = false, error = it.message ?: strings(uiLanguage).haIdentity.mqttCleanupFailed) }
+                    onFailure = {
+                        recordOperationalEvent("mqtt_cleanup_list_failed", "Could not load MQTT cleanup groups", it.diagnosticDetail())
+                        mqttCleanupUiState.copy(loading = false, error = it.message.orEmpty())
+                    }
                 )
             }
         }
@@ -2406,7 +2422,7 @@ class MainActivity : ComponentActivity() {
             }
             stored
         }.getOrElse {
-            Toast.makeText(this, it.message ?: strings(uiLanguage).haIdentity.mqttCleanupFailed, Toast.LENGTH_LONG).show()
+            showOperationFailure("mqttSave", it)
             false
         }
     }
@@ -2663,11 +2679,7 @@ class MainActivity : ComponentActivity() {
                 actionUiState = actionUiState.copy(mqttTest = false)
                 result
                     .onSuccess { mqttResult ->
-                        val message = if (mqttResult.ok) {
-                            "$label: ${mqttResult.message}"
-                        } else {
-                            "$label failed: ${mqttResult.message}"
-                        }
+                        val message = connectionTestMessage(strings(uiLanguage), label, mqttResult.ok, mqttResult.message)
                         Toast.makeText(
                             this@MainActivity,
                             message,
@@ -2675,18 +2687,14 @@ class MainActivity : ComponentActivity() {
                         ).show()
                     }
                     .onFailure { error ->
-                        Toast.makeText(
-                            this@MainActivity,
-                            "$label failed: ${error.message ?: error::class.java.simpleName}",
-                            Toast.LENGTH_LONG
-                        ).show()
+                        showOperationFailure("mqttTest", error)
                     }
                 refresh()
             }
         }
         runCatching { dashboardExecutor.execute(task) }.onFailure { error ->
             actionUiState = actionUiState.copy(mqttTest = false)
-            Toast.makeText(this@MainActivity, "$label failed: ${error.message ?: error::class.java.simpleName}", Toast.LENGTH_LONG).show()
+            showOperationFailure("mqttTest", error)
             refresh()
         }
     }
@@ -2709,11 +2717,7 @@ class MainActivity : ComponentActivity() {
                 actionUiState = clearAction(actionUiState)
                 result
                     .onSuccess { influxResult ->
-                        val message = if (influxResult.ok) {
-                            "$label: ${influxResult.message}"
-                        } else {
-                            "$label failed: ${influxResult.message}"
-                        }
+                        val message = connectionTestMessage(strings(uiLanguage), label, influxResult.ok, influxResult.message)
                         Toast.makeText(
                             this@MainActivity,
                             message,
@@ -2721,18 +2725,14 @@ class MainActivity : ComponentActivity() {
                         ).show()
                     }
                     .onFailure { error ->
-                        Toast.makeText(
-                            this@MainActivity,
-                            "$label failed: ${error.message ?: error::class.java.simpleName}",
-                            Toast.LENGTH_LONG
-                        ).show()
+                        showOperationFailure("influxTest", error)
                     }
                 refresh()
             }
         }
         runCatching { dashboardExecutor.execute(task) }.onFailure { error ->
             actionUiState = clearAction(actionUiState)
-            Toast.makeText(this@MainActivity, "$label failed: ${error.message ?: error::class.java.simpleName}", Toast.LENGTH_LONG).show()
+            showOperationFailure("influxTest", error)
             refresh()
         }
     }
@@ -2791,7 +2791,7 @@ class MainActivity : ComponentActivity() {
                 if (!AdbAuthorizationManager.currentSnapshot().adbAuthorized) {
                     recordOperationalEvent("log_recording_error", "Full system logcat authorization failed", "adb_not_authorized")
                     diagnosticsBusy = false
-                    Toast.makeText(this, "ADB не авторизовано — logcat не запущено", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, operationFailureMessage(strings(uiLanguage), "logStart", "adb_not_authorized"), Toast.LENGTH_LONG).show()
                     refresh()
                 } else {
                     val task = Runnable {
@@ -2800,10 +2800,10 @@ class MainActivity : ComponentActivity() {
                             if (destroyed) return@post
                             result.onSuccess { dir ->
                                 recordOperationalEvent("log_recording_started", "Full system logcat recording started", "source=logcat path=${dir.absolutePath}")
-                                Toast.makeText(this, "Запис logcat почато", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(this, runtimeJobMessage(strings(uiLanguage), "logStart", true), Toast.LENGTH_SHORT).show()
                             }.onFailure { error ->
                                 recordOperationalEvent("log_recording_error", "Full system logcat recording failed", error.message)
-                                Toast.makeText(this, "Помилка запису logcat: ${error.message}", Toast.LENGTH_LONG).show()
+                                Toast.makeText(this, operationFailureMessage(strings(uiLanguage), "logStart", error.message.orEmpty()), Toast.LENGTH_LONG).show()
                             }
                             diagnosticsBusy = false
                             refresh()
@@ -2812,7 +2812,7 @@ class MainActivity : ComponentActivity() {
                     runCatching { diagnosticsExecutor.execute(task) }.onFailure { error ->
                         diagnosticsBusy = false
                         recordOperationalEvent("log_recording_error", "Full system logcat start was rejected", error.message)
-                        Toast.makeText(this, "Помилка запуску logcat: ${error.message}", Toast.LENGTH_LONG).show()
+                        Toast.makeText(this, operationFailureMessage(strings(uiLanguage), "logStart", error.message.orEmpty()), Toast.LENGTH_LONG).show()
                         refresh()
                     }
                 }
@@ -2825,7 +2825,7 @@ class MainActivity : ComponentActivity() {
         if (!submitted) {
             recordOperationalEvent("log_recording_error", "Full system logcat access check was not started", "adb_self_check_in_progress")
             diagnosticsBusy = false
-            Toast.makeText(this, "Перевірка ADB вже виконується — повторіть запуск logcat", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, operationFailureMessage(strings(uiLanguage), "logStart", "Access check already running"), Toast.LENGTH_LONG).show()
             refresh()
         }
     }
@@ -2841,10 +2841,10 @@ class MainActivity : ComponentActivity() {
                 if (destroyed) return@post
                 result.onSuccess { dir ->
                     recordOperationalEvent("log_recording_stopped", "Full system logcat recording stopped", "source=logcat path=${dir?.absolutePath}")
-                    Toast.makeText(this, "Запис logcat зупинено", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, runtimeJobMessage(strings(uiLanguage), "logStop", true), Toast.LENGTH_SHORT).show()
                 }.onFailure { error ->
                     recordOperationalEvent("log_recording_error", "Full system logcat stop failed", error.message)
-                    Toast.makeText(this, "Помилка зупинки logcat: ${error.message}", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, operationFailureMessage(strings(uiLanguage), "logStop", error.message.orEmpty()), Toast.LENGTH_LONG).show()
                 }
                 diagnosticsBusy = false
                 refresh()
@@ -2853,7 +2853,7 @@ class MainActivity : ComponentActivity() {
         runCatching { diagnosticsExecutor.execute(task) }.onFailure { error ->
             diagnosticsBusy = false
             recordOperationalEvent("log_recording_error", "Full system logcat stop was rejected", error.message)
-            Toast.makeText(this, "Помилка зупинки logcat: ${error.message}", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, operationFailureMessage(strings(uiLanguage), "logStop", error.message.orEmpty()), Toast.LENGTH_LONG).show()
             refresh()
         }
     }

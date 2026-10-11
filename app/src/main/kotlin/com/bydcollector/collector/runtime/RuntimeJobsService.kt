@@ -80,11 +80,18 @@ class RuntimeJobsService : Service() {
                     check(!CollectorSettings(this).isUserShutdownRequested()) { "Shutdown requested" }
                     val result = execute(job)
                     if (destroyed) return@execute
+                    val warnings = result.optJSONArray("warnings")
+                    if (warnings != null && warnings.length() > 0) {
+                        recordDiagnostic(job, "partial", warnings.toString())
+                    } else if (result.has("ok") && !result.optBoolean("ok")) {
+                        recordDiagnostic(job, "failed", result.optString("message"))
+                    }
                     change(this, job.getString("id")) {
                         if (it.getString("status") == "running") it.put("status", "complete").put("result", result)
                     }
                 } catch (error: Exception) {
                     if (destroyed) return@execute
+                    recordDiagnostic(job, "failed", "${error.javaClass.simpleName}: ${error.message.orEmpty()}")
                     change(this, job.getString("id")) {
                         if (it.getString("status") == "running") it.put("status", "error")
                             .put("error", "${error.javaClass.simpleName}: ${error.message.orEmpty().take(300)}")
@@ -99,6 +106,16 @@ class RuntimeJobsService : Service() {
             }
         }
         if (lanes.isEmpty() && !DiagnosticLogRecorder.isRecording()) stopSelf(lastStartId)
+    }
+
+    private fun recordDiagnostic(job: JSONObject, outcome: String, detail: String) {
+        // Failure to write diagnostics must not change the operation's result.
+        runCatching {
+            (applicationContext as BydCollectorApplication).operationalEventJournal.append(
+                java.time.Instant.now().toString(), android.os.SystemClock.elapsedRealtime(),
+                "runtime_job", "${job.getString("kind")}_$outcome", detail
+            )
+        }
     }
 
     override fun onDestroy() {

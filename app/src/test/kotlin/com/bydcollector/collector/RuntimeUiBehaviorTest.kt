@@ -191,11 +191,134 @@ class RuntimeUiBehaviorTest {
         ui.onNodeWithText("ADB: OK").assertIsDisplayed()
     }
 
+    @Test fun completedRuntimeJobsShowLocalizedOutcomesNotTechnicalPayloads() {
+        val actions = ReflectionHelpers.getField<com.bydcollector.collector.ui.compose.BydCollectorActions>(screen.get(), "uiActions")
+        val consume = MainActivity::class.java.getDeclaredMethod("consumeRuntimeJobs", String::class.java)
+            .apply { isAccessible = true }
+        fun deliver(kind: String, result: org.json.JSONObject = org.json.JSONObject(), error: String? = null): String {
+            val job = org.json.JSONObject().put("id", java.util.UUID.randomUUID().toString()).put("kind", kind)
+                .put("status", if (error == null) "complete" else "failed").put("result", result)
+                .put("error", error.orEmpty())
+            consume.invoke(screen.get(), org.json.JSONArray().put(job).toString())
+            return org.robolectric.shadows.ShadowToast.getTextOfLatestToast()
+        }
+        for (language in com.bydcollector.collector.ui.compose.UiLanguage.entries) {
+            actions.onLanguageSelected(language)
+            val uk = language == com.bydcollector.collector.ui.compose.UiLanguage.UK
+            assertEquals(if (uk) "Старі логи очищено" else "Old logs cleared", deliver("logClear"))
+            val warnings = org.json.JSONObject().put("removed", 2).put("warnings",
+                org.json.JSONArray().put("diagnostic_files=IOException: denied"))
+            assertEquals(if (uk) "Логи очищено частково. Подробиці — у логах" else
+                "Logs partially cleared. See the logs for details", deliver("logClear", warnings))
+            assertEquals(if (uk) "Запис logcat почато" else "Logcat recording started", deliver("logStart"))
+            assertEquals(if (uk) "Запис logcat зупинено" else "Logcat recording stopped", deliver("logStop"))
+            assertEquals(if (uk) "InfluxDB: з’єднання успішне (HTTP 204)" else
+                "InfluxDB: connection successful (HTTP 204)", deliver("influxTest",
+                org.json.JSONObject().put("ok", true).put("message", "http 204")))
+            // A completed worker can still report a failed connection test.
+            val failed = deliver("influxTest", org.json.JSONObject().put("ok", false)
+                .put("message", "http 401: backend response"))
+            assertTrue(failed.contains(if (uk) "перевірка з’єднання невдала" else "connection test failed"))
+            assertTrue(failed.contains("HTTP 401"))
+            assertFalse(failed.contains("backend response"))
+            val error = deliver("logClear", error = "IllegalStateException: internal detail")
+            assertTrue(error.startsWith(if (uk) "Не вдалося очистити логи" else "Could not clear logs"))
+            assertFalse(error.contains("IllegalStateException"))
+            assertEquals("diagnostic_files=IOException: denied", warnings.getJSONArray("warnings").getString(0))
+        }
+    }
+
+    @Test fun modalFailuresExplainSpaceAndUnknownQueuesWithoutHidingDiagnosticsOrBlockingArchive() {
+        val actions = ReflectionHelpers.getField<com.bydcollector.collector.ui.compose.BydCollectorActions>(screen.get(), "uiActions")
+        val compression = ReflectionHelpers.getStaticField<kotlinx.coroutines.flow.MutableStateFlow<com.bydcollector.collector.service.TripCompressionState>>(
+            com.bydcollector.collector.service.TripCompressionService::class.java, "_state")
+        val pending = ReflectionHelpers.getField<androidx.compose.runtime.MutableState<com.bydcollector.collector.maintenance.DbMaintenanceOperation?>>(
+            screen.get(), "pendingMaintenanceOperation\$delegate")
+        val preflight = ReflectionHelpers.getField<androidx.compose.runtime.MutableState<com.bydcollector.collector.maintenance.MainArchivePreflight?>>(
+            screen.get(), "pendingMainArchivePreflight\$delegate")
+        val error = "IllegalStateException: Insufficient free space for Trips compression"
+        try {
+            for (language in com.bydcollector.collector.ui.compose.UiLanguage.entries) {
+                actions.onLanguageSelected(language)
+                val uk = language == com.bydcollector.collector.ui.compose.UiLanguage.UK
+                compression.value = com.bydcollector.collector.service.TripCompressionState(error = error)
+                settle()
+                ui.onNodeWithText(if (uk) "Недостатньо вільного місця. Звільніть місце та повторіть." else
+                    "Not enough free space. Free up space and retry.").assertIsDisplayed()
+                ui.onNodeWithText(error).assertDoesNotExist()
+                assertEquals(error, compression.value.error)
+                compression.value = com.bydcollector.collector.service.TripCompressionState()
+                preflight.value = com.bydcollector.collector.maintenance.MainArchivePreflight(warning = "SQLiteException: corrupt")
+                pending.value = com.bydcollector.collector.maintenance.DbMaintenanceOperation.ARCHIVE
+                settle()
+                ui.onNodeWithText(if (uk) "Не вдалося перевірити базу та черги." else
+                    "Could not check the database and queues.", substring = true).assertExists()
+                ui.onNodeWithText("SQLiteException: corrupt").assertDoesNotExist()
+                ui.onNodeWithText(if (uk) "Так" else "Yes").assertIsEnabled()
+                assertEquals("SQLiteException: corrupt", preflight.value?.warning)
+                pending.value = null
+                preflight.value = null
+                settle()
+            }
+        } finally {
+            compression.value = com.bydcollector.collector.service.TripCompressionState()
+            pending.value = null
+            preflight.value = null
+        }
+    }
+
+    @Test fun runtimeJobWarningsAndFailuresRemainInSharedJournalAfterPresentation() {
+        val jobs = com.bydcollector.collector.runtime.RuntimeJobsService
+        val owner = Robolectric.buildService(com.bydcollector.collector.runtime.RuntimeJobsService::class.java).create()
+        fun run(kind: String, args: org.json.JSONObject = org.json.JSONObject()): org.json.JSONObject {
+            val id = jobs.submit(app, kind, args)
+            owner.get().onStartCommand(null, 0, 1)
+            val deadline = System.nanoTime() + 5_000_000_000L
+            while (true) {
+                val snapshot = org.json.JSONArray(jobs.snapshot(app))
+                val job = (0 until snapshot.length()).map(snapshot::getJSONObject).single { it.getString("id") == id }
+                if (job.getString("status") in setOf("complete", "error")) {
+                    jobs.presented(app, id)
+                    return job
+                }
+                check(System.nanoTime() < deadline)
+                Thread.sleep(10)
+            }
+        }
+        try {
+            // The ADB peer acknowledges shell commands but provides no helper JSON: a real partial clear.
+            val cleared = run("logClear")
+            assertEquals("complete", cleared.getString("status"))
+            val warnings = cleared.getJSONObject("result").getJSONArray("warnings")
+            assertTrue(warnings.length() > 0)
+            shadowOf(Looper.getMainLooper()).idle()
+            val failed = run("archiveShare", org.json.JSONObject().put("ids", org.json.JSONArray().put("missing-archive")))
+            assertEquals("error", failed.getString("status"))
+            val snapshot = File(app.cacheDir, "runtime-job-journal")
+            val export = com.bydcollector.collector.diagnostics.DiagnosticLogRecorder::class.java.getDeclaredMethod(
+                "writeOperationalJournalSnapshot", android.content.Context::class.java, File::class.java).apply { isAccessible = true }
+            export.invoke(com.bydcollector.collector.diagnostics.DiagnosticLogRecorder, app, snapshot)
+            val entries = File(snapshot, "operational_journal").walkTopDown().filter { it.extension == "jsonl" }
+                .flatMap { it.readLines().asSequence() }.map { org.json.JSONObject(it) }.toList()
+            val partial = entries.single { it.optString("message") == "logClear_partial" }.getString("detail")
+            assertTrue(partial.contains(warnings.getString(0)))
+            assertTrue(entries.single { it.optString("message") == "archiveShare_failed" }.getString("detail")
+                .contains(failed.getString("error")))
+        } finally {
+            owner.destroy()
+        }
+    }
+
     private fun toggle(label: String) = ui.onNode(
         SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Switch) and
             hasAnyDescendant(hasText(label)), true)
     private fun tab(label: String) { ui.onNode(hasClickAction() and hasText(label)).performClick(); settle() }
-    private fun settle() { shadowOf(Looper.getMainLooper()).idle(); ui.mainClock.advanceTimeBy(100); ui.waitForIdle() }
+    private fun settle() {
+        androidx.compose.runtime.snapshots.Snapshot.sendApplyNotifications()
+        shadowOf(Looper.getMainLooper()).idle()
+        ui.mainClock.advanceTimeBy(100)
+        ui.waitForIdle()
+    }
     private fun await(condition: () -> Boolean) {
         val deadline = System.nanoTime() + 5_000_000_000L
         while (!condition()) { check(System.nanoTime() < deadline); shadowOf(Looper.getMainLooper()).idle(); Thread.sleep(10) }

@@ -1822,7 +1822,7 @@ private fun MqttCleanupDialog(
                 if (confirmation == null) {
                     val singleCurrent = state.groups.singleOrNull()?.current == true
                     if (state.loading && !singleCurrent) Text(strings.loading, color = p.muted, fontSize = 13.sp)
-                    state.error?.let { Text(it, color = p.red, fontSize = 13.sp) }
+                    state.error?.let { Text(operationFailureMessage(strings, "mqttCleanup", it), color = p.red, fontSize = 13.sp) }
                     Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()),
                         verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         if (!state.loading && state.error == null && state.groups.isEmpty()) {
@@ -1856,7 +1856,7 @@ private fun MqttCleanupDialog(
                                             if (group.uncertainCount > 0) Text("${strings.haIdentity.mqttCleanupUnknown}: ${group.uncertainCount}", color = p.yellow, fontSize = 12.sp)
                                         }
                                         if (group.current) Text(strings.haIdentity.mqttCleanupCurrent, color = p.green, fontSize = 12.sp)
-                                        group.error?.let { Text(it, color = p.red, fontSize = 12.sp) }
+                                        group.error?.let { Text(operationFailureDetail(strings, it), color = p.red, fontSize = 12.sp) }
                                     }
                                     MqttIdentityDeleteButton("${strings.haIdentity.mqttCleanupDelete}: ${group.deviceId}",
                                         enabled = !group.current && !running && !state.loading && state.error == null,
@@ -3159,7 +3159,7 @@ private fun TripsCompressionDialog(
                     }
                     state.error != null -> {
                         Text(strings.tripsCompressionFailed, color = p.red, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                        Text(state.error, color = p.muted, fontSize = 13.sp, lineHeight = 18.sp)
+                        Text(operationFailureDetail(strings, state.error), color = p.muted, fontSize = 13.sp, lineHeight = 18.sp)
                     }
                     state.completed -> {
                         Text(strings.tripsCompressionComplete, color = p.green, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
@@ -3235,7 +3235,7 @@ private fun DatabaseMaintenanceDialog(
                     state.completed -> {
                         Text(strings.dbMaintenanceComplete, color = p.green, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                         state.warning?.let {
-                            Text(it, color = p.yellow, fontSize = 14.sp, lineHeight = 19.sp)
+                            Text(archiveCompletionWarning(strings, it), color = p.yellow, fontSize = 14.sp, lineHeight = 19.sp)
                         }
                         state.archivePath?.let {
                             Text("${strings.dbMaintenanceArchivePath} $it", color = p.muted, fontSize = 13.sp, lineHeight = 18.sp)
@@ -3282,10 +3282,11 @@ private fun DatabaseMaintenanceConfirmBody(
         fontWeight = FontWeight.SemiBold
     )
     inspectionWarning?.let {
-        Text(it, color = p.yellow, fontSize = 14.sp, lineHeight = 19.sp)
+        Text(archivePreflightWarning(strings), color = p.yellow, fontSize = 14.sp, lineHeight = 19.sp)
     }
     preflight?.telegramStorageWarning?.let {
-        Text(it, color = p.yellow, fontSize = 14.sp, lineHeight = 19.sp)
+        Text(String.format(strings.dbMaintenanceTelegramStorageWarningTemplate, operationFailureDetail(strings, it)),
+            color = p.yellow, fontSize = 14.sp, lineHeight = 19.sp)
     }
     if (!debugArchive && inspectionWarning == null && pending > 0L) {
         Text(

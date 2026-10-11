@@ -199,7 +199,7 @@ class TripCompressionService : Service() {
                 it,
                 category = "trips_compression_failed",
                 message = "Trips compression failed",
-                detail = "duration_ms=$elapsed error_class=${error::class.java.simpleName} step=$currentStep stack=${error.stackTrace.take(3).joinToString("|") { frame -> "${frame.className}.${frame.methodName}:${frame.lineNumber}" }}"
+                detail = "duration_ms=$elapsed error_class=${error::class.java.simpleName} error=$detail step=$currentStep stack=${error.stackTrace.take(3).joinToString("|") { frame -> "${frame.className}.${frame.methodName}:${frame.lineNumber}" }}"
             )
         }
         finishRun(token, startId, TripCompressionState(stepIndex = currentStep, error = detail))
