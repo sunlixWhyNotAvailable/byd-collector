@@ -63,18 +63,22 @@ class RuntimeLauncherActivity : ComponentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        setTheme(if (RuntimeUiAppearance.dark(this)) com.bydcollector.collector.R.style.AppTheme
+            else com.bydcollector.collector.R.style.AppTheme_Light)
         super.onCreate(savedInstanceState)
         check(!BuildConfig.RUNTIME_CLIENT)
         model = ViewModelProvider(this)[RuntimeAccessModel::class.java]
         if (!model.initialized) model.reset(request(intent))
         setContent {
             LaunchedEffect(model.revision, resumed, focused) { continueAccess() }
-            BydCollectorTheme(true) {
+            val dark = RuntimeUiAppearance.dark(this)
+            BydCollectorTheme(dark) {
                 Box(Modifier.fillMaxSize().background(LocalBydPalette.current.background)) {
-                    if (model.installing) {
+                    if (model.installing && model.repairing) {
                         RuntimeRecoveryPanel(
                             language = launcherLanguage(),
                             phase = RuntimeRecoveryUiPhase.INSTALLING,
+                            darkTheme = dark,
                             onRetry = {},
                             onClose = ::finishAndRemoveTask
                         )
@@ -82,6 +86,7 @@ class RuntimeLauncherActivity : ComponentActivity() {
                         RuntimeRecoveryPanel(
                             language = launcherLanguage(),
                             phase = RuntimeRecoveryUiPhase.FAILED,
+                            darkTheme = dark,
                             onRetry = ::retryClientInstall,
                             onClose = ::finishAndRemoveTask
                         )
@@ -206,11 +211,11 @@ class RuntimeLauncherActivity : ComponentActivity() {
     private fun launchClient() {
         if (model.installing) return
         if (model.clientReady) {
-            startActivity(Intent(intent.action).setClassName(RuntimeEndpoint.UI_PACKAGE,
+            startActivity(RuntimeUiAppearance.forLaunch(Intent(intent.action).setClassName(RuntimeEndpoint.UI_PACKAGE,
                 "com.bydcollector.collector.MainActivity").apply {
                 intent.categories?.forEach(::addCategory)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-            })
+            }, launcherLanguage(), RuntimeUiAppearance.dark(this)))
             finishAndRemoveTask()
             return
         }
@@ -220,7 +225,11 @@ class RuntimeLauncherActivity : ComponentActivity() {
         val app = applicationContext
         // The operation belongs to the owner, not the client being installed/replaced.
         Thread({
-            val result = runCatching { synchronized(INSTALL_LOCK) { ensureClient(app) } }
+            val result = runCatching { synchronized(INSTALL_LOCK) {
+                ensureClient(app) {
+                    Handler(Looper.getMainLooper()).post { pending.repairing = true }
+                }
+            } }
             Handler(Looper.getMainLooper()).post {
                 pending.installing = false
                 pending.clientReady = result.isSuccess
@@ -238,7 +247,7 @@ class RuntimeLauncherActivity : ComponentActivity() {
         private var verifiedClient: Pair<String, Long>? = null
         private var automaticAccessCompleted = false
 
-    private fun ensureClient(context: Context) = with(context) {
+    private fun ensureClient(context: Context, onRepairRequired: () -> Unit) = with(context) {
         fun installedIdentity(): Pair<String, Long>? = runCatching {
             val pm = packageManager
             val info = pm.getPackageInfo(RuntimeEndpoint.UI_PACKAGE, 0)
@@ -258,6 +267,7 @@ class RuntimeLauncherActivity : ComponentActivity() {
             }
         }.getOrDefault(false)
         if (matches()) return
+        onRepairRequired()
         val client = AdbLocalClient(File(filesDir, "adb_keys"))
         val authorization = client.checkAuthorizationReadOnly()
         check(authorization.category == "adb_authorization_connected") { authorization.message }
@@ -283,6 +293,7 @@ class RuntimeAccessModel : ViewModel() {
     internal var error by mutableStateOf<String?>(null)
     internal var manualAdb = false
     internal var installing = false
+    internal var repairing by mutableStateOf(false)
     internal var clientReady = false
 
     internal fun reset(request: String) {
@@ -291,6 +302,7 @@ class RuntimeAccessModel : ViewModel() {
         manualAdb = request == "adb"
         backgroundVisible = false
         error = null
+        repairing = false
         clientReady = false
         revision++
     }

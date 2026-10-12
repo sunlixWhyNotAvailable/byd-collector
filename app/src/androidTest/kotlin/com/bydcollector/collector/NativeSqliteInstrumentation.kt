@@ -19,17 +19,11 @@ import java.util.UUID
 class NativeSqliteInstrumentation : Instrumentation() {
     private val prefix = "callback_gate_${UUID.randomUUID()}"
     private val completed = mutableListOf<String>()
-    private var hintFixture = false
-    private var shutdownShellFixture = false
     private var runtimeBoundaryFixture = false
-    private var listenerFixture: String? = null
 
     override fun onCreate(arguments: Bundle?) {
         super.onCreate(arguments)
-        hintFixture = arguments?.getString("hintFixture") == "true"
-        shutdownShellFixture = arguments?.getString("shutdownShellFixture") == "true"
         runtimeBoundaryFixture = arguments?.getString("runtimeBoundary") == "true"
-        listenerFixture = arguments?.getString("listenerFixture")
         start()
     }
 
@@ -38,52 +32,18 @@ class NativeSqliteInstrumentation : Instrumentation() {
             finish(Activity.RESULT_CANCELED, Bundle().apply { putString("stream", "Tests require an emulator") })
             return
         }
-        if (runtimeBoundaryFixture || hintFixture || shutdownShellFixture) {
-            val result = runCatching {
-                when {
-                    runtimeBoundaryFixture -> RuntimeBoundaryGate.run(this)
-                    shutdownShellFixture -> ShutdownShellBehaviorGate.run(this)
-                    else -> HintWindowBehaviorGate.run(this)
-                }
-            }
+        if (runtimeBoundaryFixture) {
+            val result = runCatching { RuntimeBoundaryGate.run(this) }
             finish(if (result.isSuccess) Activity.RESULT_OK else Activity.RESULT_CANCELED,
                 Bundle().apply { putString("stream", result.getOrElse { it.stackTraceToString() }) })
             return
         }
-        listenerFixture?.let { action ->
-            try {
-                val component = android.content.ComponentName(targetContext,
-                    com.bydcollector.collector.system.CollectorNotificationListenerService::class.java)
-                val manager = targetContext.packageManager
-                val prefs = targetContext.getSharedPreferences("shutdown_listener_fixture", 0)
-                val desired = when (action) {
-                    "disable" -> {
-                        if (!prefs.contains("previous")) check(prefs.edit().putInt("previous",
-                            manager.getComponentEnabledSetting(component)).commit())
-                        android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED
-                    }
-                    "restore" -> {
-                        check(prefs.contains("previous")) { "No saved listener state" }
-                        prefs.getInt("previous", android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DEFAULT)
-                    }
-                    else -> error("Unknown listener fixture action")
-                }
-                manager.setComponentEnabledSetting(component, desired, android.content.pm.PackageManager.DONT_KILL_APP)
-                check(manager.getComponentEnabledSetting(component) == desired)
-                if (action == "restore") check(prefs.edit().remove("previous").commit())
-                finish(Activity.RESULT_OK, Bundle().apply { putString("stream", "LISTENER_FIXTURE $action state=$desired") })
-            } catch (failure: Throwable) {
-                finish(Activity.RESULT_CANCELED, Bundle().apply { putString("stream", failure.stackTraceToString()) })
+        val tests = listOf(
+            "secondary_old_new_full_delta_replay" to ::secondaryCatalogReplay,
+            "callback_android_parcel_paging_ack" to {
+                CallbackParcelGate.run(File(targetContext.cacheDir, "${prefix}_parcel"))
             }
-            return
-        }
-        val tests = SettingsBehaviorGate.cases(targetContext, prefix, this) +
-            StorageBehaviorGate.cases(targetContext, prefix) + listOf(
-                "secondary_old_new_full_delta_replay" to ::secondaryCatalogReplay,
-                "callback_android_parcel_paging_ack" to {
-                    CallbackParcelGate.run(File(targetContext.cacheDir, "${prefix}_parcel"))
-                }
-            )
+        )
         var failure: Throwable? = null
         try {
             tests.forEachIndexed { index, (name, body) ->

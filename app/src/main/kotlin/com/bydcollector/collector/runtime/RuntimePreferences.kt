@@ -26,6 +26,8 @@ class RuntimePreferences private constructor(private val context: Context) : Sha
         }
         val previous = values
         values = next
+        RuntimeUiAppearance.save(context, com.bydcollector.collector.ui.compose.UiLanguage.fromCode(
+            next[CollectorSettings.KEY_UI_LANGUAGE_CODE] as? String ?: CollectorSettings.DEFAULT_UI_LANGUAGE_CODE))
         val changed = (previous.keys + next.keys).filter { previous[it] != next[it] }
         if (changed.isNotEmpty()) main.post {
             changed.forEach { key -> listeners.forEach { it.onSharedPreferenceChanged(this, key) } }

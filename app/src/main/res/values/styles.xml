@@ -9,4 +9,7 @@
         <item name="android:windowLightStatusBar">false</item>
         <item name="android:colorAccent">#006D77</item>
     </style>
+    <style name="AppTheme.Light" parent="AppTheme">
+        <item name="android:windowBackground">#EAF1F8</item>
+    </style>
 </resources>

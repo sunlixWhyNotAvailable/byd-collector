@@ -43,7 +43,7 @@ android {
 
     testOptions {
         unitTests.isIncludeAndroidResources = true
-        // Each class starts a fresh app process, including process-owned runtime and Compose state.
+        // Isolate process-owned runtime state between test classes.
         unitTests.all { it.forkEvery = 1 }
     }
 
@@ -87,5 +87,4 @@ dependencies {
     testImplementation(kotlin("test"))
     testImplementation("org.json:json:20240303")
     testImplementation("org.robolectric:robolectric:4.16.1")
-    testImplementation("androidx.compose.ui:ui-test-junit4")
 }

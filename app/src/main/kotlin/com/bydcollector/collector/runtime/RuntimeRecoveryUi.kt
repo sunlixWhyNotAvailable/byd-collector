@@ -23,6 +23,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -40,6 +41,19 @@ internal enum class RuntimeRecoveryUiPhase {
     RECOVERING,
     INSTALLING,
     FAILED
+}
+
+internal fun runtimeRecoveryPhase(
+    status: RuntimeRecoveryStatus,
+    previous: RuntimeRecoveryUiPhase?
+): RuntimeRecoveryUiPhase? = when (status) {
+    RuntimeRecoveryStatus.WAITING -> RuntimeRecoveryUiPhase.WAITING
+    RuntimeRecoveryStatus.CHECKING -> if (previous in setOf(RuntimeRecoveryUiPhase.RECOVERING,
+            RuntimeRecoveryUiPhase.FAILED)) RuntimeRecoveryUiPhase.RECOVERING else RuntimeRecoveryUiPhase.CHECKING
+    RuntimeRecoveryStatus.RETRYING -> RuntimeRecoveryUiPhase.RECOVERING
+    RuntimeRecoveryStatus.FAILED -> RuntimeRecoveryUiPhase.FAILED
+    RuntimeRecoveryStatus.READY -> null
+    RuntimeRecoveryStatus.BOOTSTRAPPING -> RuntimeRecoveryUiPhase.INSTALLING
 }
 
 internal data class RuntimeDialogRecoveryHost(
@@ -78,6 +92,7 @@ internal fun BoxScope.RuntimeDialogRecoveryShield(dialogId: String) {
             darkTheme = recovery.darkTheme,
             onRetry = recovery.onRetry,
             onClose = recovery.onClose,
+            preserveContent = true,
             modifier = Modifier.matchParentSize()
         )
     }
@@ -90,13 +105,10 @@ private data class RuntimeRecoveryCopy(
     val close: String
 )
 
-private fun runtimeRecoveryCopy(language: UiLanguage, phase: RuntimeRecoveryUiPhase): RuntimeRecoveryCopy =
+private fun runtimeRecoveryCopy(language: UiLanguage, phase: RuntimeRecoveryUiPhase): RuntimeRecoveryCopy? =
     when (language) {
         UiLanguage.UK -> when (phase) {
-            RuntimeRecoveryUiPhase.WAITING -> RuntimeRecoveryCopy(
-                "Підготовка перевірки", "Зачекайте, доки BYD Collector стане активним.", "Повторити", "Закрити")
-            RuntimeRecoveryUiPhase.CHECKING -> RuntimeRecoveryCopy(
-                "Перевірка сумісності", "Перевіряємо безпечне з’єднання з системою BYD Collector.", "Повторити", "Закрити")
+            RuntimeRecoveryUiPhase.WAITING, RuntimeRecoveryUiPhase.CHECKING -> null
             RuntimeRecoveryUiPhase.RECOVERING -> RuntimeRecoveryCopy(
                 "Відновлення з’єднання", "Тимчасово немає відповіді. Повторна спроба виконується автоматично.", "Повторити", "Закрити")
             RuntimeRecoveryUiPhase.INSTALLING -> RuntimeRecoveryCopy(
@@ -105,10 +117,7 @@ private fun runtimeRecoveryCopy(language: UiLanguage, phase: RuntimeRecoveryUiPh
                 "Не вдалося відновити з’єднання", "Система BYD Collector недоступна. Спробуйте ще раз або закрийте застосунок.", "Повторити", "Закрити")
         }
         UiLanguage.EN -> when (phase) {
-            RuntimeRecoveryUiPhase.WAITING -> RuntimeRecoveryCopy(
-                "Preparing a compatibility check", "Wait until BYD Collector is active.", "Retry", "Close")
-            RuntimeRecoveryUiPhase.CHECKING -> RuntimeRecoveryCopy(
-                "Checking compatibility", "Checking the secure connection to BYD Collector.", "Retry", "Close")
+            RuntimeRecoveryUiPhase.WAITING, RuntimeRecoveryUiPhase.CHECKING -> null
             RuntimeRecoveryUiPhase.RECOVERING -> RuntimeRecoveryCopy(
                 "Restoring the connection", "There is no response yet. Another attempt will run automatically.", "Retry", "Close")
             RuntimeRecoveryUiPhase.INSTALLING -> RuntimeRecoveryCopy(
@@ -125,6 +134,7 @@ internal fun RuntimeRecoveryPanel(
     darkTheme: Boolean = true,
     onRetry: () -> Unit,
     onClose: () -> Unit,
+    preserveContent: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     BydCollectorTheme(darkTheme) {
@@ -132,10 +142,11 @@ internal fun RuntimeRecoveryPanel(
         val copy = runtimeRecoveryCopy(language, phase)
         Box(
             modifier = modifier.fillMaxSize()
-                .background(palette.background)
+                .background(if (copy == null && preserveContent) Color.Transparent else palette.background)
                 .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {},
             contentAlignment = Alignment.Center
         ) {
+            if (copy == null) return@Box
             DashboardSurface(Modifier.fillMaxWidth().padding(horizontal = 28.dp)) {
                 Column(
                     modifier = Modifier.fillMaxWidth().padding(vertical = 14.dp),

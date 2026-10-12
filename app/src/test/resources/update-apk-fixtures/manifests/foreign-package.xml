@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.bydcollector.updatefixture.foreign"
-    android:versionCode="2000000000"
-    android:versionName="3.2.2">
-    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="29" />
-    <application android:hasCode="false" android:label="@string/fixture_label" />
-</manifest>

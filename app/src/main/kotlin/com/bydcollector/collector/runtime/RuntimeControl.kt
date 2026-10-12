@@ -64,7 +64,10 @@ internal object RuntimeControl {
             "updateStart" -> update.start("ui_client")
             "updateResume" -> update.onUiResumed()
             "updateAccess" -> update.onPresentationAccessChanged()
-            "hintStyle" -> app.updateHints.refresh(args.getBoolean("dark"))
+            "hintStyle" -> {
+                RuntimeUiAppearance.save(app, dark = args.getBoolean("dark"))
+                app.updateHints.refresh(args.getBoolean("dark"))
+            }
             "updateAuto" -> update.onAutoCheckEnabledChanged()
             "updateRequest" -> putBoolean("accepted", update.request(args.getBoolean("manual")))
             "updateDismiss" -> update.dismissOffer()

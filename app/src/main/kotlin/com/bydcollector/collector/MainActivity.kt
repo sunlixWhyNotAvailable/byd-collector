@@ -448,6 +448,7 @@ class MainActivity : ComponentActivity() {
         override fun onLanguageSelected(language: UiLanguage) {
             uiLanguage = language
             settings.setUiLanguageCode(language.code)
+            RuntimeUiAppearance.save(applicationContext, language = language)
             if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("hintStyle", Bundle().apply { putBoolean("dark", darkTheme) })
             else (applicationContext as BydCollectorApplication).updateHints.refresh(darkTheme)
             dashboardUiStateStore.selectVehicleKpiLanguage(language.vehicleKpiLanguage())
@@ -469,6 +470,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onDarkThemeSelected(dark: Boolean) {
             darkTheme = dark
+            RuntimeUiAppearance.save(applicationContext, dark = dark)
             if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("hintStyle", Bundle().apply { putBoolean("dark", dark) })
             else (applicationContext as BydCollectorApplication).updateHints.refresh(dark)
         }
@@ -978,6 +980,10 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        if (BuildConfig.RUNTIME_CLIENT && savedInstanceState == null) RuntimeUiAppearance.acceptLaunch(this, intent)
+        darkTheme = RuntimeUiAppearance.dark(this)
+        uiLanguage = RuntimeUiAppearance.language(this)
+        setTheme(if (darkTheme) R.style.AppTheme else R.style.AppTheme_Light)
         super.onCreate(savedInstanceState)
         if (BuildConfig.RUNTIME_CLIENT) {
             initializeRuntimeUi(savedInstanceState)
@@ -988,7 +994,7 @@ class MainActivity : ComponentActivity() {
         runtimeSavedInstanceState = savedInstanceState
         setContent {
             RuntimeRecoveryPanel(
-                language = recoveryUiLanguage(),
+                language = uiLanguage,
                 phase = runtimeRecoveryUiPhase ?: RuntimeRecoveryUiPhase.WAITING,
                 darkTheme = darkTheme,
                 onRetry = ::retryRuntimeRecovery,
@@ -996,16 +1002,6 @@ class MainActivity : ComponentActivity() {
             )
         }
         updateRuntimeRecoveryEligibility()
-    }
-
-    private fun recoveryUiLanguage(): UiLanguage {
-        if (uiInitialized) return uiLanguage
-        val cachedCode = if (RuntimePreferences.isInitialized()) {
-            RuntimePreferences.get(applicationContext).getString(CollectorSettings.KEY_UI_LANGUAGE_CODE, null)
-        } else null
-        val languageCode = cachedCode?.takeIf(String::isNotBlank)
-            ?: resources.configuration.locales[0]?.language.orEmpty()
-        return UiLanguage.fromCode(languageCode)
     }
 
     private fun runtimeRecoveryForegroundEligible(): Boolean =
@@ -1054,14 +1050,7 @@ class MainActivity : ComponentActivity() {
     private fun onRuntimeRecoveryStatusChanged(status: RuntimeRecoveryStatus) {
         if (!BuildConfig.RUNTIME_CLIENT) return
         runtimeCompatibleForUi = status == RuntimeRecoveryStatus.READY
-        runtimeRecoveryUiPhase = when (status) {
-            RuntimeRecoveryStatus.WAITING -> RuntimeRecoveryUiPhase.WAITING
-            RuntimeRecoveryStatus.CHECKING -> RuntimeRecoveryUiPhase.CHECKING
-            RuntimeRecoveryStatus.RETRYING -> RuntimeRecoveryUiPhase.RECOVERING
-            RuntimeRecoveryStatus.FAILED -> RuntimeRecoveryUiPhase.FAILED
-            RuntimeRecoveryStatus.READY -> null
-            RuntimeRecoveryStatus.BOOTSTRAPPING -> RuntimeRecoveryUiPhase.INSTALLING
-        }
+        runtimeRecoveryUiPhase = runtimeRecoveryPhase(status, runtimeRecoveryUiPhase)
         when (status) {
             RuntimeRecoveryStatus.READY -> {
                 if (uiInitialized) dispatchRuntimeUiLifecycle()
@@ -1087,7 +1076,6 @@ class MainActivity : ComponentActivity() {
         }
 
         runtimeInitializationInFlight = true
-        runtimeRecoveryUiPhase = RuntimeRecoveryUiPhase.RECOVERING
         dashboardExecutor.execute {
             val result = runCatching {
                 RuntimeClient.refresh()
@@ -1101,6 +1089,7 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 runtimeInitializationInFlight = false
                 if (destroyed || isFinishing) return@runOnUiThread
+                uiLanguage = RuntimeUiAppearance.language(applicationContext)
                 result.onFailure(::failRuntimeUiInitialization)
                 if (result.isFailure || !runtimeCompatibleForUi || !runtimeRecoveryForegroundEligible()) return@runOnUiThread
                 runCatching { initializeUi(runtimeSavedInstanceState) }
@@ -1175,6 +1164,7 @@ class MainActivity : ComponentActivity() {
         shutdownUiRequested = restoredShutdownInThisProcess &&
             savedInstanceState?.getBoolean("shutdownUiRequested", false) == true && settings.isUserShutdownRequested()
         uiLanguage = UiLanguage.fromCode(settings.uiLanguageCode())
+        RuntimeUiAppearance.save(applicationContext, language = uiLanguage)
         updateHintEnabled = settings.isUpdateHintEnabled()
         updateHintAppearance = settings.updateHintAppearance()
         settingsPreferences = RuntimePreferences.get(applicationContext)
@@ -1295,6 +1285,7 @@ class MainActivity : ComponentActivity() {
                         darkTheme = darkTheme,
                         onRetry = ::retryRuntimeRecovery,
                         onClose = ::closeRuntimeRecovery,
+                        preserveContent = true,
                         modifier = Modifier.align(Alignment.Center)
                     )
                 }
