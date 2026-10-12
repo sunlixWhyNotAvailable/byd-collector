@@ -217,6 +217,8 @@ Confirmation and progress when deleting selected archives:
 
 In `Options`, configure service recovery and, if needed, Wi-Fi/cellular recovery, Bluetooth recovery, or optional Tailscale activation. These restore Android services and connections, not vehicle controls. Notification access used for service recovery is not used to read notification contents.
 
+Wi-Fi/cellular recovery only enables connections when the vehicle is confirmed off. With the vehicle on, it leaves your manual Wi-Fi and cellular choices unchanged; if vehicle power cannot be determined, automatic enabling is skipped.
+
 Automatic-start switches on the collection and integration tabs control their respective functions. Use `Shutdown` to stop operation until you open the app again.
 
 The app appears in Android's recent apps. Swiping away its card closes only the interface, not already-started collection or exports, even with automatic start disabled. If Android also kills the process, recovery can resume the work retained at card removal within the same tablet boot; this does not enable automatic start after a reboot or override Stop/Shutdown. Firmware restrictions can still interrupt background work.

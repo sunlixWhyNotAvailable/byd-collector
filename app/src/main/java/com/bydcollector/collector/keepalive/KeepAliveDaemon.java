@@ -27,6 +27,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.function.BiFunction;
+import java.util.function.Supplier;
 
 //keeps selected dilink radios/service recovery alive from shell while the app process may be backgrounded
 public final class KeepAliveDaemon {
@@ -121,12 +123,21 @@ public final class KeepAliveDaemon {
         boolean keepBluetooth = isEnabled("settings get global bydcollector_keep_bluetooth");
         boolean recoverCollectorService = isEnabled("settings get global bydcollector_recover_collector_service");
 
+        runOnce(keepWifi, keepMobileData, keepBluetooth, recoverCollectorService,
+                KeepAliveDaemon::readWifiEnabled, KeepAliveDaemon::readMobileDataEnabled,
+                KeepAliveDaemon::recoverCollectorServiceIfNeeded, KeepAliveDaemon::run);
+    }
+
+    static void runOnce(boolean keepWifi, boolean keepMobileData, boolean keepBluetooth,
+                        boolean recoverCollectorService, Supplier<Boolean> wifiState,
+                        Supplier<Boolean> mobileDataState, Runnable serviceRecovery,
+                        BiFunction<String, Long, ShellResult> commandRunner) {
         if (keepWifi) {
-            keepRadioAlive("wifi", "svc wifi enable", readWifiEnabled());
+            keepRadioAlive("wifi", "svc wifi enable", wifiState.get(), commandRunner);
         }
 
         if (keepMobileData) {
-            keepRadioAlive("mobile_data", "svc data enable", readMobileDataEnabled());
+            keepRadioAlive("mobile_data", "svc data enable", mobileDataState.get(), commandRunner);
         }
 
         if (keepBluetooth) {
@@ -134,7 +145,7 @@ public final class KeepAliveDaemon {
         }
 
         if (recoverCollectorService) {
-            recoverCollectorServiceIfNeeded();
+            serviceRecovery.run();
         }
     }
 
@@ -253,7 +264,12 @@ public final class KeepAliveDaemon {
     }
 
     private static void runAndLog(String event, String command) {
-        ShellResult result = run(command, 10_000L);
+        runAndLog(event, command, KeepAliveDaemon::run);
+    }
+
+    private static void runAndLog(String event, String command,
+                                  BiFunction<String, Long, ShellResult> commandRunner) {
+        ShellResult result = commandRunner.apply(command, 10_000L);
         log(event + " ok=" + result.ok + " elapsed_ms=" + result.elapsedMs + " output=" + sanitize(result.output));
         if (!result.error.isEmpty()) {
             log(event + "_error " + sanitize(result.error));
@@ -373,13 +389,28 @@ public final class KeepAliveDaemon {
         }
     }
 
-    private static void keepRadioAlive(String name, String command, Boolean enabled) {
+    private static void keepRadioAlive(String name, String command, Boolean enabled,
+                                       BiFunction<String, Long, ShellResult> commandRunner) {
         if (!shouldEnableRadio(enabled)) {
             log(name + "_already_enabled");
             return;
         }
         if (enabled == null) log(name + "_state_unavailable; retaining enable recovery");
-        runAndLog(name + "_enable_requested", command);
+
+        //requires a fresh successful power read before each network enable request
+        ShellResult vehiclePower = commandRunner.apply(VEHICLE_POWER_COMMAND, 5_000L);
+        Boolean vehiclePoweredOff = vehiclePower.ok ? parseVehiclePoweredOff(vehiclePower.output) : null;
+        if (!Boolean.TRUE.equals(vehiclePoweredOff)) {
+            log(Boolean.FALSE.equals(vehiclePoweredOff)
+                    ? name + "_enable_skipped_vehicle_on"
+                    : name + "_vehicle_power_state_unavailable ok=" + vehiclePower.ok
+                            + " elapsed_ms=" + vehiclePower.elapsedMs
+                            + " output=" + sanitize(vehiclePower.output)
+                            + " error=" + sanitize(vehiclePower.error));
+            return;
+        }
+
+        runAndLog(name + "_enable_requested", command, commandRunner);
     }
 
     static Boolean readWifiEnabled() {
@@ -480,13 +511,13 @@ public final class KeepAliveDaemon {
         }
     }
 
-    private static final class ShellResult {
+    static final class ShellResult {
         private final boolean ok;
         private final String output;
         private final String error;
         private final long elapsedMs;
 
-        private ShellResult(boolean ok, String output, String error, long elapsedMs) {
+        ShellResult(boolean ok, String output, String error, long elapsedMs) {
             this.ok = ok;
             this.output = output == null ? "" : output;
             this.error = error == null ? "" : error;
