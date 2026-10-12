@@ -122,6 +122,7 @@ import com.bydcollector.collector.update.ReleaseNotesEntry
 import com.bydcollector.collector.update.UpdateInfo
 import com.bydcollector.collector.update.UpdateHintAppearance
 import com.bydcollector.collector.update.UpdateUiState
+import com.bydcollector.collector.runtime.RuntimeDialogRecoveryShield
 import java.util.Locale
 import org.osmdroid.config.Configuration
 import org.osmdroid.tileprovider.tilesource.XYTileSource
@@ -350,7 +351,8 @@ fun BydCollectorApp(
                         releaseNotesHistory = releaseNotesHistory,
                         onPresented = onUpdateOfferPresented,
                         onDismiss = actions::onDismissUpdateDialog,
-                        onUpdate = actions::onInstallUpdate
+                        onUpdate = actions::onInstallUpdate,
+                        onCancel = actions::onCancelUpdateDownload
                     )
                 }
             }
@@ -1458,6 +1460,7 @@ private fun TripRouteDialog(
                     ActionButton(strings.close, onDismiss, modifier = Modifier.width(140.dp))
                 }
             }
+            RuntimeDialogRecoveryShield("trip-route:${trip.id}")
         }
     }
 }
@@ -1889,6 +1892,7 @@ private fun MqttCleanupDialog(
                     }
                 }
             }
+            RuntimeDialogRecoveryShield("mqtt-cleanup")
         }
     }
 }
@@ -2563,6 +2567,7 @@ private fun TelegramLocationDialog(
                     ActionButton(strings.locationClose, { onApply(selectedEnabled, TelegramNavigatorMask.sanitize(selectedMask)) }, modifier = Modifier.width(140.dp))
                 }
             }
+            RuntimeDialogRecoveryShield("telegram-location")
         }
     }
 }
@@ -2688,6 +2693,7 @@ private fun TelegramVariableDialog(
                     ActionButton(strings.close, onDismiss, modifier = Modifier.width(140.dp))
                 }
             }
+            RuntimeDialogRecoveryShield("telegram-variable")
         }
     }
 }
@@ -3049,7 +3055,8 @@ private fun UpdateCheckDialog(
     releaseNotesHistory: ReleaseNotesHistory?,
     onPresented: () -> Unit,
     onDismiss: () -> Unit,
-    onUpdate: () -> Unit
+    onUpdate: () -> Unit,
+    onCancel: () -> Unit
 ) {
     val p = LocalBydPalette.current
     val releaseNotesScroll = rememberScrollState()
@@ -3099,6 +3106,21 @@ private fun UpdateCheckDialog(
                             Spacer(Modifier.height(10.dp))
                             AvailableUpdateNotes(strings, state.info, language, releaseNotesHistory)
                         }
+                        is UpdateUiState.Cancelling -> {
+                            Text(strings.updateCancelling, color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                            Spacer(Modifier.height(10.dp))
+                            AvailableUpdateNotes(strings, state.info, language, releaseNotesHistory)
+                        }
+                        is UpdateUiState.Cancelled -> {
+                            Text(strings.updateCancelled, color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                            Spacer(Modifier.height(10.dp))
+                            AvailableUpdateNotes(strings, state.info, language, releaseNotesHistory)
+                        }
+                        is UpdateUiState.CancelError -> {
+                            Text(strings.updateCancelFailed, color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                            Spacer(Modifier.height(10.dp))
+                            AvailableUpdateNotes(strings, state.info, language, releaseNotesHistory)
+                        }
                         is UpdateUiState.Error -> Text("${strings.updateError}: ${localizedUpdateError(strings, state.message)}", color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                         UpdateUiState.Hidden -> Text(strings.checkingForUpdate, color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                     }
@@ -3109,10 +3131,12 @@ private fun UpdateCheckDialog(
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 ActionButton(
-                    text = strings.update,
-                    onClick = onUpdate,
+                    text = if (state is UpdateUiState.Downloading || state is UpdateUiState.CancelError) strings.cancel
+                        else if (state is UpdateUiState.Cancelling) strings.updateCancelling else strings.update,
+                    onClick = if (state is UpdateUiState.Downloading || state is UpdateUiState.CancelError) onCancel else onUpdate,
                     primary = true,
-                    enabled = state is UpdateUiState.Available,
+                    enabled = state is UpdateUiState.Available || state is UpdateUiState.Cancelled ||
+                        state is UpdateUiState.Downloading || state is UpdateUiState.CancelError,
                     modifier = Modifier.weight(1f)
                 )
                 ActionButton(strings.close, onDismiss, modifier = Modifier.weight(1f))

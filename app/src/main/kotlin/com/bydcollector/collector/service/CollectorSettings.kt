@@ -258,6 +258,19 @@ class CollectorSettings(
             .commit()
     }
 
+    fun keepAliveLaunchMatches(installedApkPath: String, installedUpdateTimeMs: Long): Boolean =
+        installedApkPath.isNotBlank() && installedUpdateTimeMs > 0L &&
+            prefs.getString(KEY_KEEP_ALIVE_LAUNCH_SOURCE_DIR, null) == installedApkPath &&
+            prefs.getLong(KEY_KEEP_ALIVE_LAUNCH_UPDATE_TIME_MS, 0L) == installedUpdateTimeMs
+
+    fun confirmKeepAliveLaunch(installedApkPath: String, installedUpdateTimeMs: Long): Boolean {
+        if (installedApkPath.isBlank() || installedUpdateTimeMs <= 0L) return false
+        return prefs.edit()
+            .putString(KEY_KEEP_ALIVE_LAUNCH_SOURCE_DIR, installedApkPath)
+            .putLong(KEY_KEEP_ALIVE_LAUNCH_UPDATE_TIME_MS, installedUpdateTimeMs)
+            .commit()
+    }
+
     fun helperReplacementAllowed(): Boolean = !isUserShutdownRequested() && (
         isPollingEnabled() && !isMainManuallyStopped() ||
             isDebugPollingEnabled() && !isDebugManuallyStopped()
@@ -1429,6 +1442,8 @@ class CollectorSettings(
         const val KEY_DEBUG_POLLING_ENABLED = "debugPollingEnabled"
         const val KEY_HELPER_REPLACEMENT_PENDING = "helperReplacementPending"
         const val KEY_HELPER_CONFIRMED_UPDATE_TIME_MS = "helperConfirmedUpdateTimeMs"
+        const val KEY_KEEP_ALIVE_LAUNCH_SOURCE_DIR = "keepAliveLaunchSourceDir"
+        const val KEY_KEEP_ALIVE_LAUNCH_UPDATE_TIME_MS = "keepAliveLaunchUpdateTimeMs"
         const val KEY_DEBUG_AUTO_START = "debugAutoStart"
         const val KEY_KEEP_WIFI = "keepWifi"
         const val KEY_KEEP_MOBILE_DATA = "keepMobileData"

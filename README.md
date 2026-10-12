@@ -227,6 +227,8 @@ Collection can continue with the vehicle off on supported firmware, but uninterr
 
 Update checks can run in the background and retry when the network returns. Use Options for a manual check. The optional update hint appears above other apps and requires Android's display-over-other-apps permission. Without it, ordinary in-app update offers and collection still work.
 
+During an update download, `Close` hides the dialog without stopping the download; `Check updates` reopens its progress and release notes. `Cancel` stops the download and preparation while keeping the dialog open, so you can retry with `Update`. After the APK has been handed to Android's installer, installation is controlled by that system window.
+
 <p align="center"><img src="docs/screenshots/en/options.png" alt="BYD Collector options and runtime settings" width="100%"></p>
 
 ### Update hint widget

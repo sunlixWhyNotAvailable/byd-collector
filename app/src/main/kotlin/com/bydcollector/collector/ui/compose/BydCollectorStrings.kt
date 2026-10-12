@@ -106,6 +106,13 @@ data class HaIdentityStrings(
     val mqttCleanupDelete: String,
 )
 
+data class UpdateDownloadStrings(
+    val downloading: String,
+    val cancelling: String,
+    val cancelled: String,
+    val cancelFailed: String,
+)
+
 data class UiStrings(
     val appSubtitle: String,
     val topBarSubtitle: String,
@@ -286,7 +293,7 @@ data class UiStrings(
     val updateHintTitle: String,
     val updateHintDescription: String,
     val checkingForUpdate: String,
-    val downloadingUpdate: String,
+    val updateDownload: UpdateDownloadStrings,
     val latestVersion: String,
     val currentVersion: String,
     val availableVersion: String,
@@ -351,7 +358,12 @@ data class UiStrings(
     val dbMaintenanceCancelled: String,
     val dbMaintenanceGenericError: String,
     val dbMaintenanceArchivePath: String
-)
+) {
+    val downloadingUpdate: String get() = updateDownload.downloading
+    val updateCancelling: String get() = updateDownload.cancelling
+    val updateCancelled: String get() = updateDownload.cancelled
+    val updateCancelFailed: String get() = updateDownload.cancelFailed
+}
 
 private val telegramUk = TelegramStrings(
     tab = "Telegram",
@@ -793,7 +805,12 @@ private fun buildStrings(language: UiLanguage): UiStrings {
             updateHintTitle = "Віджет-підказка нової версії",
             updateHintDescription = "Показувати 10 секунд, коли перевірка знаходить оновлення",
             checkingForUpdate = "Перевіряємо оновлення...",
-            downloadingUpdate = "Завантажуємо оновлення...",
+            updateDownload = UpdateDownloadStrings(
+                downloading = "Завантажуємо оновлення...",
+                cancelling = "Скасовуємо завантаження…",
+                cancelled = "Завантаження оновлення скасовано",
+                cancelFailed = "Не вдалося очистити файли оновлення. Натисніть «Скасувати», щоб повторити.",
+            ),
             latestVersion = "Це остання версія застосунку",
             currentVersion = "Поточна версія:",
             availableVersion = "Доступна версія:",
@@ -1068,7 +1085,12 @@ private fun buildStrings(language: UiLanguage): UiStrings {
             updateHintTitle = "New version hint widget",
             updateHintDescription = "Show for 10 seconds when a check finds an update",
             checkingForUpdate = "Checking for update...",
-            downloadingUpdate = "Downloading update...",
+            updateDownload = UpdateDownloadStrings(
+                downloading = "Downloading update...",
+                cancelling = "Cancelling update download…",
+                cancelled = "Update download cancelled",
+                cancelFailed = "Could not clean up update files. Select Cancel to retry.",
+            ),
             latestVersion = "This is the latest app version",
             currentVersion = "Current version:",
             availableVersion = "Available version:",

@@ -19,7 +19,6 @@ class KeepAliveSupervisor(
     private val clockMs: () -> Long = { android.os.SystemClock.elapsedRealtime() }
 ) {
     private val executor: ExecutorService = namedSingleThreadExecutor("byd-keepalive")
-    private val reconcileLock = Any()
     private val reconcileState = KeepAliveReconcileState(ALIVE_TTL_MS)
 
     fun reconcile(config: KeepAliveConfig, forceStatusCheck: Boolean = false) {
@@ -63,7 +62,7 @@ class KeepAliveSupervisor(
     }
 
     private fun runReconcileSerialized(config: KeepAliveConfig, forceStatusCheck: Boolean): Boolean {
-        return synchronized(reconcileLock) {
+        return synchronized(PROCESS_RECONCILE_LOCK) {
             runReconcile(config, forceStatusCheck)
         }
     }
@@ -71,15 +70,25 @@ class KeepAliveSupervisor(
     private fun runReconcile(config: KeepAliveConfig, forceStatusCheck: Boolean): Boolean {
         return try {
             val nowMs = clockMs()
-            val userShutdown = CollectorSettings(context.applicationContext, store).isUserShutdownRequested()
-            val effectiveConfig = if (userShutdown) KeepAliveConfig(false, false, false, false) else config
+            val settings = CollectorSettings(context.applicationContext, store)
+            val explicitlyDisabled = !config.anyEnabled
+            var userShutdown = settings.isUserShutdownRequested()
+            var effectiveConfig = resolveEffectiveConfig(settings, explicitlyDisabled, userShutdown)
+            val installedIdentity = installedApkIdentity()
+            if (effectiveConfig.anyEnabled && installedIdentity == null) {
+                reconcileState.clearAlive()
+                recordInstalledApkIdentityUnavailable()
+                return false
+            }
+            val replacementPending = effectiveConfig.anyEnabled &&
+                installedIdentity?.let { !settings.keepAliveLaunchMatches(it.sourceDir, it.lastUpdateTimeMs) } == true
             val configChanged = reconcileState.configChanged(effectiveConfig, userShutdown)
             val shouldStopDisabledDaemon = forceStatusCheck ||
                 reconcileState.shouldStopDaemonForDisabledConfig(configChanged)
             if (effectiveConfig.keepBluetooth) reconcileState.markBluetoothProfilesMayBeOverridden()
-            val shouldRestoreBluetoothProfiles = reconcileState.shouldRestoreBluetoothProfiles(effectiveConfig)
+            var shouldRestoreBluetoothProfiles = reconcileState.shouldRestoreBluetoothProfiles(effectiveConfig)
             if (
-                canReuseKeepAliveStatus(
+                !replacementPending && canReuseKeepAliveStatus(
                     anyEnabled = effectiveConfig.anyEnabled,
                     forceStatusCheck = forceStatusCheck,
                     configChanged = configChanged,
@@ -108,6 +117,57 @@ class KeepAliveSupervisor(
             }
 
             if (effectiveConfig.anyEnabled) {
+                if (replacementPending) {
+                    reconcileState.clearAlive()
+                    val stopped = runCommand(
+                        shell,
+                        KeepAliveShellPlanner.daemonStopCommand(),
+                        "keep_alive_daemon_stop"
+                    ).ok
+                    if (!stopped) return false
+
+                    // The request may have waited behind shell work while settings or Shutdown changed.
+                    userShutdown = settings.isUserShutdownRequested()
+                    effectiveConfig = resolveEffectiveConfig(
+                        settings,
+                        explicitlyDisabled,
+                        userShutdown
+                    )
+                    if (effectiveConfig.keepBluetooth) reconcileState.markBluetoothProfilesMayBeOverridden()
+                    val configChangedAfterStop = reconcileState.configChanged(effectiveConfig, userShutdown)
+                    if (configChangedAfterStop) {
+                        for (command in KeepAliveShellPlanner.mirrorSettingsCommands(effectiveConfig, userShutdown)) {
+                            if (!runCommand(shell, command, "keep_alive_setting_sync").ok) return false
+                        }
+                        if (effectiveConfig.anyEnabled) {
+                            reconcileState.markConfigApplied(effectiveConfig, userShutdown)
+                        }
+                    }
+                    shouldRestoreBluetoothProfiles = reconcileState.shouldRestoreBluetoothProfiles(effectiveConfig)
+                    if (shouldRestoreBluetoothProfiles) {
+                        val rollback = runCommand(
+                            shell,
+                            KeepAliveShellPlanner.bluetoothProfilesRestoreCommand(),
+                            "keep_alive_bluetooth_profiles_restore"
+                        )
+                        if (!rollback.ok) return false
+                        reconcileState.markBluetoothProfilesRestored()
+                    }
+                    if (!effectiveConfig.anyEnabled) {
+                        reconcileState.clearAlive()
+                        reconcileState.markConfigApplied(effectiveConfig, userShutdown)
+                        return true
+                    }
+
+                    // Re-resolve the APK after stopping so a package update during the stop uses its current path.
+                    val launchIdentity = installedApkIdentity() ?: run {
+                        reconcileState.clearAlive()
+                        recordInstalledApkIdentityUnavailable()
+                        return false
+                    }
+                    return launchAndConfirm(shell, settings, effectiveConfig, launchIdentity)
+                }
+
                 val status = runCommand(shell, KeepAliveShellPlanner.daemonStatusCommand(), "keep_alive_daemon_status")
                 if (status.ok) {
                     reconcileState.markAlive(clockMs())
@@ -115,24 +175,8 @@ class KeepAliveSupervisor(
                 }
                 reconcileState.clearAlive()
                 //starts the delegate only after a stale/failed one-shot status check
-                runCommand(
-                    shell,
-                    KeepAliveShellPlanner.daemonLaunchCommand(context.applicationInfo.sourceDir),
-                    "keep_alive_daemon_start"
-                )
-                val retryStatus = runCommand(shell, KeepAliveShellPlanner.daemonStatusRetryCommand(), "keep_alive_daemon_status")
-                if (!retryStatus.ok) {
-                    //captures the daemon tail because shell startup failures are otherwise invisible in the app ui
-                    val tail = shell.exec(KeepAliveShellPlanner.daemonLogTailCommand(), timeoutMs = 10_000)
-                    store.recordEvent(
-                        category = "keep_alive_daemon_log_tail",
-                        message = "Keep-alive daemon log tail captured",
-                        detail = tail.output.take(1_000)
-                    )
-                } else {
-                    reconcileState.markAlive(clockMs())
-                }
-                retryStatus.ok
+                val identity = installedIdentity ?: return false
+                launchAndConfirm(shell, settings, effectiveConfig, identity)
             } else {
                 reconcileState.clearAlive()
                 //The stop command exits successfully only after the detached daemon is confirmed absent.
@@ -150,6 +194,74 @@ class KeepAliveSupervisor(
             false
         }
     }
+
+    private fun resolveEffectiveConfig(
+        settings: CollectorSettings,
+        explicitlyDisabled: Boolean,
+        userShutdown: Boolean
+    ): KeepAliveConfig = when {
+        userShutdown || explicitlyDisabled -> KeepAliveConfig(false, false, false, false)
+        else -> settings.keepAliveConfig()
+    }
+
+    private fun installedApkIdentity(): InstalledApkIdentity? {
+        val appContext = context.applicationContext
+        val sourceDir = appContext.applicationInfo.sourceDir
+        if (sourceDir.isNullOrBlank()) return null
+        val updateTimeMs = runCatching {
+            appContext.packageManager.getPackageInfo(appContext.packageName, 0).lastUpdateTime
+        }.getOrNull() ?: return null
+        if (updateTimeMs <= 0L) return null
+        return InstalledApkIdentity(sourceDir, updateTimeMs)
+    }
+
+    private fun launchAndConfirm(
+        shell: KeepAliveShell,
+        settings: CollectorSettings,
+        expectedConfig: KeepAliveConfig,
+        identity: InstalledApkIdentity
+    ): Boolean {
+        if (settings.isUserShutdownRequested() || settings.keepAliveConfig() != expectedConfig) return false
+        val currentIdentity = installedApkIdentity() ?: run {
+            recordInstalledApkIdentityUnavailable()
+            return false
+        }
+        if (currentIdentity != identity) return false
+        runCommand(
+            shell,
+            KeepAliveShellPlanner.daemonLaunchCommand(currentIdentity.sourceDir),
+            "keep_alive_daemon_start"
+        )
+        val retryStatus = runCommand(shell, KeepAliveShellPlanner.daemonStatusRetryCommand(), "keep_alive_daemon_status")
+        if (!retryStatus.ok) {
+            //captures the daemon tail because shell startup failures are otherwise invisible in the app ui
+            val tail = shell.exec(KeepAliveShellPlanner.daemonLogTailCommand(), timeoutMs = 10_000)
+            store.recordEvent(
+                category = "keep_alive_daemon_log_tail",
+                message = "Keep-alive daemon log tail captured",
+                detail = tail.output.take(1_000)
+            )
+            return false
+        }
+        if (!settings.confirmKeepAliveLaunch(currentIdentity.sourceDir, currentIdentity.lastUpdateTimeMs)) {
+            reconcileState.clearAlive()
+            return false
+        }
+        reconcileState.markAlive(clockMs())
+        return true
+    }
+
+    private fun recordInstalledApkIdentityUnavailable() {
+        store.recordEvent(
+            category = "keep_alive_apk_identity_unavailable",
+            message = "Installed APK identity unavailable"
+        )
+    }
+
+    private data class InstalledApkIdentity(
+        val sourceDir: String,
+        val lastUpdateTimeMs: Long
+    )
 
     fun shutdown() {
         shutdownAndAwait(0L)
@@ -189,6 +301,7 @@ class KeepAliveSupervisor(
 
     companion object {
         private const val ALIVE_TTL_MS = 10 * 60 * 1000L
+        private val PROCESS_RECONCILE_LOCK = Any()
     }
 
 }

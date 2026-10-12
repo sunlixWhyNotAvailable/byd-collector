@@ -35,6 +35,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.bydcollector.collector.R
+import com.bydcollector.collector.runtime.RuntimeDialogRecoveryShield
 
 private const val SUPPORT_JAR_URL = "https://send.monobank.ua/jar/bKFV15i9e"
 private const val SUPPORT_JAR_CARD = "4874 1000 3354 3078"
@@ -78,9 +79,10 @@ internal fun SupportDialog(palette: BydPalette, language: UiLanguage, onClose: (
         }
     }
     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Column(Modifier.width(820.dp).fillMaxHeight(0.9f).clip(RoundedCornerShape(8.dp))
-            .background(palette.surface).border(1.dp, palette.borderStrong, RoundedCornerShape(8.dp))
-            .padding(18.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        Box(contentAlignment = Alignment.Center) {
+            Column(Modifier.width(820.dp).fillMaxHeight(0.9f).clip(RoundedCornerShape(8.dp))
+                .background(palette.surface).border(1.dp, palette.borderStrong, RoundedCornerShape(8.dp))
+                .padding(18.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Text(if (ukrainian) "Підтримати розробку" else "Support development",
                 color = palette.text, fontSize = 22.sp, fontWeight = FontWeight.Bold)
             Row(Modifier.fillMaxWidth().weight(1f), horizontalArrangement = Arrangement.spacedBy(22.dp),
@@ -128,20 +130,22 @@ internal fun SupportDialog(palette: BydPalette, language: UiLanguage, onClose: (
                     }
                 }
             }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                PreviewButton(shareLabel, buttonPalette, primary = true, icon = Icons.Outlined.Share,
-                    modifier = Modifier.width(170.dp), onClick = {
-                        val intent = Intent(Intent.ACTION_SEND).apply {
-                            type = "text/plain"
-                            putExtra(Intent.EXTRA_SUBJECT, "Support BYD app")
-                            putExtra(Intent.EXTRA_TEXT, "Support BYD app\n\n$description\n\n$SUPPORT_JAR_URL\n\n$cardLabel: $SUPPORT_JAR_CARD")
-                        }
-                        openIntent(Intent.createChooser(intent, shareLabel))
-                    })
-                Spacer(Modifier.width(10.dp))
-                PreviewButton(if (ukrainian) "Закрити" else "Close", buttonPalette, primary = false,
-                    modifier = Modifier.width(138.dp), highlightOnPress = false, onClick = onClose)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    PreviewButton(shareLabel, buttonPalette, primary = true, icon = Icons.Outlined.Share,
+                        modifier = Modifier.width(170.dp), onClick = {
+                            val intent = Intent(Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(Intent.EXTRA_SUBJECT, "Support BYD app")
+                                putExtra(Intent.EXTRA_TEXT, "Support BYD app\n\n$description\n\n$SUPPORT_JAR_URL\n\n$cardLabel: $SUPPORT_JAR_CARD")
+                            }
+                            openIntent(Intent.createChooser(intent, shareLabel))
+                        })
+                    Spacer(Modifier.width(10.dp))
+                    PreviewButton(if (ukrainian) "Закрити" else "Close", buttonPalette, primary = false,
+                        modifier = Modifier.width(138.dp), highlightOnPress = false, onClick = onClose)
+                }
             }
+            RuntimeDialogRecoveryShield("support")
         }
     }
 }

@@ -19,5 +19,8 @@ sealed interface UpdateUiState : java.io.Serializable {
     data object UpToDate : UpdateUiState
     data class Available(val info: UpdateInfo) : UpdateUiState
     data class Downloading(val info: UpdateInfo, val progress: Int) : UpdateUiState
+    data class Cancelling(val info: UpdateInfo) : UpdateUiState
+    data class Cancelled(val info: UpdateInfo) : UpdateUiState
+    data class CancelError(val info: UpdateInfo) : UpdateUiState
     data class Error(val message: String) : UpdateUiState
 }

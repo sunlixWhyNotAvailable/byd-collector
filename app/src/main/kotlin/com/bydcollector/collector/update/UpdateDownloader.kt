@@ -35,17 +35,16 @@ class UpdateDownloader(private val context: Context) {
     }
 
     fun downloadedFile(info: UpdateInfo): File {
-        return File(
-            context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS),
-            updateApkName(info.version)
-        )
+        val downloads = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+            ?: error("Update download directory is unavailable")
+        return File(downloads, updateApkName(info.version))
     }
 
     fun progress(downloadId: Long): Int {
         val manager = context.getSystemService(DownloadManager::class.java)
         val query = DownloadManager.Query().setFilterById(downloadId)
         manager.query(query).use { cursor ->
-            if (!cursor.moveToFirst()) return 0
+            if (!cursor.moveToFirst()) return -1
             when (cursor.intValue(DownloadManager.COLUMN_STATUS)) {
                 DownloadManager.STATUS_SUCCESSFUL -> return 100
                 DownloadManager.STATUS_FAILED -> return -1

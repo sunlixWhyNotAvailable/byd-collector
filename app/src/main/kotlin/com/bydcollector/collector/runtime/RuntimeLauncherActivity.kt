@@ -9,7 +9,6 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
-import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -19,7 +18,6 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import com.bydcollector.collector.BuildConfig
@@ -73,22 +71,23 @@ class RuntimeLauncherActivity : ComponentActivity() {
             LaunchedEffect(model.revision, resumed, focused) { continueAccess() }
             BydCollectorTheme(true) {
                 Box(Modifier.fillMaxSize().background(LocalBydPalette.current.background)) {
-                    AndroidView(factory = { context -> TextView(context).apply {
-                        gravity = android.view.Gravity.CENTER
-                        setTextColor(android.graphics.Color.rgb(231, 237, 245))
-                        textSize = 18f
-                    } }, modifier = Modifier.fillMaxSize(), update = { status ->
-                        status.text = model.error?.let {
-                            "BYD Collector\n$it\n${if (CollectorSettings(this@RuntimeLauncherActivity).uiLanguageCode() == "en") "Tap to retry" else "Натисніть, щоб повторити"}"
-                        }.orEmpty()
-                        status.setOnClickListener { if (model.error != null) {
-                            model.reset("startup")
-                            model.flow.complete(Step.BACKGROUND)
-                            model.manualAdb = true
-                        } }
-                    })
+                    if (model.installing) {
+                        RuntimeRecoveryPanel(
+                            language = launcherLanguage(),
+                            phase = RuntimeRecoveryUiPhase.INSTALLING,
+                            onRetry = {},
+                            onClose = ::finishAndRemoveTask
+                        )
+                    } else if (model.error != null) {
+                        RuntimeRecoveryPanel(
+                            language = launcherLanguage(),
+                            phase = RuntimeRecoveryUiPhase.FAILED,
+                            onRetry = ::retryClientInstall,
+                            onClose = ::finishAndRemoveTask
+                        )
+                    }
                     if (model.backgroundVisible) {
-                        BackgroundAppsSetupPrompt(strings(UiLanguage.fromCode(CollectorSettings(this@RuntimeLauncherActivity).uiLanguageCode())),
+                        BackgroundAppsSetupPrompt(strings(launcherLanguage()),
                             onOpenSettings = ::openBackgroundSettings, onDismiss = ::completeBackground)
                     }
                 }
@@ -116,6 +115,16 @@ class RuntimeLauncherActivity : ComponentActivity() {
         if (intent.component?.className == RuntimeLauncherActivity::class.java.name)
             intent.getStringExtra("accessRequest")?.takeIf { it in setOf("adb", "overlay", "background") } ?: "startup"
         else "startup" // Exported launcher alias cannot inject a manual access request.
+
+    private fun launcherLanguage(): UiLanguage =
+        UiLanguage.fromCode(CollectorSettings(this).uiLanguageCode())
+
+    private fun retryClientInstall() {
+        if (model.installing) return
+        model.reset("startup")
+        model.flow.complete(Step.BACKGROUND)
+        model.manualAdb = true
+    }
 
     private fun continueAccess() {
         if (!resumed || !focused || isFinishing || model.error != null || model.flow.inFlight) return
@@ -206,6 +215,7 @@ class RuntimeLauncherActivity : ComponentActivity() {
             return
         }
         model.installing = true
+        model.revision++
         val pending = model
         val app = applicationContext
         // The operation belongs to the owner, not the client being installed/replaced.
@@ -214,7 +224,10 @@ class RuntimeLauncherActivity : ComponentActivity() {
             Handler(Looper.getMainLooper()).post {
                 pending.installing = false
                 pending.clientReady = result.isSuccess
-                pending.error = result.exceptionOrNull()?.let { "${it.javaClass.simpleName}: ${it.message}" }
+                pending.error = result.exceptionOrNull()?.let {
+                    event("client_install_failed", "${it.javaClass.simpleName}: ${it.message}")
+                    "${it.javaClass.simpleName}: ${it.message}"
+                }
                 pending.revision++
             }
         }, "collector-client-bootstrap").start()

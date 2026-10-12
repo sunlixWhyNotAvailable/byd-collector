@@ -297,6 +297,7 @@ interface BydCollectorActions {
     fun onCheckForUpdates()
     fun onDismissUpdateDialog()
     fun onInstallUpdate()
+    fun onCancelUpdateDownload()
     fun onShutdownApp()
 
     fun onStartLogcat()

@@ -12,6 +12,8 @@ import android.database.MatrixCursor
 import android.net.Uri
 import android.os.Environment
 import android.os.Looper
+import android.util.AtomicFile
+import androidx.lifecycle.Lifecycle
 import com.bydcollector.collector.disposeTestComposition
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.core.content.FileProvider
@@ -21,11 +23,14 @@ import com.bydcollector.collector.MainActivity
 import com.bydcollector.collector.adb.AdbAuthorizationManager
 import com.bydcollector.collector.adb.AdbLocalClient
 import com.bydcollector.collector.adb.StartupAdbPeer
+import com.bydcollector.collector.runtime.RuntimeJobsService
 import com.bydcollector.collector.service.CollectorSettings
 import java.io.File
 import java.security.MessageDigest
 import java.security.cert.X509Certificate
 import java.time.Duration
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.jar.JarFile
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
@@ -43,11 +48,13 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.android.controller.ActivityController
+import org.robolectric.android.controller.ServiceController
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 import org.robolectric.annotation.Implementation
 import org.robolectric.annotation.Implements
 import org.robolectric.shadows.ShadowApplicationPackageManager
+import org.robolectric.shadows.ShadowProcess
 import org.robolectric.util.ReflectionHelpers
 
 @RunWith(RobolectricTestRunner::class)
@@ -67,9 +74,12 @@ class UpdateApkVerifierContractTest {
     @get:Rule val ui = createEmptyComposeRule()
     private lateinit var app: BydCollectorApplication
     private lateinit var screen: ActivityController<MainActivity>
+    private var runtimeJobsController: ServiceController<RuntimeJobsService>? = null
 
     @Before fun prepare() {
         app = RuntimeEnvironment.getApplication() as BydCollectorApplication
+        ShadowProcess.setPid(12001)
+        resetRuntimeJobStore()
         val settings = CollectorSettings(app)
         settings.setUiLanguageCode("en")
         settings.setUpdateAutoCheckEnabled(false)
@@ -89,7 +99,10 @@ class UpdateApkVerifierContractTest {
     }
 
     @After fun cleanup() {
+        stopRuntimeJobs()
         if (::app.isInitialized) app.updateRuntime.shutdown()
+        if (::app.isInitialized) RuntimeJobsService::class.java.getDeclaredField("cached")
+            .apply { isAccessible = true }.set(null, null)
         if (::screen.isInitialized) {
             try {
                 screen.get().disposeTestComposition()
@@ -129,40 +142,19 @@ class UpdateApkVerifierContractTest {
         val acceptedBytes = fixture("valid.apk").readBytes()
         assertEquals(parsedInstalledSigners, signerDigests(registerArchive("valid.apk", app.packageName, 2_000_000_000L, flags)))
 
-        // MainActivity validates the private install copy twice. Hold its main-thread continuation after
-        // the first successful validation, change that copy, then prove the final validation blocks install.
+        // The shared runtime job copies and validates the private staging file before claiming installer handoff.
         writeDownloadedApk(downloader, acceptedInfo, acceptedBytes)
-        val mainLooper = shadowOf(Looper.getMainLooper())
-        val wasMainLooperPaused = mainLooper.isPaused
-        val enqueuesBeforeTamper = CompletedDownloadManagerShadow.enqueueCount
-        val cachedApk = File(app.cacheDir, "updates/bydcollector-3.2.2.apk")
-        mainLooper.pause()
-        try {
-            invokeDownload(acceptedInfo)
-            awaitPreflightValidation(cachedApk, enqueuesBeforeTamper + 1)
-            assertContentEquals(acceptedBytes, cachedApk.readBytes(), "The private copy should pass preflight before mutation")
-            cachedApk.writeBytes(acceptedBytes.copyOf().apply { this[0] = (this[0].toInt() xor 0xff).toByte() })
-        } finally {
-            if (!wasMainLooperPaused) mainLooper.unPause()
-        }
-        mainLooper.idle()
-        await { activityUpdateState() is UpdateUiState.Error }
-        val tamperError = activityUpdateState() as UpdateUiState.Error
-        assertTrue(tamperError.message.contains("not an APK", ignoreCase = true), tamperError.message)
-        assertFalse(verifier.validate(File(app.cacheDir, "updates/bydcollector-3.2.2.apk")).ok)
-        assertNull(shadowOf(app).peekNextStartedActivity(), "Changed private copy must not launch an installer")
-
         invokeDownload(acceptedInfo)
-        await { shadowOf(app).peekNextStartedActivity() != null }
+        awaitInstaller()
 
         val installerIntent = assertNotNull(shadowOf(app).nextStartedActivity)
         assertEquals(Intent.ACTION_VIEW, installerIntent.action)
         assertEquals("application/vnd.android.package-archive", installerIntent.type)
         assertTrue(installerIntent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION != 0)
-        assertTrue(installerIntent.flags and Intent.FLAG_ACTIVITY_NEW_TASK != 0)
         val apkUri = assertNotNull(installerIntent.data)
         assertEquals("${app.packageName}.fileprovider", apkUri.authority)
-        assertEquals(listOf("verified_updates", cachedApk.name), apkUri.pathSegments)
+        assertEquals("verified_updates", apkUri.pathSegments.first())
+        val cachedApk = File(File(app.cacheDir, "updates"), apkUri.lastPathSegment!!)
         assertTrue(cachedApk.isFile)
         assertContentEquals(acceptedBytes, cachedApk.readBytes())
         val finalValidation = verifier.validate(cachedApk)
@@ -174,7 +166,37 @@ class UpdateApkVerifierContractTest {
         assertContentEquals(acceptedBytes, readBack)
         assertEquals(sha256(acceptedBytes), finalValidation.sha256)
         assertEquals(sha256(readBack), finalValidation.sha256)
-        assertEquals(2, CompletedDownloadManagerShadow.enqueueCount)
+        assertEquals(1, CompletedDownloadManagerShadow.enqueueCount)
+        val handedOffId = MainActivity::class.java.getDeclaredField("updateDownloadJobId")
+            .apply { isAccessible = true }.get(screen.get()) as String
+        assertEquals("INSTALLER_CLAIMED", RuntimeJobsService.cancelUpdateDownload(app, handedOffId),
+            "Cancellation must lose once the verified installer handoff is claimed")
+
+        // Exercise the shared job's installer-claim boundary: changing the exact staged file
+        // after worker verification must fail the saved SHA check before any installer claim.
+        screen.pause().stop()
+        val tamperedJobId = RuntimeJobsService.submit(app, "updateDownload", org.json.JSONObject()
+            .put("version", acceptedInfo.version).put("url", acceptedInfo.downloadUrl)
+            .put("notes", acceptedInfo.releaseNotes).put("contentType", acceptedInfo.downloadContentType))
+        RuntimeJobsService.dismissUpdateDialog(app, tamperedJobId)
+        writeDownloadedApk(downloader, acceptedInfo, acceptedBytes)
+        startRuntimeJobs()
+        val stagedApk = File(File(app.cacheDir, "updates"), "runtime-$tamperedJobId.apk")
+        await {
+            stagedApk.isFile && jobIn(RuntimeJobsService.snapshot(app), tamperedJobId).optString("status") == "complete"
+        }
+        val verifiedResult = jobIn(RuntimeJobsService.snapshot(app), tamperedJobId).getJSONObject("result")
+        val verifiedSha = verifiedResult.getString("sha256")
+        stagedApk.writeBytes(acceptedBytes.copyOf().apply { this[0] = (this[0].toInt() xor 0xff).toByte() })
+        assertTrue(UpdateApkVerifier(app).sha256(stagedApk) != verifiedSha)
+        screen.start().resume().visible()
+        val reopened = assertNotNull(RuntimeJobsService.reopenUpdateDialog(app, tamperedJobId))
+        consumeJobs(reopened.second)
+        awaitUpdateError()
+        val tamperError = activityUpdateState() as UpdateUiState.Error
+        assertTrue(tamperError.message.contains("changed", ignoreCase = true), tamperError.message)
+        assertFalse(cachedJob(tamperedJobId).optBoolean("installerClaimed"))
+        assertNull(shadowOf(app).peekNextStartedActivity(), "Tampered staged APK must not reach the installer")
 
         val rejected = listOf(
             ApkCandidate("downgrade.apk", "3.2.1", app.packageName, 1L, "version is not newer", sameSigner = true),
@@ -195,12 +217,173 @@ class UpdateApkVerifierContractTest {
             val info = updateInfo(candidate.downloadVersion)
             writeDownloadedApk(downloader, info, bytes)
             invokeDownload(info)
-            await { activityUpdateState() is UpdateUiState.Error }
+            awaitUpdateError()
             val error = activityUpdateState() as UpdateUiState.Error
             assertTrue(error.message.contains(candidate.failureText, ignoreCase = true), error.message)
             assertNull(shadowOf(app).peekNextStartedActivity(), "Rejected ${candidate.fixture} must not launch an installer")
         }
         assertEquals(6, CompletedDownloadManagerShadow.enqueueCount)
+    }
+
+    @Test fun cancellationRemovesItsDownloadAndFencesStaleCompletionAcrossRecoveryAndRetry() {
+        val flags = PackageManager.GET_SIGNING_CERTIFICATES
+        val installedArchive = registerArchive("installed.apk", app.packageName, 1L, flags)
+        val installedPackageInfo = assertNotNull(
+            shadowOf(app.packageManager).getInternalMutablePackageInfo(app.packageName)
+        )
+        installedPackageInfo.signatures = installedArchive.signatures
+        installedPackageInfo.signingInfo = installedArchive.signingInfo
+
+        screen.pause().stop()
+        val info = updateInfo("3.2.6")
+        val downloader = UpdateDownloader(app)
+        val validApk = fixture("valid.apk").readBytes()
+        val unrelatedStaging = File(app.cacheDir, "updates/runtime-unrelated.apk").apply {
+            parentFile?.mkdirs()
+            writeBytes(byteArrayOf(7, 8, 9))
+        }
+        val cancelledIds = mutableListOf<String>()
+        val downloadIds = mutableListOf<Long>()
+
+        listOf(false, true).forEach { completeBeforeCancel ->
+            CompletedDownloadManagerShadow.queryStatus = if (completeBeforeCancel) {
+                DownloadManager.STATUS_SUCCESSFUL
+            } else {
+                DownloadManager.STATUS_RUNNING
+            }
+            val queryEntered = if (completeBeforeCancel) null else CountDownLatch(1)
+            val queryRelease = if (completeBeforeCancel) null else CountDownLatch(1)
+            CompletedDownloadManagerShadow.queryEntered = queryEntered
+            CompletedDownloadManagerShadow.queryRelease = queryRelease
+            val id = RuntimeJobsService.submit(app, "updateDownload", org.json.JSONObject()
+                .put("version", info.version).put("url", info.downloadUrl)
+                .put("notes", info.releaseNotes).put("contentType", info.downloadContentType))
+            cancelledIds += id
+            if (completeBeforeCancel) writeDownloadedApk(downloader, info, validApk)
+
+            startRuntimeJobs()
+            await {
+                val current = jobIn(RuntimeJobsService.snapshot(app), id)
+                current.optLong("downloadId", -1L) > 0L && if (completeBeforeCancel) {
+                    current.optString("status") == "complete"
+                } else {
+                    queryEntered?.count == 0L
+                }
+            }
+
+            val beforeCancel = jobIn(RuntimeJobsService.snapshot(app), id)
+            val downloadId = beforeCancel.getLong("downloadId")
+            downloadIds += downloadId
+            val staleCompleteSnapshot = if (completeBeforeCancel) {
+                RuntimeJobsService.snapshot(app).also { snapshot ->
+                    assertEquals("complete", jobIn(snapshot, id).getString("status"))
+                }
+            } else {
+                writeDownloadedApk(downloader, info, validApk)
+                File(app.cacheDir, "updates/runtime-$id.apk").apply {
+                    parentFile?.mkdirs()
+                    writeBytes(byteArrayOf(1, 2, 3))
+                }
+                null
+            }
+            val downloadedFile = downloader.downloadedFile(info)
+            val stagedFile = File(app.cacheDir, "updates/runtime-$id.apk")
+            assertTrue(downloadedFile.isFile, "Fixture must have this job's exact DownloadManager destination")
+            assertTrue(stagedFile.isFile, "Fixture must have this job's exact staged APK")
+
+            assertEquals("REQUESTED", RuntimeJobsService.cancelUpdateDownload(app, id))
+            assertTrue(CompletedDownloadManagerShadow.removedIds.contains(downloadId),
+                "Cancellation must remove DownloadManager ID $downloadId")
+            val shutdownRecovery = !completeBeforeCancel
+            if (shutdownRecovery) {
+                val settings = CollectorSettings(app)
+                assertTrue(settings.setUserShutdownRequested(true))
+                RuntimeJobsService.cancelForShutdown(app)
+                assertEquals("cancelling", jobIn(RuntimeJobsService.snapshot(app), id).getString("status"),
+                    "Shutdown must preserve requested update cleanup as pending")
+                stopRuntimeJobs()
+                queryRelease?.countDown()
+                CompletedDownloadManagerShadow.queryEntered = null
+                CompletedDownloadManagerShadow.queryRelease = null
+                RuntimeJobsService::class.java.getDeclaredField("cached").apply { isAccessible = true }.set(null, null)
+                assertTrue(settings.clearUserShutdownRequestIfSet())
+                val blockedRetryError = runCatching {
+                    RuntimeJobsService.submit(app, "updateDownload", org.json.JSONObject()
+                        .put("version", info.version).put("url", info.downloadUrl)
+                        .put("notes", info.releaseNotes).put("contentType", info.downloadContentType))
+                }.exceptionOrNull()
+                assertEquals("Update cancellation cleanup is still pending", blockedRetryError?.message,
+                    "A new same-version job must remain fenced across shutdown until cleanup finishes")
+                val enqueuesBeforeRecovery = CompletedDownloadManagerShadow.enqueueCount
+                RuntimeJobsService.recover(app)
+                startRuntimeJobs()
+                assertEquals(enqueuesBeforeRecovery, CompletedDownloadManagerShadow.enqueueCount,
+                    "Shutdown recovery must not enqueue a second update download")
+            } else {
+                runtimeJobsController?.get()?.onStartCommand(null, 0, 2) ?: startRuntimeJobs()
+            }
+            val cancellationDeadline = System.nanoTime() + Duration.ofSeconds(2).toNanos()
+            var cancellationStatus = jobIn(RuntimeJobsService.snapshot(app), id).optString("status")
+            while (cancellationStatus !in setOf("cancelled", "cancelError") &&
+                System.nanoTime() < cancellationDeadline) {
+                shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(25))
+                Thread.sleep(10)
+                cancellationStatus = jobIn(RuntimeJobsService.snapshot(app), id).optString("status")
+            }
+            if (completeBeforeCancel && cancellationStatus !in setOf("cancelled", "cancelError")) startRuntimeJobs()
+            await {
+                jobIn(RuntimeJobsService.snapshot(app), id).optString("status") in setOf("cancelled", "cancelError")
+            }
+            val cancellationResult = jobIn(RuntimeJobsService.snapshot(app), id)
+            assertEquals("cancelled", cancellationResult.getString("status"),
+                "Cancellation cleanup failed at completeBeforeCancel=$completeBeforeCancel: " +
+                    cancellationResult.optString("cancelCleanupError"))
+
+            assertFalse(downloadedFile.exists(), "Cancellation must delete only this update's downloaded APK")
+            assertFalse(stagedFile.exists(), "Cancellation must delete only this job's staged APK")
+            assertTrue(unrelatedStaging.isFile, "Cancellation must leave an unrelated staged job untouched")
+            assertFalse(RuntimeJobsService.prepareResult(app, id),
+                "A stale completed snapshot must not claim the installer after cancellation")
+            assertNull(shadowOf(app).peekNextStartedActivity(), "Cancelled work must not launch an installer")
+            staleCompleteSnapshot?.let { stale ->
+                assertEquals("complete", jobIn(stale, id).getString("status"),
+                    "The saved pre-cancel view should remain stale while the owner rejects its handoff")
+            }
+
+            if (!shutdownRecovery) {
+                stopRuntimeJobs()
+                RuntimeJobsService::class.java.getDeclaredField("cached").apply { isAccessible = true }.set(null, null)
+                val enqueuesBeforeRecovery = CompletedDownloadManagerShadow.enqueueCount
+                RuntimeJobsService.recover(app)
+                startRuntimeJobs()
+                assertEquals(enqueuesBeforeRecovery, CompletedDownloadManagerShadow.enqueueCount,
+                    "Service/cache recovery must not re-enqueue a terminally cancelled update")
+            }
+            assertEquals("cancelled", jobIn(RuntimeJobsService.snapshot(app), id).getString("status"))
+            stopRuntimeJobs()
+        }
+
+        assertEquals(2, cancelledIds.distinct().size)
+        assertEquals(downloadIds.toSet(), CompletedDownloadManagerShadow.removedIds.toSet(),
+            "Cancellation cleanup must remove only the two cancelled jobs' DownloadManager IDs")
+
+        CompletedDownloadManagerShadow.queryStatus = DownloadManager.STATUS_SUCCESSFUL
+        val retryId = RuntimeJobsService.submit(app, "updateDownload", org.json.JSONObject()
+            .put("version", info.version).put("url", info.downloadUrl)
+            .put("notes", info.releaseNotes).put("contentType", info.downloadContentType))
+        assertFalse(retryId in cancelledIds, "An explicit retry must create a fresh job")
+        writeDownloadedApk(downloader, info, validApk)
+        startRuntimeJobs()
+        await { jobIn(RuntimeJobsService.snapshot(app), retryId).optString("status") == "complete" }
+        assertEquals(3, CompletedDownloadManagerShadow.enqueueCount,
+            "Only the two original jobs and the explicit retry may enqueue downloads")
+        assertNull(shadowOf(app).peekNextStartedActivity(), "A stopped UI must not auto-offer the completed retry")
+        unrelatedStaging.delete()
+    }
+
+    @Test fun missingDownloadManagerRowIsTerminalInsteadOfStallingAtZeroProgress() {
+        CompletedDownloadManagerShadow.missingRow = true
+        assertEquals(-1, UpdateDownloader(app).progress(42L))
     }
 
     private fun invokeDownload(info: UpdateInfo) {
@@ -209,6 +392,41 @@ class UpdateApkVerifierContractTest {
             "startUpdateDownload",
             ReflectionHelpers.ClassParameter.from(UpdateInfo::class.java, info)
         )
+        startRuntimeJobs()
+    }
+
+    private fun startRuntimeJobs() {
+        stopRuntimeJobs()
+        runtimeJobsController = Robolectric.buildService(RuntimeJobsService::class.java).create()
+        runtimeJobsController!!.get().onStartCommand(null, 0, 1)
+    }
+
+    private fun stopRuntimeJobs() {
+        runtimeJobsController?.let { runCatching { it.destroy() } }
+        runtimeJobsController = null
+    }
+
+    private fun resetRuntimeJobStore() {
+        RuntimeJobsService::class.java.getDeclaredField("cached").apply { isAccessible = true }.set(null, null)
+        AtomicFile(File(app.filesDir, "runtime_jobs.json")).delete()
+        RuntimeJobsService::class.java.getDeclaredField("cached").apply { isAccessible = true }.set(null, null)
+    }
+
+    private fun consumeJobs(json: String) {
+        MainActivity::class.java.getDeclaredMethod("consumeRuntimeJobs", String::class.java)
+            .apply { isAccessible = true }.invoke(screen.get(), json)
+        shadowOf(Looper.getMainLooper()).idle()
+    }
+
+    private fun jobIn(json: String, id: String): org.json.JSONObject {
+        val jobs = org.json.JSONArray(json)
+        return (0 until jobs.length()).map(jobs::getJSONObject).single { it.getString("id") == id }
+    }
+
+    private fun cachedJob(id: String): org.json.JSONObject {
+        val jobs = RuntimeJobsService::class.java.getDeclaredField("cached").apply { isAccessible = true }
+            .get(null) as MutableList<org.json.JSONObject>
+        return jobs.single { it.getString("id") == id }
     }
 
     private fun activityUpdateState(): UpdateUiState = ReflectionHelpers.callInstanceMethod(screen.get(), "getUpdateUiState")
@@ -285,6 +503,24 @@ class UpdateApkVerifierContractTest {
         shadowOf(Looper.getMainLooper()).idle()
     }
 
+    private fun awaitInstaller() {
+        await {
+            if (screen.get().lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                consumeJobs(RuntimeJobsService.snapshot(app))
+            }
+            shadowOf(app).peekNextStartedActivity() != null
+        }
+    }
+
+    private fun awaitUpdateError() {
+        await {
+            if (screen.get().lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                consumeJobs(RuntimeJobsService.snapshot(app))
+            }
+            activityUpdateState() is UpdateUiState.Error
+        }
+    }
+
     private fun updateBoundaryDiagnostics(): String {
         val uiState = runCatching { activityUpdateState().toString() }.getOrDefault("<unavailable>")
         val startedActivity = runCatching { shadowOf(app).peekNextStartedActivity()?.toString() }
@@ -293,22 +529,17 @@ class UpdateApkVerifierContractTest {
             ?.joinToString { "${it.name}:${it.length()}" } ?: "<none>"
         val downloadFiles = app.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)?.listFiles()
             ?.joinToString { "${it.name}:${it.length()}" } ?: "<none>"
-        return "ui=$uiState worker=${updateWorkerState()} enqueues=${CompletedDownloadManagerShadow.enqueueCount} " +
-            "cache=[$cacheFiles] downloads=[$downloadFiles] installer=$startedActivity"
+        val jobs = runCatching {
+            val all = org.json.JSONArray(RuntimeJobsService.snapshot(app))
+            (0 until all.length()).joinToString { index ->
+                val job = all.getJSONObject(index)
+                "${job.optString("id")}:${job.optString("status")}:" +
+                    job.optString("cancelCleanupError", job.optString("error"))
+            }
+        }.getOrElse { "<${it.javaClass.simpleName}>" }
+        return "ui=$uiState enqueues=${CompletedDownloadManagerShadow.enqueueCount} " +
+            "cache=[$cacheFiles] downloads=[$downloadFiles] jobs=[$jobs] installer=$startedActivity"
     }
-
-    private fun awaitPreflightValidation(privateCopy: File, requiredEnqueueCount: Int) {
-        val deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos()
-        while (CompletedDownloadManagerShadow.enqueueCount < requiredEnqueueCount ||
-            !privateCopy.isFile || updateWorkerState() != Thread.State.WAITING
-        ) {
-            check(System.nanoTime() < deadline) { "Timed out waiting for update preflight validation" }
-            Thread.sleep(10)
-        }
-    }
-
-    private fun updateWorkerState(): Thread.State? = Thread.getAllStackTraces().keys
-        .firstOrNull { it.name == "byd-update" }?.state
 
     private data class ApkCandidate(
         val fixture: String,
@@ -336,12 +567,39 @@ class CompletedDownloadManagerShadow {
             DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR
         )
     ).apply {
-        addRow(arrayOf(DownloadManager.STATUS_SUCCESSFUL, 1L, 1L))
+        queryCount += 1
+        queryEntered?.countDown()
+        queryRelease?.let { check(it.await(10, TimeUnit.SECONDS)) { "Timed out releasing DownloadManager query" } }
+        if (!missingRow) {
+            val downloaded = if (queryStatus == DownloadManager.STATUS_SUCCESSFUL) 1L else 0L
+            addRow(arrayOf(queryStatus, 1L, downloaded))
+        }
+    }
+
+    @Implementation
+    fun remove(vararg ids: Long): Int {
+        removedIds.addAll(ids.toList())
+        return ids.size
     }
 
     companion object {
         @Volatile var enqueueCount = 0
-        fun reset() { enqueueCount = 0 }
+        @Volatile var missingRow = false
+        @Volatile var queryCount = 0
+        @Volatile var queryStatus = DownloadManager.STATUS_SUCCESSFUL
+        @Volatile var queryEntered: CountDownLatch? = null
+        @Volatile var queryRelease: CountDownLatch? = null
+        val removedIds = java.util.Collections.synchronizedList(mutableListOf<Long>())
+        fun reset() {
+            queryRelease?.countDown()
+            queryEntered = null
+            queryRelease = null
+            enqueueCount = 0
+            missingRow = false
+            queryCount = 0
+            queryStatus = DownloadManager.STATUS_SUCCESSFUL
+            removedIds.clear()
+        }
     }
 }
 
@@ -349,13 +607,25 @@ class CompletedDownloadManagerShadow {
 class VerifiedArchivePackageManagerShadow : ShadowApplicationPackageManager() {
     @Implementation
     override fun getPackageArchiveInfo(archiveFilePath: String, flags: Int): PackageInfo? {
-        val parsedInfo = super.getPackageArchiveInfo(archiveFilePath, flags) ?: return null
-        val verifiedSignatures = verifiedJarSignatures(File(archiveFilePath)) ?: return null
-        parsedInfo.signatures = verifiedSignatures.toTypedArray()
-        parsedInfo.signingInfo = SigningInfo().apply {
-            shadowOf(this).setSignatures(verifiedSignatures.toTypedArray())
+        // Robolectric's native PackageManager can keep the parsed archive open on Windows.
+        // Parse a byte-identical host-temp copy so cancellation can still assert deletion of
+        // the production staging path after verification.
+        val source = File(archiveFilePath)
+        val parserCopy = File.createTempFile("update-apk-archive-", ".apk").apply {
+            writeBytes(source.readBytes())
+            deleteOnExit()
         }
-        return parsedInfo
+        return try {
+            val parsedInfo = super.getPackageArchiveInfo(parserCopy.absolutePath, flags) ?: return null
+            val verifiedSignatures = verifiedJarSignatures(parserCopy) ?: return null
+            parsedInfo.signatures = verifiedSignatures.toTypedArray()
+            parsedInfo.signingInfo = SigningInfo().apply {
+                shadowOf(this).setSignatures(verifiedSignatures.toTypedArray())
+            }
+            parsedInfo
+        } finally {
+            parserCopy.delete()
+        }
     }
 }
 

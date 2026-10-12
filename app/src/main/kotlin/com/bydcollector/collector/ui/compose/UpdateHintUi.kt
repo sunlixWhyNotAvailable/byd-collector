@@ -45,6 +45,7 @@ import kotlinx.coroutines.launch
 import java.util.Locale
 import kotlin.math.roundToInt
 import com.bydcollector.collector.R
+import com.bydcollector.collector.runtime.RuntimeDialogRecoveryShield
 import com.bydcollector.collector.update.UpdateHintAppearance
 import com.bydcollector.collector.update.UpdateHintCardView
 
@@ -292,6 +293,7 @@ internal fun UpdateHintSettingsDialog(
                     PreviewButton(language.choose("Закрити", "Close", "Закрыть"), palette, primary = false, modifier = Modifier.width(160.dp), onClick = onClose)
                 }
             }
+            RuntimeDialogRecoveryShield("update-hint-settings")
         }
     }
     if (choosingColor) {
@@ -349,12 +351,13 @@ private fun WidgetColorPicker(
         hexDraft = String.format(Locale.ROOT, "%06X", draft and 0xFFFFFF)
     }
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Column(
-            Modifier.width(560.dp).heightIn(max = 600.dp).clip(RoundedCornerShape(8.dp))
-                .background(palette.surface).border(1.dp, palette.borderStrong, RoundedCornerShape(8.dp))
-                .verticalScroll(rememberScrollState()).padding(18.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
+        Box(contentAlignment = Alignment.Center) {
+            Column(
+                Modifier.width(560.dp).heightIn(max = 600.dp).clip(RoundedCornerShape(8.dp))
+                    .background(palette.surface).border(1.dp, palette.borderStrong, RoundedCornerShape(8.dp))
+                    .verticalScroll(rememberScrollState()).padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
             Text(title, color = palette.text, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
                 Box(Modifier.size(48.dp).background(Color(draft), RoundedCornerShape(7.dp)).border(1.dp, palette.borderStrong, RoundedCornerShape(7.dp)))
@@ -402,10 +405,12 @@ private fun WidgetColorPicker(
                     updateDraftColor((draft and (0xFF shl shift).inv()) or (value shl shift))
                 }
             }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                PreviewButton(uiLanguage.choose("Обрати", "Select", "Выбрать"), palette, primary = true, modifier = Modifier.weight(1f)) { onSelect(draft) }
-                PreviewButton(uiLanguage.choose("Скасувати", "Cancel", "Отмена"), palette, primary = false, modifier = Modifier.weight(1f), onClick = onDismiss)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    PreviewButton(uiLanguage.choose("Обрати", "Select", "Выбрать"), palette, primary = true, modifier = Modifier.weight(1f)) { onSelect(draft) }
+                    PreviewButton(uiLanguage.choose("Скасувати", "Cancel", "Отмена"), palette, primary = false, modifier = Modifier.weight(1f), onClick = onDismiss)
+                }
             }
+            RuntimeDialogRecoveryShield("update-hint-color-picker")
         }
     }
 }

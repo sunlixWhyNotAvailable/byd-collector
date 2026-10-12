@@ -117,9 +117,25 @@ class RuntimeEndpointProvider : ContentProvider() {
                     RuntimeJobsService.dismissUpdateDialog(ctx, requireNotNull(extras.getString("id")))
                     Bundle()
                 }
+                "job.reopenUpdate" -> Bundle().apply {
+                    RuntimeJobsService.reopenUpdateDialog(ctx, extras.getString("id"), extras.getInt("pid"))?.let { (id, jobs) ->
+                        putString("id", id)
+                        putString("jobs", jobs)
+                    }
+                }
                 "job.prepare" -> {
-                    RuntimeJobsService.prepareResult(ctx, requireNotNull(extras.getString("id")))
+                    Bundle().apply {
+                        putBoolean("ready", RuntimeJobsService.prepareResult(ctx,
+                            requireNotNull(extras.getString("id")), extras.getInt("pid")))
+                    }
+                }
+                "job.releaseInstaller" -> {
+                    RuntimeJobsService.releaseInstallerClaim(ctx, requireNotNull(extras.getString("id")), extras.getInt("pid"))
                     Bundle()
+                }
+                "job.cancelUpdate" -> Bundle().apply {
+                    putString("result", RuntimeJobsService.cancelUpdateDownload(ctx,
+                        requireNotNull(extras.getString("id")), extras.getInt("pid")))
                 }
                 "job.submit" -> Bundle().apply {
                     val json = extras.getString("args") ?: "{}"

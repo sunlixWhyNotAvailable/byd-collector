@@ -14,7 +14,7 @@ import java.util.Locale
 class UpdateApkVerifier(private val context: Context) {
     fun validate(file: File): UpdateApkValidation {
         if (!file.isFile) return UpdateApkValidation.fail("downloaded APK is missing")
-        val sha256 = fileSha256(file)
+        val sha256 = sha256(file)
         val archive = archiveInfo(file) ?: return UpdateApkValidation.fail("downloaded file is not an APK")
         if (archive.packageName != context.packageName) {
             return UpdateApkValidation.fail("APK package mismatch: ${archive.packageName}")
@@ -30,6 +30,19 @@ class UpdateApkVerifier(private val context: Context) {
             return UpdateApkValidation.fail("APK signing certificate mismatch")
         }
         return UpdateApkValidation.ok(sha256)
+    }
+
+    internal fun sha256(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        FileInputStream(file).use { input ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val read = input.read(buffer)
+                if (read <= 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { byte -> String.format(Locale.US, "%02x", byte.toInt() and 0xff) }
     }
 
     private companion object {
@@ -79,18 +92,6 @@ class UpdateApkVerifier(private val context: Context) {
         }.toSet()
     }
 
-    private fun fileSha256(file: File): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        FileInputStream(file).use { input ->
-            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-            while (true) {
-                val read = input.read(buffer)
-                if (read <= 0) break
-                digest.update(buffer, 0, read)
-            }
-        }
-        return digest.digest().joinToString("") { byte -> String.format(Locale.US, "%02x", byte.toInt() and 0xff) }
-    }
 }
 
 data class UpdateApkValidation(

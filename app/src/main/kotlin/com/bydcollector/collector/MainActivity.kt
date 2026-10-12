@@ -18,15 +18,21 @@ import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
+import android.view.View
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.core.content.FileProvider
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.bydcollector.collector.adb.AdbAuthorizationManager
 import com.bydcollector.collector.adb.AccessCheckMode
@@ -95,9 +101,7 @@ import com.bydcollector.collector.ui.compose.operationFailureDetail
 import com.bydcollector.collector.ui.compose.connectionTestMessage
 import com.bydcollector.collector.update.UpdateRuntime
 import com.bydcollector.collector.update.UpdateHintAppearance
-import com.bydcollector.collector.update.UpdateApkVerifier
 import com.bydcollector.collector.update.UpdateCheckSession
-import com.bydcollector.collector.update.UpdateDownloader
 import com.bydcollector.collector.update.UpdateInfo
 import com.bydcollector.collector.update.UpdateUiState
 import com.bydcollector.collector.runtime.RuntimeJobsService
@@ -117,13 +121,18 @@ class MainActivity : ComponentActivity() {
     private var updateDownloadJobId: String? = null
     private var lastRuntimeMetadataAt = 0L
     private val runtimeObserver = object : android.database.ContentObserver(Handler(Looper.getMainLooper())) {
-        override fun onChange(selfChange: Boolean) { if (foreground && !destroyed) refresh(force = false) }
+        override fun onChange(selfChange: Boolean) {
+            if (foreground && !destroyed && (!BuildConfig.RUNTIME_CLIENT ||
+                    runtimeCompatibleForUi)) refresh(force = false)
+        }
     }
 
     private fun submitRuntimeJob(kind: String, args: JSONObject = JSONObject()): String? = runCatching {
-        RuntimeEndpoint.call(this, "job.submit", Bundle().apply {
-            putString("kind", kind); putString("args", args.toString())
-        }).getString("id") ?: error("Runtime did not accept the task")
+        if (BuildConfig.RUNTIME_CLIENT) {
+            RuntimeEndpoint.call(this, "job.submit", Bundle().apply {
+                putString("kind", kind); putString("args", args.toString())
+            }).getString("id") ?: error("Runtime did not accept the task")
+        } else RuntimeJobsService.submit(this, kind, args)
     }.onFailure {
         actionUiState = actionUiState.copy(mqttTest = false,
             mqttCleanup = actionUiState.mqttCleanup && kind != "mqttCleanup", influxTest = false, adbGrant = false)
@@ -135,7 +144,8 @@ class MainActivity : ComponentActivity() {
     private fun consumeRuntimeJobs(json: String) {
         val array = JSONArray(json)
         val jobs = (0 until array.length()).map(array::getJSONObject)
-        val active = jobs.filter { it.optString("status") in setOf("queued", "running") }
+        val active = jobs.filter { it.optString("status") in setOf("queued", "running", "cancelling") }
+        val activeUpdateId = active.firstOrNull { it.optString("kind") == "updateDownload" }?.optString("id")
         diagnosticsBusy = active.any { it.getString("kind").startsWith("log") }
         actionUiState = actionUiState.copy(mqttTest = active.any { it.getString("kind") == "mqttTest" },
             mqttCleanup = active.any { it.getString("kind") == "mqttCleanup" },
@@ -143,18 +153,62 @@ class MainActivity : ComponentActivity() {
         active.firstOrNull { it.getString("kind") == "updateDownload" }?.let { job ->
             updateDownloadJobId = job.getString("id")
             if (job.optBoolean("dialogDismissed") || updateDownloadJobId in dismissedUpdateJobs) return@let
-            updateUiState = UpdateUiState.Downloading(RuntimeJobsService.updateInfo(job), job.optInt("progress"))
+            updateUiState = if (job.optBoolean("cancelRequested") || job.optString("status") == "cancelling") {
+                UpdateUiState.Cancelling(RuntimeJobsService.updateInfo(job))
+            } else UpdateUiState.Downloading(RuntimeJobsService.updateInfo(job), job.optInt("progress"))
             syncReleaseNotesUi()
         }
         jobs.filter { it !in active && !it.optBoolean("presented") }.forEach { job ->
+            //A result read before backgrounding stays authoritative and unpresented until the
+            //compatible UI is resumed and focused; in particular, never open an installer late.
+            if (BuildConfig.RUNTIME_CLIENT &&
+                (!runtimeCompatibleForUi || !runtimeRecoveryForegroundEligible())) return@forEach
             val id = job.getString("id")
             if (id in presentedRuntimeJobs) return@forEach
             val kind = job.getString("kind")
+            val status = job.optString("status")
+            if (kind == "updateDownload" && status in setOf("cancelled", "cancelError")) {
+                if (activeUpdateId != null && activeUpdateId != id) return@forEach
+                if (!job.optBoolean("dialogDismissed") && id !in dismissedUpdateJobs) {
+                    updateDownloadJobId = id
+                    val info = RuntimeJobsService.updateInfo(job)
+                    updateUiState = when (status) {
+                        "cancelled" -> UpdateUiState.Cancelled(info)
+                        else -> UpdateUiState.CancelError(info)
+                    }
+                    syncReleaseNotesUi()
+                }
+                return@forEach
+            }
             val success = job.getString("status") == "complete"
             val result = job.optJSONObject("result") ?: JSONObject()
+            var keepUpdateForExplicitReopen = false
+            var installerLaunchAttempted = false
             val delivered = runCatching {
-                if (success && (result.has("uri") || result.has("uris"))) {
-                    RuntimeEndpoint.call(this, "job.prepare", Bundle().apply { putString("id", id) })
+                val resultPrepared = if (success && (result.has("uri") || result.has("uris"))) {
+                    RuntimeJobsService.prepareResult(this, id)
+                } else true
+                if (success && kind == "updateDownload" && !resultPrepared) {
+                    val currentJobs = JSONArray(RuntimeJobsService.snapshot(this))
+                    val current = (0 until currentJobs.length()).map(currentJobs::getJSONObject)
+                        .firstOrNull { it.optString("id") == id } ?: job
+                    updateDownloadJobId = id
+                    val currentStatus = current.optString("status")
+                    if (current.optBoolean("cancelRequested") || currentStatus in setOf("cancelling", "cancelError", "cancelled")) {
+                        updateUiState = when (currentStatus) {
+                            "cancelled" -> UpdateUiState.Cancelled(RuntimeJobsService.updateInfo(current))
+                            "cancelError" -> UpdateUiState.CancelError(RuntimeJobsService.updateInfo(current))
+                            else -> UpdateUiState.Cancelling(RuntimeJobsService.updateInfo(current))
+                        }
+                        keepUpdateForExplicitReopen = true
+                        syncReleaseNotesUi()
+                    } else if (current.optBoolean("installerClaimed")) {
+                        // A prior process may have crossed the installer boundary; wait for an explicit reopen.
+                        keepUpdateForExplicitReopen = !current.optBoolean("presented")
+                        if (keepUpdateForExplicitReopen) presentedRuntimeJobs += id
+                        updateUiState = UpdateUiState.Hidden
+                    }
+                    return@runCatching
                 }
                 if (success && (kind == "logShare" || kind == "archiveShare")) {
                     val uris = if (kind == "logShare") arrayListOf(Uri.parse(result.getString("uri")))
@@ -170,8 +224,18 @@ class MainActivity : ComponentActivity() {
                     }
                     startActivity(Intent.createChooser(share, "BYD Collector"))
                 } else if (success && kind == "updateDownload") {
-                    startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(result.getString("uri")),
-                        "application/vnd.android.package-archive").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                    try {
+                        installerLaunchAttempted = true
+                        startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(result.getString("uri")),
+                            "application/vnd.android.package-archive").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                    } catch (error: Exception) {
+                        RuntimeJobsService.releaseInstallerClaim(this, id)
+                        presentedRuntimeJobs += id
+                        recordOperationalEvent("runtime_update_installer_open_failed", "Could not open verified update", error.diagnosticDetail())
+                        updateUiState = UpdateUiState.Error("Could not open the verified update installer")
+                        syncReleaseNotesUi()
+                        throw error
+                    }
                     updateRuntime.onInstallerLaunched()
                     updateUiState = UpdateUiState.Hidden
                 } else if (kind == "mqttCleanup") {
@@ -186,10 +250,26 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 runtimeJobCallbacks.remove(id)?.invoke(success)
-                RuntimeEndpoint.call(this, "job.presented", Bundle().apply { putString("id", id) })
+                RuntimeJobsService.presented(this, id)
             }
-            if (delivered.isSuccess) presentedRuntimeJobs += id
-            else Log.w(TAG, "Runtime result presentation failed", delivered.exceptionOrNull())
+            if (delivered.isSuccess && !keepUpdateForExplicitReopen) presentedRuntimeJobs += id
+            else if (delivered.isFailure) {
+                val error = delivered.exceptionOrNull()
+                Log.w(TAG, "Runtime result presentation failed", error)
+                if (kind == "updateDownload" && success) {
+                    updateDownloadJobId = id
+                    presentedRuntimeJobs += id
+                    val detail = error?.message?.take(300) ?: "Could not prepare the verified update installer"
+                    recordOperationalEvent("runtime_update_installer_prepare_failed", "Could not prepare verified update", error?.diagnosticDetail())
+                    updateRuntime.onInstallFinished()
+                    if (!installerLaunchAttempted) {
+                        runCatching { RuntimeJobsService.presented(this, id) }
+                            .onFailure { Log.w(TAG, "Could not retire invalid verified update result", it) }
+                    }
+                    updateUiState = UpdateUiState.Error(detail)
+                    syncReleaseNotesUi()
+                }
+            }
         }
     }
     private lateinit var store: TelemetryStore
@@ -209,13 +289,28 @@ class MainActivity : ComponentActivity() {
     private var updateReleaseNotes by mutableStateOf<com.bydcollector.collector.update.ReleaseNotesHistory?>(null)
     private val updateRuntime: UpdateRuntime
         get() = (applicationContext as BydCollectorApplication).updateRuntime
-    private val updateDownloader by lazy { UpdateDownloader(applicationContext) }
-    private val updateApkVerifier by lazy { UpdateApkVerifier(applicationContext) }
+    private var runtimeRecoveryUiPhase by mutableStateOf<RuntimeRecoveryUiPhase?>(
+        if (BuildConfig.RUNTIME_CLIENT) RuntimeRecoveryUiPhase.WAITING else null
+    )
+    private var runtimeCompatibleForUi = !BuildConfig.RUNTIME_CLIENT
+    private var runtimeInitializationInFlight = false
+    private var runtimeSavedInstanceState: Bundle? = null
+    private var uiVisibleDelivered = false
+    private var uiResumedDelivered = false
+    private val runtimeForegroundRecovery = RuntimeForegroundRecovery(
+        schedule = { task, delayMs -> handler.postDelayed(task, delayMs) },
+        cancel = handler::removeCallbacks,
+        probe = ::probeRuntimeCompatibility,
+        onStatusChanged = ::onRuntimeRecoveryStatusChanged,
+        onClientMismatch = ::launchOwnerRecoveryLauncher
+    )
     private var startupBackgroundLaunchPosted = false
     private var startupAdbSelfCheckPosted = false
     private var startupAdbSelfCheckSource = "startup"
     private var startupAccessFlowCompleted = false
     private var mainWindowHasFocus by mutableStateOf(false)
+    private val runtimeDialogWindowViews = mutableMapOf<String, View>()
+    private val runtimeDialogViewReporter: (String, View?) -> Unit = ::onRuntimeDialogViewChanged
     private var runtimePermissionRequestInFlight = false
     private val overlayPermissionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         runtimePermissionRequestInFlight = false
@@ -270,6 +365,7 @@ class MainActivity : ComponentActivity() {
     @Volatile private var forcedRefreshPending = false
     private var credentialsLoadStarted = false
     private var uiInitialized = false
+    private var runtimeObserverRegistered = false
     private var credentialsLoaded = false
     private var mqttCredentialRevision = 0L
     private var influxCredentialRevision = 0L
@@ -757,7 +853,24 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onCheckForUpdates() {
-            runUpdateCheck(force = true)
+            val reopened = try {
+                RuntimeJobsService.reopenUpdateDialog(this@MainActivity, updateDownloadJobId)
+            } catch (error: Exception) {
+                Log.w(TAG, "Could not reopen update task", error)
+                recordOperationalEvent("runtime_update_reopen_failed", "Could not reopen update progress", error.diagnosticDetail())
+                updateUiState = UpdateUiState.Error("Runtime update status unavailable")
+                syncReleaseNotesUi()
+                return
+            }
+            if (reopened == null) {
+                runUpdateCheck(force = true)
+                return
+            }
+            val id = reopened.first
+            updateDownloadJobId = id
+            dismissedUpdateJobs.remove(id)
+            presentedRuntimeJobs.remove(id)
+            consumeRuntimeJobs(reopened.second)
         }
 
         override fun onToggleUpdateHint(enabled: Boolean) {
@@ -790,8 +903,36 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onInstallUpdate() {
-            val available = updateUiState as? UpdateUiState.Available ?: return
-            startUpdateDownload(available.info)
+            when (val state = updateUiState) {
+                is UpdateUiState.Available -> startUpdateDownload(state.info)
+                is UpdateUiState.Cancelled -> {
+                    val previousId = updateDownloadJobId
+                    if (startUpdateDownload(state.info)) previousId?.let { runCatching { RuntimeJobsService.presented(this@MainActivity, it) } }
+                }
+                else -> Unit
+            }
+        }
+
+        override fun onCancelUpdateDownload() {
+            val info = when (val state = updateUiState) {
+                is UpdateUiState.Downloading -> state.info
+                is UpdateUiState.CancelError -> state.info
+                else -> return
+            }
+            val id = updateDownloadJobId ?: return
+            val result = runCatching { RuntimeJobsService.cancelUpdateDownload(this@MainActivity, id) }
+                .onFailure { error ->
+                    Log.w(TAG, "Could not cancel update download", error)
+                    recordOperationalEvent("runtime_update_cancel_failed", "Could not cancel update download", error.diagnosticDetail())
+                }.getOrNull()
+            updateUiState = when (result) {
+                "REQUESTED" -> UpdateUiState.Cancelling(info)
+                "CANCELLED" -> UpdateUiState.Cancelled(info)
+                "INSTALLER_CLAIMED" -> UpdateUiState.Hidden
+                else -> UpdateUiState.CancelError(info)
+            }
+            syncReleaseNotesUi()
+            if (result == null) Toast.makeText(this@MainActivity, strings(uiLanguage).updateCancelFailed, Toast.LENGTH_LONG).show()
         }
 
         override fun onShutdownApp() {
@@ -844,23 +985,113 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun initializeRuntimeUi(savedInstanceState: Bundle?) {
-        if (RuntimePreferences.isInitialized() &&
-            BydCollectorApplication.dashboardUiStateStore(applicationContext).currentChrome() != null) {
-            initializeUi(savedInstanceState)
+        runtimeSavedInstanceState = savedInstanceState
+        setContent {
+            RuntimeRecoveryPanel(
+                language = recoveryUiLanguage(),
+                phase = runtimeRecoveryUiPhase ?: RuntimeRecoveryUiPhase.WAITING,
+                darkTheme = darkTheme,
+                onRetry = ::retryRuntimeRecovery,
+                onClose = ::closeRuntimeRecovery
+            )
+        }
+        updateRuntimeRecoveryEligibility()
+    }
+
+    private fun recoveryUiLanguage(): UiLanguage {
+        if (uiInitialized) return uiLanguage
+        val cachedCode = if (RuntimePreferences.isInitialized()) {
+            RuntimePreferences.get(applicationContext).getString(CollectorSettings.KEY_UI_LANGUAGE_CODE, null)
+        } else null
+        val languageCode = cachedCode?.takeIf(String::isNotBlank)
+            ?: resources.configuration.locales[0]?.language.orEmpty()
+        return UiLanguage.fromCode(languageCode)
+    }
+
+    private fun runtimeRecoveryForegroundEligible(): Boolean =
+        BuildConfig.RUNTIME_CLIENT && !destroyed && !isFinishing &&
+            runtimeRecoveryEligible(
+                activityResumed = lifecycle.currentState == androidx.lifecycle.Lifecycle.State.RESUMED,
+                activityWindowFocused = mainWindowHasFocus && window.decorView.hasWindowFocus(),
+                ownedDialogWindowFocused = runtimeDialogWindowViews.values.any {
+                    it.isAttachedToWindow && it.hasWindowFocus()
+                }
+            )
+
+    private fun onRuntimeDialogViewChanged(dialogId: String, view: View?) {
+        if (!BuildConfig.RUNTIME_CLIENT) return
+        if (view == null) runtimeDialogWindowViews.remove(dialogId)
+        else runtimeDialogWindowViews[dialogId] = view
+        updateRuntimeRecoveryEligibility()
+    }
+
+    private fun updateRuntimeRecoveryEligibility() {
+        if (!BuildConfig.RUNTIME_CLIENT) return
+        val eligible = runtimeRecoveryForegroundEligible()
+        runtimeForegroundRecovery.setEligible(eligible)
+        // A cold owner load can finish while focus belongs to a permission dialog or another
+        // app. Its callback defers UI creation; retry the local continuation when focus returns.
+        if (eligible && runtimeCompatibleForUi && !uiInitialized) initializeRuntimeUiAfterPreflight()
+    }
+
+    private fun probeRuntimeCompatibility(complete: (RuntimePreflightResult) -> Unit) {
+        dashboardExecutor.execute {
+            val result = runCatching {
+                val identity = RuntimeEndpoint.call(applicationContext, "identity")
+                check(identity.getString("package") == RuntimeEndpoint.OWNER_PACKAGE &&
+                    identity.getInt("protocol") == RuntimeEndpoint.PROTOCOL) { "Runtime identity mismatch" }
+                RuntimePreflightResult.COMPATIBLE
+            }.getOrElse { error ->
+                Log.w(TAG, "Runtime compatibility preflight failed", error)
+                classifyRuntimePreflightFailure(error).also { result ->
+                    recordRuntimeRecoveryDiagnostic("preflight_${result.name.lowercase()}", error)
+                }
+            }
+            runOnUiThread { if (!destroyed && !isFinishing) complete(result) }
+        }
+    }
+
+    private fun onRuntimeRecoveryStatusChanged(status: RuntimeRecoveryStatus) {
+        if (!BuildConfig.RUNTIME_CLIENT) return
+        runtimeCompatibleForUi = status == RuntimeRecoveryStatus.READY
+        runtimeRecoveryUiPhase = when (status) {
+            RuntimeRecoveryStatus.WAITING -> RuntimeRecoveryUiPhase.WAITING
+            RuntimeRecoveryStatus.CHECKING -> RuntimeRecoveryUiPhase.CHECKING
+            RuntimeRecoveryStatus.RETRYING -> RuntimeRecoveryUiPhase.RECOVERING
+            RuntimeRecoveryStatus.FAILED -> RuntimeRecoveryUiPhase.FAILED
+            RuntimeRecoveryStatus.READY -> null
+            RuntimeRecoveryStatus.BOOTSTRAPPING -> RuntimeRecoveryUiPhase.INSTALLING
+        }
+        when (status) {
+            RuntimeRecoveryStatus.READY -> {
+                if (uiInitialized) dispatchRuntimeUiLifecycle()
+                else initializeRuntimeUiAfterPreflight()
+            }
+            else -> Unit
+        }
+    }
+
+    private fun initializeRuntimeUiAfterPreflight() {
+        if (!runtimeCompatibleForUi || !runtimeRecoveryForegroundEligible() || uiInitialized ||
+            runtimeInitializationInFlight || destroyed || isFinishing) return
+        val cache = BydCollectorApplication.dashboardUiStateStore(applicationContext)
+        if (RuntimePreferences.isInitialized() && cache.currentChrome() != null) {
+            runCatching { initializeUi(runtimeSavedInstanceState) }
+                .onSuccess {
+                    runtimeSavedInstanceState = null
+                    runtimeRecoveryUiPhase = null
+                    dispatchRuntimeUiLifecycle()
+                }
+                .onFailure(::failRuntimeUiInitialization)
             return
         }
-        val loading = android.widget.TextView(this).apply {
-            gravity = android.view.Gravity.CENTER
-            setTextColor(android.graphics.Color.rgb(231, 237, 245))
-            setBackgroundColor(android.graphics.Color.rgb(8, 13, 18))
-            textSize = 18f
-        }
-        setContentView(loading)
+
+        runtimeInitializationInFlight = true
+        runtimeRecoveryUiPhase = RuntimeRecoveryUiPhase.RECOVERING
         dashboardExecutor.execute {
             val result = runCatching {
                 RuntimeClient.refresh()
                 RuntimePreferences.get(applicationContext)
-                val cache = BydCollectorApplication.dashboardUiStateStore(applicationContext)
                 if (cache.currentChrome() == null) {
                     val initialSettings = CollectorSettings(applicationContext)
                     cache.seed(DashboardStateProvider(applicationContext,
@@ -868,17 +1099,71 @@ class MainActivity : ComponentActivity() {
                 }
             }
             runOnUiThread {
+                runtimeInitializationInFlight = false
                 if (destroyed || isFinishing) return@runOnUiThread
-                result.onSuccess {
-                    initializeUi(savedInstanceState)
-                    if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)) startUi()
-                    if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) resumeUi()
-                }.onFailure { error ->
-                    Log.e(TAG, "UI initialization failed", error)
-                    loading.text = "BYD Collector\n${dashboardErrorDetail(error)}\nНатисніть, щоб повторити / Tap to retry"
-                    loading.setOnClickListener { loading.setOnClickListener(null); initializeRuntimeUi(savedInstanceState) }
-                }
+                result.onFailure(::failRuntimeUiInitialization)
+                if (result.isFailure || !runtimeCompatibleForUi || !runtimeRecoveryForegroundEligible()) return@runOnUiThread
+                runCatching { initializeUi(runtimeSavedInstanceState) }
+                    .onSuccess {
+                        runtimeSavedInstanceState = null
+                        runtimeRecoveryUiPhase = null
+                        dispatchRuntimeUiLifecycle()
+                    }
+                    .onFailure(::failRuntimeUiInitialization)
             }
+        }
+    }
+
+    private fun failRuntimeUiInitialization(error: Throwable) {
+        Log.e(TAG, "UI initialization failed after runtime compatibility check", error)
+        recordRuntimeRecoveryDiagnostic("ui_initialization_failed", error)
+        runtimeCompatibleForUi = false
+        runtimeForegroundRecovery.failCurrentRecovery()
+    }
+
+    private fun dispatchRuntimeUiLifecycle() {
+        if (!runtimeCompatibleForUi || !runtimeRecoveryForegroundEligible() || !uiInitialized) return
+        if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)) startUi()
+        if (lifecycle.currentState == androidx.lifecycle.Lifecycle.State.RESUMED) resumeUi()
+    }
+
+    private fun retryRuntimeRecovery() {
+        if (!BuildConfig.RUNTIME_CLIENT || destroyed || isFinishing) return
+        updateRuntimeRecoveryEligibility()
+        if (runtimeRecoveryForegroundEligible()) runtimeForegroundRecovery.retry()
+    }
+
+    private fun closeRuntimeRecovery() {
+        runtimeForegroundRecovery.setEligible(false)
+        finishAndRemoveTask()
+    }
+
+    private fun launchOwnerRecoveryLauncher() {
+        if (!runtimeRecoveryForegroundEligible()) return
+        try {
+            startActivity(Intent(Intent.ACTION_MAIN)
+                .addCategory(Intent.CATEGORY_LAUNCHER)
+                .setClassName(RuntimeEndpoint.OWNER_PACKAGE, "com.bydcollector.collector.MainActivity")
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
+            finishAndRemoveTask()
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Could not open the owner recovery launcher", error)
+            recordRuntimeRecoveryDiagnostic("owner_launcher_failed", error)
+            runtimeForegroundRecovery.failCurrentRecovery()
+        }
+    }
+
+    private fun recordRuntimeRecoveryDiagnostic(event: String, error: Throwable) {
+        val app = applicationContext as BydCollectorApplication
+        val detail = error.diagnosticDetail("phase=$event").take(8_192)
+        dispatchOperationalEvent(diagnosticsExecutor) {
+            app.operationalEventJournal.append(
+                timestamp = java.time.Instant.now().toString(),
+                elapsedMs = SystemClock.elapsedRealtime(),
+                category = "runtime_recovery",
+                message = event,
+                detail = detail
+            )
         }
     }
 
@@ -937,60 +1222,83 @@ class MainActivity : ComponentActivity() {
             dashboardUiStateStore.seed(stateProvider.loadInitial())
         }
         setContent {
-            val renderedOfferResultId = updateOfferResultId
-            val chromeSnapshot by dashboardUiStateStore.chromeState.collectAsStateWithLifecycle()
-            // A different flow must start with its own cached value, not the previous tab's frame.
-            val tabSnapshot = key(activeTab) {
-                val snapshot by dashboardUiStateStore.tabState(activeTab).collectAsStateWithLifecycle()
-                snapshot
+            Box(Modifier.fillMaxSize()) {
+                val renderedOfferResultId = updateOfferResultId
+                val chromeSnapshot by dashboardUiStateStore.chromeState.collectAsStateWithLifecycle()
+                // A different flow must start with its own cached value, not the previous tab's frame.
+                val tabSnapshot = key(activeTab) {
+                    val snapshot by dashboardUiStateStore.tabState(activeTab).collectAsStateWithLifecycle()
+                    snapshot
+                }
+                val renderedChrome = chromeSnapshot?.state
+                val renderedTab = (tabSnapshot?.state ?: renderedChrome)?.let { state ->
+                    if (activeTab == AppTab.STORAGE && tabSnapshot?.lastError != null) state.copy(
+                        archiveStorageScanPending = false,
+                        archiveStorageScanError = tabSnapshot.lastError
+                    ) else state
+                }
+                // Cached content stays real during refresh; only an empty pending archive scan is a placeholder.
+                val tabContentReady = renderedTab != null &&
+                    (activeTab != AppTab.STORAGE || !renderedTab.archiveStorageScanPending ||
+                        renderedTab.archiveStorageSnapshot.entries.isNotEmpty())
+                CompositionLocalProvider(
+                    LocalRuntimeDialogRecovery provides RuntimeDialogRecoveryHost(
+                        phase = runtimeRecoveryUiPhase.takeIf { BuildConfig.RUNTIME_CLIENT },
+                        language = uiLanguage,
+                        darkTheme = darkTheme,
+                        onRetry = ::retryRuntimeRecovery,
+                        onClose = ::closeRuntimeRecovery,
+                        onDialogViewChanged = runtimeDialogViewReporter
+                    )
+                ) {
+                    BydCollectorApp(
+                    state = renderedTab,
+                    chromeState = renderedChrome,
+                    activeTab = activeTab,
+                    navigationSession = navigationSession,
+                    tabContentReady = tabContentReady,
+                    language = uiLanguage,
+                    darkTheme = darkTheme,
+                    mqttDraft = mqttDraft,
+                    influxDraft = influxDraft,
+                    tripsUiState = tripsUiState,
+                    tripsUiActions = tripsUiActions,
+                    telegramUiState = telegramUiState,
+                    telegramActions = telegramActions,
+                    appVersionName = BuildConfig.VERSION_NAME,
+                    updateAutoCheckEnabled = settings.isUpdateAutoCheckEnabled(),
+                    updateHintEnabled = updateHintEnabled,
+                    updateHintAppearance = updateHintAppearance,
+                    updateUiState = updateUiState,
+                    releaseNotesHistory = updateReleaseNotes,
+                    onUpdateOfferPresented = {
+                        // A frame drawn behind native permission UI is not an offer
+                        // shown to the user. Focus is observed in the draw callback.
+                        if (mainWindowHasFocus && foreground) {
+                            renderedOfferResultId?.let(updateRuntime::onOfferPresented)
+                        }
+                    },
+                    databaseMaintenanceUiState = currentMaintenanceUiState(renderedChrome),
+                    diagnosticsBusy = diagnosticsBusy,
+                    actionUiState = actionUiState,
+                    mqttCleanupUiState = mqttCleanupUiState,
+                    actions = uiActions,
+                    backgroundSetupPromptVisible = backgroundSetupPromptVisible,
+                    onOpenBackgroundSettingsFromPrompt = ::onOpenBackgroundSettingsFromPrompt,
+                    onDismissBackgroundSetupPrompt = ::onDismissBackgroundSetupPrompt
+                    )
+                }
+                runtimeRecoveryUiPhase?.takeIf { BuildConfig.RUNTIME_CLIENT }?.let { phase ->
+                    RuntimeRecoveryPanel(
+                        language = uiLanguage,
+                        phase = phase,
+                        darkTheme = darkTheme,
+                        onRetry = ::retryRuntimeRecovery,
+                        onClose = ::closeRuntimeRecovery,
+                        modifier = Modifier.align(Alignment.Center)
+                    )
+                }
             }
-            val renderedChrome = chromeSnapshot?.state
-            val renderedTab = (tabSnapshot?.state ?: renderedChrome)?.let { state ->
-                if (activeTab == AppTab.STORAGE && tabSnapshot?.lastError != null) state.copy(
-                    archiveStorageScanPending = false,
-                    archiveStorageScanError = tabSnapshot.lastError
-                ) else state
-            }
-            // Cached content stays real during refresh; only an empty pending archive scan is a placeholder.
-            val tabContentReady = renderedTab != null &&
-                (activeTab != AppTab.STORAGE || !renderedTab.archiveStorageScanPending ||
-                    renderedTab.archiveStorageSnapshot.entries.isNotEmpty())
-            BydCollectorApp(
-                state = renderedTab,
-                chromeState = renderedChrome,
-                activeTab = activeTab,
-                navigationSession = navigationSession,
-                tabContentReady = tabContentReady,
-                language = uiLanguage,
-                darkTheme = darkTheme,
-                mqttDraft = mqttDraft,
-                influxDraft = influxDraft,
-                tripsUiState = tripsUiState,
-                tripsUiActions = tripsUiActions,
-                telegramUiState = telegramUiState,
-                telegramActions = telegramActions,
-                appVersionName = BuildConfig.VERSION_NAME,
-                updateAutoCheckEnabled = settings.isUpdateAutoCheckEnabled(),
-                updateHintEnabled = updateHintEnabled,
-                updateHintAppearance = updateHintAppearance,
-                updateUiState = updateUiState,
-                releaseNotesHistory = updateReleaseNotes,
-                onUpdateOfferPresented = {
-                    // A frame drawn behind native permission UI is not an offer
-                    // shown to the user. Focus is observed in the draw callback.
-                    if (mainWindowHasFocus && foreground) {
-                        renderedOfferResultId?.let(updateRuntime::onOfferPresented)
-                    }
-                },
-                databaseMaintenanceUiState = currentMaintenanceUiState(renderedChrome),
-                diagnosticsBusy = diagnosticsBusy,
-                actionUiState = actionUiState,
-                mqttCleanupUiState = mqttCleanupUiState,
-                actions = uiActions,
-                backgroundSetupPromptVisible = backgroundSetupPromptVisible,
-                onOpenBackgroundSettingsFromPrompt = ::onOpenBackgroundSettingsFromPrompt,
-                onDismissBackgroundSetupPrompt = ::onDismissBackgroundSetupPrompt
-            )
         }
         uiInitialized = true
         loadCredentialsAfterFirstFrame()
@@ -1022,11 +1330,19 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        if (BuildConfig.RUNTIME_CLIENT) updateRuntimeRecoveryEligibility()
         if (uiInitialized) startUi()
     }
 
     private fun startUi() {
-        if (BuildConfig.RUNTIME_CLIENT) contentResolver.registerContentObserver(RuntimeEndpoint.uri, false, runtimeObserver)
+        if (!uiInitialized || (BuildConfig.RUNTIME_CLIENT &&
+                (!runtimeCompatibleForUi || !runtimeRecoveryForegroundEligible()))) return
+        if (uiVisibleDelivered) return
+        uiVisibleDelivered = true
+        if (BuildConfig.RUNTIME_CLIENT) {
+            contentResolver.registerContentObserver(RuntimeEndpoint.uri, false, runtimeObserver)
+            runtimeObserverRegistered = true
+        }
         updateRuntime.onUiVisible()
         if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.controlAsync("attach")
         else if (!settings.isUserShutdownRequested()) CollectorServiceController.start(this)
@@ -1034,10 +1350,20 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        if (uiInitialized) resumeUi()
+        if (BuildConfig.RUNTIME_CLIENT) updateRuntimeRecoveryEligibility()
+        else if (uiInitialized) resumeUi()
+    }
+
+    override fun onPostResume() {
+        super.onPostResume()
+        if (BuildConfig.RUNTIME_CLIENT) updateRuntimeRecoveryEligibility()
     }
 
     private fun resumeUi() {
+        if (!uiInitialized || (BuildConfig.RUNTIME_CLIENT &&
+                (!runtimeCompatibleForUi || !runtimeRecoveryForegroundEligible()))) return
+        if (uiResumedDelivered) return
+        uiResumedDelivered = true
         foreground = true
         updateRuntime.onUiResumed()
         consumeUpdateHintOpen()
@@ -1056,7 +1382,8 @@ class MainActivity : ComponentActivity() {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         mainWindowHasFocus = hasFocus
-        if (hasFocus && uiInitialized) {
+        if (BuildConfig.RUNTIME_CLIENT) updateRuntimeRecoveryEligibility()
+        if (hasFocus && uiInitialized && (!BuildConfig.RUNTIME_CLIENT || runtimeCompatibleForUi)) {
             maybeContinueStartupAccessFlow()
             syncUpdateCheckUi()
         }
@@ -1205,6 +1532,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         foreground = false
+        uiResumedDelivered = false
+        if (BuildConfig.RUNTIME_CLIENT) runtimeForegroundRecovery.endForeground()
         updateKpiVisibility()
         mainWindowHasFocus = false
         handler.removeCallbacks(refreshTask)
@@ -1213,16 +1542,24 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
-        if (BuildConfig.RUNTIME_CLIENT && uiInitialized) contentResolver.unregisterContentObserver(runtimeObserver)
+        if (BuildConfig.RUNTIME_CLIENT && runtimeObserverRegistered) {
+            contentResolver.unregisterContentObserver(runtimeObserver)
+            runtimeObserverRegistered = false
+        }
         if (uiInitialized && !isChangingConfigurations && !settings.isUserShutdownRequested()) {
             updateRuntime.onUiHidden()
         }
+        uiVisibleDelivered = false
         super.onStop()
     }
 
     override fun onDestroy() {
         destroyed = true
-        if (BuildConfig.RUNTIME_CLIENT) contentResolver.unregisterContentObserver(runtimeObserver)
+        if (BuildConfig.RUNTIME_CLIENT) runtimeForegroundRecovery.setEligible(false)
+        if (BuildConfig.RUNTIME_CLIENT && runtimeObserverRegistered) {
+            contentResolver.unregisterContentObserver(runtimeObserver)
+            runtimeObserverRegistered = false
+        }
         if (BuildConfig.RUNTIME_CLIENT) runCatching { RuntimeClient.visibility(ui = false, kpi = false) }
         else com.bydcollector.collector.service.KpiUiVisibility.update(kpiVisibilityOwner, false)
         if (uiInitialized) {
@@ -1744,6 +2081,7 @@ class MainActivity : ComponentActivity() {
 
     private fun refresh(force: Boolean = true) {
         if (destroyed || !foreground) return
+        if (BuildConfig.RUNTIME_CLIENT && !runtimeCompatibleForUi) return
         val nowMs = SystemClock.elapsedRealtime()
         val tab = activeTab
         val profile = dashboardProfile(tab)
@@ -1774,12 +2112,15 @@ class MainActivity : ComponentActivity() {
         val chromeGeneration = if (chromeDue || BuildConfig.RUNTIME_CLIENT) dashboardUiStateStore.beginChromeRefresh() else null
         val kpiLanguage = uiLanguage.vehicleKpiLanguage()
         dashboardExecutor.execute {
-            val runtimeJobs = if (BuildConfig.RUNTIME_CLIENT && nowMs - lastRuntimeMetadataAt >= 1_000L) runCatching {
-                RuntimeClient.refresh()
-                RuntimePreferences.refresh(this@MainActivity)
-                RuntimeClient.refreshUpdates()
+            val runtimeJobs = if ((BuildConfig.RUNTIME_CLIENT || updateDownloadJobId != null) &&
+                nowMs - lastRuntimeMetadataAt >= 1_000L) runCatching {
+                if (BuildConfig.RUNTIME_CLIENT) {
+                    RuntimeClient.refresh()
+                    RuntimePreferences.refresh(this@MainActivity)
+                    RuntimeClient.refreshUpdates()
+                }
                 lastRuntimeMetadataAt = nowMs
-                RuntimeReads.read<String>(this@MainActivity, "jobs")
+                RuntimeJobsService.snapshot(this@MainActivity)
             } else null
             val tabResult = if (tabGeneration != null && profile != null) {
                 runCatching {
@@ -2204,7 +2545,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun runUpdateCheck(force: Boolean) {
-        if (destroyed || !foreground || updateUiState is UpdateUiState.Downloading) return
+        if (destroyed || !foreground || updateUiState is UpdateUiState.Downloading ||
+            updateUiState is UpdateUiState.Cancelling || updateUiState is UpdateUiState.Cancelled ||
+            updateUiState is UpdateUiState.CancelError) return
         val accepted = updateRuntime.request(manual = force)
         if (accepted) {
             updateUiGeneration += 1L
@@ -2218,6 +2561,10 @@ class MainActivity : ComponentActivity() {
         if (snapshot.revision == updatePresentationRevision) return
         updatePresentationRevision = snapshot.revision
         updateOfferResultId = snapshot.availableResultId
+        // The native job owns its modal after an offer has become a download.
+        if (updateDownloadJobId != null && (updateUiState is UpdateUiState.Downloading ||
+                updateUiState is UpdateUiState.Cancelling || updateUiState is UpdateUiState.Cancelled ||
+                updateUiState is UpdateUiState.CancelError)) return
         updateUiState = snapshot.uiState
         (updateUiState as? UpdateUiState.Available)?.let { releaseNotesHistory.request(it.info) }
         syncReleaseNotesUi()
@@ -2228,6 +2575,9 @@ class MainActivity : ComponentActivity() {
         val info = when (val state = updateUiState) {
             is UpdateUiState.Available -> state.info
             is UpdateUiState.Downloading -> state.info
+            is UpdateUiState.Cancelling -> state.info
+            is UpdateUiState.Cancelled -> state.info
+            is UpdateUiState.CancelError -> state.info
             else -> null
         }
         updateReleaseNotes = info?.let(releaseNotesHistory::snapshot)
@@ -2237,88 +2587,23 @@ class MainActivity : ComponentActivity() {
         (applicationContext as BydCollectorApplication).recordUpdateEvent(message, detail)
     }
 
-    private fun startUpdateDownload(info: UpdateInfo) {
-        if (BuildConfig.RUNTIME_CLIENT) {
-            submitRuntimeJob("updateDownload", JSONObject().put("version", info.version).put("url", info.downloadUrl)
-                .put("notes", info.releaseNotes).put("contentType", info.downloadContentType))?.let { id ->
-                updateDownloadJobId = id
-                updateUiState = UpdateUiState.Downloading(info, 0)
-            }
-            return
-        }
+    private fun startUpdateDownload(info: UpdateInfo): Boolean {
         updateRuntime.onInstallStarted()
-        updateChecks.clearPresentation()
+        if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("updateClear") else updateChecks.clearPresentation()
         updatePresentationRevision = updateChecks.snapshot().revision
-        val uiGeneration = ++updateUiGeneration
-        updateUiState = UpdateUiState.Downloading(info, 0)
-        runCatching {
-            updateExecutor.execute {
-                val result = runCatching {
-                    val downloadId = updateDownloader.enqueue(info)
-                    var progress = 0
-                    //polls downloadmanager because install intent should be offered only after the apk is fully written
-                    while (progress < 100 && !destroyed) {
-                        Thread.sleep(350L)
-                        progress = updateDownloader.progress(downloadId)
-                        if (progress < 0) error("Update download failed")
-                        runOnUiThread {
-                            if (!destroyed && uiGeneration == updateUiGeneration) {
-                                updateUiState = UpdateUiState.Downloading(info, progress)
-                            }
-                        }
-                    }
-                    val verifiedFile = updateDownloader.copyDownloadedApkForInstall(info)
-                    val validation = updateApkVerifier.validate(verifiedFile)
-                    if (!validation.ok) error(validation.message)
-                    VerifiedUpdateDownload(
-                        info = info,
-                        file = verifiedFile,
-                        sha256 = validation.sha256 ?: error("APK digest unavailable")
-                    )
-                }
-                runOnUiThread {
-                    if (destroyed) {
-                        updateRuntime.onInstallFinished()
-                        return@runOnUiThread
-                    }
-                    result
-                        .onSuccess { verified ->
-                            val finalValidation = updateApkVerifier.validate(verified.file)
-                            if (!finalValidation.ok || finalValidation.sha256 != verified.sha256) {
-                                updateRuntime.onInstallFinished()
-                                if (uiGeneration == updateUiGeneration) {
-                                    updateUiState = UpdateUiState.Error(
-                                        if (!finalValidation.ok) finalValidation.message else "APK digest changed before install"
-                                    )
-                                }
-                                return@onSuccess
-                            }
-                            runCatching { updateDownloader.install(verified.info, verified.file) }
-                                .onSuccess {
-                                    updateRuntime.onInstallerLaunched()
-                                    if (uiGeneration == updateUiGeneration) updateUiState = UpdateUiState.Hidden
-                                }
-                                .onFailure { error ->
-                                    updateRuntime.onInstallFinished()
-                                    if (uiGeneration == updateUiGeneration) {
-                                        updateUiState = UpdateUiState.Error(error.message ?: error::class.java.simpleName)
-                                    }
-                                }
-                        }
-                        .onFailure { error ->
-                            updateRuntime.onInstallFinished()
-                            if (uiGeneration == updateUiGeneration) {
-                                updateUiState = UpdateUiState.Error(error.message ?: error::class.java.simpleName)
-                            }
-                        }
-                }
-            }
-        }.onFailure { error ->
+        val id = submitRuntimeJob("updateDownload", JSONObject().put("version", info.version).put("url", info.downloadUrl)
+            .put("notes", info.releaseNotes).put("contentType", info.downloadContentType))
+        if (id == null) {
             updateRuntime.onInstallFinished()
-            if (!destroyed && uiGeneration == updateUiGeneration) {
-                updateUiState = UpdateUiState.Error(error.message ?: error::class.java.simpleName)
-            }
+            updateUiState = UpdateUiState.Error("Could not start the update download")
+            syncReleaseNotesUi()
+            return false
         }
+        updateDownloadJobId = id
+        dismissedUpdateJobs.remove(id)
+        updateUiState = UpdateUiState.Downloading(info, 0)
+        syncReleaseNotesUi()
+        return true
     }
 
     private fun loadCredentialsAfterFirstFrame() {
@@ -3032,12 +3317,6 @@ private fun telegramTestStatus(value: String): TelegramTestStatus = when (value)
     "failed" -> TelegramTestStatus.FAILED
     else -> TelegramTestStatus.NOT_TESTED
 }
-
-private data class VerifiedUpdateDownload(
-    val info: UpdateInfo,
-    val file: File,
-    val sha256: String
-)
 
 private data class LoadedCredentials(
     val mqttUsername: String,
