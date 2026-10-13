@@ -274,7 +274,7 @@ class AdbLocalClient(
                     if (authResult.category != "adb_authorization_connected") {
                         throw IllegalStateException("${authResult.category}: ${authResult.message}")
                     }
-                    socket.soTimeout = 0
+                    socket.soTimeout = DEFAULT_TIMEOUT_MS
                     val localId = 1
                     writePacket(socketOutput, COMMAND_OPEN, localId, 0, "shell:$command\u0000".toByteArray())
                     var remoteId = 0
@@ -292,6 +292,8 @@ class AdbLocalClient(
                             COMMAND_CLSE -> throw IllegalStateException("ADB shell stream closed during open")
                         }
                     }
+                    // Only an established stream may wait indefinitely; opening still holds AUTH_LOCK.
+                    socket.soTimeout = 0
                     return AdbShellStream(socket, input, socketOutput, output, localId, remoteId)
                 } catch (error: AdbOperationCancelledException) {
                     socket?.let { runCatching { it.close() }; cancellation.unregister(it) }
