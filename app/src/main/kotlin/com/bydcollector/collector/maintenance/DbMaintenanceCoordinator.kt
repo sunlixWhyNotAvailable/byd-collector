@@ -116,7 +116,7 @@ class DbMaintenanceCoordinator(
                     diagnostics.endPhase()
                     beforeFileMaintenance()
                     archive(operation)
-                } ?: throw TerminalArchiveFailure("Database writers did not quiesce; refusing file maintenance")
+                } ?: error("Database writers did not quiesce; refusing file maintenance")
             } catch (error: Throwable) {
                 if (!gateEntered) diagnostics.failPhase(error)
                 throw error
@@ -323,6 +323,10 @@ class DbMaintenanceCoordinator(
         application.maintenanceDiagnostics.runPhase("old_database_close") {
             application.closeTelemetryStoreForMaintenance()
         }
+        val pendingEnergyCount = runCatching { DeferredEnergyArchive.count(databaseFile) }.getOrElse {
+            warnings += "${DeferredEnergyArchive.UNVERIFIED_WARNING}: ${it::class.java.simpleName}"
+            -1L
+        }
         val sourceNames = sourceNames(databaseFile)
         check(databaseFile.name in sourceNames) { "Main database source is not preservable after close" }
 
@@ -338,7 +342,8 @@ class DbMaintenanceCoordinator(
             manual = true,
             sourceNames = sourceNames,
             sourceDatabaseName = databaseFile.name,
-            targetDatabaseName = databaseFile.name
+            targetDatabaseName = databaseFile.name,
+            pendingEnergyCount = pendingEnergyCount
         )
         if (!runCatching {
                 application.maintenanceDiagnostics.runPhase("persist_cutover_journal") {
@@ -396,11 +401,16 @@ class DbMaintenanceCoordinator(
                 )) { "Cannot persist database verification journal" }
                 check(newStore.verifyWritableDatabase()) { "New database quick_check failed" }
             }
+            if (pendingEnergyCount > 0) {
+                application.maintenanceDiagnostics.runPhase("deferred_energy_transfer") {
+                    newStore.restoreDeferredEnergy(File(archive.archiveDirectory, databaseFile.name), pendingEnergyCount)
+                }
+            }
         }.exceptionOrNull()
         if (createFailure != null) rollbackMain(databaseFile, archive, createFailure, manual = true)
 
         if (!runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)) {
-            throw RuntimeException("Cannot clear database cutover journal after successful archive")
+            throw TerminalArchiveFailure("Cannot clear database cutover journal after successful archive")
         }
         return DbMaintenanceResult(
             ok = true,

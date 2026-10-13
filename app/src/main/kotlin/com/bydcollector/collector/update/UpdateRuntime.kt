@@ -27,6 +27,7 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
     private var awaitingInstallerReturn = false
     private var lastProcessedCompletionToken = 0L
     private val presentation = UpdateResultPresentation()
+    private var lastHintBlock: Pair<Long, String>? = null
     private val wakePolicy = UpdateWakePolicy()
     private val hintCreationRetry: UpdateHintCreationRetry by lazy {
         UpdateHintCreationRetry(
@@ -267,6 +268,7 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
     private fun presentPendingHint() {
         val snapshot = app.updateChecks.snapshot()
         val resultId = snapshot.availableResultId.takeIf { snapshot.uiState is UpdateUiState.Available }
+        if (resultId == null) lastHintBlock = null else canCreateHint(resultId)
         hintCreationRetry.offer(resultId)
         if (resultId == null) {
             if (app.updateHints.activeResultId != null) cancelHintPresentation("stale_result")
@@ -274,9 +276,6 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
         }
         if (mainDisplayForUpdateHintIfReady(app) == null) {
             cancelHintPresentation("display_not_ready")
-            if (snapshot.uiState is UpdateUiState.Available) {
-                app.recordUpdateEvent("hint_unavailable", "reason=display_not_ready phase=show")
-            }
             return
         }
         if (!settings.isUpdateHintEnabled() || !canDrawUpdateHints()) {
@@ -337,6 +336,7 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
         app.updateChecks.reset()
         app.releaseNotesHistory.reset()
         presentation.reset()
+        lastHintBlock = null
         app.updateHints.shutdown()
         wakeReceiver?.let { receiver ->
             runCatching { app.unregisterReceiver(receiver) }
@@ -408,19 +408,34 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
 
     private fun canCreateHint(resultId: Long): Boolean {
         val snapshot = app.updateChecks.snapshot()
-        return hintEnvironmentReady(resultId) && presentation.canPresentHint(
-            snapshot,
-            ownUiVisible = ownUiVisible,
-            hintEnabled = true
-        )
+        val reason = hintEnvironmentBlockReason(resultId) ?: if (presentation.canPresentHint(
+                snapshot, ownUiVisible = ownUiVisible, hintEnabled = true
+            )) null else "already_consumed"
+        val blocked = reason?.let { resultId to it }
+        if (blocked != lastHintBlock) {
+            lastHintBlock = blocked
+            if (reason != null) app.recordUpdateEvent("hint_unavailable",
+                "result_id=$resultId reason=$reason phase=eligibility")
+        }
+        return reason == null
     }
 
-    private fun hintEnvironmentReady(resultId: Long): Boolean {
+    private fun hintEnvironmentReady(resultId: Long): Boolean = hintEnvironmentBlockReason(resultId) == null
+
+    private fun hintEnvironmentBlockReason(resultId: Long): String? {
         val snapshot = app.updateChecks.snapshot()
-        return snapshot.availableResultId == resultId && snapshot.uiState is UpdateUiState.Available &&
-            !ownUiVisible && started && !installing && !wakePolicy.sleeping &&
-            !settings.isUserShutdownRequested() && settings.isUpdateHintEnabled() &&
-            canDrawUpdateHints() && mainDisplayForUpdateHintIfReady(app) != null
+        return when {
+            snapshot.availableResultId != resultId || snapshot.uiState !is UpdateUiState.Available -> "result_unavailable"
+            ownUiVisible -> "own_ui_visible"
+            !started -> "runtime_not_started"
+            installing -> "installing"
+            wakePolicy.sleeping -> "sleeping"
+            settings.isUserShutdownRequested() -> "shutdown"
+            !settings.isUpdateHintEnabled() -> "disabled"
+            !canDrawUpdateHints() -> "permission_missing"
+            mainDisplayForUpdateHintIfReady(app) == null -> "display_not_ready"
+            else -> null
+        }
     }
 
     private fun canDrawUpdateHints(): Boolean = runCatching { Settings.canDrawOverlays(app) }.getOrDefault(false)

@@ -358,7 +358,7 @@ class RuntimeJobsService : Service() {
         }
 
         fun <T> withMqttConfigurationEdit(context: Context, keys: Set<String>, action: () -> T): T {
-            if (keys.none(mqttConfigurationKeys::contains)) return action()
+            if (!isMqttConfigurationEdit(keys)) return action()
             return synchronized(LOCK) {
                 val cleanupActive = load(context).any {
                     it.optString("kind") == "mqttCleanup" && it.optString("status") in setOf("queued", "running")
@@ -367,6 +367,8 @@ class RuntimeJobsService : Service() {
                 action()
             }
         }
+
+        fun isMqttConfigurationEdit(keys: Set<String>): Boolean = keys.any(mqttConfigurationKeys::contains)
 
         private fun parseCleanupSelection(args: JSONObject): MqttCleanupSelection {
             require(args.length() == 2 && args.has("deviceId") && args.has("fingerprint")) {

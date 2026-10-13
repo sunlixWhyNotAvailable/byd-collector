@@ -58,6 +58,7 @@ class TripRuntimeCoordinator(
     private var gpsStarted = false
     private val gpsStartRetry = GpsStartRetryGate()
     private var lastLocation: GpsLocationSample? = null
+    private var trustAnchor: GpsLocationSample? = null
     private var lastLocationTripId: String? = null
     private var latestBatteryPowerKw: Double? = null
     private var latestBatteryPowerAtMs = Long.MIN_VALUE
@@ -321,7 +322,7 @@ class TripRuntimeCoordinator(
         if (gpsStarted || !locationCaptureEnabled()) return
         val nowMs = elapsedRealtimeMs()
         if (!gpsStartRetry.canAttempt(nowMs)) return
-        val result = locationSource.start(lastLocation)
+        val result = locationSource.start(trustAnchor?.takeIf { it.canAnchorRecovery(bootId, nowMs) })
         gpsStarted = result.started
         if (gpsStarted) {
             val recovered = gpsStartRetry.hasFailures
@@ -345,6 +346,7 @@ class TripRuntimeCoordinator(
     private fun handleLocation(sample: GpsLocationSample, isFinal: Boolean) {
         if (!running.get()) return
         lastLocation = sample
+        trustAnchor = sample
         persistLocation(LocationNormalizer.observations(sample, sample.receiveWallTimeMs))
         val current = session ?: return
         lastLocationTripId = current.tripId
@@ -402,6 +404,7 @@ class TripRuntimeCoordinator(
             tripStore.queryRoutePoints(current.tripId).lastOrNull { it.kind == RoutePoint.KIND_VALID }?.toGpsSample()
         }
         lastLocationTripId = session?.tripId?.takeIf { lastLocation != null }
+        trustAnchor = lastLocation
         // An open trip is durable evidence that ON still needs a matching OFF. Without
         // one (including when history is disabled), OFF is the restart baseline rather
         // than a new boundary. Establish it only after retryable store reads succeed.

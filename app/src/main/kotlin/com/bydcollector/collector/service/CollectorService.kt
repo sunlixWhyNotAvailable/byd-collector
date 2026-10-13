@@ -780,7 +780,7 @@ class CollectorService : Service() {
             ACTION_CANCEL_DATABASE_MAINTENANCE -> cancelDatabaseMaintenance()
             ACTION_RECONCILE_ARCHIVE_STORAGE -> {
                 ensureForegroundForChannel("Archive storage")
-                enqueueArchiveStorageMaintenance(null)
+                enqueueArchiveStorageMaintenance(null, manualRetry = intent?.getBooleanExtra(EXTRA_ARCHIVE_MANUAL_RETRY, false) == true)
             }
             ACTION_DELETE_ARCHIVES -> {
                 ensureForegroundForChannel("Archive storage")
@@ -1313,13 +1313,14 @@ class CollectorService : Service() {
 
     private fun drainDeferredEnergy(): Boolean {
         if (!running.get()) return false
-        return synchronized(energyCoordinator) {
+        var waitingForRetry = false
+        val hasMore = synchronized(energyCoordinator) {
             val pending = (applicationContext as BydCollectorApplication).withDatabaseRead {
                 store.oldestDeferredEnergy(System.currentTimeMillis())
             }
             if (pending == null) {
                 val hasPending = (applicationContext as BydCollectorApplication).withDatabaseRead { store.hasDeferredEnergy() }
-                if (hasPending) Thread.sleep(1_000L)
+                waitingForRetry = hasPending
                 return@synchronized hasPending
             }
             try {
@@ -1336,6 +1337,9 @@ class CollectorService : Service() {
             }
             true
         }
+        // Waiting for a durable head must not block live collection enqueuing behind it.
+        if (waitingForRetry) Thread.sleep(1_000L)
+        return hasMore
     }
 
     private fun createTripRuntimeCoordinator(): TripRuntimeCoordinator {
@@ -3497,12 +3501,6 @@ class CollectorService : Service() {
             maintenanceCoordinator.reportDrainProgress(operation, if (pending.hasMore) null else 0,
                 "нормалізація", "normalization", pending.processedCount > 0)
         } while (pending.hasMore)
-        while (store.hasDeferredEnergy()) {
-            maintenanceCoordinator.checkDrainCancelled(operation)
-            maintenanceCoordinator.reportDrainProgress(operation, null, "енергетичні записи", "energy receipts", false)
-            drainDeferredEnergy()
-        }
-
         if (!tripRuntime.pauseAndAwait("database_maintenance")) {
             maintenanceRuntimeRestoreAllowed.set(false)
             error("Trip runtime did not pause for database maintenance")
@@ -3704,6 +3702,11 @@ class CollectorService : Service() {
 
     private fun restoreRuntimeAfterMaintenance(operation: DbMaintenanceOperation, snapshot: RuntimeSnapshot) {
         requireRuntimeOwner()
+        settings.storageCutoverJournal()?.let { journal ->
+            // A retry must not consume transferred receipts before restart recovery settles the journal.
+            if ((journal.family == DirectDebugDatabaseHelper.SCHEMA_FAMILY) ==
+                (operation == DbMaintenanceOperation.DEBUG_ARCHIVE)) return
+        }
         restoringRuntime.set(true)
         try {
             if (settings.isUserShutdownRequested()) {
@@ -3756,8 +3759,7 @@ class CollectorService : Service() {
         influxCoordinator = createInfluxCoordinator()
         telegramCoordinator = createTelegramCoordinator()
         poller = createTelemetryPoller()
-        if (startupCollectionGate.open && !deferredEnergyWorker.isRunning()) check(deferredEnergyWorker.start())
-        startKpiWorker()
+        // Workers resume only after the cutover journal has been safely settled.
         lastDatabaseFootprintAtMs = Long.MIN_VALUE
         requestDashboardMetricsRefresh()
         scheduleDatabaseFootprintRefresh(force = true)
@@ -4720,6 +4722,7 @@ class CollectorService : Service() {
         val submitted = expectedGeneration ?: influxWorkGeneration.get()
         val terminal = java.util.concurrent.atomic.AtomicReference<String?>(null)
         if (!isStop && settings.isInfluxEnabled() && !maintenanceBlocksRuntimeStart()) influxConnection.reserve()
+        val localStorageFailure = AtomicBoolean(false)
         influxWorkInFlight.incrementAndGet()
         return executeChannel(
             channelName = "Influx",
@@ -4734,7 +4737,9 @@ class CollectorService : Service() {
                     !maintenanceBlocksRuntimeStart() &&
                     (if (isStop) !settings.isInfluxEnabled() else settings.isInfluxEnabled() && !influxConnection.stopping)
             },
-            action = action,
+            action = { action().also { result ->
+                localStorageFailure.set(result.category == "influx_sqlite_busy" || result.category == "influx_export_exception")
+            } },
             onSuccess = { result, submittedGeneration ->
                 if (!isStop && !result.ok && !result.retryable) terminal.set(result.category)
                 if (submittedGeneration == influxWorkGeneration.get()) {
@@ -4766,7 +4771,7 @@ class CollectorService : Service() {
                     (isStop || (settings.isInfluxEnabled() && !influxConnection.stopping))
                 ) {
                     setInfluxRuntime(RuntimeActionStatus.ERROR)
-                    if (activateTailscaleOnFailure) maybeActivateTailscaleAfterHaFailure("influx")
+                    if (activateTailscaleOnFailure && !localStorageFailure.get()) maybeActivateTailscaleAfterHaFailure("influx")
                 }
             }
         ) { result ->
@@ -5197,11 +5202,13 @@ class CollectorService : Service() {
         maintenanceCoordinator.requestCancel()
     }
 
-    private fun enqueueArchiveStorageMaintenance(preferredArchivePath: String?) {
+    private fun enqueueArchiveStorageMaintenance(preferredArchivePath: String?, manualRetry: Boolean = false) {
+        val retryIds = if (manualRetry) settings.archiveStorageItems()
+            .filter { it.phase == ArchiveStorageItemPhase.FAILED }.map { it.archiveId } else emptyList()
         enqueueArchiveStorageWork(
             "archive_storage_rejected", ArchiveStorageJobMode.RETENTION,
             deferIfBusy = true,
-            queuedArchiveIds = listOfNotNull(preferredArchivePath?.let { File(it).name })
+            queuedArchiveIds = listOfNotNull(preferredArchivePath?.let { File(it).name }) + retryIds
         ) { operationId, publish ->
             val manager = archiveStorageManager()
             val limitBytes = settings.archiveStorageLimitGb() * 1024L * 1024L * 1024L
@@ -5210,16 +5217,16 @@ class CollectorService : Service() {
                 "Could not reconcile archive state"
             }
             val pending = checkNotNull(manager.pendingRawArchiveIds()) { "Cannot list pending archives" }
-            check(settings.queueArchiveStorageItems(operationId, pending)) { "Could not persist archive queue" }
+            val deferred = if (manualRetry) emptySet() else manager.deferredRetryArchiveIds(settings.archiveStorageItems())
+            val eligible = pending.filterNot { it in deferred }
+            check(settings.queueArchiveStorageItems(operationId, eligible)) { "Could not persist archive queue" }
             dashboardStateProvider.invalidateArchiveStorageSnapshot()
             // A failed preferred archive is attempted once, not immediately again by the scan.
-            val preferred = preferredArchivePath?.let(::File)?.takeIf { it.name in pending }
+            val preferred = preferredArchivePath?.let(::File)?.takeIf { it.name in eligible }
             preferred?.let { manager.compressRawArchiveDirectory(it, publish) }
-            manager.compressPendingRawArchives(publish, setOfNotNull(preferred?.name))
+            manager.compressPendingRawArchives(publish, deferred + setOfNotNull(preferred?.name))
             val rawArchives = checkNotNull(manager.pendingRawArchiveIds()) { "Cannot verify remaining archives" }
-            check(rawArchives.none { !archiveFileOperationProtected(it) }) {
-                "Raw database archive verification/compression remains pending; raw data retained"
-            }
+            // Unverified raw data stays visible, but cannot hold unrelated ready ZIPs above their quota.
             manager.enforceRetention(limitBytes, publish)
             if (rawArchives.isEmpty()) settings.setCutoverArchiveStoragePending(false)
         }
@@ -5457,6 +5464,9 @@ class CollectorService : Service() {
     }
 
     private fun maintenanceBlocksRuntimeStart(debugRuntime: Boolean = false): Boolean {
+        settings.storageCutoverJournal()?.let { journal ->
+            if ((journal.family == DirectDebugDatabaseHelper.SCHEMA_FAMILY) == debugRuntime) return true
+        }
         if (restoringRuntime.get() && isRuntimeOwner()) return false
         if (maintenanceActive.get()) {
             return (activeMaintenanceOperation == DbMaintenanceOperation.DEBUG_ARCHIVE) == debugRuntime
@@ -5686,6 +5696,7 @@ class CollectorService : Service() {
         val ACTION_RECONCILE_ARCHIVE_STORAGE: String = "${BuildConfig.ACTION_PREFIX}.action.RECONCILE_ARCHIVE_STORAGE"
         val ACTION_DELETE_ARCHIVES: String = "${BuildConfig.ACTION_PREFIX}.action.DELETE_ARCHIVES"
         const val EXTRA_ARCHIVE_IDS = "archiveIds"
+        private const val EXTRA_ARCHIVE_MANUAL_RETRY = "archiveManualRetry"
         private const val EXTRA_FORCE_KEEP_ALIVE_STATUS_CHECK = "forceKeepAliveStatusCheck"
         private const val CHANNEL_ID = "collector"
         private const val NOTIFICATION_ID = 1001
@@ -5921,8 +5932,9 @@ class CollectorService : Service() {
             action = ACTION_CANCEL_DATABASE_MAINTENANCE
         }
 
-        fun reconcileArchiveStorageIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
+        fun reconcileArchiveStorageIntent(context: Context, manualRetry: Boolean = false): Intent = Intent(context, CollectorService::class.java).apply {
             action = ACTION_RECONCILE_ARCHIVE_STORAGE
+            putExtra(EXTRA_ARCHIVE_MANUAL_RETRY, manualRetry)
         }
 
         fun deleteArchivesIntent(context: Context, ids: ArrayList<String>): Intent = Intent(context, CollectorService::class.java).apply {

@@ -31,6 +31,15 @@ internal object RuntimeClient {
     private val lifecycleExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { task ->
         Thread(task, "collector-ui-lifecycle")
     }
+    private val main = android.os.Handler(android.os.Looper.getMainLooper())
+
+    /** Acknowledged UI operations share one process-owned lane, including across Activity recreation. */
+    fun <T> executeOwnerAction(work: () -> T, complete: (Result<T>) -> Unit) {
+        lifecycleExecutor.execute {
+            val result = runCatching(work)
+            main.post { complete(result) }
+        }
+    }
     private val visibilityDelivery = RuntimeVisibilityDelivery(
         schedule = { task, delay -> lifecycleExecutor.schedule(task, delay, java.util.concurrent.TimeUnit.MILLISECONDS); Unit },
         deliver = { ui, kpi -> control("visibility", Bundle().apply {

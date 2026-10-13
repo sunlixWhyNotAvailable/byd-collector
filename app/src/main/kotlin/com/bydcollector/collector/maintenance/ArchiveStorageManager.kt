@@ -179,6 +179,12 @@ class ArchiveStorageManager(
             .map { it.name }
     }
 
+    fun deferredRetryArchiveIds(states: List<ArchiveStorageItemState>): Set<String> {
+        val now = clock()
+        return states.filter { it.phase == ArchiveStorageItemPhase.FAILED &&
+            now - it.updatedAtMs < 5 * 60_000L }.mapTo(mutableSetOf()) { it.archiveId }
+    }
+
     fun reconcilePersistedItems(persisted: List<ArchiveStorageItemState>): ArchiveStorageItemsReconciliation {
         if (!archiveRoot.isDirectory && !archiveRoot.mkdirs() && !archiveRoot.isDirectory) {
             return ArchiveStorageItemsReconciliation(

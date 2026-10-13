@@ -6,6 +6,10 @@ import com.bydcollector.collector.data.energy.EnergySessionCoordinator
 import com.bydcollector.collector.data.local.PollReading
 import com.bydcollector.collector.data.local.TelegramDatabaseHelper
 import com.bydcollector.collector.data.local.TelegramStore
+import com.bydcollector.collector.data.local.TelegramLegacyOutboxRow
+import com.bydcollector.collector.data.local.TelegramLegacySnapshot
+import com.bydcollector.collector.data.local.TelegramMigrationResult
+import com.bydcollector.collector.data.local.TelegramOutboxMessage
 import com.bydcollector.collector.data.normalized.NormalizedFieldCatalog
 import com.bydcollector.collector.data.normalized.NormalizedFieldDefinition
 import com.bydcollector.collector.data.normalized.NormalizedObservation
@@ -28,11 +32,54 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29])
 class TelegramMidTripUpgradeReproductionTest {
+    @Test fun pendingSurvivesClockJumpButOverflowRemainsBounded() {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "telegram-clock.db"
+        var helper = TelegramDatabaseHelper(context, name)
+        var store = TelegramStore(context, helper)
+        val created = 1_780_000_000_000L
+        val future = created + 60L * 24 * 60 * 60 * 1_000
+        try {
+            // Older persisted queue input, not a substituted network delivery outcome.
+            val oldQueue = TelegramLegacySnapshot(outbox = listOf(
+                TelegramLegacyOutboxRow(1, "untouched", "trip_summary", "first", created, created, 0, null, null, false),
+                TelegramLegacyOutboxRow(2, "attempted", "trip_summary", "second", created, created + 30_000, 1, created, null, false)
+            ))
+            assertEquals(TelegramMigrationResult.Status.COMMITTED, store.importLegacySnapshot(oldQueue, created).status)
+            store.pruneTelegramDeliveryReceipts(future)
+            store.commitTelegramEvents(listOf(TelegramOutboxMessage("new", "trip_summary", "third")), null, future)
+            assertNotNull(store.telegramMessageByDedupeKey("untouched"))
+            assertEquals(1, store.telegramMessageByDedupeKey("attempted")?.attemptCount)
+            store.close()
+            helper = TelegramDatabaseHelper(context, name)
+            store = TelegramStore(context, helper)
+            assertEquals("untouched", store.oldestDueTelegramMessage(future, null)?.dedupeKey)
+            assertEquals(1, store.telegramMessageByDedupeKey("attempted")?.attemptCount)
+
+            val inFlight = assertNotNull(store.telegramMessageByDedupeKey("untouched")).id
+            val results = store.commitTelegramEvents((1..1_000).map {
+                TelegramOutboxMessage("overflow-$it", "trip_summary", "message $it")
+            }, null, future, protectedTelegramIds = setOf(inFlight))
+            assertEquals(0, results.sumOf { it.expiredCount })
+            assertEquals(3, results.sumOf { it.overflowCount })
+            assertNotNull(store.telegramMessageByDedupeKey("untouched"), "in-flight row is protected during overflow")
+            assertNull(store.telegramMessageByDedupeKey("attempted"), "overflow still removes the oldest unprotected row")
+            helper.readableDatabase.rawQuery("SELECT COUNT(*) FROM telegram_outbox", null).use {
+                assertTrue(it.moveToFirst())
+                assertEquals(1_000, it.getInt(0))
+            }
+        } finally {
+            store.close()
+            context.deleteDatabase(name)
+        }
+    }
+
     @Test
     fun powerTripAndTelegramDriveSurviveRestartShortParkAndCloseOnlyOnPowerOff() {
         val context = RuntimeEnvironment.getApplication()

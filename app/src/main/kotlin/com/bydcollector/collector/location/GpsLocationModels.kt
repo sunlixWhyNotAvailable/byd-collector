@@ -32,6 +32,12 @@ data class GpsLocationSample(
     val receivedWallTimeMs: Long get() = receiveWallTimeMs
     val receivedElapsedRealtimeNanos: Long get() = receiveElapsedRealtimeNanos
 
+    internal fun canAnchorRecovery(currentBootId: String, nowElapsedMs: Long): Boolean =
+        bootId.isNotBlank() && bootId != "unknown" && bootId == currentBootId &&
+            elapsedRealtimeNanos > 0L && receiveElapsedRealtimeNanos >= elapsedRealtimeNanos &&
+            receiveElapsedRealtimeNanos / 1_000_000L <= nowElapsedMs &&
+            !isMock && isValidCoordinate(latitude, longitude)
+
     companion object {
         fun fromLocation(location: Location, bootId: String, segmentId: String, wallTimeMs: Long): GpsLocationSample? {
             val elapsed = location.elapsedRealtimeNanos

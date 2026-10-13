@@ -247,6 +247,7 @@ internal class StorageFormatCutoverCoordinator(
         val journal = settings.storageCutoverJournal() ?: return true
         if (journal.family !in setOf(MAIN_FAMILY, DEBUG_FAMILY)) return false
         if (journal.phase !in setOf(PHASE_ARCHIVING, PHASE_CREATING, PHASE_VERIFYING, PHASE_ROLLBACK)) return false
+        if (journal.pendingEnergyCount < -1L) return false
         if (journal.family != family) return true
         if (journal.sourceFormat == StorageFormat.ABSENT) {
             return recoverInterruptedFreshCreation(family, databaseFile, journal)
@@ -333,6 +334,20 @@ internal class StorageFormatCutoverCoordinator(
                     !quickCheckArchived(archivedDatabase))) ||
                 !quickCheck(activeDatabaseFile)
             ) return false
+            if (family == MAIN_FAMILY && journal.manual && journal.pendingEnergyCount > 0) {
+                if (runCatching {
+                        open(activeDatabaseFile, readOnly = false).use { target ->
+                            DeferredEnergyArchive.restore(archivedDatabase, target, journal.pendingEnergyCount)
+                        }
+                    }.isFailure) return false
+            }
+            if (family == MAIN_FAMILY && journal.manual && journal.pendingEnergyCount == -1L) {
+                val status = settings.dbMaintenanceStatus()
+                val warning = listOfNotNull(status.warning, DeferredEnergyArchive.UNVERIFIED_WARNING)
+                    .distinct().joinToString("; ")
+                if (!settings.setDbMaintenanceStatus(status.copy(warning = warning,
+                        archivePath = journal.archivePath), synchronous = true)) return false
+            }
             if (runCatching { settings.setCutoverArchiveStoragePending(true) }.isFailure) return false
             return runCatching { settings.clearStorageCutoverJournal() }.getOrDefault(false)
         }

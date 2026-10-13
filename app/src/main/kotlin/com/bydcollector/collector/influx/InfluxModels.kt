@@ -33,7 +33,8 @@ data class InfluxActionResult(
     val failureKind: InfluxFailureKind? = null
 ) {
     val retryable: Boolean get() = !ok && failureKind != InfluxFailureKind.AUTHENTICATION &&
-        failureKind != InfluxFailureKind.PROTOCOL && httpStatus !in setOf(401, 403) &&
+        failureKind != InfluxFailureKind.PROTOCOL && failureKind != InfluxFailureKind.DATA &&
+        httpStatus !in setOf(400, 401, 403, 422) &&
         category !in setOf("influx_disabled", "influx_endpoint_invalid", "influx_database_missing", "influx_export_exception")
 
     companion object {
@@ -92,6 +93,7 @@ interface InfluxExportStore {
     fun pendingInfluxSummary(fieldKeys: Set<String>): InfluxPendingSummary
     fun pendingInfluxRows(fieldKeys: Set<String>, limit: Int): List<InfluxPendingHistoryRow>
     fun updateInfluxCursorSuccess(fieldKey: String, historyId: Long, exportedAt: String)
+    fun skipInfluxRow(fieldKey: String, historyId: Long, reason: String, skippedAt: String)
     fun updateInfluxCursorError(fieldKey: String, error: String, errorAt: String)
     fun influxExportState(): InfluxExportStateSnapshot
     fun updateInfluxExportState(

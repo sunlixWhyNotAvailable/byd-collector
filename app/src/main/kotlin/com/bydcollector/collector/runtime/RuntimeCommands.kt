@@ -26,7 +26,7 @@ internal object RuntimeCommands {
             "archiveDatabase" -> Controller.archiveDatabase(context)
             "archiveDebugDatabase" -> Controller.archiveDebugDatabase(context)
             "cancelDatabaseMaintenance" -> Controller.cancelDatabaseMaintenance(context)
-            "reconcileArchiveStorage" -> Controller.reconcileArchiveStorage(context)
+            "reconcileArchiveStorage" -> Controller.reconcileArchiveStorage(context, args.getBoolean("manualRetry"))
             "deleteArchives" -> {
                 val ids = requireNotNull(args.getStringArrayList("ids"))
                 require(ids.size in 1..500 && ids.all { it.length in 1..512 })

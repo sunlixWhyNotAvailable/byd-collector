@@ -32,6 +32,7 @@ internal fun operationFailureMessage(strings: UiStrings, kind: String, detail: S
         "logShare" -> strings.logsShareFailed
         "archiveShare" -> strings.archiveShareFailed
         "updateDownload" -> strings.updateDownloadFailed
+        "updateDismiss" -> strings.feedback("Не вдалося зберегти закриття вікна оновлення", "Could not save the update dialog dismissal")
         "mqttCleanup" -> strings.haIdentity.mqttCleanupFailed
         "mqttTest" -> strings.feedback("MQTT: перевірка з’єднання невдала", "MQTT: connection test failed")
         "influxTest" -> strings.feedback("InfluxDB: перевірка з’єднання невдала", "InfluxDB: connection test failed")
@@ -55,7 +56,10 @@ internal fun archiveCompletionWarning(strings: UiStrings, warning: String): Stri
     val text = warning.lowercase()
     val summary = strings.feedback("Архівацію завершено з попередженнями. Подробиці — у логах.",
         "Archiving completed with warnings. See the logs for details.")
-    return if ("archive verification could not be scheduled" in text) summary + "\n" + strings.feedback(
+    return if ("pending energy transfer could not be verified" in text) summary + "\n" + strings.feedback(
+        "Перенесення відкладених енергетичних записів не підтверджено. Вихідні файли збережено в архіві.",
+        "Pending energy records could not be confirmed as transferred. The source files are preserved in the archive.")
+    else if ("archive verification could not be scheduled" in text) summary + "\n" + strings.feedback(
         "Сирий архів збережено, але його перевірку та пакування не запущено.",
         "The raw archive is preserved, but its verification and compression could not be started.")
     else summary
@@ -75,6 +79,9 @@ internal fun operationFailureDetail(strings: UiStrings, detail: String): String 
     val text = detail.lowercase()
     val httpCode = httpStatusCode.find(detail)?.groupValues?.get(1)
     return when {
+        "mqtt_cleanup_pending" in text || "retained discovery cleanup is pending" in text ->
+            strings.feedback("Для цього Device ID залишилось незавершене очищення. Виберіть попередній або інший ID без такого очищення, завершіть очищення, потім поверніться до потрібного ID.",
+                "Cleanup is pending for this Device ID. Select the previous or another ID without pending cleanup, finish cleanup, then return to the desired ID.")
         "insufficient free space" in text || "no space left" in text || "free-space reserve" in text ->
             strings.feedback("Недостатньо вільного місця. Звільніть місце та повторіть.",
                 "Not enough free space. Free up space and retry.")

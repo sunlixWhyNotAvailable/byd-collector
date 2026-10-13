@@ -17,6 +17,7 @@ import com.bydcollector.collector.data.energy.EnergyReceipt
 import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
 import com.bydcollector.collector.direct.TelemetryCallbackBatch
 import com.bydcollector.collector.diagnostics.OperationalEventJournal
+import com.bydcollector.collector.maintenance.DeferredEnergyArchive
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.data.normalized.NormalizedQuality
 import com.bydcollector.collector.data.normalized.CallbackNormalizationPageResult
@@ -311,6 +312,9 @@ class TelemetryStore(
     fun hasDeferredEnergy(): Boolean = helper.readableDatabase.rawQuery(
         "SELECT 1 FROM energy_deferred_receipts LIMIT 1", emptyArray()
     ).use { it.moveToFirst() }
+
+    internal fun restoreDeferredEnergy(sourceFile: File, expectedCount: Long) =
+        DeferredEnergyArchive.restore(sourceFile, helper.writableDatabase, expectedCount)
 
     fun oldestDeferredEnergy(nowMs: Long): DeferredEnergyReceipt? = helper.readableDatabase.rawQuery(
         "SELECT id, source_identity, observed_at, boot_id, elapsed_ms, voltage, current_a, " +
@@ -1480,6 +1484,25 @@ class TelemetryStore(
             "field_key = ?",
             arrayOf(fieldKey)
         )
+    }
+
+    override fun skipInfluxRow(fieldKey: String, historyId: Long, reason: String, skippedAt: String) {
+        val db = helper.writableDatabase
+        db.beginTransaction()
+        try {
+            db.insertOrThrow("influx_export_events", null, ContentValues().apply {
+                put("ts", skippedAt)
+                put("event_type", "influx_export_rejected_row")
+                put("message", "field=$fieldKey reason=$reason")
+                put("batch_count", 1)
+                put("from_history_id", historyId)
+                put("to_history_id", historyId)
+            })
+            updateInfluxCursorSuccess(fieldKey, historyId, skippedAt)
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
     }
 
     override fun updateInfluxCursorError(fieldKey: String, error: String, errorAt: String) {

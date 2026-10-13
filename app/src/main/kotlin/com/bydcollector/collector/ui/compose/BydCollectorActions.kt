@@ -52,8 +52,11 @@ data class BydCollectorActionUiState(
     val archiveDeleteDispatch: Boolean = false,
     val mqttTest: Boolean = false,
     val mqttCleanup: Boolean = false,
-    val influxTest: Boolean = false
+    val influxTest: Boolean = false,
+    val pendingOperations: Set<String> = emptySet()
 )
+
+internal fun BydCollectorActionUiState.isPending(operation: String): Boolean = operation in pendingOperations
 
 data class MqttCleanupUiState(
     val groups: List<MqttCleanupGroup> = emptyList(),
@@ -190,6 +193,7 @@ data class TripsUiActions(
     val onCurrentTripRequested: () -> Unit = {},
     val onCurrentTripDismissed: () -> Unit = {},
     val onCompressDatabase: () -> Unit = {},
+    val onDismissCompressionResult: () -> Unit = {},
     val onRefreshRequested: () -> Unit = {}
 )
 
@@ -298,6 +302,7 @@ interface BydCollectorActions {
     fun onDismissUpdateDialog()
     fun onInstallUpdate()
     fun onCancelUpdateDownload()
+    fun onUpdateDialogPresented() {}
     fun onShutdownApp()
 
     fun onStartLogcat()

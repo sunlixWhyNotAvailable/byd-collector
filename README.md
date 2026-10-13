@@ -150,7 +150,7 @@ Trip summaries can be sent after the configured parking delay in `P`. When the v
 
 **When GPS is unavailable, the link uses the last trusted point, which may not be the final parking spot.** Without a trusted point, no location link is sent.
 
-Pending messages survive app restarts and telemetry database archiving, and failed deliveries retry automatically. Storage is limited; messages are not retained indefinitely. Clearing diagnostic logs does not cancel pending messages.
+Pending messages survive app restarts and telemetry database archiving, and failed deliveries retry automatically. Undelivered messages do not expire by date; the queue is limited to 1,000 messages, so older messages may be removed when it fills. Clearing diagnostic logs does not cancel pending messages.
 
 <p align="center"><img src="docs/screenshots/en/telegram.png" alt="BYD Collector Telegram notification settings" width="100%"></p>
 

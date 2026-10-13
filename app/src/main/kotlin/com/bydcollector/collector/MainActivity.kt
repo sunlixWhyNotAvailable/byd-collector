@@ -42,9 +42,7 @@ import com.bydcollector.collector.data.trips.TripSession
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseResolver
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
-import com.bydcollector.collector.influx.InfluxActionResult
 import com.bydcollector.collector.influx.InfluxConfig
-import com.bydcollector.collector.influx.InfluxActions
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
 import com.bydcollector.collector.maintenance.DbMaintenanceUiState
@@ -53,12 +51,10 @@ import com.bydcollector.collector.maintenance.StorageFormatCutoverCoordinator
 import com.bydcollector.collector.maintenance.ArchiveStorageManager
 import com.bydcollector.collector.maintenance.ArchiveShareLeaseRegistry
 import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
-import com.bydcollector.collector.mqtt.HaMqttActions
 import com.bydcollector.collector.ha.HaEndpointProfile
 import com.bydcollector.collector.ha.HaExportChannel
 import com.bydcollector.collector.ha.HaRunSession
 import com.bydcollector.collector.ui.compose.validEndpointDraft
-import com.bydcollector.collector.mqtt.MqttActionResult
 import com.bydcollector.collector.mqtt.HaMqttConfig
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorServiceController
@@ -77,6 +73,7 @@ import com.bydcollector.collector.ui.compose.AppTab
 import com.bydcollector.collector.ui.compose.BydCollectorActions
 import com.bydcollector.collector.ui.compose.BydCollectorApp
 import com.bydcollector.collector.ui.compose.BydCollectorActionUiState
+import com.bydcollector.collector.ui.compose.isPending
 import com.bydcollector.collector.ui.compose.InfluxDraft
 import com.bydcollector.collector.ui.compose.MqttDraft
 import com.bydcollector.collector.ui.compose.TelegramConfig
@@ -98,7 +95,6 @@ import com.bydcollector.collector.ui.compose.strings
 import com.bydcollector.collector.ui.compose.runtimeJobMessage
 import com.bydcollector.collector.ui.compose.operationFailureMessage
 import com.bydcollector.collector.ui.compose.operationFailureDetail
-import com.bydcollector.collector.ui.compose.connectionTestMessage
 import com.bydcollector.collector.update.UpdateRuntime
 import com.bydcollector.collector.update.UpdateHintAppearance
 import com.bydcollector.collector.update.UpdateCheckSession
@@ -116,8 +112,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 //coordinates the user-facing compose shell while CollectorService owns long-running vehicle work
 class MainActivity : ComponentActivity() {
     private val runtimeJobCallbacks = mutableMapOf<String, (Boolean) -> Unit>()
-    private val presentedRuntimeJobs = mutableSetOf<String>()
-    private val dismissedUpdateJobs = mutableSetOf<String>()
+    private val runtimeJobSubmissionKinds = mutableMapOf<String, String>()
+    private val presentedRuntimeJobs = processPresentedRuntimeJobs
+    private val preparingRuntimeJobs = processPreparingRuntimeJobs
+    private val dismissedUpdateJobs = processDismissedUpdateJobs
     private var updateDownloadJobId: String? = null
     private var lastRuntimeMetadataAt = 0L
     private val runtimeObserver = object : android.database.ContentObserver(Handler(Looper.getMainLooper())) {
@@ -127,150 +125,323 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun submitRuntimeJob(kind: String, args: JSONObject = JSONObject()): String? = runCatching {
-        if (BuildConfig.RUNTIME_CLIENT) {
-            RuntimeEndpoint.call(this, "job.submit", Bundle().apply {
-                putString("kind", kind); putString("args", args.toString())
-            }).getString("id") ?: error("Runtime did not accept the task")
-        } else RuntimeJobsService.submit(this, kind, args)
-    }.onFailure {
-        actionUiState = actionUiState.copy(mqttTest = false,
-            mqttCleanup = actionUiState.mqttCleanup && kind != "mqttCleanup", influxTest = false, adbGrant = false)
-        diagnosticsBusy = false
-        recordOperationalEvent("runtime_job_submit_failed", "Runtime task submission failed", "$kind: ${it.diagnosticDetail()}")
-        Toast.makeText(this, operationFailureMessage(strings(uiLanguage), kind, it.message.orEmpty()), Toast.LENGTH_LONG).show()
-    }.getOrNull()
+    private var accessJobSubmissionsPending = 0
+    private var pendingUpdatePresentationId: String? = null
+
+    private fun submitRuntimeJob(
+        kind: String,
+        args: JSONObject = JSONObject(),
+        beforeSubmit: () -> Unit = {},
+        onSubmitted: (String) -> Unit = {},
+        onFailure: (Throwable) -> Unit = { error -> showOperationFailure(kind, error) }
+    ): Boolean {
+        if (kind == "access") accessJobSubmissionsPending += 1
+        val immutableArgs = JSONObject(args.toString())
+        val accepted = submitUiOwnerAction(
+            operation = "jobSubmit:$kind",
+            failureKind = kind,
+            allowDuplicate = kind.startsWith("log"),
+            work = {
+                beforeSubmit()
+                if (BuildConfig.RUNTIME_CLIENT) {
+                    RuntimeEndpoint.call(applicationContext, "job.submit", Bundle().apply {
+                        putString("kind", kind); putString("args", immutableArgs.toString())
+                    }).getString("id") ?: error("Runtime did not accept the task")
+                } else RuntimeJobsService.submit(applicationContext, kind, immutableArgs)
+            },
+            onSuccess = { id ->
+                runtimeJobSubmissionKinds[id] = kind
+                onSubmitted(id)
+                refresh()
+            },
+            onFailure = { error ->
+                if (kind == "access") accessJobSubmissionsPending = (accessJobSubmissionsPending - 1).coerceAtLeast(0)
+                actionUiState = actionUiState.copy(
+                    mqttTest = actionUiState.mqttTest && kind != "mqttTest",
+                    mqttCleanup = actionUiState.mqttCleanup && kind != "mqttCleanup",
+                    influxTest = actionUiState.influxTest && kind != "influxTest",
+                    archiveShare = actionUiState.archiveShare && kind != "archiveShare",
+                    adbGrant = actionUiState.adbGrant && kind != "access"
+                )
+                if (kind.startsWith("log")) diagnosticsBusy = false
+                recordOperationalEvent("runtime_job_submit_failed", "Runtime task submission failed", "$kind: ${error.diagnosticDetail()}")
+                onFailure(error)
+                refresh()
+            }
+        )
+        if (!accepted && kind == "access") {
+            accessJobSubmissionsPending = (accessJobSubmissionsPending - 1).coerceAtLeast(0)
+        }
+        if (!accepted) {
+            actionUiState = actionUiState.copy(
+                mqttTest = actionUiState.mqttTest && kind != "mqttTest",
+                mqttCleanup = actionUiState.mqttCleanup && kind != "mqttCleanup",
+                influxTest = actionUiState.influxTest && kind != "influxTest",
+                archiveShare = actionUiState.archiveShare && kind != "archiveShare",
+                adbGrant = actionUiState.adbGrant && kind != "access"
+            )
+            if (kind.startsWith("log")) diagnosticsBusy = false
+        }
+        return accepted
+    }
+
+    private fun <T> submitUiOwnerAction(
+        operation: String,
+        failureKind: String = operation,
+        allowDuplicate: Boolean = false,
+        work: () -> T,
+        onSuccess: (T) -> Unit = {},
+        onFailure: (Throwable) -> Unit = { error -> showOperationFailure(failureKind, error); refresh() },
+        onSettled: (Result<T>) -> Unit = {}
+    ): Boolean {
+        val count = pendingOperationCounts[operation] ?: 0
+        if (!allowDuplicate && count > 0) return false
+        pendingOperationCounts[operation] = count + 1
+        if (count == 0) actionUiState = actionUiState.copy(pendingOperations = actionUiState.pendingOperations + operation)
+
+        val complete: (Result<T>) -> Unit = { result ->
+            val remaining = ((pendingOperationCounts[operation] ?: 1) - 1).coerceAtLeast(0)
+            if (remaining == 0) {
+                pendingOperationCounts.remove(operation)
+                actionUiState = actionUiState.copy(pendingOperations = actionUiState.pendingOperations - operation)
+            } else pendingOperationCounts[operation] = remaining
+            runCatching { onSettled(result) }
+                .onFailure { Log.w(TAG, "Owner action completion cleanup failed: $operation", it) }
+            if (!destroyed) {
+                runCatching { result.fold(onSuccess, onFailure) }
+                    .onFailure { error ->
+                        Log.e(TAG, "Owner action UI completion failed: $operation", error)
+                        runCatching { onFailure(error) }
+                            .onFailure { Log.e(TAG, "Owner action UI failure handler failed: $operation", it) }
+                    }
+            }
+        }
+        try {
+            RuntimeClient.executeOwnerAction(work, complete)
+        } catch (error: RuntimeException) {
+            complete(Result.failure(error))
+        }
+        return true
+    }
+
+    private data class RuntimeJobPreparation(val resultPrepared: Boolean, val jobJson: String)
 
     private fun consumeRuntimeJobs(json: String) {
         val array = JSONArray(json)
         val jobs = (0 until array.length()).map(array::getJSONObject)
+        jobs.forEach { runtimeJobSubmissionKinds.remove(it.optString("id")) }
+        val pendingKinds = runtimeJobSubmissionKinds.values.toSet()
         val active = jobs.filter { it.optString("status") in setOf("queued", "running", "cancelling") }
         val activeUpdateId = active.firstOrNull { it.optString("kind") == "updateDownload" }?.optString("id")
-        diagnosticsBusy = active.any { it.getString("kind").startsWith("log") }
-        actionUiState = actionUiState.copy(mqttTest = active.any { it.getString("kind") == "mqttTest" },
-            mqttCleanup = active.any { it.getString("kind") == "mqttCleanup" },
-            influxTest = active.any { it.getString("kind") == "influxTest" })
+        val pendingLogSubmit = listOf("logStart", "logStop", "logShare", "logClear")
+            .any { actionUiState.isPending("jobSubmit:$it") }
+        diagnosticsBusy = active.any { it.getString("kind").startsWith("log") } ||
+            pendingKinds.any { it.startsWith("log") } || pendingLogSubmit
+        actionUiState = actionUiState.copy(
+            mqttTest = actionUiState.isPending("jobSubmit:mqttTest") ||
+                active.any { it.getString("kind") == "mqttTest" } || "mqttTest" in pendingKinds,
+            mqttCleanup = actionUiState.isPending("jobSubmit:mqttCleanup") ||
+                active.any { it.getString("kind") == "mqttCleanup" } || "mqttCleanup" in pendingKinds,
+            influxTest = actionUiState.isPending("jobSubmit:influxTest") ||
+                active.any { it.getString("kind") == "influxTest" } || "influxTest" in pendingKinds,
+            archiveShare = actionUiState.isPending("jobSubmit:archiveShare") ||
+                active.any { it.getString("kind") == "archiveShare" } || "archiveShare" in pendingKinds
+        )
         active.firstOrNull { it.getString("kind") == "updateDownload" }?.let { job ->
-            updateDownloadJobId = job.getString("id")
-            if (job.optBoolean("dialogDismissed") || updateDownloadJobId in dismissedUpdateJobs) return@let
+            val id = job.getString("id")
+            updateDownloadJobId = id
+            if (job.optBoolean("dialogDismissed") || id in dismissedUpdateJobs) return@let
             updateUiState = if (job.optBoolean("cancelRequested") || job.optString("status") == "cancelling") {
                 UpdateUiState.Cancelling(RuntimeJobsService.updateInfo(job))
             } else UpdateUiState.Downloading(RuntimeJobsService.updateInfo(job), job.optInt("progress"))
             syncReleaseNotesUi()
         }
         jobs.filter { it !in active && !it.optBoolean("presented") }.forEach { job ->
-            //A result read before backgrounding stays authoritative and unpresented until the
-            //compatible UI is resumed and focused; in particular, never open an installer late.
-            if (BuildConfig.RUNTIME_CLIENT &&
-                (!runtimeCompatibleForUi || !runtimeRecoveryForegroundEligible())) return@forEach
             val id = job.getString("id")
-            if (id in presentedRuntimeJobs) return@forEach
             val kind = job.getString("kind")
             val status = job.optString("status")
+            if (kind == "access" && accessJobSubmissionsPending > 0) return@forEach
+            if (!canPresentRuntimeResults()) return@forEach
+            if (id == pendingUpdatePresentationId) return@forEach
+            if (id in presentedRuntimeJobs || id in preparingRuntimeJobs) return@forEach
             if (kind == "updateDownload" && status in setOf("cancelled", "cancelError")) {
                 if (activeUpdateId != null && activeUpdateId != id) return@forEach
                 if (!job.optBoolean("dialogDismissed") && id !in dismissedUpdateJobs) {
                     updateDownloadJobId = id
                     val info = RuntimeJobsService.updateInfo(job)
-                    updateUiState = when (status) {
-                        "cancelled" -> UpdateUiState.Cancelled(info)
-                        else -> UpdateUiState.CancelError(info)
-                    }
+                    updateUiState = if (status == "cancelled") UpdateUiState.Cancelled(info) else UpdateUiState.CancelError(info)
+                    pendingUpdatePresentationId = id
                     syncReleaseNotesUi()
                 }
                 return@forEach
             }
-            val success = job.getString("status") == "complete"
+            if (kind == "updateDownload" && status == "complete" &&
+                (job.optBoolean("dialogDismissed") || id in dismissedUpdateJobs)) return@forEach
+
+            val immutableJobJson = job.toString()
+            val success = status == "complete"
             val result = job.optJSONObject("result") ?: JSONObject()
-            var keepUpdateForExplicitReopen = false
-            var installerLaunchAttempted = false
-            val delivered = runCatching {
-                val resultPrepared = if (success && (result.has("uri") || result.has("uris"))) {
-                    RuntimeJobsService.prepareResult(this, id)
-                } else true
-                if (success && kind == "updateDownload" && !resultPrepared) {
-                    val currentJobs = JSONArray(RuntimeJobsService.snapshot(this))
-                    val current = (0 until currentJobs.length()).map(currentJobs::getJSONObject)
-                        .firstOrNull { it.optString("id") == id } ?: job
-                    updateDownloadJobId = id
-                    val currentStatus = current.optString("status")
-                    if (current.optBoolean("cancelRequested") || currentStatus in setOf("cancelling", "cancelError", "cancelled")) {
-                        updateUiState = when (currentStatus) {
-                            "cancelled" -> UpdateUiState.Cancelled(RuntimeJobsService.updateInfo(current))
-                            "cancelError" -> UpdateUiState.CancelError(RuntimeJobsService.updateInfo(current))
-                            else -> UpdateUiState.Cancelling(RuntimeJobsService.updateInfo(current))
-                        }
-                        keepUpdateForExplicitReopen = true
-                        syncReleaseNotesUi()
-                    } else if (current.optBoolean("installerClaimed")) {
-                        // A prior process may have crossed the installer boundary; wait for an explicit reopen.
-                        keepUpdateForExplicitReopen = !current.optBoolean("presented")
-                        if (keepUpdateForExplicitReopen) presentedRuntimeJobs += id
-                        updateUiState = UpdateUiState.Hidden
+            val needsResultPreparation = success && (result.has("uri") || result.has("uris"))
+            val capturedUpdateGeneration = updateUiGeneration
+            val installerClaimAcquired = AtomicBoolean(false)
+            preparingRuntimeJobs += id
+            val accepted = submitUiOwnerAction(
+                operation = "jobPrepare:$id",
+                failureKind = kind,
+                work = {
+                    val prepared = !needsResultPreparation || RuntimeJobsService.prepareResult(applicationContext, id)
+                    if (success && kind == "updateDownload" && prepared) installerClaimAcquired.set(true)
+                    if (success && kind == "updateDownload") {
+                        val currentJobs = JSONArray(RuntimeJobsService.snapshot(applicationContext))
+                        val current = (0 until currentJobs.length()).map(currentJobs::getJSONObject)
+                            .firstOrNull { it.optString("id") == id }
+                        RuntimeJobPreparation(prepared, current?.toString() ?: immutableJobJson)
+                    } else RuntimeJobPreparation(prepared, immutableJobJson)
+                },
+                onSuccess = { preparation ->
+                    val current = JSONObject(preparation.jobJson)
+                    val stillPresentable = canPresentRuntimeResults()
+                    if (!stillPresentable) {
+                        if (kind == "updateDownload" && installerClaimAcquired.get()) releaseInstallerClaim(id)
+                        return@submitUiOwnerAction
                     }
-                    return@runCatching
-                }
-                if (success && (kind == "logShare" || kind == "archiveShare")) {
-                    val uris = if (kind == "logShare") arrayListOf(Uri.parse(result.getString("uri")))
-                    else result.getJSONArray("uris").let { list -> ArrayList((0 until list.length()).map { Uri.parse(list.getString(it)) }) }
-                    val share = Intent(if (uris.size == 1) Intent.ACTION_SEND else Intent.ACTION_SEND_MULTIPLE).apply {
-                        type = "application/zip"
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                        if (uris.size == 1) putExtra(Intent.EXTRA_STREAM, uris[0])
-                        else putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
-                        clipData = android.content.ClipData.newRawUri("BYD Collector", uris.first()).also { clip ->
-                            uris.drop(1).forEach { clip.addItem(android.content.ClipData.Item(it)) }
-                        }
+                    if (kind == "updateDownload" &&
+                        (current.optBoolean("dialogDismissed") || id in dismissedUpdateJobs ||
+                            updateUiGeneration != capturedUpdateGeneration)) {
+                        if (installerClaimAcquired.get()) releaseInstallerClaim(id)
+                        if (updateDownloadJobId == id) updateUiState = UpdateUiState.Hidden
+                        if (pendingUpdatePresentationId == id) pendingUpdatePresentationId = null
+                        return@submitUiOwnerAction
                     }
-                    startActivity(Intent.createChooser(share, "BYD Collector"))
-                } else if (success && kind == "updateDownload") {
-                    try {
-                        installerLaunchAttempted = true
-                        startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(result.getString("uri")),
-                            "application/vnd.android.package-archive").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
-                    } catch (error: Exception) {
-                        RuntimeJobsService.releaseInstallerClaim(this, id)
-                        presentedRuntimeJobs += id
-                        recordOperationalEvent("runtime_update_installer_open_failed", "Could not open verified update", error.diagnosticDetail())
-                        updateUiState = UpdateUiState.Error("Could not open the verified update installer")
-                        syncReleaseNotesUi()
-                        throw error
-                    }
-                    updateRuntime.onInstallerLaunched()
-                    updateUiState = UpdateUiState.Hidden
-                } else if (kind == "mqttCleanup") {
-                    refreshMqttCleanupGroups()
-                    Toast.makeText(this, runtimeJobMessage(strings(uiLanguage), kind, success, result, job.optString("error")), Toast.LENGTH_LONG).show()
-                } else if (kind != "access") {
-                    val message = runtimeJobMessage(strings(uiLanguage), kind, success, result, job.optString("error"))
-                    Toast.makeText(this, message, Toast.LENGTH_LONG).show()
-                    if (kind == "updateDownload" && !job.optBoolean("dialogDismissed") && id !in dismissedUpdateJobs) {
+                    if (success && kind == "updateDownload" && !preparation.resultPrepared) {
+                        val currentStatus = current.optString("status")
                         updateDownloadJobId = id
-                        updateUiState = UpdateUiState.Error(job.optString("error"))
+                        if (current.optBoolean("cancelRequested") || currentStatus in setOf("cancelling", "cancelError", "cancelled")) {
+                            val info = RuntimeJobsService.updateInfo(current)
+                            updateUiState = when (currentStatus) {
+                                "cancelled" -> UpdateUiState.Cancelled(info)
+                                "cancelError" -> UpdateUiState.CancelError(info)
+                                else -> UpdateUiState.Cancelling(info)
+                            }
+                            pendingUpdatePresentationId = id
+                            syncReleaseNotesUi()
+                        } else if (current.optBoolean("installerClaimed")) {
+                            // A prior process may already have crossed the installer boundary; wait for explicit reopen.
+                            presentedRuntimeJobs += id
+                            updateUiState = UpdateUiState.Hidden
+                        }
+                        return@submitUiOwnerAction
+                    }
+                    if (!preparation.resultPrepared && needsResultPreparation) return@submitUiOwnerAction
+                    val deliveredSuccess = current.optString("status") == "complete"
+                    val deliveredResult = current.optJSONObject("result") ?: JSONObject()
+                    if (deliveredSuccess && (kind == "logShare" || kind == "archiveShare")) {
+                        val uris = if (kind == "logShare") arrayListOf(Uri.parse(deliveredResult.getString("uri")))
+                        else deliveredResult.getJSONArray("uris").let { list -> ArrayList((0 until list.length()).map { Uri.parse(list.getString(it)) }) }
+                        val share = Intent(if (uris.size == 1) Intent.ACTION_SEND else Intent.ACTION_SEND_MULTIPLE).apply {
+                            type = "application/zip"
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            if (uris.size == 1) putExtra(Intent.EXTRA_STREAM, uris[0])
+                            else putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                            clipData = android.content.ClipData.newRawUri("BYD Collector", uris.first()).also { clip ->
+                                uris.drop(1).forEach { clip.addItem(android.content.ClipData.Item(it)) }
+                            }
+                        }
+                        startActivity(Intent.createChooser(share, "BYD Collector"))
+                    } else if (deliveredSuccess && kind == "updateDownload") {
+                        try {
+                            startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(deliveredResult.getString("uri")),
+                                "application/vnd.android.package-archive").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                        } catch (error: Exception) {
+                            releaseInstallerClaim(id)
+                            recordOperationalEvent("runtime_update_installer_open_failed", "Could not open verified update", error.diagnosticDetail())
+                            updateUiState = UpdateUiState.Error("Could not open the verified update installer")
+                            pendingUpdatePresentationId = id
+                            syncReleaseNotesUi()
+                            return@submitUiOwnerAction
+                        }
+                        submitUiOwnerAction("updateInstallerLaunched", work = { updateRuntime.onInstallerLaunched() })
+                        updateUiState = UpdateUiState.Hidden
+                        acknowledgeRuntimeJob(id)
+                    } else if (kind == "mqttCleanup") {
+                        refreshMqttCleanupGroups()
+                        Toast.makeText(this, runtimeJobMessage(strings(uiLanguage), kind, deliveredSuccess,
+                            deliveredResult, current.optString("error")), Toast.LENGTH_LONG).show()
+                    } else if (kind != "access") {
+                        val message = runtimeJobMessage(strings(uiLanguage), kind, deliveredSuccess,
+                            deliveredResult, current.optString("error"))
+                        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+                        if (kind == "updateDownload" && !current.optBoolean("dialogDismissed") && id !in dismissedUpdateJobs) {
+                            updateDownloadJobId = id
+                            updateUiState = UpdateUiState.Error(current.optString("error"))
+                            pendingUpdatePresentationId = id
+                            syncReleaseNotesUi()
+                        }
+                    }
+                    runtimeJobCallbacks.remove(id)?.invoke(deliveredSuccess)
+                    if (kind != "updateDownload") acknowledgeRuntimeJob(id)
+                },
+                onFailure = { error ->
+                    Log.w(TAG, "Runtime result preparation failed", error)
+                    if (kind == "updateDownload" && success) {
+                        recordOperationalEvent("runtime_update_installer_prepare_failed", "Could not prepare verified update", error.diagnosticDetail())
+                        if (installerClaimAcquired.get()) releaseInstallerClaim(id)
+                        submitUiOwnerAction("updateInstallFinished", work = { updateRuntime.onInstallFinished() })
+                        if (canPresentRuntimeResults() && id !in dismissedUpdateJobs &&
+                            updateUiGeneration == capturedUpdateGeneration) {
+                            updateDownloadJobId = id
+                            updateUiState = UpdateUiState.Error(error.message?.take(300) ?: "Could not prepare the verified update installer")
+                            pendingUpdatePresentationId = id
+                            syncReleaseNotesUi()
+                        }
+                    } else {
+                        Toast.makeText(this, runtimeJobMessage(strings(uiLanguage), kind, false,
+                            JSONObject(), error.diagnosticDetail()), Toast.LENGTH_LONG).show()
+                        runtimeJobCallbacks.remove(id)?.invoke(false)
+                        acknowledgeRuntimeJob(id)
+                    }
+                },
+                onSettled = { outcome ->
+                    preparingRuntimeJobs.remove(id)
+                    if (destroyed && kind == "updateDownload" && success &&
+                        (outcome.getOrNull()?.resultPrepared == true || installerClaimAcquired.get())) {
+                        releaseInstallerClaim(id)
                     }
                 }
-                runtimeJobCallbacks.remove(id)?.invoke(success)
-                RuntimeJobsService.presented(this, id)
-            }
-            if (delivered.isSuccess && !keepUpdateForExplicitReopen) presentedRuntimeJobs += id
-            else if (delivered.isFailure) {
-                val error = delivered.exceptionOrNull()
-                Log.w(TAG, "Runtime result presentation failed", error)
-                if (kind == "updateDownload" && success) {
-                    updateDownloadJobId = id
-                    presentedRuntimeJobs += id
-                    val detail = error?.message?.take(300) ?: "Could not prepare the verified update installer"
-                    recordOperationalEvent("runtime_update_installer_prepare_failed", "Could not prepare verified update", error?.diagnosticDetail())
-                    updateRuntime.onInstallFinished()
-                    if (!installerLaunchAttempted) {
-                        runCatching { RuntimeJobsService.presented(this, id) }
-                            .onFailure { Log.w(TAG, "Could not retire invalid verified update result", it) }
-                    }
-                    updateUiState = UpdateUiState.Error(detail)
-                    syncReleaseNotesUi()
-                }
-            }
+            )
+            if (!accepted) preparingRuntimeJobs.remove(id)
         }
+    }
+
+    private fun canPresentRuntimeResults(): Boolean = !destroyed && foreground &&
+        (!BuildConfig.RUNTIME_CLIENT || (runtimeCompatibleForUi && runtimeRecoveryForegroundEligible()))
+
+    private fun releaseInstallerClaim(id: String) {
+        submitUiOwnerAction("jobReleaseInstaller:$id", failureKind = "updateDownload",
+            work = { RuntimeJobsService.releaseInstallerClaim(applicationContext, id) },
+            onFailure = { Log.w(TAG, "Could not release stale update installer claim", it) })
+    }
+
+    private fun acknowledgeRuntimeJob(id: String) {
+        if (!presentedRuntimeJobs.add(id)) return
+        submitUiOwnerAction("jobPresented:$id", failureKind = "runtimeJob",
+            work = { RuntimeJobsService.presented(applicationContext, id) },
+            onFailure = { Log.w(TAG, "Could not persist runtime task presentation", it) },
+            onSettled = { result -> if (result.isFailure) presentedRuntimeJobs.remove(id) })
+    }
+
+    private fun persistDismissedUpdateJob(id: String) {
+        if (!dismissedUpdateJobs.add(id)) return
+        val context = applicationContext
+        submitUiOwnerAction("updateDismissJob:$id", failureKind = "updateDismiss",
+            work = { RuntimeJobsService.dismissUpdateDialog(context, id) },
+            onFailure = { Log.w(TAG, "Could not persist stale update dismissal", it) })
+    }
+
+    private fun onUpdateDialogPresented() {
+        val id = pendingUpdatePresentationId ?: return
+        pendingUpdatePresentationId = null
+        acknowledgeRuntimeJob(id)
     }
     private lateinit var store: TelemetryStore
     private lateinit var settings: CollectorSettings
@@ -354,6 +525,7 @@ class MainActivity : ComponentActivity() {
     private var backgroundSetupPromptAutoLaunch = false
     private var diagnosticsBusy by mutableStateOf(false)
     private var actionUiState by mutableStateOf(BydCollectorActionUiState())
+    private val pendingOperationCounts = mutableMapOf<String, Int>()
     private var mqttCleanupUiState by mutableStateOf(MqttCleanupUiState())
     private var mqttCleanupRequestGeneration = 0L
     private var archiveDeleteDispatchStartedAtMs: Long? = null
@@ -370,20 +542,38 @@ class MainActivity : ComponentActivity() {
     private var mqttCredentialRevision = 0L
     private var influxCredentialRevision = 0L
     private var telegramCredentialRevision = 0L
+    private var telegramConfigRevision = 0L
     private val tripsUiActions = TripsUiActions(
         onColorMetricChanged = { tripsUiState = tripsUiState.copy(colorMetric = it) },
         onSpeedThresholdsChanged = { green, yellow ->
-            settings.setTripSpeedThresholds(green, yellow)
-            tripsUiState = tripsUiState.copy(speedGreenThreshold = settings.tripSpeedGreenThreshold(), speedYellowThreshold = settings.tripSpeedYellowThreshold())
+            tripsUiState = tripsUiState.copy(speedGreenThreshold = green.coerceIn(0, 300), speedYellowThreshold = yellow.coerceIn(0, 300))
+            val source = settings
+            submitUiOwnerAction("tripSpeedThresholds", allowDuplicate = true,
+                work = { source.setTripSpeedThresholds(green, yellow) }, onFailure = { showOperationFailure("settings", it) })
         },
         onConsumptionThresholdsChanged = { green, yellow ->
-            settings.setTripConsumptionThresholds(green, yellow)
-            tripsUiState = tripsUiState.copy(consumptionGreenThreshold = settings.tripConsumptionGreenThreshold(), consumptionYellowThreshold = settings.tripConsumptionYellowThreshold())
+            tripsUiState = tripsUiState.copy(consumptionGreenThreshold = green.coerceIn(0, 300), consumptionYellowThreshold = yellow.coerceIn(0, 300))
+            val source = settings
+            submitUiOwnerAction("tripConsumptionThresholds", allowDuplicate = true,
+                work = { source.setTripConsumptionThresholds(green, yellow) }, onFailure = { showOperationFailure("settings", it) })
         },
         onRouteRequested = { tripId -> loadTripsUi(tripId) },
         onCurrentTripRequested = ::openCurrentTrip,
         onCurrentTripDismissed = ::dismissCurrentTrip,
-        onCompressDatabase = { TripCompressionService.start(applicationContext) },
+        onCompressDatabase = {
+            val appContext = applicationContext
+            submitUiOwnerAction("tripCompression", work = { TripCompressionService.start(appContext) })
+        },
+        onDismissCompressionResult = {
+            submitUiOwnerAction("tripCompressionDismiss", work = { TripCompressionService.dismissResult() },
+                onSuccess = { dismissed ->
+                    if (dismissed && !destroyed) {
+                        loadTripsUi()
+                        stateProvider.invalidateArchiveStorageSnapshot()
+                        refresh()
+                    }
+                })
+        },
         onRefreshRequested = {
             loadTripsUi()
             stateProvider.invalidateArchiveStorageSnapshot()
@@ -416,11 +606,6 @@ class MainActivity : ComponentActivity() {
     private val updateCheckUiTask = Runnable { syncUpdateCheckUi() }
     private val updateCheckListener: () -> Unit = { handler.post(updateCheckUiTask); Unit }
     private val releaseNotesListener: () -> Unit = { handler.post { syncReleaseNotesUi() }; Unit }
-    private val telegramReconcileTask = Runnable {
-        if (!destroyed && ::settings.isInitialized) {
-            CollectorServiceController.reconcileTelegram(this@MainActivity)
-        }
-    }
 
     private val telegramActions = TelegramUiActions(
         onConfigChanged = ::onTelegramConfigChanged,
@@ -447,49 +632,58 @@ class MainActivity : ComponentActivity() {
 
         override fun onLanguageSelected(language: UiLanguage) {
             uiLanguage = language
-            settings.setUiLanguageCode(language.code)
             RuntimeUiAppearance.save(applicationContext, language = language)
-            if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("hintStyle", Bundle().apply { putBoolean("dark", darkTheme) })
-            else (applicationContext as BydCollectorApplication).updateHints.refresh(darkTheme)
             dashboardUiStateStore.selectVehicleKpiLanguage(language.vehicleKpiLanguage())
             val previousTelegram = telegramUiState
-            if (previousTelegram.config.messages[TelegramMessageType.TRIP_SUMMARY]?.usesDefaultTemplate == true) {
-                settings.resetTelegramTripTemplateLimitState()
-            }
-            val localizedTelegram = loadTelegramUiState()
-            telegramUiState = localizedTelegram.copy(
-                config = localizedTelegram.config.copy(
-                    botToken = previousTelegram.config.botToken,
-                    botTokenSet = previousTelegram.config.botTokenSet,
-                    chatId = previousTelegram.config.chatId
-                ),
-                testStatus = previousTelegram.testStatus
-            )
+            telegramUiState = previousTelegram.copy(config = previousTelegram.config.copy(
+                messages = previousTelegram.config.messages.mapValues { (type, message) ->
+                    if (message.usesDefaultTemplate) message.copy(template = strings(language).telegram.messages.getValue(type).defaultTemplate)
+                    else message
+                }))
+            val source = settings
+            val dark = darkTheme
+            submitUiOwnerAction("language", allowDuplicate = true, work = {
+                source.setUiLanguageCode(language.code)
+                if (previousTelegram.config.messages[TelegramMessageType.TRIP_SUMMARY]?.usesDefaultTemplate == true) {
+                    source.resetTelegramTripTemplateLimitState()
+                }
+                if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("hintStyle", Bundle().apply { putBoolean("dark", dark) })
+            }, onSuccess = {
+                if (!BuildConfig.RUNTIME_CLIENT) (applicationContext as BydCollectorApplication).updateHints.refresh(darkTheme)
+                refresh()
+            })
             if (activeTab == AppTab.TRIPS) loadTripsUi()
         }
 
         override fun onDarkThemeSelected(dark: Boolean) {
             darkTheme = dark
             RuntimeUiAppearance.save(applicationContext, dark = dark)
-            if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("hintStyle", Bundle().apply { putBoolean("dark", dark) })
-            else (applicationContext as BydCollectorApplication).updateHints.refresh(dark)
+            submitUiOwnerAction("theme", allowDuplicate = true, work = {
+                if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("hintStyle", Bundle().apply { putBoolean("dark", dark) })
+            }, onSuccess = {
+                if (!BuildConfig.RUNTIME_CLIENT) (applicationContext as BydCollectorApplication).updateHints.refresh(darkTheme)
+            })
         }
 
         override fun onStartMain() {
             refreshStoreBackedState()
-            settings.setMainManuallyStopped(false)
-            settings.setPollingEnabled(true)
             requestAccessCheck("start_main", AccessCheckMode.NORMAL)
-            CollectorServiceController.start(this@MainActivity)
-            refresh()
+            val source = settings
+            submitUiOwnerAction("mainStart", work = {
+                source.setMainManuallyStopped(false)
+                source.setPollingEnabled(true)
+                CollectorServiceController.start(applicationContext)
+            }, onSuccess = { refresh() })
         }
 
         override fun onStopMain() {
             refreshStoreBackedState()
-            settings.setMainManuallyStopped(true)
-            settings.setPollingEnabled(false)
-            CollectorServiceController.stop(this@MainActivity)
-            refresh()
+            val source = settings
+            submitUiOwnerAction("mainStop", work = {
+                source.setMainManuallyStopped(true)
+                source.setPollingEnabled(false)
+                CollectorServiceController.stop(applicationContext)
+            }, onSuccess = { refresh() })
         }
 
         override fun onToggleMainAutoStart(enabled: Boolean) {
@@ -505,18 +699,19 @@ class MainActivity : ComponentActivity() {
                 return
             }
             refreshStoreBackedState()
-            if (settings.isAutoStartEnabled() != enabled) {
-                if (enabled) settings.setMainManuallyStopped(false)
-                settings.setAutoStartEnabled(
+            val source = settings
+            val tab = activeTab
+            submitUiOwnerAction("mainAuto", allowDuplicate = true, work = {
+                if (enabled) source.setMainManuallyStopped(false)
+                source.setAutoStartEnabled(
                     enabled,
-                    detail = "source=ui control=main_auto_start tab=$activeTab"
+                    detail = "source=ui control=main_auto_start tab=$tab"
                 )
                 if (enabled) {
                     if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("watchdog")
-                    else CollectorAutoStart.scheduleWatchdog(applicationContext, settings, currentStore())
+                    else CollectorAutoStart.scheduleWatchdog(applicationContext, source, currentStore())
                 }
-                refresh()
-            }
+            }, onSuccess = { refresh() })
         }
 
         override fun onGrantAdb() {
@@ -547,10 +742,10 @@ class MainActivity : ComponentActivity() {
             pendingMainArchivePreflight = null
             stateProvider.invalidateArchiveStorageSnapshot()
             if (BuildConfig.RUNTIME_CLIENT) {
-                runCatching {
-                    if (operation == DbMaintenanceOperation.ARCHIVE) CollectorServiceController.archiveDatabase(this@MainActivity)
-                    else CollectorServiceController.archiveDebugDatabase(this@MainActivity)
-                }.onFailure(::postMaintenanceLaunchFailure)
+                submitUiOwnerAction("archiveStart", work = {
+                    if (operation == DbMaintenanceOperation.ARCHIVE) CollectorServiceController.archiveDatabase(applicationContext)
+                    else CollectorServiceController.archiveDebugDatabase(applicationContext)
+                }, onSuccess = { refresh() }, onFailure = ::postMaintenanceLaunchFailure)
                 return
             }
             val runningStatus = DbMaintenanceRuntimeStatus(
@@ -609,24 +804,27 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onCancelDatabaseMaintenance() {
-            CollectorServiceController.cancelDatabaseMaintenance(this@MainActivity)
-            refresh()
+            submitUiOwnerAction("archiveCancel", work = {
+                CollectorServiceController.cancelDatabaseMaintenance(applicationContext)
+            }, onSuccess = { refresh() })
         }
 
         override fun onDismissDatabaseMaintenance() {
             if (dashboardUiStateStore.currentChrome()?.dbMaintenanceStatus?.running == true || maintenanceLaunchOperation != null) return
             pendingMaintenanceOperation = null
             pendingMainArchivePreflight = null
-            settings.clearDbMaintenanceStatus()
-            refresh()
+            val source = settings
+            submitUiOwnerAction("archiveDismiss", work = { source.clearDbMaintenanceStatus() }, onSuccess = { refresh() })
         }
 
         override fun onSetArchiveStorageLimitGb(value: Int) {
             refreshStoreBackedState()
-            settings.setArchiveStorageLimitGb(value)
+            val source = settings
             stateProvider.invalidateArchiveStorageSnapshot()
-            CollectorServiceController.reconcileArchiveStorage(this@MainActivity)
-            refresh()
+            submitUiOwnerAction("archiveLimit", allowDuplicate = true, work = {
+                source.setArchiveStorageLimitGb(value)
+                CollectorServiceController.reconcileArchiveStorage(applicationContext, manualRetry = true)
+            }, onSuccess = { refresh() })
         }
 
         override fun onDeleteArchives(ids: List<String>) {
@@ -635,9 +833,10 @@ class MainActivity : ComponentActivity() {
             actionUiState = actionUiState.copy(archiveDeleteDispatch = true)
             stateProvider.retireArchiveStorageEntries(ids)
             stateProvider.invalidateArchiveStorageSnapshot()
-            runCatching {
-                CollectorServiceController.deleteArchives(this@MainActivity, ids)
-            }.onFailure { error ->
+            val requestedIds = ids.toList()
+            submitUiOwnerAction("archiveDelete", work = {
+                CollectorServiceController.deleteArchives(applicationContext, requestedIds)
+            }, onSuccess = { refresh() }, onFailure = { error ->
                 archiveDeleteDispatchStartedAtMs = null
                 actionUiState = actionUiState.copy(archiveDeleteDispatch = false)
                 stateProvider.restoreRetiredArchiveStorageEntries(ids)
@@ -647,7 +846,9 @@ class MainActivity : ComponentActivity() {
                     "Archive delete command could not be dispatched",
                     error.diagnosticDetail("archive_ids=${ids.joinToString(",")}")
                 )
-            }
+                showOperationFailure("archiveDelete", error)
+                refresh()
+            })
             refresh()
         }
 
@@ -659,38 +860,44 @@ class MainActivity : ComponentActivity() {
         override fun onStartDebug() {
             refreshStoreBackedState()
             requestAccessCheck("start_debug", AccessCheckMode.NORMAL)
-            settings.setDebugManuallyStopped(false)
-            settings.setDebugPollingEnabled(true)
-            CollectorServiceController.startDebug(this@MainActivity)
-            refresh()
+            val source = settings
+            submitUiOwnerAction("debugStart", work = {
+                source.setDebugManuallyStopped(false)
+                source.setDebugPollingEnabled(true)
+                CollectorServiceController.startDebug(applicationContext)
+            }, onSuccess = { refresh() })
         }
 
         override fun onStopDebug() {
             refreshStoreBackedState()
-            settings.setDebugManuallyStopped(true)
-            settings.setDebugPollingEnabled(false)
-            CollectorServiceController.stopDebug(this@MainActivity)
-            refresh()
+            val source = settings
+            submitUiOwnerAction("debugStop", work = {
+                source.setDebugManuallyStopped(true)
+                source.setDebugPollingEnabled(false)
+                CollectorServiceController.stopDebug(applicationContext)
+            }, onSuccess = { refresh() })
         }
 
         override fun onToggleDebugAutoStart(enabled: Boolean) {
-            if (settings.isDebugAutoStartEnabled() != enabled) {
-                if (enabled) settings.setDebugManuallyStopped(false)
-                settings.setDebugAutoStartEnabled(
+            val source = settings
+            val tab = activeTab
+            submitUiOwnerAction("debugAuto", allowDuplicate = true, work = {
+                if (enabled) source.setDebugManuallyStopped(false)
+                source.setDebugAutoStartEnabled(
                     enabled,
-                    detail = "source=ui control=debug_auto_start tab=$activeTab"
+                    detail = "source=ui control=debug_auto_start tab=$tab"
                 )
                 if (enabled) {
                     if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("watchdog")
-                    else CollectorAutoStart.scheduleWatchdog(applicationContext, settings, currentStore())
+                    else CollectorAutoStart.scheduleWatchdog(applicationContext, source, currentStore())
                 }
-                refresh()
-            }
+            }, onSuccess = { refresh() })
         }
 
         override fun onToggleSharedCategories(enabled: Boolean) {
-            settings.setHaSharedCategoriesEnabled(enabled)
-            refresh()
+            val source = settings
+            submitUiOwnerAction("sharedCategories", allowDuplicate = true,
+                work = { source.setHaSharedCategoriesEnabled(enabled) }, onSuccess = { refresh() })
         }
 
         override fun onStartMqtt() {
@@ -698,54 +905,56 @@ class MainActivity : ComponentActivity() {
             if (actionUiState.mqttTest || actionUiState.mqttCleanup || CollectorService.mqttConnection.owned) return
             if (!CollectorService.mqttConnection.owned && !validateMqttDraft()) return
             requestAccessCheck("start_mqtt", AccessCheckMode.NORMAL)
-            if (!saveMqttDraft()) {
-                refresh()
-                return
-            }
-            settings.setMqttManuallyStopped(false)
-            settings.setMqttEnabled(true)
-            runCatching { CollectorServiceController.startMqttExport(this@MainActivity) }.onFailure { error ->
-                if (!CollectorService.mqttConnection.owned) settings.setMqttEnabled(false)
-                showOperationFailure("mqttStart", error)
-            }
-            refresh()
+            val draft = mqttDraft
+            val loaded = credentialsLoaded
+            val source = settings
+            submitUiOwnerAction("mqttStart", work = {
+                saveMqttDraft(source, draft, loaded)
+                source.setMqttManuallyStopped(false)
+                source.setMqttEnabled(true)
+                try { CollectorServiceController.startMqttExport(applicationContext) }
+                catch (error: Exception) {
+                    if (!CollectorService.mqttConnection.owned) source.setMqttEnabled(false)
+                    throw error
+                }
+            }, onSuccess = { refresh() })
         }
 
         override fun onStopMqtt() {
             refreshStoreBackedState()
-            settings.setMqttManuallyStopped(true)
-            settings.setMqttEnabled(false)
-            runCatching { CollectorServiceController.stopMqttExport(this@MainActivity) }.onFailure { error ->
-                showOperationFailure("mqttStop", error)
-            }
-            refresh()
+            val source = settings
+            submitUiOwnerAction("mqttStop", work = {
+                source.setMqttManuallyStopped(true)
+                source.setMqttEnabled(false)
+                CollectorServiceController.stopMqttExport(applicationContext)
+            }, onSuccess = { refresh() })
         }
 
         override fun onTestMqtt() {
             if (actionUiState.mqttTest || actionUiState.mqttCleanup || !validateMqttDraft(mqttDraft.editingProfile)) return
             val selected = mqttDraft.editingProfile
             actionUiState = actionUiState.copy(mqttTest = true)
-            if (BuildConfig.RUNTIME_CLIENT) {
-                if (saveMqttDraft()) submitRuntimeJob("mqttTest", JSONObject().put("profile", selected.name))
-                else actionUiState = actionUiState.copy(mqttTest = false)
-                return
-            }
-            runMqttChannelAction("MQTT") { actionStore ->
-                HaMqttActions.testConnection(actionStore, settings, profile = selected)
-            }
+            val draft = mqttDraft
+            val loaded = credentialsLoaded
+            val source = settings
+            submitRuntimeJob("mqttTest", JSONObject().put("profile", selected.name),
+                beforeSubmit = { saveMqttDraft(source, draft, loaded) })
         }
 
         override fun onToggleMqttAutoStart(enabled: Boolean) {
-            if (!enabled && CollectorService.mqttConnection.owned && !CollectorService.mqttConnection.stopping &&
-                !settings.isMqttManuallyStopped()) if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("grantMqtt") else HaRunSession.process.start(HaExportChannel.MQTT)
-            if (enabled) settings.setMqttManuallyStopped(false)
-            settings.setMqttAutoStartEnabled(enabled)
-            refresh()
+            val source = settings
+            submitUiOwnerAction("mqttAuto", allowDuplicate = true, work = {
+                if (!enabled && CollectorService.mqttConnection.owned && !CollectorService.mqttConnection.stopping &&
+                    !source.isMqttManuallyStopped()) if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("grantMqtt") else HaRunSession.process.start(HaExportChannel.MQTT)
+                if (enabled) source.setMqttManuallyStopped(false)
+                source.setMqttAutoStartEnabled(enabled)
+            }, onSuccess = { refresh() })
         }
 
         override fun onToggleMqttCategory(category: String, enabled: Boolean) {
-            settings.setMqttCategoryEnabled(category, enabled)
-            refresh()
+            val source = settings
+            submitUiOwnerAction("mqttCategory", allowDuplicate = true,
+                work = { source.setMqttCategoryEnabled(category, enabled) }, onSuccess = { refresh() })
         }
 
         override fun onMqttDraftChanged(draft: MqttDraft) {
@@ -754,7 +963,10 @@ class MainActivity : ComponentActivity() {
                 mqttCredentialRevision += 1L
             }
             mqttDraft = draft
-            saveMqttDraft()
+            val source = settings
+            val loaded = credentialsLoaded
+            submitUiOwnerAction("mqttSave", allowDuplicate = true,
+                work = { saveMqttDraft(source, draft, loaded) }, onSuccess = { refresh() })
         }
 
         override fun onRefreshMqttCleanup() = refreshMqttCleanupGroups()
@@ -772,53 +984,56 @@ class MainActivity : ComponentActivity() {
             if (actionUiState.influxTest || CollectorService.influxConnection.owned) return
             if (!CollectorService.influxConnection.owned && !validateInfluxDraft()) return
             requestAccessCheck("start_influx", AccessCheckMode.NORMAL)
-            if (!saveInfluxDraft()) {
-                refresh()
-                return
-            }
-            settings.setInfluxManuallyStopped(false)
-            settings.setInfluxEnabled(true)
-            runCatching { CollectorServiceController.startInfluxExport(this@MainActivity) }.onFailure { error ->
-                if (!CollectorService.influxConnection.owned) settings.setInfluxEnabled(false)
-                showOperationFailure("influxStart", error)
-            }
-            refresh()
+            val draft = influxDraft
+            val loaded = credentialsLoaded
+            val source = settings
+            submitUiOwnerAction("influxStart", work = {
+                saveInfluxDraft(source, draft, loaded)
+                source.setInfluxManuallyStopped(false)
+                source.setInfluxEnabled(true)
+                try { CollectorServiceController.startInfluxExport(applicationContext) }
+                catch (error: Exception) {
+                    if (!CollectorService.influxConnection.owned) source.setInfluxEnabled(false)
+                    throw error
+                }
+            }, onSuccess = { refresh() })
         }
 
         override fun onStopInflux() {
             refreshStoreBackedState()
-            settings.setInfluxManuallyStopped(true)
-            settings.setInfluxEnabled(false)
-            runCatching { CollectorServiceController.stopInfluxExport(this@MainActivity) }.onFailure { error ->
-                showOperationFailure("influxStop", error)
-            }
-            refresh()
+            val source = settings
+            submitUiOwnerAction("influxStop", work = {
+                source.setInfluxManuallyStopped(true)
+                source.setInfluxEnabled(false)
+                CollectorServiceController.stopInfluxExport(applicationContext)
+            }, onSuccess = { refresh() })
         }
 
         override fun onTestInflux() {
             if (actionUiState.influxTest || !validateInfluxDraft(influxDraft.editingProfile)) return
             val selected = influxDraft.editingProfile
             actionUiState = actionUiState.copy(influxTest = true)
-            if (BuildConfig.RUNTIME_CLIENT) {
-                if (saveInfluxDraft()) submitRuntimeJob("influxTest", JSONObject().put("profile", selected.name))
-                return
-            }
-            runInfluxChannelAction("InfluxDB", clearAction = { it.copy(influxTest = false) }) { actionStore ->
-                InfluxActions.testConnection(actionStore, settings, profile = selected)
-            }
+            val draft = influxDraft
+            val loaded = credentialsLoaded
+            val source = settings
+            submitRuntimeJob("influxTest", JSONObject().put("profile", selected.name),
+                beforeSubmit = { saveInfluxDraft(source, draft, loaded) })
         }
 
         override fun onToggleInfluxAutoStart(enabled: Boolean) {
-            if (!enabled && CollectorService.influxConnection.owned && !CollectorService.influxConnection.stopping &&
-                !settings.isInfluxManuallyStopped()) if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("grantInflux") else HaRunSession.process.start(HaExportChannel.INFLUX)
-            if (enabled) settings.setInfluxManuallyStopped(false)
-            settings.setInfluxAutoStartEnabled(enabled)
-            refresh()
+            val source = settings
+            submitUiOwnerAction("influxAuto", allowDuplicate = true, work = {
+                if (!enabled && CollectorService.influxConnection.owned && !CollectorService.influxConnection.stopping &&
+                    !source.isInfluxManuallyStopped()) if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("grantInflux") else HaRunSession.process.start(HaExportChannel.INFLUX)
+                if (enabled) source.setInfluxManuallyStopped(false)
+                source.setInfluxAutoStartEnabled(enabled)
+            }, onSuccess = { refresh() })
         }
 
         override fun onToggleInfluxCategory(category: String, enabled: Boolean) {
-            settings.setInfluxCategoryEnabled(category, enabled)
-            refresh()
+            val source = settings
+            submitUiOwnerAction("influxCategory", allowDuplicate = true,
+                work = { source.setInfluxCategoryEnabled(category, enabled) }, onSuccess = { refresh() })
         }
 
         override fun onInfluxDraftChanged(draft: InfluxDraft) {
@@ -827,78 +1042,152 @@ class MainActivity : ComponentActivity() {
                 influxCredentialRevision += 1L
             }
             influxDraft = draft
-            saveInfluxDraft()
+            val source = settings
+            val loaded = credentialsLoaded
+            submitUiOwnerAction("influxSave", allowDuplicate = true,
+                work = { saveInfluxDraft(source, draft, loaded) }, onSuccess = { refresh() })
         }
 
         override fun onToggleConnectivityRecovery(enabled: Boolean) {
-            updateKeepAliveSetting(enabled) { settings.setConnectivityRecoveryEnabled(it) }
+            val source = settings
+            updateKeepAliveSetting("connectivityRecovery", enabled) { source.setConnectivityRecoveryEnabled(it) }
         }
 
         override fun onToggleKeepBluetooth(enabled: Boolean) {
-            updateKeepAliveSetting(enabled) { settings.setKeepBluetoothEnabled(it) }
+            val source = settings
+            updateKeepAliveSetting("bluetoothRecovery", enabled) { source.setKeepBluetoothEnabled(it) }
         }
 
         override fun onToggleKeepCollector(enabled: Boolean) {
-            updateKeepAliveSetting(enabled) { settings.setRecoverCollectorServiceEnabled(it) }
+            val source = settings
+            updateKeepAliveSetting("collectorRecovery", enabled) { source.setRecoverCollectorServiceEnabled(it) }
         }
 
         override fun onToggleTailscaleActivation(enabled: Boolean) {
             refreshStoreBackedState()
-            settings.setTailscaleActivationEnabled(enabled)
-            refresh()
+            val source = settings
+            submitUiOwnerAction("tailscale", allowDuplicate = true,
+                work = { source.setTailscaleActivationEnabled(enabled) }, onSuccess = { refresh() })
         }
 
         override fun onToggleUpdateAutoCheck(enabled: Boolean) {
-            settings.setUpdateAutoCheckEnabled(enabled)
-            updateRuntime.onAutoCheckEnabledChanged()
-            refresh()
+            val source = settings
+            if (!BuildConfig.RUNTIME_CLIENT) {
+                source.setUpdateAutoCheckEnabled(enabled)
+                updateRuntime.onAutoCheckEnabledChanged()
+                refresh()
+                return
+            }
+            submitUiOwnerAction("updateAutoCheck", failureKind = "settings", work = {
+                source.setUpdateAutoCheckEnabled(enabled)
+                updateRuntime.onAutoCheckEnabledChanged()
+            }, onSuccess = { refresh() })
         }
 
         override fun onCheckForUpdates() {
-            val reopened = try {
-                RuntimeJobsService.reopenUpdateDialog(this@MainActivity, updateDownloadJobId)
-            } catch (error: Exception) {
-                Log.w(TAG, "Could not reopen update task", error)
-                recordOperationalEvent("runtime_update_reopen_failed", "Could not reopen update progress", error.diagnosticDetail())
-                updateUiState = UpdateUiState.Error("Runtime update status unavailable")
-                syncReleaseNotesUi()
-                return
-            }
-            if (reopened == null) {
-                runUpdateCheck(force = true)
-                return
-            }
-            val id = reopened.first
-            updateDownloadJobId = id
-            dismissedUpdateJobs.remove(id)
-            presentedRuntimeJobs.remove(id)
-            consumeRuntimeJobs(reopened.second)
+            val context = applicationContext
+            val selectedId = updateDownloadJobId
+            val requestGeneration = updateUiGeneration
+            submitUiOwnerAction("updateReopen", failureKind = "updateReopen",
+                work = { RuntimeJobsService.reopenUpdateDialog(context, selectedId) },
+                onSuccess = { reopened ->
+                    if (updateUiGeneration != requestGeneration) {
+                        reopened?.first?.let(::persistDismissedUpdateJob)
+                        return@submitUiOwnerAction
+                    }
+                    if (reopened == null) {
+                        runUpdateCheck(force = true)
+                        return@submitUiOwnerAction
+                    }
+                    val id = reopened.first
+                    updateDownloadJobId = id
+                    dismissedUpdateJobs.remove(id)
+                    presentedRuntimeJobs.remove(id)
+                    consumeRuntimeJobs(reopened.second)
+                },
+                onFailure = { error ->
+                    Log.w(TAG, "Could not reopen update task", error)
+                    recordOperationalEvent("runtime_update_reopen_failed", "Could not reopen update progress", error.diagnosticDetail())
+                    if (updateUiGeneration == requestGeneration) {
+                        updateUiState = UpdateUiState.Error("Runtime update status unavailable")
+                        syncReleaseNotesUi()
+                    }
+                })
         }
 
         override fun onToggleUpdateHint(enabled: Boolean) {
-            settings.setUpdateHintEnabled(enabled)
-            updateHintEnabled = settings.isUpdateHintEnabled()
-            if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("hintStyle", Bundle().apply { putBoolean("dark", darkTheme) })
-            else (applicationContext as BydCollectorApplication).updateHints.refresh(darkTheme)
-            if (enabled) maybeRequestOverlayAccess(userInitiated = true)
-            updateRuntime.onPresentationAccessChanged()
+            val source = settings
+            val dark = darkTheme
+            val app = applicationContext as BydCollectorApplication
+            if (!BuildConfig.RUNTIME_CLIENT) {
+                source.setUpdateHintEnabled(enabled)
+                updateHintEnabled = source.isUpdateHintEnabled()
+                app.updateHints.refresh(dark)
+                if (enabled) maybeRequestOverlayAccess(userInitiated = true)
+                updateRuntime.onPresentationAccessChanged()
+                return
+            }
+            updateHintEnabled = enabled
+            submitUiOwnerAction("updateHint", failureKind = "settings", work = {
+                source.setUpdateHintEnabled(enabled)
+                RuntimeClient.control("hintStyle", Bundle().apply { putBoolean("dark", dark) })
+                updateRuntime.onPresentationAccessChanged()
+                source.isUpdateHintEnabled()
+            }, onSuccess = { saved ->
+                updateHintEnabled = saved
+                if (saved) maybeRequestOverlayAccess(userInitiated = true)
+            }, onFailure = { error ->
+                updateHintEnabled = source.isUpdateHintEnabled()
+                showOperationFailure("settings", error)
+            })
         }
 
         override fun onUpdateHintAppearanceChanged(appearance: UpdateHintAppearance) {
-            settings.setUpdateHintAppearance(appearance)
-            updateHintAppearance = settings.updateHintAppearance()
-            if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("hintStyle", Bundle().apply { putBoolean("dark", darkTheme) })
-            else (applicationContext as BydCollectorApplication).updateHints.refresh(darkTheme)
+            val source = settings
+            val dark = darkTheme
+            val app = applicationContext as BydCollectorApplication
+            if (!BuildConfig.RUNTIME_CLIENT) {
+                source.setUpdateHintAppearance(appearance)
+                updateHintAppearance = source.updateHintAppearance()
+                app.updateHints.refresh(dark)
+                return
+            }
+            val previous = updateHintAppearance
+            updateHintAppearance = appearance
+            submitUiOwnerAction("updateHintAppearance", failureKind = "settings", work = {
+                source.setUpdateHintAppearance(appearance)
+                RuntimeClient.control("hintStyle", Bundle().apply { putBoolean("dark", dark) })
+                source.updateHintAppearance()
+            }, onSuccess = { updateHintAppearance = it }, onFailure = { error ->
+                updateHintAppearance = previous
+                showOperationFailure("settings", error)
+            })
         }
 
         override fun onDismissUpdateDialog() {
-            updateDownloadJobId?.let { id ->
+            val id = updateDownloadJobId
+            id?.let {
                 // Fence an already-read progress snapshot before persisting the dismissal.
-                dismissedUpdateJobs += id
-                runCatching { RuntimeJobsService.dismissUpdateDialog(this@MainActivity, id) }
-                    .onFailure { Log.w(TAG, "Could not persist update dialog dismissal", it) }
+                dismissedUpdateJobs += it
             }
-            updateRuntime.dismissOffer()
+            if (BuildConfig.RUNTIME_CLIENT) {
+                val context = applicationContext
+                submitUiOwnerAction("updateDismiss", failureKind = "updateDismiss", work = {
+                    id?.let { RuntimeJobsService.dismissUpdateDialog(context, it) }
+                    updateRuntime.dismissOffer()
+                }, onSettled = { result ->
+                    if (destroyed) result.exceptionOrNull()?.let { processUpdateDismissFailure = it }
+                })
+            } else {
+                id?.let { selected ->
+                    submitUiOwnerAction("updateDismissJob", failureKind = "updateDismiss",
+                        work = { RuntimeJobsService.dismissUpdateDialog(applicationContext, selected) },
+                        onSettled = { result ->
+                            if (destroyed) result.exceptionOrNull()?.let { processUpdateDismissFailure = it }
+                        })
+                }
+                updateRuntime.dismissOffer()
+            }
             updatePresentationRevision = updateChecks.snapshot().revision
             updateUiGeneration += 1L
             updateUiState = UpdateUiState.Hidden
@@ -907,10 +1196,7 @@ class MainActivity : ComponentActivity() {
         override fun onInstallUpdate() {
             when (val state = updateUiState) {
                 is UpdateUiState.Available -> startUpdateDownload(state.info)
-                is UpdateUiState.Cancelled -> {
-                    val previousId = updateDownloadJobId
-                    if (startUpdateDownload(state.info)) previousId?.let { runCatching { RuntimeJobsService.presented(this@MainActivity, it) } }
-                }
+                is UpdateUiState.Cancelled -> startUpdateDownload(state.info)
                 else -> Unit
             }
         }
@@ -922,44 +1208,61 @@ class MainActivity : ComponentActivity() {
                 else -> return
             }
             val id = updateDownloadJobId ?: return
-            val result = runCatching { RuntimeJobsService.cancelUpdateDownload(this@MainActivity, id) }
-                .onFailure { error ->
+            val requestGeneration = updateUiGeneration
+            updateUiState = UpdateUiState.Cancelling(info)
+            syncReleaseNotesUi()
+            submitUiOwnerAction("updateCancel", failureKind = "updateCancel",
+                work = { RuntimeJobsService.cancelUpdateDownload(applicationContext, id) },
+                onSuccess = { result ->
+                    if (updateUiGeneration != requestGeneration) return@submitUiOwnerAction
+                    updateUiState = when (result) {
+                        "REQUESTED" -> UpdateUiState.Cancelling(info)
+                        "CANCELLED" -> UpdateUiState.Cancelled(info)
+                        "INSTALLER_CLAIMED" -> UpdateUiState.Hidden
+                        else -> UpdateUiState.CancelError(info)
+                    }
+                    syncReleaseNotesUi()
+                }, onFailure = { error ->
                     Log.w(TAG, "Could not cancel update download", error)
                     recordOperationalEvent("runtime_update_cancel_failed", "Could not cancel update download", error.diagnosticDetail())
-                }.getOrNull()
-            updateUiState = when (result) {
-                "REQUESTED" -> UpdateUiState.Cancelling(info)
-                "CANCELLED" -> UpdateUiState.Cancelled(info)
-                "INSTALLER_CLAIMED" -> UpdateUiState.Hidden
-                else -> UpdateUiState.CancelError(info)
-            }
-            syncReleaseNotesUi()
-            if (result == null) Toast.makeText(this@MainActivity, strings(uiLanguage).updateCancelFailed, Toast.LENGTH_LONG).show()
+                    if (updateUiGeneration != requestGeneration) return@submitUiOwnerAction
+                    updateUiState = UpdateUiState.CancelError(info)
+                    syncReleaseNotesUi()
+                    Toast.makeText(this@MainActivity, strings(uiLanguage).updateCancelFailed, Toast.LENGTH_LONG).show()
+                })
         }
+
+        override fun onUpdateDialogPresented() = this@MainActivity.onUpdateDialogPresented()
 
         override fun onShutdownApp() {
             if (shutdownReopenInFlight || CollectorService.isUserShutdownInProgress()) return
-            if (!settings.setUserShutdownRequested(true)) {
-                showShutdownFailure("Could not save Shutdown request")
-                return
-            }
             shutdownUiRequested = true
             handler.removeCallbacks(startupAdbSelfCheckTask)
             startupAdbSelfCheckPosted = false
-            handler.removeCallbacks(telegramReconcileTask)
-            if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("cancelWatchdog")
-            else CollectorAutoStart.cancelScheduled(applicationContext)
-            updateRuntime.shutdown()
+            if (!BuildConfig.RUNTIME_CLIENT) updateRuntime.shutdown()
             updateUiGeneration += 1L
             updateUiState = UpdateUiState.Hidden
-            try {
-                CollectorServiceController.shutdown(this@MainActivity)
-            } catch (error: RuntimeException) {
+            val source = settings
+            val context = applicationContext
+            submitUiOwnerAction("shutdown", failureKind = "shutdown", work = {
+                if (!source.setUserShutdownRequested(true)) error("Could not save Shutdown request")
+                try {
+                    if (BuildConfig.RUNTIME_CLIENT) {
+                        RuntimeClient.control("cancelWatchdog")
+                        updateRuntime.shutdown()
+                    } else CollectorAutoStart.cancelScheduled(context)
+                    CollectorServiceController.shutdown(context)
+                } catch (error: RuntimeException) {
+                    source.setUserShutdownPhase(CollectorSettings.SHUTDOWN_PHASE_ERROR,
+                        detail = "${error::class.java.simpleName}: ${error.message}")
+                    throw error
+                }
+            }, onFailure = { error ->
                 shutdownUiRequested = false
-                settings.setUserShutdownPhase(CollectorSettings.SHUTDOWN_PHASE_ERROR,
-                    detail = "${error::class.java.simpleName}: ${error.message}")
-                showShutdownFailure(settings.userShutdownDetail().orEmpty())
-            }
+                val detail = if (error.message == "Could not save Shutdown request") error.message.orEmpty()
+                else source.userShutdownDetail().orEmpty().ifBlank { error.diagnosticDetail() }
+                showShutdownFailure(detail)
+            })
         }
 
         override fun onStartLogcat() {
@@ -1578,7 +1881,6 @@ class MainActivity : ComponentActivity() {
         }
         handler.removeCallbacks(updateCheckUiTask)
         handler.removeCallbacks(startupAdbSelfCheckTask)
-        handler.removeCallbacks(telegramReconcileTask)
         handler.removeCallbacks(currentTripRefreshTask)
         super.onDestroy()
     }
@@ -1625,7 +1927,9 @@ class MainActivity : ComponentActivity() {
 
     private fun reconcileCutoverArchiveStorageIfNeeded() {
         if (settings.isCutoverArchiveStoragePending() && !CollectorService.isArchiveStorageActive()) {
-            CollectorServiceController.reconcileArchiveStorage(this)
+            submitUiOwnerAction("archiveReconcile", work = {
+                CollectorServiceController.reconcileArchiveStorage(applicationContext)
+            })
         }
     }
 
@@ -2073,6 +2377,10 @@ class MainActivity : ComponentActivity() {
     private fun refresh(force: Boolean = true) {
         if (destroyed || !foreground) return
         if (BuildConfig.RUNTIME_CLIENT && !runtimeCompatibleForUi) return
+        processUpdateDismissFailure?.let { error ->
+            processUpdateDismissFailure = null
+            showOperationFailure("updateDismiss", error)
+        }
         val nowMs = SystemClock.elapsedRealtime()
         val tab = activeTab
         val profile = dashboardProfile(tab)
@@ -2210,13 +2518,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun updateKeepAliveSetting(
+        operation: String,
         enabled: Boolean,
         applySetting: (Boolean) -> Unit
     ) {
-        refreshStoreBackedState()
-        applySetting(enabled)
-        CollectorServiceController.reconcileKeepAlive(this@MainActivity)
-        refresh()
+        submitUiOwnerAction(operation, allowDuplicate = true, work = {
+            applySetting(enabled)
+            CollectorServiceController.reconcileKeepAlive(applicationContext)
+        }, onSuccess = { refresh() })
     }
 
     private fun maybeRunStartupSetup(): Boolean {
@@ -2504,9 +2813,22 @@ class MainActivity : ComponentActivity() {
         onTerminal: (() -> Unit)? = null
     ): Boolean {
         if (BuildConfig.RUNTIME_CLIENT) {
-            val id = submitRuntimeJob("access", JSONObject().put("source", source).put("mode", mode.name)) ?: return false
-            runtimeJobCallbacks[id] = { success -> if (success) afterComplete?.invoke(); onTerminal?.invoke() }
-            return true
+            return submitRuntimeJob(
+                "access",
+                JSONObject().put("source", source).put("mode", mode.name),
+                onSubmitted = { id ->
+                    runtimeJobCallbacks[id] = { success ->
+                        if (success) afterComplete?.invoke()
+                        onTerminal?.invoke()
+                    }
+                    accessJobSubmissionsPending = (accessJobSubmissionsPending - 1).coerceAtLeast(0)
+                    refresh()
+                },
+                onFailure = { error ->
+                    showOperationFailure("access", error)
+                    onTerminal?.invoke()
+                }
+            )
         }
         return AdbAuthorizationManager.request(
             context = applicationContext,
@@ -2539,6 +2861,15 @@ class MainActivity : ComponentActivity() {
         if (destroyed || !foreground || updateUiState is UpdateUiState.Downloading ||
             updateUiState is UpdateUiState.Cancelling || updateUiState is UpdateUiState.Cancelled ||
             updateUiState is UpdateUiState.CancelError) return
+        if (BuildConfig.RUNTIME_CLIENT) {
+            submitUiOwnerAction("updateCheck", failureKind = "updateCheck",
+                work = { updateRuntime.request(manual = force) },
+                onSuccess = { accepted ->
+                    if (accepted) updateUiGeneration += 1L
+                    syncUpdateCheckUi()
+                })
+            return
+        }
         val accepted = updateRuntime.request(manual = force)
         if (accepted) {
             updateUiGeneration += 1L
@@ -2553,9 +2884,9 @@ class MainActivity : ComponentActivity() {
         updatePresentationRevision = snapshot.revision
         updateOfferResultId = snapshot.availableResultId
         // The native job owns its modal after an offer has become a download.
-        if (updateDownloadJobId != null && (updateUiState is UpdateUiState.Downloading ||
+        if (actionUiState.isPending("updateInstall") || (updateDownloadJobId != null && (updateUiState is UpdateUiState.Downloading ||
                 updateUiState is UpdateUiState.Cancelling || updateUiState is UpdateUiState.Cancelled ||
-                updateUiState is UpdateUiState.CancelError)) return
+                updateUiState is UpdateUiState.CancelError))) return
         updateUiState = snapshot.uiState
         (updateUiState as? UpdateUiState.Available)?.let { releaseNotesHistory.request(it.info) }
         syncReleaseNotesUi()
@@ -2578,23 +2909,56 @@ class MainActivity : ComponentActivity() {
         (applicationContext as BydCollectorApplication).recordUpdateEvent(message, detail)
     }
 
-    private fun startUpdateDownload(info: UpdateInfo): Boolean {
-        updateRuntime.onInstallStarted()
-        if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.control("updateClear") else updateChecks.clearPresentation()
-        updatePresentationRevision = updateChecks.snapshot().revision
-        val id = submitRuntimeJob("updateDownload", JSONObject().put("version", info.version).put("url", info.downloadUrl)
-            .put("notes", info.releaseNotes).put("contentType", info.downloadContentType))
-        if (id == null) {
-            updateRuntime.onInstallFinished()
-            updateUiState = UpdateUiState.Error("Could not start the update download")
-            syncReleaseNotesUi()
-            return false
+    private fun startUpdateDownload(info: UpdateInfo) {
+        if (!BuildConfig.RUNTIME_CLIENT) {
+            updateRuntime.onInstallStarted()
+            updateChecks.clearPresentation()
+            updatePresentationRevision = updateChecks.snapshot().revision
         }
-        updateDownloadJobId = id
-        dismissedUpdateJobs.remove(id)
         updateUiState = UpdateUiState.Downloading(info, 0)
         syncReleaseNotesUi()
-        return true
+        val requestGeneration = updateUiGeneration
+        val context = applicationContext
+        val args = JSONObject().put("version", info.version).put("url", info.downloadUrl)
+            .put("notes", info.releaseNotes).put("contentType", info.downloadContentType)
+        submitUiOwnerAction("updateInstall", failureKind = "updateDownload", work = {
+            if (BuildConfig.RUNTIME_CLIENT) {
+                updateRuntime.onInstallStarted()
+                RuntimeClient.control("updateClear")
+            }
+            try {
+                if (BuildConfig.RUNTIME_CLIENT) {
+                    RuntimeEndpoint.call(context, "job.submit", Bundle().apply {
+                        putString("kind", "updateDownload")
+                        putString("args", args.toString())
+                    }).getString("id") ?: error("Runtime did not accept the update task")
+                } else RuntimeJobsService.submit(context, "updateDownload", args)
+            } catch (error: Throwable) {
+                if (BuildConfig.RUNTIME_CLIENT) updateRuntime.onInstallFinished()
+                throw error
+            }
+        }, onSuccess = { id ->
+            updateDownloadJobId = id
+            if (updateUiGeneration != requestGeneration) {
+                persistDismissedUpdateJob(id)
+                return@submitUiOwnerAction
+            }
+            dismissedUpdateJobs.remove(id)
+            updateUiState = UpdateUiState.Downloading(info, 0)
+            syncReleaseNotesUi()
+            refresh()
+        }, onFailure = { error ->
+            if (!BuildConfig.RUNTIME_CLIENT) updateRuntime.onInstallFinished()
+            if (updateUiGeneration == requestGeneration) {
+                updateUiState = UpdateUiState.Error(error.message ?: "Could not start the update download")
+                syncReleaseNotesUi()
+                showOperationFailure("updateDownload", error)
+            }
+        }, onSettled = { result ->
+            result.getOrNull()?.let { id ->
+                if (updateUiGeneration != requestGeneration) persistDismissedUpdateJob(id)
+            }
+        })
     }
 
     private fun loadCredentialsAfterFirstFrame() {
@@ -2667,39 +3031,25 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun saveMqttDraft(): Boolean {
-        if (CollectorService.mqttConnection.owned) return true
-        if (actionUiState.mqttCleanup) return false
-        return runCatching {
-            //keeps saved passwords sticky while empty password fields mean "leave existing secret unchanged"
-            settings.setMqttHost(mqttDraft.host)
-            settings.setMqttPort(mqttDraft.port.toIntOrNull() ?: 0)
-            settings.setMqttAlternativeHost(mqttDraft.alternativeHost)
-            settings.setMqttAlternativePort(if (mqttDraft.alternativePort.isBlank()) null else mqttDraft.alternativePort.toIntOrNull() ?: 0)
-            val usernameStored = if (credentialsLoaded || mqttDraft.username.isNotBlank()) {
-                settings.setMqttUsername(mqttDraft.username)
-            } else {
-                true
-            }
-            val passwordStored = mqttDraft.password.isBlank() || settings.setMqttPassword(mqttDraft.password)
-            settings.setMqttClientId(mqttDraft.clientId)
-            settings.setMqttTopicPrefix(mqttDraft.topicPrefix)
-            settings.setMqttDiscoveryPrefix(mqttDraft.discoveryPrefix)
-            settings.setMqttDeviceId(mqttDraft.deviceId)
-            settings.setMqttDeviceIdentifier(mqttDraft.deviceIdentifier)
-            settings.setMqttDeviceName(mqttDraft.deviceName)
-            settings.setMqttDeviceModel(mqttDraft.deviceModel)
-            val stored = usernameStored && passwordStored
-            if (!stored) {
-                mqttDraft = mqttDraft.copy(
-                    username = settings.mqttUsername(),
-                    password = settings.mqttPassword()
-                )
-            }
-            stored
-        }.getOrElse {
-            showOperationFailure("mqttSave", it)
-            false
+    private fun saveMqttDraft(source: CollectorSettings, draft: MqttDraft, credentialsReady: Boolean) {
+        check(!CollectorService.mqttConnection.owned) { "MQTT is already active" }
+        // Empty password means retain the existing secret, not clear it.
+        val config = source.mqttConfig(includeCredentials = false).copy(
+            host = draft.host,
+            port = draft.port.toIntOrNull() ?: 0,
+            clientId = draft.clientId,
+            topicPrefix = draft.topicPrefix,
+            discoveryPrefix = draft.discoveryPrefix,
+            deviceId = draft.deviceId,
+            deviceIdentifier = draft.deviceIdentifier,
+            deviceName = draft.deviceName,
+            deviceModel = draft.deviceModel,
+            alternativeHost = draft.alternativeHost,
+            alternativePort = if (draft.alternativePort.isBlank()) null else draft.alternativePort.toIntOrNull() ?: 0
+        )
+        val usernameUpdate = if (credentialsReady || draft.username.isNotBlank()) draft.username else null
+        check(source.saveMqttConfiguration(config, usernameUpdate, draft.password.takeIf(String::isNotBlank))) {
+            "MQTT settings or credentials were not persisted"
         }
     }
 
@@ -2718,30 +3068,23 @@ class MainActivity : ComponentActivity() {
         return valid
     }
 
-    private fun saveInfluxDraft(): Boolean {
-        if (CollectorService.influxConnection.owned) return true
+    private fun saveInfluxDraft(source: CollectorSettings, draft: InfluxDraft, credentialsReady: Boolean) {
+        check(!CollectorService.influxConnection.owned) { "InfluxDB is already active" }
         //mirrors mqtt draft semantics so editing non-secret influx fields never clears the stored password
-        settings.setInfluxHost(influxDraft.host)
-        settings.setInfluxPort(influxDraft.port.toIntOrNull() ?: 0)
-        settings.setInfluxAlternativeHost(influxDraft.alternativeHost)
-        settings.setInfluxAlternativePort(if (influxDraft.alternativePort.isBlank()) null else influxDraft.alternativePort.toIntOrNull() ?: 0)
-        val usernameStored = if (credentialsLoaded || influxDraft.username.isNotBlank()) {
-            settings.setInfluxUsername(influxDraft.username)
+        source.setInfluxHost(draft.host)
+        source.setInfluxPort(draft.port.toIntOrNull() ?: 0)
+        source.setInfluxAlternativeHost(draft.alternativeHost)
+        source.setInfluxAlternativePort(if (draft.alternativePort.isBlank()) null else draft.alternativePort.toIntOrNull() ?: 0)
+        val usernameStored = if (credentialsReady || draft.username.isNotBlank()) {
+            source.setInfluxUsername(draft.username)
         } else {
             true
         }
-        val passwordStored = influxDraft.password.isBlank() || settings.setInfluxPassword(influxDraft.password)
-        settings.setInfluxDatabase(influxDraft.database)
-        settings.setInfluxMeasurement(influxDraft.measurement)
-        settings.setInfluxVehicleId(influxDraft.vehicleId)
-        val stored = usernameStored && passwordStored
-        if (!stored) {
-            influxDraft = influxDraft.copy(
-                username = settings.influxUsername(),
-                password = settings.influxPassword()
-            )
-        }
-        return stored
+        val passwordStored = draft.password.isBlank() || source.setInfluxPassword(draft.password)
+        source.setInfluxDatabase(draft.database)
+        source.setInfluxMeasurement(draft.measurement)
+        source.setInfluxVehicleId(draft.vehicleId)
+        check(usernameStored && passwordStored) { "InfluxDB credentials were not persisted" }
     }
 
     private fun validateInfluxDraft(selected: HaEndpointProfile? = null): Boolean {
@@ -2759,8 +3102,12 @@ class MainActivity : ComponentActivity() {
         return valid
     }
 
-    private fun loadTelegramUiState(): TelegramUiState {
-        val localizedMessages = strings(uiLanguage).telegram.messages
+    private fun loadTelegramUiState(
+        settings: CollectorSettings = this.settings,
+        language: UiLanguage = uiLanguage,
+        includeTokenState: Boolean = false
+    ): TelegramUiState {
+        val localizedMessages = strings(language).telegram.messages
         val botToken = ""
         val messages = TelegramMessageType.entries.associateWith { type ->
             val eventKey = type.eventKey()
@@ -2775,7 +3122,7 @@ class MainActivity : ComponentActivity() {
             config = TelegramConfig(
                 enabled = settings.isTelegramEnabled(),
                 botToken = botToken,
-                botTokenSet = settings.isTelegramBotTokenSet(),
+                botTokenSet = includeTokenState && settings.isTelegramBotTokenSet(),
                 chatId = settings.telegramChatId(),
                 chargeStepPercent = settings.telegramChargeStepPercent(),
                 low12vThresholdVolts = settings.telegramLowVoltageThreshold(),
@@ -2792,14 +3139,29 @@ class MainActivity : ComponentActivity() {
 
     private fun onTelegramConfigChanged(config: TelegramConfig) {
         refreshStoreBackedState()
-        val previous = telegramUiState.config
+        if (config.botToken != telegramUiState.config.botToken) telegramCredentialRevision += 1L
+        val revision = ++telegramConfigRevision
+        val source = settings
+        val language = uiLanguage
+        val captured = config.copy(messages = config.messages.toMap())
+        telegramUiState = telegramUiState.copy(config = captured)
+        submitUiOwnerAction("telegramSave", allowDuplicate = true, work = {
+            persistTelegramConfig(source, captured, language)
+        }, onSuccess = { saved ->
+            if (revision == telegramConfigRevision) telegramUiState = saved
+            refresh()
+        })
+    }
+
+    private fun persistTelegramConfig(settings: CollectorSettings, config: TelegramConfig, language: UiLanguage): TelegramUiState {
+        val previousState = loadTelegramUiState(settings, language, includeTokenState = true)
+        val previous = previousState.config.copy(botToken = settings.telegramBotToken())
         val previousTrip = previous.messages[TelegramMessageType.TRIP_SUMMARY]
         val nextTrip = config.messages[TelegramMessageType.TRIP_SUMMARY]
         val tripLimitInputsChanged = previous.sendLocation != config.sendLocation ||
             previous.navigatorMask != config.navigatorMask ||
             previousTrip?.template != nextTrip?.template ||
             previousTrip?.usesDefaultTemplate != nextTrip?.usesDefaultTemplate
-        if (config.botToken != previous.botToken) telegramCredentialRevision += 1L
         var tokenSet = previous.botTokenSet
         var secretWriteFailed = false
 
@@ -2849,7 +3211,7 @@ class MainActivity : ComponentActivity() {
         val nextTestStatus = when {
             secretWriteFailed -> TelegramTestStatus.STORAGE_ERROR
             credentialsChanged -> TelegramTestStatus.NOT_TESTED
-            else -> telegramUiState.testStatus
+            else -> previousState.testStatus
         }
         if (secretWriteFailed) {
             settings.setTelegramConnectionStatus("storage_error", "keystore")
@@ -2862,13 +3224,13 @@ class MainActivity : ComponentActivity() {
             botToken = if (secretWriteFailed) settings.telegramBotToken() else config.botToken,
             botTokenSet = if (secretWriteFailed) settings.isTelegramBotTokenSet() else tokenSet
         )
-        telegramUiState = telegramUiState.copy(
+        val saved = previousState.copy(
             config = effectiveConfig,
             testStatus = nextTestStatus,
             tripTemplateLimitState = if (tripLimitInputsChanged) {
                 TelegramPayloadLimitState.NONE
             } else {
-                telegramUiState.tripTemplateLimitState
+                previousState.tripTemplateLimitState
             }
         )
         if (secretWriteFailed) {
@@ -2879,59 +3241,57 @@ class MainActivity : ComponentActivity() {
         }
 
         val enabledChanged = previous.enabled != effectiveConfig.enabled
-        if (enabledChanged || secretWriteFailed) {
-            handler.removeCallbacks(telegramReconcileTask)
-            CollectorServiceController.reconcileTelegram(this)
-        } else if (credentialsChanged && effectiveConfig.enabled) {
-            handler.removeCallbacks(telegramReconcileTask)
-            handler.postDelayed(telegramReconcileTask, TELEGRAM_RECONCILE_DELAY_MS)
+        if (enabledChanged || secretWriteFailed || (credentialsChanged && effectiveConfig.enabled)) {
+            CollectorServiceController.reconcileTelegram(applicationContext)
         }
+        return saved
     }
 
     private fun onClearTelegramBotToken() {
         refreshStoreBackedState()
         telegramCredentialRevision += 1L
-        val cleared = settings.clearTelegramBotToken()
-        if (!cleared) settings.setTelegramEnabled(false)
-        val persistedToken = settings.telegramBotToken()
-        telegramUiState = telegramUiState.copy(
-            config = telegramUiState.config.copy(
-                enabled = settings.isTelegramEnabled(),
-                botToken = persistedToken,
-                botTokenSet = persistedToken.isNotEmpty()
-            ),
-            testStatus = if (cleared) TelegramTestStatus.NOT_TESTED else TelegramTestStatus.STORAGE_ERROR
-        )
-        if (cleared) {
-            settings.setTelegramConnectionStatus("not_tested", null)
-        } else {
-            settings.setTelegramConnectionStatus("storage_error", "clear_failed")
-            recordOperationalEvent(
-                "telegram_secret_clear_failed",
-                "Telegram bot token could not be cleared from Android Keystore"
+        val revision = ++telegramConfigRevision
+        val source = settings
+        submitUiOwnerAction("telegramClear", work = {
+            val cleared = source.clearTelegramBotToken()
+            if (!cleared) source.setTelegramEnabled(false)
+            val persistedToken = source.telegramBotToken()
+            source.setTelegramConnectionStatus(if (cleared) "not_tested" else "storage_error", if (cleared) null else "clear_failed")
+            if (!cleared) recordOperationalEvent("telegram_secret_clear_failed", "Telegram bot token could not be cleared from Android Keystore")
+            CollectorServiceController.reconcileTelegram(applicationContext)
+            Triple(persistedToken, source.isTelegramEnabled(), cleared)
+        }, onSuccess = { (token, enabled, cleared) ->
+            if (revision == telegramConfigRevision) telegramUiState = telegramUiState.copy(
+                config = telegramUiState.config.copy(enabled = enabled, botToken = token, botTokenSet = token.isNotEmpty()),
+                testStatus = if (cleared) TelegramTestStatus.NOT_TESTED else TelegramTestStatus.STORAGE_ERROR
             )
-        }
-        handler.removeCallbacks(telegramReconcileTask)
-        CollectorServiceController.reconcileTelegram(this)
+        })
     }
 
     private fun onTestTelegramConnection() {
         refreshStoreBackedState()
-        if (!settings.isTelegramBotTokenSet()) {
-            settings.setTelegramConnectionStatus("storage_error", "missing_persisted_token")
-            telegramUiState = telegramUiState.copy(testStatus = TelegramTestStatus.STORAGE_ERROR)
-            return
-        }
         telegramUiState = telegramUiState.copy(testStatus = TelegramTestStatus.TESTING)
-        settings.setTelegramConnectionStatus("testing", null)
-        runCatching { CollectorServiceController.testTelegram(this) }.onFailure { error ->
-            settings.setTelegramConnectionStatus("failed", error.message ?: error::class.java.simpleName)
+        val source = settings
+        submitUiOwnerAction("telegramTest", work = {
+            if (!source.isTelegramBotTokenSet()) {
+                source.setTelegramConnectionStatus("storage_error", "missing_persisted_token")
+            } else {
+                source.setTelegramConnectionStatus("testing", null)
+                try { CollectorServiceController.testTelegram(applicationContext) }
+                catch (error: Exception) {
+                    source.setTelegramConnectionStatus("failed", error.message ?: error::class.java.simpleName)
+                    throw error
+                }
+            }
+        }, onSuccess = { syncTelegramUiRuntimeState() }, onFailure = { error ->
             telegramUiState = telegramUiState.copy(testStatus = TelegramTestStatus.FAILED)
-        }
+            showOperationFailure("telegramTest", error)
+        })
     }
 
     private fun syncTelegramUiRuntimeState() {
         if (telegramUiState.config.messages.isEmpty()) return
+        if (actionUiState.pendingOperations.any { it in setOf("telegramSave", "telegramClear", "telegramTest") }) return
         telegramUiState = telegramUiState.copy(
             config = telegramUiState.config.copy(
                 enabled = settings.isTelegramEnabled()
@@ -2939,78 +3299,6 @@ class MainActivity : ComponentActivity() {
             testStatus = telegramTestStatus(settings.telegramConnectionStatus()),
             tripTemplateLimitState = settings.telegramTripTemplateLimitState()
         )
-    }
-
-    private fun runMqttChannelAction(label: String, action: (TelemetryStore) -> MqttActionResult) {
-        refreshStoreBackedState()
-        if (!saveMqttDraft()) {
-            actionUiState = actionUiState.copy(mqttTest = false)
-            refresh()
-            return
-        }
-        val task = Runnable {
-            val result = runCatching { withTelemetryStoreRead(action) }
-            runOnUiThread {
-                if (destroyed) return@runOnUiThread
-                actionUiState = actionUiState.copy(mqttTest = false)
-                result
-                    .onSuccess { mqttResult ->
-                        val message = connectionTestMessage(strings(uiLanguage), label, mqttResult.ok, mqttResult.message)
-                        Toast.makeText(
-                            this@MainActivity,
-                            message,
-                            if (mqttResult.ok) Toast.LENGTH_SHORT else Toast.LENGTH_LONG
-                        ).show()
-                    }
-                    .onFailure { error ->
-                        showOperationFailure("mqttTest", error)
-                    }
-                refresh()
-            }
-        }
-        runCatching { dashboardExecutor.execute(task) }.onFailure { error ->
-            actionUiState = actionUiState.copy(mqttTest = false)
-            showOperationFailure("mqttTest", error)
-            refresh()
-        }
-    }
-
-    private fun runInfluxChannelAction(
-        label: String,
-        clearAction: (BydCollectorActionUiState) -> BydCollectorActionUiState,
-        action: (TelemetryStore) -> InfluxActionResult
-    ) {
-        refreshStoreBackedState()
-        if (!saveInfluxDraft()) {
-            actionUiState = clearAction(actionUiState)
-            refresh()
-            return
-        }
-        val task = Runnable {
-            val result = runCatching { withTelemetryStoreRead(action) }
-            runOnUiThread {
-                if (destroyed) return@runOnUiThread
-                actionUiState = clearAction(actionUiState)
-                result
-                    .onSuccess { influxResult ->
-                        val message = connectionTestMessage(strings(uiLanguage), label, influxResult.ok, influxResult.message)
-                        Toast.makeText(
-                            this@MainActivity,
-                            message,
-                            if (influxResult.ok) Toast.LENGTH_SHORT else Toast.LENGTH_LONG
-                        ).show()
-                    }
-                    .onFailure { error ->
-                        showOperationFailure("influxTest", error)
-                    }
-                refresh()
-            }
-        }
-        runCatching { dashboardExecutor.execute(task) }.onFailure { error ->
-            actionUiState = clearAction(actionUiState)
-            showOperationFailure("influxTest", error)
-            refresh()
-        }
     }
 
     private fun currentMaintenanceUiState(state: DashboardState? = dashboardUiStateStore.currentChrome()): DbMaintenanceUiState? {
@@ -3238,8 +3526,11 @@ class MainActivity : ComponentActivity() {
         private const val KEY_BACKGROUND_SETTINGS_PENDING_RETURN = "background_settings_pending_return"
         private const val KEY_LOCATION_PERMISSION_SETUP_CONSUMED = "location_permission_setup_consumed"
         private const val STARTUP_ADB_SELF_CHECK_DELAY_MS = 600L
-        private const val TELEGRAM_RECONCILE_DELAY_MS = 600L
         private const val LOCATION_PERMISSION_REQUEST_CODE = 4101
+        private val processPresentedRuntimeJobs = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        private val processPreparingRuntimeJobs = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        private val processDismissedUpdateJobs = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        private var processUpdateDismissFailure: Throwable? = null
     }
 }
 

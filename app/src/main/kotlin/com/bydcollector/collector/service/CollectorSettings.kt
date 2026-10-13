@@ -2,6 +2,7 @@ package com.bydcollector.collector.service
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.Bundle
 import org.json.JSONArray
 import org.json.JSONObject
 import com.bydcollector.collector.update.UpdateHintAppearance
@@ -46,8 +47,9 @@ class CollectorSettings(
         val sharedCategories: Boolean
     )
 
-    private val prefs = com.bydcollector.collector.runtime.RuntimePreferences.get(context)
-    private val secretStore = KeystoreSecretStore(context)
+    private val appContext = context.applicationContext
+    private val prefs = com.bydcollector.collector.runtime.RuntimePreferences.get(appContext)
+    private val secretStore = KeystoreSecretStore(appContext)
 
     init {
         if (!com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) {
@@ -480,6 +482,56 @@ class CollectorSettings(
             KEY_MQTT_DEVICE_MODEL,
             deviceModel.ifBlank { HaDiscoveryBuilder.DEVICE_MODEL }
         ).apply()
+    }
+
+    /** Commits one MQTT draft through the owner guard so identity rejection cannot partially save it. */
+    fun saveMqttConfiguration(
+        config: HaMqttConfig,
+        usernameUpdate: String? = null,
+        passwordUpdate: String? = null
+    ): Boolean {
+        val removals = arrayListOf<String>()
+        val changes = Bundle().apply {
+            putString(KEY_MQTT_HOST, config.host.trim())
+            putInt(KEY_MQTT_PORT, config.port)
+            config.alternativeHost?.trim()?.takeIf(String::isNotBlank)?.let { putString(KEY_MQTT_ALTERNATIVE_HOST, it) }
+                ?: removals.add(KEY_MQTT_ALTERNATIVE_HOST)
+            config.alternativePort?.let { putInt(KEY_MQTT_ALTERNATIVE_PORT, it) }
+                ?: removals.add(KEY_MQTT_ALTERNATIVE_PORT)
+            putString(KEY_MQTT_CLIENT_ID, config.clientId.ifBlank { HaMqttConfig.DEFAULT_CLIENT_ID })
+            putString(KEY_MQTT_TOPIC_PREFIX, config.normalizedTopicPrefix())
+            putString(KEY_MQTT_DISCOVERY_PREFIX, config.normalizedDiscoveryPrefix())
+            putString(KEY_MQTT_DEVICE_ID, config.normalizedDeviceId())
+            putString(KEY_MQTT_DEVICE_IDENTIFIER, config.deviceIdentifier.ifBlank { HaDiscoveryBuilder.DEVICE_IDENTIFIER })
+            putString(KEY_MQTT_DEVICE_NAME, config.deviceName.ifBlank { HaDiscoveryBuilder.DEVICE_NAME })
+            putString(KEY_MQTT_DEVICE_MODEL, config.deviceModel.ifBlank { HaDiscoveryBuilder.DEVICE_MODEL })
+            usernameUpdate?.let { putString(com.bydcollector.collector.runtime.RuntimePreferences.MQTT_USERNAME_EDIT_KEY, it) }
+            passwordUpdate?.let { putString(com.bydcollector.collector.runtime.RuntimePreferences.MQTT_PASSWORD_EDIT_KEY, it) }
+        }
+
+        if (com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) {
+            val editor = prefs.edit()
+            changes.keySet().forEach { key ->
+                @Suppress("DEPRECATION") val value = changes.get(key)
+                when (value) {
+                    is String -> editor.putString(key, value)
+                    is Int -> editor.putInt(key, value)
+                    else -> error("Unsupported MQTT configuration value")
+                }
+            }
+            removals.forEach(editor::remove)
+            return editor.commit()
+        }
+
+        val response = com.bydcollector.collector.runtime.RuntimePreferences.editOwner(
+            appContext,
+            prefs,
+            Bundle().apply {
+                putBundle("changes", changes)
+                putStringArrayList("remove", removals)
+            }
+        )
+        return response.getBoolean("committed") && response.getBoolean("credentialsStored", true)
     }
 
     fun mqttEnabledCategories(): Set<String> {
@@ -1009,7 +1061,8 @@ class CollectorSettings(
             KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_FORMAT,
             KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_NAMES,
             KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_DATABASE_NAME,
-            KEY_STORAGE_CUTOVER_JOURNAL_TARGET_DATABASE_NAME
+            KEY_STORAGE_CUTOVER_JOURNAL_TARGET_DATABASE_NAME,
+            KEY_STORAGE_CUTOVER_JOURNAL_PENDING_ENERGY_COUNT
         )
         if (runCatching { journalKeys.none(prefs::contains) }.getOrDefault(false)) return null
         fun journalString(key: String): String? = runCatching { prefs.getString(key, null) }.getOrNull()
@@ -1032,7 +1085,9 @@ class CollectorSettings(
                     .toSet()
             }.getOrDefault(emptySet()),
             sourceDatabaseName = journalString(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_DATABASE_NAME).orEmpty(),
-            targetDatabaseName = journalString(KEY_STORAGE_CUTOVER_JOURNAL_TARGET_DATABASE_NAME).orEmpty()
+            targetDatabaseName = journalString(KEY_STORAGE_CUTOVER_JOURNAL_TARGET_DATABASE_NAME).orEmpty(),
+            pendingEnergyCount = runCatching { prefs.getLong(KEY_STORAGE_CUTOVER_JOURNAL_PENDING_ENERGY_COUNT, 0L) }
+                .getOrDefault(Long.MIN_VALUE)
         )
     }
 
@@ -1045,6 +1100,7 @@ class CollectorSettings(
             putStringSet(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_NAMES, journal.sourceNames.toSet())
             putString(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_DATABASE_NAME, journal.sourceDatabaseName)
             putString(KEY_STORAGE_CUTOVER_JOURNAL_TARGET_DATABASE_NAME, journal.targetDatabaseName)
+            putLong(KEY_STORAGE_CUTOVER_JOURNAL_PENDING_ENERGY_COUNT, journal.pendingEnergyCount)
             journal.archivePath?.let { putString(KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH, it) }
                 ?: remove(KEY_STORAGE_CUTOVER_JOURNAL_ARCHIVE_PATH)
         }.commit()
@@ -1059,6 +1115,7 @@ class CollectorSettings(
             .remove(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_NAMES)
             .remove(KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_DATABASE_NAME)
             .remove(KEY_STORAGE_CUTOVER_JOURNAL_TARGET_DATABASE_NAME)
+            .remove(KEY_STORAGE_CUTOVER_JOURNAL_PENDING_ENERGY_COUNT)
             .commit()
 
     fun isCutoverArchiveStoragePending(): Boolean =
@@ -1554,6 +1611,7 @@ class CollectorSettings(
         const val KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_NAMES = "storageCutoverJournalSourceNames"
         const val KEY_STORAGE_CUTOVER_JOURNAL_SOURCE_DATABASE_NAME = "storageCutoverJournalSourceDatabaseName"
         const val KEY_STORAGE_CUTOVER_JOURNAL_TARGET_DATABASE_NAME = "storageCutoverJournalTargetDatabaseName"
+        const val KEY_STORAGE_CUTOVER_JOURNAL_PENDING_ENERGY_COUNT = "storageCutoverJournalPendingEnergyCount"
         const val KEY_STORAGE_CUTOVER_ARCHIVE_PENDING = "storageCutoverArchivePending"
         const val DB_MAINTENANCE_RECOVERY_GRACE_MS = 15_000L
         const val DEFAULT_ARCHIVE_STORAGE_LIMIT_GB = 2

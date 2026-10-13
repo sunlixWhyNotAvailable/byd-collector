@@ -75,20 +75,15 @@ class TelegramStore(
         require(message.eventType.isNotBlank()) { "Telegram event type must not be blank" }
         require(message.payload.isNotBlank()) { "Telegram payload must not be blank" }
         val (protectedClause, protectedArgs) = protectedIdFilter(protectedTelegramIds)
-        val expired = db.delete(
-            "telegram_outbox",
-            "created_at_ms < ? AND attempt_count > 0$protectedClause",
-            arrayOf((nowMs - TelegramDatabaseHelper.RETENTION_MS).toString()) + protectedArgs
-        )
         pruneDeliveryReceipts(db, nowMs)
         telegramDeliveryReceipt(db, message.dedupeKey)?.let { receipt ->
             check(receipt.eventType == message.eventType) {
                 "Telegram dedupe key was reused for a different event type"
             }
-            return TelegramEnqueueResult(inserted = false, expiredCount = expired, overflowCount = 0)
+            return TelegramEnqueueResult(inserted = false, expiredCount = 0, overflowCount = 0)
         }
         if (telegramMessageExists(db, message.dedupeKey)) {
-            return TelegramEnqueueResult(inserted = false, expiredCount = expired, overflowCount = 0)
+            return TelegramEnqueueResult(inserted = false, expiredCount = 0, overflowCount = 0)
         }
         val waitsForSummaryKey = message.waitsForSummaryKey?.takeUnless {
             telegramDeliveryReceipt(db, it) != null
@@ -118,7 +113,7 @@ class TelegramStore(
             },
             SQLiteDatabase.CONFLICT_IGNORE
         ) != -1L
-        return TelegramEnqueueResult(inserted, expired, overflow)
+        return TelegramEnqueueResult(inserted, 0, overflow)
     }
 
     fun oldestUnblockedTelegramMessage(eventType: String? = null): TelegramOutboxEntry? {
@@ -216,22 +211,12 @@ class TelegramStore(
             )
         }
 
-    fun pruneTelegramMessages(
-        nowMs: Long = clockMs(),
-        protectedTelegramIds: Set<Long> = emptySet()
-    ): Int {
+    fun pruneTelegramDeliveryReceipts(nowMs: Long = clockMs()) {
         val db = helper.writableDatabase
-        val (protectedClause, protectedArgs) = protectedIdFilter(protectedTelegramIds)
         db.beginTransactionNonExclusive()
         try {
-            val expired = db.delete(
-                "telegram_outbox",
-                "created_at_ms < ? AND attempt_count > 0$protectedClause",
-                arrayOf((nowMs - TelegramDatabaseHelper.RETENTION_MS).toString()) + protectedArgs
-            )
             pruneDeliveryReceipts(db, nowMs)
             db.setTransactionSuccessful()
-            return expired
         } finally {
             db.endTransaction()
         }

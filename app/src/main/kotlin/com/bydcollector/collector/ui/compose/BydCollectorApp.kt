@@ -43,6 +43,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -181,6 +182,10 @@ fun BydCollectorApp(
                 showSupportDialog = false
             }
         }
+        SideEffect {
+            if (updateUiState is UpdateUiState.Error || updateUiState is UpdateUiState.Cancelled ||
+                updateUiState is UpdateUiState.CancelError) actions.onUpdateDialogPresented()
+        }
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -214,7 +219,7 @@ fun BydCollectorApp(
                             //mount only the active tab; navigation state lives in the process-owned session
                             when (activeTab) {
                                 AppTab.MAIN -> MainTab(state, s, actions, actionUiState, navigationSession, tabContentReady)
-                                AppTab.ALL_PARAMETERS -> AllParametersTab(state, s, language, actions, navigationSession, tabContentReady)
+                                AppTab.ALL_PARAMETERS -> AllParametersTab(state, s, language, actions, actionUiState, navigationSession, tabContentReady)
                                 AppTab.TRIPS -> TripsTab(
                                     tripsUiState,
                                     tripsUiActions.copy(onCompressDatabase = { showTripsCompressionConfirm = true }),
@@ -237,7 +242,7 @@ fun BydCollectorApp(
                                          actions.onRefreshMqttCleanup()
                                      }
                                  )
-                                AppTab.TELEGRAM -> TelegramTab(s, telegramUiState, telegramActions, navigationSession)
+                                AppTab.TELEGRAM -> TelegramTab(s, telegramUiState, telegramActions, actionUiState, navigationSession)
                                  AppTab.STORAGE -> StorageTab(
                                     state = state,
                                     strings = s,
@@ -253,6 +258,7 @@ fun BydCollectorApp(
                                     updateAutoCheckEnabled = updateAutoCheckEnabled,
                                     updateHintEnabled = updateHintEnabled,
                                     diagnosticsBusy = diagnosticsBusy,
+                                    actionUiState = actionUiState,
                                     actions = actions,
                                     language = language,
                                     darkTheme = darkTheme,
@@ -283,6 +289,7 @@ fun BydCollectorApp(
                     DatabaseMaintenanceDialog(
                         strings = s,
                         state = databaseMaintenanceUiState,
+                        actionUiState = actionUiState,
                         onConfirm = actions::onConfirmDatabaseMaintenance,
                         onCancel = actions::onCancelDatabaseMaintenance,
                         onDismiss = actions::onDismissDatabaseMaintenance
@@ -318,13 +325,15 @@ fun BydCollectorApp(
                     TripsCompressionDialog(
                         strings = s,
                         state = tripsCompression,
+                        operationPending = actionUiState.isPending("tripCompression"),
+                        dismissPending = actionUiState.isPending("tripCompressionDismiss"),
                         onConfirm = {
                             showTripsCompressionConfirm = false
                             tripsUiActions.onCompressDatabase()
                         },
                         onDismiss = {
                             showTripsCompressionConfirm = false
-                            if (TripCompressionService.dismissResult()) tripsUiActions.onRefreshRequested()
+                            tripsUiActions.onDismissCompressionResult()
                         }
                     )
                 }
@@ -348,6 +357,7 @@ fun BydCollectorApp(
                         appVersionName = appVersionName,
                         language = language,
                         state = updateUiState,
+                        actionUiState = actionUiState,
                         releaseNotesHistory = releaseNotesHistory,
                         onPresented = onUpdateOfferPresented,
                         onDismiss = actions::onDismissUpdateDialog,
@@ -689,13 +699,13 @@ private fun MainCollectionCard(
                 if (status == RuntimeActionStatus.STARTING) strings.starting else strings.start,
                 actions::onStartMain,
                 primary = true,
-                enabled = status != RuntimeActionStatus.STARTING && status != RuntimeActionStatus.RUNNING,
+                enabled = status != RuntimeActionStatus.STARTING && status != RuntimeActionStatus.RUNNING && !actionUiState.isPending("mainStart"),
                 modifier = Modifier.weight(1f)
             )
             ActionButton(
                 if (status == RuntimeActionStatus.STOPPING) strings.stopping else strings.stop,
                 actions::onStopMain,
-                enabled = status != RuntimeActionStatus.STOPPING && status != RuntimeActionStatus.STOPPED,
+                enabled = status != RuntimeActionStatus.STOPPING && status != RuntimeActionStatus.STOPPED && !actionUiState.isPending("mainStop"),
                 modifier = Modifier.weight(1f)
             )
         }
@@ -712,7 +722,7 @@ private fun MainCollectionCard(
             ActionButton(strings.backgroundWork, actions::onOpenBackgroundApps, modifier = Modifier.weight(0.9f))
         }
         SwitchControlRow(
-            SwitchToggle(state?.autoStartEnabled == true, actions::onToggleMainAutoStart),
+            SwitchToggle(state?.autoStartEnabled == true, actions::onToggleMainAutoStart, enabled = !actionUiState.isPending("mainAuto")),
             Modifier.fillMaxWidth().height(42.dp)
         ) {
             Text(strings.autoStart, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
@@ -769,6 +779,7 @@ private fun AllParametersTab(
     strings: UiStrings,
     language: UiLanguage,
     actions: BydCollectorActions,
+    actionUiState: BydCollectorActionUiState,
     session: UiSessionState,
     contentReady: Boolean
 ) {
@@ -799,18 +810,18 @@ private fun AllParametersTab(
                             if (debugStatus == DebugRuntimeStatus.STARTING) strings.starting else strings.start,
                             actions::onStartDebug,
                             primary = true,
-                            enabled = startAllowed,
+                            enabled = startAllowed && !actionUiState.isPending("debugStart"),
                             modifier = Modifier.weight(1f)
                         )
                         ActionButton(
                             if (debugStatus == DebugRuntimeStatus.STOPPING) strings.stopping else strings.stop,
                             actions::onStopDebug,
-                            enabled = debugStatus != DebugRuntimeStatus.STOPPING && debugStatus != DebugRuntimeStatus.STOPPED,
+                            enabled = debugStatus != DebugRuntimeStatus.STOPPING && debugStatus != DebugRuntimeStatus.STOPPED && !actionUiState.isPending("debugStop"),
                             modifier = Modifier.weight(1f)
                         )
                     }
                     SwitchControlRow(
-                        SwitchToggle(state?.debugAutoStartEnabled == true, actions::onToggleDebugAutoStart),
+                        SwitchToggle(state?.debugAutoStartEnabled == true, actions::onToggleDebugAutoStart, enabled = !actionUiState.isPending("debugAuto")),
                         Modifier.fillMaxWidth().height(42.dp)
                     ) {
                         Text(strings.autoStart, color = LocalBydPalette.current.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
@@ -1783,7 +1794,8 @@ private fun HaTab(
         Row(Modifier.fillMaxWidth().height(36.dp), verticalAlignment = Alignment.CenterVertically) {
             ScreenTitle(strings.haTab, strings.haSubtitle, modifier = Modifier.weight(1f))
             SwitchControlRow(
-                SwitchToggle(state?.haSharedCategoriesEnabled == true, actions::onToggleSharedCategories, enabled = state?.influxEnabled != true),
+                SwitchToggle(state?.haSharedCategoriesEnabled == true, actions::onToggleSharedCategories,
+                    enabled = state?.influxEnabled != true && !actionUiState.isPending("sharedCategories")),
                 Modifier.height(36.dp)
             ) {
                 Text(strings.sharedCategories, color = LocalBydPalette.current.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
@@ -1939,14 +1951,22 @@ private fun MqttCard(
             testInFlight = actionUiState.mqttTest,
             connectionOwned = connection.owned,
             connectionStopping = connection.stopping,
-            cleanupInFlight = actionUiState.mqttCleanup
+            cleanupInFlight = actionUiState.mqttCleanup,
+            startPending = actionUiState.isPending("mqttStart"),
+            stopPending = actionUiState.isPending("mqttStop")
         )
         ChannelQueueRow(strings, "${formatCount(state?.mqttPendingCount ?: -1L)} ${strings.messages}",
-            state?.mqttAutoStartEnabled == true, actions::onToggleMqttAutoStart)
-        CategoryGrid(strings.mqttCategories, state?.mqttEnabledCategories.orEmpty(), enabled = controls.edit, strings = strings) { category ->
+            state?.mqttAutoStartEnabled == true, actions::onToggleMqttAutoStart,
+            enabled = !actionUiState.isPending("mqttAuto"))
+        if (actionUiState.isPending("mqttSave")) {
+            Text(strings.loading, color = LocalBydPalette.current.muted, fontSize = 12.sp)
+        }
+        CategoryGrid(strings.mqttCategories, state?.mqttEnabledCategories.orEmpty(),
+            enabled = controls.edit && !actionUiState.isPending("mqttCategory"), strings = strings) { category ->
             actions.onToggleMqttCategory(category, !state?.mqttEnabledCategories.orEmpty().contains(category))
         }
-        val editIdentity = controls.edit && !actionUiState.mqttCleanup
+        val editIdentity = controls.edit && !actionUiState.mqttCleanup &&
+            !actionUiState.isPending("mqttStart")
         CredentialGridMqtt(strings, draft, actions, connection.activeRoute, editIdentity,
             Modifier.onGloballyPositioned { onCredentialHeight(it.size.height) })
         MqttIdentityFields(strings, draft, actions, editIdentity)
@@ -1982,24 +2002,31 @@ private fun InfluxCard(
             runtimeStatus = state?.influxRuntimeStatus ?: RuntimeActionStatus.STOPPED,
             testInFlight = actionUiState.influxTest,
             connectionOwned = connection.owned,
-            connectionStopping = connection.stopping
+            connectionStopping = connection.stopping,
+            startPending = actionUiState.isPending("influxStart"),
+            stopPending = actionUiState.isPending("influxStop")
         )
         ChannelQueueRow(strings, "${formatCount(state?.influxPendingRows ?: -1L)} ${strings.points}",
-            state?.influxAutoStartEnabled == true, actions::onToggleInfluxAutoStart)
+            state?.influxAutoStartEnabled == true, actions::onToggleInfluxAutoStart,
+            enabled = !actionUiState.isPending("influxAuto"))
+        if (actionUiState.isPending("influxSave")) {
+            Text(strings.loading, color = LocalBydPalette.current.muted, fontSize = 12.sp)
+        }
         CategoryGrid(
             strings.influxCategories,
             if (state?.haSharedCategoriesEnabled == true) state.mqttEnabledCategories else state?.influxEnabledCategories.orEmpty(),
-            enabled = controls.edit && state?.haSharedCategoriesEnabled != true,
+            enabled = controls.edit && state?.haSharedCategoriesEnabled != true && !actionUiState.isPending("influxCategory"),
             strings = strings
         ) { category ->
             actions.onToggleInfluxCategory(category, !state?.influxEnabledCategories.orEmpty().contains(category))
         }
-        CredentialGridInflux(strings, draft, actions, connection.activeRoute, controls.edit,
+        CredentialGridInflux(strings, draft, actions, connection.activeRoute,
+            controls.edit && !actionUiState.isPending("influxStart"),
             Modifier.heightIn(min = credentialMinHeight))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             TextInput(strings.haIdentity.influxVehicleId, draft.vehicleId,
                 { actions.onInfluxDraftChanged(draft.copy(vehicleId = it)) },
-                Modifier.weight(1f), enabled = controls.edit)
+                Modifier.weight(1f), enabled = controls.edit && !actionUiState.isPending("influxStart"))
             Spacer(Modifier.weight(1f))
         }
         if (connection.owned) Text(strings.stopChannelToEdit, color = LocalBydPalette.current.muted, fontSize = 12.sp)
@@ -2011,14 +2038,15 @@ private fun ChannelQueueRow(
     strings: UiStrings,
     pendingText: String,
     autoStart: Boolean,
-    onAutoStartChanged: (Boolean) -> Unit
+    onAutoStartChanged: (Boolean) -> Unit,
+    enabled: Boolean = true
 ) {
     Row(
         modifier = Modifier.fillMaxWidth().height(42.dp),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        SwitchControlRow(SwitchToggle(autoStart, onAutoStartChanged), Modifier.weight(1f).height(42.dp)) {
+        SwitchControlRow(SwitchToggle(autoStart, onAutoStartChanged, enabled = enabled), Modifier.weight(1f).height(42.dp)) {
             Text(strings.autoStart, color = LocalBydPalette.current.text, fontSize = 14.sp,
                 fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
         }
@@ -2036,7 +2064,9 @@ private fun ChannelButtons(
     testInFlight: Boolean,
     connectionOwned: Boolean = false,
     connectionStopping: Boolean = false,
-    cleanupInFlight: Boolean = false
+    cleanupInFlight: Boolean = false,
+    startPending: Boolean = false,
+    stopPending: Boolean = false
 ) {
     val starting = runtimeStatus == RuntimeActionStatus.STARTING ||
         (connectionOwned && runtimeStatus == RuntimeActionStatus.STOPPED)
@@ -2046,13 +2076,13 @@ private fun ChannelButtons(
             if (starting) strings.starting else strings.start,
             onStart,
             primary = true,
-            enabled = controls.start && !cleanupInFlight,
+            enabled = controls.start && !cleanupInFlight && !startPending,
             modifier = Modifier.weight(1f)
         )
         ActionButton(
             if (connectionStopping || runtimeStatus == RuntimeActionStatus.STOPPING) strings.stopping else strings.stop,
             onStop,
-            enabled = controls.stop,
+            enabled = (controls.stop || startPending) && !stopPending,
             modifier = Modifier.weight(1f)
         )
         ActionButton(
@@ -2227,6 +2257,7 @@ private fun TelegramTab(
     strings: UiStrings,
     uiState: TelegramUiState,
     actions: TelegramUiActions,
+    actionUiState: BydCollectorActionUiState,
     session: UiSessionState
 ) {
     var config by remember(uiState.config) { mutableStateOf(uiState.config) }
@@ -2241,6 +2272,8 @@ private fun TelegramTab(
             strings = strings,
             config = config,
             testStatus = uiState.testStatus,
+            clearPending = actionUiState.isPending("telegramClear"),
+            testPending = actionUiState.isPending("telegramTest"),
             onConfigChanged = updateConfig,
             onClearBotToken = actions.onClearBotToken,
             onTestConnection = actions.onTestConnection
@@ -2272,6 +2305,8 @@ private fun TelegramConnectionCard(
     strings: UiStrings,
     config: TelegramConfig,
     testStatus: TelegramTestStatus,
+    clearPending: Boolean,
+    testPending: Boolean,
     onConfigChanged: (TelegramConfig) -> Unit,
     onClearBotToken: () -> Unit,
     onTestConnection: () -> Unit
@@ -2304,7 +2339,7 @@ private fun TelegramConnectionCard(
                 showPasswordContentDescription = strings.showSecret,
                 hidePasswordContentDescription = strings.hideSecret,
                 clearContentDescription = strings.telegram.clearBotToken,
-                onClear = onClearBotToken,
+                onClear = onClearBotToken.takeUnless { clearPending },
                 showClearWhenEmpty = config.botTokenSet
             )
             TextInput(
@@ -2324,7 +2359,7 @@ private fun TelegramConnectionCard(
                 text = strings.testConnection,
                 onClick = onTestConnection,
                 primary = true,
-                enabled = config.botTokenSet && config.chatId.isNotBlank() && testStatus != TelegramTestStatus.TESTING,
+                enabled = config.botTokenSet && config.chatId.isNotBlank() && testStatus != TelegramTestStatus.TESTING && !testPending,
                 modifier = Modifier.width(180.dp)
             )
             StatusPill(
@@ -2719,6 +2754,7 @@ private fun ExtraTab(
     updateAutoCheckEnabled: Boolean,
     updateHintEnabled: Boolean,
     diagnosticsBusy: Boolean,
+    actionUiState: BydCollectorActionUiState,
     actions: BydCollectorActions,
     language: UiLanguage,
     darkTheme: Boolean,
@@ -2738,30 +2774,35 @@ private fun ExtraTab(
                     SwitchRow(
                         strings.restoreConnectivity,
                         state?.keepWifiEnabled == true && state?.keepMobileDataEnabled == true,
-                        actions::onToggleConnectivityRecovery
+                        actions::onToggleConnectivityRecovery,
+                        enabled = !actionUiState.isPending("connectivityRecovery")
                     )
                     SwitchRow(
                         strings.keepBluetooth,
                         state?.keepBluetoothEnabled == true,
-                        actions::onToggleKeepBluetooth
+                        actions::onToggleKeepBluetooth,
+                        enabled = !actionUiState.isPending("bluetoothRecovery")
                     )
                     SwitchRow(
                         strings.restoreCollector,
                         state?.recoverCollectorServiceEnabled == true,
-                        actions::onToggleKeepCollector
+                        actions::onToggleKeepCollector,
+                        enabled = !actionUiState.isPending("collectorRecovery")
                     )
                     Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         ActionButton(
                             strings.startLogcat,
                             actions::onStartLogcat,
                             primary = true,
-                            enabled = state?.logRecording != true && !logsBusy,
+                            enabled = state?.logRecording != true && !logsBusy &&
+                                !actionUiState.isPending("jobSubmit:logStart"),
                             modifier = Modifier.weight(1f)
                         )
                         ActionButton(
                             strings.stopLogcat,
                             actions::onStopLogcat,
-                            enabled = state?.logRecording == true && !logsBusy,
+                            enabled = state?.logRecording == true && !logsBusy &&
+                                !actionUiState.isPending("jobSubmit:logStop"),
                             modifier = Modifier.weight(1f)
                         )
                     }
@@ -2770,23 +2811,29 @@ private fun ExtraTab(
                             shareStage?.let { strings.shareLogStages[it.ordinal] } ?: strings.shareLogs,
                             actions::onShareLogs,
                             primary = true,
-                            enabled = !logsBusy,
+                            enabled = !logsBusy && !actionUiState.isPending("jobSubmit:logShare"),
                             modifier = Modifier.weight(1f)
                         )
                         ActionButton(
                             strings.clearLogs,
                             onRequestClearLogs,
-                            enabled = !logsBusy,
+                            enabled = !logsBusy && !actionUiState.isPending("jobSubmit:logClear"),
                             modifier = Modifier.weight(1f)
                         )
                     }
                 }
             }
             SectionCard(strings.appRuntime, Modifier.weight(1f).heightIn(min = optionsCardHeight).fillMaxHeight()) {
-                TailscaleRuntimeRow(strings, state?.tailscaleActivationEnabled == true, actions::onToggleTailscaleActivation)
+                TailscaleRuntimeRow(
+                    strings,
+                    state?.tailscaleActivationEnabled == true,
+                    actions::onToggleTailscaleActivation,
+                    pending = actionUiState.isPending("tailscale")
+                )
                 UpdateSettingsRow(
                     strings = strings,
                     updateAutoCheckEnabled = updateAutoCheckEnabled,
+                    actionUiState = actionUiState,
                     actions = actions
                 )
                 Box(Modifier.fillMaxWidth().height(1.dp).background(LocalBydPalette.current.border))
@@ -2795,21 +2842,32 @@ private fun ExtraTab(
                     language = language,
                     darkTheme = darkTheme,
                     enabled = updateHintEnabled,
+                    togglePending = actionUiState.isPending("updateHint"),
+                    appearancePending = actionUiState.isPending("updateHintAppearance"),
                     onChange = actions::onToggleUpdateHint,
                     onSettings = onUpdateHintSettings
                 )
-                ShutdownSettingsRow(strings = strings, actions = actions)
+                ShutdownSettingsRow(
+                    strings = strings,
+                    actions = actions,
+                    pending = actionUiState.isPending("shutdown")
+                )
             }
         }
     }
 }
 
 @Composable
-private fun TailscaleRuntimeRow(strings: UiStrings, enabled: Boolean, onChange: (Boolean) -> Unit) {
+private fun TailscaleRuntimeRow(
+    strings: UiStrings,
+    enabled: Boolean,
+    onChange: (Boolean) -> Unit,
+    pending: Boolean
+) {
     val p = LocalBydPalette.current
     Column(Modifier.fillMaxWidth()) {
         SwitchControlRow(
-            SwitchToggle(enabled, onChange),
+            SwitchToggle(enabled, onChange, enabled = !pending),
             modifier = Modifier.fillMaxWidth().heightIn(min = 72.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
@@ -2840,10 +2898,12 @@ private fun TailscaleRuntimeRow(strings: UiStrings, enabled: Boolean, onChange: 
 private fun UpdateSettingsRow(
     strings: UiStrings,
     updateAutoCheckEnabled: Boolean,
+    actionUiState: BydCollectorActionUiState,
     actions: BydCollectorActions
 ) {
     SwitchControlRow(
-        SwitchToggle(updateAutoCheckEnabled, actions::onToggleUpdateAutoCheck),
+        SwitchToggle(updateAutoCheckEnabled, actions::onToggleUpdateAutoCheck,
+            enabled = !actionUiState.isPending("updateAutoCheck")),
         modifier = Modifier.fillMaxWidth().heightIn(min = 72.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp)
     ) {
@@ -2865,12 +2925,17 @@ private fun UpdateSettingsRow(
                 overflow = TextOverflow.Ellipsis
             )
         }
-        ActionButton(strings.checkUpdates, actions::onCheckForUpdates, modifier = Modifier.width(210.dp))
+        ActionButton(
+            if (actionUiState.isPending("updateReopen")) strings.loading else strings.checkUpdates,
+            actions::onCheckForUpdates,
+            enabled = !actionUiState.isPending("updateReopen"),
+            modifier = Modifier.width(210.dp)
+        )
     }
 }
 
 @Composable
-private fun ShutdownSettingsRow(strings: UiStrings, actions: BydCollectorActions) {
+private fun ShutdownSettingsRow(strings: UiStrings, actions: BydCollectorActions, pending: Boolean) {
     val p = LocalBydPalette.current
     Column(Modifier.fillMaxWidth()) {
         Box(
@@ -2905,17 +2970,18 @@ private fun ShutdownSettingsRow(strings: UiStrings, actions: BydCollectorActions
                     overflow = TextOverflow.Ellipsis
                 )
             }
-            ShutdownIconButton(onClick = actions::onShutdownApp)
+            if (pending) CircularProgressIndicator(Modifier.size(24.dp), color = p.red, strokeWidth = 2.dp)
+            else ShutdownIconButton(onClick = actions::onShutdownApp)
         }
     }
 }
 
 @Composable
-private fun ShutdownIconButton(onClick: () -> Unit) {
+private fun ShutdownIconButton(onClick: () -> Unit, enabled: Boolean = true) {
     val p = LocalBydPalette.current
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
-    val press = rememberForcedPressClick(enabled = true, onClick = onClick)
+    val press = rememberForcedPressClick(enabled = enabled, onClick = onClick)
     val visualPressed = pressed || press.visualPressed
     val buttonBackground = if (visualPressed) p.redSoft else p.redSoft.copy(alpha = 0.56f)
     Box(
@@ -2924,7 +2990,7 @@ private fun ShutdownIconButton(onClick: () -> Unit) {
             .pressScaleModifier(interactionSource, forcePressed = press.visualPressed)
             .background(buttonBackground, Rounded8)
             .border(1.dp, p.red.copy(alpha = 0.72f), Rounded8)
-            .clickable(enabled = !press.locked, interactionSource = interactionSource, indication = null) {
+            .clickable(enabled = enabled && !press.locked, interactionSource = interactionSource, indication = null) {
                 press.onClick()
             },
         contentAlignment = Alignment.Center
@@ -2939,12 +3005,14 @@ private fun UpdateHintSettingsRow(
     language: UiLanguage,
     darkTheme: Boolean,
     enabled: Boolean,
+    togglePending: Boolean,
+    appearancePending: Boolean,
     onChange: (Boolean) -> Unit,
     onSettings: () -> Unit
 ) {
     val p = LocalBydPalette.current
     SwitchControlRow(
-        toggle = SwitchToggle(enabled, onChange),
+        toggle = SwitchToggle(enabled, onChange, enabled = !togglePending),
         modifier = Modifier.fillMaxWidth().heightIn(min = 72.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp)
     ) {
@@ -2952,7 +3020,9 @@ private fun UpdateHintSettingsRow(
             Text(strings.updateHintTitle, color = p.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
             Text(strings.updateHintDescription, color = p.muted, fontSize = 12.sp, lineHeight = 16.sp, maxLines = 2)
         }
-        UpdateHintSettingsButton(language, darkTheme, onSettings)
+        if (appearancePending) {
+            CircularProgressIndicator(Modifier.size(22.dp), color = p.accent, strokeWidth = 2.dp)
+        } else UpdateHintSettingsButton(language, darkTheme, onSettings)
     }
 }
 
@@ -3019,11 +3089,12 @@ private fun SwitchRow(
     label: String,
     checked: Boolean,
     onChange: (Boolean) -> Unit,
-    divider: Boolean = true
+    divider: Boolean = true,
+    enabled: Boolean = true
 ) {
     val p = LocalBydPalette.current
     Column(Modifier.fillMaxWidth()) {
-        SwitchControlRow(SwitchToggle(checked, onChange), Modifier.fillMaxWidth().height(42.dp)) {
+        SwitchControlRow(SwitchToggle(checked, onChange, enabled = enabled), Modifier.fillMaxWidth().height(42.dp)) {
             Text(label, color = p.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
         }
         if (divider) {
@@ -3052,6 +3123,7 @@ private fun UpdateCheckDialog(
     appVersionName: String,
     language: UiLanguage,
     state: UpdateUiState,
+    actionUiState: BydCollectorActionUiState,
     releaseNotesHistory: ReleaseNotesHistory?,
     onPresented: () -> Unit,
     onDismiss: () -> Unit,
@@ -3060,6 +3132,10 @@ private fun UpdateCheckDialog(
 ) {
     val p = LocalBydPalette.current
     val releaseNotesScroll = rememberScrollState()
+    val primaryOperation = if (state is UpdateUiState.Downloading || state is UpdateUiState.CancelError) {
+        "updateCancel"
+    } else "updateInstall"
+    val primaryPending = actionUiState.isPending(primaryOperation)
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -3131,15 +3207,19 @@ private fun UpdateCheckDialog(
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 ActionButton(
-                    text = if (state is UpdateUiState.Downloading || state is UpdateUiState.CancelError) strings.cancel
+                    text = if (primaryPending) strings.loading
+                        else if (state is UpdateUiState.Downloading || state is UpdateUiState.CancelError) strings.cancel
                         else if (state is UpdateUiState.Cancelling) strings.updateCancelling else strings.update,
                     onClick = if (state is UpdateUiState.Downloading || state is UpdateUiState.CancelError) onCancel else onUpdate,
                     primary = true,
-                    enabled = state is UpdateUiState.Available || state is UpdateUiState.Cancelled ||
-                        state is UpdateUiState.Downloading || state is UpdateUiState.CancelError,
+                    enabled = !primaryPending && (state is UpdateUiState.Available || state is UpdateUiState.Cancelled ||
+                        state is UpdateUiState.Downloading || state is UpdateUiState.CancelError),
                     modifier = Modifier.weight(1f)
                 )
-                ActionButton(strings.close, onDismiss, modifier = Modifier.weight(1f))
+                ActionButton(strings.close, onDismiss,
+                    enabled = !actionUiState.isPending("updateDismiss"),
+                    modifier = Modifier.weight(1f)
+                )
             }
         }
     }
@@ -3149,11 +3229,13 @@ private fun UpdateCheckDialog(
 private fun TripsCompressionDialog(
     strings: UiStrings,
     state: TripCompressionState,
+    operationPending: Boolean,
+    dismissPending: Boolean,
     onConfirm: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val p = LocalBydPalette.current
-    BackHandler { if (!state.running) onDismiss() }
+    BackHandler(enabled = !state.running && !dismissPending) { onDismiss() }
     Box(
         Modifier.fillMaxSize().background(p.background.copy(alpha = 0.82f)).padding(28.dp),
         contentAlignment = Alignment.Center
@@ -3204,10 +3286,13 @@ private fun TripsCompressionDialog(
             if (!state.running) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     if (state.error != null || state.completed) {
-                        ActionButton(strings.ok, onDismiss, modifier = Modifier.weight(1f))
+                        ActionButton(strings.ok, onDismiss, enabled = !dismissPending,
+                            modifier = Modifier.weight(1f))
                     } else {
-                        ActionButton(strings.yes, onConfirm, primary = true, modifier = Modifier.weight(1f))
-                        ActionButton(strings.no, onDismiss, modifier = Modifier.weight(1f))
+                        ActionButton(strings.yes, onConfirm, primary = true, enabled = !operationPending,
+                            modifier = Modifier.weight(1f))
+                        ActionButton(strings.no, onDismiss, enabled = !dismissPending,
+                            modifier = Modifier.weight(1f))
                     }
                 }
             }
@@ -3219,11 +3304,15 @@ private fun TripsCompressionDialog(
 private fun DatabaseMaintenanceDialog(
     strings: UiStrings,
     state: DbMaintenanceUiState,
+    actionUiState: BydCollectorActionUiState,
     onConfirm: () -> Unit,
     onCancel: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val p = LocalBydPalette.current
+    val archivePending = actionUiState.isPending("archiveStart")
+    val cancelPending = actionUiState.isPending("archiveCancel")
+    val dismissPending = actionUiState.isPending("archiveDismiss")
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -3271,14 +3360,18 @@ private fun DatabaseMaintenanceDialog(
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 when {
                     state.error != null || state.completed -> {
-                        ActionButton(strings.ok, onDismiss, modifier = Modifier.weight(1f))
+                        ActionButton(strings.ok, onDismiss, enabled = !dismissPending,
+                            modifier = Modifier.weight(1f))
                     }
                     state.running -> {
-                        ActionButton(strings.cancel, onCancel, enabled = state.cancelAvailable, modifier = Modifier.weight(1f))
+                        ActionButton(strings.cancel, onCancel,
+                            enabled = state.cancelAvailable && !cancelPending, modifier = Modifier.weight(1f))
                     }
                     else -> {
-                        ActionButton(strings.yes, onConfirm, primary = true, modifier = Modifier.weight(1f))
-                        ActionButton(strings.no, onDismiss, modifier = Modifier.weight(1f))
+                        ActionButton(strings.yes, onConfirm, primary = true, enabled = !archivePending,
+                            modifier = Modifier.weight(1f))
+                        ActionButton(strings.no, onDismiss, enabled = !dismissPending,
+                            modifier = Modifier.weight(1f))
                     }
                 }
             }
@@ -3542,7 +3635,9 @@ private fun StorageTab(
                         ActionButton("-", { draftLimitGb = (draftLimitGb - 1).coerceAtLeast(1) }, enabled = draftLimitGb > 1, modifier = Modifier.width(42.dp))
                         ReadOnlyPathField(UiSizeFormatter.gigabytes(draftLimitGb, strings), modifier = Modifier.weight(0.7f))
                         ActionButton("+", { draftLimitGb = (draftLimitGb + 1).coerceAtMost(10) }, enabled = draftLimitGb < 10, modifier = Modifier.width(42.dp))
-                        ActionButton(strings.ok, { actions.onSetArchiveStorageLimitGb(draftLimitGb) }, primary = true, enabled = draftLimitGb != limitGb, modifier = Modifier.weight(1f))
+                        ActionButton(strings.ok, { actions.onSetArchiveStorageLimitGb(draftLimitGb) }, primary = true,
+                            enabled = draftLimitGb != limitGb && !actionUiState.isPending("archiveLimit"),
+                            modifier = Modifier.weight(1f))
                     }
                     Text(strings.archiveStorageLimitHint, color = LocalBydPalette.current.muted, fontSize = 12.sp, lineHeight = 16.sp)
                 }
@@ -3575,8 +3670,9 @@ private fun StorageTab(
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     ReadOnlyPathField(snapshot?.archiveRootPath ?: "-", modifier = Modifier.weight(0.6f))
                     ArchiveShareIconButton(
-                        enabled = shareEnabled && !actionUiState.archiveShare,
-                        loading = actionUiState.archiveShare,
+                        enabled = shareEnabled && !actionUiState.archiveShare &&
+                            !actionUiState.isPending("jobSubmit:archiveShare"),
+                        loading = actionUiState.archiveShare || actionUiState.isPending("jobSubmit:archiveShare"),
                         contentDescription = strings.shareSelectedArchives,
                         label = strings.shareArchives,
                         onClick = { actions.onShareArchives(selectedArchiveIds) },
@@ -3628,6 +3724,7 @@ private fun StorageTab(
                             primary = true,
                             enabled = selectedDeleteIds.isNotEmpty() &&
                                 !actionUiState.archiveDeleteDispatch &&
+                                !actionUiState.isPending("archiveDelete") &&
                                 job?.running != true &&
                                 !CollectorService.isArchiveStorageActive(),
                             modifier = Modifier.width(320.dp)

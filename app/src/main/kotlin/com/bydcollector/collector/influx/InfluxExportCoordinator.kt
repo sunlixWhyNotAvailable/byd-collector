@@ -1,5 +1,7 @@
 package com.bydcollector.collector.influx
 
+import android.database.sqlite.SQLiteDatabaseLockedException
+import android.database.sqlite.SQLiteTableLockedException
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import com.bydcollector.collector.ha.HaEndpointProfile
@@ -22,6 +24,8 @@ class InfluxExportCoordinator(
     @Volatile private var sessionConnection: InfluxConfig? = null
     private var lastDiagnosticGate: String? = null
     @Volatile private var terminalFailure = false
+    private var sqliteLockRetries = 0
+    @Volatile private var sqliteRetryAt: String? = null
 
     @Volatile
     private var currentRoute: HaEndpointProfile? = null
@@ -64,6 +68,8 @@ class InfluxExportCoordinator(
     }
 
     fun endSession() {
+        sqliteRetryAt = null
+        sqliteLockRetries = 0
         sessionConnection = null
         currentRoute = null
         diagnostic("influx_session_ended", mapOf("frozen" to "false", "actual_route" to "none"))
@@ -72,10 +78,13 @@ class InfluxExportCoordinator(
     /** Cancels split work between HTTP requests without discarding an acknowledged write. */
     fun cancelInFlight() {
         cancellationGeneration.incrementAndGet()
+        sqliteRetryAt = null
     }
 
     fun startExport(isCurrent: () -> Boolean = { true }): InfluxActionResult {
         terminalFailure = false
+        sqliteLockRetries = 0
+        sqliteRetryAt = null
         //a real batch write is the only start success signal; a separate HTTP test caused a false-success flicker
         return runOneCycle(force = true, isCurrent = isCurrent)
     }
@@ -139,7 +148,8 @@ class InfluxExportCoordinator(
             return null
         }
         // The completed cycle already persisted its deadline; scheduling must not rescan history.
-        val nextRetryAt = store.influxExportState().nextRetryAt ?: return null
+        // A locked database may not have accepted the retry status; keep the live run's deadline.
+        val nextRetryAt = sqliteRetryAt ?: store.influxExportState().nextRetryAt ?: return null
         return runCatching {
             val now = OffsetDateTime.parse(clock.nowIso()).toInstant().toEpochMilli()
             (OffsetDateTime.parse(nextRetryAt).toInstant().toEpochMilli() - now).coerceAtLeast(0L)
@@ -177,12 +187,27 @@ class InfluxExportCoordinator(
 
     private fun guardCycle(isCurrent: () -> Boolean, action: () -> InfluxActionResult): InfluxActionResult {
         val generation = cancellationGeneration.get()
+        if (!isCurrent()) return InfluxActionResult.ok("influx work superseded")
+        sqliteRetryAt?.let { retryAt ->
+            if (!retryDue(retryAt, clock.nowIso())) {
+                return InfluxActionResult.fail("influx_sqlite_busy", "SQLite is busy; retry pending")
+            }
+        }
         val result = try { action() }
         catch (error: CancellationException) { throw error }
         catch (error: RuntimeException) {
             if (!isCurrent() || generation != cancellationGeneration.get()) return InfluxActionResult.ok("influx work superseded")
+            if ((error is SQLiteDatabaseLockedException || error is SQLiteTableLockedException) && sqliteLockRetries < 3) {
+                sqliteLockRetries++
+                sqliteRetryAt = plusSeconds(clock.nowIso(), FAILURE_RETRY_INTERVAL_SECONDS)
+                diagnostic("influx_retry_pending", mapOf("reason" to "sqlite_locked",
+                    "attempt" to sqliteLockRetries.toString(), "retry_deadline" to checkNotNull(sqliteRetryAt)))
+                return InfluxActionResult.fail("influx_sqlite_busy", "SQLite is busy; retry $sqliteLockRetries/3")
+            }
             InfluxActionResult.fail("influx_export_exception", "${error::class.java.simpleName}: ${error.message ?: "no message"}".take(512))
         }
+        sqliteRetryAt = null
+        if (result.ok) sqliteLockRetries = 0
         if (!result.ok && !result.retryable && isCurrent() && generation == cancellationGeneration.get()) {
             terminalFailure = true
             // File evidence precedes best-effort SQL: a broken database cannot hide termination.
@@ -549,8 +574,9 @@ class InfluxExportCoordinator(
         if (isInfluxLineProtocolDataFailure(write)) {
             if (rows.size == 1) {
                 val row = rows.single()
-                store.updateInfluxCursorSuccess(row.fieldKey, row.id, exportedAt)
-                pass.recordPoison(row, checkNotNull(influxDataFormatReason(write)))
+                val reason = checkNotNull(influxDataFormatReason(write))
+                store.skipInfluxRow(row.fieldKey, row.id, reason, exportedAt)
+                pass.recordPoison(row, reason)
                 return BatchExportResult(poisonRows = 1)
             }
             val midpoint = rows.size / 2

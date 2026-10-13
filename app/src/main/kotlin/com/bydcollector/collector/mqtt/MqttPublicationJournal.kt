@@ -275,6 +275,11 @@ class MqttPublicationJournal(
             val targetRefs = group.map { it.target }.distinctBy { it.scopeKey to it.topic }
             val fingerprint = historyFingerprint(group)
             val cleanup = cleanupState[deviceId]
+            val currentCleanupPending = deviceId == currentDeviceId &&
+                (cleanup?.first == "running" || cleanup?.first == "error")
+            val reportedError = if (currentCleanupPending) {
+                "mqtt_cleanup_pending_identity" + cleanup?.second?.takeIf(String::isNotBlank)?.let { ": $it" }.orEmpty()
+            } else cleanup?.second
             val identity = group.maxByOrNull { it.identityAt }
             MqttCleanupGroup(
                 deviceId = deviceId,
@@ -283,7 +288,7 @@ class MqttPublicationJournal(
                 deviceModel = identity?.deviceModel,
                 topicCount = targetRefs.map { it.topic }.distinct().size,
                 uncertainCount = group.filter { it.uncertain }.map { it.target.topic }.distinct().size,
-                error = cleanup?.second,
+                error = reportedError,
                 current = deviceId == currentDeviceId,
                 state = when {
                     deviceId == currentDeviceId -> "current"

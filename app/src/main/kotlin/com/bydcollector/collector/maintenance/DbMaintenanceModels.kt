@@ -115,5 +115,7 @@ data class StorageCutoverJournal(
     /** Exact active filename before the archive operation. */
     val sourceDatabaseName: String = "",
     /** Exact filename opened after the archive operation. */
-    val targetDatabaseName: String = sourceDatabaseName
+    val targetDatabaseName: String = sourceDatabaseName,
+    /** -1 means unreadable source; older journals drained the queue before cutover. */
+    val pendingEnergyCount: Long = 0L
 )

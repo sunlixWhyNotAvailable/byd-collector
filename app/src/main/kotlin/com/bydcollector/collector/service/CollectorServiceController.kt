@@ -205,9 +205,9 @@ object CollectorServiceController {
         context.startService(intent)
     }
 
-    fun reconcileArchiveStorage(context: Context) {
-        if (RuntimeEndpoint.forward(context, "reconcileArchiveStorage")) return
-        val intent = CollectorService.reconcileArchiveStorageIntent(context)
+    fun reconcileArchiveStorage(context: Context, manualRetry: Boolean = false) {
+        if (RuntimeEndpoint.forward(context, "reconcileArchiveStorage", Bundle().apply { putBoolean("manualRetry", manualRetry) })) return
+        val intent = CollectorService.reconcileArchiveStorageIntent(context, manualRetry)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             context.startForegroundService(intent)
         } else {

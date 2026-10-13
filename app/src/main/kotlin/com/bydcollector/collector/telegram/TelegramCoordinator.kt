@@ -135,14 +135,7 @@ class TelegramCoordinator internal constructor(
         val startupDeadline = ensureStartupRecovery()
         val tickAtMs = nowMs()
         flushSourceDiagnostics(tickAtMs)
-        val expired = telegramStore.pruneTelegramMessages(tickAtMs, protectedTelegramIds())
-        if (expired > 0) {
-            eventStore.recordEvent(
-                "telegram_outbox_pruned",
-                "Telegram outbox retention removed messages",
-                "expired=$expired overflow=0"
-            )
-        }
+        telegramStore.pruneTelegramDeliveryReceipts(tickAtMs)
         val result = engine.onTick(
             eventConfig(),
             mainCollectionExpected,

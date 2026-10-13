@@ -29,10 +29,11 @@ internal class DiagnosticShareSanitizer {
     }
 
     fun sanitizeText(text: String): String {
-        // Every masked syntax needs an assignment/URI separator, a VIN API name,
-        // or Android's Location[...] form. Ordinary labels/IDs need no regex pass.
-        if (':' !in text && '=' !in text &&
-            !text.contains("vin", ignoreCase = true) && !text.contains("Location[", ignoreCase = true)) return text
+        // Unlabelled numbers/IDs remain diagnostic data, not guessed identities.
+        if (':' !in text && '=' !in text && '-' !in text &&
+            !text.contains("vin", ignoreCase = true) && !text.contains("imei", ignoreCase = true) &&
+            !text.contains("imsi", ignoreCase = true) && !text.contains("iccid", ignoreCase = true) &&
+            !text.contains("Location[", ignoreCase = true)) return text
         var sanitized = replaceCookieHeaders(text)
         sanitized = replaceAuthHeaders(sanitized)
         // Android Wi-Fi dumps allow an unquoted SSID containing spaces. Match
@@ -44,6 +45,10 @@ internal class DiagnosticShareSanitizer {
             match.groups["prefix"]!!.value + replaceMaskedToken(match.groups["value"]!!.value,
                 alias(IdentityKind.VIN, match.groups["value"]!!.value))
         }
+        sanitized = RADIO_ID_PATTERN.replace(sanitized) { match ->
+            match.groups["prefix"]!!.value + REDACTED
+        }
+        sanitized = MAC_PATTERN.replace(sanitized, REDACTED)
         sanitized = ASSIGNMENT_PATTERN.replace(sanitized) { match ->
             val key = match.groups["key"]?.value.orEmpty()
             val token = match.groups["value"]?.value.orEmpty()
@@ -211,7 +216,8 @@ internal class DiagnosticShareSanitizer {
             "bottoken", "telegrambottoken", "apikey", "accesstoken",
             "refreshtoken", "clientsecret", "authorization", "proxyauthorization",
             "cookie", "setcookie", "xapikey",
-            "ssid", "bssid", "mssid", "mbssid", "wifissid", "wifibssid"
+            "ssid", "bssid", "mssid", "mbssid", "wifissid", "wifibssid",
+            "imei", "imei1", "imei2", "imsi", "iccid"
         )
         private val VIN_KEYS = setOf("vin", "infovin", "vehiclevin", "autovin", "realautovin", "bodyworkautovin", "bodyworkrealautovin")
         private val CHAT_ID_KEYS = setOf("chatid", "telegramchatid")
@@ -223,6 +229,7 @@ internal class DiagnosticShareSanitizer {
             "(?:password|passwd|mqtt[-_.]?password|influx[-_.]?password|(?:telegram[-_.]?)?bot[-_.]?token|" +
                 "api[-_.]?key|access[-_.]?token|refresh[-_.]?token|client[-_.]?secret|" +
                 "authorization|proxy[-_.]?authorization|cookie|set[-_.]?cookie|x[-_.]?api[-_.]?key|" +
+                "imei[12]?|imsi|iccid|" +
                 "vin|info[-_.]?vin|vehicle[-_.]?vin|(?:bodywork[-_.]?)?(?:real[-_.]?)?auto[-_.]?vin|" +
                 "(?:telegram[-_.]?)?chat[-_.]?id|(?:telegram[-_.]?)?account[-_.]?id|" +
                 "latitude|longitude|location[-_.]?(?:latitude|longitude)|lat|lon|lng)"
@@ -234,7 +241,13 @@ internal class DiagnosticShareSanitizer {
         )
         // VIN-valued API/property results, not arbitrary 17-character IDs or MACs.
         private val VIN_RESULT_PATTERN = Regex(
-            """(?i)(?<![A-Za-z0-9_.-])(?<prefix>(?:get(?:Vehicle)?Vin\(\)[ \t]*(?:[:=]|->|returns?)[ \t]*|INFO_VIN[ \t]+(?:value|result)[ \t]*[:=][ \t]*))(?<value>"[A-HJ-NPR-Z0-9]{17}"|'[A-HJ-NPR-Z0-9]{17}'|[A-HJ-NPR-Z0-9]{17})(?![A-Za-z0-9])"""
+            """(?i)(?<![A-Za-z0-9_.-])(?<prefix>(?:get(?:Vehicle)?Vin\(\)[ \t]*(?:[:=]|->|returns?)[ \t]*|INFO_VIN[ \t]+(?:value|result)[ \t]*[:=][ \t]*|VIN[ \t]+))(?<value>"[A-HJ-NPR-Z0-9]{17}"|'[A-HJ-NPR-Z0-9]{17}'|[A-HJ-NPR-Z0-9]{17})(?![A-Za-z0-9])"""
+        )
+        private val RADIO_ID_PATTERN = Regex(
+            """(?i)(?<![A-Za-z0-9_.-])(?<prefix>(?:imei[12]?|imsi|iccid)[ \t]+)[0-9]{14,22}(?![A-Za-z0-9])"""
+        )
+        private val MAC_PATTERN = Regex(
+            """(?i)(?<![A-Za-z0-9:-])(?:[0-9A-F]{2}(?::[0-9A-F]{2}){5}|[0-9A-F]{2}(?:-[0-9A-F]{2}){5})(?![A-Za-z0-9:-])"""
         )
         private val AUTH_HEADER_PATTERN = Regex(
             "(?i)(?<![A-Za-z0-9_.-])(?<prefix>(?:Authorization|Proxy-Authorization)[ \\t]*(?:[\\\"'][ \\t]*)?[:=][ \\t]*)(?<value>\\\"(?:\\\\.|[^\\\"\\\\])*\\\"|'(?:\\\\.|[^'\\\\])*'|(?:(?:Bearer|Basic)[ \\t]+)?[^\\s,;&}\\]]+)"

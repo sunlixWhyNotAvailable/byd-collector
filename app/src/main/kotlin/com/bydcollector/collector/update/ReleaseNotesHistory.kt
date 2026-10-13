@@ -78,6 +78,7 @@ class ReleaseNotesHistorySession(
     private var target: UpdateInfo? = null
     private var history: ReleaseNotesHistory? = null
     private var generation = 0L
+    private var clientRequestPending: UpdateInfo? = null
 
     fun snapshot(info: UpdateInfo): ReleaseNotesHistory? = synchronized(lock) {
         if (BuildConfig.RUNTIME_CLIENT) return com.bydcollector.collector.runtime.RuntimeClient.history
@@ -87,10 +88,22 @@ class ReleaseNotesHistorySession(
 
     fun request(info: UpdateInfo) {
         if (BuildConfig.RUNTIME_CLIENT) {
-            if (snapshot(info) == null) com.bydcollector.collector.runtime.RuntimeClient.control("history", android.os.Bundle().apply {
-                putString("version", info.version); putString("url", info.downloadUrl)
-                putString("notes", info.releaseNotes); putString("type", info.downloadContentType)
-            })
+            synchronized(lock) {
+                if (snapshot(info) != null || clientRequestPending == info) return
+                clientRequestPending = info
+            }
+            com.bydcollector.collector.runtime.RuntimeClient.executeOwnerAction({
+                com.bydcollector.collector.runtime.RuntimeClient.control("history", android.os.Bundle().apply {
+                    putString("version", info.version); putString("url", info.downloadUrl)
+                    putString("notes", info.releaseNotes); putString("type", info.downloadContentType)
+                })
+                com.bydcollector.collector.runtime.RuntimeClient.refreshUpdates()
+            }) { result ->
+                synchronized(lock) { if (clientRequestPending == info) clientRequestPending = null }
+                result.onSuccess { notifyListeners() }.onFailure {
+                    android.util.Log.w("CollectorUpdate", "Could not request release history from owner", it)
+                }
+            }
             return
         }
         val token = synchronized(lock) {
