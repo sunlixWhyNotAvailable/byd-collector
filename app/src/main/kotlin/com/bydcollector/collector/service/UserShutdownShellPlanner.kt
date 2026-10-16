@@ -24,6 +24,7 @@ internal object UserShutdownShellPlanner {
             append("settings put global bydcollector_keep_wifi 0 || exit 71; ")
             append("settings put global bydcollector_keep_mobile_data 0 || exit 71; ")
             append("settings put global bydcollector_keep_bluetooth 0 || exit 71; ")
+            append("settings put global bydcollector_keep_usb 0 || exit 71; ")
             append("settings put global bydcollector_recover_collector_service 0 || exit 71; ")
             append("settings put global bydcollector_user_shutdown 1 || exit 71; ")
             append("settings put global $GENERATION_KEY '$token' || exit 71; ")

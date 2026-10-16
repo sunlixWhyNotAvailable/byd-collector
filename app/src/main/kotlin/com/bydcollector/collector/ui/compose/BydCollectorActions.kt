@@ -293,6 +293,7 @@ interface BydCollectorActions {
     fun onToggleConnectivityRecovery(enabled: Boolean)
     fun onToggleKeepBluetooth(enabled: Boolean)
     fun onToggleKeepCollector(enabled: Boolean)
+    fun onToggleKeepUsb(enabled: Boolean)
     fun onToggleTailscaleActivation(enabled: Boolean)
 
     fun onToggleUpdateAutoCheck(enabled: Boolean)

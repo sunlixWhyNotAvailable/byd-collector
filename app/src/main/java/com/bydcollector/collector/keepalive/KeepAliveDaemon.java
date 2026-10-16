@@ -2,14 +2,18 @@ package com.bydcollector.collector.keepalive;
 
 import android.content.Context;
 import android.net.wifi.WifiManager;
+import android.os.SystemClock;
 import android.telephony.SubscriptionManager;
 import android.telephony.TelephonyManager;
 
 import com.bydcollector.collector.direct.HelperWakeLockPlatform;
 
 import java.io.ByteArrayOutputStream;
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.nio.channels.FileChannel;
@@ -41,11 +45,13 @@ public final class KeepAliveDaemon {
     private static final long BLUETOOTH_VERIFY_DELAY_MS = 1_000L;
     private static final int BLUETOOTH_VERIFY_ATTEMPTS = 5;
     private static final String USER_SHUTDOWN_COMMAND = "settings get global bydcollector_user_shutdown";
+    private static final String KEEP_USB_COMMAND = "settings get global " + KeepAliveProtocol.KEY_KEEP_USB;
     private static final String BLUETOOTH_STATE_COMMAND = "dumpsys bluetooth_manager | grep -E 'enabled:|state:'";
     private static final String VEHICLE_POWER_COMMAND = "service call autoservice 5 i32 1001 i32 315621418";
     private static final Pattern VEHICLE_POWER_REPLY = Pattern.compile(
             "Result:\\s*Parcel\\(\\s*(?:0x00000000:\\s*)?00000000\\s+([0-9a-fA-F]{8})\\s+'[^'\\r\\n]*'\\s*\\)"
     );
+    private static String lastUsbSkipReason = "";
     private static final String RECOVER_COLLECTOR_COMMAND =
             "am broadcast --include-stopped-packages -a com.bydcollector.collector.action.KEEP_ALIVE_RECOVERY " +
                     "-n com.bydcollector.collector/com.bydcollector.collector.system.KeepAliveRecoveryReceiver";
@@ -71,6 +77,7 @@ public final class KeepAliveDaemon {
             "settings get global bydcollector_keep_mobile_data",
             "settings get global bydcollector_keep_bluetooth",
             "settings get global bydcollector_recover_collector_service",
+            KEEP_USB_COMMAND,
             USER_SHUTDOWN_COMMAND,
             "svc wifi enable",
             "svc data enable",
@@ -79,6 +86,9 @@ public final class KeepAliveDaemon {
             "settings put global bluetooth_disabled_profiles 0",
             BLUETOOTH_STATE_COMMAND,
             VEHICLE_POWER_COMMAND,
+            UsbKeepAliveTransport.READ_ACC_COMMAND,
+            UsbKeepAliveTransport.READ_BODYWORK_POWER_LEVEL_COMMAND,
+            UsbKeepAliveTransport.USB_DATA_PORT_ON_COMMAND,
             "dumpsys power | grep mWakefulness",
             "pidof com.bydcollector.collector",
             "dumpsys activity services com.bydcollector.collector/.service.CollectorService",
@@ -97,11 +107,21 @@ public final class KeepAliveDaemon {
         }
 
         try {
+            UsbKeepAliveState usbState = UsbKeepAliveState.open(new File(KeepAliveProtocol.USB_STATE_PATH));
+            UsbKeepAliveState.Snapshot usbSnapshot = usbState.snapshot();
+            log("usb_state_open usable=" + usbSnapshot.usable
+                    + " status=" + usbSnapshot.lastStatus
+                    + " reservations_total=" + usbSnapshot.reservationCount
+                    + " attempts_total=" + usbSnapshot.attemptCount
+                    + " cycle_reservations=" + usbSnapshot.cycleReservations
+                    + " cycle_attempts=" + usbSnapshot.cycleAttempts
+                    + " history_recovered=" + usbSnapshot.historyRecovered
+                    + " error=" + sanitizeUsb(usbSnapshot.error));
             log("ready");
             while (true) {
                 try {
                     log("heartbeat_start");
-                    runOnce();
+                    runOnce(usbState);
                     log("heartbeat_end");
                 } catch (Throwable error) {
                     log("loop_error " + error.getClass().getSimpleName() + ": " + sanitize(error.getMessage() == null ? "no message" : error.getMessage()));
@@ -116,7 +136,15 @@ public final class KeepAliveDaemon {
         }
     }
 
-    private static void runOnce() {
+    private static void runOnce(UsbKeepAliveState usbState) {
+        //USB persistence or telemetry errors must not suppress the other keep-alive duties.
+        try {
+            maintainUsb(usbState);
+        } catch (Throwable error) {
+            logUsbSkip("usb_internal_error:" + error.getClass().getSimpleName(), usbState,
+                    "", "", "");
+        }
+
         //reads mirrored global flags each loop so toggles can change without restarting the delegate
         boolean keepWifi = isEnabled("settings get global bydcollector_keep_wifi");
         boolean keepMobileData = isEnabled("settings get global bydcollector_keep_mobile_data");
@@ -126,6 +154,295 @@ public final class KeepAliveDaemon {
         runOnce(keepWifi, keepMobileData, keepBluetooth, recoverCollectorService,
                 KeepAliveDaemon::readWifiEnabled, KeepAliveDaemon::readMobileDataEnabled,
                 KeepAliveDaemon::recoverCollectorServiceIfNeeded, KeepAliveDaemon::run);
+    }
+
+    private static void maintainUsb(UsbKeepAliveState state) {
+        UsbKeepAliveState.Snapshot snapshot = state.snapshot();
+        String bootId = readBootId();
+        boolean bootObserved = bootId != null && state.observeBoot(bootId);
+
+        //Observe ACC every heartbeat, including while USB is disabled or shutdown is requested.
+        UsbRead baselineAcc = readUsbAcc();
+        String accRaw = baselineAcc.raw;
+        if (baselineAcc.result != null && baselineAcc.result.valid) state.observeAcc(baselineAcc.result.value);
+        snapshot = state.snapshot();
+        if (!snapshot.usable) {
+            String reason = bootId == null ? "state_unavailable:" + snapshot.error
+                    : "state_unavailable_waiting_for_new_cycle_or_boot:" + snapshot.error;
+            logUsbSkip(reason, state, bootId == null ? "" : bootId, "", accRaw);
+            return;
+        }
+        if (!bootObserved) {
+            logUsbSkip("boot_id_unavailable", state, bootId == null ? "" : bootId, "", accRaw);
+            return;
+        }
+
+        FlagRead enabled = readFlag(KEEP_USB_COMMAND);
+        FlagRead shutdown = readFlag(USER_SHUTDOWN_COMMAND);
+        String disabledReason = usbDisabledReason(enabled, shutdown);
+        if (disabledReason != null) {
+            logUsbSkip(disabledReason, state, bootId, "", accRaw);
+            return;
+        }
+
+        UsbRead power = readUsbPower();
+        UsbRead freshAcc = readUsbAcc();
+        accRaw = freshAcc.raw;
+        if (freshAcc.result != null && freshAcc.result.valid) state.observeAcc(freshAcc.result.value);
+        snapshot = state.snapshot();
+        if (!snapshot.usable) {
+            logUsbSkip("state_unavailable:" + snapshot.error, state, bootId, power.raw, accRaw);
+            return;
+        }
+        if (power.result == null || !power.result.valid) {
+            logUsbSkip("power_unavailable:" + usbReadError(power), state, bootId, power.raw, accRaw);
+            return;
+        }
+        if (freshAcc.result == null || !freshAcc.result.valid) {
+            logUsbSkip("acc_unavailable:" + usbReadError(freshAcc), state, bootId, power.raw, accRaw);
+            return;
+        }
+        if (power.result.value != 0) {
+            logUsbSkip("vehicle_power_not_off", state, bootId, power.raw, accRaw);
+            return;
+        }
+        if (freshAcc.result.value != 0) {
+            logUsbSkip("acc_not_off", state, bootId, power.raw, accRaw);
+            return;
+        }
+
+        //Recheck both gates immediately before consuming the boot/cycle allowance.
+        enabled = readFlag(KEEP_USB_COMMAND);
+        shutdown = readFlag(USER_SHUTDOWN_COMMAND);
+        disabledReason = usbDisabledReason(enabled, shutdown);
+        if (disabledReason != null) {
+            logUsbSkip(disabledReason, state, bootId, power.raw, accRaw);
+            return;
+        }
+        String trigger = state.eligibleTrigger(bootId);
+        if (trigger == null) {
+            logUsbSkip("no_unused_off_cycle", state, bootId, power.raw, accRaw);
+            return;
+        }
+
+        long wallMs = System.currentTimeMillis();
+        long elapsedMs = SystemClock.elapsedRealtime();
+        UsbKeepAliveState.Reservation reservation = state.reserveAttempt(bootId, power.result.value,
+                freshAcc.result.value, power.raw, accRaw, wallMs, elapsedMs);
+        if (reservation == null) {
+            snapshot = state.snapshot();
+            logUsbSkip(snapshot.usable ? "reservation_unavailable" : "state_unavailable:" + snapshot.error,
+                    state, bootId, power.raw, accRaw);
+            return;
+        }
+        lastUsbSkipReason = "";
+        snapshot = state.snapshot();
+        log("usb_attempt_reserved wall_ms=" + wallMs + " elapsed_ms=" + elapsedMs
+                + " boot_id=" + bootId + " cycle=" + reservation.cycleCount
+                + " trigger=" + reservation.trigger + " reservation=" + reservation.id
+                + " reservations_total=" + snapshot.reservationCount + " attempts_total=" + snapshot.attemptCount
+                + " cycle_reservations=" + snapshot.cycleReservations + " cycle_attempts=" + snapshot.cycleAttempts
+                + " power=" + power.result.value + " acc=" + freshAcc.result.value
+                + " power_raw=" + sanitizeUsb(power.raw) + " acc_raw=" + sanitizeUsb(accRaw));
+
+        //A toggle/shutdown change after reservation consumes this cycle but never issues ON.
+        enabled = readFlag(KEEP_USB_COMMAND);
+        shutdown = readFlag(USER_SHUTDOWN_COMMAND);
+        disabledReason = usbDisabledReason(enabled, shutdown);
+        if (disabledReason != null) {
+            wallMs = System.currentTimeMillis();
+            elapsedMs = SystemClock.elapsedRealtime();
+            boolean recorded = state.markNotDispatched(reservation, disabledReason,
+                    power.result.value, freshAcc.result.value, power.raw, accRaw, wallMs, elapsedMs);
+            snapshot = state.snapshot();
+            log("usb_on_not_dispatched wall_ms=" + wallMs + " elapsed_ms=" + elapsedMs
+                    + " boot_id=" + bootId + " cycle=" + reservation.cycleCount
+                    + " trigger=" + reservation.trigger + " reservation=" + reservation.id
+                    + " reservations_total=" + snapshot.reservationCount + " attempts_total=" + snapshot.attemptCount
+                    + " cycle_reservations=" + snapshot.cycleReservations + " cycle_attempts=" + snapshot.cycleAttempts
+                    + " status=" + snapshot.lastStatus + " recorded=" + recorded
+                    + " reason=" + disabledReason + " power_raw=" + sanitizeUsb(power.raw)
+                    + " acc_raw=" + sanitizeUsb(accRaw) + " state_error=" + sanitizeUsb(snapshot.error));
+            return;
+        }
+
+        //The earlier OFF sample may be stale after settings reads. Verify vehicle state and identity
+        //again immediately before durably marking the one-shot attempt started.
+        UsbRead dispatchPower = readUsbPower();
+        UsbRead dispatchAcc = readUsbAcc();
+        String dispatchBootId = readBootId();
+        boolean sameCycle = dispatchBootId != null && dispatchBootId.equalsIgnoreCase(reservation.bootId)
+                && state.snapshot().bootId.equalsIgnoreCase(reservation.bootId)
+                && state.snapshot().cycleCount == reservation.cycleCount;
+        String dispatchBlockReason = !sameCycle ? "vehicle_identity_changed"
+                : dispatchPower.result == null || !dispatchPower.result.valid ? "power_unavailable"
+                : dispatchAcc.result == null || !dispatchAcc.result.valid ? "acc_unavailable"
+                : dispatchPower.result.value != 0 ? "vehicle_power_not_off"
+                : dispatchAcc.result.value != 0 ? "acc_not_off" : null;
+        if (dispatchBlockReason != null) {
+            wallMs = System.currentTimeMillis();
+            elapsedMs = SystemClock.elapsedRealtime();
+            int finalPower = dispatchPower.result != null && dispatchPower.result.valid
+                    ? dispatchPower.result.value : -1;
+            int finalAcc = dispatchAcc.result != null && dispatchAcc.result.valid
+                    ? dispatchAcc.result.value : -1;
+            boolean recorded = state.markNotDispatched(reservation, dispatchBlockReason,
+                    finalPower, finalAcc, dispatchPower.raw, dispatchAcc.raw, wallMs, elapsedMs);
+            if (dispatchBootId != null && !dispatchBootId.equalsIgnoreCase(reservation.bootId)) {
+                state.observeBoot(dispatchBootId);
+            }
+            if (dispatchAcc.result != null && dispatchAcc.result.valid) {
+                state.observeAcc(dispatchAcc.result.value);
+            }
+            snapshot = state.snapshot();
+            log("usb_on_not_dispatched wall_ms=" + wallMs + " elapsed_ms=" + elapsedMs
+                    + " boot_id=" + reservation.bootId + " observed_boot_id="
+                    + (dispatchBootId == null ? "unavailable" : dispatchBootId)
+                    + " cycle=" + reservation.cycleCount + " trigger=" + reservation.trigger
+                    + " reservation=" + reservation.id + " reservations_total=" + snapshot.reservationCount
+                    + " attempts_total=" + snapshot.attemptCount + " cycle_reservations="
+                    + snapshot.cycleReservations + " cycle_attempts=" + snapshot.cycleAttempts
+                    + " status=" + snapshot.lastStatus + " recorded=" + recorded
+                    + " reason=" + dispatchBlockReason + " power=" + finalPower + " acc=" + finalAcc
+                    + " power_raw=" + sanitizeUsb(dispatchPower.raw)
+                    + " acc_raw=" + sanitizeUsb(dispatchAcc.raw)
+                    + " state_error=" + sanitizeUsb(snapshot.error));
+            return;
+        }
+
+        wallMs = System.currentTimeMillis();
+        elapsedMs = SystemClock.elapsedRealtime();
+        if (!state.markStarted(reservation, wallMs, elapsedMs)) {
+            snapshot = state.snapshot();
+            logUsbSkip(snapshot.usable ? "start_record_unavailable" : "state_unavailable:" + snapshot.error,
+                    state, dispatchBootId, dispatchPower.raw, dispatchAcc.raw);
+            return;
+        }
+        snapshot = state.snapshot();
+        log("usb_on_started wall_ms=" + wallMs + " elapsed_ms=" + elapsedMs
+                + " boot_id=" + bootId + " cycle=" + reservation.cycleCount
+                + " trigger=" + reservation.trigger + " reservation=" + reservation.id
+                + " attempts_total=" + snapshot.attemptCount + " cycle_reservations=" + snapshot.cycleReservations
+                + " cycle_attempts=" + snapshot.cycleAttempts + " status=" + snapshot.lastStatus);
+
+        ShellResult request = run(UsbKeepAliveTransport.USB_DATA_PORT_ON_COMMAND, 10_000L);
+        UsbKeepAliveTransport.Result binder = request.ok
+                ? UsbKeepAliveTransport.parseUsbOnReply(request.output) : null;
+        wallMs = System.currentTimeMillis();
+        boolean resultRecorded = state.recordResult(reservation, request.ok,
+                dispatchPower.result.value, dispatchAcc.result.value, dispatchPower.raw, dispatchAcc.raw,
+                request.output, request.error, binder, request.elapsedMs, wallMs);
+        snapshot = state.snapshot();
+        lastUsbSkipReason = "";
+        String status = !request.ok ? "shell_failed"
+                : binder != null && binder.valid ? "binder_result_zero" : "binder_reply_invalid";
+        log("usb_on_result wall_ms=" + wallMs + " elapsed_ms=" + SystemClock.elapsedRealtime()
+                + " boot_id=" + bootId + " cycle=" + reservation.cycleCount
+                + " trigger=" + reservation.trigger + " reservation=" + reservation.id
+                + " reservations_total=" + snapshot.reservationCount + " attempts_total=" + snapshot.attemptCount
+                + " cycle_reservations=" + snapshot.cycleReservations + " cycle_attempts=" + snapshot.cycleAttempts
+                + " power=" + dispatchPower.result.value
+                + " acc=" + dispatchAcc.result.value + " power_raw=" + sanitizeUsb(dispatchPower.raw)
+                + " acc_raw=" + sanitizeUsb(dispatchAcc.raw) + " on_raw=" + sanitizeUsb(request.output)
+                + " duration_ms=" + request.elapsedMs + " shell_ok=" + request.ok
+                + " binder_valid=" + snapshot.binderValid
+                + " binder_exception=" + (binder == null ? "unavailable" : binder.exceptionCode)
+                + " binder_return=" + (binder == null ? "unavailable" : binder.returnedInt)
+                + " status=" + status + " result_recorded=" + resultRecorded
+                + " shell_error=" + sanitizeUsb(request.error)
+                + " binder_error=" + (binder == null ? "shell_not_successful" : sanitizeUsb(binder.error)));
+    }
+
+    private static String readBootId() {
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                new FileInputStream(KeepAliveProtocol.KERNEL_BOOT_ID_PATH), StandardCharsets.UTF_8))) {
+            String value = reader.readLine();
+            return value == null || value.trim().isEmpty() ? null : value.trim();
+        } catch (Exception error) {
+            return null;
+        }
+    }
+
+    private static UsbRead readUsbAcc() {
+        ShellResult shell = run(UsbKeepAliveTransport.READ_ACC_COMMAND, 5_000L);
+        UsbKeepAliveTransport.Result result = shell.ok
+                ? UsbKeepAliveTransport.parseAccReply(shell.output) : null;
+        return new UsbRead(result, shell.output, shell.ok ? (result == null ? "parse_unavailable" : result.error) : shell.error,
+                shell.elapsedMs);
+    }
+
+    private static UsbRead readUsbPower() {
+        ShellResult shell = run(UsbKeepAliveTransport.READ_BODYWORK_POWER_LEVEL_COMMAND, 5_000L);
+        UsbKeepAliveTransport.Result result = shell.ok
+                ? UsbKeepAliveTransport.parseBodyworkPowerLevelReply(shell.output) : null;
+        return new UsbRead(result, shell.output, shell.ok ? (result == null ? "parse_unavailable" : result.error) : shell.error,
+                shell.elapsedMs);
+    }
+
+    private static FlagRead readFlag(String command) {
+        ShellResult shell = run(command, 5_000L);
+        if (!shell.ok) return new FlagRead(null, shell.output, shell.error);
+        String value = shell.output.trim();
+        if ("0".equals(value)) return new FlagRead(Boolean.FALSE, shell.output, "");
+        if ("1".equals(value)) return new FlagRead(Boolean.TRUE, shell.output, "");
+        return new FlagRead(null, shell.output, "invalid_setting_value");
+    }
+
+    private static String usbDisabledReason(FlagRead enabled, FlagRead shutdown) {
+        if (enabled.value == null) return "keep_usb_setting_unavailable:" + enabled.error;
+        if (!enabled.value) return "feature_disabled";
+        if (shutdown.value == null) return "user_shutdown_setting_unavailable:" + shutdown.error;
+        return shutdown.value ? "user_shutdown" : null;
+    }
+
+    private static String usbReadError(UsbRead read) {
+        if (read.result != null) return read.result.error;
+        return read.error;
+    }
+
+    private static void logUsbSkip(String reason, UsbKeepAliveState state, String bootId,
+                                   String powerRaw, String accRaw) {
+        if (reason.equals(lastUsbSkipReason)) return;
+        lastUsbSkipReason = reason;
+        UsbKeepAliveState.Snapshot snapshot = state.snapshot();
+        log("usb_skip wall_ms=" + System.currentTimeMillis() + " elapsed_ms=" + SystemClock.elapsedRealtime()
+                + " reason=" + sanitizeUsb(reason) + " boot_id=" + sanitizeUsb(bootId)
+                + " cycle=" + snapshot.cycleCount + " reservations_total=" + snapshot.reservationCount
+                + " attempts_total=" + snapshot.attemptCount + " cycle_reservations=" + snapshot.cycleReservations
+                + " cycle_attempts=" + snapshot.cycleAttempts + " status=" + snapshot.lastStatus
+                + " power_raw=" + sanitizeUsb(powerRaw) + " acc_raw=" + sanitizeUsb(accRaw)
+                + " state_error=" + sanitizeUsb(snapshot.error));
+    }
+
+    private static String sanitizeUsb(String value) {
+        String sanitized = sanitize(value == null ? "" : value);
+        return sanitized.length() <= 1_024 ? sanitized : sanitized.substring(0, 1_024);
+    }
+
+    private static final class UsbRead {
+        private final UsbKeepAliveTransport.Result result;
+        private final String raw;
+        private final String error;
+        private final long elapsedMs;
+
+        private UsbRead(UsbKeepAliveTransport.Result result, String raw, String error, long elapsedMs) {
+            this.result = result;
+            this.raw = raw == null ? "" : raw;
+            this.error = error == null ? "" : error;
+            this.elapsedMs = elapsedMs;
+        }
+    }
+
+    private static final class FlagRead {
+        private final Boolean value;
+        private final String raw;
+        private final String error;
+
+        private FlagRead(Boolean value, String raw, String error) {
+            this.value = value;
+            this.raw = raw == null ? "" : raw;
+            this.error = error == null ? "" : error;
+        }
     }
 
     static void runOnce(boolean keepWifi, boolean keepMobileData, boolean keepBluetooth,

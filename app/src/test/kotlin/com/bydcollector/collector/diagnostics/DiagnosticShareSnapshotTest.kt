@@ -13,6 +13,39 @@ import kotlin.test.assertTrue
 
 class DiagnosticShareSnapshotTest {
     @Test
+    fun usbStateSurvivesDiagnosticSanitizingAndZipWithoutChangingDedupe() {
+        val root = Files.createTempDirectory("collector-usb-share").toFile()
+        try {
+            val stateFile = File(root, "usb-state.json")
+            val state = com.bydcollector.collector.keepalive.UsbKeepAliveState.open(stateFile)
+            val boot = "11111111-1111-1111-1111-111111111111"
+            assertTrue(state.observeBoot(boot))
+            kotlin.test.assertNotNull(state.reserveAttempt(boot, 0, 0, "", "", 100, 50))
+            val original = stateFile.readBytes()
+            val snapshot = File(root, "snapshot_usb").apply { mkdirs() }
+            stateFile.copyTo(File(snapshot, "bydcollector_keepalive_usb_state.json"))
+            sanitizeDiagnosticSnapshot(snapshot)
+            val zip = File(root, "usb.zip")
+            DiagnosticZipWriter.writeLatestZip(zip, snapshot)
+            val stateJson = ZipInputStream(zip.inputStream()).use { input ->
+                var found: String? = null
+                while (true) {
+                    val entry = input.nextEntry ?: break
+                    if (entry.name == "bydcollector_keepalive_usb_state.json") {
+                        found = input.readBytes().toString(Charsets.UTF_8)
+                    }
+                }
+                kotlin.test.assertNotNull(found)
+            }
+            assertEquals(1, JSONObject(stateJson).getInt("reservation_count"))
+            assertContentEquals(original, stateFile.readBytes())
+            kotlin.test.assertNull(com.bydcollector.collector.keepalive.UsbKeepAliveState.open(stateFile).eligibleTrigger(boot))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun shareCopiesAreSanitizedBeforeZipWithoutChangingRecordingsOrDatabaseArchives() {
         val root = Files.createTempDirectory("collector-share-privacy").toFile()
         try {

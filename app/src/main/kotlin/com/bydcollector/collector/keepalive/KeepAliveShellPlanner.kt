@@ -7,6 +7,7 @@ object KeepAliveShellPlanner {
             "settings put global bydcollector_keep_wifi ${flag(config.keepWifi)}",
             "settings put global bydcollector_keep_mobile_data ${flag(config.keepMobileData)}",
             "settings put global bydcollector_keep_bluetooth ${flag(config.keepBluetooth)}",
+            "settings put global bydcollector_keep_usb ${flag(config.keepUsb)}",
             "settings put global bydcollector_recover_collector_service ${flag(config.recoverCollectorService)}",
             "settings put global bydcollector_user_shutdown ${flag(userShutdown)}"
         )

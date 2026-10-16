@@ -255,6 +255,7 @@ class DashboardStateProvider(
             keepMobileDataEnabled = keepAliveConfig?.keepMobileData == true,
             keepBluetoothEnabled = keepAliveConfig?.keepBluetooth == true,
             recoverCollectorServiceEnabled = keepAliveConfig?.recoverCollectorService == true,
+            keepUsbEnabled = keepAliveConfig?.keepUsb == true,
             tailscaleActivationEnabled = if (runtimeSettingsLoaded) settings.isTailscaleActivationEnabled() else false,
             keepAliveEnabled = keepAliveConfig?.anyEnabled == true,
             keepAliveStatus = if (keepAliveConfig?.anyEnabled == true) "enabled" else "disabled",

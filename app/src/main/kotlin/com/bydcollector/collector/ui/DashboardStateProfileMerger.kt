@@ -129,6 +129,7 @@ internal object DashboardStateProfileMerger {
                 keepMobileDataEnabled = previous.keepMobileDataEnabled,
                 keepBluetoothEnabled = previous.keepBluetoothEnabled,
                 recoverCollectorServiceEnabled = previous.recoverCollectorServiceEnabled,
+                keepUsbEnabled = previous.keepUsbEnabled,
                 tailscaleActivationEnabled = previous.tailscaleActivationEnabled,
                 keepAliveEnabled = previous.keepAliveEnabled,
                 keepAliveStatus = previous.keepAliveStatus

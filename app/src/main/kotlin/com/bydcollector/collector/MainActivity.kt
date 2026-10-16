@@ -1063,6 +1063,11 @@ class MainActivity : ComponentActivity() {
             updateKeepAliveSetting("collectorRecovery", enabled) { source.setRecoverCollectorServiceEnabled(it) }
         }
 
+        override fun onToggleKeepUsb(enabled: Boolean) {
+            val source = settings
+            updateKeepAliveSetting("usbRecovery", enabled) { source.setKeepUsbEnabled(it) }
+        }
+
         override fun onToggleTailscaleActivation(enabled: Boolean) {
             refreshStoreBackedState()
             val source = settings

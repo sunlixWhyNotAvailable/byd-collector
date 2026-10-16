@@ -2775,8 +2775,12 @@ private fun ExtraTab(
                         strings.restoreConnectivity,
                         state?.keepWifiEnabled == true && state?.keepMobileDataEnabled == true,
                         actions::onToggleConnectivityRecovery,
+                        divider = false,
                         enabled = !actionUiState.isPending("connectivityRecovery")
                     )
+                    Text(strings.restoreConnectivityDescription, color = LocalBydPalette.current.muted,
+                        fontSize = 12.sp, lineHeight = 16.sp, modifier = Modifier.padding(bottom = 6.dp))
+                    Box(Modifier.fillMaxWidth().height(1.dp).background(LocalBydPalette.current.border))
                     SwitchRow(
                         strings.keepBluetooth,
                         state?.keepBluetoothEnabled == true,
@@ -2789,6 +2793,16 @@ private fun ExtraTab(
                         actions::onToggleKeepCollector,
                         enabled = !actionUiState.isPending("collectorRecovery")
                     )
+                    SwitchRow(
+                        strings.restoreUsb,
+                        state?.keepUsbEnabled == true,
+                        actions::onToggleKeepUsb,
+                        divider = false,
+                        enabled = !actionUiState.isPending("usbRecovery")
+                    )
+                    Text(strings.restoreUsbDescription, color = LocalBydPalette.current.muted,
+                        fontSize = 12.sp, lineHeight = 16.sp, modifier = Modifier.padding(bottom = 6.dp))
+                    Box(Modifier.fillMaxWidth().height(1.dp).background(LocalBydPalette.current.border))
                     Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         ActionButton(
                             strings.startLogcat,

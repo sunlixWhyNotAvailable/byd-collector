@@ -21,6 +21,7 @@ import com.bydcollector.collector.influx.InfluxConfig
 import com.bydcollector.collector.influx.InfluxRuntimeDiagnostics
 import com.bydcollector.collector.influx.InfluxRuntimeDiagnosticsProcess
 import com.bydcollector.collector.influx.safeInfluxDiagnosticHost
+import com.bydcollector.collector.keepalive.KeepAliveProtocol
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.util.sharedOperationalEventExecutor
 import com.bydcollector.collector.util.dispatchOperationalEvent
@@ -275,6 +276,7 @@ object DiagnosticLogRecorder {
                 val archiveStateStatus = writeArchiveStorageStateSnapshot(appContext, snapshotDir)
                 val databaseStatus = writeCollectorEventsSnapshot(appContext, snapshotDir)
                 val helperStatus = writeKeepAliveLogSnapshot(appContext, snapshotDir)
+                val usbStateStatus = writeUsbStateSnapshot(appContext, snapshotDir)
                 val telemetryHelperStatus = writeTelemetryHelperSnapshot(appContext, snapshotDir)
                 val tripsTelegramStatus = writeTripsTelegramEvidence(appContext, snapshotDir)
                 val influxStatus = writeInfluxEvidence(appContext, snapshotDir)
@@ -289,6 +291,7 @@ object DiagnosticLogRecorder {
                         appendLine("archive_storage_state=$archiveStateStatus")
                         appendLine("collector_events=$databaseStatus")
                         appendLine("keep_alive_log=$helperStatus")
+                        appendLine("keep_alive_usb_state=$usbStateStatus")
                         appendLine("telemetry_helper=$telemetryHelperStatus")
                         appendLine("trips_telegram_evidence=$tripsTelegramStatus")
                         appendLine("influx_evidence=$influxStatus")
@@ -617,6 +620,28 @@ object DiagnosticLogRecorder {
             }
             "error"
         }
+    }
+
+    private fun writeUsbStateSnapshot(context: Context, runDir: File): String {
+        val statusFile = File(runDir, "bydcollector_keepalive_usb_state_status.txt")
+        val status = runCatching {
+            val result = AdbLocalClient(File(context.filesDir, "adb_keys")).execShell(
+                command = "head -c 16385 ${KeepAliveProtocol.USB_STATE_PATH} 2>/dev/null",
+                timeoutMs = 5_000,
+                allowAuthorizationPrompt = false
+            )
+            when {
+                !result.ok -> "unavailable error=${diagnosticSafeText(result.error)}"
+                result.output.toByteArray(Charsets.UTF_8).size > 16_384 -> "error=state_size_limit"
+                else -> {
+                    // Copy evidence even if corrupt; never rewrite or clear the helper's dedupe state.
+                    File(runDir, "bydcollector_keepalive_usb_state.json").writeText(result.output, Charsets.UTF_8)
+                    "ok elapsed_ms=${result.elapsedMs}"
+                }
+            }
+        }.getOrElse { "error=${it.javaClass.simpleName}: ${diagnosticSafeText(it.message)}" }
+        statusFile.writeText("captured_at=${timestampIso()}\nsource=${KeepAliveProtocol.USB_STATE_PATH}\nstatus=$status\n", Charsets.UTF_8)
+        return status
     }
 
     private fun writeTelemetryHelperSnapshot(context: Context, runDir: File): String {

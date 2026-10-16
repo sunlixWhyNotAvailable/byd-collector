@@ -1240,7 +1240,8 @@ class CollectorSettings(
             keepWifi = recoverConnectivity,
             keepMobileData = recoverConnectivity,
             keepBluetooth = isKeepBluetoothEnabled(),
-            recoverCollectorService = isRecoverCollectorServiceEnabled()
+            recoverCollectorService = isRecoverCollectorServiceEnabled(),
+            keepUsb = isKeepUsbEnabled()
         )
     }
 
@@ -1270,6 +1271,16 @@ class CollectorSettings(
     }
 
     fun isRecoverCollectorServiceEnabled(): Boolean = prefs.getBoolean(KEY_RECOVER_COLLECTOR_SERVICE, false)
+
+    fun isKeepUsbEnabled(): Boolean = prefs.getBoolean(KEY_KEEP_USB, false)
+
+    fun setKeepUsbEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_KEEP_USB, enabled).apply()
+        recordEvent(
+            category = if (enabled) "keep_alive_usb_enabled" else "keep_alive_usb_disabled",
+            message = "USB recovery ${if (enabled) "enabled" else "disabled"}"
+        )
+    }
 
     fun setRecoverCollectorServiceEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_RECOVER_COLLECTOR_SERVICE, enabled).apply()
@@ -1505,6 +1516,7 @@ class CollectorSettings(
         const val KEY_KEEP_WIFI = "keepWifi"
         const val KEY_KEEP_MOBILE_DATA = "keepMobileData"
         const val KEY_KEEP_BLUETOOTH = "keepBluetooth"
+        const val KEY_KEEP_USB = "keepUsb"
         const val KEY_RECOVER_COLLECTOR_SERVICE = "recoverCollectorService"
         const val KEY_MQTT_ENABLED = "mqttEnabled"
         const val KEY_MQTT_AUTO_START = "mqttAutoStart"
