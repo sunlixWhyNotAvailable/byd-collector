@@ -1088,7 +1088,8 @@ private fun SegmentButton(
 fun KpiTile(
     label: String,
     value: String,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    unit: String? = null
 ) {
     val p = LocalBydPalette.current
     Box(
@@ -1117,6 +1118,16 @@ fun KpiTile(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.align(Alignment.Center)
         )
+        if (unit != null) {
+            Text(
+                text = unit,
+                color = p.muted,
+                fontSize = 11.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.align(Alignment.BottomCenter)
+            )
+        }
     }
 }
 

@@ -267,7 +267,8 @@ object NormalizedFieldCatalog {
     val kpiFields = listOf(soc, batteryRemainingEnergy, cumulativeEnergy, odometerKm, insideTemp,
         perfume1RemainingPercent, perfume2RemainingPercent, perfume3RemainingPercent,
         batterySoh, batteryChargePower, batteryDischargePower, remainingRangeKm,
-        batteryAverageTemp, batteryHighestCellVoltage, batteryLowestCellVoltage)
+        batteryAverageTemp, batteryHighestCellVoltage, batteryLowestCellVoltage,
+        hvBatteryVoltage, chargeCurrent, auxVoltage)
     val kpiKeys: Set<String> = kpiFields.map { it.fieldKey }.toSet()
     val kpiSourceKeys: Set<String> = kpiFields.flatMap { it.sourceKeys }.toSet()
     // Adding the range fallback input must not accelerate Main/Secondary recording reads.

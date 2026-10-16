@@ -265,7 +265,13 @@ data class VehicleKpis(
     val batteryPowerKw: String = "-",
     val remainingRangeKm: String = "-",
     val batteryTempC: String = "-",
-    val cellVoltageDeltaMv: String = "-"
+    val cellVoltageDeltaMv: String = "-",
+    val averageConsumptionKwhPer100Km: String = "-",
+    val minCellVoltageV: String = "-",
+    val maxCellVoltageV: String = "-",
+    val batteryVoltageV: String = "-",
+    val batteryCurrentA: String = "-",
+    val auxVoltageV: String = "-"
 ) : java.io.Serializable
 
 data class DashboardRowCounts(

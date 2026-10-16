@@ -46,7 +46,13 @@ object VehicleKpiMapper {
             batteryPowerKw = power?.let { formatKw(if (charging) abs(it) else -abs(it), language) } ?: "-",
             remainingRangeKm = range.rangeKm.kmValue(language),
             batteryTempC = byKey.temp("battery_average_temp_raw"),
-            cellVoltageDeltaMv = deltaMv?.let { formatMv(it, language) } ?: "-"
+            cellVoltageDeltaMv = deltaMv?.let { formatMv(it, language) } ?: "-",
+            averageConsumptionKwhPer100Km = formatNumber(range.averageKwhPer100Km, 1, language) ?: "-",
+            minCellVoltageV = formatElectricalNumber(lowestCell, 3, "V", language) ?: "-",
+            maxCellVoltageV = formatElectricalNumber(highestCell, 3, "V", language) ?: "-",
+            batteryVoltageV = formatElectricalNumber(byKey.number("hv_battery_voltage_v"), 0, "V", language) ?: "-",
+            batteryCurrentA = formatElectricalNumber(byKey.number("charge_current_a"), 1, "A", language, allowNegative = true) ?: "-",
+            auxVoltageV = formatElectricalNumber(byKey.number("aux_voltage_v"), 1, "V", language) ?: "-"
         )
     }
 
@@ -84,7 +90,13 @@ object VehicleKpiMapper {
             batteryPowerKw = power?.let { formatKw(if (charging) abs(it) else -abs(it), language) } ?: "-",
             remainingRangeKm = range.rangeKm.kmValue(language),
             batteryTempC = numbers.tempValue("battery_average_temp_raw"),
-            cellVoltageDeltaMv = deltaMv?.let { formatMv(it, language) } ?: "-"
+            cellVoltageDeltaMv = deltaMv?.let { formatMv(it, language) } ?: "-",
+            averageConsumptionKwhPer100Km = formatNumber(range.averageKwhPer100Km, 1, language) ?: "-",
+            minCellVoltageV = formatElectricalNumber(numbers["battery_lowest_cell_voltage_raw"], 3, "V", language) ?: "-",
+            maxCellVoltageV = formatElectricalNumber(numbers["battery_highest_cell_voltage_raw"], 3, "V", language) ?: "-",
+            batteryVoltageV = formatElectricalNumber(numbers["hv_battery_voltage_v"], 0, "V", language) ?: "-",
+            batteryCurrentA = formatElectricalNumber(numbers["charge_current_a"], 1, "A", language, allowNegative = true) ?: "-",
+            auxVoltageV = formatElectricalNumber(numbers["aux_voltage_v"], 1, "V", language) ?: "-"
         )
     }
 
@@ -180,6 +192,27 @@ object VehicleKpiMapper {
         val unit = if (language == VehicleKpiLanguage.UK) "кВт" else "kW"
         return "$rounded $unit"
     }
+
+    private fun formatElectricalNumber(
+        value: Double?,
+        decimals: Int,
+        unit: String,
+        language: VehicleKpiLanguage,
+        allowNegative: Boolean = false
+    ): String? = formatNumber(value?.takeIf { allowNegative || it >= 0.0 }, decimals, language)
+        ?.let {
+            val localizedUnit = if (language == VehicleKpiLanguage.UK) when (unit) {
+                "V" -> "В"
+                "A" -> "А"
+                else -> unit
+            } else unit
+            "$it $localizedUnit"
+        }
+
+    private fun formatNumber(value: Double?, decimals: Int, language: VehicleKpiLanguage): String? = value
+        ?.takeIf { it.isFinite() }
+        ?.let { String.format(Locale.US, "%.${decimals}f", it) }
+        ?.let { formatted -> if (language == VehicleKpiLanguage.UK) formatted.replace('.', ',') else formatted }
 
     private fun formatKwh(value: Double?, language: VehicleKpiLanguage): String = value
         ?.takeIf { it.isFinite() && it >= 0.0 }

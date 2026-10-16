@@ -801,7 +801,7 @@ private fun AllParametersTab(
                     },
                     modifier = Modifier
                         .weight(1f)
-                        .height(262.dp)
+                        .height(344.dp)
                 ) {
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         val debugStatus = state?.debugRuntimeStatus ?: DebugRuntimeStatus.STOPPED
@@ -831,7 +831,7 @@ private fun AllParametersTab(
                         NumericInput(state?.debugParameterCount?.toString().orEmpty(), modifier = Modifier.width(60.dp))
                     }
                 }
-            VehicleKpiCard(state?.vehicleKpis, strings, Modifier.weight(2f).height(262.dp)
+            VehicleKpiCard(state?.vehicleKpis, strings, Modifier.weight(2f).height(344.dp)
                 .onGloballyPositioned { coordinates ->
                     // boundsInWindow is clipped by the scroll viewport and window bounds.
                     actions.onKpiViewportVisibilityChanged(
@@ -900,27 +900,38 @@ private fun VehicleKpiCard(kpi: VehicleKpis?, strings: UiStrings, modifier: Modi
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
                     KpiTile(strings.kpiSoc, kpi?.socPercent ?: "-", modifier = Modifier.fillMaxWidth())
-                    KpiTile(strings.kpiEnergyLeft, kpi?.remainingEnergyKwh ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(strings.kpiSoh, kpi?.sohPercent ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(strings.kpiMinCell, kpi?.minCellVoltageV ?: "-", modifier = Modifier.fillMaxWidth())
                 }
                 Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
-                    KpiTile(strings.kpiOdometer, kpi?.odometerKm ?: "-", modifier = Modifier.fillMaxWidth())
-                    KpiTile(chargeLabel, kpi?.batteryPowerKw ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(strings.kpiBatteryTemp, kpi?.batteryTempC ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(strings.kpiEnergyLeft, kpi?.remainingEnergyKwh ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(strings.kpiMaxCell, kpi?.maxCellVoltageV ?: "-", modifier = Modifier.fillMaxWidth())
                 }
                 Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
                     KpiTile(strings.kpiCabinTemp, kpi?.cabinTempC ?: "-", modifier = Modifier.fillMaxWidth())
-                    KpiTile(strings.kpiRange, kpi?.remainingRangeKm ?: "-", modifier = Modifier.fillMaxWidth())
-                }
-                Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
-                    KpiTile(strings.kpiPerfume1, kpi?.perfume1RemainingPercent ?: "-", modifier = Modifier.fillMaxWidth())
-                    KpiTile(strings.kpiBatteryTemp, kpi?.batteryTempC ?: "-", modifier = Modifier.fillMaxWidth())
-                }
-                Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
-                    KpiTile(strings.kpiPerfume2, kpi?.perfume2RemainingPercent ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(chargeLabel, kpi?.batteryPowerKw ?: "-", modifier = Modifier.fillMaxWidth())
                     KpiTile(strings.kpiCellDelta, kpi?.cellVoltageDeltaMv ?: "-", modifier = Modifier.fillMaxWidth())
                 }
                 Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+                    KpiTile(strings.kpiPerfume1, kpi?.perfume1RemainingPercent ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(
+                        strings.kpiAverageConsumption,
+                        kpi?.averageConsumptionKwhPer100Km ?: "-",
+                        modifier = Modifier.fillMaxWidth(),
+                        unit = "kWh/100 km"
+                    )
+                    KpiTile(strings.kpiBatteryVoltage, kpi?.batteryVoltageV ?: "-", modifier = Modifier.fillMaxWidth())
+                }
+                Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+                    KpiTile(strings.kpiPerfume2, kpi?.perfume2RemainingPercent ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(strings.kpiRange, kpi?.remainingRangeKm ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(strings.kpiBatteryCurrent, kpi?.batteryCurrentA ?: "-", modifier = Modifier.fillMaxWidth())
+                }
+                Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
                     KpiTile(strings.kpiPerfume3, kpi?.perfume3RemainingPercent ?: "-", modifier = Modifier.fillMaxWidth())
-                    KpiTile(strings.kpiSoh, kpi?.sohPercent ?: "-", modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(64.dp))
+                    KpiTile(strings.kpiAuxVoltage, kpi?.auxVoltageV ?: "-", modifier = Modifier.fillMaxWidth())
                 }
             }
         }
