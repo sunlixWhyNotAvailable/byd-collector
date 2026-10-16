@@ -21,6 +21,9 @@ import com.bydcollector.collector.data.trips.TripSession
 import com.bydcollector.collector.data.trips.TripStore
 import com.bydcollector.collector.telegram.TelegramEventType
 import com.bydcollector.collector.telegram.TelegramNavigatorMask
+import com.bydcollector.collector.telegram.TelegramPayloadLimitState
+import com.bydcollector.collector.telegram.TelegramTemplateLanguage
+import com.bydcollector.collector.telegram.renderTelegramPayload
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -31,6 +34,7 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -38,6 +42,45 @@ import kotlin.test.assertTrue
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29])
 class TelegramMidTripUpgradeReproductionTest {
+    @Test
+    fun tripLocationRenderingKeepsItsBoundaryAndLengthContracts() {
+        val links = "Google: https://maps.example/?q=49,24\nWaze: https://waze.example/?ll=49,24"
+        val event = TelegramDetectedEvent(
+            type = TelegramEventType.TRIP_SUMMARY,
+            dedupeKey = "trip:summary",
+            variables = emptyMap(),
+            textSuffix = "\n$links"
+        )
+        val template = "Report\r\n\r\n\n"
+
+        assertEquals(
+            "Report\n\n$links",
+            renderTelegramPayload(event, template, TelegramTemplateLanguage.EN).text
+        )
+        assertEquals(
+            template,
+            renderTelegramPayload(event.copy(textSuffix = null), template, TelegramTemplateLanguage.EN).text
+        )
+        assertEquals(
+            links,
+            renderTelegramPayload(
+                event.copy(textSuffix = links, locationOnly = true),
+                null,
+                TelegramTemplateLanguage.EN
+            ).text
+        )
+
+        val atLimitTemplate = "R".repeat(4_093)
+        val atLimit = renderTelegramPayload(event.copy(textSuffix = "\nA"), atLimitTemplate, TelegramTemplateLanguage.EN)
+        assertEquals("$atLimitTemplate\n\nA", atLimit.text)
+        assertEquals(TelegramPayloadLimitState.NONE, atLimit.limitState)
+
+        val overLimitTemplate = "R".repeat(4_094)
+        val overLimit = renderTelegramPayload(event.copy(textSuffix = "\nA"), overLimitTemplate, TelegramTemplateLanguage.EN)
+        assertEquals(overLimitTemplate, overLimit.text)
+        assertEquals(TelegramPayloadLimitState.WITH_LOCATION, overLimit.limitState)
+    }
+
     @Test fun pendingSurvivesClockJumpButOverflowRemainsBounded() {
         val context = RuntimeEnvironment.getApplication()
         val name = "telegram-clock.db"
@@ -195,6 +238,29 @@ class TelegramMidTripUpgradeReproductionTest {
             assertMetric(summary, "soc_end", 70.0)
             assertMetric(summary, "total_soc_start", 72.0)
             assertMetric(summary, "total_soc_end", 70.0)
+            val totalOnlyUk = assertNotNull(
+                renderTelegramPayload(summary, null, TelegramTemplateLanguage.UK).text
+            )
+            assertFalse(totalOnlyUk.contains("📊 Поточна статистика."))
+            assertTrue(totalOnlyUk.contains("📈 Загальна статистика."))
+
+            val historic = renderTelegramPayload(
+                summary,
+                "Trip complete: {trip_distance_km} km, {trip_energy_kwh} kWh at {time}.",
+                TelegramTemplateLanguage.EN
+            )
+            val historicText = assertNotNull(historic.text)
+            assertFalse(historicText.contains("📊 Current statistics."))
+            assertTrue(historicText.contains("📈 Total statistics."))
+
+            val fallback = renderTelegramPayload(summary, "{invalid", TelegramTemplateLanguage.EN)
+            val fallbackText = assertNotNull(fallback.text)
+            assertTrue(fallback.usedFallback)
+            assertFalse(fallbackText.contains("📊 Current statistics."))
+            assertTrue(fallbackText.contains("📈 Total statistics."))
+            assertEquals("Custom trip summary", renderTelegramPayload(
+                summary, "Custom trip summary", TelegramTemplateLanguage.EN
+            ).text)
             assertEquals(tripId, tripStore.openSessions().single().tripId)
 
             val finalEnergy = submitTripPoll(runtime, energy, elapsed, bootId, 9_500L, powerOn = false,
@@ -230,6 +296,66 @@ class TelegramMidTripUpgradeReproductionTest {
             tripStore.close()
             telegramStore.close()
         }
+    }
+
+    @Test
+    fun parkedConsumptionAndLaterDriveKeepDifferentTotalsVisible() {
+        val telegramConfig = TelegramEventConfig(
+            enabledEvents = setOf(TelegramEventType.TRIP_SUMMARY),
+            chargeStepPercent = 5,
+            lowVoltageThreshold = 12.0,
+            unavailableDelayMs = 60_000L,
+            tripEndDelayMs = 2_000L,
+            language = TelegramTemplateLanguage.UK
+        )
+        val engine = drivingTelegramEngine(telegramConfig)
+        val firstDrive = tripTelemetry(gear = "D", soc = 71.0, odometer = 102.0, tripEnergy = 1.5)
+        engine.onSuccessfulPoll(firstDrive, telegramConfig, 2_000L)
+        engine.onSuccessfulPoll(
+            tripTelemetry(gear = "D", soc = 70.0, odometer = 106.0, tripEnergy = 2.5),
+            telegramConfig,
+            5_000L
+        )
+        val parked = tripTelemetry(gear = "P", soc = 70.0, odometer = 106.0, tripEnergy = 2.5)
+        engine.onSuccessfulPoll(parked, telegramConfig, 6_000L)
+        engine.onSuccessfulPoll(parked, telegramConfig, 6_500L)
+        engine.onSuccessfulPoll(parked, telegramConfig, 7_500L)
+        val parkedSummary = engine.onSuccessfulPoll(
+            tripTelemetry(gear = "P", soc = 69.0, odometer = 106.0, tripEnergy = 2.5),
+            telegramConfig,
+            8_500L
+        )
+            .events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+        assertMetric(parkedSummary, "soc_end", 70.0)
+        assertMetric(parkedSummary, "total_soc_end", 69.0)
+        val parkedText = assertNotNull(
+            renderTelegramPayload(parkedSummary, null, TelegramTemplateLanguage.UK).text
+        )
+        assertTrue(parkedText.contains("📊 Поточна статистика."))
+        assertTrue(parkedText.contains("📈 Загальна статистика."))
+
+        val englishConfig = telegramConfig.copy(language = TelegramTemplateLanguage.EN)
+        engine.onSuccessfulPoll(
+            tripTelemetry(gear = "D", soc = 70.0, odometer = 106.0, tripEnergy = 2.5),
+            englishConfig,
+            9_000L
+        )
+        engine.onSuccessfulPoll(
+            tripTelemetry(gear = "D", soc = 69.0, odometer = 107.0, tripEnergy = 3.0),
+            englishConfig,
+            9_500L
+        )
+        val powerOff = engine.onPowerOffConfirmed(
+            englishConfig,
+            TelegramPowerOffSnapshot(odometerKm = 108.0, soc = 68.0, tripEnergyKwh = 3.5),
+            nowMs = 10_000L
+        )
+        val summary = powerOff.events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+        assertMetric(summary, "trip_distance_km", 1.0)
+        assertMetric(summary, "total_distance_km", 7.0)
+        val rendered = assertNotNull(renderTelegramPayload(summary, null, TelegramTemplateLanguage.EN).text)
+        assertTrue(rendered.contains("📊 Current statistics."))
+        assertTrue(rendered.contains("📈 Total statistics."))
     }
 
     private fun newTripRuntime(

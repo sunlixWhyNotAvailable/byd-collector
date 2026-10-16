@@ -752,7 +752,7 @@ internal fun renderTelegramPayload(
 
     fun render(template: String): TelegramTemplateRenderResult = TelegramTemplateRenderer.render(
         event.type,
-        TelegramTemplateCatalog.templateForRendering(event.type, template, language, event.omitOverall),
+        TelegramTemplateCatalog.templateForRendering(event.type, template, language, event.omitCurrent),
         event.variables
     )
 
@@ -762,7 +762,9 @@ internal fun renderTelegramPayload(
     val fallback = savedTemplate?.takeIf { selected.text == null }?.let { render(defaultTemplate) }
     val base = selected.text ?: fallback?.text ?: return selected
     val suffix = event.textSuffix.orEmpty()
-    val combined = base + suffix
+    val combined = if (suffix.isEmpty()) base else {
+        base.trimEnd('\r', '\n') + "\n\n" + suffix.trimStart('\r', '\n')
+    }
     val locationTooLong = combined.codePointCount(0, combined.length) > TELEGRAM_MESSAGE_MAX_CHARS
     val payload = if (locationTooLong) base else combined
     val limitState = when {

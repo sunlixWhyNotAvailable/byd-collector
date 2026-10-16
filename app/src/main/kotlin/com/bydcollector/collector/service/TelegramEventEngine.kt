@@ -57,7 +57,7 @@ data class TelegramDetectedEvent(
     val dedupeKey: String,
     val variables: Map<String, String>,
     val textSuffix: String? = null,
-    val omitOverall: Boolean = false,
+    val omitCurrent: Boolean = false,
     val locationOnly: Boolean = false,
     val waitsForSummaryKey: String? = null,
     val occurredAtMs: Long? = null,
@@ -866,7 +866,7 @@ class TelegramEventEngine(
                     ?.takeIf { config.sendLocation }
                     ?.let { formatLocation(it, config.navigatorMask) }
                     ?.takeIf(String::isNotEmpty),
-                omitOverall = displayedTripTotalsMatch(
+                omitCurrent = displayedTripTotalsMatch(
                     distance = distance,
                     energy = energy,
                     durationMs = durationMs,
@@ -1386,7 +1386,7 @@ class TelegramEventEngine(
                     language = config.language,
                     nowMs = tripEndAtMs
                 ),
-                omitOverall = displayedTripTotalsMatch(
+                omitCurrent = displayedTripTotalsMatch(
                     distance = distance,
                     energy = energy,
                     durationMs = durationMs,
@@ -1699,7 +1699,7 @@ class TelegramEventEngine(
         dedupeKey: String,
         variables: Map<String, String>,
         textSuffix: String? = null,
-        omitOverall: Boolean = false,
+        omitCurrent: Boolean = false,
         locationOnly: Boolean = false,
         waitsForSummaryKey: String? = null,
         occurredAtMs: Long? = null,
@@ -1711,7 +1711,7 @@ class TelegramEventEngine(
                 dedupeKey = dedupeKey,
                 variables = variables,
                 textSuffix = textSuffix,
-                omitOverall = omitOverall,
+                omitCurrent = omitCurrent,
                 locationOnly = locationOnly,
                 waitsForSummaryKey = waitsForSummaryKey,
                 occurredAtMs = occurredAtMs,

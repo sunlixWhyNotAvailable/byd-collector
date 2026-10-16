@@ -221,11 +221,20 @@ object TelegramBuiltInTemplates {
     fun defaultTemplate(type: TelegramEventType, language: TelegramTemplateLanguage): String =
         current.getValue(type).getValue(language)
 
-    fun tripSummaryTemplate(language: TelegramTemplateLanguage, includeOverall: Boolean): String {
+    fun tripSummaryTemplate(language: TelegramTemplateLanguage, includeCurrent: Boolean): String {
         val full = defaultTemplate(TelegramEventType.TRIP_SUMMARY, language)
-        return if (includeOverall) full else full.substringBefore(
-            if (language == TelegramTemplateLanguage.UK) "\n\n📈 Загальна статистика." else "\n\n📈 Total statistics."
-        )
+        if (includeCurrent) return full
+        val currentHeading = if (language == TelegramTemplateLanguage.UK) {
+            "\n\n📊 Поточна статистика."
+        } else {
+            "\n\n📊 Current statistics."
+        }
+        val totalHeading = if (language == TelegramTemplateLanguage.UK) {
+            "\n\n📈 Загальна статистика."
+        } else {
+            "\n\n📈 Total statistics."
+        }
+        return full.substringBefore(currentHeading) + totalHeading + full.substringAfter(totalHeading)
     }
 
     fun classify(type: TelegramEventType, template: String): TelegramBuiltInTemplateMatch? {
@@ -376,11 +385,11 @@ object TelegramTemplateCatalog {
         event: TelegramEventType,
         template: String,
         language: TelegramTemplateLanguage,
-        omitOverall: Boolean
+        omitCurrent: Boolean
     ): String {
-        if (event != TelegramEventType.TRIP_SUMMARY || !omitOverall) return template
+        if (event != TelegramEventType.TRIP_SUMMARY || !omitCurrent) return template
         val match = TelegramBuiltInTemplates.classify(event, template) ?: return template
-        return TelegramBuiltInTemplates.tripSummaryTemplate(match.language, includeOverall = false)
+        return TelegramBuiltInTemplates.tripSummaryTemplate(match.language, includeCurrent = false)
     }
 
     fun defaultTemplate(event: TelegramEventType): String = spec(event).defaultTemplate
