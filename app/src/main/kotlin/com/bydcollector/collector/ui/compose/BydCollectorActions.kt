@@ -4,6 +4,7 @@ import com.bydcollector.collector.influx.InfluxConfig
 import com.bydcollector.collector.mqtt.MqttCleanupGroup
 import com.bydcollector.collector.mqtt.MqttCleanupSelection
 import com.bydcollector.collector.telegram.TelegramNavigatorMask
+import com.bydcollector.collector.telegram.ChargingEtaSelection
 import com.bydcollector.collector.telegram.TelegramPayloadLimitState
 import com.bydcollector.collector.ha.HaEndpointProfile
 import com.bydcollector.collector.update.UpdateHintAppearance
@@ -221,6 +222,8 @@ data class TelegramConfig(
     val botTokenSet: Boolean = false,
     val chatId: String = "",
     val chargeStepPercent: Int = 5,
+    val acEtaSelection: ChargingEtaSelection = ChargingEtaSelection.CALCULATED,
+    val dcEtaSelection: ChargingEtaSelection = ChargingEtaSelection.CALCULATED,
     val low12vThresholdVolts: Float = 12.5f,
     val telemetryUnavailableMinutes: Int = 1,
     val tripSummaryDelaySeconds: Int = 10,

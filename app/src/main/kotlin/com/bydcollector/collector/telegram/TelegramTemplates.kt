@@ -36,8 +36,10 @@ data class TelegramBuiltInTemplateMatch(
 object TelegramBuiltInTemplates {
     const val CHARGING_STARTED_UK = "⚡ Заряджання розпочато\n🔋 SOC: {soc}%\n🕒 Час: {time}"
     const val CHARGING_STARTED_EN = "⚡ Charging started\n🔋 SOC: {soc}%\n🕒 Time: {time}"
-    const val CHARGING_PROGRESS_UK = "🔋 Заряд: {soc}%\n⚡ Потужність: {battery_power_kw} кВт\n📈 За крок: +{charge_step_added_percent}% / +{charge_step_added_kwh} кВт·год\n⏱️ Час кроку: {charge_step_duration}\n📊 За сесію: +{charge_added_percent}% / +{charge_added_kwh} кВт·год\n⏱️ Час сесії: {charge_duration}\n🕒 Час: {time}"
-    const val CHARGING_PROGRESS_EN = "🔋 Charge: {soc}%\n⚡ Power: {battery_power_kw} kW\n📈 This step: +{charge_step_added_percent}% / +{charge_step_added_kwh} kWh\n⏱️ Step time: {charge_step_duration}\n📊 Session total: +{charge_added_percent}% / +{charge_added_kwh} kWh\n⏱️ Session time: {charge_duration}\n🕒 Time: {time}"
+    const val CHARGING_PROGRESS_UK = "🔌 Тип заряджання: {charge_type}\n🔋 Заряд: {soc}%\n⚡ Потужність: {battery_power_kw} кВт\n\n📈 За крок: +{charge_step_added_percent}% / +{charge_step_added_kwh} кВт·год\n⏱️ Час кроку: {charge_step_duration}\n\n📊 За сесію: +{charge_added_percent}% / +{charge_added_kwh} кВт·год\n⏱️ Час сесії: {charge_duration}\n\n⏳ Заряд до 100%: {charge_time_to_full}\n🏁 Повний заряд об: {charge_full_time}\n🕒 Час: {time}"
+    const val CHARGING_PROGRESS_EN = "🔌 Charging type: {charge_type}\n🔋 Charge: {soc}%\n⚡ Power: {battery_power_kw} kW\n\n📈 This step: +{charge_step_added_percent}% / +{charge_step_added_kwh} kWh\n⏱️ Step time: {charge_step_duration}\n\n📊 Session total: +{charge_added_percent}% / +{charge_added_kwh} kWh\n⏱️ Session time: {charge_duration}\n\n⏳ Time to 100%: {charge_time_to_full}\n🏁 Full charge at: {charge_full_time}\n🕒 Time: {time}"
+    private const val PRE_ETA_CHARGING_PROGRESS_UK = "🔋 Заряд: {soc}%\n⚡ Потужність: {battery_power_kw} кВт\n📈 За крок: +{charge_step_added_percent}% / +{charge_step_added_kwh} кВт·год\n⏱️ Час кроку: {charge_step_duration}\n📊 За сесію: +{charge_added_percent}% / +{charge_added_kwh} кВт·год\n⏱️ Час сесії: {charge_duration}\n🕒 Час: {time}"
+    private const val PRE_ETA_CHARGING_PROGRESS_EN = "🔋 Charge: {soc}%\n⚡ Power: {battery_power_kw} kW\n📈 This step: +{charge_step_added_percent}% / +{charge_step_added_kwh} kWh\n⏱️ Step time: {charge_step_duration}\n📊 Session total: +{charge_added_percent}% / +{charge_added_kwh} kWh\n⏱️ Session time: {charge_duration}\n🕒 Time: {time}"
     const val CHARGED_TO_100_UK = "✅ Авто заряджено до 100%\n📈 Заряджено: {charge_added_percent}% / {charge_added_kwh} кВт·год\n⏱️ Час заряджання: {charge_start_time} → {charge_end_time} ({charge_duration_hhmm})\n🔋 Енергія: {remaining_energy_kwh} кВт·год\n🛣️ Запас ходу: {range_km} км"
     const val CHARGED_TO_100_EN = "✅ Vehicle charged to 100%\n📈 Charged: {charge_added_percent}% / {charge_added_kwh} kWh\n⏱️ Charging time: {charge_start_time} → {charge_end_time} ({charge_duration_hhmm})\n🔋 Energy: {remaining_energy_kwh} kWh\n🛣️ Range: {range_km} km"
     const val CHARGING_STOPPED_UK = "⏹️ Заряджання зупинено\n🔋 SOC: {soc}%\n⏱️ Тривалість: {charge_duration}\n🕒 Час: {time}"
@@ -159,11 +161,13 @@ object TelegramBuiltInTemplates {
         TelegramEventType.CHARGING_PROGRESS to mapOf(
             TelegramTemplateLanguage.UK to setOf(
                 HISTORIC_CHARGING_PROGRESS_UK,
+                PRE_ETA_CHARGING_PROGRESS_UK,
                 "Заряд: {soc}%\nДодано: {charge_added_percent}% / {charge_added_kwh} кВт·год",
                 "Заряд: {soc}%\nЗа крок: +{charge_step_added_percent}% / +{charge_step_added_kwh} кВт·год\nЗа сесію: +{charge_added_percent}% / +{charge_added_kwh} кВт·год"
             ),
             TelegramTemplateLanguage.EN to setOf(
                 HISTORIC_CHARGING_PROGRESS_EN,
+                PRE_ETA_CHARGING_PROGRESS_EN,
                 "Charge: {soc}%\nAdded: {charge_added_percent}% / {charge_added_kwh} kWh",
                 "Charging progress: {soc}% (+{charge_added_percent}%, {charge_added_kwh} kWh), {battery_power_kw} kW.",
                 "Charge: {soc}%\nThis step: +{charge_step_added_percent}% / +{charge_step_added_kwh} kWh\nSession total: +{charge_added_percent}% / +{charge_added_kwh} kWh"
@@ -305,6 +309,9 @@ object TelegramTemplateCatalog {
                 "charge_added_kwh",
                 "charge_duration",
                 "battery_power_kw",
+                "charge_type",
+                "charge_time_to_full",
+                "charge_full_time",
                 "time"
             )
         ),

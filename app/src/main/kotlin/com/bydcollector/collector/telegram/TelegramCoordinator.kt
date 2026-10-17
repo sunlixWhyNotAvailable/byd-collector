@@ -78,12 +78,25 @@ class TelegramCoordinator internal constructor(
         val previousChargingActive = engine.state.chargingActive
         val previousBmsConflict = engine.state.bmsFinishHighPowerConflictActive
         val previousTripId = engine.state.tripId
+        val eventNowMs = nowMs()
         val result = engine.onSourcePoll(
             pollId, timestamp, source, readings, origin, currentBootId,
-            eventConfig(), nowMs(), normalizer, energySnapshot
+            eventConfig(), eventNowMs, normalizer, energySnapshot,
+            android.os.SystemClock.elapsedRealtime()
         )
         val committed = handle(result)
-        if (committed) recordSourceDecisions(result, origin)
+        if (committed) {
+            recordSourceDecisions(result, origin)
+            result.chargingEtaStateDiagnosticDetail?.let { detail ->
+                runCatching {
+                    eventStore.recordEvent(
+                        "telegram_charging_eta_state",
+                        "Telegram charging ETA source state changed",
+                        "origin=${origin.name.lowercase()} $detail"
+                    )
+                }
+            }
+        }
         // Only a leg created by this poll has a proven relation to this poll's Trips session.
         // Restored active/pending legs without metadata remain explicitly unlinked.
         if (committed) {
@@ -498,7 +511,9 @@ class TelegramCoordinator internal constructor(
                         location = locationKind,
                         extra = "occurred_at_ms=${message.occurredAtMs ?: "unknown"} " +
                             "created_at_ms=$committedAt " +
-                            "source_ref=${eventsByDedupeKey[message.dedupeKey]?.sourceIdentityHash ?: "none"}"
+                            "source_ref=${eventsByDedupeKey[message.dedupeKey]?.sourceIdentityHash ?: "none"}" +
+                            eventsByDedupeKey[message.dedupeKey]?.chargingEtaDiagnosticDetail
+                                ?.takeIf(String::isNotBlank)?.let { " $it" }.orEmpty()
                     )
                 )
             }
@@ -654,6 +669,8 @@ class TelegramCoordinator internal constructor(
         return TelegramEventConfig(
             enabledEvents = enabled,
             chargeStepPercent = settings.telegramChargeStepPercent(),
+            acEtaSelection = settings.telegramAcEtaSelection(),
+            dcEtaSelection = settings.telegramDcEtaSelection(),
             lowVoltageThreshold = settings.telegramLowVoltageThreshold().toDouble(),
             unavailableDelayMs = settings.telegramUnavailableDelayMinutes() * 60_000L,
             tripEndDelayMs = settings.telegramTripEndDelaySeconds() * 1_000L,

@@ -107,6 +107,7 @@ import com.bydcollector.collector.service.TripCompressionService
 import com.bydcollector.collector.service.TripCompressionState
 import com.bydcollector.collector.telegram.TelegramEventType
 import com.bydcollector.collector.telegram.TelegramNavigatorMask
+import com.bydcollector.collector.telegram.ChargingEtaSelection
 import com.bydcollector.collector.telegram.TelegramPayloadLimitState
 import com.bydcollector.collector.telegram.TelegramTemplateErrorKind
 import com.bydcollector.collector.telegram.TelegramTemplateRenderer
@@ -547,6 +548,9 @@ private val TelegramMessageDefinitions = listOf(
             "charge_added_kwh",
             "charge_duration",
             "battery_power_kw",
+            "charge_type",
+            "charge_time_to_full",
+            "charge_full_time",
             "time"
         )
     ),
@@ -2442,7 +2446,19 @@ private fun TelegramMessageCard(
         modifier = modifier
     ) {
         val setting = telegramNumberSetting(definition.type, config, strings.telegram, onConfigChanged)
-        if (setting != null) {
+        if (definition.type == TelegramMessageType.CHARGING_PROGRESS) {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                TelegramNumberStepper(requireNotNull(setting))
+                TelegramEtaSelector(strings.telegram.acForecast, strings.telegram, config.acEtaSelection) {
+                    onConfigChanged(config.copy(acEtaSelection = it))
+                }
+                TelegramEtaSelector(strings.telegram.dcForecast, strings.telegram, config.dcEtaSelection) {
+                    onConfigChanged(config.copy(dcEtaSelection = it))
+                }
+            }
+        } else if (definition.type == TelegramMessageType.CHARGING_STARTED) {
+            Spacer(Modifier.height(150.dp))
+        } else if (setting != null) {
             TelegramNumberStepper(setting)
         } else {
             Spacer(Modifier.height(42.dp))
@@ -2519,6 +2535,40 @@ private fun TelegramMessageCard(
                 showLocationSettings = false
             },
             onDismiss = { showLocationSettings = false }
+        )
+    }
+}
+
+@Composable
+private fun TelegramEtaSelector(
+    label: String,
+    strings: TelegramStrings,
+    selection: ChargingEtaSelection,
+    onSelected: (ChargingEtaSelection) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().height(42.dp),
+        horizontalArrangement = Arrangement.spacedBy(7.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            label,
+            color = LocalBydPalette.current.text,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.weight(1f),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        SegmentedControl(
+            left = strings.forecastVehicle,
+            right = strings.forecastCalculated,
+            leftSelected = selection == ChargingEtaSelection.OEM_ONLY,
+            onLeft = { onSelected(ChargingEtaSelection.OEM_ONLY) },
+            onRight = { onSelected(ChargingEtaSelection.CALCULATED) },
+            leftWidth = 170.dp,
+            rightWidth = 125.dp,
+            animateSelection = true
         )
     }
 }

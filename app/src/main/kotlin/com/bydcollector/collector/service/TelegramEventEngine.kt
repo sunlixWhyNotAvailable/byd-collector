@@ -14,11 +14,19 @@ import com.bydcollector.collector.data.polling.PollOrigin
 import com.bydcollector.collector.data.polling.PollSampleSource
 import com.bydcollector.collector.data.trips.TripMetrics
 import com.bydcollector.collector.diagnostics.diagnosticSha256
+import com.bydcollector.collector.telegram.ChargingEtaCalculator
+import com.bydcollector.collector.telegram.ChargingEtaInput
+import com.bydcollector.collector.telegram.ChargingEtaResult
+import com.bydcollector.collector.telegram.ChargingEtaSelection
+import com.bydcollector.collector.telegram.ChargingEtaSessionId
+import com.bydcollector.collector.telegram.ChargingType
+import com.bydcollector.collector.telegram.DcChargingProfile
 import com.bydcollector.collector.telegram.TelegramEventType
 import com.bydcollector.collector.telegram.TelegramNavigatorMask
 import com.bydcollector.collector.telegram.TelegramTemplateLanguage
 import org.json.JSONObject
 import java.util.UUID
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.roundToInt
@@ -31,7 +39,9 @@ data class TelegramEventConfig(
     val tripEndDelayMs: Long,
     val sendLocation: Boolean = false,
     val language: TelegramTemplateLanguage = TelegramTemplateLanguage.UK,
-    val navigatorMask: Int = TelegramNavigatorMask.NONE
+    val navigatorMask: Int = TelegramNavigatorMask.NONE,
+    val acEtaSelection: ChargingEtaSelection = ChargingEtaSelection.CALCULATED,
+    val dcEtaSelection: ChargingEtaSelection = ChargingEtaSelection.CALCULATED
 )
 
 data class TelegramLocationSnapshot(
@@ -61,7 +71,8 @@ data class TelegramDetectedEvent(
     val locationOnly: Boolean = false,
     val waitsForSummaryKey: String? = null,
     val occurredAtMs: Long? = null,
-    val sourceIdentityHash: String? = null
+    val sourceIdentityHash: String? = null,
+    val chargingEtaDiagnosticDetail: String? = null
 )
 
 data class TelegramEventResult(
@@ -71,7 +82,8 @@ data class TelegramEventResult(
     val nextWakeAtMs: Long?,
     val locationEligibilityReason: String? = null,
     val sourceOrderStats: TelegramSourceOrderStats? = null,
-    val detectorDecisions: List<TelegramDetectorDecision> = emptyList()
+    val detectorDecisions: List<TelegramDetectorDecision> = emptyList(),
+    val chargingEtaStateDiagnosticDetail: String? = null
 )
 
 data class TelegramDetectorDecision(
@@ -333,6 +345,12 @@ class TelegramEventEngine(
     initialState: TelegramEventState = TelegramEventState(),
     private val ecMeanKwhPer100Km: () -> Double? = { null }
 ) {
+    private var chargingEtaCalculator = ChargingEtaCalculator()
+    private var chargingEtaSession: ChargingEtaSessionId? = null
+    private var chargingEtaType: ChargingType? = null
+    private var chargingEtaPaused = false
+    private var chargingEtaLastPowerElapsedMs: Long? = null
+
     private val resumePendingChargingTransition =
         initialState.chargingActiveCandidate != null &&
             initialState.chargingActiveCandidateCount > 0 &&
@@ -364,6 +382,7 @@ class TelegramEventEngine(
 
     fun reset(): TelegramEventState {
         state = TelegramEventState()
+        clearChargingEtaHistory()
         return state
     }
 
@@ -444,7 +463,8 @@ class TelegramEventEngine(
         config: TelegramEventConfig,
         nowMs: Long,
         normalizer: VehicleStateNormalizer,
-        energySnapshot: EnergySnapshot? = null
+        energySnapshot: EnergySnapshot? = null,
+        nowElapsedMs: Long = source.capturedElapsedMs
     ): TelegramEventResult {
         val original = state
         val pollStamp = normalizedPollSourceStamp(source, timestamp)
@@ -455,6 +475,19 @@ class TelegramEventEngine(
             pollId = pollId,
             currentBootId = currentBootId
         )
+        val currentSocStamp = ordered.sourceStamp("soc", freshOnly = false)
+        val currentEnergyStamp = ordered.sourceStamp("battery_remaining_energy_kwh", freshOnly = false)
+        val previousEnergyCursor = original.rawSourceInputs["power_battery_remain_electricity"]
+            ?.takeIf {
+                currentSocStamp != null && currentEnergyStamp?.elapsedMs?.let { it > currentSocStamp.elapsedMs } == true &&
+                    it.stamp.bootId == currentBootId && it.stamp.elapsedMs <= currentSocStamp.elapsedMs
+            }
+        val previousEnergyObservation = previousEnergyCursor?.let { cursor ->
+            normalizer.normalizeSparse(
+                mapOf("power_battery_remain_electricity" to cursor.toInput("power_battery_remain_electricity")),
+                setOf("power_battery_remain_electricity")
+            ).firstOrNull { it.field.fieldKey == "battery_remaining_energy_kwh" }
+        }
         // Reconstruct the current bounded telemetry view from accepted and cached cursors.
         // Freshness is gated separately below; this keeps evidence selection coherent on sparse polls.
         val observations = normalizer.normalizeSparse(ordered.inputs, ordered.inputs.keys)
@@ -467,7 +500,13 @@ class TelegramEventEngine(
             energySnapshot = energySnapshot,
             freshness = ordered,
             origin = origin,
-            original = original
+            original = original,
+            etaCurrentBootId = currentBootId,
+            etaCycleBootId = source.bootId,
+            etaCycleElapsedMs = source.capturedElapsedMs,
+            etaNowElapsedMs = nowElapsedMs,
+            etaPreviousEnergyKwh = previousEnergyObservation?.value?.number,
+            etaPreviousEnergyStamp = previousEnergyCursor?.stamp
         )
         return result.copy(
             sourceOrderStats = ordered.stats,
@@ -569,7 +608,13 @@ class TelegramEventEngine(
         energySnapshot: EnergySnapshot?,
         freshness: TelegramOrderedPollInput?,
         origin: PollOrigin,
-        original: TelegramEventState
+        original: TelegramEventState,
+        etaCurrentBootId: String? = null,
+        etaCycleBootId: String? = null,
+        etaCycleElapsedMs: Long? = null,
+        etaNowElapsedMs: Long? = null,
+        etaPreviousEnergyKwh: Double? = null,
+        etaPreviousEnergyStamp: NormalizedSourceStamp? = null
     ): TelegramEventResult {
         val values = observations.asSequence()
             .filter { it.quality == NormalizedQuality.OK }
@@ -591,6 +636,16 @@ class TelegramEventEngine(
         ).rangeKm
         val rawGun = values.bool("charge_gun_connected_raw")
         val bmsState = values.text("charging_battery_device_state")
+        val resolvedChargeType = resolveChargingType(
+            values.text("charging_type").takeIf {
+                freshness == null || freshness.hasCurrentBoot("charging_type")
+            },
+            values.text("charging_gun_type").takeIf {
+                freshness == null || freshness.hasCurrentBoot("charging_gun_type")
+            }
+        )
+        val paused = bmsState == "charging_pause" &&
+            (freshness == null || freshness.hasCurrentBoot("charging_battery_device_state"))
         val rawGear = values.text("gear_auto_mode_raw")
         val events = mutableListOf<TelegramDetectedEvent>()
         val currentEnergyPoint = observeEnergySnapshot(energySnapshot, allowInactive = false)
@@ -692,11 +747,59 @@ class TelegramEventEngine(
             events = events,
             sourceIdentity = evidenceSourceIdentity
         ) else false
+        val chargingEtaStateDiagnosticDetail = if (freshness != null && origin == PollOrigin.LIVE &&
+            etaCycleBootId == etaCurrentBootId && etaCurrentBootId != null &&
+            etaCycleElapsedMs != null && etaNowElapsedMs != null
+        ) {
+            updateChargingEtaHistory(
+                input = freshness,
+                observations = observations,
+                currentBootId = etaCurrentBootId,
+                cycleElapsedMs = etaCycleElapsedMs,
+                nowElapsedMs = etaNowElapsedMs,
+                chargeType = resolvedChargeType,
+                batteryChargePower = batteryChargePower,
+                confirmedActive = state.chargingActive == true && evidence.active != false,
+                evidenceActive = evidence.active == true,
+                paused = paused
+            )?.let { reason ->
+                chargingEtaStateDiagnosticDetail(
+                    reason = reason,
+                    chargeType = resolvedChargeType,
+                    selection = etaSelection(resolvedChargeType, config),
+                    soc = soc,
+                    powerKw = batteryChargePower
+                )
+            }
+        } else null
         val fullFinished = evidence.active != null && (state.chargingSessionId != null || stopCharging) &&
             if (socFresh) evaluateChargingProgress(
                 freshness?.sourceStamp("soc")?.wallMs ?: nowMs,
                 soc, remainingEnergy, batteryChargePower, range, config, events,
-                freshness?.sourceStamp("soc")?.identity
+                freshness?.sourceStamp("soc")?.identity,
+                progressEta = {
+                    if (origin == PollOrigin.LIVE && freshness != null && etaCurrentBootId != null &&
+                        etaCycleBootId == etaCurrentBootId &&
+                        etaCycleElapsedMs != null && etaNowElapsedMs != null
+                    ) {
+                        chargingEtaPresentation(
+                            input = freshness,
+                            currentBootId = etaCurrentBootId,
+                            nowElapsedMs = etaNowElapsedMs,
+                            soc = soc,
+                            remainingEnergy = remainingEnergy,
+                            batteryChargePower = batteryChargePower,
+                            previousRemainingEnergy = etaPreviousEnergyKwh,
+                            previousRemainingEnergyStamp = etaPreviousEnergyStamp,
+                            chargeType = resolvedChargeType,
+                            selection = etaSelection(resolvedChargeType, config),
+                            active = state.chargingActive == true && evidence.active != false,
+                            paused = paused
+                        )
+                    } else {
+                        ChargingEtaPresentation(resolvedChargeType, etaSelection(resolvedChargeType, config), null)
+                    }
+                }
             ) else false
         if (freshness != null && socFresh && soc == null && state.chargingSessionId != null) {
             state = state.copy(fullCandidateCount = 0)
@@ -734,7 +837,7 @@ class TelegramEventEngine(
             force = firstPoll || tripCounterResetObserved || powerEnergySessionChanged || changedBeyondHeartbeat ||
                 nowMs - state.lastPersistedAtMs >= STATE_HEARTBEAT_MS,
             config = config
-        )
+        ).copy(chargingEtaStateDiagnosticDetail = chargingEtaStateDiagnosticDetail)
     }
 
     fun onTick(
@@ -1190,7 +1293,8 @@ class TelegramEventEngine(
         range: Double?,
         config: TelegramEventConfig,
         events: MutableList<TelegramDetectedEvent>,
-        sourceIdentity: String? = null
+        sourceIdentity: String? = null,
+        progressEta: (() -> ChargingEtaPresentation)? = null
     ): Boolean {
         val sessionId = state.chargingSessionId ?: return false
         val currentSoc = soc ?: return false
@@ -1208,13 +1312,19 @@ class TelegramEventEngine(
                         sourceIdentity = sourceIdentity
                     )
                 } else {
-                    val variables = chargingProgressVariables(nowMs, soc, remainingEnergy, batteryChargePower, config.language)
+                    val eta = progressEta?.takeIf {
+                        TelegramEventType.CHARGING_PROGRESS in config.enabledEvents
+                    }?.invoke()
+                    val variables = chargingProgressVariables(
+                        nowMs, soc, remainingEnergy, batteryChargePower, config.language, eta
+                    )
                     advanceChargingProgressBaseline(nowMs, soc, remainingEnergy)
                     addIfEnabled(
                         events, config, TelegramEventType.CHARGING_PROGRESS, "$sessionId:progress:100",
                         variables,
                         occurredAtMs = nowMs,
-                        sourceIdentity = sourceIdentity
+                        sourceIdentity = sourceIdentity,
+                        chargingEtaDiagnosticDetail = eta?.diagnosticDetail(soc, batteryChargePower)
                     )
                 }
             }
@@ -1227,13 +1337,19 @@ class TelegramEventEngine(
         val previousThreshold = state.lastProgressThreshold ?: return false
         if (threshold <= previousThreshold) return false
         state = state.copy(lastProgressThreshold = threshold)
-        val variables = chargingProgressVariables(nowMs, soc, remainingEnergy, batteryChargePower, config.language)
+        val eta = progressEta?.takeIf {
+            TelegramEventType.CHARGING_PROGRESS in config.enabledEvents
+        }?.invoke()
+        val variables = chargingProgressVariables(
+            nowMs, soc, remainingEnergy, batteryChargePower, config.language, eta
+        )
         advanceChargingProgressBaseline(nowMs, soc, remainingEnergy)
         addIfEnabled(
             events, config, TelegramEventType.CHARGING_PROGRESS, "$sessionId:progress:$threshold",
             variables,
             occurredAtMs = nowMs,
-            sourceIdentity = sourceIdentity
+            sourceIdentity = sourceIdentity,
+            chargingEtaDiagnosticDetail = eta?.diagnosticDetail(soc, batteryChargePower)
         )
         return false
     }
@@ -1310,6 +1426,7 @@ class TelegramEventEngine(
     }
 
     private fun finishChargingSession(full: Boolean) {
+        clearChargingEtaHistory()
         state = state.copy(
             chargingSessionId = null,
             chargingStartedAtMs = null,
@@ -1586,7 +1703,8 @@ class TelegramEventEngine(
         soc: Double?,
         remainingEnergy: Double?,
         batteryPower: Double?,
-        language: TelegramTemplateLanguage
+        language: TelegramTemplateLanguage,
+        eta: ChargingEtaPresentation? = null
     ): Map<String, String> {
         return chargingVariables(nowMs, soc, remainingEnergy, batteryPower, language) + mapOf(
             "charge_step_added_percent" to formatNumber(
@@ -1598,7 +1716,10 @@ class TelegramEventEngine(
             "charge_step_duration" to formatChargeDuration(
                 nowMs - (state.chargingStepStartedAtMs ?: state.chargingStartedAtMs ?: nowMs),
                 language
-            )
+            ),
+            "charge_type" to formatChargeType(eta?.chargeType),
+            "charge_time_to_full" to formatEtaDuration(eta?.result?.roundedUpMinutes, language),
+            "charge_full_time" to formatEtaFullTime(eta?.result?.finishAtWallMs)
         )
     }
 
@@ -1703,7 +1824,8 @@ class TelegramEventEngine(
         locationOnly: Boolean = false,
         waitsForSummaryKey: String? = null,
         occurredAtMs: Long? = null,
-        sourceIdentity: String? = null
+        sourceIdentity: String? = null,
+        chargingEtaDiagnosticDetail: String? = null
     ) {
         if (type in config.enabledEvents) {
             events += TelegramDetectedEvent(
@@ -1715,7 +1837,8 @@ class TelegramEventEngine(
                 locationOnly = locationOnly,
                 waitsForSummaryKey = waitsForSummaryKey,
                 occurredAtMs = occurredAtMs,
-                sourceIdentityHash = sourceIdentity?.let(::diagnosticSha256)
+                sourceIdentityHash = sourceIdentity?.let(::diagnosticSha256),
+                chargingEtaDiagnosticDetail = chargingEtaDiagnosticDetail
             )
         }
     }
@@ -1753,6 +1876,7 @@ class TelegramEventEngine(
         private const val FULL_SOC_THRESHOLD = 99.5
         private const val CHARGING_POWER_THRESHOLD_KW = 0.5
         private const val CHARGING_LOW_POWER_CONFIRM_MS = 60_000L
+        private const val MAX_ETA_POWER_SAMPLE_GAP_MS = 5_000L
         private const val BMS_CHARGING = "charging"
         private const val BMS_FINISHED = "finished"
         private const val LOW_VOLTAGE_CONFIRM_MS = 60_000L
@@ -1763,6 +1887,223 @@ class TelegramEventEngine(
         private const val MIN_TRIP_DISTANCE_KM = 0.1
         private const val MIN_TRIP_ENERGY_KWH = 0.1
         private const val TRIP_ENERGY_RESET_TOLERANCE_KWH = 0.1
+    }
+
+    private fun updateChargingEtaHistory(
+        input: TelegramOrderedPollInput,
+        observations: List<NormalizedObservation>,
+        currentBootId: String,
+        cycleElapsedMs: Long,
+        nowElapsedMs: Long,
+        chargeType: ChargingType,
+        batteryChargePower: Double?,
+        confirmedActive: Boolean,
+        evidenceActive: Boolean,
+        paused: Boolean
+    ): String? {
+        val sessionId = state.chargingSessionId
+        if (sessionId == null) {
+            val hadHistory = chargingEtaSession != null
+            if (hadHistory) clearChargingEtaHistory()
+            return if (hadHistory) "inactive" else null
+        }
+        if (!paused && !evidenceActive) {
+            val hadHistory = chargingEtaSession != null
+            clearChargingEtaHistory()
+            return if (hadHistory) "inactive" else null
+        }
+        val session = ChargingEtaSessionId(currentBootId, sessionId)
+        val previousSession = chargingEtaSession
+        val previousType = chargingEtaType
+        val wasPaused = chargingEtaPaused
+        var transitionReason = when {
+            previousSession == null -> "session_started"
+            previousSession.bootId != session.bootId -> "boot_changed"
+            previousSession.sessionId != session.sessionId -> "session_changed"
+            previousType != chargeType -> "type_changed"
+            paused && !wasPaused -> "paused"
+            !paused && wasPaused -> "resumed"
+            else -> null
+        }
+        if (chargingEtaSession != session || chargingEtaType != chargeType) {
+            resetChargingEtaHistory(session, chargeType)
+        }
+        if (paused) {
+            if (!chargingEtaPaused) resetChargingEtaHistory(session, chargeType)
+            chargingEtaPaused = true
+            return transitionReason
+        }
+        if (chargingEtaPaused) {
+            if (evidenceActive && confirmedActive) resetChargingEtaHistory(session, chargeType)
+            else chargingEtaLastPowerElapsedMs = null
+        }
+        chargingEtaPaused = false
+
+        if (!confirmedActive) return transitionReason
+
+        if (input.hasCurrentBoot("battery_charge_power_kw")) {
+            input.latestAcceptedStamp("battery_charge_power_kw")?.let { stamp ->
+                val previousPowerElapsedMs = chargingEtaLastPowerElapsedMs
+                if (previousPowerElapsedMs != null && stamp.elapsedMs - previousPowerElapsedMs > MAX_ETA_POWER_SAMPLE_GAP_MS) {
+                    resetChargingEtaHistory(session, chargeType)
+                    transitionReason = transitionReason ?: "gap"
+                }
+                if (chargingEtaCalculator.addPowerSample(session, stamp.elapsedMs, batteryChargePower)) {
+                    chargingEtaLastPowerElapsedMs = stamp.elapsedMs
+                }
+            }
+        }
+
+        if (input.hasCurrentBoot("charging_time_remaining")) {
+            val timeObservation = observations.firstOrNull { it.field.fieldKey == "charging_time_remaining" }
+            val minuteKey = input.sourceKeys("charging_time_remaining").getOrNull(1)
+            val minuteStamp = minuteKey?.let { input.inputs[it]?.stamp }
+            if (minuteStamp?.bootId == currentBootId) {
+                val parts = if (timeObservation?.quality == NormalizedQuality.OK) {
+                    timeObservation.value.text?.split(':')
+                } else {
+                    null
+                }
+                chargingEtaCalculator.observeOem(
+                    session = session,
+                    evaluatedElapsedMs = nowElapsedMs,
+                    minuteSourceElapsedMs = minuteStamp.elapsedMs,
+                    cycleSourceElapsedMs = cycleElapsedMs,
+                    sourceWallMs = minuteStamp.wallMs,
+                    hours = parts?.getOrNull(0)?.toIntOrNull() ?: -1,
+                    minutes = parts?.getOrNull(1)?.toIntOrNull() ?: -1
+                )
+            }
+        }
+        return transitionReason
+    }
+
+    private fun chargingEtaPresentation(
+        input: TelegramOrderedPollInput,
+        currentBootId: String,
+        nowElapsedMs: Long,
+        soc: Double?,
+        remainingEnergy: Double?,
+        batteryChargePower: Double?,
+        previousRemainingEnergy: Double?,
+        previousRemainingEnergyStamp: NormalizedSourceStamp?,
+        chargeType: ChargingType,
+        selection: ChargingEtaSelection,
+        active: Boolean,
+        paused: Boolean
+    ): ChargingEtaPresentation {
+        val session = chargingEtaSession
+        val socStamp = input.sourceStamp("soc")
+            ?.takeIf { it.bootId == currentBootId && input.hasCurrentBoot("soc") }
+        val currentEnergyStamp = input.sourceStamp("battery_remaining_energy_kwh", freshOnly = false)
+            ?.takeIf { it.bootId == currentBootId && input.hasCurrentBoot("battery_remaining_energy_kwh") }
+        val useCurrentEnergy = currentEnergyStamp != null && socStamp != null &&
+            currentEnergyStamp.elapsedMs <= socStamp.elapsedMs
+        val energyStamp = if (useCurrentEnergy) currentEnergyStamp else previousRemainingEnergyStamp
+            ?.takeIf {
+                it.bootId == currentBootId && socStamp != null && it.elapsedMs <= socStamp.elapsedMs
+            }
+        val energy = if (useCurrentEnergy) remainingEnergy else previousRemainingEnergy
+        val result = if (session != null && socStamp != null && chargingEtaType == chargeType) {
+            chargingEtaCalculator.estimate(
+                ChargingEtaInput(
+                    session = session,
+                    nowElapsedMs = nowElapsedMs,
+                    measuredAtElapsedMs = socStamp.elapsedMs,
+                    measuredAtWallMs = socStamp.wallMs,
+                    socPct = soc,
+                    remainingEnergyKwh = energy,
+                    remainingEnergySourceElapsedMs = energyStamp?.elapsedMs,
+                    chargeType = chargeType,
+                    selection = selection,
+                    chargingActive = active,
+                    paused = paused
+                )
+            )
+        } else {
+            null
+        }
+        return ChargingEtaPresentation(chargeType, selection, result)
+    }
+
+    private fun resetChargingEtaHistory(session: ChargingEtaSessionId, chargeType: ChargingType) {
+        chargingEtaCalculator = ChargingEtaCalculator()
+        chargingEtaCalculator.beginSession(session)
+        chargingEtaSession = session
+        chargingEtaType = chargeType
+        chargingEtaPaused = false
+        chargingEtaLastPowerElapsedMs = null
+    }
+
+    private fun clearChargingEtaHistory() {
+        chargingEtaCalculator = ChargingEtaCalculator()
+        chargingEtaSession = null
+        chargingEtaType = null
+        chargingEtaPaused = false
+        chargingEtaLastPowerElapsedMs = null
+    }
+
+    private fun chargingEtaStateDiagnosticDetail(
+        reason: String,
+        chargeType: ChargingType,
+        selection: ChargingEtaSelection,
+        soc: Double?,
+        powerKw: Double?
+    ): String = buildString {
+        append("eta_source=none eta_selection=").append(selection.name.lowercase())
+        append(" eta_type=").append(chargeType.name.lowercase())
+        append(" eta_reason=").append(reason)
+        append(" soc_pct=").append(formatNumber(soc))
+        append(" instant_power_kw=").append(formatNumber(powerKw))
+        append(" eta_seconds=unknown eta_minutes=unknown eta_profile=")
+        append(if (chargeType == ChargingType.DC) DcChargingProfile.FROZEN_VERSION else "none")
+    }
+
+    private fun resolveChargingType(chargingType: String?, gunType: String?): ChargingType {
+        val fromChargingType = when (chargingType) {
+            "ac", "gb_non_dc" -> ChargingType.AC
+            "gb_dc" -> ChargingType.DC
+            else -> ChargingType.UNKNOWN
+        }
+        val fromGunType = when (gunType) {
+            "ac" -> ChargingType.AC
+            "dc" -> ChargingType.DC
+            else -> ChargingType.UNKNOWN
+        }
+        return when {
+            fromChargingType != ChargingType.UNKNOWN && fromGunType != ChargingType.UNKNOWN &&
+                fromChargingType != fromGunType -> ChargingType.CONFLICT
+            fromChargingType != ChargingType.UNKNOWN -> fromChargingType
+            else -> fromGunType
+        }
+    }
+
+    private fun etaSelection(type: ChargingType, config: TelegramEventConfig): ChargingEtaSelection =
+        if (type == ChargingType.DC) config.dcEtaSelection else config.acEtaSelection
+
+    private data class ChargingEtaPresentation(
+        val chargeType: ChargingType,
+        val selection: ChargingEtaSelection,
+        val result: ChargingEtaResult?
+    ) {
+        fun diagnosticDetail(soc: Double?, powerKw: Double?): String = buildString {
+            append("eta_source=").append(result?.source?.name?.lowercase() ?: "none")
+            append(" eta_selection=").append(selection.name.lowercase())
+            append(" eta_type=").append(chargeType.name.lowercase())
+            append(" eta_reason=").append(
+                result?.unavailableReason?.name?.lowercase()
+                    ?: result?.fallbackReason?.name?.lowercase()
+                    ?: if (result?.available == true) "available" else "missing_source_stamp"
+            )
+            append(" soc_pct=").append(formatNumber(soc))
+            append(" instant_power_kw=").append(formatNumber(powerKw))
+            append(" window_power_kw=").append(formatNumber(result?.calculationPowerKw))
+            append(" eta_seconds=").append(result?.seconds?.let { String.format(Locale.US, "%.1f", it) } ?: "unknown")
+            append(" eta_minutes=").append(result?.roundedUpMinutes ?: "unknown")
+            append(" eta_profile=").append(result?.profileVersion ?: "none")
+            append(" eta_measured_at_ms=").append(result?.measuredAtWallMs ?: "unknown")
+            append(" eta_oem_source_at_ms=").append(result?.sourceObservedAtWallMs ?: "unknown")
+        }
     }
 
     private data class ChargingEvidence(
@@ -1845,6 +2186,35 @@ private fun formatChargeDuration(durationMs: Long, language: TelegramTemplateLan
         }
     }
 }
+
+private fun formatEtaDuration(totalMinutes: Long?, language: TelegramTemplateLanguage): String {
+    if (totalMinutes == null || totalMinutes <= 0L) return "—"
+    val days = totalMinutes / 1_440L
+    val hours = totalMinutes % 1_440L / 60L
+    val minutes = totalMinutes % 60L
+    return when (language) {
+        TelegramTemplateLanguage.UK -> listOfNotNull(
+            days.takeIf { it > 0L }?.let { "${it}д" },
+            hours.takeIf { it > 0L }?.let { "${it}год" },
+            minutes.takeIf { it > 0L }?.let { "${it}хв" }
+        ).joinToString(" ").ifEmpty { "1хв" }
+        TelegramTemplateLanguage.EN -> listOfNotNull(
+            days.takeIf { it > 0L }?.let { "${it}d" },
+            hours.takeIf { it > 0L }?.let { "${it}h" },
+            minutes.takeIf { it > 0L }?.let { "${it}m" }
+        ).joinToString(" ").ifEmpty { "1m" }
+    }
+}
+
+private fun formatChargeType(type: ChargingType?): String = when (type) {
+    ChargingType.AC -> "AC"
+    ChargingType.DC -> "DC"
+    else -> "—"
+}
+
+private fun formatEtaFullTime(timeMs: Long?): String = timeMs?.let {
+    java.text.SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(java.util.Date(it))
+} ?: "—"
 
 private fun formatChargeDurationHhmm(durationMs: Long): String {
     val totalMinutes = durationMs.coerceAtLeast(0L) / 60_000L

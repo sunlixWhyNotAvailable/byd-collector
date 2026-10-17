@@ -11,8 +11,8 @@ android {
         applicationId = "com.bydcollector.collector.ui"
         minSdk = 26
         targetSdk = 29
-        versionCode = 307
-        versionName = "3.3.1"
+        versionCode = 308
+        versionName = "3.3.2"
         buildConfigField("String", "COLLECTOR_DISPLAY_NAME", "\"BYD Collector\"")
         buildConfigField("String", "COLLECTOR_DATABASE_NAME", "\"bydcollector_telemetry.db\"")
         buildConfigField("String", "UPDATE_RELEASES_API_URL", "\"https://api.github.com/repos/sunlixWhyNotAvailable/byd-collector/releases/latest\"")

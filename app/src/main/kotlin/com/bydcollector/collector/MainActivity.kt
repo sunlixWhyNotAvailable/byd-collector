@@ -3130,6 +3130,8 @@ class MainActivity : ComponentActivity() {
                 botTokenSet = includeTokenState && settings.isTelegramBotTokenSet(),
                 chatId = settings.telegramChatId(),
                 chargeStepPercent = settings.telegramChargeStepPercent(),
+                acEtaSelection = settings.telegramAcEtaSelection(),
+                dcEtaSelection = settings.telegramDcEtaSelection(),
                 low12vThresholdVolts = settings.telegramLowVoltageThreshold(),
                 telemetryUnavailableMinutes = settings.telegramUnavailableDelayMinutes(),
                 tripSummaryDelaySeconds = settings.telegramTripEndDelaySeconds(),
@@ -3178,6 +3180,12 @@ class MainActivity : ComponentActivity() {
         }
         if (previous.chargeStepPercent != config.chargeStepPercent) {
             settings.setTelegramChargeStepPercent(config.chargeStepPercent)
+        }
+        if (previous.acEtaSelection != config.acEtaSelection) {
+            settings.setTelegramAcEtaSelection(config.acEtaSelection)
+        }
+        if (previous.dcEtaSelection != config.dcEtaSelection) {
+            settings.setTelegramDcEtaSelection(config.dcEtaSelection)
         }
         if (previous.low12vThresholdVolts != config.low12vThresholdVolts) {
             settings.setTelegramLowVoltageThreshold(config.low12vThresholdVolts)

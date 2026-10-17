@@ -109,6 +109,12 @@ internal data class TelegramOrderedPollInput(
         return newest(keys.mapNotNull { inputs[it]?.stamp })
     }
 
+    fun latestAcceptedStamp(fieldKey: String): NormalizedSourceStamp? {
+        val keys = sourceKeys(fieldKey).filter { it in acceptedSourceKeys }
+        if (keys.isEmpty() || (sourceKeys(fieldKey).size > 1 && !hasSingleBoot(fieldKey))) return null
+        return newest(keys.mapNotNull { inputs[it]?.stamp })
+    }
+
     fun latestStamp(vararg fieldKeys: String): NormalizedSourceStamp? =
         newest(fieldKeys.flatMap(::sourceKeys).distinct().mapNotNull { inputs[it]?.stamp })
 
@@ -247,6 +253,9 @@ private val TELEGRAM_EVENT_FIELD_KEYS = setOf(
     "soc",
     "trip_energy_kwh",
     "charge_gun_connected_raw",
+    "charging_gun_type",
+    "charging_type",
+    "charging_time_remaining",
     "charging_battery_device_state",
     "battery_charge_power_kw",
     "battery_remaining_energy_kwh",

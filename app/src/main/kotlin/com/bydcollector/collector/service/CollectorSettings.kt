@@ -9,6 +9,7 @@ import com.bydcollector.collector.update.UpdateHintAppearance
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.polling.LivePollSource
 import com.bydcollector.collector.telegram.TelegramBuiltInTemplates
+import com.bydcollector.collector.telegram.ChargingEtaSelection
 import com.bydcollector.collector.telegram.TelegramEventType
 import com.bydcollector.collector.telegram.TelegramNavigatorMask
 import com.bydcollector.collector.telegram.TelegramPayloadLimitState
@@ -802,6 +803,22 @@ class CollectorSettings(
         ).apply()
     }
 
+    fun telegramAcEtaSelection(): ChargingEtaSelection = telegramEtaSelection(KEY_TELEGRAM_AC_ETA)
+
+    fun telegramDcEtaSelection(): ChargingEtaSelection = telegramEtaSelection(KEY_TELEGRAM_DC_ETA)
+
+    private fun telegramEtaSelection(key: String): ChargingEtaSelection =
+        ChargingEtaSelection.entries.firstOrNull { it.name == prefs.getString(key, null) }
+            ?: ChargingEtaSelection.CALCULATED
+
+    fun setTelegramAcEtaSelection(value: ChargingEtaSelection) {
+        prefs.edit().putString(KEY_TELEGRAM_AC_ETA, value.name).apply()
+    }
+
+    fun setTelegramDcEtaSelection(value: ChargingEtaSelection) {
+        prefs.edit().putString(KEY_TELEGRAM_DC_ETA, value.name).apply()
+    }
+
     fun telegramLowVoltageThreshold(): Float {
         return (round(prefs.getFloat(KEY_TELEGRAM_LOW_VOLTAGE, DEFAULT_TELEGRAM_LOW_VOLTAGE) * 10f) / 10f)
             .coerceIn(MIN_TELEGRAM_LOW_VOLTAGE, MAX_TELEGRAM_LOW_VOLTAGE)
@@ -1559,6 +1576,8 @@ class CollectorSettings(
         const val KEY_TELEGRAM_BUILTIN_DEFAULTS_MIGRATION_DONE = "telegramBuiltInDefaultsMigrationDone"
         const val KEY_TELEGRAM_CHARGED_TO_100_MIGRATION_DONE = "telegramChargedTo100MigrationDone"
         const val KEY_TELEGRAM_CHARGE_STEP = "telegramChargeStep"
+        const val KEY_TELEGRAM_AC_ETA = "telegramAcEtaSelection"
+        const val KEY_TELEGRAM_DC_ETA = "telegramDcEtaSelection"
         const val KEY_TELEGRAM_LOW_VOLTAGE = "telegramLowVoltage"
         const val KEY_TELEGRAM_UNAVAILABLE_DELAY = "telegramUnavailableDelay"
         const val KEY_TELEGRAM_TRIP_END_DELAY = "telegramTripEndDelay"
