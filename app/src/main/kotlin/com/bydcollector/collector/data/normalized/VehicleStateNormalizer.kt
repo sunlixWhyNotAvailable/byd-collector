@@ -120,6 +120,13 @@ class VehicleStateNormalizer(
                 return NormalizedQuality.INVALID to emptyValue(field.valueType)
             }
         }
+        if (field.fieldKey == "ac_compressor_power_kw" && reading.rawValue != null) {
+            val raw = parseInteger(reading.rawValue)
+            val source = DirectFidRegistry.entries.first { it.key == "power_compressor_consume_power" }
+            if (raw == null || DirectValueDecoders.decode(source, raw) == null) {
+                return NormalizedQuality.INVALID to emptyValue(field.valueType)
+            }
+        }
         return when (field.normalizerId) {
             "percent_0_100" -> normalizeNumber(field, rawOnly(reading)) { it in 0.0..100.0 }
             "number_non_negative" -> normalizeNumber(field, rawOnly(reading)) { it >= 0.0 }

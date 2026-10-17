@@ -11,6 +11,10 @@ import java.util.UUID
 import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicLong
 
+private const val REALTIME_BATCH_LIMIT = 300
+private const val CATCH_UP_BATCH_LIMIT = 2_000
+private const val CATCH_UP_THRESHOLD = 5_000
+
 //exports normalized vehicle_state_history to influx as the durable analytics channel
 class InfluxExportCoordinator(
     private val store: InfluxExportStore,
@@ -20,9 +24,11 @@ class InfluxExportCoordinator(
     private val diagnostics: InfluxDiagnosticSink = {}
 ) {
     private var currentBatchSize: Int? = null
+    private var currentBatchSizeReason: String? = null
     private val cancellationGeneration = AtomicLong(0L)
     @Volatile private var sessionConnection: InfluxConfig? = null
     private var lastDiagnosticGate: String? = null
+    private var lastBatchSizingDiagnosticKey: String? = null
     @Volatile private var terminalFailure = false
     private var sqliteLockRetries = 0
     @Volatile private var sqliteRetryAt: String? = null
@@ -122,7 +128,7 @@ class InfluxExportCoordinator(
                 preservesFailure -> STATUS_BACKOFF
                 else -> STATUS_SCHEDULED
             },
-            mode = modeFor(pending.rows),
+            mode = influxModeFor(pending),
             pendingRows = pending.rows,
             oldestPendingAt = pending.oldestObservedAt,
             nextRetryAt = when {
@@ -166,7 +172,7 @@ class InfluxExportCoordinator(
             val state = store.influxExportState()
             store.updateInfluxExportState(
                 status = STATUS_STOPPED,
-                mode = modeFor(pending.rows),
+                mode = influxModeFor(pending),
                 pendingRows = pending.rows,
                 oldestPendingAt = pending.oldestObservedAt,
                 nextRetryAt = null,
@@ -261,15 +267,27 @@ class InfluxExportCoordinator(
         // Queue statistics are not delivery authority; every batch still reads the durable cursors.
         val pendingBefore = pendingSummary(fieldKeys)
 
-        val batchLimit = nextBatchLimit(pendingBefore)
+        val sizing = influxBatchSizing(pendingBefore, currentBatchSize, currentBatchSizeReason)
+        currentBatchSize = sizing.limit
+        currentBatchSizeReason = sizing.reason
+        val batchLimit = sizing.limit
         val rows = timedDatabasePhase("select_batch") { store.pendingInfluxRows(fieldKeys, batchLimit) }
         if (pass.cancelled()) return InfluxActionResult.ok("influx work superseded")
-        if (rows.isEmpty()) {
+        val selectionReason = when {
+            rows.isEmpty() -> "empty_reset"
+            rows.size < batchLimit -> "short_batch_reset"
+            else -> sizing.reason
+        }
+        if (rows.size < batchLimit) {
             currentBatchSize = REALTIME_BATCH_LIMIT
+            currentBatchSizeReason = selectionReason
+        }
+        diagnosticBatchSizing(batchLimit, rows.size, selectionReason)
+        if (rows.isEmpty()) {
             diagnosticGate("no_work")
             store.updateInfluxExportState(
                 status = STATUS_IDLE,
-                mode = modeFor(pendingBefore.rows),
+                mode = influxModeFor(pendingBefore),
                 pendingRows = 0,
                 oldestPendingAt = null,
                 nextRetryAt = null,
@@ -283,7 +301,7 @@ class InfluxExportCoordinator(
 
         store.updateInfluxExportState(
             status = STATUS_EXPORTING,
-            mode = modeFor(pendingBefore.rows),
+            mode = influxModeFor(pendingBefore),
             pendingRows = pendingBefore.rows,
             oldestPendingAt = pendingBefore.oldestObservedAt,
             nextRetryAt = null,
@@ -315,7 +333,14 @@ class InfluxExportCoordinator(
             batch.failure?.let { failure ->
                 val pendingAfterFailure = pendingAfter
                 if (isTransientFailure(failure)) {
-                    deescalateBatchSize(pendingAfterFailure.rows)
+                    val previousLimit = currentBatchSize ?: batchLimit
+                    val nextLimit = influxBatchSizeAfterTransientFailure(pendingAfterFailure, currentBatchSize)
+                    currentBatchSize = nextLimit
+                    currentBatchSizeReason = if (nextLimit < previousLimit) {
+                        "transient_failure_reduced"
+                    } else {
+                        "transient_failure_floor"
+                    }
                 }
                 recordFailure(if (failure.retryable) STATUS_BACKOFF else "error", failure.message, pendingAfterFailure)
                 return failure
@@ -325,7 +350,7 @@ class InfluxExportCoordinator(
                 val stopped = batch.cancelled && !configProvider().enabled
                 store.updateInfluxExportState(
                     status = if (stopped) STATUS_STOPPED else STATUS_SCHEDULED,
-                    mode = modeFor(pendingAfter.rows),
+                    mode = influxModeFor(pendingAfter),
                     pendingRows = pendingAfter.rows,
                     oldestPendingAt = pendingAfter.oldestObservedAt,
                     nextRetryAt = if (!stopped && pendingMayRemain(pendingAfter)) {
@@ -344,14 +369,24 @@ class InfluxExportCoordinator(
                 )
             }
 
-            if (batch.exportedRows > 0) {
-                rampBatchSize(pendingAfter)
-            } else if (pendingAfter.complete && influxDesiredBatchLimit(pendingAfter.rows) == REALTIME_BATCH_LIMIT) {
-                currentBatchSize = REALTIME_BATCH_LIMIT
+            if (batch.poisonRows == 0 && batch.exportedRows == rows.size) {
+                val nextLimit = influxBatchSizeAfterCleanAck(
+                    pendingAfter,
+                    currentBatchSize,
+                    requestedLimit = batchLimit,
+                    actualRows = rows.size
+                )
+                currentBatchSize = nextLimit
+                currentBatchSizeReason = when {
+                    pendingAfter.complete && influxDesiredBatchLimit(pendingAfter.rows) == REALTIME_BATCH_LIMIT -> "known_realtime"
+                    rows.size < batchLimit -> "short_batch_reset"
+                    nextLimit > batchLimit -> "clean_ack_ramp"
+                    else -> currentBatchSizeReason ?: sizing.reason
+                }
             }
             store.updateInfluxExportState(
                 status = if (pendingMayRemain(pendingAfter)) STATUS_SCHEDULED else STATUS_IDLE,
-                mode = modeFor(pendingAfter.rows),
+                mode = influxModeFor(pendingAfter),
                 pendingRows = pendingAfter.rows,
                 oldestPendingAt = pendingAfter.oldestObservedAt,
                 nextRetryAt = if (pendingMayRemain(pendingAfter)) {
@@ -444,45 +479,6 @@ class InfluxExportCoordinator(
             enabled = live.enabled,
             enabledCategories = live.enabledCategories.toSet()
         )
-    }
-
-    private fun nextBatchLimit(pending: InfluxPendingSummary): Int {
-        if (!pending.complete) {
-            return (currentBatchSize ?: REALTIME_BATCH_LIMIT).also { currentBatchSize = it }
-        }
-        val desired = influxDesiredBatchLimit(pending.rows)
-        if (desired == REALTIME_BATCH_LIMIT) {
-            currentBatchSize = REALTIME_BATCH_LIMIT
-            return REALTIME_BATCH_LIMIT
-        }
-        val next = (currentBatchSize ?: desired).coerceIn(REALTIME_BATCH_LIMIT, desired)
-        currentBatchSize = next
-        return next
-    }
-
-    private fun rampBatchSize(pending: InfluxPendingSummary) {
-        if (!pending.complete) return
-        val desired = influxDesiredBatchLimit(pending.rows)
-        if (desired == REALTIME_BATCH_LIMIT) {
-            currentBatchSize = REALTIME_BATCH_LIMIT
-            return
-        }
-        val current = currentBatchSize ?: REALTIME_BATCH_LIMIT
-        currentBatchSize = minOf(desired, maxOf(REALTIME_BATCH_LIMIT, current * 2))
-    }
-
-    private fun deescalateBatchSize(pendingRows: Long) {
-        val desired = influxDesiredBatchLimit(pendingRows)
-        if (desired == REALTIME_BATCH_LIMIT) {
-            currentBatchSize = REALTIME_BATCH_LIMIT
-            return
-        }
-        val current = currentBatchSize ?: desired
-        currentBatchSize = when {
-            current >= CATCH_UP_BATCH_LIMIT -> 1_000
-            current >= 1_000 -> 500
-            else -> REALTIME_BATCH_LIMIT
-        }.coerceIn(REALTIME_BATCH_LIMIT, desired)
     }
 
     private fun exportRows(
@@ -793,6 +789,20 @@ class InfluxExportCoordinator(
         diagnostic("influx_cycle_gate", details + ("reason" to reason))
     }
 
+    private fun diagnosticBatchSizing(requestedLimit: Int, actualSelectedRows: Int, reason: String) {
+        val key = "$requestedLimit:$reason"
+        if (lastBatchSizingDiagnosticKey == key) return
+        lastBatchSizingDiagnosticKey = key
+        diagnostic(
+            "influx_batch_sizing",
+            mapOf(
+                "requested_limit" to requestedLimit.toString(),
+                "actual_selected_rows" to actualSelectedRows.toString(),
+                "reason" to reason
+            )
+        )
+    }
+
     private fun diagnosticValidationGate(result: InfluxActionResult) {
         diagnosticGate(
             if (result.category == "influx_disabled") "disabled" else "invalid_config",
@@ -857,7 +867,7 @@ class InfluxExportCoordinator(
         val state = store.influxExportState()
         store.updateInfluxExportState(
             status = status,
-            mode = modeFor(pendingSummary.rows),
+            mode = influxModeFor(pendingSummary),
             pendingRows = pendingSummary.rows,
             oldestPendingAt = pendingSummary.oldestObservedAt,
             nextRetryAt = if (status == STATUS_BACKOFF) plusSeconds(now, FAILURE_RETRY_INTERVAL_SECONDS) else null,
@@ -889,15 +899,8 @@ class InfluxExportCoordinator(
         }.getOrDefault(true)
     }
 
-    private fun modeFor(pendingRows: Long): String {
-        return if (pendingRows >= CATCH_UP_THRESHOLD) "catch_up" else "realtime"
-    }
-
     private companion object {
         const val EXPORT_SOURCE_TABLE = "vehicle_state_history"
-        const val REALTIME_BATCH_LIMIT = 300
-        const val CATCH_UP_BATCH_LIMIT = 2_000
-        const val CATCH_UP_THRESHOLD = 5_000
         const val SUCCESS_BATCH_INTERVAL_SECONDS = 1L
         const val FAILURE_RETRY_INTERVAL_SECONDS = 30L
         const val MAX_HTTP_WRITES_PER_PASS = 64
@@ -912,7 +915,63 @@ class InfluxExportCoordinator(
 }
 
 internal fun influxDesiredBatchLimit(pendingRows: Long): Int {
-    return if (pendingRows >= 5_000L) 2_000 else 300
+    return if (pendingRows >= CATCH_UP_THRESHOLD) CATCH_UP_BATCH_LIMIT else REALTIME_BATCH_LIMIT
+}
+
+internal data class InfluxBatchSizing(val limit: Int, val reason: String)
+
+internal fun influxBatchSizing(
+    pending: InfluxPendingSummary,
+    currentBatchSize: Int?,
+    currentBatchSizeReason: String? = null
+): InfluxBatchSizing {
+    val desired = if (pending.complete) influxDesiredBatchLimit(pending.rows) else CATCH_UP_BATCH_LIMIT
+    val initial = if (pending.complete) desired else REALTIME_BATCH_LIMIT
+    val limit = (currentBatchSize ?: initial)
+        .coerceIn(REALTIME_BATCH_LIMIT, desired)
+    val reason = when {
+        desired == REALTIME_BATCH_LIMIT -> "known_realtime"
+        !pending.complete && currentBatchSize == null -> "unknown_start"
+        currentBatchSizeReason != null -> currentBatchSizeReason
+        !pending.complete -> "unknown_adaptive"
+        currentBatchSize != null -> "known_backlog_adaptive"
+        else -> "known_backlog"
+    }
+    return InfluxBatchSizing(limit, reason)
+}
+
+internal fun influxBatchSizeAfterCleanAck(
+    pendingAfter: InfluxPendingSummary,
+    currentBatchSize: Int?,
+    requestedLimit: Int,
+    actualRows: Int
+): Int {
+    if (actualRows < requestedLimit) return REALTIME_BATCH_LIMIT
+    val desired = if (pendingAfter.complete) influxDesiredBatchLimit(pendingAfter.rows) else CATCH_UP_BATCH_LIMIT
+    if (desired == REALTIME_BATCH_LIMIT) return REALTIME_BATCH_LIMIT
+    val current = (currentBatchSize ?: requestedLimit).coerceIn(REALTIME_BATCH_LIMIT, desired)
+    return minOf(desired, maxOf(REALTIME_BATCH_LIMIT, current * 2))
+}
+
+internal fun influxBatchSizeAfterTransientFailure(
+    pending: InfluxPendingSummary,
+    currentBatchSize: Int?
+): Int {
+    val desired = if (pending.complete) influxDesiredBatchLimit(pending.rows) else CATCH_UP_BATCH_LIMIT
+    if (desired == REALTIME_BATCH_LIMIT) return REALTIME_BATCH_LIMIT
+    val current = (currentBatchSize ?: if (pending.complete) desired else REALTIME_BATCH_LIMIT)
+        .coerceIn(REALTIME_BATCH_LIMIT, desired)
+    return when {
+        current >= CATCH_UP_BATCH_LIMIT -> 1_000
+        current >= 1_000 -> 500
+        else -> REALTIME_BATCH_LIMIT
+    }.coerceIn(REALTIME_BATCH_LIMIT, desired)
+}
+
+internal fun influxModeFor(pending: InfluxPendingSummary): String = when {
+    !pending.complete -> "unknown"
+    pending.rows >= CATCH_UP_THRESHOLD -> "catch_up"
+    else -> "realtime"
 }
 
 internal fun isInfluxLineProtocolDataFailure(result: InfluxActionResult): Boolean {

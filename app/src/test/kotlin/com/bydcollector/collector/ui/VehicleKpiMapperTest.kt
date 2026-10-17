@@ -23,7 +23,8 @@ class VehicleKpiMapperTest {
             reading("ota_battery_voltage", "13.8", "13.84"),
             reading("statistic_highest_battery_voltage", "3303"),
             reading("statistic_lowest_battery_voltage", "3301"),
-            reading("power_battery_remain_electricity", "54.3", "54.3")
+            reading("power_battery_remain_electricity", "54.3", "54.3"),
+            reading("power_compressor_consume_power", "1056")
         )
         val uk = VehicleKpiMapper.fromObservations(observations, VehicleKpiLanguage.UK, 17.84)
         val en = VehicleKpiMapper.fromObservations(observations, VehicleKpiLanguage.EN, 17.84)
@@ -31,14 +32,19 @@ class VehicleKpiMapperTest {
         assertEquals("3,301 В", uk.minCellVoltageV)
         assertEquals("3,303 В", uk.maxCellVoltageV)
         assertEquals("704 В", uk.batteryVoltageV)
-        assertEquals("4,2 А", uk.batteryCurrentA)
+        assertEquals("-4,2 А", uk.batteryCurrentA)
+        assertEquals("54,3", uk.remainingEnergyKwh)
+        assertEquals("1,06 кВт", uk.acCompressorPowerKw)
+        assertEquals(4.2, observations.single { it.field.fieldKey == "charge_current_a" }.value.number)
         assertEquals("13,8 В", uk.auxVoltageV)
         assertEquals("17,8", uk.averageConsumptionKwhPer100Km)
         assertEquals("-3.0 кВт", uk.batteryPowerKw)
         assertEquals("3.301 V", en.minCellVoltageV)
         assertEquals("3.303 V", en.maxCellVoltageV)
         assertEquals("704 V", en.batteryVoltageV)
-        assertEquals("4.2 A", en.batteryCurrentA)
+        assertEquals("-4.2 A", en.batteryCurrentA)
+        assertEquals("54.3", en.remainingEnergyKwh)
+        assertEquals("1.06 kW", en.acCompressorPowerKw)
         assertEquals("13.8 V", en.auxVoltageV)
         assertEquals("17.8", en.averageConsumptionKwhPer100Km)
 
@@ -48,20 +54,23 @@ class VehicleKpiMapperTest {
             stored("hv_battery_voltage_v", 704.2),
             stored("charge_current_a", 4.2),
             stored("aux_voltage_v", 13.84),
-            stored("battery_remaining_energy_kwh", 54.3)
+            stored("battery_remaining_energy_kwh", 54.3),
+            stored("ac_compressor_power_kw", 1.056)
         )
         val storedUk = VehicleKpiMapper.from(storedRows, VehicleKpiLanguage.UK, 17.84)
         assertEquals("3,301 В", storedUk.minCellVoltageV)
         assertEquals("3,303 В", storedUk.maxCellVoltageV)
         assertEquals("704 В", storedUk.batteryVoltageV)
-        assertEquals("4,2 А", storedUk.batteryCurrentA)
+        assertEquals("-4,2 А", storedUk.batteryCurrentA)
+        assertEquals("1,06 кВт", storedUk.acCompressorPowerKw)
         assertEquals("13,8 В", storedUk.auxVoltageV)
         assertEquals("17,8", storedUk.averageConsumptionKwhPer100Km)
         val storedEn = VehicleKpiMapper.from(storedRows, VehicleKpiLanguage.EN, 17.84)
         assertEquals("3.301 V", storedEn.minCellVoltageV)
         assertEquals("3.303 V", storedEn.maxCellVoltageV)
         assertEquals("704 V", storedEn.batteryVoltageV)
-        assertEquals("4.2 A", storedEn.batteryCurrentA)
+        assertEquals("-4.2 A", storedEn.batteryCurrentA)
+        assertEquals("1.06 kW", storedEn.acCompressorPowerKw)
         assertEquals("13.8 V", storedEn.auxVoltageV)
         assertEquals("17.8", storedEn.averageConsumptionKwhPer100Km)
 
@@ -116,19 +125,21 @@ class VehicleKpiMapperTest {
     }
 
     @Test
-    fun validZeroAndNegativeCurrentKeepTheirValuesAndPolarity() {
+    fun currentPolarityChangesOnlyForDisplayAndZeroStaysUnsigned() {
         val zero = normalize(
             reading("charging_charge_battery_volt", "0", "0"),
             reading("charging_charge_current", "0", "0"),
             reading("ota_battery_voltage", "0", "0"),
             reading("statistic_highest_battery_voltage", "0"),
-            reading("statistic_lowest_battery_voltage", "0")
+            reading("statistic_lowest_battery_voltage", "0"),
+            reading("power_compressor_consume_power", "0")
         )
         val zeroKpis = VehicleKpiMapper.fromObservations(zero, VehicleKpiLanguage.UK)
         assertEquals("0,000 В", zeroKpis.minCellVoltageV)
         assertEquals("0,000 В", zeroKpis.maxCellVoltageV)
         assertEquals("0 В", zeroKpis.batteryVoltageV)
         assertEquals("0,0 А", zeroKpis.batteryCurrentA)
+        assertEquals("0,00 кВт", zeroKpis.acCompressorPowerKw)
         assertEquals("0,0 В", zeroKpis.auxVoltageV)
 
         val charging = normalize(
@@ -136,8 +147,23 @@ class VehicleKpiMapperTest {
             reading("charging_charge_current", "1", "-0.7")
         )
         val chargingKpis = VehicleKpiMapper.fromObservations(charging, VehicleKpiLanguage.EN)
-        assertEquals("-0.7 A", chargingKpis.batteryCurrentA)
+        assertEquals("+0.7 A", chargingKpis.batteryCurrentA)
+        assertEquals(-0.7, charging.single { it.field.fieldKey == "charge_current_a" }.value.number)
         assertEquals("0.5 kW", chargingKpis.batteryPowerKw)
+        listOf(0.0, -0.0, 0.01, -0.01).forEach { raw ->
+            val input = normalize(reading("charging_charge_current", raw.toString(), raw.toString()))
+            assertEquals("0.0 A", VehicleKpiMapper.fromObservations(input, VehicleKpiLanguage.EN).batteryCurrentA)
+        }
+    }
+
+    @Test
+    fun invalidCompressorPowerIsNotShownAsZero() {
+        listOf(-10013, -10011, 65535, 1048575, -1).forEach { raw ->
+            val input = normalize(reading("power_compressor_consume_power", raw.toString()))
+            assertEquals("-", VehicleKpiMapper.fromObservations(input).acCompressorPowerKw)
+        }
+        val storedInvalid = VehicleKpiMapper.from(listOf(stored("ac_compressor_power_kw", null, NormalizedQuality.INVALID)))
+        assertEquals("-", storedInvalid.acCompressorPowerKw)
     }
 
     @Test
@@ -179,5 +205,6 @@ class VehicleKpiMapperTest {
         assertEquals("-", kpis.batteryVoltageV)
         assertEquals("-", kpis.batteryCurrentA)
         assertEquals("-", kpis.auxVoltageV)
+        assertEquals("-", kpis.acCompressorPowerKw)
     }
 }

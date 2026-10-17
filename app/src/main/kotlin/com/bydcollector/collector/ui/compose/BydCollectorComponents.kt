@@ -1107,7 +1107,8 @@ fun KpiTile(
             fontWeight = FontWeight.Normal,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.align(Alignment.TopStart).offset(y = (-4).dp)
+            // Compensate the existing 8dp/10dp padding to center in the full tile.
+            modifier = Modifier.align(Alignment.TopCenter).offset(x = 1.dp, y = (-4).dp)
         )
         Text(
             text = value,

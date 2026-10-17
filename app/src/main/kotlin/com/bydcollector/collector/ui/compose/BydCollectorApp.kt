@@ -835,7 +835,7 @@ private fun AllParametersTab(
                         NumericInput(state?.debugParameterCount?.toString().orEmpty(), modifier = Modifier.width(60.dp))
                     }
                 }
-            VehicleKpiCard(state?.vehicleKpis, strings, Modifier.weight(2f).height(344.dp)
+            VehicleKpiCard(state?.vehicleKpis, strings, language, Modifier.weight(2f).height(344.dp)
                 .onGloballyPositioned { coordinates ->
                     // boundsInWindow is clipped by the scroll viewport and window bounds.
                     actions.onKpiViewportVisibilityChanged(
@@ -895,7 +895,7 @@ private fun collectionDisplayStatus(state: DashboardState?, strings: UiStrings):
 }
 
 @Composable
-private fun VehicleKpiCard(kpi: VehicleKpis?, strings: UiStrings, modifier: Modifier) {
+private fun VehicleKpiCard(kpi: VehicleKpis?, strings: UiStrings, language: UiLanguage, modifier: Modifier) {
     val chargeLabel = if (kpi?.batteryPowerCharging == true) strings.kpiCharging else strings.kpiDischarging
     SectionCard(title = strings.currentVehicleState, modifier = modifier, bodyPadding = 14.dp) {
         Spacer(Modifier.height(5.dp))
@@ -909,7 +909,8 @@ private fun VehicleKpiCard(kpi: VehicleKpis?, strings: UiStrings, modifier: Modi
                 }
                 Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
                     KpiTile(strings.kpiBatteryTemp, kpi?.batteryTempC ?: "-", modifier = Modifier.fillMaxWidth())
-                    KpiTile(strings.kpiEnergyLeft, kpi?.remainingEnergyKwh ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(strings.kpiEnergyLeft, kpi?.remainingEnergyKwh ?: "-", modifier = Modifier.fillMaxWidth(),
+                        unit = if (language == UiLanguage.UK) "кВт·год" else "kWh")
                     KpiTile(strings.kpiMaxCell, kpi?.maxCellVoltageV ?: "-", modifier = Modifier.fillMaxWidth())
                 }
                 Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
@@ -923,7 +924,7 @@ private fun VehicleKpiCard(kpi: VehicleKpis?, strings: UiStrings, modifier: Modi
                         strings.kpiAverageConsumption,
                         kpi?.averageConsumptionKwhPer100Km ?: "-",
                         modifier = Modifier.fillMaxWidth(),
-                        unit = "kWh/100 km"
+                        unit = consumptionUnit(language)
                     )
                     KpiTile(strings.kpiBatteryVoltage, kpi?.batteryVoltageV ?: "-", modifier = Modifier.fillMaxWidth())
                 }
@@ -934,7 +935,7 @@ private fun VehicleKpiCard(kpi: VehicleKpis?, strings: UiStrings, modifier: Modi
                 }
                 Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
                     KpiTile(strings.kpiPerfume3, kpi?.perfume3RemainingPercent ?: "-", modifier = Modifier.fillMaxWidth())
-                    Spacer(Modifier.height(64.dp))
+                    KpiTile(strings.kpiAirConditioning, kpi?.acCompressorPowerKw ?: "-", modifier = Modifier.fillMaxWidth())
                     KpiTile(strings.kpiAuxVoltage, kpi?.auxVoltageV ?: "-", modifier = Modifier.fillMaxWidth())
                 }
             }

@@ -5,6 +5,11 @@ import android.database.sqlite.SQLiteDatabase
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
+import com.bydcollector.collector.data.normalized.NormalizedFieldCatalog
+import com.bydcollector.collector.data.normalized.NormalizedObservation
+import com.bydcollector.collector.data.normalized.NormalizedQuality
+import com.bydcollector.collector.data.normalized.NormalizedValue
+import com.bydcollector.collector.data.normalized.NormalizedValueType
 import com.bydcollector.collector.diagnostics.OperationalEventJournal
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -12,11 +17,76 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import java.time.Instant
+import java.util.UUID
 import kotlin.test.*
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
 class InfluxStorageRecoveryTest {
+    @Test fun normalizedHistoryCursorAndCappedPagingSurviveReopen() {
+        val context = RuntimeEnvironment.getApplication()
+        val databaseName = "influx_batch_policy_${UUID.randomUUID()}.db"
+        val field = NormalizedFieldCatalog.soc
+        val fields = setOf(field.fieldKey)
+        var store = TelemetryStore(
+            context,
+            TelemetryDatabaseHelper(context, databaseName),
+            operationalEventJournal = OperationalEventJournal(context)
+        )
+        fun addSoc(value: Double, observedAt: String) {
+            val write = store.applyNormalizedObservations(
+                listOf(
+                    NormalizedObservation(
+                        field = field,
+                        value = NormalizedValue(NormalizedValueType.NUMBER, number = value),
+                        quality = NormalizedQuality.OK,
+                        sourcePollId = null,
+                        sourceKey = field.sourceKeys.firstOrNull(),
+                        observedAt = observedAt
+                    )
+                )
+            )
+            assertEquals(1, write.historyInsertedCount)
+        }
+
+        try {
+            addSoc(50.0, "2026-10-12T12:00:00Z")
+            addSoc(51.0, "2026-10-12T12:01:00Z")
+            assertEquals(2L, store.refreshInfluxPendingSummary(fields).rows)
+            val firstRows = store.pendingInfluxRows(fields, limit = 10)
+            assertEquals(2, firstRows.size)
+            assertTrue(firstRows[0].id < firstRows[1].id)
+
+            store.updateInfluxCursorSuccess(field.fieldKey, firstRows.first().id, "2026-10-12T12:02:00Z")
+            assertFalse(store.pendingInfluxSummary(fields).complete)
+            assertEquals(1L, store.refreshInfluxPendingSummary(fields).rows)
+
+            addSoc(52.0, "2026-10-12T12:03:00Z")
+            assertFalse(store.pendingInfluxSummary(fields).complete)
+            assertEquals(2L, store.refreshInfluxPendingSummary(fields).rows)
+            val oneRowBatch = store.pendingInfluxRows(fields, limit = 1)
+            assertEquals(listOf(firstRows[1].id), oneRowBatch.map { it.id })
+            val twoRowBatch = store.pendingInfluxRows(fields, limit = 2)
+            assertEquals(2, twoRowBatch.size)
+            assertTrue(twoRowBatch[0].id < twoRowBatch[1].id)
+
+            store.close()
+            store = TelemetryStore(
+                context,
+                TelemetryDatabaseHelper(context, databaseName),
+                operationalEventJournal = OperationalEventJournal(context)
+            )
+            assertFalse(store.pendingInfluxSummary(fields).complete)
+            assertEquals(2L, store.refreshInfluxPendingSummary(fields).rows)
+            val reopenedBatch = store.pendingInfluxRows(fields, limit = 2)
+            assertEquals(twoRowBatch.map { it.id }, reopenedBatch.map { it.id })
+            assertEquals(listOf(51.0, 52.0), reopenedBatch.map { requireNotNull(it.valueNumber) })
+        } finally {
+            store.close()
+            context.deleteDatabase(databaseName)
+        }
+    }
+
     @Test fun rejectionAndCursorCommitTogether() {
         val context = RuntimeEnvironment.getApplication()
         val helper = TelemetryDatabaseHelper(context)

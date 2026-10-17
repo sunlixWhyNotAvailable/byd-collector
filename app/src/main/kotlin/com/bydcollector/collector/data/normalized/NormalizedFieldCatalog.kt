@@ -2,7 +2,7 @@ package com.bydcollector.collector.data.normalized
 
 //semantic catalog that maps curated raw keys to stable fields exposed to dashboard, mqtt, and influx
 object NormalizedFieldCatalog {
-    const val CATALOG_VERSION = "normalized-direct-v16-20260928-discharge-limit"
+    const val CATALOG_VERSION = "normalized-direct-v17-20261017-ac-compressor-power"
 
     val soc = number(
         fieldKey = "soc",
@@ -70,6 +70,8 @@ object NormalizedFieldCatalog {
         mqttDefaultEnabled = true
     )
     val acPower = bool("ac_power", NormalizedCategory.CLIMATE, "Climate", null, listOf("ac_1000_1077936144_5"), "zero_false_nonzero_true")
+    //Owner-approved SL07 working watts interpretation; this is compressor power, not confirmed whole-HVAC load.
+    val acCompressorPowerKw = number("ac_compressor_power_kw", NormalizedCategory.CLIMATE, "kW", "AC compressor power", "power", "measurement", listOf("power_compressor_consume_power"), "raw_number_milli_non_negative")
     val driverTempSetpoint = number("driver_temp_setpoint_raw", NormalizedCategory.CLIMATE, "°C", "Driver temperature setting", "temperature", "measurement", listOf("ac_1000_1077936168_5"), "raw_temperature_c", mqttDefaultEnabled = false)
     val acWindLevel = number("ac_wind_level_raw", NormalizedCategory.CLIMATE, "level", "Fan speed", null, "measurement", listOf("ac_wind_level"), "ac_wind_level_0_7", mqttDefaultEnabled = false)
     val perfume1RemainingPercent = number("perfume_1_remaining_percent", NormalizedCategory.CLIMATE, "%", "Perfume slot 1 estimated remaining", null, "measurement", listOf("ac_1000_1242562584_5"), "decoded_percent_0_100")
@@ -188,6 +190,7 @@ object NormalizedFieldCatalog {
         chargingBatteryDeviceState,
         chargingTimeRemaining,
         acPower,
+        acCompressorPowerKw,
         driverTempSetpoint,
         acWindLevel,
         perfume1RemainingPercent,
@@ -264,7 +267,7 @@ object NormalizedFieldCatalog {
     )
 
     /** Dashboard fields share one source definition for display freshness and helper validation. */
-    val kpiFields = listOf(soc, batteryRemainingEnergy, cumulativeEnergy, odometerKm, insideTemp,
+    val kpiFields = listOf(soc, batteryRemainingEnergy, cumulativeEnergy, odometerKm, insideTemp, acCompressorPowerKw,
         perfume1RemainingPercent, perfume2RemainingPercent, perfume3RemainingPercent,
         batterySoh, batteryChargePower, batteryDischargePower, remainingRangeKm,
         batteryAverageTemp, batteryHighestCellVoltage, batteryLowestCellVoltage,

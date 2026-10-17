@@ -271,7 +271,8 @@ data class VehicleKpis(
     val maxCellVoltageV: String = "-",
     val batteryVoltageV: String = "-",
     val batteryCurrentA: String = "-",
-    val auxVoltageV: String = "-"
+    val auxVoltageV: String = "-",
+    val acCompressorPowerKw: String = "-"
 ) : java.io.Serializable
 
 data class DashboardRowCounts(

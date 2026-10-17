@@ -39,8 +39,10 @@ enum class DirectValueDecoder {
 //curated read-only autoservice scope for the main db; exploratory values belong in round-robin
 object DirectFidRegistry {
     const val LEGACY_WORKER_CATALOG_VERSION = "autoservice-fid-direct-20260820-curated-82-power-v1"
-    const val CATALOG_VERSION = "autoservice-fid-direct-20260908-curated-95-telemetry-v1"
-    const val CATALOG_FINGERPRINT = "EE469CF73CCF1E7FE562FF6F500E4208866D881A580F6212E18525E983798B8D"
+    const val PREVIOUS_CATALOG_VERSION = "autoservice-fid-direct-20260908-curated-95-telemetry-v1"
+    const val PREVIOUS_CATALOG_FINGERPRINT = "EE469CF73CCF1E7FE562FF6F500E4208866D881A580F6212E18525E983798B8D"
+    const val CATALOG_VERSION = "autoservice-fid-direct-20261017-curated-96-telemetry-v1"
+    const val CATALOG_FINGERPRINT = "64E327E07E6ADA9BF13BFF58D677C817C296B25164AF43B81575F38B0987CDFB"
     const val TX_GET_INT = 5
     const val TX_GET_FLOAT = 7
 
@@ -142,12 +144,15 @@ object DirectFidRegistry {
         DirectFidEntry("ac_1000_1242562614_5", 1000, 1242562614, TX_GET_INT, DirectValueDecoder.INT_ENUM, groupName = "direct_ac", featureNames = "AC_SECOND_PERFUME_INSTALLATION_STATUS;Ac.AC_SECOND_PERFUME_INSTALLATION_STATUS", classification = "curated_debug_promotion_20260908", prodCategory = "climate_environment", source = "debug-main-promotion-20260908"),
         DirectFidEntry("ac_1000_1242562616_5", 1000, 1242562616, TX_GET_INT, DirectValueDecoder.INT_ENUM, groupName = "direct_ac", featureNames = "AC_THIRD_PERFUME_INSTALLATION_STATUS;Ac.AC_THIRD_PERFUME_INSTALLATION_STATUS", classification = "curated_debug_promotion_20260908", prodCategory = "climate_environment", source = "debug-main-promotion-20260908"),
         DirectFidEntry("charging_1009_1186988040_7", 1009, 1186988040, TX_GET_FLOAT, DirectValueDecoder.FLOAT_SIGNED_RAW, groupName = "direct_charging", featureNames = "CHARGING_DRIVER_MOTOR_CURRENT;Charging.CHARGING_DRIVER_MOTOR_CURRENT", classification = "curated_debug_promotion_20260908", prodCategory = "motion_powertrain", source = "debug-main-promotion-20260908"),
-        DirectFidEntry("charging_1009_1186988056_7", 1009, 1186988056, TX_GET_FLOAT, DirectValueDecoder.FLOAT_SIGNED_RAW, groupName = "direct_charging", featureNames = "CHARGING_REAR_DRIVER_MOTOR_CURRENT;Charging.CHARGING_REAR_DRIVER_MOTOR_CURRENT", classification = "curated_debug_promotion_20260908", prodCategory = "motion_powertrain", source = "debug-main-promotion-20260908")
+        DirectFidEntry("charging_1009_1186988056_7", 1009, 1186988056, TX_GET_FLOAT, DirectValueDecoder.FLOAT_SIGNED_RAW, groupName = "direct_charging", featureNames = "CHARGING_REAR_DRIVER_MOTOR_CURRENT;Charging.CHARGING_REAR_DRIVER_MOTOR_CURRENT", classification = "curated_debug_promotion_20260908", prodCategory = "motion_powertrain", source = "debug-main-promotion-20260908"),
+        DirectFidEntry("power_compressor_consume_power", 1005, 1031798840, TX_GET_INT, DirectValueDecoder.INT_RAW, groupName = "direct_power", featureNames = "POWER_COMPRESSOR_CONSUME_POWER;Power.POWER_COMPRESSOR_CONSUME_POWER", classification = "owner_approved_live_telemetry", prodCategory = "climate_environment", source = "live20261017")
     )
 
     val entries: List<DirectFidEntry> = definitions
         .filter { TelemetryCatalogPolicy.isRuntimeSelected(it.dev, it.fid) }
-        .also { require(it.size == 95) { "Unexpected active Main catalog size: ${it.size}" } }
+        .also { require(it.size == 96) { "Unexpected active Main catalog size: ${it.size}" } }
+
+    private val previousCatalogEntries = entries.filter { it.key != "power_compressor_consume_power" }
 
     private val verifiedCatalogFingerprint = TelemetryCatalogPolicy.newFingerprint().let { digest ->
         entries.forEach { TelemetryCatalogPolicy.addToFingerprint(digest, it.dev, it.fid, it.tx) }
@@ -163,6 +168,7 @@ object DirectFidRegistry {
         currentEntries: List<DirectFidEntry>
     ): List<DirectFidEntry>? = when {
         catalogVersion == currentCatalogVersion -> currentEntries
+        catalogVersion == PREVIOUS_CATALOG_VERSION -> previousCatalogEntries
         catalogVersion == LEGACY_WORKER_CATALOG_VERSION -> legacyWorkerEntries
         else -> null
     }

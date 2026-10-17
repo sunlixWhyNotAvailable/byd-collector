@@ -51,8 +51,9 @@ object VehicleKpiMapper {
             minCellVoltageV = formatElectricalNumber(lowestCell, 3, "V", language) ?: "-",
             maxCellVoltageV = formatElectricalNumber(highestCell, 3, "V", language) ?: "-",
             batteryVoltageV = formatElectricalNumber(byKey.number("hv_battery_voltage_v"), 0, "V", language) ?: "-",
-            batteryCurrentA = formatElectricalNumber(byKey.number("charge_current_a"), 1, "A", language, allowNegative = true) ?: "-",
-            auxVoltageV = formatElectricalNumber(byKey.number("aux_voltage_v"), 1, "V", language) ?: "-"
+            batteryCurrentA = formatBatteryCurrent(byKey.number("charge_current_a"), language),
+            auxVoltageV = formatElectricalNumber(byKey.number("aux_voltage_v"), 1, "V", language) ?: "-",
+            acCompressorPowerKw = formatElectricalNumber(byKey.number("ac_compressor_power_kw"), 2, "kW", language) ?: "-"
         )
     }
 
@@ -95,8 +96,9 @@ object VehicleKpiMapper {
             minCellVoltageV = formatElectricalNumber(numbers["battery_lowest_cell_voltage_raw"], 3, "V", language) ?: "-",
             maxCellVoltageV = formatElectricalNumber(numbers["battery_highest_cell_voltage_raw"], 3, "V", language) ?: "-",
             batteryVoltageV = formatElectricalNumber(numbers["hv_battery_voltage_v"], 0, "V", language) ?: "-",
-            batteryCurrentA = formatElectricalNumber(numbers["charge_current_a"], 1, "A", language, allowNegative = true) ?: "-",
-            auxVoltageV = formatElectricalNumber(numbers["aux_voltage_v"], 1, "V", language) ?: "-"
+            batteryCurrentA = formatBatteryCurrent(numbers["charge_current_a"], language),
+            auxVoltageV = formatElectricalNumber(numbers["aux_voltage_v"], 1, "V", language) ?: "-",
+            acCompressorPowerKw = formatElectricalNumber(numbers["ac_compressor_power_kw"], 2, "kW", language) ?: "-"
         )
     }
 
@@ -193,6 +195,14 @@ object VehicleKpiMapper {
         return "$rounded $unit"
     }
 
+    private fun formatBatteryCurrent(value: Double?, language: VehicleKpiLanguage): String {
+        // Vehicle telemetry is positive for discharge; only the presentation reverses it.
+        val current = value?.takeIf { it.isFinite() }
+            ?.let { if (abs(it) < 0.05) 0.0 else -it } ?: return "-"
+        val text = formatElectricalNumber(current, 1, "A", language, allowNegative = true) ?: return "-"
+        return if (current > 0.0) "+$text" else text
+    }
+
     private fun formatElectricalNumber(
         value: Double?,
         decimals: Int,
@@ -204,6 +214,7 @@ object VehicleKpiMapper {
             val localizedUnit = if (language == VehicleKpiLanguage.UK) when (unit) {
                 "V" -> "В"
                 "A" -> "А"
+                "kW" -> "кВт"
                 else -> unit
             } else unit
             "$it $localizedUnit"
@@ -218,7 +229,7 @@ object VehicleKpiMapper {
         ?.takeIf { it.isFinite() && it >= 0.0 }
         ?.let { String.format(Locale.US, "%.1f", it).let { text ->
             if (language == VehicleKpiLanguage.UK) text.replace('.', ',') else text
-        } + " kWh" }
+        } }
         ?: "-"
 
     private fun formatMv(value: Int, language: VehicleKpiLanguage): String {

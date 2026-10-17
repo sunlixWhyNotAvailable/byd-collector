@@ -151,8 +151,13 @@ public final class CollectorHelperDaemon {
         final AtomicBoolean ownerStopAttemptRunning = new AtomicBoolean();
         final AtomicBoolean ownerStopComplete = new AtomicBoolean();
         final String mainCatalogVersion = loadMainCatalogVersion();
+        final String previousWorkerCatalogVersion = loadPreviousWorkerCatalogVersion();
         final String secondaryCatalogVersion = loadSecondaryCatalogVersion();
         final String legacyWorkerCatalogVersion = loadLegacyWorkerCatalogVersion();
+        final List<Address> previousWorkerRows = mainCatalogVersion.equals(previousWorkerCatalogVersion)
+            ? mainRows
+            : loadWorkerReplayRows(previousWorkerCatalogVersion);
+        if (previousWorkerRows == null) throw new IllegalStateException("previous worker catalog is unavailable");
         final List<Address> legacyWorkerRows = mainCatalogVersion.equals(legacyWorkerCatalogVersion)
             ? mainRows
             : loadWorkerReplayRows(legacyWorkerCatalogVersion);
@@ -162,6 +167,8 @@ public final class CollectorHelperDaemon {
                 sample,
                 mainCatalogVersion,
                 mainRows,
+                previousWorkerCatalogVersion,
+                previousWorkerRows,
                 legacyWorkerCatalogVersion,
                 legacyWorkerRows
             );
@@ -950,6 +957,11 @@ public final class CollectorHelperDaemon {
         return (String) registryClass.getField("LEGACY_WORKER_CATALOG_VERSION").get(null);
     }
 
+    private static String loadPreviousWorkerCatalogVersion() throws Exception {
+        Class<?> registryClass = Class.forName("com.bydcollector.collector.data.direct.DirectFidRegistry");
+        return (String) registryClass.getField("PREVIOUS_CATALOG_VERSION").get(null);
+    }
+
     static List<Address> loadWorkerReplayRows(String catalogVersion) {
         try {
             Class<?> registryClass = Class.forName("com.bydcollector.collector.data.direct.DirectFidRegistry");
@@ -1130,11 +1142,15 @@ public final class CollectorHelperDaemon {
         TelemetryWorkerSpool.Sample sample,
         String currentCatalogVersion,
         List<Address> currentRows,
+        String previousCatalogVersion,
+        List<Address> previousRows,
         String legacyCatalogVersion,
         List<Address> legacyRows
     ) {
         if (currentCatalogVersion.equals(sample.catalogVersion)) {
             validateWorkerSampleForReplay(sample, currentCatalogVersion, currentRows);
+        } else if (previousCatalogVersion.equals(sample.catalogVersion)) {
+            validateWorkerSampleForReplay(sample, previousCatalogVersion, previousRows);
         } else if (legacyCatalogVersion.equals(sample.catalogVersion)) {
             validateWorkerSampleForReplay(sample, legacyCatalogVersion, legacyRows);
         } else {
