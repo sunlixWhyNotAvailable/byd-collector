@@ -1,6 +1,7 @@
 package com.bydcollector.collector.ui.compose
 
 import org.json.JSONObject
+import com.bydcollector.collector.update.UpdateFailureStage
 
 private fun UiStrings.feedback(uk: String, en: String) = if (step == "Крок") uk else en
 
@@ -9,8 +10,10 @@ internal fun runtimeJobMessage(
     kind: String,
     completed: Boolean,
     result: JSONObject = JSONObject(),
-    error: String = ""
+    error: String = "",
+    updateStage: UpdateFailureStage = UpdateFailureStage.UNKNOWN
 ): String {
+    if (!completed && kind == "updateDownload") return updateFailureMessage(strings, updateStage, error)
     if (!completed) return operationFailureMessage(strings, kind, error)
     return when (kind) {
         "logClear" -> if ((result.optJSONArray("warnings")?.length() ?: 0) == 0) strings.logsCleared
@@ -22,6 +25,23 @@ internal fun runtimeJobMessage(
         "mqttCleanup" -> strings.haIdentity.mqttCleanupSuccess
         else -> strings.feedback("Операцію виконано", "Operation completed")
     }
+}
+
+internal fun updateFailureMessage(strings: UiStrings, stage: UpdateFailureStage, detail: String): String {
+    val title = when (stage) {
+        UpdateFailureStage.CHECK -> strings.updateError
+        UpdateFailureStage.DOWNLOAD -> strings.feedback("Помилка завантаження оновлення", "Update download error")
+        UpdateFailureStage.VERIFICATION -> strings.feedback("Помилка перевірки файлу оновлення", "Update file verification error")
+        UpdateFailureStage.INSTALLATION -> strings.feedback("Помилка встановлення оновлення", "Update installation error")
+        UpdateFailureStage.UNKNOWN -> strings.feedback("Помилка оновлення", "Update error")
+    }
+    val explanation = when (stage) {
+        UpdateFailureStage.VERIFICATION -> strings.updateVerificationFailed
+        UpdateFailureStage.INSTALLATION -> strings.updateInstallFailed
+        UpdateFailureStage.CHECK, UpdateFailureStage.DOWNLOAD -> operationFailureDetail(strings, detail)
+        UpdateFailureStage.UNKNOWN -> strings.updateGenericError
+    }
+    return "$title: $explanation"
 }
 
 internal fun operationFailureMessage(strings: UiStrings, kind: String, detail: String): String {

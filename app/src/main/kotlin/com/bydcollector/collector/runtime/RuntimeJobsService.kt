@@ -25,6 +25,7 @@ import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.update.UpdateApkVerifier
 import com.bydcollector.collector.update.UpdateDownloader
+import com.bydcollector.collector.update.UpdateFailureStage
 import com.bydcollector.collector.update.UpdateInfo
 import org.json.JSONArray
 import org.json.JSONObject
@@ -59,6 +60,7 @@ class RuntimeJobsService : Service() {
             NotificationChannel(CHANNEL, "BYD Collector", NotificationManager.IMPORTANCE_LOW))
         startForeground(1004, Notification.Builder(this, CHANNEL).setContentTitle("BYD Collector")
             .setContentText("Background task").setSmallIcon(android.R.drawable.stat_notify_sync).setOngoing(true).build())
+        cleanupTerminalUpdateArtifacts(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -74,7 +76,10 @@ class RuntimeJobsService : Service() {
             val ready = all.filter {
                 it.optString("status") in setOf("queued", "cancelling") && lanes.add(lane(it.getString("kind")))
             }
-            ready.filter { it.optString("status") == "queued" }.forEach { it.put("status", "running") }
+            ready.filter { it.optString("status") == "queued" }.forEach {
+                it.put("status", "running")
+                if (it.optString("kind") == "updateDownload") it.remove("errorStage")
+            }
             if (ready.isNotEmpty()) save(this, all)
             ready.map { JSONObject(it.toString()) }
         }
@@ -88,9 +93,12 @@ class RuntimeJobsService : Service() {
                     check(!CollectorSettings(this).isUserShutdownRequested()) { "Shutdown requested" }
                     val result = execute(job)
                     if (destroyed) return@execute
-                    if (job.getString("kind") == "updateDownload" && !complete(this, job.getString("id"), result)) {
-                        if (cancellationRequested(this, job.getString("id"))) finishUpdateCancellation(this, job.getString("id"))
-                        return@execute
+                    if (job.getString("kind") == "updateDownload") {
+                        if (!complete(this, job.getString("id"), result)) {
+                            if (cancellationRequested(this, job.getString("id"))) finishUpdateCancellation(this, job.getString("id"))
+                            return@execute
+                        }
+                        cleanupTerminalUpdateArtifacts(this, job.getString("id"))
                     }
                     val warnings = result.optJSONArray("warnings")
                     if (warnings != null && warnings.length() > 0) {
@@ -108,15 +116,34 @@ class RuntimeJobsService : Service() {
                                 recordDiagnostic(job, "cancel_cleanup_failed", cleanupError.message.orEmpty())
                             }
                     } else {
-                        recordDiagnostic(job, "failed", "${error.javaClass.simpleName}: ${error.message.orEmpty()}")
+                        val updateJob = job.getString("kind") == "updateDownload"
+                        val errorMessage = "${error.javaClass.simpleName}: ${error.message.orEmpty()}"
+                        val failureStage = if (updateJob) {
+                            runCatching { UpdateFailureStage.valueOf(job.optString("errorStage")) }
+                                .getOrDefault(UpdateFailureStage.UNKNOWN)
+                        } else UpdateFailureStage.UNKNOWN
+                        val diagnostic = if (updateJob) {
+                            "stage=${failureStage.name} jobId=${job.getString("id")} $errorMessage"
+                        } else errorMessage
+                        recordDiagnostic(job, "failed", if (updateJob) diagnostic.take(300) else diagnostic)
+                        val storedError = "${error.javaClass.simpleName}: ${error.message.orEmpty().take(300)}"
                         change(this, job.getString("id")) {
-                            if (it.getString("status") == "running") it.put("status", "error")
-                                .put("error", "${error.javaClass.simpleName}: ${error.message.orEmpty().take(300)}")
+                            if (it.getString("status") == "running") {
+                                it.put("status", "error")
+                                    .put("error", storedError)
+                                if (updateJob) it.put("errorStage", failureStage.name)
+                            }
                         }
-                        if (job.getString("kind") == "updateDownload") runCatching {
-                            RuntimeControl.call(this, "installFinish", android.os.Bundle())
-                        }.onFailure { controlError ->
-                            android.util.Log.w("RuntimeJobs", "Could not finish update session after failure", controlError)
+                        if (updateJob) {
+                            cleanupTerminalUpdateArtifacts(this, job.getString("id"))
+                            runCatching { deleteExact(File(cacheDir, "updates/runtime-${job.getString("id")}.apk")) }
+                                .onFailure { cleanupError ->
+                                    android.util.Log.w("RuntimeJobs", "Could not remove failed update staging file", cleanupError)
+                                }
+                            runCatching { RuntimeControl.call(this, "installFinish", android.os.Bundle()) }
+                                .onFailure { controlError ->
+                                    android.util.Log.w("RuntimeJobs", "Could not finish update session after failure", controlError)
+                                }
                         }
                     }
                     if (error is InterruptedException) Thread.currentThread().interrupt()
@@ -225,6 +252,7 @@ class RuntimeJobsService : Service() {
                 }
             }
             "updateDownload" -> {
+                job.put("errorStage", UpdateFailureStage.DOWNLOAD.name)
                 val info = updateInfo(job)
                 throwIfUpdateCancelled(job.getString("id"))
                 RuntimeControl.call(this, "installStart", android.os.Bundle())
@@ -238,33 +266,47 @@ class RuntimeJobsService : Service() {
                     if (current.optBoolean("cancelRequested") || current.getString("status") == "cancelling") {
                         throw UpdateCancellationRequested()
                     }
-                    current.optLong("downloadId", -1L).takeIf { it > 0 } ?: downloader.enqueue(info).also { id ->
-                        current.put("downloadId", id)
-                        save(this, all)
-                    }
+                    current.optLong("downloadId", -1L).takeIf { it > 0 }
+                        ?: downloader.enqueue(info, job.getString("id")).also { id ->
+                            current.put("downloadId", id)
+                            save(this, all)
+                        }
                 }
                 var previous = -1
+                val file = File(cacheDir, "updates/runtime-${job.getString("id")}.apk")
                 while (true) {
                     throwIfUpdateCancelled(job.getString("id"))
                     check(!Thread.currentThread().isInterrupted && !CollectorSettings(this).isUserShutdownRequested()) { "Shutdown requested" }
-                    val progress = downloader.progress(downloadId)
+                    val snapshot = downloader.snapshot(downloadId)
                     throwIfUpdateCancelled(job.getString("id"))
-                    check(progress >= 0) { "Update download failed" }
+                    check(snapshot.status != null) { "Update download record missing: id=$downloadId ${snapshot.detail}" }
+                    check(snapshot.status != android.app.DownloadManager.STATUS_FAILED) {
+                        "Update download failed: id=$downloadId ${snapshot.detail}"
+                    }
+                    val progress = snapshot.progress
                     if (progress != previous) {
                         change(this, job.getString("id")) { it.put("progress", progress) }
                         previous = progress
                     }
-                    if (progress >= 100) break
+                    if (snapshot.status == android.app.DownloadManager.STATUS_SUCCESSFUL) {
+                        try {
+                            downloader.copyDownloadedApk(downloadId, file)
+                        } catch (error: Exception) {
+                            throw IllegalStateException(
+                                "Could not copy downloaded update $downloadId (${snapshot.detail}): ${error.message.orEmpty()}",
+                                error
+                            )
+                        }
+                        break
+                    }
                     Thread.sleep(350)
                 }
                 throwIfUpdateCancelled(job.getString("id"))
-                val file = File(cacheDir, "updates/runtime-${job.getString("id")}.apk")
-                file.parentFile?.mkdirs()
-                downloader.downloadedFile(info).copyTo(file, overwrite = true)
-                throwIfUpdateCancelled(job.getString("id"))
+                job.put("errorStage", UpdateFailureStage.VERIFICATION.name)
                 val validation = UpdateApkVerifier(this).validate(file)
                 throwIfUpdateCancelled(job.getString("id"))
                 check(validation.ok) { validation.message }
+                job.put("errorStage", UpdateFailureStage.INSTALLATION.name)
                 val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
                 JSONObject().put("uri", uri.toString()).put("sha256", validation.sha256)
             }
@@ -589,18 +631,23 @@ class RuntimeJobsService : Service() {
             return result
         }
 
-        fun cancelForShutdown(context: Context) = synchronized(LOCK) {
+        fun cancelForShutdown(context: Context) {
             check(recordingPrefs(context).edit().putBoolean("recording", false).commit())
-            val all = load(context)
-            all.filter { it.getString("status") in setOf("queued", "running") }.forEach {
-                if (it.getString("kind") == "updateDownload" && it.optBoolean("cancelRequested")) {
-                    it.put("status", "cancelling").remove("error")
-                } else {
-                    if (it.has("downloadId")) context.getSystemService(android.app.DownloadManager::class.java).remove(it.getLong("downloadId"))
-                    it.put("status", "error").put("error", "Shutdown requested")
+            synchronized(LOCK) {
+                val all = load(context)
+                all.filter { it.getString("status") in setOf("queued", "running") }.forEach {
+                    if (it.getString("kind") == "updateDownload" && it.optBoolean("cancelRequested")) {
+                        it.put("status", "cancelling").remove("error")
+                    } else {
+                        it.put("status", "error").put("error", "Shutdown requested")
+                        if (it.getString("kind") == "updateDownload") {
+                            it.put("errorStage", UpdateFailureStage.UNKNOWN.name)
+                        }
+                    }
                 }
+                save(context, all)
             }
-            save(context, all)
+            cleanupTerminalUpdateArtifacts(context)
             context.stopService(Intent(context, RuntimeJobsService::class.java))
         }
 
@@ -639,8 +686,6 @@ class RuntimeJobsService : Service() {
             target.optLong("downloadId", -1L).takeIf { it > 0L }?.let {
                 context.getSystemService(android.app.DownloadManager::class.java).remove(it)
             }
-            val info = updateInfo(target)
-            deleteExact(UpdateDownloader(context).downloadedFile(info))
             deleteExact(File(context.cacheDir, "updates/runtime-$id.apk"))
             target.optJSONObject("result")?.optString("uri")?.takeIf(String::isNotBlank)?.let { value ->
                 runCatching {
@@ -666,6 +711,36 @@ class RuntimeJobsService : Service() {
             }
             RuntimeEndpoint.changed(context)
             return true
+        }
+
+        private fun cleanupTerminalUpdateArtifacts(context: Context) {
+            val ids = synchronized(LOCK) {
+                load(context).filter {
+                    it.optString("kind") == "updateDownload" &&
+                        it.optString("status") in setOf("complete", "error", "cancelled")
+                }.map { it.getString("id") }
+            }
+            ids.forEach { cleanupTerminalUpdateArtifacts(context, it) }
+        }
+
+        private fun cleanupTerminalUpdateArtifacts(context: Context, id: String) {
+            val target = synchronized(LOCK) {
+                load(context).firstOrNull {
+                    it.optString("id") == id && it.optString("kind") == "updateDownload" &&
+                        it.optString("status") in setOf("complete", "error", "cancelled")
+                }
+            } ?: return
+
+            val downloadId = target.optLong("downloadId", -1L)
+            if (downloadId > 0L) runCatching {
+                context.getSystemService(android.app.DownloadManager::class.java).remove(downloadId)
+                change(context, id) {
+                    if (it.optString("status") in setOf("complete", "error", "cancelled") &&
+                        it.optLong("downloadId", -1L) == downloadId) it.remove("downloadId")
+                }
+            }.onFailure {
+                android.util.Log.w("RuntimeJobs", "Could not remove terminal update download $downloadId for $id", it)
+            }
         }
 
         private fun markCancellationCleanupFailure(context: Context, id: String, error: Throwable) = synchronized(LOCK) {

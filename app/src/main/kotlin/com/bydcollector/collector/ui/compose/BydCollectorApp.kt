@@ -3273,7 +3273,7 @@ private fun UpdateCheckDialog(
                             Spacer(Modifier.height(10.dp))
                             AvailableUpdateNotes(strings, state.info, language, releaseNotesHistory)
                         }
-                        is UpdateUiState.Error -> Text("${strings.updateError}: ${localizedUpdateError(strings, state.message)}", color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                        is UpdateUiState.Error -> Text(updateFailureMessage(strings, state.stage, state.message), color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                         UpdateUiState.Hidden -> Text(strings.checkingForUpdate, color = p.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                     }
                 }
@@ -3516,26 +3516,6 @@ private fun DatabaseMaintenanceRunningBody(strings: UiStrings, state: DbMaintena
 private fun localizedMaintenanceMessage(strings: UiStrings, state: DbMaintenanceUiState): String {
     return if (strings.step == "Крок") state.messageUk.ifBlank { state.operation.stepsUk.getOrNull((state.stepIndex - 1).coerceAtLeast(0)) ?: "" }
     else state.messageEn.ifBlank { state.operation.stepsEn.getOrNull((state.stepIndex - 1).coerceAtLeast(0)) ?: "" }
-}
-
-private fun localizedUpdateError(strings: UiStrings, message: String): String {
-    val normalized = message.lowercase()
-    return when {
-        "unable to resolve host" in normalized ||
-            "failed to connect" in normalized ||
-            "timeout" in normalized ||
-            "network" in normalized ||
-            "no address associated" in normalized -> strings.updateNetworkUnavailable
-        "download" in normalized || "missing" in normalized -> strings.updateDownloadFailed
-        "apk" in normalized ||
-            "package" in normalized ||
-            "versioncode" in normalized ||
-            "certificate" in normalized ||
-            "digest" in normalized ||
-            "verification" in normalized -> strings.updateVerificationFailed
-        "activitynotfound" in normalized || "installer" in normalized -> strings.updateInstallFailed
-        else -> strings.updateGenericError
-    }
 }
 
 @Composable

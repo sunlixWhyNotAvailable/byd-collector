@@ -8,7 +8,7 @@
         android:name="com.bydcollector.collector.BydCollectorApplication"
         android:allowBackup="false"
         android:icon="@drawable/collector_launcher_icon"
-        android:label="BYD Collector"
+        android:label="BYD Collector UI"
         android:networkSecurityConfig="@xml/network_security_config"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">

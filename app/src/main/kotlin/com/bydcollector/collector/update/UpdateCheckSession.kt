@@ -225,7 +225,7 @@ class UpdateCheckSession(
                         UpdateUiState.Hidden
                     }
                     is UpdateCheckResult.Error -> if (inFlightManual) {
-                        UpdateUiState.Error(result.message)
+                        UpdateUiState.Error(result.message, UpdateFailureStage.CHECK)
                     } else {
                         UpdateUiState.Hidden
                     }

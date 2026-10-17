@@ -20,10 +20,14 @@ class NativeSqliteInstrumentation : Instrumentation() {
     private val prefix = "callback_gate_${UUID.randomUUID()}"
     private val completed = mutableListOf<String>()
     private var runtimeBoundaryFixture = false
+    private var updateDownloadFixture = false
+    private var gateArguments = Bundle()
 
     override fun onCreate(arguments: Bundle?) {
         super.onCreate(arguments)
+        gateArguments = arguments ?: Bundle()
         runtimeBoundaryFixture = arguments?.getString("runtimeBoundary") == "true"
+        updateDownloadFixture = arguments?.getString("updateDownloadGate") == "true"
         start()
     }
 
@@ -36,6 +40,19 @@ class NativeSqliteInstrumentation : Instrumentation() {
             val result = runCatching { RuntimeBoundaryGate.run(this) }
             finish(if (result.isSuccess) Activity.RESULT_OK else Activity.RESULT_CANCELED,
                 Bundle().apply { putString("stream", result.getOrElse { it.stackTraceToString() }) })
+            return
+        }
+        if (updateDownloadFixture) {
+            val result = runCatching {
+                UpdateDownloadGate.run(
+                    targetContext,
+                    checkNotNull(gateArguments.getString("updateDownloadUrl")),
+                    checkNotNull(gateArguments.getString("updateDownloadVersion")),
+                    gateArguments.getString("updateDownloadContentType")
+                )
+            }
+            finish(if (result.isSuccess) Activity.RESULT_OK else Activity.RESULT_CANCELED,
+                Bundle().apply { putString("stream", result.getOrElse { "UPDATE_DOWNLOAD_GATE_FAIL ${it.stackTraceToString()}" }) })
             return
         }
         val tests = listOf(

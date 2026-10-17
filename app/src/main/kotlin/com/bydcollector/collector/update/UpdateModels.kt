@@ -13,6 +13,8 @@ sealed interface UpdateCheckResult : java.io.Serializable {
     data class Error(val message: String) : UpdateCheckResult
 }
 
+enum class UpdateFailureStage { CHECK, DOWNLOAD, VERIFICATION, INSTALLATION, UNKNOWN }
+
 sealed interface UpdateUiState : java.io.Serializable {
     data object Hidden : UpdateUiState
     data object Checking : UpdateUiState
@@ -22,5 +24,5 @@ sealed interface UpdateUiState : java.io.Serializable {
     data class Cancelling(val info: UpdateInfo) : UpdateUiState
     data class Cancelled(val info: UpdateInfo) : UpdateUiState
     data class CancelError(val info: UpdateInfo) : UpdateUiState
-    data class Error(val message: String) : UpdateUiState
+    data class Error(val message: String, val stage: UpdateFailureStage = UpdateFailureStage.UNKNOWN) : UpdateUiState
 }

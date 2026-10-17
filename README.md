@@ -19,7 +19,7 @@ You need Android 8.0 or newer, a compatible DiLink system, permission to install
 
 1. Download the APK from the release page and compare its SHA-256 checksum with the published value when available.
 2. Install and open **BYD Collector** while parked.
-3. Follow the background-work prompt: set `Disable background Apps -> BYD Collector` to `OFF` in DiLink settings.
+3. Follow the background-work prompt: set `Disable background Apps -> BYD Collector` to `OFF` for the main app in DiLink settings. This setting is optional for the separate `BYD Collector UI` component. Check the main app's setting after each install or update.
 4. Accept Android's ADB authorization prompt when it appears. Use `Grant ADB` in the app to check access.
 5. Allow Android location access if you want GPS routes. If you declined it, you can grant it later in Android settings.
 6. Start collection on `Main` and check its status and readings. Enable automatic start if wanted.

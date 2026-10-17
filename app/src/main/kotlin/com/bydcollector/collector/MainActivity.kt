@@ -100,6 +100,7 @@ import com.bydcollector.collector.update.UpdateHintAppearance
 import com.bydcollector.collector.update.UpdateCheckSession
 import com.bydcollector.collector.update.UpdateInfo
 import com.bydcollector.collector.update.UpdateUiState
+import com.bydcollector.collector.update.UpdateFailureStage
 import com.bydcollector.collector.runtime.RuntimeJobsService
 import com.bydcollector.collector.util.dispatchOperationalEvent
 import com.bydcollector.collector.util.diagnosticDetail
@@ -335,6 +336,8 @@ class MainActivity : ComponentActivity() {
                     if (!preparation.resultPrepared && needsResultPreparation) return@submitUiOwnerAction
                     val deliveredSuccess = current.optString("status") == "complete"
                     val deliveredResult = current.optJSONObject("result") ?: JSONObject()
+                    val updateFailureStage = runCatching { UpdateFailureStage.valueOf(current.optString("errorStage")) }
+                        .getOrDefault(UpdateFailureStage.UNKNOWN)
                     if (deliveredSuccess && (kind == "logShare" || kind == "archiveShare")) {
                         val uris = if (kind == "logShare") arrayListOf(Uri.parse(deliveredResult.getString("uri")))
                         else deliveredResult.getJSONArray("uris").let { list -> ArrayList((0 until list.length()).map { Uri.parse(list.getString(it)) }) }
@@ -355,7 +358,7 @@ class MainActivity : ComponentActivity() {
                         } catch (error: Exception) {
                             releaseInstallerClaim(id)
                             recordOperationalEvent("runtime_update_installer_open_failed", "Could not open verified update", error.diagnosticDetail())
-                            updateUiState = UpdateUiState.Error("Could not open the verified update installer")
+                            updateUiState = UpdateUiState.Error("Could not open the verified update installer", UpdateFailureStage.INSTALLATION)
                             pendingUpdatePresentationId = id
                             syncReleaseNotesUi()
                             return@submitUiOwnerAction
@@ -369,11 +372,11 @@ class MainActivity : ComponentActivity() {
                             deliveredResult, current.optString("error")), Toast.LENGTH_LONG).show()
                     } else if (kind != "access") {
                         val message = runtimeJobMessage(strings(uiLanguage), kind, deliveredSuccess,
-                            deliveredResult, current.optString("error"))
+                            deliveredResult, current.optString("error"), updateFailureStage)
                         Toast.makeText(this, message, Toast.LENGTH_LONG).show()
                         if (kind == "updateDownload" && !current.optBoolean("dialogDismissed") && id !in dismissedUpdateJobs) {
                             updateDownloadJobId = id
-                            updateUiState = UpdateUiState.Error(current.optString("error"))
+                            updateUiState = UpdateUiState.Error(current.optString("error"), updateFailureStage)
                             pendingUpdatePresentationId = id
                             syncReleaseNotesUi()
                         }
@@ -390,7 +393,7 @@ class MainActivity : ComponentActivity() {
                         if (canPresentRuntimeResults() && id !in dismissedUpdateJobs &&
                             updateUiGeneration == capturedUpdateGeneration) {
                             updateDownloadJobId = id
-                            updateUiState = UpdateUiState.Error(error.message?.take(300) ?: "Could not prepare the verified update installer")
+                            updateUiState = UpdateUiState.Error(error.message?.take(300) ?: "Could not prepare the verified update installer", UpdateFailureStage.INSTALLATION)
                             pendingUpdatePresentationId = id
                             syncReleaseNotesUi()
                         }
@@ -2955,7 +2958,7 @@ class MainActivity : ComponentActivity() {
         }, onFailure = { error ->
             if (!BuildConfig.RUNTIME_CLIENT) updateRuntime.onInstallFinished()
             if (updateUiGeneration == requestGeneration) {
-                updateUiState = UpdateUiState.Error(error.message ?: "Could not start the update download")
+                updateUiState = UpdateUiState.Error(error.message ?: "Could not start the update download", UpdateFailureStage.DOWNLOAD)
                 syncReleaseNotesUi()
                 showOperationFailure("updateDownload", error)
             }
