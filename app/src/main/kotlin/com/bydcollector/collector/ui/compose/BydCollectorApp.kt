@@ -920,22 +920,22 @@ private fun VehicleKpiCard(kpi: VehicleKpis?, strings: UiStrings, language: UiLa
                 }
                 Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
                     KpiTile(strings.kpiPerfume1, kpi?.perfume1RemainingPercent ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(strings.kpiAirConditioning, kpi?.acCompressorPowerKw ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(strings.kpiBatteryVoltage, kpi?.batteryVoltageV ?: "-", modifier = Modifier.fillMaxWidth())
+                }
+                Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+                    KpiTile(strings.kpiPerfume2, kpi?.perfume2RemainingPercent ?: "-", modifier = Modifier.fillMaxWidth())
                     KpiTile(
                         strings.kpiAverageConsumption,
                         kpi?.averageConsumptionKwhPer100Km ?: "-",
                         modifier = Modifier.fillMaxWidth(),
                         unit = consumptionUnit(language)
                     )
-                    KpiTile(strings.kpiBatteryVoltage, kpi?.batteryVoltageV ?: "-", modifier = Modifier.fillMaxWidth())
-                }
-                Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
-                    KpiTile(strings.kpiPerfume2, kpi?.perfume2RemainingPercent ?: "-", modifier = Modifier.fillMaxWidth())
-                    KpiTile(strings.kpiRange, kpi?.remainingRangeKm ?: "-", modifier = Modifier.fillMaxWidth())
                     KpiTile(strings.kpiBatteryCurrent, kpi?.batteryCurrentA ?: "-", modifier = Modifier.fillMaxWidth())
                 }
                 Column(Modifier.width(kpiWidth), verticalArrangement = Arrangement.spacedBy(18.dp)) {
                     KpiTile(strings.kpiPerfume3, kpi?.perfume3RemainingPercent ?: "-", modifier = Modifier.fillMaxWidth())
-                    KpiTile(strings.kpiAirConditioning, kpi?.acCompressorPowerKw ?: "-", modifier = Modifier.fillMaxWidth())
+                    KpiTile(strings.kpiRange, kpi?.remainingRangeKm ?: "-", modifier = Modifier.fillMaxWidth())
                     KpiTile(strings.kpiAuxVoltage, kpi?.auxVoltageV ?: "-", modifier = Modifier.fillMaxWidth())
                 }
             }

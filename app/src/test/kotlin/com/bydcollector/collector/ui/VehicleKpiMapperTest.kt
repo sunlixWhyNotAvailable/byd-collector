@@ -34,7 +34,8 @@ class VehicleKpiMapperTest {
         assertEquals("704 В", uk.batteryVoltageV)
         assertEquals("-4,2 А", uk.batteryCurrentA)
         assertEquals("54,3", uk.remainingEnergyKwh)
-        assertEquals("1,06 кВт", uk.acCompressorPowerKw)
+        assertEquals("-1,06 кВт", uk.acCompressorPowerKw)
+        assertEquals(1.056, observations.single { it.field.fieldKey == "ac_compressor_power_kw" }.value.number)
         assertEquals(4.2, observations.single { it.field.fieldKey == "charge_current_a" }.value.number)
         assertEquals("13,8 В", uk.auxVoltageV)
         assertEquals("17,8", uk.averageConsumptionKwhPer100Km)
@@ -44,7 +45,7 @@ class VehicleKpiMapperTest {
         assertEquals("704 V", en.batteryVoltageV)
         assertEquals("-4.2 A", en.batteryCurrentA)
         assertEquals("54.3", en.remainingEnergyKwh)
-        assertEquals("1.06 kW", en.acCompressorPowerKw)
+        assertEquals("-1.06 kW", en.acCompressorPowerKw)
         assertEquals("13.8 V", en.auxVoltageV)
         assertEquals("17.8", en.averageConsumptionKwhPer100Km)
 
@@ -62,7 +63,7 @@ class VehicleKpiMapperTest {
         assertEquals("3,303 В", storedUk.maxCellVoltageV)
         assertEquals("704 В", storedUk.batteryVoltageV)
         assertEquals("-4,2 А", storedUk.batteryCurrentA)
-        assertEquals("1,06 кВт", storedUk.acCompressorPowerKw)
+        assertEquals("-1,06 кВт", storedUk.acCompressorPowerKw)
         assertEquals("13,8 В", storedUk.auxVoltageV)
         assertEquals("17,8", storedUk.averageConsumptionKwhPer100Km)
         val storedEn = VehicleKpiMapper.from(storedRows, VehicleKpiLanguage.EN, 17.84)
@@ -70,7 +71,8 @@ class VehicleKpiMapperTest {
         assertEquals("3.303 V", storedEn.maxCellVoltageV)
         assertEquals("704 V", storedEn.batteryVoltageV)
         assertEquals("-4.2 A", storedEn.batteryCurrentA)
-        assertEquals("1.06 kW", storedEn.acCompressorPowerKw)
+        assertEquals("-1.06 kW", storedEn.acCompressorPowerKw)
+        assertEquals(1.056, storedRows.single { it.fieldKey == "ac_compressor_power_kw" }.valueNumber)
         assertEquals("13.8 V", storedEn.auxVoltageV)
         assertEquals("17.8", storedEn.averageConsumptionKwhPer100Km)
 
@@ -153,6 +155,31 @@ class VehicleKpiMapperTest {
         listOf(0.0, -0.0, 0.01, -0.01).forEach { raw ->
             val input = normalize(reading("charging_charge_current", raw.toString(), raw.toString()))
             assertEquals("0.0 A", VehicleKpiMapper.fromObservations(input, VehicleKpiLanguage.EN).batteryCurrentA)
+        }
+    }
+
+    @Test
+    fun compressorConsumptionKeepsRoundedZeroUnsignedAndRejectsInvalidStoredValues() {
+        for ((language, zeroText, negativeText) in listOf(
+            Triple(VehicleKpiLanguage.UK, "0,00 кВт", "-0,01 кВт"),
+            Triple(VehicleKpiLanguage.EN, "0.00 kW", "-0.01 kW")
+        )) {
+            for (raw in listOf(0, 1, 4, 5)) {
+                val expected = if (raw < 5) zeroText else negativeText
+                val observations = normalize(reading("power_compressor_consume_power", raw.toString()))
+                assertEquals(expected, VehicleKpiMapper.fromObservations(observations, language).acCompressorPowerKw)
+                assertEquals(expected, VehicleKpiMapper.from(
+                    listOf(stored("ac_compressor_power_kw", raw / 1000.0)), language
+                ).acCompressorPowerKw)
+            }
+            assertEquals(zeroText, VehicleKpiMapper.from(
+                listOf(stored("ac_compressor_power_kw", -0.0)), language
+            ).acCompressorPowerKw)
+            for (invalid in listOf(-1.0, Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY)) {
+                assertEquals("-", VehicleKpiMapper.from(
+                    listOf(stored("ac_compressor_power_kw", invalid)), language
+                ).acCompressorPowerKw)
+            }
         }
     }
 
