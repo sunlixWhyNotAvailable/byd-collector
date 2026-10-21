@@ -25,8 +25,18 @@ object KeepAliveShellPlanner {
         "settings put global bluetooth_disabled_profiles 0"
 
     fun daemonStopCommand(): String =
-        "pidof bydcollector_keepalive >/dev/null 2>&1 && kill -TERM \$(pidof bydcollector_keepalive) 2>/dev/null || true; " +
-            "for i in 1 2 3; do if ! pidof bydcollector_keepalive >/dev/null 2>&1; then exit 0; fi; sleep 1; done; exit 1"
+        // setsid gives the daemon its own group; a PID-only stop can orphan an in-flight cmd.
+        "keepalive_groups=\$(pidof bydcollector_keepalive); " +
+            "for keepalive_pid in \$keepalive_groups; do " +
+            "keepalive_pgid=\$(ps -o PGID= -p \"\$keepalive_pid\" | tr -d '[:space:]'); " +
+            "[ \"\$keepalive_pgid\" = \"\$keepalive_pid\" ] || { echo keepalive_stop_group_unverified; exit 1; }; done; " +
+            "for keepalive_pid in \$keepalive_groups; do kill -TERM -- -\$keepalive_pid 2>/dev/null; done; " +
+            "for keepalive_i in 1 2 3 4; do keepalive_alive=0; " +
+            "for keepalive_pid in \$keepalive_groups; do " +
+            "if kill -0 -- -\$keepalive_pid 2>/dev/null; then keepalive_alive=1; " +
+            "[ \"\$keepalive_i\" != 3 ] || kill -KILL -- -\$keepalive_pid 2>/dev/null; fi; done; " +
+            "[ \"\$keepalive_alive\" != 0 ] || exit 0; sleep 1; done; " +
+            "echo keepalive_stop_group_still_alive; exit 1"
 
     fun daemonLaunchCommand(apkPath: String): String {
         val quotedApk = shellQuote(apkPath)

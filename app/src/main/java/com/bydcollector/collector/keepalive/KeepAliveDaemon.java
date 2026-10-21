@@ -14,6 +14,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.nio.channels.FileChannel;
@@ -52,9 +53,13 @@ public final class KeepAliveDaemon {
             "Result:\\s*Parcel\\(\\s*(?:0x00000000:\\s*)?00000000\\s+([0-9a-fA-F]{8})\\s+'[^'\\r\\n]*'\\s*\\)"
     );
     private static String lastUsbSkipReason = "";
-    private static final String RECOVER_COLLECTOR_COMMAND =
-            "am broadcast --include-stopped-packages -a com.bydcollector.collector.action.KEEP_ALIVE_RECOVERY " +
-                    "-n com.bydcollector.collector/com.bydcollector.collector.system.KeepAliveRecoveryReceiver";
+    private static final String[] RECOVER_COLLECTOR_ARGS = {
+            "/system/bin/cmd", "activity", "broadcast", "--async", "--include-stopped-packages",
+            "-a", "com.bydcollector.collector.action.KEEP_ALIVE_RECOVERY",
+            "-n", "com.bydcollector.collector/com.bydcollector.collector.system.KeepAliveRecoveryReceiver"
+    };
+    private static final String RECOVER_COLLECTOR_COMMAND = String.join(" ", RECOVER_COLLECTOR_ARGS);
+    private static final RecoveryCommandOwner RECOVERY_COMMAND_OWNER = new RecoveryCommandOwner();
     private static final ThreadPoolExecutor RADIO_STATE_READER = new ThreadPoolExecutor(
             1,
             1,
@@ -577,6 +582,7 @@ public final class KeepAliveDaemon {
                 ? "collector_service_record_present"
                 : "collector_service_record_missing");
 
+        // Async exit acknowledges submission only; the receiver/service records actual recovery.
         runAndLog("collector_service_recovery_broadcast_requested", RECOVER_COLLECTOR_COMMAND);
     }
 
@@ -599,13 +605,19 @@ public final class KeepAliveDaemon {
             return new ShellResult(false, "", "command_rejected", 0);
         }
         long startedAt = System.currentTimeMillis();
+        boolean recoveryCommand = RECOVER_COLLECTOR_COMMAND.equals(command);
         Process process = null;
         InputStream processOutput = null;
         FutureTask<String> outputTask = null;
         try {
-            process = new ProcessBuilder("sh", "-c", command)
-                    .redirectErrorStream(true)
-                    .start();
+            ProcessBuilder builder = (recoveryCommand
+                    ? new ProcessBuilder(RECOVER_COLLECTOR_ARGS)
+                    : new ProcessBuilder("sh", "-c", command)).redirectErrorStream(true);
+            process = recoveryCommand ? RECOVERY_COMMAND_OWNER.start(builder) : builder.start();
+            if (process == null) {
+                return new ShellResult(false, "", "previous_recovery_command_alive", System.currentTimeMillis() - startedAt);
+            }
+            if (recoveryCommand) log("collector_recovery_command_started mode=async");
             processOutput = process.getInputStream();
             final InputStream drainInput = processOutput;
             outputTask = new FutureTask<>(() -> drainOutput(drainInput, COMMAND_OUTPUT_MAX_BYTES));
@@ -614,8 +626,12 @@ public final class KeepAliveDaemon {
             outputDrainer.start();
             boolean finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS);
             if (!finished) {
-                process.destroyForcibly();
-                process.waitFor(1, TimeUnit.SECONDS);
+                if (recoveryCommand) {
+                    log("collector_recovery_command_timeout terminated=" + RECOVERY_COMMAND_OWNER.stop(process));
+                } else {
+                    process.destroyForcibly();
+                    process.waitFor(1, TimeUnit.SECONDS);
+                }
             }
             String output;
             boolean outputDrainTimedOut = false;
@@ -623,7 +639,7 @@ public final class KeepAliveDaemon {
                 output = outputTask.get(OUTPUT_DRAIN_TIMEOUT_MS, TimeUnit.MILLISECONDS).trim();
             } catch (TimeoutException error) {
                 outputDrainTimedOut = true;
-                processOutput.close();
+                if (!recoveryCommand || !process.isAlive()) processOutput.close();
                 outputTask.cancel(true);
                 output = "";
             }
@@ -643,7 +659,18 @@ public final class KeepAliveDaemon {
                     System.currentTimeMillis() - startedAt
             );
         } finally {
-            if (processOutput != null) {
+            if (process != null && recoveryCommand) {
+                try {
+                    boolean terminated = RECOVERY_COMMAND_OWNER.stop(process);
+                    log("collector_recovery_command_finished terminated=" + terminated
+                            + " exit_code=" + (terminated ? process.exitValue() : "pending")
+                            + " delivery=not_confirmed");
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    log("collector_recovery_command_cleanup_interrupted alive=" + process.isAlive());
+                }
+            }
+            if (processOutput != null && (!recoveryCommand || !process.isAlive())) {
                 try {
                     processOutput.close();
                 } catch (Exception ignored) {
@@ -652,12 +679,32 @@ public final class KeepAliveDaemon {
             if (outputTask != null && !outputTask.isDone()) {
                 outputTask.cancel(true);
             }
-            if (process != null) {
+            if (process != null && !recoveryCommand) {
                 process.destroy();
                 if (process.isAlive()) {
                     process.destroyForcibly();
                 }
             }
+        }
+    }
+
+    static final class RecoveryCommandOwner {
+        private Process active;
+
+        synchronized Process start(ProcessBuilder builder) throws IOException {
+            if (active != null && active.isAlive()) return null;
+            active = builder.start();
+            return active;
+        }
+
+        boolean stop(Process process) throws InterruptedException {
+            if (process.isAlive()) process.destroyForcibly();
+            boolean terminated = process.waitFor(1, TimeUnit.SECONDS);
+            synchronized (this) {
+                // A timed-out command retains ownership until the OS confirms its exit.
+                if (terminated && active == process) active = null;
+            }
+            return terminated;
         }
     }
 

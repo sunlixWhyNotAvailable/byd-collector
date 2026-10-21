@@ -29,7 +29,8 @@ internal object UserShutdownShellPlanner {
             append("settings put global bydcollector_user_shutdown 1 || exit 71; ")
             append("settings put global $GENERATION_KEY '$token' || exit 71; ")
             append(functions(logcatOwnerEnv, packageName, apkPath))
-            append("shutdown_signal_named_process '$KEEP_ALIVE_PROCESS' '$KEEP_ALIVE_CLASS' TERM || exit 72; ")
+            append("shutdown_has_named_process '$KEEP_ALIVE_PROCESS' '$KEEP_ALIVE_CLASS' || exit 72; ")
+            append("(${KeepAliveShellPlanner.daemonStopCommand()}) || exit 72; ")
             append("shutdown_signal_owned_logcat TERM || exit 73; ")
             append("echo BYDCOLLECTOR_SHUTDOWN_GRACEFUL_SIGNAL_SENT")
         }
@@ -84,7 +85,7 @@ internal object UserShutdownShellPlanner {
             append("shutdown_wait_named_absent '$HELPER_PROCESS' '$HELPER_CLASS' || exit 83; ")
             append("shutdown_has_named_process '$KEEP_ALIVE_PROCESS' '$KEEP_ALIVE_CLASS' || exit 84; ")
             append("shutdown_forced_keepalive=\$shutdown_named_present; ")
-            append("shutdown_signal_named_process '$KEEP_ALIVE_PROCESS' '$KEEP_ALIVE_CLASS' KILL || exit 83; ")
+            append("(${KeepAliveShellPlanner.daemonStopCommand()}) || exit 83; ")
             append("shutdown_wait_named_absent '$KEEP_ALIVE_PROCESS' '$KEEP_ALIVE_CLASS' || exit 85; ")
             append("shutdown_owned_logcat_present || exit 86; shutdown_forced_logcat=\$shutdown_owned_logcat_found; ")
             append("shutdown_signal_owned_logcat KILL || exit 87; ")
