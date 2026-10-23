@@ -153,6 +153,7 @@ data class TelegramEventState(
     val bootTotalDistanceKm: Double = 0.0,
     val bootTotalEnergyKwh: Double = 0.0,
     val bootTotalDurationMs: Long = 0L,
+    val tripSummaryCreatedInPowerSession: Boolean = false,
     val bootTotalStartedAtMs: Long? = null,
     val bootTotalEndedAtMs: Long? = null,
     val lastTripEnergyCounterKwh: Double? = null,
@@ -185,6 +186,7 @@ data class TelegramEventState(
             bootTotalDistanceKm > 0.0 ||
             bootTotalEnergyKwh > 0.0 ||
             bootTotalDurationMs > 0L ||
+            tripSummaryCreatedInPowerSession ||
             bootTotalStartedAtMs != null ||
             bootTotalEndedAtMs != null ||
             rawSourceInputs.isNotEmpty()
@@ -247,6 +249,7 @@ data class TelegramEventState(
         put("bootTotalDistanceKm", bootTotalDistanceKm)
         put("bootTotalEnergyKwh", bootTotalEnergyKwh)
         put("bootTotalDurationMs", bootTotalDurationMs)
+        put("tripSummaryCreatedInPowerSession", tripSummaryCreatedInPowerSession)
         putNullable("bootTotalStartedAtMs", bootTotalStartedAtMs)
         putNullable("bootTotalEndedAtMs", bootTotalEndedAtMs)
         putNullable("lastTripEnergyCounterKwh", lastTripEnergyCounterKwh)
@@ -329,6 +332,11 @@ data class TelegramEventState(
                     bootTotalEnergyKwh = json.optDoubleOrNull("bootTotalEnergyKwh")
                         ?.takeIf { it.isFinite() && it >= 0.0 } ?: 0.0,
                     bootTotalDurationMs = (json.optLongOrNull("bootTotalDurationMs") ?: 0L).coerceAtLeast(0L),
+                    tripSummaryCreatedInPowerSession = if (json.has("tripSummaryCreatedInPowerSession")) {
+                        json.optBoolean("tripSummaryCreatedInPowerSession", false)
+                    } else {
+                        json.optStringOrNull("pendingPowerOffLocationTripId") != null
+                    },
                     bootTotalStartedAtMs = json.optLongOrNull("bootTotalStartedAtMs"),
                     bootTotalEndedAtMs = json.optLongOrNull("bootTotalEndedAtMs"),
                     lastTripEnergyCounterKwh = json.optDoubleOrNull("lastTripEnergyCounterKwh")
@@ -969,25 +977,6 @@ class TelegramEventEngine(
                     ?.takeIf { config.sendLocation }
                     ?.let { formatLocation(it, config.navigatorMask) }
                     ?.takeIf(String::isNotEmpty),
-                omitCurrent = displayedTripTotalsMatch(
-                    distance = distance,
-                    energy = energy,
-                    durationMs = durationMs,
-                    totalDistance = totalDistance,
-                    totalEnergy = totalEnergy,
-                    totalDurationMs = totalDurationMs,
-                    tripStartSoc = state.tripStartSoc,
-                    tripEndSoc = state.tripEndSoc,
-                    totalStartSoc = state.bootStartSoc,
-                    totalEndSoc = state.bootEndSoc,
-                    tripStartAtMs = state.tripStartedAtMs,
-                    tripEndAtMs = tripEndAtMs,
-                    totalStartAtMs = state.bootTotalStartedAtMs,
-                    totalEndAtMs = totalEndAtMs,
-                    tripEnergyMetrics = tripEnergyMetrics,
-                    totalEnergyMetrics = totalEnergyMetrics,
-                    language = config.language
-                ),
                 occurredAtMs = tripEndAtMs,
                 sourceIdentity = "trip:$tripId"
             )
@@ -1503,25 +1492,6 @@ class TelegramEventEngine(
                     language = config.language,
                     nowMs = tripEndAtMs
                 ),
-                omitCurrent = displayedTripTotalsMatch(
-                    distance = distance,
-                    energy = energy,
-                    durationMs = durationMs,
-                    totalDistance = totalDistance,
-                    totalEnergy = totalEnergy,
-                    totalDurationMs = totalDurationMs,
-                    tripStartSoc = state.tripStartSoc,
-                    tripEndSoc = state.tripEndSoc,
-                    totalStartSoc = state.bootStartSoc,
-                    totalEndSoc = state.bootEndSoc,
-                    tripStartAtMs = state.tripStartedAtMs,
-                    tripEndAtMs = tripEndAtMs,
-                    totalStartAtMs = state.bootTotalStartedAtMs,
-                    totalEndAtMs = totalEndAtMs,
-                    tripEnergyMetrics = tripEnergyMetrics,
-                    totalEnergyMetrics = totalEnergyMetrics,
-                    language = config.language
-                ),
                 occurredAtMs = tripEndAtMs,
                 sourceIdentity = "trip:$tripId"
             )
@@ -1804,6 +1774,7 @@ class TelegramEventEngine(
             bootTotalDistanceKm = 0.0,
             bootTotalEnergyKwh = 0.0,
             bootTotalDurationMs = 0L,
+            tripSummaryCreatedInPowerSession = false,
             bootTotalStartedAtMs = null,
             bootTotalEndedAtMs = null,
             lastTripEnergyCounterKwh = null,
@@ -1820,7 +1791,6 @@ class TelegramEventEngine(
         dedupeKey: String,
         variables: Map<String, String>,
         textSuffix: String? = null,
-        omitCurrent: Boolean = false,
         locationOnly: Boolean = false,
         waitsForSummaryKey: String? = null,
         occurredAtMs: Long? = null,
@@ -1828,18 +1798,20 @@ class TelegramEventEngine(
         chargingEtaDiagnosticDetail: String? = null
     ) {
         if (type in config.enabledEvents) {
+            val fullTripSummary = type == TelegramEventType.TRIP_SUMMARY && !locationOnly
             events += TelegramDetectedEvent(
                 type = type,
                 dedupeKey = dedupeKey,
                 variables = variables,
                 textSuffix = textSuffix,
-                omitCurrent = omitCurrent,
+                omitCurrent = fullTripSummary && !state.tripSummaryCreatedInPowerSession,
                 locationOnly = locationOnly,
                 waitsForSummaryKey = waitsForSummaryKey,
                 occurredAtMs = occurredAtMs,
                 sourceIdentityHash = sourceIdentity?.let(::diagnosticSha256),
                 chargingEtaDiagnosticDetail = chargingEtaDiagnosticDetail
             )
+            if (fullTripSummary) state = state.copy(tripSummaryCreatedInPowerSession = true)
         }
     }
 
@@ -2283,50 +2255,6 @@ private fun tripSummaryVariables(
     ),
     "time" to formatTime(nowMs)
 )
-
-private fun displayedTripTotalsMatch(
-    distance: Double?,
-    energy: Double?,
-    durationMs: Long,
-    totalDistance: Double,
-    totalEnergy: Double,
-    totalDurationMs: Long,
-    tripStartSoc: Double?,
-    tripEndSoc: Double?,
-    totalStartSoc: Double?,
-    totalEndSoc: Double?,
-    tripStartAtMs: Long?,
-    tripEndAtMs: Long?,
-    totalStartAtMs: Long?,
-    totalEndAtMs: Long?,
-    tripEnergyMetrics: TelegramEnergyMetrics,
-    totalEnergyMetrics: TelegramEnergyMetrics,
-    language: TelegramTemplateLanguage
-): Boolean {
-    val newEnergyAvailable = tripEnergyMetrics.netKwh != null || totalEnergyMetrics.netKwh != null
-    val displayedEnergyMatches = if (newEnergyAvailable) {
-        formatNumber(tripEnergyMetrics.dischargedKwh) ==
-            formatNumber(totalEnergyMetrics.dischargedKwh) &&
-            formatNumber(tripEnergyMetrics.regeneratedKwh) ==
-            formatNumber(totalEnergyMetrics.regeneratedKwh) &&
-            formatNumber(tripEnergyMetrics.netKwh) ==
-            formatNumber(totalEnergyMetrics.netKwh) &&
-            formatNumber(
-                TripMetrics.averageConsumptionKwhPer100Km(tripEnergyMetrics.netKwh, distance)
-            ) == formatNumber(
-                TripMetrics.averageConsumptionKwhPer100Km(totalEnergyMetrics.netKwh, totalDistance)
-            )
-    } else {
-        formatNumber(energy) == formatNumber(totalEnergy)
-    }
-    return formatNumber(distance) == formatNumber(totalDistance) &&
-        displayedEnergyMatches &&
-        formatDuration(durationMs) == formatDuration(totalDurationMs) &&
-        formatNumber(tripStartSoc) == formatNumber(totalStartSoc) &&
-        formatNumber(tripEndSoc) == formatNumber(totalEndSoc) &&
-        formatLocalTime(tripStartAtMs) == formatLocalTime(totalStartAtMs) &&
-        formatLocalTime(tripEndAtMs) == formatLocalTime(totalEndAtMs)
-}
 
 private data class TelegramEnergyMetrics(
     val dischargedKwh: Double? = null,

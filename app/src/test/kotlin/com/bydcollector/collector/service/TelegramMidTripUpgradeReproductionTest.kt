@@ -24,6 +24,7 @@ import com.bydcollector.collector.telegram.TelegramNavigatorMask
 import com.bydcollector.collector.telegram.TelegramPayloadLimitState
 import com.bydcollector.collector.telegram.TelegramTemplateLanguage
 import com.bydcollector.collector.telegram.renderTelegramPayload
+import org.json.JSONObject
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -117,6 +118,195 @@ class TelegramMidTripUpgradeReproductionTest {
                 assertTrue(it.moveToFirst())
                 assertEquals(1_000, it.getInt(0))
             }
+        } finally {
+            store.close()
+            context.deleteDatabase(name)
+        }
+    }
+
+    @Test
+    fun legacyTripSummaryMarkerSurvivesSqliteRecoveryUntilPowerOff() {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "trip-summary-marker.db"
+        var helper = TelegramDatabaseHelper(context, name)
+        var store = TelegramStore(context, helper)
+        val config = TelegramEventConfig(
+            enabledEvents = setOf(TelegramEventType.TRIP_SUMMARY),
+            chargeStepPercent = 5,
+            lowVoltageThreshold = 12.0,
+            unavailableDelayMs = 60_000L,
+            tripEndDelayMs = 1_000L,
+            sendLocation = true,
+            navigatorMask = TelegramNavigatorMask.GOOGLE,
+            language = TelegramTemplateLanguage.EN
+        )
+        val engine = drivingTelegramEngine(config)
+        try {
+            engine.onSuccessfulPoll(
+                tripTelemetry(gear = "D", soc = 71.0, odometer = 100.0, tripEnergy = 0.5), config, 2_000L
+            )
+            engine.onSuccessfulPoll(
+                tripTelemetry(gear = "P", soc = 71.0, odometer = 100.0, tripEnergy = 0.5), config, 3_000L
+            )
+            val parked = engine.onSuccessfulPoll(
+                tripTelemetry(gear = "P", soc = 71.0, odometer = 100.0, tripEnergy = 0.5), config, 4_000L
+            )
+            assertTrue(parked.events.none { it.type == TelegramEventType.TRIP_SUMMARY })
+            val legacyBeforeFirst = JSONObject(parked.state.toJson()).apply {
+                remove("tripSummaryCreatedInPowerSession")
+            }.toString()
+            assertFalse(TelegramEventState.fromJson(legacyBeforeFirst).tripSummaryCreatedInPowerSession)
+            val summaryResult = engine.onTick(config, mainCollectionExpected = true, lastError = null, nowMs = 5_000L)
+            val summary = summaryResult.events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+            assertTrue(summary.omitCurrent)
+            assertMetric(summary, "trip_distance_km", 0.0)
+            assertMetric(summary, "total_distance_km", 0.0)
+            assertMetric(summary, "trip_energy_kwh", 0.0)
+            assertMetric(summary, "total_energy_kwh", 0.0)
+            assertNotNull(summaryResult.state.pendingPowerOffLocationTripId)
+            assertTrue(summaryResult.state.hasDeferredStorageWork())
+
+            val legacyJson = JSONObject(summaryResult.state.toJson()).apply {
+                remove("tripSummaryCreatedInPowerSession")
+            }.toString()
+            val migratedState = TelegramEventState.fromJson(legacyJson)
+            assertTrue(migratedState.tripSummaryCreatedInPowerSession)
+            val firstText = assertNotNull(renderTelegramPayload(summary, null, config.language).text)
+            assertFalse(firstText.contains("📊 Current statistics."))
+            assertTrue(firstText.contains("📈 Total statistics."))
+
+            val payload = assertNotNull(renderTelegramPayload(summary, null, config.language).text)
+            val enqueued = store.commitTelegramEvents(
+                listOf(TelegramOutboxMessage(summary.dedupeKey, summary.type.key, payload)),
+                migratedState.toJson(),
+                nowMs = 5_000L
+            )
+            assertTrue(enqueued.single().inserted)
+            assertNotNull(store.telegramMessageByDedupeKey(summary.dedupeKey))
+
+            store.close()
+            helper = TelegramDatabaseHelper(context, name)
+            store = TelegramStore(context, helper)
+            val recovered = TelegramEventEngine(
+                TelegramEventState.fromJson(requireNotNull(store.telegramRuntimeState()))
+            )
+            assertTrue(recovered.state.tripSummaryCreatedInPowerSession)
+            assertNotNull(store.telegramMessageByDedupeKey(summary.dedupeKey), "summary remains queued across restart")
+            assertTrue(recovered.recoverPendingTrip(config, 6_000L).state.tripSummaryCreatedInPowerSession)
+
+            recovered.onSuccessfulPoll(
+                tripTelemetry(gear = "D", soc = 72.0, odometer = 100.0, tripEnergy = 0.5), config, 6_000L
+            )
+            recovered.onSuccessfulPoll(
+                tripTelemetry(gear = "D", soc = 72.0, odometer = 100.0, tripEnergy = 0.5), config, 6_500L
+            )
+            recovered.onSuccessfulPoll(
+                tripTelemetry(gear = "D", soc = 71.0, odometer = 102.0, tripEnergy = 1.5), config, 7_000L
+            )
+            recovered.onSuccessfulPoll(
+                tripTelemetry(gear = "P", soc = 71.0, odometer = 102.0, tripEnergy = 1.5), config, 7_500L
+            )
+            recovered.onSuccessfulPoll(
+                tripTelemetry(gear = "P", soc = 71.0, odometer = 102.0, tripEnergy = 1.5), config, 8_000L
+            )
+            val secondResult = recovered.onTick(
+                config, mainCollectionExpected = true, lastError = null, nowMs = 9_000L
+            )
+            val secondSummary = secondResult.events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+            assertFalse(secondSummary.omitCurrent)
+            assertMetric(secondSummary, "trip_distance_km", 2.0)
+            assertMetric(secondSummary, "total_distance_km", 2.0)
+            assertMetric(secondSummary, "trip_energy_kwh", 1.0)
+            assertMetric(secondSummary, "total_energy_kwh", 1.0)
+            listOf(
+                "trip_distance_km" to "total_distance_km",
+                "trip_energy_kwh" to "total_energy_kwh",
+                "trip_avg_kwh_per_100km" to "total_avg_kwh_per_100km",
+                "trip_duration" to "total_duration",
+                "trip_start_time" to "total_start_time",
+                "trip_end_time" to "total_end_time",
+                "soc_start" to "total_soc_start",
+                "soc_end" to "total_soc_end",
+                "trip_discharged_kwh" to "total_discharged_kwh",
+                "trip_regenerated_kwh" to "total_regenerated_kwh",
+                "trip_net_kwh" to "total_net_kwh",
+                "trip_net_kwh_per_100km" to "total_net_kwh_per_100km"
+            ).forEach { (current, total) ->
+                assertEquals(secondSummary.variables[current], secondSummary.variables[total], "$current == $total")
+            }
+            val secondText = assertNotNull(renderTelegramPayload(secondSummary, null, config.language).text)
+            assertTrue(secondText.contains("📊 Current statistics."))
+            assertTrue(secondText.contains("📈 Total statistics."))
+            assertTrue(secondResult.state.tripSummaryCreatedInPowerSession)
+
+            val secondPayload = assertNotNull(renderTelegramPayload(secondSummary, null, config.language).text)
+            assertTrue(store.commitTelegramEvents(
+                listOf(TelegramOutboxMessage(secondSummary.dedupeKey, secondSummary.type.key, secondPayload)),
+                secondResult.state.toJson(),
+                nowMs = 9_000L
+            ).single().inserted)
+            assertNotNull(store.telegramMessageByDedupeKey(summary.dedupeKey), "first summary remains queued")
+            assertNotNull(store.telegramMessageByDedupeKey(secondSummary.dedupeKey), "second summary is queued")
+
+            store.close()
+            helper = TelegramDatabaseHelper(context, name)
+            store = TelegramStore(context, helper)
+            val afterSecondRestart = TelegramEventEngine(
+                TelegramEventState.fromJson(requireNotNull(store.telegramRuntimeState()))
+            )
+            assertTrue(afterSecondRestart.state.tripSummaryCreatedInPowerSession)
+            assertNotNull(store.telegramMessageByDedupeKey(summary.dedupeKey))
+            assertNotNull(store.telegramMessageByDedupeKey(secondSummary.dedupeKey))
+
+            val location = TelegramLocationSnapshot(
+                latitude = 49.0,
+                longitude = 24.0,
+                capturedAt = "2026-10-11T10:00:09Z",
+                ageSeconds = 0L,
+                osmUrl = "https://osm.example/?mlat=49&mlon=24",
+                googleUrl = "https://maps.example/?q=49,24",
+                appleUrl = "https://maps.apple.example/?q=49,24"
+            )
+            val powerOff = afterSecondRestart.onPowerOffConfirmed(config, location = location, nowMs = 10_000L)
+            val locationEvent = powerOff.events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+            assertTrue(locationEvent.locationOnly)
+            assertEquals(secondSummary.dedupeKey, locationEvent.waitsForSummaryKey)
+            assertFalse(powerOff.state.tripSummaryCreatedInPowerSession)
+            val locationPayload = assertNotNull(renderTelegramPayload(locationEvent, null, config.language).text)
+            assertTrue(store.commitTelegramEvents(
+                listOf(TelegramOutboxMessage(locationEvent.dedupeKey, locationEvent.type.key, locationPayload)),
+                powerOff.state.toJson(),
+                nowMs = 10_000L
+            ).single().inserted)
+            assertNotNull(store.telegramMessageByDedupeKey(locationEvent.dedupeKey))
+            store.close()
+
+            helper = TelegramDatabaseHelper(context, name)
+            store = TelegramStore(context, helper)
+            val newPowerSession = TelegramEventEngine(
+                TelegramEventState.fromJson(requireNotNull(store.telegramRuntimeState()))
+            )
+            assertFalse(newPowerSession.state.tripSummaryCreatedInPowerSession)
+            newPowerSession.onSuccessfulPoll(
+                tripTelemetry(gear = "D", soc = 72.0, odometer = 102.0, tripEnergy = 0.5), config, 11_000L
+            )
+            newPowerSession.onSuccessfulPoll(
+                tripTelemetry(gear = "D", soc = 72.0, odometer = 102.0, tripEnergy = 0.5), config, 11_500L
+            )
+            newPowerSession.onSuccessfulPoll(
+                tripTelemetry(gear = "D", soc = 71.0, odometer = 103.0, tripEnergy = 1.5), config, 12_000L
+            )
+            val newPowerOff = newPowerSession.onPowerOffConfirmed(
+                config,
+                TelegramPowerOffSnapshot(odometerKm = 103.0, soc = 71.0, tripEnergyKwh = 1.5),
+                nowMs = 13_000L
+            )
+            val newFirstSummary = newPowerOff.events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+            assertTrue(newFirstSummary.omitCurrent)
+            assertFalse(newPowerOff.state.tripSummaryCreatedInPowerSession)
+            val newFirstText = assertNotNull(renderTelegramPayload(newFirstSummary, null, config.language).text)
+            assertFalse(newFirstText.contains("📊 Current statistics."))
+            assertTrue(newFirstText.contains("📈 Total statistics."))
         } finally {
             store.close()
             context.deleteDatabase(name)
@@ -299,7 +489,7 @@ class TelegramMidTripUpgradeReproductionTest {
     }
 
     @Test
-    fun parkedConsumptionAndLaterDriveKeepDifferentTotalsVisible() {
+    fun firstParkedSummaryIsTotalOnlyAndLaterPowerOffSummaryShowsBothBlocks() {
         val telegramConfig = TelegramEventConfig(
             enabledEvents = setOf(TelegramEventType.TRIP_SUMMARY),
             chargeStepPercent = 5,
@@ -326,12 +516,13 @@ class TelegramMidTripUpgradeReproductionTest {
             8_500L
         )
             .events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+        assertTrue(parkedSummary.omitCurrent)
         assertMetric(parkedSummary, "soc_end", 70.0)
         assertMetric(parkedSummary, "total_soc_end", 69.0)
         val parkedText = assertNotNull(
             renderTelegramPayload(parkedSummary, null, TelegramTemplateLanguage.UK).text
         )
-        assertTrue(parkedText.contains("📊 Поточна статистика."))
+        assertFalse(parkedText.contains("📊 Поточна статистика."))
         assertTrue(parkedText.contains("📈 Загальна статистика."))
 
         val englishConfig = telegramConfig.copy(language = TelegramTemplateLanguage.EN)
@@ -351,11 +542,83 @@ class TelegramMidTripUpgradeReproductionTest {
             nowMs = 10_000L
         )
         val summary = powerOff.events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+        assertFalse(summary.omitCurrent)
         assertMetric(summary, "trip_distance_km", 1.0)
         assertMetric(summary, "total_distance_km", 7.0)
         val rendered = assertNotNull(renderTelegramPayload(summary, null, TelegramTemplateLanguage.EN).text)
         assertTrue(rendered.contains("📊 Current statistics."))
         assertTrue(rendered.contains("📈 Total statistics."))
+    }
+
+    @Test
+    fun filteredAndDisabledTripsDoNotConsumeFirstSummaryInPowerSession() {
+        val enabledConfig = TelegramEventConfig(
+            enabledEvents = setOf(TelegramEventType.TRIP_SUMMARY),
+            chargeStepPercent = 5,
+            lowVoltageThreshold = 12.0,
+            unavailableDelayMs = 60_000L,
+            tripEndDelayMs = 1_000L
+        )
+        val disabledConfig = enabledConfig.copy(enabledEvents = emptySet())
+        val engine = drivingTelegramEngine(enabledConfig)
+
+        engine.onSuccessfulPoll(
+            tripTelemetry(gear = "D", soc = 72.0, odometer = 100.0, tripEnergy = 0.5), enabledConfig, 2_000L
+        )
+        engine.onSuccessfulPoll(
+            tripTelemetry(gear = "P", soc = 72.0, odometer = 100.0, tripEnergy = 0.5), enabledConfig, 2_500L
+        )
+        engine.onSuccessfulPoll(
+            tripTelemetry(gear = "P", soc = 72.0, odometer = 100.0, tripEnergy = 0.5), enabledConfig, 3_000L
+        )
+        val filtered = engine.onTick(
+            enabledConfig, mainCollectionExpected = true, lastError = null, nowMs = 4_000L
+        )
+        assertTrue(filtered.events.none { it.type == TelegramEventType.TRIP_SUMMARY })
+        assertFalse(filtered.state.tripSummaryCreatedInPowerSession)
+
+        engine.onSuccessfulPoll(
+            tripTelemetry(gear = "D", soc = 72.0, odometer = 100.0, tripEnergy = 0.5), disabledConfig, 5_000L
+        )
+        engine.onSuccessfulPoll(
+            tripTelemetry(gear = "D", soc = 72.0, odometer = 100.0, tripEnergy = 0.5), disabledConfig, 5_500L
+        )
+        engine.onSuccessfulPoll(
+            tripTelemetry(gear = "D", soc = 71.0, odometer = 102.0, tripEnergy = 1.5), disabledConfig, 6_000L
+        )
+        engine.onSuccessfulPoll(
+            tripTelemetry(gear = "P", soc = 71.0, odometer = 102.0, tripEnergy = 1.5), disabledConfig, 6_500L
+        )
+        engine.onSuccessfulPoll(
+            tripTelemetry(gear = "P", soc = 71.0, odometer = 102.0, tripEnergy = 1.5), disabledConfig, 7_000L
+        )
+        val disabled = engine.onTick(
+            disabledConfig, mainCollectionExpected = true, lastError = null, nowMs = 8_000L
+        )
+        assertTrue(disabled.events.none { it.type == TelegramEventType.TRIP_SUMMARY })
+        assertFalse(disabled.state.tripSummaryCreatedInPowerSession)
+
+        engine.onSuccessfulPoll(
+            tripTelemetry(gear = "D", soc = 71.0, odometer = 102.0, tripEnergy = 1.5), enabledConfig, 9_000L
+        )
+        engine.onSuccessfulPoll(
+            tripTelemetry(gear = "D", soc = 71.0, odometer = 102.0, tripEnergy = 1.5), enabledConfig, 9_500L
+        )
+        engine.onSuccessfulPoll(
+            tripTelemetry(gear = "D", soc = 70.0, odometer = 104.0, tripEnergy = 2.5), enabledConfig, 10_000L
+        )
+        engine.onSuccessfulPoll(
+            tripTelemetry(gear = "P", soc = 70.0, odometer = 104.0, tripEnergy = 2.5), enabledConfig, 10_500L
+        )
+        engine.onSuccessfulPoll(
+            tripTelemetry(gear = "P", soc = 70.0, odometer = 104.0, tripEnergy = 2.5), enabledConfig, 11_000L
+        )
+        val firstEmittedSummary = engine.onTick(
+            enabledConfig, mainCollectionExpected = true, lastError = null, nowMs = 12_000L
+        ).events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+        assertTrue(firstEmittedSummary.omitCurrent)
+        assertMetric(firstEmittedSummary, "trip_distance_km", 2.0)
+        assertMetric(firstEmittedSummary, "total_distance_km", 4.0)
     }
 
     private fun newTripRuntime(
