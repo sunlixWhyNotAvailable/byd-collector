@@ -13,8 +13,8 @@ android {
         testInstrumentationRunner = "com.bydcollector.collector.NativeSqliteInstrumentation"
         minSdk = 26
         targetSdk = 29
-        versionCode = 312
-        versionName = "3.3.6"
+        versionCode = 313
+        versionName = "3.3.7"
         manifestPlaceholders["collectorLabel"] = "BYD Collector"
         buildConfigField("String", "COLLECTOR_DISPLAY_NAME", "\"BYD Collector\"")
         buildConfigField("String", "COLLECTOR_DATABASE_NAME", "\"bydcollector_telemetry.db\"")
