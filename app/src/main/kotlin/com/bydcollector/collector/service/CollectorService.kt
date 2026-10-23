@@ -4430,7 +4430,7 @@ class CollectorService : Service() {
         if (kpiWorker?.isAlive == true) return
         val liveness = currentRuntimeLiveness()
         if (liveness.active) return
-        if (!settings.runtimeDemand().requiresPersistentOwner) {
+        if (!settings.runtimeDemand().requiresPersistentOwner && !settings.hasPendingWifiPolicy()) {
             CollectorAutoStart.cancelScheduled(applicationContext)
         }
         releaseWakeLock()

@@ -21,6 +21,7 @@ class NativeSqliteInstrumentation : Instrumentation() {
     private val completed = mutableListOf<String>()
     private var runtimeBoundaryFixture = false
     private var updateDownloadFixture = false
+    private var wifiPolicyGate = false
     private var gateArguments = Bundle()
 
     override fun onCreate(arguments: Bundle?) {
@@ -28,6 +29,7 @@ class NativeSqliteInstrumentation : Instrumentation() {
         gateArguments = arguments ?: Bundle()
         runtimeBoundaryFixture = arguments?.getString("runtimeBoundary") == "true"
         updateDownloadFixture = arguments?.getString("updateDownloadGate") == "true"
+        wifiPolicyGate = arguments?.getString("wifiPolicyGate") == "true"
         start()
     }
 
@@ -53,6 +55,17 @@ class NativeSqliteInstrumentation : Instrumentation() {
             }
             finish(if (result.isSuccess) Activity.RESULT_OK else Activity.RESULT_CANCELED,
                 Bundle().apply { putString("stream", result.getOrElse { "UPDATE_DOWNLOAD_GATE_FAIL ${it.stackTraceToString()}" }) })
+            return
+        }
+        if (wifiPolicyGate) {
+            val result = runCatching { WifiPolicyGate.run(this) }
+            finish(if (result.isSuccess) Activity.RESULT_OK else Activity.RESULT_CANCELED,
+                Bundle().apply {
+                    putString("stream", result.fold(
+                        { "WIFI_POLICY_GATE_PASS\n$it" },
+                        { "WIFI_POLICY_GATE_FAIL ${it.stackTraceToString()}" }
+                    ))
+                })
             return
         }
         val tests = listOf(

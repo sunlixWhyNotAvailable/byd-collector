@@ -20,6 +20,10 @@ class KeepAliveSupervisor(
 ) {
     private val executor: ExecutorService = namedSingleThreadExecutor("byd-keepalive")
     private val reconcileState = KeepAliveReconcileState(ALIVE_TTL_MS)
+    private val wifiPolicy = WifiPolicyRecovery(
+        context.applicationContext.getSharedPreferences(CollectorSettings.PREFS_NAME, Context.MODE_PRIVATE),
+        shellFactory
+    ) { category, message, detail -> store.recordEvent(category, message, detail) }
 
     fun reconcile(config: KeepAliveConfig, forceStatusCheck: Boolean = false) {
         executor.execute {
@@ -63,7 +67,26 @@ class KeepAliveSupervisor(
 
     private fun runReconcileSerialized(config: KeepAliveConfig, forceStatusCheck: Boolean): Boolean {
         return synchronized(PROCESS_RECONCILE_LOCK) {
-            runReconcile(config, forceStatusCheck)
+            try {
+                runReconcile(config, forceStatusCheck)
+            } finally {
+                // Independent of daemon liveness/cache and success; policy failure cannot block recovery.
+                try {
+                    wifiPolicy.reconcile()
+                    val settings = CollectorSettings(context.applicationContext, store)
+                    if (settings.hasPendingWifiPolicy()) {
+                        com.bydcollector.collector.system.CollectorAutoStart.scheduleWatchdog(context, settings, store)
+                    }
+                } catch (error: Exception) {
+                    android.util.Log.e("KeepAliveSupervisor", "Wi-Fi policy reconciliation failed", error)
+                    try {
+                        store.recordEvent("wifi_policy_reconcile_failed", "Wi-Fi policy reconciliation failed", error.stackTraceToString())
+                    } catch (loggingError: Exception) {
+                        error.addSuppressed(loggingError)
+                        android.util.Log.e("KeepAliveSupervisor", "Could not persist Wi-Fi policy failure", error)
+                    }
+                }
+            }
         }
     }
 

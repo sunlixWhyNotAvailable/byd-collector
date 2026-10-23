@@ -47,6 +47,11 @@ object CollectorAutoStart {
         val demand = prepareRuntimeDemand(settings)
         if (!demand.any) {
             (appContext.applicationContext as BydCollectorApplication).startDashboardMetrics()
+            if (settings.hasPendingWifiPolicy()) {
+                CollectorServiceController.reconcileKeepAlive(appContext)
+                scheduleWatchdog(appContext, settings, store)
+                return
+            }
             store.recordEvent("boot_auto_start_skipped", "No runtime channel is eligible for recovery", action)
             cancelRetry(appContext)
             cancelWatchdog(appContext)
@@ -202,6 +207,10 @@ object CollectorAutoStart {
         val demand = prepareRuntimeDemand(settings)
         if (!demand.any) {
             (appContext.applicationContext as BydCollectorApplication).startDashboardMetrics()
+            if (settings.hasPendingWifiPolicy()) {
+                CollectorServiceController.reconcileKeepAlive(appContext)
+                scheduleWatchdog(appContext, settings, store)
+            }
             return
         }
         if (CollectorService.isRunning()) {
@@ -340,7 +349,7 @@ object CollectorAutoStart {
     }
 
     private fun shouldRunService(settings: CollectorSettings): Boolean {
-        return settings.runtimeDemand().any
+        return settings.runtimeDemand().any || settings.hasPendingWifiPolicy()
     }
 
     private fun attemptStart(

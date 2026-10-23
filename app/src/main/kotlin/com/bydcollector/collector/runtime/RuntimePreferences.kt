@@ -156,22 +156,35 @@ class RuntimePreferences private constructor(private val context: Context) : Sha
                     if (CollectorSettings.KEY_MQTT_PASSWORD !in removals) removals.add(CollectorSettings.KEY_MQTT_PASSWORD)
                 }
 
-                val editor = preferences.edit()
-                removals.forEach(editor::remove)
-                changes.keySet().forEach { key ->
-                    @Suppress("DEPRECATION") val value = changes.get(key)
-                    when (value) {
-                        is String -> editor.putString(key, value)
-                        is Boolean -> editor.putBoolean(key, value)
-                        is Int -> editor.putInt(key, value)
-                        is Long -> editor.putLong(key, value)
-                        is Float -> editor.putFloat(key, value)
-                        is ArrayList<*> -> editor.putStringSet(key, value.filterIsInstance<String>().toSet())
-                        else -> error("Unsupported setting type")
+                val committed = synchronized(com.bydcollector.collector.keepalive.WifiPolicyState.LOCK) {
+                    val editor = preferences.edit()
+                    removals.forEach(editor::remove)
+                    changes.keySet().forEach { key ->
+                        @Suppress("DEPRECATION") val value = changes.get(key)
+                        when (value) {
+                            is String -> editor.putString(key, value)
+                            is Boolean -> editor.putBoolean(key, value)
+                            is Int -> editor.putInt(key, value)
+                            is Long -> editor.putLong(key, value)
+                            is Float -> editor.putFloat(key, value)
+                            is ArrayList<*> -> editor.putStringSet(key, value.filterIsInstance<String>().toSet())
+                            else -> error("Unsupported setting type")
+                        }
                     }
+                    if (!credentialsStored) editor.putBoolean(CollectorSettings.KEY_MQTT_ENABLED, false)
+                    val wifiKey = CollectorSettings.KEY_KEEP_WIFI
+                    val mobileKey = CollectorSettings.KEY_KEEP_MOBILE_DATA
+                    if (wifiKey in guardedKeys || mobileKey in guardedKeys) {
+                        fun nextEnabled(key: String): Boolean = when {
+                            changes.containsKey(key) -> changes.getBoolean(key)
+                            key in removals -> false
+                            else -> preferences.getBoolean(key, false)
+                        }
+                        com.bydcollector.collector.keepalive.WifiPolicyState.stageToggle(
+                            preferences, editor, nextEnabled(wifiKey) || nextEnabled(mobileKey))
+                    }
+                    editor.commit()
                 }
-                if (!credentialsStored) editor.putBoolean(CollectorSettings.KEY_MQTT_ENABLED, false)
-                val committed = editor.commit()
                 Bundle().apply {
                     putBoolean("committed", committed)
                     putBoolean("credentialsStored", credentialsStored)

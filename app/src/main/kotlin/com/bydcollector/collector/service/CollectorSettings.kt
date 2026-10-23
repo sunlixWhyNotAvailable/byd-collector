@@ -1266,11 +1266,19 @@ class CollectorSettings(
 
     fun isKeepMobileDataEnabled(): Boolean = prefs.getBoolean(KEY_KEEP_MOBILE_DATA, false)
 
+    fun hasPendingWifiPolicy(): Boolean = !isUserShutdownRequested() &&
+        com.bydcollector.collector.keepalive.WifiPolicyState(prefs)
+            .needsWork(isKeepWifiEnabled() || isKeepMobileDataEnabled())
+
     fun setConnectivityRecoveryEnabled(enabled: Boolean) {
-        prefs.edit()
-            .putBoolean(KEY_KEEP_WIFI, enabled)
-            .putBoolean(KEY_KEEP_MOBILE_DATA, enabled)
-            .apply()
+        synchronized(com.bydcollector.collector.keepalive.WifiPolicyState.LOCK) {
+            val edit = prefs.edit().putBoolean(KEY_KEEP_WIFI, enabled).putBoolean(KEY_KEEP_MOBILE_DATA, enabled)
+            // The UI cache forwards the edit; only the owner may create the policy generation.
+            if (!com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) {
+                com.bydcollector.collector.keepalive.WifiPolicyState.stageToggle(prefs, edit, enabled)
+            }
+            check(edit.commit()) { "Connectivity recovery setting was not persisted" }
+        }
         recordEvent(
             category = if (enabled) "connectivity_recovery_enabled" else "connectivity_recovery_disabled",
             message = "Wi-Fi and cellular recovery ${if (enabled) "enabled" else "disabled"}"
