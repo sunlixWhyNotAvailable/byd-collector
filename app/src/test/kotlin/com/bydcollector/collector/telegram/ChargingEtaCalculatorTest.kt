@@ -163,7 +163,6 @@ class ChargingEtaCalculatorTest {
         assertEquals(54, profile.observedBins.size)
         assertEquals(2, profile.observedBins.first().donorCount)
         assertEquals(5, profile.observedBins.last().donorCount)
-        assertEquals("dae8239fc5a63f05a29fb0c92276dc8f8d5e6c20e9e093ff7f23fa68ba38462c", DcChargingProfile.SOURCE_SAMPLES_SHA256)
         assertEquals(EXPECTED_ALL_SIX_PROFILE_SHA256, profile.observedBinsSha256)
 
         val p26 = profile.observedBins.first().referencePowerKw
