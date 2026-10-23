@@ -13,6 +13,27 @@ BYD Collector shows vehicle status, records telemetry and trips, and can send da
 - **Help:** [Troubleshooting](#troubleshooting) · [Report a problem](#report-a-problem) · [Privacy](PRIVACY.md).
 - **Donate:** [Support the project by card number](#support-the-project).
 
+## Contents
+
+- [Installation and first start](#installation-and-first-start)
+- [Everyday use](#everyday-use)
+  - [Main collection and vehicle status](#main-collection-and-vehicle-status)
+  - [Secondary collection — All data](#secondary-collection--all-data)
+  - [Trips and routes](#trips-and-routes)
+    - [Route details and current trip](#route-details-and-current-trip)
+- [Optional integrations](#optional-integrations)
+  - [MQTT, Home Assistant, and InfluxDB](#mqtt-home-assistant-and-influxdb)
+  - [Telegram notifications](#telegram-notifications)
+    - [Example: trip summary template](#example-trip-summary-template)
+- [Storage and archives](#storage-and-archives)
+  - [Archive confirmation and progress](#archive-confirmation-and-progress)
+- [Background operation and updates](#background-operation-and-updates)
+  - [Update hint widget](#update-hint-widget)
+- [Troubleshooting](#troubleshooting)
+  - [Report a problem](#report-a-problem)
+- [Support the project](#support-the-project)
+- [License](#license)
+
 ## Installation and first start
 
 You need Android 8.0 or newer, a compatible DiLink system, permission to install APK files, and local ADB access. ADB is the Android connection the app uses to read vehicle data.
