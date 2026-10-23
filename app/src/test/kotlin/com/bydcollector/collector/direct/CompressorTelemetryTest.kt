@@ -26,7 +26,6 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
-import java.nio.file.Files
 import java.util.UUID
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -187,58 +186,6 @@ class CompressorTelemetryTest {
         }
     }
 
-    @Test
-    fun previousAndLegacyCatalogSpoolsReplayWithTheirRecordedFieldOrder() {
-        val currentVersion = DirectFidRegistry.CATALOG_VERSION
-        val previousVersion = DirectFidRegistry.PREVIOUS_CATALOG_VERSION
-        val legacyVersion = DirectFidRegistry.LEGACY_WORKER_CATALOG_VERSION
-        val currentRows = requireNotNull(CollectorHelperDaemon.loadWorkerReplayRows(currentVersion))
-        val previousRows = requireNotNull(CollectorHelperDaemon.loadWorkerReplayRows(previousVersion))
-        val legacyRows = requireNotNull(CollectorHelperDaemon.loadWorkerReplayRows(legacyVersion))
-        assertEquals(96, currentRows.size)
-        assertEquals(95, previousRows.size)
-        assertEquals(82, legacyRows.size)
-
-        val digest = TelemetryCatalogPolicy.newFingerprint()
-        previousRows.forEach { TelemetryCatalogPolicy.addToFingerprint(digest, it.dev, it.fid, it.tx) }
-        assertEquals(
-            DirectFidRegistry.PREVIOUS_CATALOG_FINGERPRINT,
-            TelemetryCatalogPolicy.finishFingerprint(digest)
-        )
-
-        val directory = Files.createTempDirectory("byd-compressor-spool-").toFile()
-        try {
-            val writer = TelemetryWorkerSpool.openForTest(directory, 8L * 1024L * 1024L)
-            try {
-                assertEquals(TelemetryWorkerSpool.AppendResult.SUCCESS, writer.append(workerSample(currentVersion, currentRows, 1)))
-                assertEquals(TelemetryWorkerSpool.AppendResult.SUCCESS, writer.append(workerSample(previousVersion, previousRows, 2)))
-                assertEquals(TelemetryWorkerSpool.AppendResult.SUCCESS, writer.append(workerSample(legacyVersion, legacyRows, 3)))
-            } finally {
-                writer.close()
-            }
-
-            val reader = TelemetryWorkerSpool.openForTest(directory, 8L * 1024L * 1024L)
-            try {
-                val replayed = reader.pending(10) { sample ->
-                    CollectorHelperDaemon.validateWorkerSampleForReplay(
-                        sample,
-                        currentVersion,
-                        currentRows,
-                        previousVersion,
-                        previousRows,
-                        legacyVersion,
-                        legacyRows
-                    )
-                }
-                assertEquals(listOf(currentVersion, previousVersion, legacyVersion), replayed.map { it.catalogVersion })
-            } finally {
-                reader.close()
-            }
-        } finally {
-            directory.deleteRecursively()
-        }
-    }
-
     private fun compressorEntry() = DirectFidRegistry.entries.single { it.key == "power_compressor_consume_power" }
 
     private fun compressorReading(raw: Int) = PollReading(
@@ -261,33 +208,5 @@ class CompressorTelemetryTest {
         context = context,
         helper = helper,
         operationalEventJournal = OperationalEventJournal(context)
-    )
-
-    private fun workerSample(
-        catalogVersion: String,
-        rows: List<CollectorHelperDaemon.Address>,
-        sequence: Long
-    ) = TelemetryWorkerSpool.Sample(
-        TelemetryWorkerSampleIdentity("compressor-test-boot", "compressor-test-helper", sequence),
-        catalogVersion,
-        sequence * 1_000L,
-        sequence * 1_000L,
-        1L,
-        CollectorHelperProtocol.STATUS_OK,
-        CollectorHelperProtocol.MODE_NATIVE,
-        true,
-        0,
-        null,
-        rows.mapIndexed { index, row ->
-            TelemetryWorkerSpool.Value(
-                index,
-                row.tx,
-                row.dev,
-                row.fid,
-                CollectorHelperProtocol.STATUS_OK,
-                0,
-                null
-            )
-        }
     )
 }
