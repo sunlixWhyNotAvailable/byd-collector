@@ -12,7 +12,7 @@ import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicLong
 
 private const val REALTIME_BATCH_LIMIT = 300
-private const val CATCH_UP_BATCH_LIMIT = 2_000
+private const val CATCH_UP_BATCH_LIMIT = 5_000
 private const val CATCH_UP_THRESHOLD = 5_000
 
 //exports normalized vehicle_state_history to influx as the durable analytics channel
@@ -25,6 +25,7 @@ class InfluxExportCoordinator(
 ) {
     private var currentBatchSize: Int? = null
     private var currentBatchSizeReason: String? = null
+    private var serverBatchLimit = CATCH_UP_BATCH_LIMIT
     private val cancellationGeneration = AtomicLong(0L)
     @Volatile private var sessionConnection: InfluxConfig? = null
     private var lastDiagnosticGate: String? = null
@@ -78,6 +79,7 @@ class InfluxExportCoordinator(
         sqliteLockRetries = 0
         sessionConnection = null
         currentRoute = null
+        serverBatchLimit = CATCH_UP_BATCH_LIMIT
         diagnostic("influx_session_ended", mapOf("frozen" to "false", "actual_route" to "none"))
     }
 
@@ -218,7 +220,13 @@ class InfluxExportCoordinator(
             terminalFailure = true
             // File evidence precedes best-effort SQL: a broken database cannot hide termination.
             diagnostic("influx_terminal_failure", mapOf("category" to result.category))
-            runCatching { recordFailure("error", result.message) }
+            runCatching {
+                val persisted = store.influxExportState()
+                // A handled failure already stored its queue snapshot and original error.
+                if (persisted.status != "error" || persisted.lastError != result.message) {
+                    recordFailure("error", result.message)
+                }
+            }
         }
         return result
     }
@@ -270,19 +278,30 @@ class InfluxExportCoordinator(
         val sizing = influxBatchSizing(pendingBefore, currentBatchSize, currentBatchSizeReason)
         currentBatchSize = sizing.limit
         currentBatchSizeReason = sizing.reason
-        val batchLimit = sizing.limit
-        val rows = timedDatabasePhase("select_batch") { store.pendingInfluxRows(fieldKeys, batchLimit) }
+        val batchLimit = minOf(sizing.limit, serverBatchLimit)
+        val selectedRows = timedDatabasePhase("select_batch") { store.pendingInfluxRows(fieldKeys, batchLimit) }
         if (pass.cancelled()) return InfluxActionResult.ok("influx work superseded")
         val selectionReason = when {
-            rows.isEmpty() -> "empty_reset"
-            rows.size < batchLimit -> "short_batch_reset"
+            selectedRows.isEmpty() -> "empty_reset"
+            selectedRows.size < batchLimit -> "short_batch_reset"
             else -> sizing.reason
         }
-        if (rows.size < batchLimit) {
+        if (selectedRows.size < batchLimit) {
             currentBatchSize = REALTIME_BATCH_LIMIT
             currentBatchSizeReason = selectionReason
         }
-        diagnosticBatchSizing(batchLimit, rows.size, selectionReason)
+        diagnosticBatchSizing(batchLimit, selectedRows.size, selectionReason)
+        val payload = InfluxLineProtocol.boundedPayload(selectedRows, config)
+        if (payload.oversizedPointBytes != null) {
+            val failure = InfluxActionResult.fail(
+                "influx_point_too_large",
+                "history_id=${selectedRows.first().id}: UTF-8 line is ${payload.oversizedPointBytes} bytes; " +
+                    "request limit is $INFLUX_MAX_PAYLOAD_BYTES bytes; point retained"
+            )
+            recordFailure("error", failure.message, pendingBefore)
+            return failure
+        }
+        val rows = selectedRows.take(payload.lines.size)
         if (rows.isEmpty()) {
             diagnosticGate("no_work")
             store.updateInfluxExportState(
@@ -314,7 +333,7 @@ class InfluxExportCoordinator(
             val exportedAt = clock.nowIso()
             var exportFailure: Throwable? = null
             val batch = try {
-                exportRows(config, rows, exportedAt, pass = pass)
+                exportRows(config, rows, exportedAt, pass = pass, preparedLines = payload.lines)
             } catch (error: Throwable) {
                 exportFailure = error
                 throw error
@@ -369,7 +388,7 @@ class InfluxExportCoordinator(
                 )
             }
 
-            if (batch.poisonRows == 0 && batch.exportedRows == rows.size) {
+            if (batch.poisonRows == 0 && batch.exportedRows == rows.size && rows.size == selectedRows.size) {
                 val nextLimit = influxBatchSizeAfterCleanAck(
                     pendingAfter,
                     currentBatchSize,
@@ -486,11 +505,12 @@ class InfluxExportCoordinator(
         rows: List<InfluxPendingHistoryRow>,
         exportedAt: String,
         pinnedRoute: HaEndpointProfile? = null,
-        pass: ExportPass
+        pass: ExportPass,
+        preparedLines: List<String>? = null
     ): BatchExportResult {
         if (rows.isEmpty()) return BatchExportResult()
         val route = pinnedRoute ?: currentRoute ?: HaEndpointProfile.PRIMARY
-        val lines = rows.map { InfluxLineProtocol.toLine(it, config) }
+        val lines = preparedLines ?: rows.map { InfluxLineProtocol.toLine(it, config) }
         val writeAttempt = if (pinnedRoute == null) {
             writeWithFailover(config, route, lines, pass)
         } else {
@@ -500,6 +520,21 @@ class InfluxExportCoordinator(
         }
         val write = writeAttempt.result
         val actualRoute = writeAttempt.route
+        if (write.httpStatus == 413) {
+            val previousLimit = serverBatchLimit
+            serverBatchLimit = influxBatchLimitAfterOversize(serverBatchLimit, rows.size)
+            diagnostic(
+                "influx_payload_limit_reduced",
+                mapOf(
+                    "request_id" to writeAttempt.requestId,
+                    "http_status" to "413",
+                    "rejected_rows" to rows.size.toString(),
+                    "previous_limit" to previousLimit.toString(),
+                    "next_limit" to serverBatchLimit.toString(),
+                    "single_point_rejected" to (rows.size == 1).toString()
+                )
+            )
+        }
         if (write.ok) {
             currentRoute = actualRoute
             diagnostic(
@@ -656,6 +691,8 @@ class InfluxExportCoordinator(
                 "host" to safeInfluxDiagnosticHost(routeConfig.host),
                 "port" to routeConfig.port.toString(),
                 "batch_rows" to lines.size.toString(),
+                "body_bytes" to (lines.sumOf { it.toByteArray(Charsets.UTF_8).size.toLong() } +
+                    (lines.size - 1).coerceAtLeast(0)).toString(),
                 "frozen" to (sessionConnection != null).toString()
             )
         )
@@ -771,7 +808,9 @@ class InfluxExportCoordinator(
 
     private fun isTransientFailure(result: InfluxActionResult): Boolean {
         val detail = "${result.category} ${result.message}".lowercase(Locale.US)
-        return result.httpStatus?.let { it in 500..599 } == true ||
+        return result.failureKind == InfluxFailureKind.TRANSPORT ||
+            result.httpStatus == 429 ||
+            result.httpStatus?.let { it in 500..599 } == true ||
             detail.contains("network") ||
             detail.contains("timeout") ||
             detail.contains("timed out") ||
@@ -961,11 +1000,12 @@ internal fun influxBatchSizeAfterTransientFailure(
     if (desired == REALTIME_BATCH_LIMIT) return REALTIME_BATCH_LIMIT
     val current = (currentBatchSize ?: if (pending.complete) desired else REALTIME_BATCH_LIMIT)
         .coerceIn(REALTIME_BATCH_LIMIT, desired)
-    return when {
-        current >= CATCH_UP_BATCH_LIMIT -> 1_000
-        current >= 1_000 -> 500
-        else -> REALTIME_BATCH_LIMIT
-    }.coerceIn(REALTIME_BATCH_LIMIT, desired)
+    return (current / 2).coerceIn(REALTIME_BATCH_LIMIT, desired)
+}
+
+internal fun influxBatchLimitAfterOversize(currentLimit: Int, rejectedRows: Int): Int {
+    require(currentLimit > 0 && rejectedRows > 0)
+    return minOf(currentLimit, maxOf(1, rejectedRows / 2))
 }
 
 internal fun influxModeFor(pending: InfluxPendingSummary): String = when {

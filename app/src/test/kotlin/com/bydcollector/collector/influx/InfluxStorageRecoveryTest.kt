@@ -17,12 +17,55 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import java.time.Instant
+import java.net.ServerSocket
+import java.net.SocketTimeoutException
 import java.util.UUID
 import kotlin.test.*
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
 class InfluxStorageRecoveryTest {
+    @Test fun oversizedPointRetainsCursorAndQueueAcrossReopenWithoutHttp() {
+        val context = RuntimeEnvironment.getApplication()
+        val databaseName = "influx_oversize_${UUID.randomUUID()}.db"
+        val field = NormalizedFieldCatalog.chargingType
+        val fields = setOf(field.fieldKey)
+        var store = TelemetryStore(context, TelemetryDatabaseHelper(context, databaseName),
+            operationalEventJournal = OperationalEventJournal(context))
+        try {
+            listOf("界".repeat(250_000), "AC").forEachIndexed { index, text ->
+                store.applyNormalizedObservations(listOf(NormalizedObservation(
+                    field, NormalizedValue(NormalizedValueType.TEXT, text = text), NormalizedQuality.OK,
+                    null, field.sourceKeys.firstOrNull(), "2026-10-25T00:00:0${index}Z"
+                )))
+            }
+            val before = store.pendingInfluxRows(fields, 10).map { it.id }
+            assertEquals(2L, store.refreshInfluxPendingSummary(fields).rows)
+            // A real listening socket observes access; it never fabricates an HTTP result.
+            ServerSocket(0).use { listener ->
+                val config = InfluxConfig(true, "127.0.0.1", listener.localPort, "test", null, null, "state", setOf("battery"))
+                val coordinator = InfluxExportCoordinator(store, HttpInfluxClient(), { config })
+                val result = coordinator.startExport()
+                assertEquals("influx_point_too_large", result.category)
+                assertFalse(result.retryable)
+                assertNull(coordinator.retryDelayMs())
+                assertEquals(result.message, store.influxExportState().lastError)
+                assertEquals(2L, store.influxExportState().pendingRows)
+                listener.soTimeout = 100
+                assertFailsWith<SocketTimeoutException> { listener.accept().use { error("Unexpected HTTP connection") } }
+            }
+            store.close()
+            store = TelemetryStore(context, TelemetryDatabaseHelper(context, databaseName),
+                operationalEventJournal = OperationalEventJournal(context))
+            assertEquals(before, store.pendingInfluxRows(fields, 10).map { it.id })
+            assertEquals(0L, store.influxExportState().exportedRowsTotal)
+            assertEquals("error", store.influxExportState().status)
+        } finally {
+            store.close()
+            context.deleteDatabase(databaseName)
+        }
+    }
+
     @Test fun normalizedHistoryCursorAndCappedPagingSurviveReopen() {
         val context = RuntimeEnvironment.getApplication()
         val databaseName = "influx_batch_policy_${UUID.randomUUID()}.db"

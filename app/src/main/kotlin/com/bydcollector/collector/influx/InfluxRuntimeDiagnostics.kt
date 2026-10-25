@@ -22,6 +22,7 @@ class InfluxRuntimeDiagnosticsState(
         val port: String,
         val profile: String,
         val batchRows: String?,
+        val bodyBytes: Long?,
         val frozen: String?,
         val startedElapsedMs: Long,
         val runtimeId: String?,
@@ -48,6 +49,7 @@ class InfluxRuntimeDiagnosticsState(
     private var successfulHttpRequests = 0L
     private var confirmedRows = 0L
     private var requestDurationTotalMs = 0L
+    private var requestBodyBytesTotal = 0L
     private var summaryRoute: String? = null
     private var summaryRuntimeId: String? = null
     private var problemStartedElapsedMs: Long? = null
@@ -135,6 +137,7 @@ class InfluxRuntimeDiagnosticsState(
                     port = details["port"].orEmpty(),
                     profile = details["profile"].orEmpty(),
                     batchRows = details["batch_rows"],
+                    bodyBytes = details["body_bytes"]?.toLongOrNull(),
                     frozen = details["frozen"],
                     startedElapsedMs = now,
                     runtimeId = runtimeId,
@@ -171,6 +174,7 @@ class InfluxRuntimeDiagnosticsState(
                     lastDurableGateKey = null
                     beginSummaryWindow(now)
                     successfulHttpRequests += 1
+                    requestBodyBytesTotal += requestContext?.bodyBytes ?: 0L
                     requestDurationTotalMs += details["duration_ms"]?.toLongOrNull()?.coerceAtLeast(0L) ?: 0L
                     summaryRoute = details["profile"] ?: requestContext?.profile ?: summaryRoute
                     summaryRuntimeId = eventRuntimeId ?: requestContext?.runtimeId ?: summaryRuntimeId
@@ -351,6 +355,7 @@ class InfluxRuntimeDiagnosticsState(
                     put("successful_http_requests", successfulHttpRequests.toString())
                     put("confirmed_rows", confirmedRows.toString())
                     put("request_duration_total_ms", requestDurationTotalMs.toString())
+                    put("request_body_bytes_total", requestBodyBytesTotal.toString())
                     put("request_duration_average_ms", if (successfulHttpRequests == 0L) "0" else (requestDurationTotalMs / successfulHttpRequests).toString())
                     summaryRoute?.let { put("route", it.lowercase()) }
                     summaryRuntimeId?.let { put("success_runtime_id", it) }
@@ -370,6 +375,7 @@ class InfluxRuntimeDiagnosticsState(
         successfulHttpRequests = 0L
         confirmedRows = 0L
         requestDurationTotalMs = 0L
+        requestBodyBytesTotal = 0L
         summaryRoute = null
         summaryRuntimeId = null
         return event
@@ -389,6 +395,7 @@ class InfluxRuntimeDiagnosticsState(
                 put("port", context.port)
                 put("profile", context.profile)
                 context.batchRows?.let { put("batch_rows", it) }
+                context.bodyBytes?.let { put("body_bytes", it.toString()) }
                 context.frozen?.let { put("frozen", it) }
                 put("request_age_ms", (now - context.startedElapsedMs).coerceAtLeast(0L).toString())
             }

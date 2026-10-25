@@ -35,7 +35,7 @@ data class InfluxActionResult(
     val retryable: Boolean get() = !ok && failureKind != InfluxFailureKind.AUTHENTICATION &&
         failureKind != InfluxFailureKind.PROTOCOL && failureKind != InfluxFailureKind.DATA &&
         httpStatus !in setOf(400, 401, 403, 422) &&
-        category !in setOf("influx_disabled", "influx_endpoint_invalid", "influx_database_missing", "influx_export_exception")
+        category !in setOf("influx_disabled", "influx_endpoint_invalid", "influx_database_missing", "influx_export_exception", "influx_point_too_large")
 
     companion object {
         fun ok(message: String = "ok") = InfluxActionResult(true, "ok", message)

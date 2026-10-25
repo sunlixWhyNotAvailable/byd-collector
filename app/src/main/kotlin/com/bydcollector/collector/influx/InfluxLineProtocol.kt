@@ -2,7 +2,36 @@ package com.bydcollector.collector.influx
 
 import java.time.OffsetDateTime
 
+internal const val INFLUX_MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
+
+internal data class InfluxPayload(
+    val lines: List<String>,
+    val bytes: Int,
+    val oversizedPointBytes: Int? = null
+)
+
 object InfluxLineProtocol {
+    internal fun boundedPayload(
+        rows: List<InfluxPendingHistoryRow>,
+        config: InfluxConfig,
+        maxBytes: Int = INFLUX_MAX_PAYLOAD_BYTES
+    ): InfluxPayload {
+        require(maxBytes > 0)
+        val lines = mutableListOf<String>()
+        var bytes = 0
+        for (row in rows) {
+            val line = toLine(row, config)
+            val lineBytes = line.toByteArray(Charsets.UTF_8).size
+            val separatorBytes = if (lines.isEmpty()) 0 else 1
+            if (lineBytes.toLong() + separatorBytes > maxBytes.toLong() - bytes) {
+                return InfluxPayload(lines, bytes, lineBytes.takeIf { lines.isEmpty() })
+            }
+            lines += line
+            bytes += lineBytes + separatorBytes
+        }
+        return InfluxPayload(lines, bytes)
+    }
+
     fun toLine(row: InfluxPendingHistoryRow, config: InfluxConfig): String {
         require(config.validateVehicleId() == null) {
             "InfluxDB vehicle ID cannot contain carriage returns, line feeds, or NUL characters"
