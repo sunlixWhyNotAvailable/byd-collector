@@ -1,5 +1,7 @@
 package com.bydcollector.collector.mqtt
 
+import android.database.sqlite.SQLiteException
+import com.bydcollector.collector.util.diagnosticDetail
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import com.bydcollector.collector.data.normalized.StoredNormalizedState
@@ -29,13 +31,13 @@ class HaMqttMessageFactory(
         return fullResyncMessages(configProvider())
     }
 
-    fun fullResyncMessages(configOverride: HaMqttConfig): MqttMessageBuildResult {
+    fun fullResyncMessages(configOverride: HaMqttConfig, status: HaMqttStatus? = null): MqttMessageBuildResult {
         val config = configOverride
         return runCatching {
             //filters at publish time so changing categories does not require rewriting normalized storage
             val rows = HaMqttFieldFilter.publishableRows(normalizedProvider.currentState(config.enabledCategories), config)
             buildList {
-                add(onlineStatusMessage(config, rows))
+                add(status?.let { buildStatusMessage(config, it) } ?: onlineStatusMessage(config, rows))
                 addAll(categoryStateMessages(config, rows, config.enabledCategories))
             }
         }.fold(
@@ -136,9 +138,11 @@ class HaMqttMessageFactory(
     }
 
     private fun stateError(error: Throwable): MqttMessageBuildResult.Failure {
+        // The storage retry owner needs the actual SQLite type, not a generic build failure.
+        if (error is SQLiteException || error is java.util.concurrent.CancellationException) throw error
         return MqttMessageBuildResult.Failure(
             category = "mqtt_state_error",
-            message = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+            message = error.diagnosticDetail("stage=mqtt_message_build")
         )
     }
 

@@ -544,6 +544,11 @@ class DashboardUiStateStore(
                 mqttNextRetryAt = runtime.mqttNextRetryAt,
                 mqttRetryLastFailureAt = runtime.mqttRetryLastFailureAt,
                 mqttRetryLastSuccessAt = runtime.mqttRetryLastSuccessAt,
+                healthReadErrors = mergeHealthReadErrors(
+                    state.healthReadErrors,
+                    runtime.healthReadErrors,
+                    INTEGRATION_HEALTH_READ_FIELDS
+                ),
                 influxEnabled = runtime.influxEnabled,
                 influxStatus = runtime.influxStatus,
                 influxPendingRows = runtime.influxPendingRows,
@@ -709,6 +714,11 @@ internal fun mergeDashboardFreshQueueOverlay(current: DashboardState, incoming: 
             mqttNextRetryAt = current.mqttNextRetryAt,
             mqttRetryLastFailureAt = current.mqttRetryLastFailureAt,
             mqttRetryLastSuccessAt = current.mqttRetryLastSuccessAt,
+            healthReadErrors = mergeHealthReadErrors(
+                merged.healthReadErrors,
+                current.healthReadErrors,
+                INTEGRATION_HEALTH_READ_FIELDS
+            ),
             influxStatus = current.influxStatus,
             influxNextRetryAt = current.influxNextRetryAt,
             influxLastSuccessAt = current.influxLastSuccessAt,

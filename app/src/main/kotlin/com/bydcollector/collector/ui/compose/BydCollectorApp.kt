@@ -3596,7 +3596,12 @@ private fun StorageTab(
 ) {
     val snapshot = state?.archiveStorageSnapshot
     val entries = snapshot?.let {
-        projectArchiveStorageRows(it, state?.archiveStorageItemStates.orEmpty(), state?.archiveStorageScanPending == true)
+        projectArchiveStorageRows(
+            it,
+            state?.archiveStorageItemStates.orEmpty(),
+            state?.archiveStorageScanPending == true,
+            state?.archiveStorageItemStatesAvailable == true
+        )
     }.orEmpty()
     val listKey = entries.map { it.key }.sorted()
     var selectedIds by remember(actionUiState.archiveShareHandoffGeneration) {
@@ -3749,7 +3754,13 @@ private fun StorageTab(
                         color = LocalBydPalette.current.red, fontSize = 14.sp, lineHeight = 19.sp
                     )
                 }
-                if (entries.isEmpty() && state?.archiveStorageScanError == null) {
+                state?.archiveStorageItemStateError?.let { error ->
+                    Text(
+                        (if (strings.step == "Крок") "Не вдалося прочитати стан архівів: " else "Could not read archive state: ") + error,
+                        color = LocalBydPalette.current.red, fontSize = 14.sp, lineHeight = 19.sp
+                    )
+                }
+                if (entries.isEmpty() && state?.archiveStorageScanError == null && state?.archiveStorageItemStateError == null) {
                     Text(
                         if (state?.archiveStorageScanPending == true) strings.archiveStorageScanning else strings.archiveStorageEmpty,
                         color = LocalBydPalette.current.muted,

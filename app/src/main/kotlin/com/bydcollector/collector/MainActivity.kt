@@ -1956,7 +1956,8 @@ class MainActivity : ComponentActivity() {
                     failArchiveShare(requestedIds, lease, "archive_job_started")
                     return@execute
                 }
-                val files = runCatching {
+                val filesResult = runCatching {
+                    settings.archiveStorageItems()
                     ArchiveStorageManager(
                         archiveRoot = File(filesDir, "db_archive"),
                         mainDatabaseFile = currentStore().databaseFile(),
@@ -1964,7 +1965,20 @@ class MainActivity : ComponentActivity() {
                         debugDatabaseFile = getDatabasePath(DirectDebugDatabaseHelper.DATABASE_NAME),
                         tripsDatabaseFile = getDatabasePath(com.bydcollector.collector.data.trips.TripDatabaseHelper.DATABASE_NAME)
                     ).resolveShareZipFiles(requestedIds)
-                }.getOrNull()
+                }.onFailure { error ->
+                    if (error is com.bydcollector.collector.maintenance.ArchiveStorageItemsException) {
+                        recordOperationalEvent(
+                            "archive_storage_share_error",
+                            "Archive sharing could not read item metadata",
+                            error.diagnosticDetail("stage=archive_storage_share_read")
+                        )
+                    }
+                }
+                if (filesResult.exceptionOrNull() is com.bydcollector.collector.maintenance.ArchiveStorageItemsException) {
+                    failArchiveShare(requestedIds, lease, "archive_item_metadata_unavailable")
+                    return@execute
+                }
+                val files = filesResult.getOrNull()
                 if (files == null) {
                     failArchiveShare(requestedIds, lease, "invalid_or_stale_selection")
                     return@execute

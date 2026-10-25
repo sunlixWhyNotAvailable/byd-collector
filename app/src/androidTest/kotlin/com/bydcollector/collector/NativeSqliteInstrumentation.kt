@@ -21,6 +21,7 @@ class NativeSqliteInstrumentation : Instrumentation() {
     private val completed = mutableListOf<String>()
     private var runtimeBoundaryFixture = false
     private var updateDownloadFixture = false
+    private var updateApkCleanupGate = false
     private var wifiPolicyGate = false
     private var gateArguments = Bundle()
 
@@ -29,6 +30,7 @@ class NativeSqliteInstrumentation : Instrumentation() {
         gateArguments = arguments ?: Bundle()
         runtimeBoundaryFixture = arguments?.getString("runtimeBoundary") == "true"
         updateDownloadFixture = arguments?.getString("updateDownloadGate") == "true"
+        updateApkCleanupGate = arguments?.getString("updateApkCleanupGate") == "true"
         wifiPolicyGate = arguments?.getString("wifiPolicyGate") == "true"
         start()
     }
@@ -55,6 +57,14 @@ class NativeSqliteInstrumentation : Instrumentation() {
             }
             finish(if (result.isSuccess) Activity.RESULT_OK else Activity.RESULT_CANCELED,
                 Bundle().apply { putString("stream", result.getOrElse { "UPDATE_DOWNLOAD_GATE_FAIL ${it.stackTraceToString()}" }) })
+            return
+        }
+        if (updateApkCleanupGate) {
+            val result = runCatching {
+                UpdateApkCleanupGate.run(targetContext, gateArguments.getString("updateApkCleanupOlderPath"))
+            }
+            finish(if (result.isSuccess) Activity.RESULT_OK else Activity.RESULT_CANCELED,
+                Bundle().apply { putString("stream", result.getOrElse { "UPDATE_APK_CLEANUP_GATE_FAIL ${it.stackTraceToString()}" }) })
             return
         }
         if (wifiPolicyGate) {

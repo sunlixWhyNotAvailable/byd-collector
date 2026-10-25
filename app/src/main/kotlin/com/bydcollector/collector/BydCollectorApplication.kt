@@ -23,6 +23,7 @@ import com.bydcollector.collector.data.energy.HistoricalBackfillFinalizationGate
 import java.util.concurrent.locks.ReentrantLock
 import com.bydcollector.collector.diagnostics.OperationalEventJournal
 import com.bydcollector.collector.diagnostics.ProcessExitDiagnostics
+import com.bydcollector.collector.diagnostics.DiagnosticShareSanitizer
 import com.bydcollector.collector.maintenance.DatabaseMaintenanceGate
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.maintenance.MaintenanceDiagnostics
@@ -86,10 +87,29 @@ class BydCollectorApplication : Application() {
         val elapsed = SystemClock.elapsedRealtime()
         val journals = if (OperationalEventJournal.isMaintenanceEvent("database_maintenance", event))
             listOf(operationalEventJournal, maintenanceEventJournal) else listOf(operationalEventJournal)
-        dispatchOperationalEvent(sharedOperationalEventExecutor) {
-            journals.forEach { journal ->
-                runCatching { journal.append(timestamp, elapsed, "database_maintenance", event, detail) }
+        fun logFailure(stage: String, error: Throwable) {
+            val originalDetail = runCatching { DiagnosticShareSanitizer().sanitizeText(detail) }
+                .getOrDefault("[original event detail withheld; sanitization failed]")
+            runCatching {
+                android.util.Log.e(
+                    "BydCollectorApplication",
+                    "Could not persist maintenance event=$event stage=$stage original_detail=$originalDetail",
+                    error
+                )
             }
+        }
+        try {
+            sharedOperationalEventExecutor.execute {
+                journals.forEach { journal ->
+                    try {
+                        journal.append(timestamp, elapsed, "database_maintenance", event, detail)
+                    } catch (error: Throwable) {
+                        logFailure("journal_append", error)
+                    }
+                }
+            }
+        } catch (error: RuntimeException) {
+            logFailure("dispatch", error)
         }
     }
     val dashboardUiStateStore by lazy { DashboardUiStateStore().apply {
@@ -163,6 +183,7 @@ class BydCollectorApplication : Application() {
             runCatching { com.bydcollector.collector.runtime.RuntimeJobsService.recover(this) }
                 .onFailure { android.util.Log.e("CollectorRuntime", "Background task recovery failed", it) }
         }
+        com.bydcollector.collector.system.CollectorAutoStart.scheduleArchiveRetry(this)
         // A Messenger bind can create only this Application. Normal runtime entry
         // points start update timing explicitly; IPC must not start checks or collection.
     }

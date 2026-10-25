@@ -13,6 +13,7 @@ import com.bydcollector.collector.data.local.TelegramDiagnosticSnapshot
 import com.bydcollector.collector.data.trips.TripRouteDiagnosticEvidence
 import com.bydcollector.collector.data.trips.TripSession
 import com.bydcollector.collector.maintenance.ArchiveStorageItemState
+import com.bydcollector.collector.maintenance.ArchiveStorageItemsRead
 import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.ArchiveShareLeaseRegistry
 import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
@@ -25,6 +26,7 @@ import com.bydcollector.collector.keepalive.KeepAliveProtocol
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.util.sharedOperationalEventExecutor
 import com.bydcollector.collector.util.dispatchOperationalEvent
+import com.bydcollector.collector.util.diagnosticDetail
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONObject
@@ -477,7 +479,7 @@ object DiagnosticLogRecorder {
         return runCatching {
             val settings = CollectorSettings(context.applicationContext)
             val job = settings.archiveStorageJobStatus()
-            val items = settings.archiveStorageItems()
+            val items = settings.archiveStorageItemsRead()
             val maintenance = settings.dbMaintenanceStatus()
             val json = buildArchiveStorageStateJson(
                 job,
@@ -486,7 +488,11 @@ object DiagnosticLogRecorder {
                 maintenance
             )
             output.writeText(json.toString() + "\n", Charsets.UTF_8)
-            "ok items=${items.size}"
+            when (items) {
+                ArchiveStorageItemsRead.Missing -> "ok items=0 state=missing"
+                is ArchiveStorageItemsRead.Valid -> "ok items=${items.items.size} state=valid"
+                is ArchiveStorageItemsRead.Corrupt -> "partial items=unavailable state=corrupt"
+            }
         }.getOrElse { error ->
             runCatching {
                 File(runDir, "archive_storage_state_status.txt").writeText(
@@ -1216,11 +1222,19 @@ private const val CLEAR_CANCELLED = 2
 
 internal fun buildArchiveStorageStateJson(
     job: ArchiveStorageJobStatus,
-    items: List<ArchiveStorageItemState>,
+    items: ArchiveStorageItemsRead,
     pendingAuditOperationId: String?,
     maintenance: DbMaintenanceRuntimeStatus
 ): JSONObject = JSONObject()
     .put("pending_audit_operation_id", pendingAuditOperationId ?: JSONObject.NULL)
+    .put("archive_items_state", when (items) {
+        ArchiveStorageItemsRead.Missing -> "missing"
+        is ArchiveStorageItemsRead.Valid -> "valid"
+        is ArchiveStorageItemsRead.Corrupt -> "corrupt"
+    })
+    .put("archive_items_available", items !is ArchiveStorageItemsRead.Corrupt)
+    .put("archive_items_error", (items as? ArchiveStorageItemsRead.Corrupt)
+        ?.error?.diagnosticDetail("stage=archive_storage_item_state_read") ?: JSONObject.NULL)
     .put("archive_job", JSONObject()
         .put("mode", job.mode?.name ?: "none")
         .put("running", job.running)
@@ -1233,8 +1247,10 @@ internal fun buildArchiveStorageStateJson(
         .put("phase", job.phase?.name ?: "none")
         .put("error", job.error ?: JSONObject.NULL)
         .put("updated_at_ms", job.updatedAtMs))
-    .put("archive_items", JSONArray().apply {
-        items.sortedBy { it.archiveId }.forEach { item ->
+    .put("archive_items", when (items) {
+        ArchiveStorageItemsRead.Missing -> JSONArray()
+        is ArchiveStorageItemsRead.Valid -> JSONArray().apply {
+            items.items.sortedBy { it.archiveId }.forEach { item ->
             put(JSONObject()
                 .put("archive_id", item.archiveId)
                 .put("operation_id", item.operationId)
@@ -1245,7 +1261,9 @@ internal fun buildArchiveStorageStateJson(
                 .put("updated_at_ms", item.updatedAtMs)
                 .put("completed_at_ms", item.completedAtMs ?: JSONObject.NULL)
                 .put("error", item.error ?: JSONObject.NULL))
+            }
         }
+        is ArchiveStorageItemsRead.Corrupt -> JSONObject.NULL
     })
     .put("database_maintenance", JSONObject()
         .put("operation", maintenance.operation?.key ?: "none")

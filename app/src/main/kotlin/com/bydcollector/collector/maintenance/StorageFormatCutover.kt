@@ -8,6 +8,7 @@ import com.bydcollector.collector.data.debug.DirectDebugDatabaseResolver
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.service.TelegramEventState
+import com.bydcollector.collector.util.diagnosticDetail
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -158,7 +159,19 @@ internal class StorageFormatCutoverCoordinator(
                 application?.recordMaintenanceEvent("legacy_archive_end", "$detail ok=$ok")
             }
         } catch (error: Throwable) {
-            application?.recordMaintenanceEvent("legacy_archive_error", "$detail error=${error::class.java.simpleName}: ${error.message}")
+            val errorDetail = error.diagnosticDetail("stage=legacy_archive_cutover family=$family")
+            runCatching {
+                application?.recordMaintenanceEvent("legacy_archive_error", "$detail\n$errorDetail")
+            }.onFailure { loggingError ->
+                if (loggingError !== error) error.addSuppressed(loggingError)
+                runCatching {
+                    android.util.Log.e(
+                        "StorageFormatCutover",
+                        "Could not persist legacy archive failure; original_detail=$errorDetail",
+                        loggingError
+                    )
+                }
+            }
             throw error
         }
     }
@@ -335,11 +348,37 @@ internal class StorageFormatCutoverCoordinator(
                 !quickCheck(activeDatabaseFile)
             ) return false
             if (family == MAIN_FAMILY && journal.manual && journal.pendingEnergyCount > 0) {
-                if (runCatching {
-                        open(activeDatabaseFile, readOnly = false).use { target ->
-                            DeferredEnergyArchive.restore(archivedDatabase, target, journal.pendingEnergyCount)
+                val restore = runCatching {
+                    open(activeDatabaseFile, readOnly = false).use { target ->
+                        DeferredEnergyArchive.restore(archivedDatabase, target, journal.pendingEnergyCount)
+                    }
+                }
+                restore.exceptionOrNull()?.let { error ->
+                    val detail = error.diagnosticDetail("stage=interrupted_cutover_energy_restore family=$family")
+                    val application = appContext as? com.bydcollector.collector.BydCollectorApplication
+                    if (application == null) {
+                        runCatching {
+                            android.util.Log.e("StorageFormatCutover", "No file journal for energy restore failure: $detail")
                         }
-                    }.isFailure) return false
+                        return false
+                    }
+                    runCatching {
+                        application.recordMaintenanceEvent(
+                            "storage_cutover_energy_restore_error",
+                            detail
+                        )
+                    }.onFailure { loggingError ->
+                        if (loggingError !== error) error.addSuppressed(loggingError)
+                        runCatching {
+                            android.util.Log.e(
+                                "StorageFormatCutover",
+                                "Could not persist energy restore failure; original_detail=$detail",
+                                loggingError
+                            )
+                        }
+                    }
+                    return false
+                }
             }
             if (family == MAIN_FAMILY && journal.manual && journal.pendingEnergyCount == -1L) {
                 val status = settings.dbMaintenanceStatus()

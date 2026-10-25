@@ -29,8 +29,15 @@ class UpdateApkVerifier(private val context: Context) {
         if (archiveDigests.isEmpty() || archiveDigests != installedDigests) {
             return UpdateApkValidation.fail("APK signing certificate mismatch")
         }
-        return UpdateApkValidation.ok(sha256)
+        return UpdateApkValidation.ok(sha256, identity(archive, archiveDigests))
     }
+
+    internal fun installedIdentity(): UpdateApkIdentity? = installedInfo()?.let { info ->
+        identity(info, certificateDigests(info))
+    }
+
+    internal fun archiveIdentity(file: File): UpdateApkIdentity? =
+        if (file.isFile) archiveInfo(file)?.let { info -> identity(info, certificateDigests(info)) } else null
 
     internal fun sha256(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
@@ -92,15 +99,26 @@ class UpdateApkVerifier(private val context: Context) {
         }.toSet()
     }
 
+    private fun identity(info: PackageInfo, signerDigests: Set<String>) =
+        UpdateApkIdentity(info.packageName, info.longVersion(), signerDigests)
+
 }
+
+data class UpdateApkIdentity(
+    val packageName: String,
+    val versionCode: Long,
+    val signerDigests: Set<String>
+)
 
 data class UpdateApkValidation(
     val ok: Boolean,
     val message: String,
-    val sha256: String? = null
+    val sha256: String? = null,
+    val identity: UpdateApkIdentity? = null
 ) {
     companion object {
-        fun ok(sha256: String): UpdateApkValidation = UpdateApkValidation(true, "APK verified", sha256)
+        fun ok(sha256: String, identity: UpdateApkIdentity): UpdateApkValidation =
+            UpdateApkValidation(true, "APK verified", sha256, identity)
         fun fail(message: String): UpdateApkValidation = UpdateApkValidation(false, message)
     }
 }

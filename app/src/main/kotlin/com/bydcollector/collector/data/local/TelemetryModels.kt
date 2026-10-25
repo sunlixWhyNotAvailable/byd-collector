@@ -84,8 +84,22 @@ data class HealthSnapshot(
     val latestSoc: String?,
     val latestSpeed: String?,
     val latestCharging: String?,
-    val recentEvents: List<CollectorEvent>
+    val recentEvents: List<CollectorEvent>,
+    val recentEventsAvailability: HealthReadAvailability = HealthReadAvailability.NOT_REQUESTED,
+    val healthReadErrors: List<HealthReadError> = emptyList()
 )
+
+enum class HealthReadAvailability {
+    NOT_REQUESTED,
+    AVAILABLE,
+    ERROR
+}
+
+data class HealthReadError(
+    val field: String,
+    val exceptionType: String,
+    val message: String
+) : java.io.Serializable
 
 data class TelemetryRowCounts(
     val pollCount: Long,

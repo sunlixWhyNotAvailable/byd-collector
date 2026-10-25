@@ -24,6 +24,7 @@ import java.util.UUID;
 public final class UsbKeepAliveState {
     private static final int MAX_FILE_BYTES = 16_384;
     private static final int MAX_DETAIL_CHARS = 1_024;
+    private static final int MAX_ERROR_CHARS = 32_768;
     private static final String NONE = "NONE", RESERVED = "RESERVED", NOT_DISPATCHED = "NOT_DISPATCHED";
     private static final String STARTED = "STARTED", RESULT = "RESULT";
     private static final Set<String> ROOT_KEYS = new HashSet<>(Arrays.asList(
@@ -74,7 +75,7 @@ public final class UsbKeepAliveState {
             state.persisted = true;
             return state;
         } catch (Exception failure) {
-            return state.corrupt("state_read_failed:" + failure.getClass().getSimpleName());
+            return state.corrupt(KeepAliveDaemon.diagnosticDetail(failure, "stage=usb_state_read"));
         }
     }
 
@@ -250,16 +251,16 @@ public final class UsbKeepAliveState {
             persisted = true;
             return true;
         } catch (Exception failure) {
-            return fail("state_write_failed:" + failure.getClass().getSimpleName());
+            return fail(KeepAliveDaemon.diagnosticDetail(failure, "stage=usb_state_write"));
         }
     }
 
-    private boolean fail(String reason) {
-        usable = false; recoverable = false; error = bounded(reason); return false;
+    private boolean fail(String detail) {
+        usable = false; recoverable = false; error = boundedError(detail); return false;
     }
 
-    private UsbKeepAliveState corrupt(String reason) {
-        usable = false; recoverable = true; error = bounded(reason);
+    private UsbKeepAliveState corrupt(String detail) {
+        usable = false; recoverable = true; error = boundedError(detail);
         return this;
     }
 
@@ -383,6 +384,11 @@ public final class UsbKeepAliveState {
     private static String bounded(String value) {
         if (value == null) return "";
         return value.length() <= MAX_DETAIL_CHARS ? value : value.substring(0, MAX_DETAIL_CHARS);
+    }
+    private static String boundedError(String value) {
+        if (value == null || value.length() <= MAX_ERROR_CHARS) return value == null ? "" : value;
+        String marker = " [TRUNCATED; limit=" + MAX_ERROR_CHARS + " chars]";
+        return value.substring(0, MAX_ERROR_CHARS - marker.length()) + marker;
     }
     private static long nonNegative(long value) { return Math.max(0, value); }
     private static long elapsedSince(long start, long end) { return end < start ? 0 : end - start; }

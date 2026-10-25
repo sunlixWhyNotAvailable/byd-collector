@@ -3,12 +3,14 @@ package com.bydcollector.collector.maintenance
 import android.content.Context
 import android.os.SystemClock
 import com.bydcollector.collector.BydCollectorApplication
+import com.bydcollector.collector.diagnostics.DiagnosticShareSanitizer
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseResolver
 import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.service.CollectorSettings
+import com.bydcollector.collector.util.diagnosticDetail
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -324,7 +326,23 @@ class DbMaintenanceCoordinator(
             application.closeTelemetryStoreForMaintenance()
         }
         val pendingEnergyCount = runCatching { DeferredEnergyArchive.count(databaseFile) }.getOrElse {
-            warnings += "${DeferredEnergyArchive.UNVERIFIED_WARNING}: ${it::class.java.simpleName}"
+            val error = it
+            val detail = error.diagnosticDetail("stage=archive_energy_receipt_count")
+            val conciseError = runCatching {
+                DiagnosticShareSanitizer().sanitizeText("${error::class.java.simpleName}: ${error.message ?: "no message"}")
+            }.getOrElse { "${error::class.java.simpleName}: [message withheld; diagnostic sanitization failed]" }
+            warnings += "${DeferredEnergyArchive.UNVERIFIED_WARNING}: $conciseError"
+            runCatching { application.recordMaintenanceEvent("database_maintenance_warning", detail) }
+                .onFailure { loggingError ->
+                    if (loggingError !== error) error.addSuppressed(loggingError)
+                    runCatching {
+                        android.util.Log.e(
+                            "DbMaintenanceCoordinator",
+                            "Could not persist energy receipt count warning; original_detail=$detail",
+                            loggingError
+                        )
+                    }
+                }
             -1L
         }
         val sourceNames = sourceNames(databaseFile)

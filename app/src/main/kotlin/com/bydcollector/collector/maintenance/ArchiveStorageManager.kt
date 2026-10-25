@@ -181,8 +181,9 @@ class ArchiveStorageManager(
 
     fun deferredRetryArchiveIds(states: List<ArchiveStorageItemState>): Set<String> {
         val now = clock()
-        return states.filter { it.phase == ArchiveStorageItemPhase.FAILED &&
-            now - it.updatedAtMs < 5 * 60_000L }.mapTo(mutableSetOf()) { it.archiveId }
+        return states.filter {
+            it.phase == ArchiveStorageItemPhase.FAILED && !ArchiveStorageRetryPolicy.isAutomaticRetryDue(it, now)
+        }.mapTo(mutableSetOf()) { it.archiveId }
     }
 
     fun reconcilePersistedItems(persisted: List<ArchiveStorageItemState>): ArchiveStorageItemsReconciliation {
@@ -211,7 +212,9 @@ class ArchiveStorageManager(
                             phase = ArchiveStorageItemPhase.READY,
                             updatedAtMs = clock(),
                             completedAtMs = clock(),
-                            error = null
+                            error = null,
+                            automaticRetryCount = 0,
+                            automaticRetryAtMs = null
                         )
                     state.phase.inProgress -> state.interrupted(
                         clock(),
@@ -771,5 +774,8 @@ private fun ArchiveStorageItemState.interrupted(nowMs: Long, errorCode: String):
     phase = ArchiveStorageItemPhase.FAILED,
     updatedAtMs = nowMs,
     completedAtMs = nowMs,
-    error = errorCode
+    error = errorCode,
+    automaticRetryAtMs = if (operationMode == ArchiveStorageJobMode.COMPRESS) {
+        ArchiveStorageRetryPolicy.deadlineAfterFailure(nowMs, automaticRetryCount)
+    } else null
 )

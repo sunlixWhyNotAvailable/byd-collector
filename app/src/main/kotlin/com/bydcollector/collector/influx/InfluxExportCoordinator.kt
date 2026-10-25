@@ -5,6 +5,7 @@ import android.database.sqlite.SQLiteTableLockedException
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import com.bydcollector.collector.ha.HaEndpointProfile
+import com.bydcollector.collector.util.diagnosticDetail
 import java.time.OffsetDateTime
 import java.util.Locale
 import java.util.UUID
@@ -205,14 +206,15 @@ class InfluxExportCoordinator(
         catch (error: CancellationException) { throw error }
         catch (error: RuntimeException) {
             if (!isCurrent() || generation != cancellationGeneration.get()) return InfluxActionResult.ok("influx work superseded")
+            val detail = error.diagnosticDetail("stage=influx_guard_cycle")
             if ((error is SQLiteDatabaseLockedException || error is SQLiteTableLockedException) && sqliteLockRetries < 3) {
                 sqliteLockRetries++
                 sqliteRetryAt = plusSeconds(clock.nowIso(), FAILURE_RETRY_INTERVAL_SECONDS)
                 diagnostic("influx_retry_pending", mapOf("reason" to "sqlite_locked",
                     "attempt" to sqliteLockRetries.toString(), "retry_deadline" to checkNotNull(sqliteRetryAt)))
-                return InfluxActionResult.fail("influx_sqlite_busy", "SQLite is busy; retry $sqliteLockRetries/3")
+                return InfluxActionResult.fail("influx_sqlite_busy", "SQLite is busy; retry $sqliteLockRetries/3\n$detail")
             }
-            InfluxActionResult.fail("influx_export_exception", "${error::class.java.simpleName}: ${error.message ?: "no message"}".take(512))
+            InfluxActionResult.fail("influx_export_exception", detail)
         }
         sqliteRetryAt = null
         if (result.ok) sqliteLockRetries = 0

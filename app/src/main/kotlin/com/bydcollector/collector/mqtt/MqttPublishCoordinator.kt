@@ -1,8 +1,12 @@
 package com.bydcollector.collector.mqtt
 
+import android.database.sqlite.SQLiteDatabaseLockedException
+import android.database.sqlite.SQLiteTableLockedException
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import com.bydcollector.collector.ha.HaEndpointProfile
+import com.bydcollector.collector.util.diagnosticDetail
+import java.util.concurrent.CancellationException
 import java.time.OffsetDateTime
 import java.util.Locale
 
@@ -15,12 +19,94 @@ class MqttPublishCoordinator(
     private val configProvider: () -> HaMqttConfig,
     private val retryPolicy: MqttRetryPolicy = MqttRetryPolicy(),
     private val clock: Clock = SystemClockAdapter(),
-    private val publicationJournal: MqttPublicationJournalStore = NoopMqttPublicationJournalStore
+    private val publicationJournal: MqttPublicationJournalStore = NoopMqttPublicationJournalStore,
+    private val storageDiagnostic: (String, String) -> Unit = { _, _ -> }
 ) {
     private var sessionConnection: HaMqttConfig? = null
     private var sessionToken: String? = null
     @Volatile
     private var currentRoute: HaEndpointProfile? = null
+    private val storageRetryLock = Any()
+    private var storageGeneration = 0L
+    private var storageRetryAt: Long? = null
+    private var storageLockRetries = 0
+    private var storageRecoveryRequired = false
+    private var storageTerminalFailure: String? = null
+    private var latestStatus: HaMqttStatus? = null
+
+    /** A new run or explicit stop invalidates old in-flight storage failures. */
+    fun resetStorageRecovery() = synchronized(storageRetryLock) {
+        storageGeneration++
+        storageRetryAt = null
+        storageLockRetries = 0
+        storageRecoveryRequired = false
+        storageTerminalFailure = null
+        latestStatus = null
+    }
+
+    fun runWithStorageRecovery(
+        stage: String,
+        isCurrent: () -> Boolean = { true },
+        action: () -> MqttActionResult
+    ): MqttActionResult {
+        val pass = synchronized(storageRetryLock) { storageGeneration }
+        if (!isCurrent()) return MqttActionResult.ok("MQTT work superseded")
+        synchronized(storageRetryLock) { storageTerminalFailure }?.let {
+            return MqttActionResult.fail("mqtt_storage_error", it)
+        }
+        storageRetryDelay()?.takeIf { it > 0L }?.let {
+            return MqttActionResult.fail("mqtt_sqlite_busy", "SQLite retry pending")
+        }
+        return try {
+            // Rebuild latest retained state as inputs may change while storage is blocked.
+            // This also completes discovery/full-state enqueue interrupted during Start.
+            val recovering = synchronized(storageRetryLock) { storageRecoveryRequired }
+            val result = if (recovering) startLiveExport() else action()
+            synchronized(storageRetryLock) {
+                if (pass == storageGeneration && isCurrent()) {
+                    storageRetryAt = null
+                    storageLockRetries = 0
+                    storageRecoveryRequired = false
+                }
+            }
+            result
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: RuntimeException) {
+            if (!isCurrent() || synchronized(storageRetryLock) { pass != storageGeneration }) {
+                return MqttActionResult.ok("MQTT work superseded")
+            }
+            val retry = recordStorageFailure(error, stage, pass, isCurrent)
+            MqttActionResult.fail(
+                if (retry) "mqtt_sqlite_busy" else "mqtt_storage_error",
+                error.diagnosticDetail("stage=$stage")
+            )
+        }
+    }
+
+    private fun storageRetryDelay(): Long? = synchronized(storageRetryLock) {
+        storageRetryAt?.let { (it - clock.elapsedRealtimeMs()).coerceAtLeast(0L) }
+    }
+
+    private fun recordStorageFailure(error: RuntimeException, stage: String, pass: Long, isCurrent: () -> Boolean): Boolean {
+        val details = synchronized(storageRetryLock) {
+            if (pass != storageGeneration || !isCurrent()) return false
+            val retry = (error is SQLiteDatabaseLockedException || error is SQLiteTableLockedException) && storageLockRetries < 3
+            if (retry) storageLockRetries++
+            storageRetryAt = if (retry) clock.elapsedRealtimeMs() + 30_000L else null
+            storageRecoveryRequired = retry
+            if (!retry) storageTerminalFailure = error.diagnosticDetail("stage=$stage")
+            retry to "stage=$stage retry=$retry attempt=$storageLockRetries/3 retry_at_elapsed_ms=$storageRetryAt"
+        }
+        try {
+            storageDiagnostic(if (details.first) "mqtt_storage_retry_pending" else "mqtt_storage_terminal_failure",
+                error.diagnosticDetail(details.second))
+        } catch (loggingError: Throwable) {
+            if (loggingError !== error) error.addSuppressed(loggingError)
+            android.util.Log.e("MqttStorage", error.diagnosticDetail(details.second))
+        }
+        return details.first
+    }
 
     val activeRoute: HaEndpointProfile?
         get() = if (client.isConnected) currentRoute else null
@@ -62,14 +148,23 @@ class MqttPublishCoordinator(
 
         //queues discovery before state so a failed initial connection retains complete restart work
         enqueueBuildResult(messageFactory.discoveryMessages(config), DISCOVERY_PRIORITY, config)?.let { return it }
-        enqueueBuildResult(messageFactory.fullResyncMessages(config), STATE_PRIORITY, config)?.let { return it }
+        enqueueBuildResult(messageFactory.fullResyncMessages(config, synchronized(storageRetryLock) { latestStatus }), STATE_PRIORITY, config)?.let { return it }
         return flushPendingInternal(force = true, allowFullResyncAfterSuccess = false)
     }
 
-    fun retryDelayMs(): Long? {
+    fun retryDelayMs(isCurrent: () -> Boolean = { true }): Long? {
         val config = runtimeConfig()
-        if (!config.enabled || validateEnabled(config) != null || outbox.pendingCount() == 0L) return null
-        val nextAttemptAt = retryStateStore.retryState().nextAttemptAt ?: return null
+        if (!config.enabled || validateEnabled(config) != null || !isCurrent()) return null
+        storageRetryDelay()?.let { return it }
+        val pass = synchronized(storageRetryLock) { storageGeneration }
+        val nextAttemptAt = try {
+            if (outbox.pendingCount() == 0L) return null
+            retryStateStore.retryState().nextAttemptAt ?: return null
+        } catch (error: RuntimeException) {
+            if (!isCurrent() || synchronized(storageRetryLock) { pass != storageGeneration }) return null
+            if (recordStorageFailure(error, "mqtt_retry_preparation", pass, isCurrent)) return storageRetryDelay()
+            throw error
+        }
         return runCatching {
             val now = OffsetDateTime.parse(clock.nowIso()).toInstant().toEpochMilli()
             (OffsetDateTime.parse(nextAttemptAt).toInstant().toEpochMilli() - now).coerceAtLeast(0L)
@@ -89,11 +184,13 @@ class MqttPublishCoordinator(
     fun queueFullResyncAndFlush(force: Boolean = true): MqttActionResult {
         val config = runtimeConfig(capture = true)
         validateEnabled(config)?.let { return it }
-        return enqueueBuildResult(messageFactory.fullResyncMessages(config), STATE_PRIORITY, config)
+        return enqueueBuildResult(messageFactory.fullResyncMessages(config, synchronized(storageRetryLock) { latestStatus }), STATE_PRIORITY, config)
             ?: flushPending(force)
     }
 
     fun queueStatusAndFlush(status: HaMqttStatus, force: Boolean = false): MqttActionResult {
+        // A failed enqueue must not turn the next retained-state resync into generic "online".
+        synchronized(storageRetryLock) { latestStatus = status }
         val config = runtimeConfig(capture = true)
         validateEnabled(config)?.let { return it }
         return enqueueBuildResult(messageFactory.statusMessage(config, status), STATUS_PRIORITY, config)
@@ -219,7 +316,7 @@ class MqttPublishCoordinator(
         retryStateStore.recordRetrySuccess(clock.nowIso())
         if (hadPreviousFailure && allowFullResyncAfterSuccess) {
             //after reconnect, resync everything because retained topics may have gone stale during outage
-            return enqueueBuildResult(messageFactory.fullResyncMessages(runtimeConfig()), STATE_PRIORITY, config)
+            return enqueueBuildResult(messageFactory.fullResyncMessages(runtimeConfig(), synchronized(storageRetryLock) { latestStatus }), STATE_PRIORITY, config)
                 ?: flushPendingInternal(force = true, allowFullResyncAfterSuccess = false)
         }
         return MqttActionResult.ok()

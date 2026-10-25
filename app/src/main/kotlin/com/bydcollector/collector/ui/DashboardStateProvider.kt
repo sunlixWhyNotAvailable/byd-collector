@@ -12,15 +12,20 @@ import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.data.local.CollectorEvent
 import com.bydcollector.collector.data.local.HealthSnapshot
 import com.bydcollector.collector.data.local.HealthSnapshotDetail
+import com.bydcollector.collector.data.local.HealthReadAvailability
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
 import com.bydcollector.collector.influx.InfluxExportStateSnapshot
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
+import com.bydcollector.collector.maintenance.ArchiveStorageItemsRead
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorSettings
+import com.bydcollector.collector.util.diagnosticDetail
 import com.bydcollector.collector.util.TimedCache
 import com.bydcollector.collector.util.sqliteFootprintBytes
+import java.security.MessageDigest
+import java.time.Instant
 
 //assembles one immutable dashboard snapshot from settings, service flags, sqlite health, and diagnostics
 class DashboardStateProvider(
@@ -50,6 +55,8 @@ class DashboardStateProvider(
     private var recentEventsSource: List<CollectorEvent>? = null
     private var formattedRecentEvents: List<CollectorEvent> = emptyList()
     private var archiveStorageJobActive = false
+    private val archiveItemErrorLock = Any()
+    private var archiveItemErrorFingerprint: String? = null
 
     fun loadInitial(): DashboardState = load(DashboardLoadProfile.INITIAL)
 
@@ -145,6 +152,12 @@ class DashboardStateProvider(
         val influxConfig = if (integrationSettingsLoaded) settings.influxConfig(includeCredentials = false) else null
         val archiveStorageLimitGb = settings.archiveStorageLimitGb()
         val archiveStorageJobStatus = settings.archiveStorageJobStatus()
+        val archiveStorageItemsRead = if (profile.readsArchiveDetails) settings.archiveStorageItemsRead() else null
+        if (archiveStorageItemsRead is ArchiveStorageItemsRead.Corrupt) {
+            recordArchiveItemsError(archiveStorageItemsRead, store)
+        } else if (archiveStorageItemsRead != null) {
+            synchronized(archiveItemErrorLock) { archiveItemErrorFingerprint = null }
+        }
         val archiveJobActiveNow = archiveStorageJobStatus.running || CollectorService.isArchiveStorageActive()
         if (archiveJobActiveNow != archiveStorageJobActive) {
             archiveStorageCache.invalidate()
@@ -227,7 +240,16 @@ class DashboardStateProvider(
             // INITIAL does not list archives: an empty seed is not a completed empty scan.
             archiveStorageScanPending = profile == DashboardLoadProfile.INITIAL || archiveStorageResult.pending,
             archiveStorageJobStatus = archiveStorageJobStatus,
-            archiveStorageItemStates = if (archiveDetailsLoaded) settings.archiveStorageItems() else emptyList(),
+            archiveStorageItemStates = when (val read = archiveStorageItemsRead) {
+                is ArchiveStorageItemsRead.Valid -> read.items
+                else -> emptyList()
+            },
+            archiveStorageItemStatesAvailable = archiveStorageItemsRead != null &&
+                archiveStorageItemsRead !is ArchiveStorageItemsRead.Corrupt,
+            archiveStorageItemStateError = (archiveStorageItemsRead as? ArchiveStorageItemsRead.Corrupt)
+                ?.error?.let { error ->
+                    error.message?.take(160)?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName
+                },
             archiveStorageScanError = if (archiveDetailsLoaded) {
                 archiveStorageResult.error?.let { error ->
                     error.message?.take(160)?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName
@@ -324,6 +346,8 @@ class DashboardStateProvider(
             adbAuthorized = accessSnapshot.adbAuthorized,
             vehicleKpis = vehicleKpis,
             recentEvents = formatRecentEvents(health.recentEvents),
+            recentEventsAvailability = health.recentEventsAvailability,
+            healthReadErrors = health.healthReadErrors,
             mainStorageCutoverDeferredReason = settings.mainStorageCutoverDeferredReason(),
             mainStorageCutoverError = settings.mainStorageCutoverError(),
             debugStorageCutoverError = settings.debugStorageCutoverError()
@@ -338,6 +362,48 @@ class DashboardStateProvider(
             runtimeSettingsLoaded = runtimeSettingsLoaded,
             archiveDetailsLoaded = archiveDetailsLoaded
         ).copy(debugParameterCount = DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT)
+    }
+
+    private fun recordArchiveItemsError(read: ArchiveStorageItemsRead.Corrupt, store: TelemetryStore?) {
+        val rawText = when (val raw = read.raw) {
+            is String -> raw
+            null -> "<null>"
+            else -> "${raw.javaClass.name}:$raw"
+        }
+        val fingerprint = MessageDigest.getInstance("SHA-256")
+            .digest(rawText.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+        synchronized(archiveItemErrorLock) {
+            if (archiveItemErrorFingerprint == fingerprint) return
+            archiveItemErrorFingerprint = fingerprint
+        }
+        val category = "archive_storage_item_state_error"
+        val message = "Archive item metadata could not be read"
+        val detail = read.error.diagnosticDetail(
+            "stage=archive_storage_item_state_read raw_sha256=$fingerprint"
+        )
+        try {
+            (context.applicationContext as BydCollectorApplication).operationalEventJournal.append(
+                Instant.now().toString(),
+                SystemClock.elapsedRealtime(),
+                category,
+                message,
+                detail
+            )
+        } catch (journalError: Exception) {
+            if (journalError !== read.error) read.error.addSuppressed(journalError)
+            val fallbackSaved = store?.let { fallback -> runCatching {
+                fallback.recordEvent(
+                    category,
+                    message,
+                    read.error.diagnosticDetail("stage=archive_storage_item_state_read_journal_fallback")
+                )
+            }.isSuccess } ?: false
+            if (!fallbackSaved) synchronized(archiveItemErrorLock) {
+                if (archiveItemErrorFingerprint == fingerprint) archiveItemErrorFingerprint = null
+            }
+            // Keep the raw preference untouched; a later refresh may retry the durable diagnostic.
+        }
     }
 
     fun invalidateArchiveStorageSnapshot() {
@@ -407,8 +473,8 @@ class DashboardStateProvider(
             normalizedHistoryCount = UNKNOWN_DASHBOARD_COUNT,
             mqttLastError = null,
             mqttLastPublishedAt = null,
-            mqttPendingCount = 0L,
-            mqttRetryFailureCount = 0,
+            mqttPendingCount = UNKNOWN_DASHBOARD_COUNT,
+            mqttRetryFailureCount = UNKNOWN_DASHBOARD_COUNT.toInt(),
             mqttNextRetryAt = null,
             mqttRetryLastFailureAt = null,
             mqttRetryLastSuccessAt = null,
@@ -421,7 +487,9 @@ class DashboardStateProvider(
             latestSoc = null,
             latestSpeed = null,
             latestCharging = null,
-            recentEvents = emptyList()
+            recentEvents = emptyList(),
+            recentEventsAvailability = HealthReadAvailability.NOT_REQUESTED,
+            healthReadErrors = emptyList()
         )
     }
 
@@ -461,17 +529,18 @@ class DashboardStateProvider(
         nextRetryAt: String?
     ): String {
         val base = if (enabled) "enabled" else "disabled"
+        val pendingLabel = if (pendingCount < 0L) "-" else pendingCount.toString()
         return when {
             retryFailureCount > 0 && !nextRetryAt.isNullOrBlank() -> {
                 val retryAt = DisplayTimeFormatter.formatNullable(nextRetryAt) ?: nextRetryAt
-                "$base; pending: $pendingCount; retry #$retryFailureCount at $retryAt"
+                "$base; pending: $pendingLabel; retry #$retryFailureCount at $retryAt"
             }
-            !lastError.isNullOrBlank() -> "$base; pending: $pendingCount; error: ${lastError.truncate(96)}"
+            !lastError.isNullOrBlank() -> "$base; pending: $pendingLabel; error: ${lastError.truncate(96)}"
             !lastPublishedAt.isNullOrBlank() -> {
                 val publishedAt = DisplayTimeFormatter.formatNullable(lastPublishedAt) ?: lastPublishedAt
-                "$base; pending: $pendingCount; last publish: $publishedAt"
+                "$base; pending: $pendingLabel; last publish: $publishedAt"
             }
-            else -> "$base; pending: $pendingCount"
+            else -> "$base; pending: $pendingLabel"
         }
     }
 

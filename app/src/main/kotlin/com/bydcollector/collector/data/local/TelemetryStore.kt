@@ -5,6 +5,7 @@ import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.os.CancellationSignal
+import android.os.SystemClock
 import android.util.Log
 import com.bydcollector.collector.data.callback.CallbackDelivery
 import com.bydcollector.collector.data.callback.CallbackImportResult
@@ -17,6 +18,7 @@ import com.bydcollector.collector.data.energy.EnergyReceipt
 import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
 import com.bydcollector.collector.direct.TelemetryCallbackBatch
 import com.bydcollector.collector.diagnostics.OperationalEventJournal
+import com.bydcollector.collector.diagnostics.DiagnosticShareSanitizer
 import com.bydcollector.collector.maintenance.DeferredEnergyArchive
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.data.normalized.NormalizedQuality
@@ -54,6 +56,8 @@ import com.bydcollector.collector.mqtt.NormalizedStateProvider
 import com.bydcollector.collector.service.TelegramEventState
 import com.bydcollector.collector.util.sqliteFootprintBytes
 import com.bydcollector.collector.util.dispatchOperationalEvent
+import com.bydcollector.collector.util.diagnosticDetail
+import com.bydcollector.collector.diagnostics.diagnosticSha256
 import com.bydcollector.collector.util.sharedOperationalEventExecutor
 import java.io.Closeable
 import java.io.File
@@ -61,6 +65,7 @@ import java.security.MessageDigest
 import java.time.Instant
 import java.time.OffsetDateTime
 import java.util.Collections
+import java.util.IdentityHashMap
 import java.util.LinkedHashMap
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
@@ -278,6 +283,8 @@ class TelemetryStore(
         }
     )
     private val pollHealthLock = Any()
+    private val healthReadFailureLock = Any()
+    private val healthReadFailureSignatures = mutableMapOf<String, String>()
     @Volatile private var pollHealthCache: PollHealthCache? = null
     @Volatile private var pollValueColumnsEnsuredForCatalogVersionId: Long? = null
     private val normalizedCatalogImportLock = Any()
@@ -1162,7 +1169,7 @@ class TelemetryStore(
         }
     }
 
-    override fun pendingCount(): Long = safeScalarLong("SELECT COUNT(*) FROM mqtt_outbox")
+    override fun pendingCount(): Long = scalarLong("SELECT COUNT(*) FROM mqtt_outbox")
 
     /** Cancellable owner-side count that propagates SQLite failures instead of reporting false zero. */
     internal fun refreshMqttPendingCount(cancellationSignal: CancellationSignal?): Long {
@@ -1691,6 +1698,11 @@ class TelemetryStore(
         }
     }
 
+    private data class RecentEventsHealthRead(
+        val events: List<CollectorEvent>,
+        val availability: HealthReadAvailability
+    )
+
     fun healthSnapshot(
         running: Boolean,
         detail: HealthSnapshotDetail = HealthSnapshotDetail.FULL,
@@ -1699,23 +1711,29 @@ class TelemetryStore(
     ): HealthSnapshot {
         val includeIntegrations = detail != HealthSnapshotDetail.SUMMARY
         val includeFullDetails = detail == HealthSnapshotDetail.FULL
+        val healthReadErrors = mutableListOf<HealthReadError>()
         val mqttRetryState = if (includeIntegrations) {
-            safeMqttRetryState()
+            safeMqttRetryState(healthReadErrors)
         } else {
             MqttRetryState(
-                failureCount = 0,
+                failureCount = UNKNOWN_COUNT_INT,
                 nextAttemptAt = null,
                 lastFailureAt = null,
                 lastSuccessAt = null,
                 lastError = null
             )
         }
+        val recentEventsRead = if (includeFullDetails) {
+            safeRecentEvents(healthReadErrors)
+        } else {
+            RecentEventsHealthRead(emptyList(), HealthReadAvailability.NOT_REQUESTED)
+        }
         val pollHealth = if (includePollHealth) {
             currentPollHealth(running)
         } else {
             PollHealthCache.empty(null).snapshot
         }
-        //uses safe queries because the dashboard must keep rendering through migrations and partial failures
+        //Failed health reads are explicit unknowns; full diagnostic details go to the independent journal.
         return HealthSnapshot(
             running = running,
             activeSessionId = pollHealth.activeSessionId,
@@ -1723,18 +1741,22 @@ class TelemetryStore(
             lastError = pollHealth.lastError,
             lastErrorAt = pollHealth.lastErrorAt,
             lastPollStatus = pollHealth.lastPollStatus,
-            pollCount = if (includeCounts) safeScalarLong("SELECT COUNT(*) FROM polls") else UNKNOWN_COUNT,
+            pollCount = if (includeCounts) safeHealthCount("poll_count", "SELECT COUNT(*) FROM polls", healthReadErrors) else UNKNOWN_COUNT,
             valueRowCount = if (includeCounts) {
-                safeScalarLong("SELECT (SELECT COUNT(*) FROM poll_values) + (SELECT COUNT(*) FROM raw_callback_events)")
+                safeHealthCount(
+                    "value_row_count",
+                    "SELECT (SELECT COUNT(*) FROM poll_values) + (SELECT COUNT(*) FROM raw_callback_events)",
+                    healthReadErrors
+                )
             } else {
                 UNKNOWN_COUNT
             },
-            ecRowCount = if (includeCounts) safeScalarLong("SELECT COUNT(*) FROM ec_energy_consumption") else UNKNOWN_COUNT,
-            normalizedCurrentCount = if (includeCounts) safeScalarLong("SELECT COUNT(*) FROM vehicle_state_current") else UNKNOWN_COUNT,
-            normalizedHistoryCount = if (includeCounts) safeScalarLong("SELECT COUNT(*) FROM vehicle_state_history") else UNKNOWN_COUNT,
+            ecRowCount = if (includeCounts) safeHealthCount("ec_row_count", "SELECT COUNT(*) FROM ec_energy_consumption", healthReadErrors) else UNKNOWN_COUNT,
+            normalizedCurrentCount = if (includeCounts) safeHealthCount("normalized_current_count", "SELECT COUNT(*) FROM vehicle_state_current", healthReadErrors) else UNKNOWN_COUNT,
+            normalizedHistoryCount = if (includeCounts) safeHealthCount("normalized_history_count", "SELECT COUNT(*) FROM vehicle_state_history", healthReadErrors) else UNKNOWN_COUNT,
             mqttLastError = if (includeIntegrations) safeScalarString("SELECT last_error FROM mqtt_publish_state WHERE last_error IS NOT NULL ORDER BY last_error_at DESC, updated_at DESC, id DESC LIMIT 1") else null,
             mqttLastPublishedAt = if (includeIntegrations) safeScalarString("SELECT last_published_at FROM mqtt_publish_state WHERE last_published_at IS NOT NULL ORDER BY last_published_at DESC, id DESC LIMIT 1") else null,
-            mqttPendingCount = if (includeIntegrations) safeMqttPendingCount() else 0L,
+            mqttPendingCount = if (includeIntegrations) safeMqttPendingCount(healthReadErrors) else UNKNOWN_COUNT,
             mqttRetryFailureCount = mqttRetryState.failureCount,
             mqttNextRetryAt = mqttRetryState.nextAttemptAt,
             mqttRetryLastFailureAt = mqttRetryState.lastFailureAt,
@@ -1748,7 +1770,9 @@ class TelemetryStore(
             latestSoc = if (includeFullDetails) safeLatestReading(listOf("statistic_1014_1145045040_5", "statistic_1014_1134559272_5", "SOC", "soc")) else null,
             latestSpeed = if (includeFullDetails) safeLatestReading(listOf("speed_1013_-1807745016_7", "Speed", "speed")) else null,
             latestCharging = if (includeFullDetails) safeLatestReading(listOf("charging_charge_current", "ChargingStatus", "chargeGunState")) else null,
-            recentEvents = if (includeFullDetails) safeRecentEvents() else emptyList()
+            recentEvents = recentEventsRead.events,
+            recentEventsAvailability = recentEventsRead.availability,
+            healthReadErrors = healthReadErrors.toList()
         )
     }
 
@@ -1858,25 +1882,155 @@ class TelemetryStore(
             available = false
         )
 
-    private fun safeMqttPendingCount(): Long = runCatching {
-        pendingCount()
-    }.onFailure { error ->
-        Log.w(TAG, "mqtt pending count query failed", error)
-    }.getOrDefault(0L)
+    private fun safeHealthCount(
+        field: String,
+        sql: String,
+        errors: MutableList<HealthReadError>
+    ): Long = readHealthValue(field, UNKNOWN_COUNT, errors) { scalarLong(sql) }
 
-    private fun safeMqttRetryState(): MqttRetryState = runCatching {
-        retryState()
-    }.onFailure { error ->
-        Log.w(TAG, "mqtt retry state query failed", error)
-    }.getOrDefault(
-        MqttRetryState(
-            failureCount = 0,
+    private fun safeMqttPendingCount(errors: MutableList<HealthReadError>): Long =
+        readHealthValue("mqtt_pending_count", UNKNOWN_COUNT, errors) { pendingCount() }
+
+    private fun safeMqttRetryState(errors: MutableList<HealthReadError>): MqttRetryState = readHealthValue(
+        field = "mqtt_retry_state",
+        fallback = MqttRetryState(
+            failureCount = UNKNOWN_COUNT_INT,
             nextAttemptAt = null,
             lastFailureAt = null,
             lastSuccessAt = null,
             lastError = null
+        ),
+        errors = errors
+    ) { retryState() }
+
+    private inline fun <T> readHealthValue(
+        field: String,
+        fallback: T,
+        errors: MutableList<HealthReadError>,
+        read: () -> T
+    ): T {
+        return try {
+            read().also { clearHealthReadFailure(field) }
+        } catch (error: java.util.concurrent.CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            errors += healthReadError(field, error)
+            fallback
+        }
+    }
+
+    private fun safeRecentEvents(errors: MutableList<HealthReadError>): RecentEventsHealthRead {
+        val readErrorsBefore = errors.size
+        val events = readHealthValue("recent_events", emptyList(), errors) { recentEvents() }
+        val readFailed = errors.size != readErrorsBefore
+        return RecentEventsHealthRead(
+            events = events,
+            availability = if (readFailed) HealthReadAvailability.ERROR else HealthReadAvailability.AVAILABLE
         )
-    )
+    }
+
+    private fun healthReadError(field: String, error: Exception): HealthReadError {
+        val detail = error.diagnosticDetail("stage=dashboard_health_read field=$field")
+        val fingerprint = healthErrorFingerprint(error)
+        val shouldJournal = synchronized(healthReadFailureLock) {
+            if (healthReadFailureSignatures[field] == fingerprint) {
+                false
+            } else {
+                healthReadFailureSignatures[field] = fingerprint
+                true
+            }
+        }
+        if (shouldJournal) enqueueHealthReadDiagnostic(field, error, detail)
+
+        val message = runCatching {
+            DiagnosticShareSanitizer().sanitizeText(error.message.orEmpty())
+        }.getOrElse { "[message withheld; sanitization failed]" }
+            .replace('\r', ' ')
+            .replace('\n', ' ')
+            .replace('\t', ' ')
+            .let(::truncateHealthErrorMessage)
+        return HealthReadError(
+            field = field,
+            exceptionType = error.javaClass.name,
+            message = message.ifBlank { "[no message]" }
+        )
+    }
+
+    private fun healthErrorFingerprint(error: Throwable): String {
+        val sanitizer = DiagnosticShareSanitizer()
+        val visited = Collections.newSetFromMap(IdentityHashMap<Throwable, Boolean>())
+        var visitedCount = 0
+        val signature = buildString {
+            fun appendError(label: String, current: Throwable, depth: Int) {
+                if (depth > MAX_HEALTH_ERROR_CHAIN_DEPTH || !visited.add(current)) return
+                visitedCount += 1
+                if (visitedCount > MAX_HEALTH_ERROR_CHAIN_NODES) {
+                    append("chain_truncated")
+                    return
+                }
+                val safeMessage = runCatching {
+                    sanitizer.sanitizeText(current.message.orEmpty())
+                }.getOrElse { "[message withheld]" }
+                val boundedMessage = if (safeMessage.length > MAX_HEALTH_FINGERPRINT_MESSAGE_CHARS) {
+                    safeMessage.take(MAX_HEALTH_FINGERPRINT_MESSAGE_CHARS) + "[TRUNCATED]"
+                } else {
+                    safeMessage
+                }
+                append(label).append('|')
+                    .append(current.javaClass.name).append('|')
+                    .append(boundedMessage.length).append(':').append(boundedMessage).append('\n')
+                current.suppressed.forEachIndexed { index, suppressed ->
+                    appendError("suppressed[$index]", suppressed, depth + 1)
+                }
+                current.cause?.let { appendError("cause", it, depth + 1) }
+            }
+            appendError("root", error, 0)
+        }
+        return diagnosticSha256(signature)
+    }
+
+    private fun enqueueHealthReadDiagnostic(field: String, originalError: Exception, detail: String) {
+        val message = "Dashboard health read failed: $field"
+        try {
+            sharedOperationalEventExecutor.execute {
+                val appendResult = runCatching {
+                    operationalEventJournal.tryAppend(
+                        Instant.now().toString(),
+                        SystemClock.elapsedRealtime(),
+                        "database_health_read_error",
+                        message,
+                        detail
+                    )
+                }
+                if (appendResult.getOrDefault(false)) return@execute
+                val journalError = appendResult.exceptionOrNull()
+                if (journalError != null && journalError !== originalError) originalError.addSuppressed(journalError)
+                val writeDetail = listOfNotNull(
+                    detail,
+                    journalError?.diagnosticDetail("stage=dashboard_health_journal_write field=$field")
+                        ?: "[journal append unavailable]"
+                ).joinToString("\n")
+                runCatching { Log.e(TAG, "Could not persist dashboard health read error; original_detail=$writeDetail") }
+            }
+        } catch (dispatchError: RuntimeException) {
+            if (dispatchError !== originalError) originalError.addSuppressed(dispatchError)
+            val dispatchDetail = listOf(
+                detail,
+                dispatchError.diagnosticDetail("stage=dashboard_health_journal_dispatch field=$field")
+            ).joinToString("\n")
+            runCatching { Log.e(TAG, "Could not queue dashboard health read error; original_detail=$dispatchDetail") }
+        }
+    }
+
+    private fun clearHealthReadFailure(field: String) {
+        synchronized(healthReadFailureLock) { healthReadFailureSignatures.remove(field) }
+    }
+
+    private fun truncateHealthErrorMessage(message: String): String {
+        if (message.length <= MAX_HEALTH_ERROR_MESSAGE_CHARS) return message
+        val marker = " [TRUNCATED; limit=$MAX_HEALTH_ERROR_MESSAGE_CHARS chars]"
+        return message.take(MAX_HEALTH_ERROR_MESSAGE_CHARS - marker.length) + marker
+    }
 
     fun databaseFile(): File = context.getDatabasePath(TelemetryDatabaseHelper.DATABASE_NAME)
 
@@ -1971,12 +2125,6 @@ class TelemetryStore(
     }.onFailure { error ->
         Log.w(TAG, "latest reading query failed for $keys", error)
     }.getOrNull()
-
-    private fun safeRecentEvents(): List<CollectorEvent> = runCatching {
-        recentEvents()
-    }.onFailure { error ->
-        Log.w(TAG, "recent events query failed", error)
-    }.getOrDefault(emptyList())
 
     private fun safeLastEcImportStatus(): String? = runCatching {
         lastEcImportStatus()
@@ -2315,12 +2463,6 @@ class TelemetryStore(
         }
     }
 
-    private fun safeScalarLong(sql: String): Long = runCatching {
-        scalarLong(sql)
-    }.onFailure { error ->
-        Log.w(TAG, "scalar long query failed: $sql", error)
-    }.getOrDefault(0L)
-
     private fun scalarLongOrNull(sql: String): Long? {
         helper.readableDatabase.rawQuery(sql, emptyArray()).use { cursor ->
             return if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getLong(0) else null
@@ -2401,9 +2543,14 @@ class TelemetryStore(
         internal val HISTORICAL_ENERGY_KEYS = HISTORICAL_REQUIRED_ENERGY_KEYS + HISTORICAL_OPTIONAL_VETO_KEYS
         private const val TAG = "BYDCollectorEvent"
         private const val MAX_ERROR_TEXT_LENGTH = 2_048
+        private const val MAX_HEALTH_ERROR_MESSAGE_CHARS = 160
+        private const val MAX_HEALTH_FINGERPRINT_MESSAGE_CHARS = 1_024
+        private const val MAX_HEALTH_ERROR_CHAIN_DEPTH = 16
+        private const val MAX_HEALTH_ERROR_CHAIN_NODES = 64
         private const val MAX_RAW_RESPONSE_BODY_LENGTH = 4_096
         private const val POLL_HEALTH_RECENT_PAGE_LIMIT = 128
         private const val UNKNOWN_COUNT = -1L
+        private const val UNKNOWN_COUNT_INT = -1
         private const val DECODED_VALUE_CACHE_SIZE = 2_048
         private const val TELEGRAM_MAX_PENDING = 1_000L
     }

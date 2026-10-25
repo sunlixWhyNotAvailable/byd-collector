@@ -38,7 +38,9 @@ internal object DashboardStateProfileMerger {
                 latestCharging = previous.latestCharging,
                 normalizedCurrentCount = previous.normalizedCurrentCount,
                 normalizedHistoryCount = previous.normalizedHistoryCount,
-                recentEvents = previous.recentEvents
+                recentEvents = previous.recentEvents,
+                recentEventsAvailability = previous.recentEventsAvailability,
+                healthReadErrors = previous.healthReadErrors
             )
             HealthSnapshotDetail.INTEGRATIONS -> merged = merged.copy(
                 pollCount = previous.pollCount,
@@ -53,7 +55,13 @@ internal object DashboardStateProfileMerger {
                 latestCharging = previous.latestCharging,
                 normalizedCurrentCount = previous.normalizedCurrentCount,
                 normalizedHistoryCount = previous.normalizedHistoryCount,
-                recentEvents = previous.recentEvents
+                recentEvents = previous.recentEvents,
+                recentEventsAvailability = previous.recentEventsAvailability,
+                healthReadErrors = mergeHealthReadErrors(
+                    previous.healthReadErrors,
+                    merged.healthReadErrors,
+                    INTEGRATION_HEALTH_READ_FIELDS
+                )
             )
             HealthSnapshotDetail.FULL -> Unit
         }
@@ -145,6 +153,8 @@ internal object DashboardStateProfileMerger {
                 ),
                 archiveStorageScanPending = previous.archiveStorageScanPending,
                 archiveStorageItemStates = previous.archiveStorageItemStates,
+                archiveStorageItemStatesAvailable = previous.archiveStorageItemStatesAvailable,
+                archiveStorageItemStateError = previous.archiveStorageItemStateError,
                 archiveStorageScanError = previous.archiveStorageScanError
             )
         }
@@ -179,7 +189,10 @@ internal object DashboardStateProfileMerger {
             mqttRetryLastSuccessAt = previous.mqttRetryLastSuccessAt,
             normalizedCurrentCount = previous.normalizedCurrentCount,
             normalizedHistoryCount = previous.normalizedHistoryCount,
-            recentEvents = previous.recentEvents
+            recentEvents = previous.recentEvents,
+            recentEventsAvailability = previous.recentEventsAvailability,
+            healthReadErrors = previous.healthReadErrors
         )
     }
+
 }

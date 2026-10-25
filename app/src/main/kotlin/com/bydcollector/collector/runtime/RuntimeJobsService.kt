@@ -6,10 +6,12 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.os.Environment
 import android.os.IBinder
 import android.util.AtomicFile
 import androidx.core.content.FileProvider
 import com.bydcollector.collector.BydCollectorApplication
+import com.bydcollector.collector.diagnostics.DiagnosticShareSanitizer
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
 import com.bydcollector.collector.ha.HaEndpointProfile
 import com.bydcollector.collector.influx.InfluxActions
@@ -23,7 +25,9 @@ import com.bydcollector.collector.mqtt.MqttCleanupCore
 import com.bydcollector.collector.mqtt.MqttCleanupSelection
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorSettings
+import com.bydcollector.collector.util.diagnosticDetail
 import com.bydcollector.collector.update.UpdateApkVerifier
+import com.bydcollector.collector.update.UpdateApkIdentity
 import com.bydcollector.collector.update.UpdateDownloader
 import com.bydcollector.collector.update.UpdateFailureStage
 import com.bydcollector.collector.update.UpdateInfo
@@ -31,6 +35,14 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.UUID
+
+private fun conciseRuntimeJobError(error: Throwable): String {
+    val detail = runCatching {
+        DiagnosticShareSanitizer().sanitizeText("${error.javaClass.simpleName}: ${error.message ?: "no message"}")
+    }.getOrElse { "${error.javaClass.simpleName}: [message withheld; diagnostic sanitization failed]" }
+    val marker = " [TRUNCATED; limit=300 chars]"
+    return if (detail.length <= 300) detail else detail.take(300 - marker.length) + marker
+}
 
 private class UpdateCancellationRequested : Exception()
 
@@ -113,20 +125,23 @@ class RuntimeJobsService : Service() {
                         runCatching { finishUpdateCancellation(this, job.getString("id")) }
                             .onFailure { cleanupError ->
                                 markCancellationCleanupFailure(this, job.getString("id"), cleanupError)
-                                recordDiagnostic(job, "cancel_cleanup_failed", cleanupError.message.orEmpty())
+                                recordDiagnostic(
+                                    job,
+                                    "cancel_cleanup_failed",
+                                    cleanupError.diagnosticDetail("stage=runtime_job_cancel_cleanup job_id=${job.getString("id")}")
+                                )
                             }
                     } else {
                         val updateJob = job.getString("kind") == "updateDownload"
-                        val errorMessage = "${error.javaClass.simpleName}: ${error.message.orEmpty()}"
                         val failureStage = if (updateJob) {
                             runCatching { UpdateFailureStage.valueOf(job.optString("errorStage")) }
                                 .getOrDefault(UpdateFailureStage.UNKNOWN)
                         } else UpdateFailureStage.UNKNOWN
-                        val diagnostic = if (updateJob) {
-                            "stage=${failureStage.name} jobId=${job.getString("id")} $errorMessage"
-                        } else errorMessage
-                        recordDiagnostic(job, "failed", if (updateJob) diagnostic.take(300) else diagnostic)
-                        val storedError = "${error.javaClass.simpleName}: ${error.message.orEmpty().take(300)}"
+                        val diagnostic = error.diagnosticDetail(
+                            "stage=${if (updateJob) failureStage.name else "runtime_job"} job_id=${job.getString("id")}"
+                        )
+                        recordDiagnostic(job, "failed", diagnostic)
+                        val storedError = conciseRuntimeJobError(error)
                         change(this, job.getString("id")) {
                             if (it.getString("status") == "running") {
                                 it.put("status", "error")
@@ -156,12 +171,24 @@ class RuntimeJobsService : Service() {
     }
 
     private fun recordDiagnostic(job: JSONObject, outcome: String, detail: String) {
-        // Failure to write diagnostics must not change the operation's result.
-        runCatching {
+        val safeDetail = runCatching { DiagnosticShareSanitizer().sanitizeText(detail) }
+            .getOrElse { "[original diagnostic withheld; sanitization failed]" }
+        val marker = "\n[TRUNCATED; limit=32768 chars]"
+        val boundedDetail = if (safeDetail.length <= 32_768) safeDetail
+            else safeDetail.take(32_768 - marker.length) + marker
+        try {
             (applicationContext as BydCollectorApplication).operationalEventJournal.append(
                 java.time.Instant.now().toString(), android.os.SystemClock.elapsedRealtime(),
-                "runtime_job", "${job.getString("kind")}_$outcome", detail
+                "runtime_job", "${job.getString("kind")}_$outcome", boundedDetail
             )
+        } catch (journalError: Throwable) {
+            runCatching {
+                android.util.Log.e(
+                    "RuntimeJobs",
+                    "Could not persist runtime_job ${job.optString("kind")} $outcome; original_detail=$boundedDetail",
+                    journalError
+                )
+            }
         }
     }
 
@@ -238,6 +265,7 @@ class RuntimeJobsService : Service() {
             "archiveShare" -> {
                 val ids = args.getJSONArray("ids").let { list -> (0 until list.length()).map(list::getString) }
                 check(!CollectorService.isArchiveStorageActive()) { "Archive maintenance is active" }
+                CollectorSettings(this).archiveStorageItems()
                 val lease = CollectorService.archiveShareLeaseRegistry.acquire(ids)
                 try {
                     val files = ArchiveStorageManager(File(filesDir, "db_archive"),
@@ -255,6 +283,7 @@ class RuntimeJobsService : Service() {
                 job.put("errorStage", UpdateFailureStage.DOWNLOAD.name)
                 val info = updateInfo(job)
                 throwIfUpdateCancelled(job.getString("id"))
+                cleanupUpdateArtifacts(this)
                 RuntimeControl.call(this, "installStart", android.os.Bundle())
                 throwIfUpdateCancelled(job.getString("id"))
                 app.releaseNotesHistory.request(info)
@@ -306,9 +335,14 @@ class RuntimeJobsService : Service() {
                 val validation = UpdateApkVerifier(this).validate(file)
                 throwIfUpdateCancelled(job.getString("id"))
                 check(validation.ok) { validation.message }
+                val identity = checkNotNull(validation.identity) { "Verified update identity unavailable" }
                 job.put("errorStage", UpdateFailureStage.INSTALLATION.name)
                 val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
                 JSONObject().put("uri", uri.toString()).put("sha256", validation.sha256)
+                    .put("targetApk", JSONObject()
+                        .put("package", identity.packageName)
+                        .put("versionCode", identity.versionCode)
+                        .put("signers", JSONArray(identity.signerDigests.sorted())))
             }
             else -> error("Unknown background job")
         }
@@ -345,6 +379,7 @@ class RuntimeJobsService : Service() {
         private val accepted = setOf("access", "mqttTest", "mqttCleanup", "influxTest", "logStart", "logStop", "logShare", "logClear", "archiveShare", "updateDownload")
 
         fun recover(context: Context) {
+            cleanupUpdateArtifacts(context)
             if (CollectorSettings(context).isUserShutdownRequested()) return
             if (recordingPrefs(context).getBoolean("recording", false) && !DiagnosticLogRecorder.isRecording()) {
                 submit(context, "logStart", JSONObject())
@@ -433,7 +468,9 @@ class RuntimeJobsService : Service() {
                 return RuntimeReads.read(context, "jobs")
             }
             return synchronized(LOCK) {
-                JSONArray(load(context).filterNot { it.optBoolean("presented") }.map { item ->
+                JSONArray(load(context).filterNot {
+                    it.optBoolean("presented") || (it.optString("kind") == "updateDownload" && it.optBoolean("targetInstalled"))
+                }.map { item ->
                     JSONObject(item.toString()).apply {
                         if (optString("kind") != "updateDownload") optJSONObject("args")?.remove("notes")
                     }
@@ -449,9 +486,10 @@ class RuntimeJobsService : Service() {
         internal fun activeUpdateInfo(context: Context): UpdateInfo? = synchronized(LOCK) {
             val jobs = load(context)
             (jobs.lastOrNull {
-                it.optString("kind") == "updateDownload" && it.optString("status") in setOf("queued", "running", "cancelling")
+                it.optString("kind") == "updateDownload" && !it.optBoolean("targetInstalled") &&
+                    it.optString("status") in setOf("queued", "running", "cancelling")
             } ?: jobs.lastOrNull {
-                it.optString("kind") == "updateDownload" && !it.optBoolean("presented") &&
+                it.optString("kind") == "updateDownload" && !it.optBoolean("targetInstalled") && !it.optBoolean("presented") &&
                     it.optString("status") in setOf("cancelled", "cancelError")
             })?.let(::updateInfo)
         }
@@ -498,13 +536,16 @@ class RuntimeJobsService : Service() {
             return synchronized(LOCK) {
                 val all = load(context)
                 val job = all.lastOrNull {
-                    it.optString("kind") == "updateDownload" && it.optString("status") in setOf("queued", "running", "cancelling")
+                    it.optString("kind") == "updateDownload" && !it.optBoolean("targetInstalled") &&
+                        it.optString("status") in setOf("queued", "running", "cancelling")
                 } ?: id?.let { selectedId -> all.firstOrNull {
-                    it.optString("id") == selectedId && it.optString("kind") == "updateDownload" && !it.optBoolean("presented")
+                    it.optString("id") == selectedId && it.optString("kind") == "updateDownload" &&
+                        !it.optBoolean("targetInstalled") && !it.optBoolean("presented")
                 } } ?: all.lastOrNull {
-                    it.optString("kind") == "updateDownload" && !it.optBoolean("presented")
+                    it.optString("kind") == "updateDownload" && !it.optBoolean("targetInstalled") && !it.optBoolean("presented")
                 }
                     ?: return@synchronized null
+                if (retireIfInstalled(context, all, job)) return@synchronized null
                 var changed = false
                 if (job.has("dialogDismissed")) {
                     job.remove("dialogDismissed")
@@ -532,6 +573,8 @@ class RuntimeJobsService : Service() {
             val all = load(context)
             val job = all.firstOrNull { it.getString("id") == id } ?: return@synchronized false
             if (job.getString("status") != "complete" || job.optBoolean("cancelRequested")) return@synchronized false
+            if (job.getString("kind") == "updateDownload" &&
+                (job.optBoolean("targetInstalled") || retireIfInstalled(context, all, job))) return@synchronized false
             val redelivery = job.getString("kind") == "updateDownload" && job.optBoolean("installerClaimed") &&
                 job.optBoolean("installerReopenPending") && job.optInt("installerClaimedPid", -1) == callerPid
             if (job.getString("kind") == "updateDownload" && job.optBoolean("installerClaimed") && !redelivery) {
@@ -606,6 +649,7 @@ class RuntimeJobsService : Service() {
                     ?: return@synchronized "NOT_FOUND"
                 val status = job.getString("status")
                 if (status == "cancelled") return@synchronized "CANCELLED"
+                if (job.optBoolean("targetInstalled")) return@synchronized "NOT_CANCELLABLE"
                 if (job.optBoolean("installerClaimed")) return@synchronized "INSTALLER_CLAIMED"
                 if (status !in setOf("queued", "running", "complete", "cancelling", "cancelError")) {
                     return@synchronized "NOT_CANCELLABLE"
@@ -663,7 +707,22 @@ class RuntimeJobsService : Service() {
                 (job.optString("kind") == "updateDownload" && job.optBoolean("cancelRequested"))) {
                 return@synchronized false
             }
-            job.put("status", "complete").put("result", result)
+            val storedResult = JSONObject(result.toString())
+            if (job.optString("kind") == "updateDownload") {
+                val target = storedResult.optJSONObject("targetApk")
+                    ?: error("Verified update identity missing from completion")
+                val packageName = target.getString("package")
+                val versionCode = target.getLong("versionCode")
+                val signers = target.getJSONArray("signers")
+                check(packageName.isNotBlank() && versionCode > 0L && signers.length() > 0) {
+                    "Verified update identity is incomplete"
+                }
+                job.put("targetPackage", packageName)
+                    .put("targetVersionCode", versionCode)
+                    .put("targetSignerDigests", signers)
+                storedResult.remove("targetApk")
+            }
+            job.put("status", "complete").put("result", storedResult)
             save(context, all)
             true
         }
@@ -743,18 +802,180 @@ class RuntimeJobsService : Service() {
             }
         }
 
+        private fun cleanupUpdateArtifacts(context: Context) {
+            try {
+                cleanupTerminalUpdateArtifacts(context)
+                cleanupInstalledUpdateArtifacts(context)
+            } catch (error: Exception) {
+                android.util.Log.w("RuntimeJobs", "Update artifact cleanup failed", error)
+            }
+        }
+
+        private fun cleanupInstalledUpdateArtifacts(context: Context) {
+            val verifier = UpdateApkVerifier(context)
+            val installed = verifier.installedIdentity() ?: return
+            if (installed.packageName != context.packageName || installed.versionCode <= 0L || installed.signerDigests.isEmpty()) {
+                android.util.Log.w("RuntimeJobs", "Preserving update artifacts: installed package identity is incomplete")
+                return
+            }
+            val jobs = synchronized(LOCK) {
+                load(context).filter { it.optString("kind") == "updateDownload" }.associateBy { it.optString("id") }
+            }
+            val cacheRoot = File(context.cacheDir, "updates")
+            val cacheParent = context.cacheDir.canonicalFile
+            cleanUpdateArtifactRoot(context, verifier, installed, jobs, cacheRoot, cacheParent, "runtime-")
+            val externalParent = context.getExternalFilesDir(null)
+            val externalRoot = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+            if (externalParent != null && externalRoot != null) {
+                cleanUpdateArtifactRoot(context, verifier, installed, jobs, externalRoot,
+                    externalParent.canonicalFile, "bydcollector-")
+            }
+        }
+
+        private fun cleanUpdateArtifactRoot(
+            context: Context,
+            verifier: UpdateApkVerifier,
+            installed: UpdateApkIdentity,
+            jobs: Map<String, JSONObject>,
+            root: File,
+            expectedParent: File,
+            prefix: String
+        ) {
+            try {
+                val canonicalRoot = root.canonicalFile
+                if (canonicalRoot.parentFile != expectedParent || canonicalRoot.name != root.name) {
+                    android.util.Log.w("RuntimeJobs", "Preserving update artifacts: unexpected directory ${root.name}")
+                    return
+                }
+                root.listFiles()?.forEach { file ->
+                    val id = updateArtifactId(file.name, prefix) ?: return@forEach
+                    try {
+                        val canonicalFile = file.canonicalFile
+                        if (file.absoluteFile.parentFile?.canonicalFile != canonicalRoot ||
+                            canonicalFile != File(canonicalRoot, file.name) || !file.isFile) return@forEach
+                        val owner = jobs[id]
+                        if (owner?.let(::downloadOrCancellationActive) == true) return@forEach
+                        val archived = verifier.archiveIdentity(file) ?: run {
+                            android.util.Log.w("RuntimeJobs", "Preserving unverified update artifact ${file.name}")
+                            return@forEach
+                        }
+                        if (!isInstalledAtLeast(installed, archived)) return@forEach
+                        if (owner != null && hasStoredTarget(owner) && storedTarget(owner) != archived) {
+                            android.util.Log.w("RuntimeJobs", "Preserving update artifact with mismatched job identity ${file.name}")
+                            return@forEach
+                        }
+                        removeInstalledUpdateArtifact(context, verifier, root, expectedParent, file, id, archived)
+                    } catch (error: Exception) {
+                        android.util.Log.w("RuntimeJobs", "Could not inspect update artifact ${file.name}", error)
+                    }
+                }
+            } catch (error: Exception) {
+                android.util.Log.w("RuntimeJobs", "Could not scan update artifact directory ${root.name}", error)
+            }
+        }
+
+        private fun removeInstalledUpdateArtifact(
+            context: Context,
+            verifier: UpdateApkVerifier,
+            root: File,
+            expectedParent: File,
+            file: File,
+            id: String,
+            archived: UpdateApkIdentity
+        ) = synchronized(LOCK) {
+            val canonicalRoot = root.canonicalFile
+            if (canonicalRoot.parentFile != expectedParent || canonicalRoot.name != root.name ||
+                file.absoluteFile.parentFile?.canonicalFile != canonicalRoot ||
+                file.canonicalFile != File(canonicalRoot, file.name)) return@synchronized
+            val all = load(context)
+            val owner = all.firstOrNull { it.optString("id") == id && it.optString("kind") == "updateDownload" }
+            if (owner?.let(::downloadOrCancellationActive) == true) return@synchronized
+            val currentInstalled = verifier.installedIdentity() ?: return@synchronized
+            if (!isInstalledAtLeast(currentInstalled, archived)) return@synchronized
+            if (owner != null && hasStoredTarget(owner) && storedTarget(owner) != archived) return@synchronized
+            if (owner != null) {
+                storeTarget(owner, archived)
+                retireInstalledUpdateJob(owner, currentInstalled.versionCode)
+                save(context, all)
+            }
+            deleteExact(file)
+        }
+
+        private fun downloadOrCancellationActive(job: JSONObject): Boolean =
+            job.optString("status") in setOf("queued", "running", "cancelling", "cancelError") ||
+                job.optLong("downloadId", -1L) > 0L
+
+        private fun updateArtifactId(fileName: String, prefix: String): String? {
+            if (!fileName.startsWith(prefix) || !fileName.endsWith(".apk")) return null
+            val token = fileName.removePrefix(prefix).removeSuffix(".apk")
+            val id = runCatching { UUID.fromString(token) }.getOrNull()?.toString() ?: return null
+            return id.takeIf { it == token }
+        }
+
+        private fun hasStoredTarget(job: JSONObject): Boolean =
+            job.has("targetPackage") || job.has("targetVersionCode") || job.has("targetSignerDigests")
+
+        private fun storedTarget(job: JSONObject): UpdateApkIdentity? {
+            if (!job.has("targetPackage") || !job.has("targetVersionCode") || !job.has("targetSignerDigests")) return null
+            val packageName = job.optString("targetPackage").takeIf(String::isNotBlank) ?: return null
+            val versionCode = job.optLong("targetVersionCode", -1L).takeIf { it > 0L } ?: return null
+            val signers = job.optJSONArray("targetSignerDigests") ?: return null
+            val digests = (0 until signers.length()).map { signers.optString(it) }.toSet()
+            if (digests.isEmpty() || digests.any { !it.matches(Regex("[a-f0-9]{64}")) }) return null
+            return UpdateApkIdentity(packageName, versionCode, digests)
+        }
+
+        private fun storeTarget(job: JSONObject, target: UpdateApkIdentity) {
+            job.put("targetPackage", target.packageName)
+                .put("targetVersionCode", target.versionCode)
+                .put("targetSignerDigests", JSONArray(target.signerDigests.sorted()))
+        }
+
+        private fun identityForJob(context: Context, job: JSONObject): UpdateApkIdentity? {
+            if (hasStoredTarget(job)) return storedTarget(job)
+            val id = job.optString("id").takeIf(String::isNotBlank) ?: return null
+            if (updateArtifactId("runtime-$id.apk", "runtime-") != id) return null
+            return UpdateApkVerifier(context).archiveIdentity(File(context.cacheDir, "updates/runtime-$id.apk"))
+        }
+
+        private fun isInstalledAtLeast(installed: UpdateApkIdentity, archived: UpdateApkIdentity): Boolean =
+            installed.packageName == archived.packageName && installed.versionCode >= archived.versionCode &&
+                installed.signerDigests.isNotEmpty() && installed.signerDigests == archived.signerDigests
+
+        private fun retireInstalledUpdateJob(job: JSONObject, installedVersionCode: Long) {
+            job.put("targetInstalled", true).put("installedVersionCode", installedVersionCode)
+            job.remove("result")
+            job.remove("installerClaimed")
+            job.remove("installerClaimedPid")
+            job.remove("installerReopenPending")
+            job.remove("installerRedeliveryInProgress")
+        }
+
+        private fun retireIfInstalled(context: Context, all: List<JSONObject>, job: JSONObject): Boolean {
+            if (job.optBoolean("targetInstalled")) return true
+            if (job.optString("kind") != "updateDownload" ||
+                job.optString("status") in setOf("queued", "running", "cancelling", "cancelError")) return false
+            val target = identityForJob(context, job) ?: return false
+            val installed = UpdateApkVerifier(context).installedIdentity() ?: return false
+            if (!isInstalledAtLeast(installed, target)) return false
+            storeTarget(job, target)
+            retireInstalledUpdateJob(job, installed.versionCode)
+            save(context, all)
+            return true
+        }
+
         private fun markCancellationCleanupFailure(context: Context, id: String, error: Throwable) = synchronized(LOCK) {
             val all = load(context)
             val job = all.firstOrNull { it.optString("id") == id } ?: return@synchronized
             job.put("status", "cancelError")
                 .put("cancelRequested", true)
-                .put("cancelCleanupError", "${error.javaClass.simpleName}: ${error.message.orEmpty().take(300)}")
+                .put("cancelCleanupError", conciseRuntimeJobError(error))
             save(context, all)
             RuntimeEndpoint.changed(context)
         }
 
         private fun deleteExact(file: File) {
-            check(!file.exists() || file.delete()) { "Could not remove ${file.name}" }
+            check(!file.exists() || file.delete() || !file.exists()) { "Could not remove ${file.name}" }
         }
 
         private fun file(context: Context) = AtomicFile(File(context.filesDir, "runtime_jobs.json"))
@@ -768,13 +989,20 @@ class RuntimeJobsService : Service() {
         }
         private fun save(context: Context, jobs: List<JSONObject>) {
             val pending = jobs.filter { it.getString("status") in setOf("queued", "running", "cancelling", "cancelError") }
-            val terminal = jobs.filterNot { it in pending }.takeLast(64)
+            val updateOwners = jobs.filter { job ->
+                job.optString("kind") == "updateDownload" &&
+                    (job.optLong("downloadId", -1L) > 0L || job.optBoolean("installerClaimed") ||
+                        job.optBoolean("installerReopenPending") || job.optBoolean("installerRedeliveryInProgress") ||
+                        File(context.cacheDir, "updates/runtime-${job.optString("id")}.apk").exists())
+            }
+            val terminal = jobs.filterNot { it in pending || it in updateOwners }.takeLast(64)
+            val retained = terminal + updateOwners.filterNot { it in pending } + pending
             val target = file(context)
             val output = target.startWrite()
             try {
-                output.write(JSONArray(terminal + pending).toString().toByteArray(Charsets.UTF_8))
+                output.write(JSONArray(retained).toString().toByteArray(Charsets.UTF_8))
                 target.finishWrite(output)
-                cached = (terminal + pending).map { JSONObject(it.toString()) }.toMutableList()
+                cached = retained.map { JSONObject(it.toString()) }.toMutableList()
             } catch (error: Exception) { target.failWrite(output); throw error }
         }
         private fun change(context: Context, id: String, update: (JSONObject) -> Unit) = synchronized(LOCK) {

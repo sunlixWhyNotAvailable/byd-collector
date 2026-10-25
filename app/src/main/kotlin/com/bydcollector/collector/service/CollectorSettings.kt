@@ -5,6 +5,8 @@ import android.content.SharedPreferences
 import android.os.Bundle
 import org.json.JSONArray
 import org.json.JSONObject
+import org.json.JSONTokener
+import java.math.BigDecimal
 import com.bydcollector.collector.update.UpdateHintAppearance
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.polling.LivePollSource
@@ -24,6 +26,9 @@ import com.bydcollector.collector.maintenance.ArchiveStorageJobMode
 import com.bydcollector.collector.maintenance.ArchiveStorageJobStatus
 import com.bydcollector.collector.maintenance.ArchiveStorageItemPhase
 import com.bydcollector.collector.maintenance.ArchiveStorageItemState
+import com.bydcollector.collector.maintenance.ArchiveStorageRetryPolicy
+import com.bydcollector.collector.maintenance.ArchiveStorageItemsException
+import com.bydcollector.collector.maintenance.ArchiveStorageItemsRead
 import com.bydcollector.collector.maintenance.DbMaintenanceOperation
 import com.bydcollector.collector.maintenance.DbMaintenanceRuntimeStatus
 import com.bydcollector.collector.maintenance.StorageFormat
@@ -893,7 +898,9 @@ class CollectorSettings(
         return ArchiveStorageSettingsStore.readJobStatus(prefs)
     }
 
-    fun archiveStorageItems(): List<ArchiveStorageItemState> = ArchiveStorageSettingsStore.readItems(prefs)
+    fun archiveStorageItemsRead(): ArchiveStorageItemsRead = ArchiveStorageSettingsStore.readItems(prefs)
+
+    fun archiveStorageItems(): List<ArchiveStorageItemState> = archiveStorageItemsRead().requireItems()
 
     fun archiveStorageAuditOperationId(): String? =
         ArchiveStorageSettingsStore.pendingAuditOperationId(prefs)
@@ -907,8 +914,11 @@ class CollectorSettings(
         itemState: ArchiveStorageItemState? = null
     ): Boolean = ArchiveStorageSettingsStore.publishProgress(prefs, operationId, status, itemState)
 
-    fun queueArchiveStorageItems(operationId: String, archiveIds: Collection<String>): Boolean =
-        ArchiveStorageSettingsStore.queueItems(prefs, operationId, archiveIds)
+    fun queueArchiveStorageItems(
+        operationId: String,
+        archiveIds: Collection<String>,
+        mode: ArchiveStorageJobMode = ArchiveStorageJobMode.COMPRESS
+    ): Boolean = ArchiveStorageSettingsStore.queueItems(prefs, operationId, archiveIds, mode)
 
     fun reconcileArchiveStorageItems(
         operationId: String,
@@ -926,6 +936,46 @@ class CollectorSettings(
 
     fun recoverArchiveStorageAfterProcessRestart(operationId: String): String? =
         ArchiveStorageSettingsStore.recoverAfterProcessRestart(prefs, operationId)
+
+    fun prepareArchiveStorageRetryMetadata(nowMs: Long): List<ArchiveStorageItemState> =
+        ArchiveStorageSettingsStore.prepareRetryMetadata(prefs, nowMs)
+
+    fun hasUnfinishedArchiveStorageWork(): Boolean {
+        val items = archiveStorageItems()
+        return archiveStorageJobStatus().running || items.any { it.phase.inProgress }
+    }
+
+    fun nextAutomaticArchiveStorageRetryAtMs(nowMs: Long, rawArchiveIds: Set<String>): Long? =
+        prepareArchiveStorageRetryMetadata(nowMs)
+            .asSequence()
+            .filter { it.archiveId in rawArchiveIds && it.automaticRetryAtMs != null }
+            .filter { it.phase == ArchiveStorageItemPhase.FAILED &&
+                it.operationMode == ArchiveStorageJobMode.COMPRESS &&
+                it.automaticRetryCount < ArchiveStorageRetryPolicy.MAX_AUTOMATIC_RETRIES }
+            .mapNotNull(ArchiveStorageItemState::automaticRetryAtMs)
+            .minOrNull()
+
+    fun claimAutomaticArchiveStorageRetries(
+        operationId: String,
+        archiveIds: Collection<String>,
+        nowMs: Long
+    ): Set<String> {
+        if (archiveRetryBlocked()) return emptySet()
+        return ArchiveStorageSettingsStore.claimRetries(prefs, operationId, archiveIds, nowMs, manual = false)
+    }
+
+    fun claimManualArchiveStorageRetries(
+        operationId: String,
+        archiveIds: Collection<String>,
+        nowMs: Long
+    ): Set<String> {
+        if (archiveRetryBlocked()) return emptySet()
+        return ArchiveStorageSettingsStore.claimRetries(prefs, operationId, archiveIds, nowMs, manual = true)
+    }
+
+    private fun archiveRetryBlocked(): Boolean =
+        isUserShutdownRequested() || CollectorService.isMaintenanceRunningInProcess() || DatabaseMaintenanceService.isRunning() ||
+            isDbMaintenanceRunning(appContext) || storageCutoverJournal() != null
 
     fun dbMaintenanceStatus(): DbMaintenanceRuntimeStatus {
         return DbMaintenanceRuntimeStatus(
@@ -1750,9 +1800,101 @@ internal object ArchiveStorageSettingsStore {
         )
     }
 
-    fun readItems(prefs: SharedPreferences): List<ArchiveStorageItemState> = synchronized(lock) {
-        decodeItems(prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_ITEM_STATES, null))
+    fun readItems(prefs: SharedPreferences): ArchiveStorageItemsRead = synchronized(lock) {
+        val key = CollectorSettings.KEY_ARCHIVE_STORAGE_ITEM_STATES
+        if (!prefs.contains(key)) return@synchronized ArchiveStorageItemsRead.Missing
+        val raw = prefs.all[key]
+        if (raw !is String) {
+            return@synchronized ArchiveStorageItemsRead.Corrupt(
+                raw,
+                IllegalStateException("$key must contain a String; found ${raw?.javaClass?.name ?: "null"}")
+            )
+        }
+        try {
+            ArchiveStorageItemsRead.Valid(decodeItems(raw))
+        } catch (error: Exception) {
+            ArchiveStorageItemsRead.Corrupt(raw, error)
+        }
     }
+
+    fun prepareRetryMetadata(prefs: SharedPreferences, nowMs: Long): List<ArchiveStorageItemState> = synchronized(lock) {
+        require(nowMs >= 0L)
+        val items = readItemsForWrite(prefs)
+        val job = readJobStatus(prefs)
+        var changed = false
+        val normalized = items.values.map { state ->
+            if (state.phase != ArchiveStorageItemPhase.FAILED) return@map state
+            val matchingJob = job.takeIf {
+                it.operationId == state.operationId && it.itemId == state.archiveId &&
+                    it.phase == ArchiveStorageItemPhase.FAILED
+            }
+            val mode = state.operationMode ?: matchingJob?.mode
+            val retryAt = state.automaticRetryAtMs
+                ?: ArchiveStorageRetryPolicy.deadlineAfterFailure(
+                    state.completedAtMs ?: state.updatedAtMs,
+                    state.automaticRetryCount
+                )
+            val normalizedState = state.copy(
+                operationMode = mode,
+                automaticRetryAtMs = retryAt.takeIf {
+                    state.automaticRetryCount < ArchiveStorageRetryPolicy.MAX_AUTOMATIC_RETRIES
+                }
+            )
+            if (normalizedState != state) changed = true
+            normalizedState
+        }
+        if (changed) {
+            check(prefs.edit()
+                .putString(CollectorSettings.KEY_ARCHIVE_STORAGE_ITEM_STATES, encodeItems(normalized))
+                .commit()) { "Could not persist archive retry metadata" }
+        }
+        normalized
+    }
+
+    fun claimRetries(
+        prefs: SharedPreferences,
+        operationId: String,
+        archiveIds: Collection<String>,
+        nowMs: Long,
+        manual: Boolean
+    ): Set<String> = synchronized(lock) {
+        require(nowMs >= 0L)
+        val job = readJobStatus(prefs)
+        if (!job.running || job.operationId != operationId) return@synchronized emptySet()
+        val items = readItemsForWrite(prefs)
+        val claimed = linkedSetOf<String>()
+        archiveIds.asSequence().filter(::isRecognizedArchiveId).distinct().forEach { archiveId ->
+            val state = items[archiveId] ?: return@forEach
+            val eligible = if (manual) {
+                state.phase == ArchiveStorageItemPhase.FAILED &&
+                    (state.operationMode == null || state.operationMode == ArchiveStorageJobMode.COMPRESS)
+            } else {
+                ArchiveStorageRetryPolicy.isAutomaticRetryDue(state, nowMs)
+            }
+            if (!eligible) return@forEach
+            items[archiveId] = state.copy(
+                operationId = operationId,
+                phase = ArchiveStorageItemPhase.QUEUED,
+                startedAtMs = nowMs,
+                updatedAtMs = nowMs,
+                completedAtMs = null,
+                error = null,
+                operationMode = ArchiveStorageJobMode.COMPRESS,
+                automaticRetryCount = state.automaticRetryCount + if (manual) 0 else 1,
+                automaticRetryAtMs = null
+            )
+            claimed += archiveId
+        }
+        if (claimed.isNotEmpty()) {
+            check(prefs.edit()
+                .putString(CollectorSettings.KEY_ARCHIVE_STORAGE_ITEM_STATES, encodeItems(items.values))
+                .commit()) { "Could not persist archive retry claim" }
+        }
+        claimed
+    }
+
+    private fun readItemsForWrite(prefs: SharedPreferences): LinkedHashMap<String, ArchiveStorageItemState> =
+        readItems(prefs).requireItems().associateByTo(linkedMapOf(), ArchiveStorageItemState::archiveId)
 
     fun pendingAuditOperationId(prefs: SharedPreferences): String? =
         prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_AUDIT_PENDING_OPERATION_ID, null)
@@ -1789,35 +1931,52 @@ internal object ArchiveStorageSettingsStore {
     ): Boolean = synchronized(lock) {
         val current = readJobStatus(prefs)
         if (current.operationId != operationId || !current.running) return@synchronized false
-        val now = System.currentTimeMillis()
+        val now = status.updatedAtMs.takeIf { it > 0L } ?: System.currentTimeMillis()
+        val items = if (itemState != null && isRecognizedArchiveId(itemState.archiveId)) {
+            readItemsForWrite(prefs)
+        } else null
         val editor = prefs.edit()
         writeJobStatus(editor, status.copy(running = true, operationId = operationId, updatedAtMs = now), operationId)
-        if (itemState != null && isRecognizedArchiveId(itemState.archiveId)) {
-            val items = decodeItems(prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_ITEM_STATES, null))
-                .associateByTo(linkedMapOf()) { it.archiveId }
+        if (itemState != null && items != null) {
             val previous = items[itemState.archiveId]
             val sameOwner = previous?.operationId == operationId
             val terminal = itemState.phase == ArchiveStorageItemPhase.READY ||
                 itemState.phase == ArchiveStorageItemPhase.FAILED ||
                 itemState.phase == ArchiveStorageItemPhase.DELETED
+            val mode = status.mode ?: previous?.operationMode ?: itemState.operationMode
+            val retryCount = if (terminal && itemState.phase in setOf(
+                    ArchiveStorageItemPhase.READY,
+                    ArchiveStorageItemPhase.DELETED
+                )) 0 else previous?.automaticRetryCount ?: itemState.automaticRetryCount
             items[itemState.archiveId] = itemState.copy(
                 operationId = operationId,
                 startedAtMs = previous?.startedAtMs?.takeIf { sameOwner } ?: now,
                 updatedAtMs = now,
                 completedAtMs = if (terminal) now else null,
-                error = itemState.error?.take(MAX_ERROR_LENGTH)
+                error = itemState.error?.take(MAX_ERROR_LENGTH),
+                operationMode = mode,
+                automaticRetryCount = retryCount,
+                automaticRetryAtMs = if (itemState.phase == ArchiveStorageItemPhase.FAILED &&
+                    mode == ArchiveStorageJobMode.COMPRESS
+                ) {
+                    ArchiveStorageRetryPolicy.deadlineAfterFailure(now, retryCount)
+                } else null
             )
             editor.putString(CollectorSettings.KEY_ARCHIVE_STORAGE_ITEM_STATES, encodeItems(items.values))
         }
         editor.commit()
     }
 
-    fun queueItems(prefs: SharedPreferences, operationId: String, archiveIds: Collection<String>): Boolean = synchronized(lock) {
+    fun queueItems(
+        prefs: SharedPreferences,
+        operationId: String,
+        archiveIds: Collection<String>,
+        mode: ArchiveStorageJobMode
+    ): Boolean = synchronized(lock) {
         val current = readJobStatus(prefs)
         if (current.operationId != operationId || !current.running) return@synchronized false
         val now = System.currentTimeMillis()
-        val items = decodeItems(prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_ITEM_STATES, null))
-            .associateByTo(linkedMapOf()) { it.archiveId }
+        val items = readItemsForWrite(prefs)
         archiveIds.filter(::isRecognizedArchiveId).distinct().forEach { archiveId ->
             val previous = items[archiveId]
             val previousPhase = previous?.phase
@@ -1833,7 +1992,10 @@ internal object ArchiveStorageSettingsStore {
                     operationId = operationId,
                     phase = ArchiveStorageItemPhase.QUEUED,
                     startedAtMs = now,
-                    updatedAtMs = now
+                    updatedAtMs = now,
+                    operationMode = previous?.operationMode ?: mode,
+                    automaticRetryCount = previous?.automaticRetryCount ?: 0,
+                    automaticRetryAtMs = previous?.automaticRetryAtMs
                 )
             }
         }
@@ -1852,8 +2014,7 @@ internal object ArchiveStorageSettingsStore {
         val scanned = reconciliation.itemStates.filter {
             it.archiveId in reconciliation.knownArchiveIds && isRecognizedArchiveId(it.archiveId)
         }.associateBy { it.archiveId }
-        val currentItems = decodeItems(prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_ITEM_STATES, null))
-            .associateByTo(linkedMapOf()) { it.archiveId }
+        val currentItems = readItemsForWrite(prefs)
         val source = reconciliation.sourceItemStates
             ?.associateBy { it.archiveId }
             ?: currentItems
@@ -1878,8 +2039,7 @@ internal object ArchiveStorageSettingsStore {
         val activeOwner = readJobStatus(prefs).takeIf { it.running }?.operationId
         val selectedId = pendingAuditOperationId(prefs) ?: operationId
         val now = System.currentTimeMillis()
-        val items = decodeItems(prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_ITEM_STATES, null))
-            .associateByTo(linkedMapOf()) { it.archiveId }
+        val items = readItemsForWrite(prefs)
         archiveIds.filter(::isRecognizedArchiveId).distinct().forEach { archiveId ->
             val previous = items[archiveId]
             if (previous?.operationId != activeOwner) {
@@ -1933,7 +2093,29 @@ internal object ArchiveStorageSettingsStore {
 
     fun recoverAfterProcessRestart(prefs: SharedPreferences, recoveryOperationId: String): String? = synchronized(lock) {
         val status = readJobStatus(prefs)
-        val items = decodeItems(prefs.getString(CollectorSettings.KEY_ARCHIVE_STORAGE_ITEM_STATES, null))
+        val read = readItems(prefs)
+        if (read is ArchiveStorageItemsRead.Corrupt) {
+            if (status.running) {
+                val editor = prefs.edit()
+                writeJobStatus(
+                    editor,
+                    status.copy(
+                        running = false,
+                        phase = ArchiveStorageItemPhase.FAILED,
+                        error = "archive_item_state_unavailable",
+                        messageUk = "Неможливо відновити архівну операцію: стан пошкоджено",
+                        messageEn = "Could not recover archive operation: item state is corrupt",
+                        updatedAtMs = System.currentTimeMillis()
+                    ),
+                    status.operationId ?: recoveryOperationId
+                )
+                if (!editor.commit()) {
+                    read.error.addSuppressed(IllegalStateException("Could not persist failed archive recovery status"))
+                }
+            }
+            throw ArchiveStorageItemsException(read.raw, read.error)
+        }
+        val items = read.requireItems()
         val interrupted = status.running || items.any { it.phase.inProgress }
         val pending = pendingAuditOperationId(prefs)
             ?: status.operationId.takeIf { status.running }
@@ -1982,32 +2164,135 @@ internal object ArchiveStorageSettingsStore {
         }
     }
 
-    private fun decodeItems(raw: String?): List<ArchiveStorageItemState> = runCatching {
-        val json = JSONArray(raw.orEmpty())
-        buildList {
+    private fun decodeItems(raw: String): List<ArchiveStorageItemState> {
+        val tokener = JSONTokener(raw)
+        val root = tokener.nextValue()
+        require(root is JSONArray) { "archive item state root must be an array" }
+        require(tokener.nextClean() == '\u0000') { "trailing data after archive item state array" }
+        val json = root as JSONArray
+        val ids = hashSetOf<String>()
+        return buildList {
             for (index in 0 until json.length()) {
-                val item = json.optJSONObject(index) ?: continue
-                val archiveId = item.optString("archiveId")
-                val operationId = item.optString("operationId")
-                val phase = item.optString("phase")
-                    .let { value -> runCatching { ArchiveStorageItemPhase.valueOf(value) }.getOrNull() }
-                if (!isRecognizedArchiveId(archiveId) || operationId.isBlank() || phase == null) continue
-                add(
-                    ArchiveStorageItemState(
-                        archiveId = archiveId,
-                        operationId = operationId,
-                        phase = phase,
-                        stepIndex = item.optInt("stepIndex"),
-                        stepCount = item.optInt("stepCount"),
-                        startedAtMs = item.optLong("startedAtMs"),
-                        updatedAtMs = item.optLong("updatedAtMs"),
-                        completedAtMs = if (item.isNull("completedAtMs")) null else item.optLong("completedAtMs"),
-                        error = if (item.isNull("error")) null else item.optString("error").take(MAX_ERROR_LENGTH)
+                val value = json.get(index)
+                try {
+                    require(value is JSONObject) { "must be an object" }
+                    val item = value as JSONObject
+                    val archiveId = item.requiredString("archiveId")
+                    require(isRecognizedArchiveId(archiveId)) { "archiveId is invalid" }
+                    require(ids.add(archiveId)) { "duplicate archiveId" }
+                    val operationId = item.requiredString("operationId")
+                    require(operationId.isNotBlank()) { "operationId is blank" }
+                    val phaseName = item.requiredString("phase")
+                    val phase = try {
+                        ArchiveStorageItemPhase.valueOf(phaseName)
+                    } catch (error: IllegalArgumentException) {
+                        throw IllegalArgumentException("phase is invalid", error)
+                    }
+                    val stepIndex = item.requiredInt("stepIndex")
+                    val stepCount = item.requiredInt("stepCount")
+                    val startedAtMs = item.requiredLong("startedAtMs")
+                    val updatedAtMs = item.requiredLong("updatedAtMs")
+                    val completedAtMs = item.nullableLong("completedAtMs")
+                    val itemError = item.nullableString("error")
+                    val operationMode = item.optionalString("operationMode")?.let { modeName ->
+                        try {
+                            ArchiveStorageJobMode.valueOf(modeName)
+                        } catch (error: IllegalArgumentException) {
+                            throw IllegalArgumentException("operationMode is invalid", error)
+                        }
+                    }
+                    val automaticRetryCount = if (item.has("automaticRetryCount")) {
+                        item.requiredInt("automaticRetryCount")
+                    } else 0
+                    val automaticRetryAtMs = item.optionalLong("automaticRetryAtMs")
+                    require(stepIndex >= 0 && stepCount >= 0) { "negative step count" }
+                    require(startedAtMs >= 0L && updatedAtMs >= 0L && (completedAtMs == null || completedAtMs >= 0L)) {
+                        "negative timestamp"
+                    }
+                    require(automaticRetryCount in 0..ArchiveStorageRetryPolicy.MAX_AUTOMATIC_RETRIES) {
+                        "automaticRetryCount is outside supported range"
+                    }
+                    require(automaticRetryAtMs == null || automaticRetryAtMs >= 0L) { "negative retry timestamp" }
+                    require(automaticRetryCount < ArchiveStorageRetryPolicy.MAX_AUTOMATIC_RETRIES || automaticRetryAtMs == null) {
+                        "automatic retry deadline exists after retry budget was exhausted"
+                    }
+                    require(itemError == null || itemError.length <= MAX_ERROR_LENGTH) { "error is too long" }
+                    add(
+                        ArchiveStorageItemState(
+                            archiveId = archiveId,
+                            operationId = operationId,
+                            phase = phase,
+                            stepIndex = stepIndex,
+                            stepCount = stepCount,
+                            startedAtMs = startedAtMs,
+                            updatedAtMs = updatedAtMs,
+                            completedAtMs = completedAtMs,
+                            error = itemError,
+                            operationMode = operationMode,
+                            automaticRetryCount = automaticRetryCount,
+                            automaticRetryAtMs = automaticRetryAtMs
+                        )
                     )
-                )
+                } catch (error: Exception) {
+                    throw IllegalArgumentException(
+                        "archive item[$index] is invalid: ${error.message ?: error.javaClass.simpleName}",
+                        error
+                    )
+                }
             }
-        }.distinctBy { it.archiveId }
-    }.getOrDefault(emptyList())
+        }
+    }
+
+    private fun JSONObject.requiredString(name: String): String {
+        require(has(name)) { "missing $name" }
+        val value = get(name)
+        require(value is String) { "$name must be a string" }
+        return value as String
+    }
+
+    private fun JSONObject.requiredInt(name: String): Int {
+        val value = requiredLong(name)
+        require(value in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong()) { "$name is outside Int range" }
+        return value.toInt()
+    }
+
+    private fun JSONObject.requiredLong(name: String): Long {
+        require(has(name)) { "missing $name" }
+        val value = get(name)
+        require(value is Number) { "$name must be a number" }
+        return try {
+            BigDecimal(value.toString()).longValueExact()
+        } catch (error: ArithmeticException) {
+            throw IllegalArgumentException("$name must be an integer in Long range", error)
+        } catch (error: NumberFormatException) {
+            throw IllegalArgumentException("$name must be an integer in Long range", error)
+        }
+    }
+
+    private fun JSONObject.nullableLong(name: String): Long? {
+        require(has(name)) { "missing $name" }
+        if (get(name) == JSONObject.NULL) return null
+        return requiredLong(name)
+    }
+
+    private fun JSONObject.nullableString(name: String): String? {
+        require(has(name)) { "missing $name" }
+        val value = get(name)
+        require(value == JSONObject.NULL || value is String) { "$name must be a string or null" }
+        return (value as? String)
+    }
+
+    private fun JSONObject.optionalString(name: String): String? {
+        if (!has(name)) return null
+        val value = get(name)
+        require(value == JSONObject.NULL || value is String) { "$name must be a string or null" }
+        return (value as? String)
+    }
+
+    private fun JSONObject.optionalLong(name: String): Long? {
+        if (!has(name) || get(name) == JSONObject.NULL) return null
+        return requiredLong(name)
+    }
 
     private fun encodeItems(items: Collection<ArchiveStorageItemState>): String = JSONArray().apply {
         items.asSequence()
@@ -2025,6 +2310,9 @@ internal object ArchiveStorageSettingsStore {
                         .put("updatedAtMs", item.updatedAtMs)
                         .put("completedAtMs", item.completedAtMs ?: JSONObject.NULL)
                         .put("error", item.error?.take(MAX_ERROR_LENGTH) ?: JSONObject.NULL)
+                        .put("operationMode", item.operationMode?.name ?: JSONObject.NULL)
+                        .put("automaticRetryCount", item.automaticRetryCount)
+                        .put("automaticRetryAtMs", item.automaticRetryAtMs ?: JSONObject.NULL)
                 )
             }
     }.toString()

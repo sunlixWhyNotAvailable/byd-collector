@@ -1,6 +1,8 @@
 package com.bydcollector.collector.ui
 
 import com.bydcollector.collector.data.local.CollectorEvent
+import com.bydcollector.collector.data.local.HealthReadAvailability
+import com.bydcollector.collector.data.local.HealthReadError
 import com.bydcollector.collector.data.callback.CallbackQueueState
 import com.bydcollector.collector.maintenance.ArchiveEntryStatus
 import com.bydcollector.collector.maintenance.ArchiveStorageEntry
@@ -54,6 +56,8 @@ data class DashboardState(
     val archiveStorageScanPending: Boolean,
     val archiveStorageJobStatus: ArchiveStorageJobStatus,
     val archiveStorageItemStates: List<ArchiveStorageItemState> = emptyList(),
+    val archiveStorageItemStatesAvailable: Boolean = true,
+    val archiveStorageItemStateError: String? = null,
     val archiveStorageScanError: String? = null,
     val latestSoc: String?,
     val latestSpeed: String?,
@@ -139,7 +143,9 @@ data class DashboardState(
         if (influxEnabled) RuntimeActionStatus.RUNNING else RuntimeActionStatus.STOPPED,
     val mainCallbackQueue: CallbackQueueState? = null,
     val secondaryCallbackQueue: CallbackQueueState? = null,
-    val freshness: DashboardSnapshotFreshness = DashboardSnapshotFreshness()
+    val freshness: DashboardSnapshotFreshness = DashboardSnapshotFreshness(),
+    val healthReadErrors: List<HealthReadError> = emptyList(),
+    val recentEventsAvailability: HealthReadAvailability = HealthReadAvailability.NOT_REQUESTED
 ) : java.io.Serializable
 
 /** Measurement stamps travel with owner snapshots so a delayed IPC result cannot revive old queues. */
@@ -161,24 +167,38 @@ data class DashboardSnapshotFreshness(
     val integrationStorageGeneration: Long = 0L
 ) : java.io.Serializable
 
+internal val INTEGRATION_HEALTH_READ_FIELDS = setOf("mqtt_pending_count", "mqtt_retry_state")
+
+internal fun mergeHealthReadErrors(
+    previous: List<HealthReadError>,
+    next: List<HealthReadError>,
+    replacedFields: Set<String>
+): List<HealthReadError> =
+    (previous.filterNot { it.field in replacedFields } + next.filter { it.field in replacedFields })
+        .distinctBy { it.field }
+
 /** One logical archive backed by zero or more physical raw, temporary, and ZIP entries. */
 internal data class ArchiveStorageRow(
     val key: String,
     val displayName: String,
     val entries: List<ArchiveStorageEntry>,
     val sortTimestampMs: Long,
-    val itemState: ArchiveStorageItemState?
+    val itemState: ArchiveStorageItemState?,
+    val itemStatesAvailable: Boolean
 ) {
     val sizeBytes: Long
         get() = entries.sumOf(ArchiveStorageEntry::sizeBytes)
 
     val deleteEntryIds: List<String>
-        get() = entries.filter { it.deletable && it.status != ArchiveEntryStatus.TMP }.map { it.id }
+        get() = if (itemStatesAvailable) {
+            entries.filter { it.deletable && it.status != ArchiveEntryStatus.TMP }.map { it.id }
+        } else emptyList()
 
     /** Existing, state-free ZIPs remain shareable; all other representations stay protected. */
     val shareEntryId: String?
         get() = entries.singleOrNull()
             ?.takeIf { it.status == ArchiveEntryStatus.COMPRESSED_ZIP }
+            ?.takeIf { itemStatesAvailable }
             ?.takeIf { itemState == null || itemState.phase == ArchiveStorageItemPhase.READY }
             ?.id
 }
@@ -187,7 +207,8 @@ internal data class ArchiveStorageRow(
 internal fun projectArchiveStorageRows(
     snapshot: ArchiveStorageSnapshot,
     itemStates: List<ArchiveStorageItemState>,
-    scanPending: Boolean
+    scanPending: Boolean,
+    itemStatesAvailable: Boolean = true
 ): List<ArchiveStorageRow> {
     val statesById = itemStates
         .groupBy(ArchiveStorageItemState::archiveId)
@@ -208,7 +229,8 @@ internal fun projectArchiveStorageRows(
             displayName = orderedEntries.first().displayName,
             entries = orderedEntries,
             sortTimestampMs = archiveTimestampMs(archiveId),
-            itemState = statesById[archiveId]
+            itemState = statesById[archiveId],
+            itemStatesAvailable = itemStatesAvailable
         )
     }.toMutableList()
 
@@ -222,7 +244,8 @@ internal fun projectArchiveStorageRows(
                     displayName = state.archiveId,
                     entries = emptyList(),
                     sortTimestampMs = archiveTimestampMs(state.archiveId),
-                    itemState = state
+                    itemState = state,
+                    itemStatesAvailable = itemStatesAvailable
                 )
             }
     }

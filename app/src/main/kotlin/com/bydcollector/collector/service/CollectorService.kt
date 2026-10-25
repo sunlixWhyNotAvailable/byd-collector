@@ -41,6 +41,7 @@ import com.bydcollector.collector.data.debug.DirectDebugRoundRobinPoller
 import com.bydcollector.collector.data.debug.DirectDebugStore
 import com.bydcollector.collector.data.debug.SecondaryReplayCoordinator
 import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
+import com.bydcollector.collector.diagnostics.DiagnosticShareSanitizer
 import com.bydcollector.collector.diagnostics.BoundedProcessWindow
 import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
 import com.bydcollector.collector.data.direct.DirectStreamController
@@ -101,6 +102,7 @@ import com.bydcollector.collector.maintenance.ArchiveStorageManager
 import com.bydcollector.collector.maintenance.ArchiveStorageAdmissionKind
 import com.bydcollector.collector.maintenance.ArchiveStorageItemState
 import com.bydcollector.collector.maintenance.ArchiveStorageItemPhase
+import com.bydcollector.collector.maintenance.ArchiveStorageRetryPolicy
 import com.bydcollector.collector.maintenance.ArchiveStorageOperationCoordinator
 import com.bydcollector.collector.maintenance.ArchiveStorageOperationOutcome
 import com.bydcollector.collector.maintenance.ArchiveShareLeaseRegistry
@@ -688,6 +690,7 @@ class CollectorService : Service() {
                 check(CollectorSettings(applicationContext).setUserShutdownRequested(true)) {
                     "Could not persist Shutdown during storage initialization"
                 }
+                CollectorAutoStart.cancelArchiveRetry(applicationContext)
                 pendingStartCommands.clear()
             }
             pendingStartCommands += intent?.let(::Intent)
@@ -2115,6 +2118,7 @@ class CollectorService : Service() {
             return
         }
         maintenanceRuntimeRestoreAllowed.set(false)
+        CollectorAutoStart.cancelArchiveRetry(applicationContext)
         CollectorAutoStart.cancelScheduled(applicationContext)
         val listenerError = disableRecoveryListenerForShutdown()
         stopRuntimeForUserShutdown()
@@ -3865,6 +3869,7 @@ class CollectorService : Service() {
         mqttConnection.reserve()
         mqttTerminalError = false
         mqttWorkGeneration.incrementAndGet()
+        mqttCoordinator.resetStorageRecovery()
         if (clearManualStop) settings.setMqttManuallyStopped(false)
         settings.setMqttEnabled(true)
         setMqttRuntime(RuntimeActionStatus.STARTING)
@@ -3882,6 +3887,7 @@ class CollectorService : Service() {
         com.bydcollector.collector.ha.HaRunSession.process.stop(com.bydcollector.collector.ha.HaExportChannel.MQTT)
         mqttConnection.beginStop()
         mqttWorkGeneration.incrementAndGet()
+        mqttCoordinator.resetStorageRecovery()
         setMqttRuntime(RuntimeActionStatus.STOPPING)
         if (manualStop) settings.setMqttManuallyStopped(true)
         cancelMqttRetry()
@@ -4461,7 +4467,14 @@ class CollectorService : Service() {
 
     private fun postMqttRetrySchedule(submittedGeneration: Long) {
         if (submittedGeneration != mqttWorkGeneration.get()) return
-        val delayMs = try { mqttCoordinator.retryDelayMs() } catch (error: RuntimeException) {
+        val delayMs = try {
+            mqttCoordinator.retryDelayMs { submittedGeneration == mqttWorkGeneration.get() && !settings.isUserShutdownRequested() }
+        } catch (error: RuntimeException) {
+            recordChannelFailure(
+                "mqtt_retry_preparation_error",
+                "MQTT retry preparation failed",
+                error.diagnosticDetail("stage=mqtt_retry_preparation")
+            )
             mainHandler.post { finishMqttFailure(submittedGeneration, "retry_preparation:${error::class.java.simpleName}") }
             return
         }
@@ -4608,6 +4621,7 @@ class CollectorService : Service() {
     ): Boolean {
         val submitted = mqttWorkGeneration.get()
         val terminal = java.util.concurrent.atomic.AtomicReference<String?>(null)
+        val localStorageFailure = AtomicBoolean(false)
         if (settings.isMqttEnabled() && !maintenanceBlocksRuntimeStart()) mqttConnection.reserve()
         return executeChannel(
             channelName = "MQTT",
@@ -4619,7 +4633,14 @@ class CollectorService : Service() {
                 !settings.isUserShutdownRequested() && settings.isMqttEnabled() &&
                     !mqttConnection.stopping && !maintenanceBlocksRuntimeStart()
             },
-            action = action,
+            action = {
+                mqttCoordinator.runWithStorageRecovery(
+                    errorCategory,
+                    isCurrent = { submitted == mqttWorkGeneration.get() && !settings.isUserShutdownRequested() }
+                ) { action() }.also {
+                    localStorageFailure.set(it.category == "mqtt_sqlite_busy" || it.category == "mqtt_storage_error")
+                }
+            },
             onSuccess = { result, submittedGeneration ->
                 if (!result.ok && !result.retryable) terminal.set(result.category)
                 if (submittedGeneration == mqttWorkGeneration.get()) {
@@ -4637,7 +4658,7 @@ class CollectorService : Service() {
             onFailedAction = {
                 if (settings.isMqttEnabled() && !mqttConnection.stopping) {
                     setMqttRuntime(RuntimeActionStatus.ERROR)
-                    if (activateTailscaleOnFailure) maybeActivateTailscaleAfterHaFailure("mqtt")
+                    if (activateTailscaleOnFailure && !localStorageFailure.get()) maybeActivateTailscaleAfterHaFailure("mqtt")
                 }
             }
         ) { result ->
@@ -4941,7 +4962,7 @@ class CollectorService : Service() {
                                 recordChannelFailure(
                                     errorCategory,
                                     "$channelName async action failed",
-                                    "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                                    error.diagnosticDetail("stage=${channelName.lowercase()}_async_action")
                                 )
                                 runCatching { onFailedAction?.invoke() }
                                 onException?.invoke(error)
@@ -4970,7 +4991,7 @@ class CollectorService : Service() {
                 recordChannelFailure(
                     errorCategory,
                     "$channelName async action rejected",
-                    "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                    error.diagnosticDetail("stage=${channelName.lowercase()}_executor_rejection")
                 )
                 runCatching { onFailedAction?.invoke() }
                 onException?.invoke(error)
@@ -4988,11 +5009,28 @@ class CollectorService : Service() {
     )
 
     private fun recordChannelFailure(category: String, message: String, detail: String) {
-        runCatching { store.recordEvent(category, message, detail) }.onFailure {
-            runCatching {
+        val safeDetail = runCatching { DiagnosticShareSanitizer().sanitizeText(detail) }
+            .getOrElse { "[original channel diagnostic withheld; sanitization failed]" }
+        runCatching { store.recordEvent(category, message, safeDetail) }.onFailure {
+            val storageError = it
+            val fallbackDetail = listOfNotNull(
+                safeDetail,
+                storageError.diagnosticDetail("stage=${category}_sqlite_record")
+            ).joinToString("\n")
+            val saved = runCatching {
                 (applicationContext as BydCollectorApplication).operationalEventJournal.tryAppend(
-                    Instant.now().toString(), SystemClock.elapsedRealtime(), category, message, detail
+                    Instant.now().toString(), SystemClock.elapsedRealtime(), category, message, fallbackDetail
                 )
+            }.getOrElse { journalError ->
+                if (journalError !== storageError) storageError.addSuppressed(journalError)
+                false
+            }
+            if (!saved) {
+                val fullFallback = listOfNotNull(
+                    safeDetail,
+                    storageError.diagnosticDetail("stage=${category}_sqlite_or_journal_record")
+                ).joinToString("\n")
+                runCatching { Log.e(TAG, "Could not persist $category failure; original_detail=$fullFallback") }
             }
         }
     }
@@ -5203,28 +5241,71 @@ class CollectorService : Service() {
     }
 
     private fun enqueueArchiveStorageMaintenance(preferredArchivePath: String?, manualRetry: Boolean = false) {
-        val retryIds = if (manualRetry) settings.archiveStorageItems()
-            .filter { it.phase == ArchiveStorageItemPhase.FAILED }.map { it.archiveId } else emptyList()
+        var retryBlocked = false
         enqueueArchiveStorageWork(
             "archive_storage_rejected", ArchiveStorageJobMode.RETENTION,
-            deferIfBusy = true,
-            queuedArchiveIds = listOfNotNull(preferredArchivePath?.let { File(it).name }) + retryIds
+            deferIfBusy = !manualRetry,
+            archiveRetryMinimumDelayMs = {
+                if (retryBlocked) ARCHIVE_RETRY_BLOCKED_DELAY_MS else 0L
+            }
         ) { operationId, publish ->
+            if (archiveStorageRetryBlocked()) {
+                retryBlocked = true
+                return@enqueueArchiveStorageWork
+            }
             val manager = archiveStorageManager()
+            val itemStates = settings.archiveStorageItems()
             val limitBytes = settings.archiveStorageLimitGb() * 1024L * 1024L * 1024L
-            val reconciliation = manager.reconcilePersistedItems(settings.archiveStorageItems())
+            val reconciliation = manager.reconcilePersistedItems(itemStates)
             check(settings.reconcileArchiveStorageItems(operationId, reconciliation)) {
                 "Could not reconcile archive state"
             }
             val pending = checkNotNull(manager.pendingRawArchiveIds()) { "Cannot list pending archives" }
-            val deferred = if (manualRetry) emptySet() else manager.deferredRetryArchiveIds(settings.archiveStorageItems())
-            val eligible = pending.filterNot { it in deferred }
-            check(settings.queueArchiveStorageItems(operationId, eligible)) { "Could not persist archive queue" }
+            val currentStates = settings.archiveStorageItems()
+            val pendingIds = pending.toSet()
+            val failedIds = currentStates.asSequence()
+                .filter { it.phase == ArchiveStorageItemPhase.FAILED && it.archiveId in pendingIds }
+                .mapTo(linkedSetOf()) { it.archiveId }
+            val candidates = currentStates.filter { state ->
+                state.archiveId in failedIds && if (manualRetry) {
+                    state.operationMode == null || state.operationMode == ArchiveStorageJobMode.COMPRESS
+                } else {
+                    ArchiveStorageRetryPolicy.isAutomaticRetryDue(state, System.currentTimeMillis())
+                }
+            }
+            val attempted = linkedSetOf<String>()
+            candidates.forEach { state ->
+                if (archiveFileOperationProtected(state.archiveId)) {
+                    retryBlocked = true
+                    return@forEach
+                }
+                val claimed = if (manualRetry) {
+                    settings.claimManualArchiveStorageRetries(operationId, listOf(state.archiveId), System.currentTimeMillis())
+                } else {
+                    settings.claimAutomaticArchiveStorageRetries(operationId, listOf(state.archiveId), System.currentTimeMillis())
+                }
+                if (state.archiveId !in claimed) {
+                    val latest = settings.archiveStorageItems().firstOrNull { it.archiveId == state.archiveId }
+                    if (latest != null && ArchiveStorageRetryPolicy.isAutomaticRetryDue(latest, System.currentTimeMillis())) {
+                        retryBlocked = true
+                    }
+                    return@forEach
+                }
+                attempted += state.archiveId
+                manager.compressRawArchiveDirectory(File(File(applicationContext.filesDir, "db_archive"), state.archiveId), publish)
+            }
+            val knownIds = currentStates.mapTo(hashSetOf()) { it.archiveId }
+            val newRawIds = pending.filterNot { it in knownIds }
+            check(settings.queueArchiveStorageItems(operationId, newRawIds, ArchiveStorageJobMode.COMPRESS)) {
+                "Could not persist archive queue"
+            }
             dashboardStateProvider.invalidateArchiveStorageSnapshot()
-            // A failed preferred archive is attempted once, not immediately again by the scan.
-            val preferred = preferredArchivePath?.let(::File)?.takeIf { it.name in eligible }
+            val preferred = preferredArchivePath?.let(::File)?.takeIf { it.name in newRawIds }
             preferred?.let { manager.compressRawArchiveDirectory(it, publish) }
-            manager.compressPendingRawArchives(publish, deferred + setOfNotNull(preferred?.name))
+            manager.compressPendingRawArchives(
+                publish,
+                failedIds + attempted + setOfNotNull(preferred?.name)
+            )
             val rawArchives = checkNotNull(manager.pendingRawArchiveIds()) { "Cannot verify remaining archives" }
             // Unverified raw data stays visible, but cannot hold unrelated ready ZIPs above their quota.
             manager.enforceRetention(limitBytes, publish)
@@ -5271,6 +5352,8 @@ class CollectorService : Service() {
             }
         ) { _, publish ->
             val manager = archiveStorageManager()
+            // A corrupt state blob can hide an in-progress archive; fail before releasing leases or deleting files.
+            settings.archiveStorageItems()
             store.recordEvent(
                 "archive_delete_started",
                 "Archive deletion started",
@@ -5304,6 +5387,7 @@ class CollectorService : Service() {
         initialStatus: ArchiveStorageJobStatus? = null,
         deferIfBusy: Boolean = false,
         queuedArchiveIds: List<String> = emptyList(),
+        archiveRetryMinimumDelayMs: () -> Long = { 0L },
         onRejected: () -> Unit = {},
         onFinished: () -> Unit = {},
         work: (String, (ArchiveStorageJobStatus) -> Unit) -> Unit
@@ -5341,9 +5425,16 @@ class CollectorService : Service() {
         )
         fun settle(error: Throwable?, rejected: Boolean = false) {
             if (!settled.compareAndSet(false, true)) return
+            if (error != null) {
+                recordChannelFailure(
+                    "archive_storage_error",
+                    "Archive storage operation failed",
+                    error.diagnosticDetail("stage=archive_storage_operation")
+                )
+            }
             val detail = outcome.terminalError(error)
             val terminal = lastStatus.copy(
-                mode = requestedMode, operationId = operationId, running = false,
+                mode = lastStatus.mode ?: requestedMode, operationId = operationId, running = false,
                 error = detail,
                 phase = if (detail != null) ArchiveStorageItemPhase.FAILED else lastStatus.phase,
                 messageUk = if (detail == null) "Архівну операцію завершено" else "Архівну операцію завершено з помилками",
@@ -5377,6 +5468,17 @@ class CollectorService : Service() {
                     dashboardStateProvider.invalidateArchiveStorageSnapshot()
                     scheduleIntegrationDashboardRefresh()
                 }
+                if (!rejected) {
+                    runCatching {
+                        CollectorAutoStart.scheduleArchiveRetry(applicationContext, archiveRetryMinimumDelayMs())
+                    }.onFailure {
+                        store.recordEvent(
+                            "archive_storage_retry_schedule_error",
+                            "Could not rearm archive retry",
+                            it.diagnosticDetail("stage=archive_retry_after_operation")
+                        )
+                    }
+                }
                 // Only an independently deferred request schedules another audit, never this failure.
                 if (!rejected && deferred != null) {
                     mainHandler.post {
@@ -5399,6 +5501,7 @@ class CollectorService : Service() {
             }
         }
         try {
+            settings.prepareArchiveStorageRetryMetadata(System.currentTimeMillis())
             check(settings.beginArchiveStorageOperation(operationId, lastStatus)) { "Could not persist archive operation owner" }
             store.recordEvent("archive_storage_begin", "Archive storage action accepted",
                 "operation_id=$operationId mode=${requestedMode.name.lowercase()}")
@@ -5486,6 +5589,10 @@ class CollectorService : Service() {
         return maintenanceActive.get() || CollectorSettings.isDbMaintenanceRunning(applicationContext)
     }
 
+    private fun archiveStorageRetryBlocked(): Boolean =
+        settings.isUserShutdownRequested() || settings.dbMaintenanceStatus().running ||
+            isMaintenanceRunningInProcess() || DatabaseMaintenanceService.isRunning()
+
     private fun isRuntimeOwner(): Boolean = Looper.myLooper() == mainHandler.looper
 
     private fun requireRuntimeOwner() {
@@ -5520,10 +5627,23 @@ class CollectorService : Service() {
     }
 
     private fun recoverInterruptedArchiveStorageIfNeeded(action: String) {
-        val pending = synchronized(archiveStorageOperations) {
-            if (archiveStorageOperations.isActive()) return
-            settings.recoverArchiveStorageAfterProcessRestart(UUID.randomUUID().toString())
-        } ?: return
+        val result = runCatching {
+            synchronized(archiveStorageOperations) {
+                if (archiveStorageOperations.isActive()) return
+                settings.recoverArchiveStorageAfterProcessRestart(UUID.randomUUID().toString())
+            }
+        }
+        result.exceptionOrNull()?.let { error ->
+            recordChannelFailure(
+                "archive_storage_recovery_error",
+                "Archive state recovery could not read item metadata",
+                error.diagnosticDetail("stage=archive_storage_recovery_read")
+            )
+            dashboardStateProvider.invalidateArchiveStorageSnapshot()
+            scheduleIntegrationDashboardRefresh()
+            return
+        }
+        val pending = result.getOrNull() ?: return
         runCatching {
             store.recordEvent(
                 "archive_storage_recovery_pending",
@@ -5545,7 +5665,8 @@ class CollectorService : Service() {
                 configProvider = { settings.mqttConfig() }
             ),
             configProvider = { settings.mqttConfig() },
-            publicationJournal = (applicationContext as BydCollectorApplication).mqttPublicationJournal
+            publicationJournal = (applicationContext as BydCollectorApplication).mqttPublicationJournal,
+            storageDiagnostic = { category, detail -> recordChannelFailure(category, "MQTT storage operation failed", detail) }
         )
     }
 
@@ -5706,6 +5827,7 @@ class CollectorService : Service() {
         private const val KPI_PUBLISH_INTERVAL_MS = 1_000L
         private const val KPI_STALE_AFTER_MS = 3_000L
         private const val ACCESS_SELF_CHECK_INTERVAL_MS = 5 * 60_000L
+        private const val ARCHIVE_RETRY_BLOCKED_DELAY_MS = 60_000L
         private const val TELEGRAM_TICK_INTERVAL_MS = 15_000L
         private const val RECOVERY_STARTUP = "startup"
         private const val RECOVERY_STARTUP_CREDENTIALS = "startup_credentials"

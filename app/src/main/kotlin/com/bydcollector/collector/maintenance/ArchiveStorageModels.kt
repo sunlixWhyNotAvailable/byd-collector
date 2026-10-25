@@ -31,8 +31,47 @@ data class ArchiveStorageItemState(
     val startedAtMs: Long,
     val updatedAtMs: Long,
     val completedAtMs: Long? = null,
-    val error: String? = null
+    val error: String? = null,
+    val operationMode: ArchiveStorageJobMode? = null,
+    val automaticRetryCount: Int = 0,
+    val automaticRetryAtMs: Long? = null
 ) : java.io.Serializable
+
+object ArchiveStorageRetryPolicy {
+    const val MAX_AUTOMATIC_RETRIES = 3
+    private val delaysMs = longArrayOf(5 * 60_000L, 15 * 60_000L, 60 * 60_000L)
+
+    fun deadlineAfterFailure(completedAtMs: Long, automaticRetryCount: Int): Long? {
+        val delay = delaysMs.getOrNull(automaticRetryCount) ?: return null
+        return if (completedAtMs > Long.MAX_VALUE - delay) Long.MAX_VALUE else completedAtMs + delay
+    }
+
+    fun isAutomaticRetryDue(state: ArchiveStorageItemState, nowMs: Long): Boolean =
+        state.phase == ArchiveStorageItemPhase.FAILED &&
+            state.operationMode == ArchiveStorageJobMode.COMPRESS &&
+            state.automaticRetryCount in 0 until MAX_AUTOMATIC_RETRIES &&
+            (state.automaticRetryAtMs ?: deadlineAfterFailure(
+                state.completedAtMs ?: state.updatedAtMs,
+                state.automaticRetryCount
+            ))?.let { it <= nowMs } == true
+}
+
+sealed interface ArchiveStorageItemsRead {
+    data object Missing : ArchiveStorageItemsRead
+    data class Valid(val items: List<ArchiveStorageItemState>) : ArchiveStorageItemsRead
+    data class Corrupt(val raw: Any?, val error: Throwable) : ArchiveStorageItemsRead
+
+    fun requireItems(): List<ArchiveStorageItemState> = when (this) {
+        Missing -> emptyList()
+        is Valid -> items
+        is Corrupt -> throw ArchiveStorageItemsException(raw, error)
+    }
+}
+
+class ArchiveStorageItemsException(
+    val raw: Any?,
+    cause: Throwable
+) : IllegalStateException("Archive item metadata is unavailable", cause)
 
 data class ArchiveStorageItemsReconciliation(
     val itemStates: List<ArchiveStorageItemState>,

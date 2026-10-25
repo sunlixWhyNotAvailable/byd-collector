@@ -13,8 +13,14 @@ import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.service.CollectorService
 import com.bydcollector.collector.service.CollectorServiceController
 import com.bydcollector.collector.service.CollectorSettings
+import com.bydcollector.collector.service.DatabaseMaintenanceService
 import com.bydcollector.collector.service.RuntimeDemand
 import com.bydcollector.collector.service.RuntimeRecoveryAction
+import com.bydcollector.collector.util.diagnosticDetail
+import com.bydcollector.collector.util.sharedOperationalEventExecutor
+import java.io.File
+import java.io.IOException
+import java.time.Instant
 
 //restores collector service intent after boot, task removal, ui close, or keep-alive recovery broadcasts
 object CollectorAutoStart {
@@ -22,6 +28,7 @@ object CollectorAutoStart {
     val ACTION_WATCHDOG_AUTO_START: String = "${BuildConfig.ACTION_PREFIX}.action.WATCHDOG_AUTO_START"
     val ACTION_KEEP_ALIVE_RECOVERY: String = "${BuildConfig.ACTION_PREFIX}.action.KEEP_ALIVE_RECOVERY"
     val ACTION_KEEP_ALIVE_STOP_RETRY: String = "${BuildConfig.ACTION_PREFIX}.action.KEEP_ALIVE_STOP_RETRY"
+    val ACTION_ARCHIVE_STORAGE_RETRY: String = "${BuildConfig.ACTION_PREFIX}.action.ARCHIVE_STORAGE_RETRY"
     const val EXTRA_RETRY_ATTEMPT = "retry_attempt"
     const val EXTRA_KEEP_ALIVE_STOP_RETRY_ATTEMPT = "keep_alive_stop_retry_attempt"
     const val RETRY_DELAY_MS = 30_000L
@@ -30,6 +37,104 @@ object CollectorAutoStart {
     const val KEEP_ALIVE_MAINTENANCE_DEFER_MS = 60_000L
     const val MAX_RETRY_ATTEMPTS = 20
     private val keepAliveStopRetryAlarmLock = Any()
+    private val archiveRetryAlarmLock = Any()
+
+    fun scheduleArchiveRetry(context: Context, minimumDelayMs: Long = 0L) {
+        if (BuildConfig.RUNTIME_CLIENT) return
+        val appContext = context.applicationContext
+        try {
+            sharedOperationalEventExecutor.execute { scheduleArchiveRetryNow(appContext, minimumDelayMs) }
+        } catch (error: RuntimeException) {
+            recordArchiveRetryFailure(appContext, "archive_retry_schedule_dispatch", error)
+        }
+    }
+
+    fun cancelArchiveRetry(context: Context) = synchronized(archiveRetryAlarmLock) {
+        if (BuildConfig.RUNTIME_CLIENT) return@synchronized
+        try {
+            context.getSystemService(AlarmManager::class.java).cancel(archiveRetryIntent(context))
+        } catch (error: Exception) {
+            recordArchiveRetryFailure(context, "archive_retry_cancel", error)
+        }
+    }
+
+    private fun scheduleArchiveRetryNow(context: Context, minimumDelayMs: Long) = synchronized(archiveRetryAlarmLock) {
+        try {
+            val settings = CollectorSettings(context)
+            if (settings.isUserShutdownRequested()) {
+                cancelArchiveRetry(context)
+                return@synchronized
+            }
+            val now = System.currentTimeMillis()
+            val due = nextArchiveRetry(context, settings, now)
+            if (due == null) {
+                cancelArchiveRetry(context)
+                return@synchronized
+            }
+            context.getSystemService(AlarmManager::class.java).set(
+                AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                SystemClock.elapsedRealtime() + maxOf(1_000L, minimumDelayMs, due - now),
+                archiveRetryIntent(context)
+            )
+        } catch (error: Exception) {
+            cancelArchiveRetry(context)
+            recordArchiveRetryFailure(context, "archive_retry_schedule", error)
+        }
+    }
+
+    /** Alarm delivery is independent of auto-start switches and never starts collection. */
+    internal fun handleArchiveRetry(context: Context) {
+        if (BuildConfig.RUNTIME_CLIENT) return
+        try {
+            val settings = CollectorSettings(context)
+            if (settings.isUserShutdownRequested()) {
+                cancelArchiveRetry(context)
+                return
+            }
+            val now = System.currentTimeMillis()
+            val due = nextArchiveRetry(context, settings, now)
+            if (due == null) {
+                cancelArchiveRetry(context)
+                return
+            }
+            val busy = CollectorService.isArchiveStorageActive() || CollectorService.isMaintenanceRunningInProcess() ||
+                DatabaseMaintenanceService.isRunning()
+            if (due > now || busy) {
+                scheduleArchiveRetryNow(context, if (busy) 60_000L else 0L)
+                return
+            }
+            // Keep a wakeup if service admission fails; accepted work rearms/cancels it on settlement.
+            scheduleArchiveRetryNow(context, 60_000L)
+            if (!settings.isUserShutdownRequested()) CollectorServiceController.reconcileArchiveStorage(context)
+        } catch (error: Exception) {
+            recordArchiveRetryFailure(context, "archive_retry_delivery", error)
+            scheduleArchiveRetryNow(context, 60_000L)
+        }
+    }
+
+    private fun nextArchiveRetry(context: Context, settings: CollectorSettings, now: Long): Long? {
+        if (settings.hasUnfinishedArchiveStorageWork()) return now
+        val root = File(context.filesDir, "db_archive").canonicalFile
+        val ids = if (!root.exists()) emptySet() else {
+            val entries = root.listFiles() ?: throw IOException("Cannot list archive retry directory: $root")
+            entries.filter { it.isDirectory && it.canonicalFile.parentFile == root }.mapTo(hashSetOf()) { it.name }
+        }
+        return settings.nextAutomaticArchiveStorageRetryAtMs(now, ids)
+    }
+
+    internal fun recordArchiveRetryFailure(context: Context, stage: String, error: Throwable) {
+        val detail = error.diagnosticDetail("stage=$stage")
+        try {
+            val saved = (context.applicationContext as BydCollectorApplication).operationalEventJournal.tryAppend(
+                Instant.now().toString(), SystemClock.elapsedRealtime(),
+                "archive_retry_error", "Archive retry operation failed", detail
+            )
+            if (!saved) android.util.Log.e("CollectorArchive", "Journal unavailable; $detail")
+        } catch (journalError: Exception) {
+            if (journalError !== error) error.addSuppressed(journalError)
+            android.util.Log.e("CollectorArchive", error.diagnosticDetail("stage=$stage journal_write_failed"))
+        }
+    }
 
     fun handleBroadcast(context: Context, action: String, retryAttempt: Int = 0) {
         val appContext = context.applicationContext
@@ -508,6 +613,12 @@ object CollectorAutoStart {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
     }
+
+    private fun archiveRetryIntent(context: Context): PendingIntent = PendingIntent.getBroadcast(
+        context, 3,
+        Intent(context, InternalAutoStartReceiver::class.java).setAction(ACTION_ARCHIVE_STORAGE_RETRY),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+    )
 }
 
 internal object KeepAliveStopRetrySchedule {

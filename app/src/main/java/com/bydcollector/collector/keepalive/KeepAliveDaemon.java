@@ -7,6 +7,7 @@ import android.telephony.SubscriptionManager;
 import android.telephony.TelephonyManager;
 
 import com.bydcollector.collector.direct.HelperWakeLockPlatform;
+import com.bydcollector.collector.diagnostics.DiagnosticShareSanitizer;
 
 import java.io.ByteArrayOutputStream;
 import java.io.BufferedReader;
@@ -15,7 +16,9 @@ import java.io.FileInputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.IOException;
+import java.io.PrintWriter;
 import java.io.RandomAccessFile;
+import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
@@ -41,6 +44,7 @@ public final class KeepAliveDaemon {
     private static final File LOG_FILE = new File(KeepAliveProtocol.LOG_PATH);
     private static final long LOG_MAX_BYTES = 1_048_576L;
     private static final int COMMAND_OUTPUT_MAX_BYTES = 65_536;
+    private static final int MAX_DIAGNOSTIC_CHARS = 32_768;
     private static final long OUTPUT_DRAIN_TIMEOUT_MS = 1_000L;
     private static final long RADIO_STATE_READ_TIMEOUT_MS = 1_500L;
     private static final long BLUETOOTH_VERIFY_DELAY_MS = 1_000L;
@@ -60,6 +64,7 @@ public final class KeepAliveDaemon {
     };
     private static final String RECOVER_COLLECTOR_COMMAND = String.join(" ", RECOVER_COLLECTOR_ARGS);
     private static final RecoveryCommandOwner RECOVERY_COMMAND_OWNER = new RecoveryCommandOwner();
+    private static String lastUsbBootIdError = "";
     private static final ThreadPoolExecutor RADIO_STATE_READER = new ThreadPoolExecutor(
             1,
             1,
@@ -121,7 +126,7 @@ public final class KeepAliveDaemon {
                     + " cycle_reservations=" + usbSnapshot.cycleReservations
                     + " cycle_attempts=" + usbSnapshot.cycleAttempts
                     + " history_recovered=" + usbSnapshot.historyRecovered
-                    + " error=" + sanitizeUsb(usbSnapshot.error));
+                    + " error=" + sanitizeUsbError(usbSnapshot.error));
             log("ready");
             while (true) {
                 try {
@@ -129,12 +134,12 @@ public final class KeepAliveDaemon {
                     runOnce(usbState);
                     log("heartbeat_end");
                 } catch (Throwable error) {
-                    log("loop_error " + error.getClass().getSimpleName() + ": " + sanitize(error.getMessage() == null ? "no message" : error.getMessage()));
+                    log("loop_error " + diagnosticDetail(error, "stage=keep_alive_loop"));
                 }
                 Thread.sleep(KeepAliveProtocol.LOOP_INTERVAL_MS);
             }
         } catch (Throwable fatal) {
-            log("fatal_error " + fatal.getClass().getSimpleName() + ": " + sanitize(fatal.getMessage() == null ? "no message" : fatal.getMessage()));
+            log("fatal_error " + diagnosticDetail(fatal, "stage=keep_alive_startup"));
             throw fatal;
         } finally {
             ownerLock.close();
@@ -146,7 +151,7 @@ public final class KeepAliveDaemon {
         try {
             maintainUsb(usbState);
         } catch (Throwable error) {
-            logUsbSkip("usb_internal_error:" + error.getClass().getSimpleName(), usbState,
+            logUsbSkip("usb_internal_error:" + diagnosticDetail(error, "stage=usb_maintenance"), usbState,
                     "", "", "");
         }
 
@@ -267,7 +272,7 @@ public final class KeepAliveDaemon {
                     + " cycle_reservations=" + snapshot.cycleReservations + " cycle_attempts=" + snapshot.cycleAttempts
                     + " status=" + snapshot.lastStatus + " recorded=" + recorded
                     + " reason=" + disabledReason + " power_raw=" + sanitizeUsb(power.raw)
-                    + " acc_raw=" + sanitizeUsb(accRaw) + " state_error=" + sanitizeUsb(snapshot.error));
+                    + " acc_raw=" + sanitizeUsb(accRaw) + " state_error=" + sanitizeUsbError(snapshot.error));
             return;
         }
 
@@ -311,7 +316,7 @@ public final class KeepAliveDaemon {
                     + " reason=" + dispatchBlockReason + " power=" + finalPower + " acc=" + finalAcc
                     + " power_raw=" + sanitizeUsb(dispatchPower.raw)
                     + " acc_raw=" + sanitizeUsb(dispatchAcc.raw)
-                    + " state_error=" + sanitizeUsb(snapshot.error));
+                    + " state_error=" + sanitizeUsbError(snapshot.error));
             return;
         }
 
@@ -362,8 +367,14 @@ public final class KeepAliveDaemon {
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(
                 new FileInputStream(KeepAliveProtocol.KERNEL_BOOT_ID_PATH), StandardCharsets.UTF_8))) {
             String value = reader.readLine();
+            lastUsbBootIdError = "";
             return value == null || value.trim().isEmpty() ? null : value.trim();
         } catch (Exception error) {
+            String detail = diagnosticDetail(error, "stage=usb_boot_id_read");
+            if (!detail.equals(lastUsbBootIdError)) {
+                lastUsbBootIdError = detail;
+                log("usb_boot_id_read_error " + detail);
+            }
             return null;
         }
     }
@@ -407,21 +418,56 @@ public final class KeepAliveDaemon {
 
     private static void logUsbSkip(String reason, UsbKeepAliveState state, String bootId,
                                    String powerRaw, String accRaw) {
-        if (reason.equals(lastUsbSkipReason)) return;
-        lastUsbSkipReason = reason;
         UsbKeepAliveState.Snapshot snapshot = state.snapshot();
+        String deduplicationKey = reason + "\nstatus=" + snapshot.lastStatus
+                + "\ncycle=" + snapshot.cycleCount + "\nattempts=" + snapshot.attemptCount
+                + "\nstate_error=" + snapshot.error;
+        if (deduplicationKey.equals(lastUsbSkipReason)) return;
+        lastUsbSkipReason = deduplicationKey;
         log("usb_skip wall_ms=" + System.currentTimeMillis() + " elapsed_ms=" + SystemClock.elapsedRealtime()
-                + " reason=" + sanitizeUsb(reason) + " boot_id=" + sanitizeUsb(bootId)
+                + " reason=" + sanitizeUsbError(reason) + " boot_id=" + sanitizeUsb(bootId)
                 + " cycle=" + snapshot.cycleCount + " reservations_total=" + snapshot.reservationCount
                 + " attempts_total=" + snapshot.attemptCount + " cycle_reservations=" + snapshot.cycleReservations
                 + " cycle_attempts=" + snapshot.cycleAttempts + " status=" + snapshot.lastStatus
                 + " power_raw=" + sanitizeUsb(powerRaw) + " acc_raw=" + sanitizeUsb(accRaw)
-                + " state_error=" + sanitizeUsb(snapshot.error));
+                + " state_error=" + sanitizeUsbError(snapshot.error));
     }
 
     private static String sanitizeUsb(String value) {
         String sanitized = sanitize(value == null ? "" : value);
-        return sanitized.length() <= 1_024 ? sanitized : sanitized.substring(0, 1_024);
+        if (sanitized.length() <= 1_024) return sanitized;
+        String marker = " [TRUNCATED; limit=1024 chars]";
+        return sanitized.substring(0, 1_024 - marker.length()) + marker;
+    }
+
+    private static String sanitizeUsbError(String value) {
+        return boundedDiagnostic(sanitize(value == null ? "" : value));
+    }
+
+    static String diagnosticDetail(Throwable error, String stage) {
+        String prefix = stage == null || stage.trim().isEmpty() ? "" : stage + "\n";
+        String detail;
+        try {
+            StringWriter trace = new StringWriter();
+            error.printStackTrace(new PrintWriter(trace));
+            detail = prefix + trace;
+        } catch (Throwable formattingError) {
+            if (formattingError != error) error.addSuppressed(formattingError);
+            detail = prefix + error.getClass().getName() + ": [stack trace formatting failed]";
+        }
+        try {
+            detail = new DiagnosticShareSanitizer().sanitizeText(detail);
+        } catch (Throwable sanitizationError) {
+            if (sanitizationError != error) error.addSuppressed(sanitizationError);
+            detail = prefix + error.getClass().getName() + ": [diagnostic sanitization failed; details withheld]";
+        }
+        return boundedDiagnostic(sanitize(detail));
+    }
+
+    private static String boundedDiagnostic(String detail) {
+        if (detail.length() <= MAX_DIAGNOSTIC_CHARS) return detail;
+        String marker = " [TRUNCATED; limit=" + MAX_DIAGNOSTIC_CHARS + " chars]";
+        return detail.substring(0, MAX_DIAGNOSTIC_CHARS - marker.length()) + marker;
     }
 
     private static final class UsbRead {
@@ -652,10 +698,12 @@ public final class KeepAliveDaemon {
             int exitCode = process.exitValue();
             return new ShellResult(exitCode == 0, output, exitCode == 0 ? "" : "exit_code=" + exitCode, System.currentTimeMillis() - startedAt);
         } catch (Exception error) {
+            String detail = diagnosticDetail(error, "stage=shell_command exit_code=unavailable");
+            log("shell_command_error " + detail);
             return new ShellResult(
                     false,
                     "",
-                    error.getClass().getSimpleName() + ": " + (error.getMessage() == null ? "no message" : error.getMessage()),
+                    sanitizeUsb(detail),
                     System.currentTimeMillis() - startedAt
             );
         } finally {

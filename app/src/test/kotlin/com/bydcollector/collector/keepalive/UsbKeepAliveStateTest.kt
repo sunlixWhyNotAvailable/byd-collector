@@ -3,6 +3,7 @@ package com.bydcollector.collector.keepalive
 import org.junit.Test
 import org.json.JSONObject
 import java.nio.file.Files
+import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
@@ -83,6 +84,9 @@ class UsbKeepAliveStateTest {
 
         val corrupt = UsbKeepAliveState.open(file)
         assertFalse(corrupt.snapshot().usable)
+        assertContains(corrupt.snapshot().error, "stage=usb_state_read")
+        assertContains(corrupt.snapshot().error, "org.json.JSONException")
+        assertContains(corrupt.snapshot().error, "state_json_invalid")
         assertTrue(corrupt.observeBoot(BOOT_A))
         assertEquals(0L, corrupt.snapshot().reservationCount)
         assertEquals(0L, corrupt.snapshot().attemptCount)

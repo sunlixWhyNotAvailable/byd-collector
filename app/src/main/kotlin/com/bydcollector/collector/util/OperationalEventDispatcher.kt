@@ -1,6 +1,7 @@
 package com.bydcollector.collector.util
 
 import android.util.Log
+import com.bydcollector.collector.diagnostics.DiagnosticShareSanitizer
 import java.util.concurrent.Executor
 
 private const val TAG = "OperationalEvent"
@@ -20,10 +21,20 @@ internal fun dispatchOperationalEvent(executor: Executor, action: () -> Unit) {
     }
 }
 
-internal fun Throwable.diagnosticDetail(context: String? = null): String = buildString {
-    context?.takeIf(String::isNotBlank)?.let { append(it).append('\n') }
-    append(stackTraceToString())
-}.take(MAX_DIAGNOSTIC_DETAIL_CHARS)
+internal fun Throwable.diagnosticDetail(context: String? = null): String {
+    val prefix = context?.takeIf(String::isNotBlank)?.plus("\n").orEmpty()
+    val raw = runCatching { prefix + stackTraceToString() }.getOrElse { formattingError ->
+        if (formattingError !== this) addSuppressed(formattingError)
+        "$prefix${javaClass.name}: [stack trace formatting failed]"
+    }
+    val detail = runCatching { DiagnosticShareSanitizer().sanitizeText(raw) }.getOrElse { sanitizationError ->
+        if (sanitizationError !== this) addSuppressed(sanitizationError)
+        "$prefix${javaClass.name}: [diagnostic sanitization failed; details withheld]"
+    }
+    if (detail.length <= MAX_DIAGNOSTIC_DETAIL_CHARS) return detail
+    val marker = "\n[TRUNCATED; limit=$MAX_DIAGNOSTIC_DETAIL_CHARS chars]"
+    return detail.take(MAX_DIAGNOSTIC_DETAIL_CHARS - marker.length) + marker
+}
 
 private fun runOperationalEventTask(action: () -> Unit) {
     try {

@@ -1,11 +1,16 @@
 package com.bydcollector.collector.keepalive
 
 import android.content.Context
+import android.os.SystemClock
+import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.adb.AdbLocalClient
+import com.bydcollector.collector.diagnostics.DiagnosticShareSanitizer
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.service.CollectorSettings
+import com.bydcollector.collector.util.diagnosticDetail
 import com.bydcollector.collector.util.namedSingleThreadExecutor
 import java.io.File
+import java.time.Instant
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.TimeUnit
 
@@ -20,10 +25,11 @@ class KeepAliveSupervisor(
 ) {
     private val executor: ExecutorService = namedSingleThreadExecutor("byd-keepalive")
     private val reconcileState = KeepAliveReconcileState(ALIVE_TTL_MS)
+    private var installedApkIdentityUnavailableReason = "unknown"
     private val wifiPolicy = WifiPolicyRecovery(
         context.applicationContext.getSharedPreferences(CollectorSettings.PREFS_NAME, Context.MODE_PRIVATE),
         shellFactory
-    ) { category, message, detail -> store.recordEvent(category, message, detail) }
+    ) { category, message, detail -> recordEvent(category, message, detail) }
 
     fun reconcile(config: KeepAliveConfig, forceStatusCheck: Boolean = false) {
         executor.execute {
@@ -56,12 +62,59 @@ class KeepAliveSupervisor(
     }
 
     private fun recordReconcileThenFailure(category: String, error: Throwable) {
-        runCatching {
-            store.recordEvent(
-                category,
-                "Keep-alive reconcile completion failed",
-                "${error::class.java.simpleName}: ${error.message ?: "no message"}"
-            )
+        recordFailure(category, "Keep-alive reconcile completion failed", error)
+    }
+
+    private fun recordEvent(category: String, message: String, detail: String?) {
+        val safeDetail = detail?.let {
+            runCatching { DiagnosticShareSanitizer().sanitizeText(it) }
+                .getOrElse { "[original event detail withheld; sanitization failed]" }
+        }
+        runCatching { store.recordEvent(category, message, safeDetail) }
+            .onFailure { storageError ->
+                val fallback = listOfNotNull(safeDetail, storageError.diagnosticDetail("stage=${category}_sqlite_write"))
+                    .joinToString("\n")
+                val saved = runCatching {
+                    val journal = (context.applicationContext as? BydCollectorApplication)?.operationalEventJournal
+                        ?: return@runCatching false
+                    journal.tryAppend(Instant.now().toString(), SystemClock.elapsedRealtime(), category, message, fallback)
+                }.getOrElse { journalError ->
+                    if (journalError !== storageError) storageError.addSuppressed(journalError)
+                    false
+                }
+                if (!saved) {
+                    val fullFallback = listOfNotNull(
+                        safeDetail,
+                        storageError.diagnosticDetail("stage=${category}_sqlite_or_journal_write")
+                    ).joinToString("\n")
+                    runCatching {
+                        android.util.Log.e("KeepAliveSupervisor", "Could not persist keep-alive event; original_detail=$fullFallback")
+                    }
+                }
+            }
+    }
+
+    private fun recordFailure(category: String, message: String, error: Throwable) {
+        val detail = error.diagnosticDetail("stage=$category")
+        try {
+            store.recordEvent(category, message, detail)
+        } catch (storageError: Throwable) {
+            if (storageError !== error) error.addSuppressed(storageError)
+            val fallback = error.diagnosticDetail("stage=$category")
+            val saved = runCatching {
+                val journal = (context.applicationContext as? BydCollectorApplication)?.operationalEventJournal
+                    ?: return@runCatching false
+                journal.tryAppend(Instant.now().toString(), SystemClock.elapsedRealtime(), category, message, fallback)
+            }.getOrElse { journalError ->
+                if (journalError !== error) error.addSuppressed(journalError)
+                false
+            }
+            if (!saved) {
+                val fullFallback = error.diagnosticDetail("stage=$category")
+                runCatching {
+                    android.util.Log.e("KeepAliveSupervisor", "Could not persist keep-alive failure; original_detail=$fullFallback")
+                }
+            }
         }
     }
 
@@ -79,12 +132,7 @@ class KeepAliveSupervisor(
                     }
                 } catch (error: Exception) {
                     android.util.Log.e("KeepAliveSupervisor", "Wi-Fi policy reconciliation failed", error)
-                    try {
-                        store.recordEvent("wifi_policy_reconcile_failed", "Wi-Fi policy reconciliation failed", error.stackTraceToString())
-                    } catch (loggingError: Exception) {
-                        error.addSuppressed(loggingError)
-                        android.util.Log.e("KeepAliveSupervisor", "Could not persist Wi-Fi policy failure", error)
-                    }
+                    recordFailure("wifi_policy_reconcile_failed", "Wi-Fi policy reconciliation failed", error)
                 }
             }
         }
@@ -209,10 +257,10 @@ class KeepAliveSupervisor(
                 stopped
             }
         } catch (error: RuntimeException) {
-            store.recordEvent(
+            recordFailure(
                 "keep_alive_reconcile_error",
                 "Keep-alive reconcile failed",
-                "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                error
             )
             false
         }
@@ -228,13 +276,24 @@ class KeepAliveSupervisor(
     }
 
     private fun installedApkIdentity(): InstalledApkIdentity? {
+        installedApkIdentityUnavailableReason = "unknown"
         val appContext = context.applicationContext
         val sourceDir = appContext.applicationInfo.sourceDir
-        if (sourceDir.isNullOrBlank()) return null
-        val updateTimeMs = runCatching {
+        if (sourceDir.isNullOrBlank()) {
+            installedApkIdentityUnavailableReason = "source_dir_empty"
+            return null
+        }
+        val updateTimeMs = try {
             appContext.packageManager.getPackageInfo(appContext.packageName, 0).lastUpdateTime
-        }.getOrNull() ?: return null
-        if (updateTimeMs <= 0L) return null
+        } catch (error: Exception) {
+            installedApkIdentityUnavailableReason = "package_manager_error"
+            recordFailure("keep_alive_apk_identity_error", "Could not read installed APK identity", error)
+            return null
+        }
+        if (updateTimeMs <= 0L) {
+            installedApkIdentityUnavailableReason = "last_update_time_nonpositive"
+            return null
+        }
         return InstalledApkIdentity(sourceDir, updateTimeMs)
     }
 
@@ -275,9 +334,10 @@ class KeepAliveSupervisor(
     }
 
     private fun recordInstalledApkIdentityUnavailable() {
-        store.recordEvent(
+        recordEvent(
             category = "keep_alive_apk_identity_unavailable",
-            message = "Installed APK identity unavailable"
+            message = "Installed APK identity unavailable",
+            detail = "reason=$installedApkIdentityUnavailableReason"
         )
     }
 
