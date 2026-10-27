@@ -131,6 +131,7 @@ data class TelegramEventState(
     val lastSuccessfulPollAtMs: Long? = null,
     val telemetryExpectedSinceMs: Long? = null,
     val telemetryOutageSent: Boolean = false,
+    val telemetryFailureSinceMs: Long? = null,
     val tripId: String? = null,
     val tripPowerSessionId: String? = null,
     val tripStartedAtMs: Long? = null,
@@ -178,6 +179,7 @@ data class TelegramEventState(
             fullSent ||
             lowVoltageSinceMs != null ||
             lowVoltageSent ||
+            telemetryFailureSinceMs != null ||
             telemetryOutageSent ||
             powerEnergyPoint != null ||
             tripStartEnergyPoint != null ||
@@ -227,6 +229,7 @@ data class TelegramEventState(
         putNullable("lastSuccessfulPollAtMs", lastSuccessfulPollAtMs)
         putNullable("telemetryExpectedSinceMs", telemetryExpectedSinceMs)
         put("telemetryOutageSent", telemetryOutageSent)
+        putNullable("telemetryFailureSinceMs", telemetryFailureSinceMs)
         putNullable("tripId", tripId)
         putNullable("tripPowerSessionId", tripPowerSessionId)
         putNullable("tripStartedAtMs", tripStartedAtMs)
@@ -305,6 +308,7 @@ data class TelegramEventState(
                     lastSuccessfulPollAtMs = json.optLongOrNull("lastSuccessfulPollAtMs"),
                     telemetryExpectedSinceMs = json.optLongOrNull("telemetryExpectedSinceMs"),
                     telemetryOutageSent = json.optBoolean("telemetryOutageSent"),
+                    telemetryFailureSinceMs = json.optLongOrNull("telemetryFailureSinceMs"),
                     tripId = json.optStringOrNull("tripId"),
                     tripPowerSessionId = json.optStringOrNull("tripPowerSessionId"),
                     tripStartedAtMs = json.optLongOrNull("tripStartedAtMs"),
@@ -688,8 +692,7 @@ class TelegramEventEngine(
                 lastSuccessfulPollAtMs = if (origin == PollOrigin.LIVE) nowMs else state.lastSuccessfulPollAtMs,
                 telemetryExpectedSinceMs = if (origin == PollOrigin.LIVE) {
                     state.telemetryExpectedSinceMs ?: nowMs
-                } else state.telemetryExpectedSinceMs,
-                telemetryOutageSent = if (origin == PollOrigin.LIVE) false else state.telemetryOutageSent
+                } else state.telemetryExpectedSinceMs
             )
             if (state.tripId == null && rawGear != null && rawGear != PARK) {
                 startTrip(gearAtMs, odometer, soc, tripEnergy, currentEnergyPoint)
@@ -698,8 +701,7 @@ class TelegramEventEngine(
             if (origin == PollOrigin.LIVE) {
                 state = state.copy(
                     lastSuccessfulPollAtMs = nowMs,
-                    telemetryExpectedSinceMs = state.telemetryExpectedSinceMs ?: nowMs,
-                    telemetryOutageSent = false
+                    telemetryExpectedSinceMs = state.telemetryExpectedSinceMs ?: nowMs
                 )
             }
             if (gunFresh) confirmChargeGun(
@@ -854,23 +856,28 @@ class TelegramEventEngine(
     fun onTick(
         config: TelegramEventConfig,
         mainCollectionExpected: Boolean,
-        lastError: String?,
         nowMs: Long,
-        runtimeStartedAtMs: Long? = null
+        health: TelegramTelemetryHealthSnapshot = TelegramTelemetryHealthSnapshot()
     ): TelegramEventResult {
         val events = mutableListOf<TelegramDetectedEvent>()
         val original = state
         finalizePendingTrip(config, nowMs, events)
-        if (!mainCollectionExpected) {
-            state = state.copy(telemetryExpectedSinceMs = null, telemetryOutageSent = false)
+        if (!mainCollectionExpected || health.confirmedHealthy) {
+            state = state.copy(telemetryExpectedSinceMs = null, telemetryOutageSent = false,
+                telemetryFailureSinceMs = null)
             return persistedResult(events, nowMs, force = state != original || events.isNotEmpty(), config = config)
         }
-        val expectedSince = maxOf(
-            state.telemetryExpectedSinceMs ?: nowMs,
-            runtimeStartedAtMs ?: Long.MIN_VALUE
-        )
-        state = state.copy(telemetryExpectedSinceMs = expectedSince)
-        val outageBaseline = maxOf(state.lastSuccessfulPollAtMs ?: Long.MIN_VALUE, expectedSince)
+        // Keep a persisted episode across APP restart; only actual recovery rearms it.
+        val previousFailure = state.telemetryFailureSinceMs
+        if (previousFailure != null && health.recoveredAtMs?.let { it > previousFailure } == true) {
+            state = state.copy(telemetryFailureSinceMs = null, telemetryOutageSent = false)
+        }
+        val error = health.error ?: return persistedResult(events, nowMs,
+            force = state != original || events.isNotEmpty(), config = config)
+        val outageBaseline = state.telemetryFailureSinceMs ?: (health.failureSinceMs ?: nowMs).also {
+            // Legacy polling-era outage flags are not confirmed acquisition failures.
+            state = state.copy(telemetryFailureSinceMs = it, telemetryOutageSent = false)
+        }
         if (
             !state.telemetryOutageSent &&
             nowMs - outageBaseline >= config.unavailableDelayMs
@@ -883,7 +890,7 @@ class TelegramEventEngine(
                 "telemetry-unavailable:$outageBaseline",
                 mapOf(
                     "last_data_time" to state.lastSuccessfulPollAtMs?.let(::formatTime).orEmpty().ifBlank { "n/a" },
-                    "error" to (lastError?.take(300) ?: "unknown"),
+                    "error" to error.take(300),
                     "time" to formatTime(nowMs)
                 ),
                 occurredAtMs = nowMs

@@ -44,6 +44,31 @@ import kotlin.test.assertTrue
 @Config(sdk = [29])
 class TelegramMidTripUpgradeReproductionTest {
     @Test
+    fun elapsedTimeWithoutSourceFailureDoesNotCreateTelemetryOutage() {
+        val config = TelegramEventConfig(
+            enabledEvents = setOf(TelegramEventType.TELEMETRY_UNAVAILABLE),
+            chargeStepPercent = 5,
+            lowVoltageThreshold = 12.0,
+            unavailableDelayMs = 60_000L,
+            tripEndDelayMs = 1_000L
+        )
+        var engine = TelegramEventEngine()
+        // Time and telemetry are inputs. No helper, Binder or delivery outcome is substituted.
+        // Consumer catch-up has not reached a LIVE input; a minute alone proves no source failure.
+        for (atMs in listOf(1_000L, 61_000L, 181_000L)) {
+            assertTrue(engine.onTick(config, true, atMs).events.isEmpty())
+        }
+        engine.onSuccessfulPoll(
+            tripTelemetry(gear = "P", soc = 72.0, odometer = 100.0, tripEnergy = 0.5),
+            config, 182_000L
+        )
+        // Unchanged values do not produce callback traffic, even across runtime-state reload.
+        engine = TelegramEventEngine(TelegramEventState.fromJson(engine.state.toJson()))
+        assertTrue(engine.onTick(config, true, 782_000L).events.isEmpty())
+        assertNull(engine.state.telemetryFailureSinceMs)
+    }
+
+    @Test
     fun tripLocationRenderingKeepsItsBoundaryAndLengthContracts() {
         val links = "Google: https://maps.example/?q=49,24\nWaze: https://waze.example/?ll=49,24"
         val event = TelegramDetectedEvent(
@@ -156,7 +181,7 @@ class TelegramMidTripUpgradeReproductionTest {
                 remove("tripSummaryCreatedInPowerSession")
             }.toString()
             assertFalse(TelegramEventState.fromJson(legacyBeforeFirst).tripSummaryCreatedInPowerSession)
-            val summaryResult = engine.onTick(config, mainCollectionExpected = true, lastError = null, nowMs = 5_000L)
+            val summaryResult = engine.onTick(config, mainCollectionExpected = true, nowMs = 5_000L)
             val summary = summaryResult.events.single { it.type == TelegramEventType.TRIP_SUMMARY }
             assertTrue(summary.omitCurrent)
             assertMetric(summary, "trip_distance_km", 0.0)
@@ -210,7 +235,7 @@ class TelegramMidTripUpgradeReproductionTest {
                 tripTelemetry(gear = "P", soc = 71.0, odometer = 102.0, tripEnergy = 1.5), config, 8_000L
             )
             val secondResult = recovered.onTick(
-                config, mainCollectionExpected = true, lastError = null, nowMs = 9_000L
+                config, mainCollectionExpected = true, nowMs = 9_000L
             )
             val secondSummary = secondResult.events.single { it.type == TelegramEventType.TRIP_SUMMARY }
             assertFalse(secondSummary.omitCurrent)
@@ -572,7 +597,7 @@ class TelegramMidTripUpgradeReproductionTest {
             tripTelemetry(gear = "P", soc = 72.0, odometer = 100.0, tripEnergy = 0.5), enabledConfig, 3_000L
         )
         val filtered = engine.onTick(
-            enabledConfig, mainCollectionExpected = true, lastError = null, nowMs = 4_000L
+            enabledConfig, mainCollectionExpected = true, nowMs = 4_000L
         )
         assertTrue(filtered.events.none { it.type == TelegramEventType.TRIP_SUMMARY })
         assertFalse(filtered.state.tripSummaryCreatedInPowerSession)
@@ -593,7 +618,7 @@ class TelegramMidTripUpgradeReproductionTest {
             tripTelemetry(gear = "P", soc = 71.0, odometer = 102.0, tripEnergy = 1.5), disabledConfig, 7_000L
         )
         val disabled = engine.onTick(
-            disabledConfig, mainCollectionExpected = true, lastError = null, nowMs = 8_000L
+            disabledConfig, mainCollectionExpected = true, nowMs = 8_000L
         )
         assertTrue(disabled.events.none { it.type == TelegramEventType.TRIP_SUMMARY })
         assertFalse(disabled.state.tripSummaryCreatedInPowerSession)
@@ -614,7 +639,7 @@ class TelegramMidTripUpgradeReproductionTest {
             tripTelemetry(gear = "P", soc = 70.0, odometer = 104.0, tripEnergy = 2.5), enabledConfig, 11_000L
         )
         val firstEmittedSummary = engine.onTick(
-            enabledConfig, mainCollectionExpected = true, lastError = null, nowMs = 12_000L
+            enabledConfig, mainCollectionExpected = true, nowMs = 12_000L
         ).events.single { it.type == TelegramEventType.TRIP_SUMMARY }
         assertTrue(firstEmittedSummary.omitCurrent)
         assertMetric(firstEmittedSummary, "trip_distance_km", 2.0)

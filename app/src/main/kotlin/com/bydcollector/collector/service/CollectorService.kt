@@ -311,7 +311,7 @@ class CollectorService : Service() {
             try { startMainIfNeeded() } catch (error: RuntimeException) { handleMainStartFailure(error) }
         }
     }
-    @Volatile private var lastTelegramPollError: String? = null
+    private val telegramTelemetryHealth = TelegramTelemetryHealth()
     private var telegramTickScheduled = false
     private var telegramTickAtMs: Long? = null
     private val dashboardMetricsGeneration = AtomicLong(0L)
@@ -428,7 +428,7 @@ class CollectorService : Service() {
             ) {
                 coordinator.tick(
                     mainCollectionExpected = settings.isPollingEnabled() && !settings.isMainManuallyStopped(),
-                    lastError = lastTelegramPollError
+                    health = telegramTelemetryHealth.snapshot()
                 )
             }
         }
@@ -970,15 +970,46 @@ class CollectorService : Service() {
         )
         val live = PollPersistenceCoordinator(
             store = store,
-            client = liveClient,
+            client = object : com.bydcollector.collector.data.remote.TelemetryClient {
+                override fun read(): com.bydcollector.collector.data.remote.TelemetryReadResult {
+                    val ticket = telegramTelemetryHealth.beginObservation()
+                    try {
+                        val result = liveClient.read()
+                        if (isOwnedPollerCurrent() && result !is com.bydcollector.collector.data.remote.TelemetryReadResult.ReplayPending) {
+                            val failure = result as? com.bydcollector.collector.data.remote.TelemetryReadResult.Failure
+                            telegramTelemetryHealth.observe(TelegramTelemetryHealth.Channel.READ, ticket,
+                                failure?.let { "${it.category}: ${it.message}" }, System.currentTimeMillis())
+                        }
+                        return result
+                    } catch (error: Exception) {
+                        if (error !is InterruptedException && isOwnedPollerCurrent()) {
+                            telegramTelemetryHealth.observe(TelegramTelemetryHealth.Channel.READ, ticket,
+                                error.diagnosticDetail("telemetry read"), System.currentTimeMillis())
+                        }
+                        throw error
+                    }
+                }
+            },
             successfulPollObserver = observer,
             isActive = isOwnedPollerCurrent
         )
         val replay = TelemetryWorkerReplayCoordinator(
             store = store,
             ensureHelper = {
-                liveClient.ensureHelperReady(ownerMode)?.let { failure ->
-                    "${failure.category}: ${failure.message}"
+                val ticket = telegramTelemetryHealth.beginObservation()
+                try {
+                    liveClient.ensureHelperReady(ownerMode)?.let { failure ->
+                        val detail = "${failure.category}: ${failure.message}"
+                        if (isOwnedPollerCurrent()) telegramTelemetryHealth.observe(TelegramTelemetryHealth.Channel.READ, ticket,
+                            detail, System.currentTimeMillis())
+                        detail
+                    }
+                } catch (error: Exception) {
+                    if (error !is InterruptedException && isOwnedPollerCurrent()) {
+                        telegramTelemetryHealth.observe(TelegramTelemetryHealth.Channel.READ, ticket,
+                            error.diagnosticDetail("telemetry helper readiness"), System.currentTimeMillis())
+                    }
+                    throw error
                 }
             },
             pendingSamples = helper::pendingWorkerSamples,
@@ -1033,12 +1064,37 @@ class CollectorService : Service() {
             threadName = "byd-callback-intake-$stream",
             ready = { DirectStreamController.credentials(stream) != null },
             drain = {
-                helper.observeCallbackSource(stream) { loss -> onConfirmedCallbackSourceLoss(stream, loss) }
+                val ticket = telegramTelemetryHealth.beginObservation()
+                try {
+                    helper.observeCallbackSource(stream) { loss -> onConfirmedCallbackSourceLoss(stream, loss) }
+                } catch (error: Exception) {
+                    if (stream == CollectorHelperProtocol.STREAM_MAIN && error !is InterruptedException) {
+                        telegramTelemetryHealth.observe(TelegramTelemetryHealth.Channel.CALLBACK, ticket,
+                            error.diagnosticDetail("callback source registration"), System.currentTimeMillis())
+                    }
+                    throw error
+                }
                 drain.drain(maxBatches = 1)
             },
-            armBatchReady = { wake -> helper.awaitCallbackBatch(stream, wake) { loss ->
-                onConfirmedCallbackSourceLoss(stream, loss)
-            } },
+            armBatchReady = { wake ->
+                val ticket = telegramTelemetryHealth.beginObservation()
+                try {
+                    helper.awaitCallbackBatch(stream, wake) { loss ->
+                        onConfirmedCallbackSourceLoss(stream, loss)
+                    }.also {
+                        if (stream == CollectorHelperProtocol.STREAM_MAIN) {
+                            telegramTelemetryHealth.observe(TelegramTelemetryHealth.Channel.CALLBACK,
+                                ticket, null, System.currentTimeMillis())
+                        }
+                    }
+                } catch (error: Exception) {
+                    if (stream == CollectorHelperProtocol.STREAM_MAIN && error !is InterruptedException) {
+                        telegramTelemetryHealth.observe(TelegramTelemetryHealth.Channel.CALLBACK,
+                            ticket, error.diagnosticDetail("callback wait registration"), System.currentTimeMillis())
+                    }
+                    throw error
+                }
+            },
             onStatus = { summary ->
                 queueCallbackDiagnostic(stream, summary.detail +
                     (summary.fault?.let { "\n${it.diagnosticDetail()}" } ?: ""))
@@ -1060,6 +1116,8 @@ class CollectorService : Service() {
             observedCallbackLoss[stream - 1] = identity
         }
         if (stream == CollectorHelperProtocol.STREAM_MAIN) {
+            telegramTelemetryHealth.observe(TelegramTelemetryHealth.Channel.CALLBACK,
+                telegramTelemetryHealth.beginObservation(), "${loss.reason}: ${loss.diagnostic}", loss.observedWallMs)
             // The existing business worker retries persistence failures; Binder callbacks never write SQLite.
             pendingMainSourceLoss.add(loss)
             businessWorker.signal()
@@ -1162,7 +1220,26 @@ class CollectorService : Service() {
         queueStatus: CallbackQueueStatusTracker? = null
     ): CallbackBatchDrainCoordinator =
         CallbackBatchDrainCoordinator(
-            download = { helper.drainCallbackBatch(stream) },
+            download = {
+                val ticket = telegramTelemetryHealth.beginObservation()
+                try {
+                    helper.drainCallbackBatch(stream).also { reply ->
+                        if (stream == CollectorHelperProtocol.STREAM_MAIN &&
+                            reply.status != CollectorHelperProtocol.STATUS_STALE_TOKEN &&
+                            reply.status != CollectorHelperProtocol.STATUS_REPLAY_PENDING) {
+                            telegramTelemetryHealth.observe(TelegramTelemetryHealth.Channel.CALLBACK, ticket,
+                                if (reply.ok) null else "callback download status=${reply.status}: ${reply.error}",
+                                System.currentTimeMillis())
+                        }
+                    }
+                } catch (error: Exception) {
+                    if (stream == CollectorHelperProtocol.STREAM_MAIN && error !is InterruptedException) {
+                        telegramTelemetryHealth.observe(TelegramTelemetryHealth.Channel.CALLBACK, ticket,
+                            error.diagnosticDetail("callback download"), System.currentTimeMillis())
+                    }
+                    throw error
+                }
+            },
             importBatch = { batch, digest, delivery ->
                 val application = applicationContext as BydCollectorApplication
                 val gate = if (stream == CollectorHelperProtocol.STREAM_MAIN) application.databaseMaintenanceGate
@@ -3881,7 +3958,6 @@ class CollectorService : Service() {
         if (result.pollRowsPersisted > 0L) scheduleDatabaseFootprintRefresh(force = false)
         // Busy transport is neither a fresh sample nor a collection failure.
         if (result.deferred) return
-        lastTelegramPollError = if (result.ok) null else result.category
         val completedAt = DisplayTimeFormatter.formatNullable(result.timestamp ?: java.time.Instant.now().toString())
         val errorSummary = if (result.ok) null else PollingErrorSummaries.summary(result.category, result.errorMessage)
         dashboardUiStateStore.publishMainPollState(

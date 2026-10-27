@@ -20,6 +20,7 @@ import com.bydcollector.collector.service.TelegramEventConfig
 import com.bydcollector.collector.service.TelegramEventEngine
 import com.bydcollector.collector.service.TelegramEventResult
 import com.bydcollector.collector.service.TelegramEventState
+import com.bydcollector.collector.service.TelegramTelemetryHealthSnapshot
 import com.bydcollector.collector.service.TelegramLocationSnapshot
 import com.bydcollector.collector.service.TelegramPowerOffSnapshot
 import com.bydcollector.collector.util.diagnosticDetail
@@ -49,6 +50,7 @@ class TelegramCoordinator internal constructor(
     private var engine = createEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
     private var enabledRuntimeStartedAtMs: Long? = null
     private var startupRecoveryPending = true
+    private var lastTelemetryHealthDiagnostic: String? = null
     private val locationKindsByDedupeKey = LinkedHashMap<String, String>(16, 0.75f, true)
     private val locationKindCacheLock = Any()
     private val sourceCounts = linkedMapOf<String, Long>()
@@ -148,9 +150,9 @@ class TelegramCoordinator internal constructor(
 
     fun tick(
         mainCollectionExpected: Boolean,
-        lastError: String?
+        health: TelegramTelemetryHealthSnapshot
     ): Long? {
-        val runtimeStartedAtMs = activateEnabledRuntime() ?: return null
+        activateEnabledRuntime() ?: return null
         val startupDeadline = ensureStartupRecovery()
         val tickAtMs = nowMs()
         flushSourceDiagnostics(tickAtMs)
@@ -158,11 +160,17 @@ class TelegramCoordinator internal constructor(
         val result = engine.onTick(
             eventConfig(),
             mainCollectionExpected,
-            lastError,
             tickAtMs,
-            runtimeStartedAtMs
+            health
         )
         handle(result)
+        val detail = "expected=$mainCollectionExpected healthy=${health.confirmedHealthy} " +
+            "failure_since_ms=${result.state.telemetryFailureSinceMs} sent=${result.state.telemetryOutageSent} " +
+            "error=${health.error ?: "none"}"
+        if (detail != lastTelemetryHealthDiagnostic) {
+            eventStore.recordEvent("telegram_telemetry_health", "Telemetry availability evidence", detail)
+            lastTelemetryHealthDiagnostic = detail
+        }
         return nextWakeAt(result.nextWakeAtMs, nextWakeAt(startupDeadline, flushPending()))
     }
 
