@@ -144,7 +144,11 @@ final class HelperDualStreamRuntime implements AutoCloseable {
                 @Override public void recordLoss(int stream, TelemetryCallbackQueue.Loss loss) {
                     recordCallbackLoss(callbackTransport, stream, loss);
                 }
+                @Override public void recordLostBatch(TelemetryCallbackBatch batch, String reason, Throwable cause) {
+                    callbackTransport.recordLostBatch(batch, reason, cause);
+                }
                 @Override public void noteError(String message) { HelperDualStreamRuntime.this.noteError(message); }
+                @Override public void noteContext(String event, String message) { diagnostics.context(event, message); }
             });
     }
 
@@ -159,10 +163,8 @@ final class HelperDualStreamRuntime implements AutoCloseable {
     ) {
         long now = SystemClock.elapsedRealtime();
         if (action == CollectorHelperProtocol.CONTROL_CLAIM) {
-            long previousToken = state.snapshot(0, now).controllerToken;
             HelperStreamRuntimeState.ControlResult result = state.claim(nonce, value, now);
             if (result.status == CollectorHelperProtocol.STATUS_OK) {
-                if (previousToken != 0L && previousToken != result.controllerToken) callbacks.semanticReset();
                 refreshCallbackPlan();
             }
             signalChanged();
@@ -257,7 +259,7 @@ final class HelperDualStreamRuntime implements AutoCloseable {
                     return rejected(rows.size(), CollectorHelperProtocol.STATUS_REPLAY_PENDING,
                         "main read canceled");
                 }
-                return callbacks.readHybrid(rows,
+                return callbacks.readHybrid(CollectorHelperProtocol.STREAM_MAIN, rows, false,
                     selected -> runMeasuredRead(CollectorHelperProtocol.STREAM_MAIN, selected));
             });
         } catch (Throwable error) {
@@ -320,7 +322,7 @@ final class HelperDualStreamRuntime implements AutoCloseable {
         }
         long generation = state.workGeneration(CollectorHelperProtocol.STREAM_SECONDARY, now);
         try {
-            return readSecondaryChunks(() ->
+            return readSecondaryChunk(() ->
                 state.authorizeLive(token, CollectorHelperProtocol.STREAM_SECONDARY, epoch,
                     SystemClock.elapsedRealtime()) == CollectorHelperProtocol.STATUS_OK &&
                 generation == state.workGeneration(CollectorHelperProtocol.STREAM_SECONDARY,
@@ -395,7 +397,43 @@ final class HelperDualStreamRuntime implements AutoCloseable {
         maintainWakeLock(mainFallback || secondaryFallback);
         if (mainFallback && now >= mainNextAt) submitFallback(CollectorHelperProtocol.STREAM_MAIN, now);
         if (secondaryFallback && now >= secondaryNextAt) submitFallback(CollectorHelperProtocol.STREAM_SECONDARY, now);
+        submitKpiSeeds();
         ownerHandler.postDelayed(tick, TICK_MS);
+    }
+
+    private void submitKpiSeeds() {
+        HelperCallbackController.KpiSeedRequest request = callbacks.takeDueKpiSeeds();
+        if (request == null) return;
+        try {
+            orchestration.execute(() -> runKpiSeeds(request));
+        } catch (RejectedExecutionException error) {
+            callbacks.cancelKpiSeeds(request, 500L);
+            noteError("KPI seed scheduling rejected: " + describe(error));
+        }
+    }
+
+    private void runKpiSeeds(HelperCallbackController.KpiSeedRequest request) {
+        long[] startedWallMs = {-1L};
+        long[] startedElapsedMs = {-1L};
+        try {
+            CollectorHelperDaemon.BatchResult result = vendor.call(true, () -> {
+                startedWallMs[0] = Math.max(0L, System.currentTimeMillis());
+                startedElapsedMs[0] = Math.max(0L, SystemClock.elapsedRealtime());
+                return CollectorHelperDaemon.BatchEngine.run(request.rows, scalarReader, nativeReader);
+            });
+            callbacks.completeKpiSeeds(request, result, startedWallMs[0], startedElapsedMs[0],
+                Math.max(0L, System.currentTimeMillis()), Math.max(0L, SystemClock.elapsedRealtime()));
+        } catch (Throwable error) {
+            long completedWallMs = Math.max(0L, System.currentTimeMillis());
+            long completedElapsedMs = Math.max(0L, SystemClock.elapsedRealtime());
+            if (closed || error instanceof InterruptedException || Thread.currentThread().isInterrupted()) {
+                callbacks.cancelKpiSeeds(request, 500L);
+            } else {
+                callbacks.failKpiSeeds(request, error, startedWallMs[0], startedElapsedMs[0],
+                    completedWallMs, completedElapsedMs);
+                noteError("KPI seed GET failed: " + describe(error));
+            }
+        }
     }
 
     private void submitFallback(int stream, long now) {
@@ -416,6 +454,8 @@ final class HelperDualStreamRuntime implements AutoCloseable {
     private void runFallback(int stream, long generation) {
         long started = SystemClock.elapsedRealtime();
         long capturedWallMs = System.currentTimeMillis();
+        long suggestedDelayMs = POLL_INTERVAL_MS;
+        long responseElapsedMs = -1L;
         try {
             if (!fallbackCurrent(stream, generation)) return;
             if (stream == CollectorHelperProtocol.STREAM_MAIN) {
@@ -426,10 +466,21 @@ final class HelperDualStreamRuntime implements AutoCloseable {
                 }
                 CollectorHelperDaemon.BatchResult result = vendor.call(true, () -> {
                     if (!fallbackCurrent(stream, generation)) throw new Canceled("main fallback canceled");
-                    return callbacks.readHybrid(mainRows,
-                        selected -> runMeasuredRead(CollectorHelperProtocol.STREAM_MAIN, selected));
+                    return callbacks.readHybrid(CollectorHelperProtocol.STREAM_MAIN, mainRows, false,
+                        new HelperCallbackController.Poller() {
+                            @Override public CollectorHelperDaemon.BatchResult poll(
+                                List<CollectorHelperDaemon.Address> selected
+                            ) throws Throwable {
+                                if (!fallbackCurrent(stream, generation)) throw new Canceled("main fallback canceled");
+                                return runMeasuredRead(CollectorHelperProtocol.STREAM_MAIN, selected);
+                            }
+                            @Override public boolean canceled() { return !fallbackCurrent(stream, generation); }
+                        });
                 });
                 if (!fallbackCurrent(stream, generation)) return;
+                responseElapsedMs = SystemClock.elapsedRealtime();
+                suggestedDelayMs = result.nextDueDelayMs;
+                if (result.noWork) return;
                 setPersisting(stream, true);
                 long sequence = mainSequence++;
                 runPersistence(() -> {
@@ -443,8 +494,16 @@ final class HelperDualStreamRuntime implements AutoCloseable {
                 setPersisting(stream, false);
             } else {
                 startSecondaryGapIfNeeded(generation);
-                CollectorHelperDaemon.BatchResult result = readSecondaryChunks(() -> fallbackCurrent(stream, generation));
+                CollectorHelperDaemon.BatchResult result = readSecondaryChunk(
+                    () -> fallbackCurrent(stream, generation));
                 if (!fallbackCurrent(stream, generation)) return;
+                responseElapsedMs = SystemClock.elapsedRealtime();
+                suggestedDelayMs = result.nextDueDelayMs;
+                if (result.noWork) return;
+                if (result.values.length == 0) {
+                    throw new IllegalStateException("secondary read returned no observations: " +
+                        "status=" + result.batchStatus + " error=" + String.valueOf(result.error));
+                }
                 setPersisting(stream, true);
                 runPersistence(() -> secondarySpool.append(secondaryCycle(result, capturedWallMs, started)));
                 setPersisting(stream, false);
@@ -456,52 +515,29 @@ final class HelperDualStreamRuntime implements AutoCloseable {
         } finally {
             setPersisting(stream, false);
             long ended = SystemClock.elapsedRealtime();
-            if (stream == CollectorHelperProtocol.STREAM_MAIN) {
-                mainNextAt = Math.max(ended, started + POLL_INTERVAL_MS);
-            } else {
-                long elapsed = Math.max(0L, ended - started);
-                secondaryNextAt = elapsed < POLL_INTERVAL_MS
-                    ? started + POLL_INTERVAL_MS
-                    : saturatedAdd(ended, Math.min(elapsed, 30_000L));
-            }
+            long postReadMs = responseElapsedMs < 0L ? 0L : Math.max(0L, ended - responseElapsedMs);
+            long remainingMs = Math.max(1L, suggestedDelayMs - postReadMs);
+            long nextAt = saturatedAdd(ended, remainingMs);
+            if (stream == CollectorHelperProtocol.STREAM_MAIN) mainNextAt = nextAt;
+            else secondaryNextAt = nextAt;
             finish(stream, false);
         }
     }
 
-    private CollectorHelperDaemon.BatchResult readSecondaryChunks(CheckCurrent current) throws Throwable {
-        long startedNanos = System.nanoTime();
-        CollectorHelperDaemon.ReadValue[] values = new CollectorHelperDaemon.ReadValue[secondaryRows.size()];
-        int nativeGroups = 0;
-        int fallbackGroups = 0;
-        int fallbackReads = 0;
-        int groupFailures = 0;
-        String firstError = null;
-        for (int offset = 0; offset < secondaryRows.size(); offset += CollectorHelperProtocol.SECONDARY_CHUNK_SIZE) {
+    private CollectorHelperDaemon.BatchResult readSecondaryChunk(CheckCurrent current) throws Throwable {
+        if (!current.ok()) throw new Canceled("secondary read canceled");
+        return vendor.call(false, () -> {
             if (!current.ok()) throw new Canceled("secondary read canceled");
-            int end = Math.min(secondaryRows.size(), offset + CollectorHelperProtocol.SECONDARY_CHUNK_SIZE);
-            final int chunkOffset = offset;
-            List<CollectorHelperDaemon.Address> chunk = secondaryRows.subList(offset, end);
-            CollectorHelperDaemon.BatchResult result = callbacks.readHybrid(chunk, selected ->
-                vendor.call(false, () -> {
+            return callbacks.readDueSecondary(new HelperCallbackController.Poller() {
+                @Override public CollectorHelperDaemon.BatchResult poll(
+                    List<CollectorHelperDaemon.Address> selected
+                ) throws Throwable {
                     if (!current.ok()) throw new Canceled("secondary read canceled");
                     return runMeasuredRead(CollectorHelperProtocol.STREAM_SECONDARY, selected);
-                }));
-            System.arraycopy(result.values, 0, values, chunkOffset, result.values.length);
-            nativeGroups += result.nativeGroupCount;
-            fallbackGroups += result.fallbackGroupCount;
-            fallbackReads += result.fallbackReadCount;
-            groupFailures += result.groupFailureCount;
-            if (firstError == null) firstError = result.error;
-        }
-        boolean nativeAvailable = nativeReader.isAvailable();
-        int mode = !nativeAvailable ? CollectorHelperProtocol.MODE_SCALAR_FALLBACK
-            : fallbackGroups == 0 ? CollectorHelperProtocol.MODE_NATIVE
-            : CollectorHelperProtocol.MODE_NATIVE_WITH_FALLBACK;
-        return new CollectorHelperDaemon.BatchResult(
-            CollectorHelperProtocol.STATUS_OK, mode, nativeAvailable, nativeGroups,
-            fallbackGroups, fallbackReads, groupFailures,
-            (System.nanoTime() - startedNanos) / 1_000_000L, values,
-            nativeAvailable ? firstError : nativeReader.unavailableReason());
+                }
+                @Override public boolean canceled() { return !current.ok(); }
+            });
+        });
     }
 
     private CollectorHelperDaemon.BatchResult runMeasuredRead(
@@ -519,10 +555,13 @@ final class HelperDualStreamRuntime implements AutoCloseable {
         CollectorHelperDaemon.BatchResult result, long capturedWallMs, long capturedElapsedMs
     ) {
         List<SecondaryTelemetrySpool.Value> values = new ArrayList<>(result.values.length);
-        for (int ordinal = 0; ordinal < result.values.length; ordinal++) {
-            CollectorHelperDaemon.ReadValue value = result.values[ordinal];
+        List<Integer> sampledOrdinals = new ArrayList<>(result.requestedIndices.length);
+        for (int resultIndex = 0; resultIndex < result.values.length; resultIndex++) {
+            int ordinal = result.requestedIndices[resultIndex];
+            CollectorHelperDaemon.ReadValue value = result.values[resultIndex];
+            sampledOrdinals.add(ordinal);
             values.add(new SecondaryTelemetrySpool.Value(
-                ordinal, value.status, value.raw != null, value.raw, value.error, value.callbackSource != null));
+                ordinal, value.status, value.raw != null, value.raw, value.error, false, value.getLineage));
         }
         return new SecondaryTelemetrySpool.Cycle(
             new SecondaryTelemetrySpool.CycleIdentity(
@@ -530,7 +569,7 @@ final class HelperDualStreamRuntime implements AutoCloseable {
             secondaryCatalogVersion, capturedWallMs, capturedElapsedMs,
             result.elapsedMs, result.batchStatus, result.mode, result.nativeAvailable,
             result.nativeGroupCount, result.fallbackGroupCount, result.fallbackReadCount,
-            result.groupFailureCount, result.error, values);
+            result.groupFailureCount, result.error, values, sampledOrdinals);
     }
 
     private void startSecondaryGapIfNeeded(long generation) {

@@ -3,6 +3,8 @@ package com.bydcollector.collector.data.normalized
 import com.bydcollector.collector.data.direct.DirectFidRegistry
 import com.bydcollector.collector.data.direct.DirectValueDecoders
 import com.bydcollector.collector.data.local.PollReading
+import java.math.BigDecimal
+import java.math.RoundingMode
 import java.time.Instant
 import java.util.Locale
 
@@ -413,11 +415,10 @@ class VehicleStateNormalizer(
     }
 
     private fun stableDouble(value: Double): Double {
-        //normalizes numeric precision so tiny double noise does not create fake history changes
-        return String.format(Locale.US, "%.6f", value)
-            .trimEnd('0')
-            .trimEnd('.')
-            .toDouble()
+        if (!value.isFinite()) return value
+        val rounded = BigDecimal.valueOf(value).setScale(6, RoundingMode.HALF_UP).toDouble()
+        // Preserve Formatter's signed zero without its string allocation/parse cycle.
+        return if (rounded == 0.0) Math.copySign(0.0, value) else rounded
     }
 
     private fun observation(

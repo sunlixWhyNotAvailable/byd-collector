@@ -7,7 +7,11 @@ data class SecondarySpoolStatus(
     val status: Int,
     val readyRecords: Int = 0,
     val inFlight: Boolean = false,
-    val error: String? = null
+    val error: String? = null,
+    val catalogVersion: String? = null,
+    val catalogFieldCount: Int = 0,
+    val catalogProfile: String? = null,
+    val catalogDiagnostic: String? = null
 ) {
     val ok: Boolean get() = status == 0
     val pending: Boolean get() = readyRecords > 0 || inFlight

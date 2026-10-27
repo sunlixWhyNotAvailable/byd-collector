@@ -29,15 +29,34 @@ enum class TelegramSendFailureKind(val retryable: Boolean) {
 }
 
 sealed interface TelegramSendResult {
-    data class Success(val messageId: Long? = null) : TelegramSendResult
+    data class Success(val messageId: Long? = null) : TelegramSendResult {
+        init {
+            require(messageId == null || messageId > 0L) { "Telegram message id must be positive" }
+        }
+    }
 
     data class Failure(
         val kind: TelegramSendFailureKind,
         val httpStatus: Int? = null,
         val telegramErrorCode: Int? = null,
         val retryAfterSeconds: Long? = null,
-        val exceptionClass: String? = null
-    ) : TelegramSendResult
+        val exceptionClass: String? = null,
+        val diagnostic: String? = null
+    ) : TelegramSendResult {
+        init {
+            require(httpStatus == null || httpStatus in 100..599) { "Telegram HTTP status is invalid" }
+            require(telegramErrorCode == null || telegramErrorCode > 0) { "Telegram error code must be positive" }
+            require(retryAfterSeconds == null || retryAfterSeconds >= 0L) { "Telegram retry delay must be nonnegative" }
+            require(exceptionClass == null || (exceptionClass.length <= 512 &&
+                exceptionClass.toByteArray(StandardCharsets.UTF_8).size <= 2 * 1024)) {
+                "Telegram exception class exceeds its limit"
+            }
+            require(diagnostic == null || (diagnostic.length <= TelegramHelperProtocol.MAX_DIAGNOSTIC_CHARS &&
+                diagnostic.toByteArray(StandardCharsets.UTF_8).size <= TelegramHelperProtocol.MAX_DIAGNOSTIC_BYTES)) {
+                "Telegram diagnostic exceeds its limit"
+            }
+        }
+    }
 }
 
 class TelegramHttpClient(
@@ -55,13 +74,13 @@ class TelegramHttpClient(
 
         val body = "chat_id=${encode(request.chatId)}&text=${encode(request.text)}"
             .toByteArray(StandardCharsets.UTF_8)
-        return request(request.botToken, body)
+        return request(request, body)
     }
 
-    private fun request(botToken: String, body: ByteArray): TelegramSendResult {
+    private fun request(request: TelegramSendMessage, body: ByteArray): TelegramSendResult {
         var connection: HttpURLConnection? = null
         return try {
-            val activeConnection = connectionFactory(URL("https://api.telegram.org/bot$botToken/sendMessage"))
+            val activeConnection = connectionFactory(URL("https://api.telegram.org/bot${request.botToken}/sendMessage"))
             connection = activeConnection
             activeConnection.apply {
                 requestMethod = "POST"
@@ -84,12 +103,14 @@ class TelegramHttpClient(
                     oversizedResponse(responseStatus)
                 }
             } else {
-                classify(responseStatus, response.text)
+                classify(responseStatus, response.text, request)
             }
         } catch (error: Exception) {
+            if (error is InterruptedException) Thread.currentThread().interrupt()
             failure(
                 TelegramSendFailureKind.NETWORK_ERROR,
-                exceptionClass = error::class.java.name
+                exceptionClass = error::class.java.name,
+                diagnostic = redactedDiagnostic(error, request)
             )
         } finally {
             // Cleanup must not turn an already-confirmed send into a retryable failure.
@@ -97,13 +118,18 @@ class TelegramHttpClient(
         }
     }
 
-    private fun classify(httpStatus: Int, body: String): TelegramSendResult {
-        val json = runCatching { JSONObject(body) }.getOrNull()
-            ?: return if (httpStatus in 200..299) {
-                failure(TelegramSendFailureKind.INVALID_RESPONSE, httpStatus)
-            } else {
-                failure(kindFor(httpStatus), httpStatus, httpStatus)
-            }
+    private fun classify(httpStatus: Int, body: String, request: TelegramSendMessage): TelegramSendResult {
+        val json = try {
+            JSONObject(body)
+        } catch (error: Exception) {
+            return failure(
+                kind = if (httpStatus in 200..299) TelegramSendFailureKind.INVALID_RESPONSE else kindFor(httpStatus),
+                httpStatus = httpStatus,
+                telegramErrorCode = httpStatus.takeIf { it !in 200..299 },
+                exceptionClass = error::class.java.name,
+                diagnostic = redactedDiagnostic(error, request)
+            )
+        }
         if (httpStatus in 200..299 && json.optBoolean("ok", false)) {
             // A proven send stays successful even when optional receipt metadata is absent.
             val messageId = json.optJSONObject("result")?.opt("message_id")
@@ -151,8 +177,13 @@ class TelegramHttpClient(
         httpStatus: Int? = null,
         telegramErrorCode: Int? = null,
         retryAfterSeconds: Long? = null,
-        exceptionClass: String? = null
-    ) = TelegramSendResult.Failure(kind, httpStatus, telegramErrorCode, retryAfterSeconds, exceptionClass)
+        exceptionClass: String? = null,
+        diagnostic: String? = null
+    ) = TelegramSendResult.Failure(kind, httpStatus, telegramErrorCode, retryAfterSeconds, exceptionClass, diagnostic)
+
+    private fun redactedDiagnostic(error: Throwable, request: TelegramSendMessage): String {
+        return TelegramHelperProtocol.exceptionDiagnostic(error, "telegram_http", request)
+    }
 
     private fun encode(value: String): String = URLEncoder.encode(value, "UTF-8")
 

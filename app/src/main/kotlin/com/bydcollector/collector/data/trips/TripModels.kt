@@ -146,6 +146,7 @@ internal data class HistoricalEnergyBackfillRecord(
 ) {
     companion object {
         const val ALGORITHM_VERSION = 2
+        const val EVENT_ALGORITHM_VERSION = 3
         const val RETRY_REASON = "final_off_uncovered_interval"
     }
 }

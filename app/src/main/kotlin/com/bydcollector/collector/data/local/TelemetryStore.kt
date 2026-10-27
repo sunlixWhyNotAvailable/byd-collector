@@ -11,6 +11,12 @@ import com.bydcollector.collector.data.callback.CallbackDelivery
 import com.bydcollector.collector.data.callback.CallbackImportResult
 import com.bydcollector.collector.data.callback.CallbackRawStore
 import com.bydcollector.collector.data.callback.StoredCallbackEvent
+import com.bydcollector.collector.data.input.BusinessInputDelta
+import com.bydcollector.collector.data.input.BusinessInputContinuity
+import com.bydcollector.collector.data.input.BusinessInputCheckpointKeys
+import com.bydcollector.collector.data.input.BusinessInputRef
+import com.bydcollector.collector.data.input.BusinessInputStore
+import com.bydcollector.collector.data.input.BusinessInputTimerSource
 import com.bydcollector.collector.data.direct.DirectFidRegistry
 import com.bydcollector.collector.data.direct.DirectValueDecoders
 import com.bydcollector.collector.data.energy.EnergyInput
@@ -54,6 +60,7 @@ import com.bydcollector.collector.mqtt.PendingMqttMessage
 import com.bydcollector.collector.mqtt.MqttPublishStateRecorder
 import com.bydcollector.collector.mqtt.NormalizedStateProvider
 import com.bydcollector.collector.service.TelegramEventState
+import com.bydcollector.collector.service.TelegramOrderedInput
 import com.bydcollector.collector.util.sqliteFootprintBytes
 import com.bydcollector.collector.util.dispatchOperationalEvent
 import com.bydcollector.collector.util.diagnosticDetail
@@ -100,6 +107,23 @@ internal data class HistoricalEnergyPollPage(
 internal data class HistoricalPollHeaderPage(
     val sourceIdentity: HistoricalMainIdentity,
     val polls: List<HistoricalPollEndpoint>
+)
+
+internal data class HistoricalBusinessInputPage(
+    val sourceIdentity: HistoricalMainIdentity,
+    val businessGeneration: String,
+    val inputs: List<BusinessInputRef>
+)
+
+internal data class HistoricalBusinessInputSource(
+    val sourceIdentity: HistoricalMainIdentity,
+    val businessGeneration: String
+)
+
+internal data class HistoricalBusinessInputCoverage(
+    val source: HistoricalBusinessInputSource,
+    val startCovered: Boolean,
+    val endCovered: Boolean
 )
 
 data class CallbackNormalizationCommit(
@@ -261,9 +285,16 @@ class TelemetryStore(
         runCatching { File("/proc/sys/kernel/random/boot_id").readText().trim() }
             .getOrNull()?.takeIf { it.isNotBlank() }
     }
+    private val businessInputStore = BusinessInputStore(
+        database = { helper.writableDatabase },
+        currentBootId = { currentBootId },
+        nowMs = { java.time.OffsetDateTime.parse(clock.nowIso()).toInstant().toEpochMilli() },
+        businessInputKeys = BusinessInputCheckpointKeys.ALL + TelegramOrderedInput.rawSourceKeys
+    )
     private val callbackRawStore = CallbackRawStore(
         database = { helper.writableDatabase },
-        nowMs = { java.time.OffsetDateTime.parse(clock.nowIso()).toInstant().toEpochMilli() }
+        nowMs = { java.time.OffsetDateTime.parse(clock.nowIso()).toInstant().toEpochMilli() },
+        onMainBatchInserted = businessInputStore::enqueueCallbackBatchInTransaction
     )
     private val influxCursorInitializer = InfluxCursorInitializer()
     private val influxPendingSummaryReader = BoundedInfluxPendingSummaryReader()
@@ -287,6 +318,15 @@ class TelemetryStore(
     private val healthReadFailureSignatures = mutableMapOf<String, String>()
     @Volatile private var pollHealthCache: PollHealthCache? = null
     @Volatile private var pollValueColumnsEnsuredForCatalogVersionId: Long? = null
+    private data class ActiveCatalogCache(
+        val database: SQLiteDatabase,
+        val catalogGeneration: String,
+        val catalogVersionId: Long,
+        val parameters: List<CatalogParameter>
+    )
+    private data class BusinessInputGenerationCache(val database: SQLiteDatabase, val generation: String)
+    private var activeCatalogCache: ActiveCatalogCache? = null
+    @Volatile private var businessInputGenerationCache: BusinessInputGenerationCache? = null
     private val normalizedCatalogImportLock = Any()
     @Volatile private var normalizedCatalogEnsured = false
     private val closed = AtomicBoolean(false)
@@ -380,6 +420,9 @@ class TelemetryStore(
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         synchronized(pollHealthLock) { pollHealthCache = null }
+        activeCatalogCache = null
+        businessInputGenerationCache = null
+        pollValueColumnsEnsuredForCatalogVersionId = null
         influxCursorInitializer.clear()
         influxPendingSummaryReader.clear()
         helper.close()
@@ -401,16 +444,29 @@ class TelemetryStore(
         }
     }
 
+    @Synchronized
     fun ensureCatalogImported(): Long {
+        val db = helper.writableDatabase
+        val generation = DirectFidRegistry.CATALOG_VERSION
+        activeCatalogCache?.let { cached ->
+            if (cached.database === db && cached.catalogGeneration == generation) {
+                return cached.catalogVersionId
+            }
+        }
+        pollValueColumnsEnsuredForCatalogVersionId = null
+
         val catalogVersionId = directImporter.ensureImported()
         //adds wide poll columns for the active catalog before any poll attempts to write values
-        ensurePollValueColumns(helper.writableDatabase, catalogParameters(catalogVersionId))
+        val parameters = catalogParameters(db, catalogVersionId)
+        ensurePollValueColumns(db, parameters)
+        activeCatalogCache = ActiveCatalogCache(db, generation, catalogVersionId, parameters)
         return catalogVersionId
     }
 
+    @Synchronized
     override fun getActiveCatalogParameters(): List<CatalogParameter> {
-        val catalogVersionId = ensureCatalogImported()
-        return catalogParameters(catalogVersionId)
+        ensureCatalogImported()
+        return checkNotNull(activeCatalogCache).parameters
     }
 
     fun ensureNormalizedCatalogImported() {
@@ -463,6 +519,105 @@ class TelemetryStore(
         }
         return callbackRawStore.importBatch(batch, digest, delivery)
     }
+
+    fun nextPendingBusinessInput(): BusinessInputRef? = businessInputStore.nextPendingBusinessInput()
+
+    fun pendingBusinessInputs(limit: Int = 64): List<BusinessInputRef> =
+        businessInputStore.pendingBusinessInputs(limit)
+
+    @Synchronized
+    fun businessInputGeneration(): String {
+        val db = helper.readableDatabase
+        businessInputGenerationCache?.let { cached ->
+            if (cached.database === db) return cached.generation
+        }
+        return businessInputStore.businessInputGeneration(db).also { generation ->
+            businessInputGenerationCache = BusinessInputGenerationCache(db, generation)
+        }
+    }
+
+    fun loadBusinessInputDelta(ref: BusinessInputRef): BusinessInputDelta =
+        businessInputStore.loadBusinessInputDelta(ref)
+
+    fun loadBusinessInputCheckpoint(): Map<String, NormalizedSourceInput> =
+        businessInputStore.loadBusinessInputCheckpoint()
+
+    fun loadBusinessInputInitialCheckpoint(): Map<String, NormalizedSourceInput> =
+        businessInputStore.loadBusinessInputInitialCheckpoint()
+
+    fun loadBusinessInputContinuityCheckpoint(): Map<String, BusinessInputContinuity> =
+        businessInputStore.loadBusinessInputContinuityCheckpoint()
+
+    fun completeBusinessInput(
+        ref: BusinessInputRef,
+        acceptedCheckpointUpdates: Map<String, NormalizedSourceInput>
+    ): Boolean = businessInputStore.completeBusinessInput(ref, acceptedCheckpointUpdates)
+
+    fun completeBusinessInputs(
+        refs: List<BusinessInputRef>,
+        acceptedCheckpointUpdates: Map<String, NormalizedSourceInput>,
+        acceptedContinuityUpdates: Map<String, BusinessInputContinuity> = emptyMap()
+    ): Boolean = businessInputStore.completeBusinessInputs(refs, acceptedCheckpointUpdates, acceptedContinuityUpdates)
+
+    fun businessInputEventHistory(afterId: Long = 0L, limit: Int = 512): List<BusinessInputRef> =
+        businessInputStore.businessInputEventHistory(afterId, limit)
+
+    internal fun historicalBusinessInputPage(
+        bootId: String,
+        fromElapsedMs: Long,
+        throughElapsedMs: Long,
+        afterId: Long,
+        limit: Int
+    ): HistoricalBusinessInputPage {
+        val before = historicalMainIdentity()
+        val generation = businessInputGeneration()
+        val inputs = businessInputStore.businessInputEventHistory(
+            bootId, fromElapsedMs, throughElapsedMs, afterId, limit
+        )
+        check(before == historicalMainIdentity()) { "active_main_replaced" }
+        return HistoricalBusinessInputPage(before, generation, inputs)
+    }
+
+    internal fun historicalBusinessInputSource(): HistoricalBusinessInputSource {
+        val before = historicalMainIdentity()
+        val generation = businessInputGeneration()
+        check(before == historicalMainIdentity()) { "active_main_replaced" }
+        return HistoricalBusinessInputSource(before, generation)
+    }
+
+    internal fun historicalBusinessInputCoverage(
+        bootId: String,
+        startElapsedMs: Long,
+        endElapsedMs: Long
+    ): HistoricalBusinessInputCoverage {
+        require(startElapsedMs >= 0L && endElapsedMs >= startElapsedMs)
+        val before = historicalMainIdentity()
+        val generation = businessInputGeneration()
+        val startCovered = businessInputStore.hasBusinessInputAt(bootId, startElapsedMs)
+        val endCovered = businessInputStore.hasBusinessInputAt(bootId, endElapsedMs)
+        check(before == historicalMainIdentity()) { "active_main_replaced" }
+        return HistoricalBusinessInputCoverage(
+            HistoricalBusinessInputSource(before, generation), startCovered, endCovered
+        )
+    }
+
+    fun enqueueEvaluation(source: BusinessInputTimerSource, sessionId: Long? = null): Long =
+        businessInputStore.enqueueEvaluation(source, sessionId)
+
+    /** Persists a scoped APP observation that a particular helper generation died. */
+    fun recordAppObservedSourceLoss(
+        lostHelperGeneration: String,
+        stream: Int,
+        affectedReadingKeys: Collection<String>,
+        reason: String,
+        diagnostic: String?,
+        appBootId: String,
+        observedWallMs: Long,
+        observedElapsedMs: Long
+    ): Long = businessInputStore.recordAppObservedSourceLoss(
+        lostHelperGeneration, stream, affectedReadingKeys, reason, diagnostic,
+        appBootId, observedWallMs, observedElapsedMs
+    )
 
     fun pendingCallbackNormalization(limit: Int = CallbackRawStore.MAX_PENDING_PAGE): List<StoredCallbackEvent> =
         callbackRawStore.pendingNormalization(limit)
@@ -578,7 +733,7 @@ class TelemetryStore(
         return db.rawQuery(
             """
             SELECT source_key, raw_value, desc_value, source_kind, source_identity, source_boot_id,
-                   source_generator_id, source_sequence, source_wall_ms, source_elapsed_ms, source_poll_id
+                   source_generator_id, source_sequence, source_epoch, source_wall_ms, source_elapsed_ms, source_poll_id
             FROM normalized_source_inputs
             """.trimIndent(),
             emptyArray()
@@ -602,10 +757,11 @@ class TelemetryStore(
                                 bootId = cursor.getString(5),
                                 generatorId = cursor.getNullableString(6),
                                 sequence = if (cursor.isNull(7)) null else cursor.getLong(7),
-                                wallMs = cursor.getLong(8),
-                                elapsedMs = cursor.getLong(9)
+                                wallMs = cursor.getLong(9),
+                                elapsedMs = cursor.getLong(10),
+                                sourceEpoch = if (cursor.isNull(8)) null else cursor.getLong(8)
                             ),
-                            sourcePollId = if (cursor.isNull(10)) null else cursor.getLong(10)
+                            sourcePollId = if (cursor.isNull(11)) null else cursor.getLong(11)
                         )
                     )
                 }
@@ -645,6 +801,7 @@ class TelemetryStore(
                 put("source_boot_id", incoming.stamp.bootId)
                 putNullable("source_generator_id", incoming.stamp.generatorId)
                 putNullable("source_sequence", incoming.stamp.sequence)
+                putNullable("source_epoch", incoming.stamp.sourceEpoch)
                 put("source_wall_ms", incoming.stamp.wallMs)
                 put("source_elapsed_ms", incoming.stamp.elapsedMs)
                 putNullable("source_poll_id", incoming.sourcePollId)
@@ -699,8 +856,8 @@ class TelemetryStore(
             changedCategories = changedCategories + other.changedCategories
         )
 
-    private fun catalogParameters(catalogVersionId: Long): List<CatalogParameter> {
-        helper.readableDatabase.rawQuery(
+    private fun catalogParameters(db: SQLiteDatabase, catalogVersionId: Long): List<CatalogParameter> {
+        db.rawQuery(
             """
             SELECT id, catalog_version_id, source_id, key, name, group_name, include_desc, note
             FROM parameter_catalog
@@ -808,6 +965,7 @@ class TelemetryStore(
         db.beginTransaction()
         try {
             inserted = insertPollInTransaction(db, sessionId, input, parameters)
+            businessInputStore.enqueueGetInTransaction(db, inserted.pollId, sessionId, input)
             db.setTransactionSuccessful()
         } finally {
             db.endTransaction()
@@ -846,6 +1004,7 @@ class TelemetryStore(
                         put("imported_at", clock.nowIso())
                     }
                 )
+                businessInputStore.enqueueGetInTransaction(db, inserted.pollId, sessionId, input)
                 decodedIdsToCache = inserted.decodedIds
                 result = WorkerPollImportResult(inserted.pollId, inserted = true)
             }
@@ -2222,7 +2381,7 @@ class TelemetryStore(
     ): PollInsertResult {
         val requestedParameterCount = parameters.size
         val receivedParameterCount = if (input.ok) {
-            input.readings.map { it.rawKey }.distinct().size
+            input.readings.asSequence().filter { it.rawValue != null }.map { it.rawKey }.distinct().count()
         } else {
             0
         }
@@ -2325,6 +2484,8 @@ class TelemetryStore(
                     put("helper_generation", source.helperGeneration)
                     put("stream", source.stream)
                     put("epoch", source.epoch)
+                    if (source.hasSourceEpoch) put("source_epoch", source.sourceEpoch)
+                    else putNull("source_epoch")
                     put("event_sequence", source.eventSequence)
                     put("device", source.device)
                     put("fid", source.fid)
@@ -2334,6 +2495,36 @@ class TelemetryStore(
                     put("received_elapsed_ms", source.receivedElapsedMs)
                     source.sourceWallMs?.let { put("source_wall_ms", it) } ?: putNull("source_wall_ms")
                     put("quality", source.quality)
+                }
+            )
+        }
+        readings.forEach { reading ->
+            if (parametersByKey[reading.rawKey] == null) return@forEach
+            val lineage = reading.getLineage ?: return@forEach
+            val entry = DirectFidRegistry.entries.singleOrNull { it.key == reading.rawKey }
+                ?: error("GET lineage key is not in the direct registry: ${reading.rawKey}")
+            db.insertOrThrow(
+                "poll_get_lineage",
+                null,
+                ContentValues().apply {
+                    put("poll_id", pollId)
+                    put("source_key", reading.rawKey)
+                    put("helper_boot_id", lineage.helperBootId)
+                    put("helper_generation", lineage.helperGeneration)
+                    put("stream", lineage.stream)
+                    put("source_epoch", lineage.sourceEpoch)
+                    put("read_identity", lineage.readIdentity)
+                    put("record_sequence", lineage.recordSequence)
+                    put("device", entry.dev)
+                    put("fid", entry.fid)
+                    put("tx", entry.tx)
+                    put("started_wall_ms", lineage.startedWallMs)
+                    put("started_elapsed_ms", lineage.startedElapsedMs)
+                    put("completed_wall_ms", lineage.completedWallMs)
+                    put("completed_elapsed_ms", lineage.completedElapsedMs)
+                    put("callback_watermark_start", lineage.callbackWatermarkStart)
+                    put("callback_watermark_end", lineage.callbackWatermarkEnd)
+                    put("superseded_by_callback", if (lineage.supersededByCallback) 1 else 0)
                 }
             )
         }

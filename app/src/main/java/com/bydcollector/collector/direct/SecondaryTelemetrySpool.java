@@ -35,7 +35,10 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
     public static final long MAX_SPOOL_BYTES = 128L * 1024L * 1024L;
     public static final int EXPECTED_FIELD_COUNT = TelemetryCatalogPolicy.SECONDARY_ACTIVE_COUNT;
     public static final int MAX_SLICE_BYTES = 224 * 1024;
-    public static final int RECORD_VERSION = 2;
+    public static final int RECORD_VERSION = 5;
+    public static final int LINEAGE_RECORD_VERSION = 4;
+    public static final int SAMPLED_RECORD_VERSION = 3;
+    public static final int PREVIOUS_RECORD_VERSION = 2;
     public static final int LEGACY_RECORD_VERSION = 1;
     public static final int MAX_IDENTIFIER_CHARS = 256;
 
@@ -65,7 +68,11 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
     private boolean closed;
 
     public static SecondaryTelemetrySpool open() {
-        return open(new File(SPOOL_DIRECTORY_PATH), MAX_SPOOL_BYTES, EXPECTED_FIELD_COUNT, NO_FAILURES);
+        return open(EXPECTED_FIELD_COUNT);
+    }
+
+    static SecondaryTelemetrySpool open(int expectedFieldCount) {
+        return open(new File(SPOOL_DIRECTORY_PATH), MAX_SPOOL_BYTES, expectedFieldCount, NO_FAILURES);
     }
 
     static SecondaryTelemetrySpool openForTest(File directory, long maxBytes, int expectedFieldCount) {
@@ -184,16 +191,21 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
         if (findReady(cycle.identity) != null) return AppendResult.DUPLICATE;
 
         LossSummary loss = readLoss();
-        boolean full = forceFull || loss != null || baseline == null ||
+        boolean sparse = !isCompleteCycle(cycle, expectedFieldCount);
+        boolean full = !sparse && (forceFull || loss != null || baseline == null ||
             !cycle.identity.sameEpoch(baselineIdentity) ||
             !cycle.catalogVersion.equals(baselineCatalogVersion) ||
-            cycle.identity.sequence != baselineIdentity.sequence + 1L;
-        List<Value> persistedValues = full ? cycle.values : changes(baseline, cycle.values);
+            cycle.identity.sequence != baselineIdentity.sequence + 1L);
+        List<Value> materialized = sparse ? copyValues(cycle.values)
+            : materializeCycle(cycle, full, expectedFieldCount, baseline);
+        List<Value> persistedValues = sparse ? materialized
+            : full ? materialized : changes(baseline, materialized);
         int okCount = 0;
-        for (Value value : cycle.values) if (value.status == 0 && value.rawPresent) okCount++;
+        for (Value value : materialized) if (value.status == 0 && value.rawPresent) okCount++;
         Record record = new Record(
+            RECORD_VERSION,
             nextOrder,
-            full ? Kind.FULL : Kind.DELTA,
+            sparse ? Kind.SPARSE : full ? Kind.FULL : Kind.DELTA,
             cycle.identity,
             cycle.catalogVersion,
             cycle.capturedWallMs,
@@ -209,10 +221,11 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
             cycle.error,
             expectedFieldCount,
             okCount,
-            expectedFieldCount - okCount,
+            (sparse ? materialized.size() : expectedFieldCount) - okCount,
             persistedValues,
+            cycle.sampledOrdinals,
             loss,
-            full ? null : baselineIdentity
+            sparse || full ? null : baselineIdentity
         );
         byte[] bytes = Codec.encode(record);
         long footprint = footprintBytes();
@@ -239,10 +252,18 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
             failures.before("append_publish", temporary);
             Files.move(temporary.toPath(), ready.toPath(), StandardCopyOption.ATOMIC_MOVE);
             rootState.noteRename(temporary, ready);
-            baseline = copyValues(cycle.values);
-            baselineIdentity = cycle.identity;
-            baselineCatalogVersion = cycle.catalogVersion;
-            forceFull = false;
+            if (sparse) {
+                // SPARSE records are independent observations and never become a DELTA base.
+                baseline = null;
+                baselineIdentity = null;
+                baselineCatalogVersion = null;
+                forceFull = true;
+            } else {
+                baseline = materialized;
+                baselineIdentity = cycle.identity;
+                baselineCatalogVersion = cycle.catalogVersion;
+                forceFull = false;
+            }
             nextOrder++;
             if (loss != null) {
                 File lossFile = new File(directory, LOSS_FILE);
@@ -250,7 +271,7 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
                 else notifyPersistenceFailure("clear_loss", new IOException("cannot delete persisted loss summary"));
             }
             notifyAppend(record, bytes.length);
-            return full ? AppendResult.FULL : AppendResult.DELTA;
+            return sparse ? AppendResult.SPARSE : full ? AppendResult.FULL : AppendResult.DELTA;
         } catch (IOException error) {
             if (temporary.isFile()) temporary.delete();
             rootState.invalidate();
@@ -399,13 +420,13 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
         int count = 0;
         for (DecodedFile value : files) {
             if (value.record.spoolOrder == descriptor.spoolOrder && value.record.identity.equals(descriptor.identity)) {
-                poison = true;
-                invalidateBaseline();
+                poison = value.record.kind != Kind.SPARSE;
+                if (poison) invalidateBaseline();
             } else if (poison && value.record.kind == Kind.FULL) {
                 clearPoisonMarkers(poisonMarkers);
                 poison = false;
             }
-            if (poison) {
+            if (poison && value.record.kind != Kind.SPARSE) {
                 poisonMarkers.add(quarantineFile(value.file, reason, true));
                 count++;
             }
@@ -418,6 +439,11 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
             rootState.ensureFresh();
             return statusShared();
         }
+    }
+
+    synchronized boolean requiresFullRead() {
+        ensureOpen();
+        return forceFull || baseline == null;
     }
 
     private Status statusShared() {
@@ -591,14 +617,47 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
 
     private static void validateCycle(Cycle cycle, int expectedFieldCount) {
         if (cycle == null) throw new IllegalArgumentException("cycle is required");
-        if (cycle.values.size() != expectedFieldCount) {
-            throw new IllegalArgumentException("secondary frame cardinality mismatch");
+        if (cycle.sampledOrdinals.isEmpty() || cycle.values.size() != cycle.sampledOrdinals.size()) {
+            throw new IllegalArgumentException("secondary cycle must contain every attempted field result");
         }
-        for (int index = 0; index < cycle.values.size(); index++) {
-            if (cycle.values.get(index).ordinal != index) {
-                throw new IllegalArgumentException("secondary frame ordinal mismatch at " + index);
+        int previous = -1;
+        for (int index = 0; index < cycle.sampledOrdinals.size(); index++) {
+            int ordinal = cycle.sampledOrdinals.get(index);
+            if (ordinal <= previous || ordinal >= expectedFieldCount || cycle.values.get(index).ordinal != ordinal) {
+                throw new IllegalArgumentException("secondary sampled ordinal mismatch at " + index);
             }
+            previous = ordinal;
         }
+    }
+
+    private static boolean isCompleteCycle(Cycle cycle, int fieldCount) {
+        return cycle.values.size() == fieldCount && cycle.sampledOrdinals.size() == fieldCount &&
+            cycle.sampledOrdinals.get(0) == 0 && cycle.sampledOrdinals.get(fieldCount - 1) == fieldCount - 1;
+    }
+
+    private static List<Value> materializeCycle(
+        Cycle cycle, boolean full, int fieldCount, List<Value> previous
+    ) {
+        if (full) {
+            if (cycle.values.size() != fieldCount || cycle.sampledOrdinals.size() != fieldCount ||
+                cycle.sampledOrdinals.get(0) != 0 || cycle.sampledOrdinals.get(fieldCount - 1) != fieldCount - 1) {
+                throw new IllegalStateException("FULL baseline requires an actual GET for every secondary field");
+            }
+            return copyValues(cycle.values);
+        }
+        if (previous == null || previous.size() != fieldCount) {
+            throw new IllegalStateException("DELTA has no complete secondary baseline");
+        }
+        List<Value> result = new ArrayList<>(previous);
+        for (Value value : cycle.values) result.set(value.ordinal, value);
+        return copyValues(result);
+    }
+
+    private static List<Integer> ordinals(List<Value> values) {
+        if (values == null) return Collections.emptyList();
+        List<Integer> result = new ArrayList<>(values.size());
+        for (Value value : values) result.add(value.ordinal);
+        return result;
     }
 
     private static List<Value> copyValues(List<Value> values) {
@@ -720,9 +779,9 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
         default void onPersistenceFailure(String operation, Throwable error) { }
     }
 
-    public enum AppendResult { FULL, DELTA, DUPLICATE, CAP_REACHED }
+    public enum AppendResult { FULL, DELTA, SPARSE, DUPLICATE, CAP_REACHED }
     public enum AckResult { RELEASED, NOT_FOUND, REJECTED }
-    public enum Kind { FULL, DELTA }
+    public enum Kind { FULL, DELTA, SPARSE }
 
     public static final class CycleIdentity {
         public final String bootId;
@@ -769,6 +828,7 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
         public final Integer raw;
         public final String error;
         public final boolean cached;
+        public final HelperGetLineage getLineage;
 
         public Value(int ordinal, int status, boolean rawPresent, Integer raw, String error) {
             this(ordinal, status, rawPresent, raw, error, false);
@@ -776,6 +836,11 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
 
         public Value(int ordinal, int status, boolean rawPresent, Integer raw, String error,
                      boolean cached) {
+            this(ordinal, status, rawPresent, raw, error, cached, null);
+        }
+
+        public Value(int ordinal, int status, boolean rawPresent, Integer raw, String error,
+                     boolean cached, HelperGetLineage getLineage) {
             if (ordinal < 0) throw new IllegalArgumentException("ordinal must be non-negative");
             if (rawPresent != (raw != null)) throw new IllegalArgumentException("rawPresent/raw mismatch");
             this.ordinal = ordinal;
@@ -787,12 +852,17 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
                 throw new IllegalArgumentException("cached value requires usable raw");
             }
             this.cached = cached;
+            if (getLineage != null && (getLineage.stream != CollectorHelperProtocol.STREAM_SECONDARY || cached)) {
+                throw new IllegalArgumentException("secondary GET lineage requires a non-cached secondary observation");
+            }
+            this.getLineage = getLineage;
         }
 
         boolean sameObservation(Value other) {
             return status == other.status && rawPresent == other.rawPresent &&
                 (raw == null ? other.raw == null : raw.equals(other.raw)) &&
-                (error == null ? other.error == null : error.equals(other.error)) && cached == other.cached;
+                (error == null ? other.error == null : error.equals(other.error)) && cached == other.cached &&
+                getLineage == other.getLineage;
         }
     }
 
@@ -811,12 +881,24 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
         public final int groupFailureCount;
         public final String error;
         public final List<Value> values;
+        public final List<Integer> sampledOrdinals;
 
         public Cycle(
             CycleIdentity identity, String catalogVersion, long capturedWallMs, long capturedElapsedMs,
             long cycleElapsedMs, int batchStatus, int batchMode, boolean nativeAvailable,
             int nativeGroupCount, int fallbackGroupCount, int fallbackReadCount, int groupFailureCount,
             String error, List<Value> values
+        ) {
+            this(identity, catalogVersion, capturedWallMs, capturedElapsedMs, cycleElapsedMs,
+                batchStatus, batchMode, nativeAvailable, nativeGroupCount, fallbackGroupCount,
+                fallbackReadCount, groupFailureCount, error, values, ordinals(values));
+        }
+
+        public Cycle(
+            CycleIdentity identity, String catalogVersion, long capturedWallMs, long capturedElapsedMs,
+            long cycleElapsedMs, int batchStatus, int batchMode, boolean nativeAvailable,
+            int nativeGroupCount, int fallbackGroupCount, int fallbackReadCount, int groupFailureCount,
+            String error, List<Value> values, List<Integer> sampledOrdinals
         ) {
             if (identity == null) throw new IllegalArgumentException("identity is required");
             this.identity = identity;
@@ -827,7 +909,7 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
             if (nativeGroupCount < 0 || fallbackGroupCount < 0 || fallbackReadCount < 0 || groupFailureCount < 0) {
                 throw new IllegalArgumentException("cycle counts must be non-negative");
             }
-            if (values == null) throw new IllegalArgumentException("values is required");
+            if (values == null || sampledOrdinals == null) throw new IllegalArgumentException("values and sampled ordinals are required");
             this.capturedWallMs = capturedWallMs;
             this.capturedElapsedMs = capturedElapsedMs;
             this.cycleElapsedMs = cycleElapsedMs;
@@ -840,10 +922,12 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
             this.groupFailureCount = groupFailureCount;
             this.error = error;
             this.values = copyValues(values);
+            this.sampledOrdinals = Collections.unmodifiableList(new ArrayList<>(sampledOrdinals));
         }
     }
 
     public static final class Record {
+        public final int recordVersion;
         public final long spoolOrder;
         public final Kind kind;
         public final CycleIdentity identity;
@@ -863,31 +947,64 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
         public final int okCount;
         public final int errorCount;
         public final List<Value> values;
+        public final List<Integer> sampledOrdinals;
         public final LossSummary lossBefore;
         public final CycleIdentity predecessorIdentity;
 
         private Record(
-            long spoolOrder, Kind kind, CycleIdentity identity, String catalogVersion,
+            int recordVersion, long spoolOrder, Kind kind, CycleIdentity identity, String catalogVersion,
             long capturedWallMs, long capturedElapsedMs, long cycleElapsedMs, int batchStatus,
             int batchMode, boolean nativeAvailable, int nativeGroupCount, int fallbackGroupCount,
             int fallbackReadCount, int groupFailureCount, String error, int fieldCount,
-            int okCount, int errorCount, List<Value> values, LossSummary lossBefore,
+            int okCount, int errorCount, List<Value> values, List<Integer> sampledOrdinals, LossSummary lossBefore,
             CycleIdentity predecessorIdentity
         ) {
-            if (spoolOrder < 0 || kind == null || identity == null) {
+            if ((recordVersion != RECORD_VERSION && recordVersion != LINEAGE_RECORD_VERSION && recordVersion != SAMPLED_RECORD_VERSION && recordVersion != PREVIOUS_RECORD_VERSION &&
+                recordVersion != LEGACY_RECORD_VERSION) || spoolOrder < 0 || kind == null || identity == null) {
                 throw new IllegalArgumentException("invalid record identity");
             }
             identifier(catalogVersion, "catalogVersion");
+            int expectedCount = kind == Kind.SPARSE && sampledOrdinals != null
+                ? sampledOrdinals.size() : fieldCount;
             if (capturedWallMs < 0 || capturedElapsedMs < 0 || cycleElapsedMs < 0 ||
                 nativeGroupCount < 0 || fallbackGroupCount < 0 || fallbackReadCount < 0 ||
                 groupFailureCount < 0 || fieldCount <= 0 || okCount < 0 || errorCount < 0 ||
-                okCount + errorCount != fieldCount || values == null) {
+                okCount + errorCount != expectedCount || values == null || sampledOrdinals == null ||
+                sampledOrdinals.isEmpty()) {
                 throw new IllegalArgumentException("invalid record metadata");
             }
+            if (kind == Kind.SPARSE && recordVersion < RECORD_VERSION) {
+                throw new IllegalArgumentException("SPARSE requires record version 5");
+            }
+            int previousSample = -1;
+            for (Integer ordinal : sampledOrdinals) {
+                if (ordinal == null || ordinal <= previousSample || ordinal >= fieldCount) {
+                    throw new IllegalArgumentException("invalid sampled ordinal order");
+                }
+                previousSample = ordinal;
+            }
+            if (kind == Kind.FULL && (sampledOrdinals.size() != fieldCount ||
+                sampledOrdinals.get(0) != 0 || sampledOrdinals.get(fieldCount - 1) != fieldCount - 1)) {
+                throw new IllegalArgumentException("FULL must sample every field");
+            }
             int previousOrdinal = -1;
+            int sampledIndex = 0;
             for (Value value : values) {
                 if (value == null || value.ordinal <= previousOrdinal || value.ordinal >= fieldCount) {
                     throw new IllegalArgumentException("invalid record value order");
+                }
+                if (recordVersion >= SAMPLED_RECORD_VERSION) {
+                    while (sampledIndex < sampledOrdinals.size() && sampledOrdinals.get(sampledIndex) < value.ordinal) {
+                        sampledIndex++;
+                    }
+                    if (sampledIndex >= sampledOrdinals.size() || sampledOrdinals.get(sampledIndex) != value.ordinal) {
+                        throw new IllegalArgumentException("record value was not sampled");
+                    }
+                }
+                if (value.getLineage != null &&
+                    (!identity.bootId.equals(value.getLineage.helperBootId) ||
+                     !identity.helperGeneration.equals(value.getLineage.helperGeneration))) {
+                    throw new IllegalArgumentException("secondary GET lineage belongs to a different helper");
                 }
                 previousOrdinal = value.ordinal;
             }
@@ -898,11 +1015,19 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
                 int actualOk = 0;
                 for (Value value : values) if (value.status == 0 && value.rawPresent) actualOk++;
                 if (actualOk != okCount) throw new IllegalArgumentException("FULL cycle counts mismatch");
+            } else if (kind == Kind.SPARSE) {
+                if (values.size() != sampledOrdinals.size() || predecessorIdentity != null) {
+                    throw new IllegalArgumentException("invalid SPARSE record");
+                }
+                int actualOk = 0;
+                for (Value value : values) if (value.status == 0 && value.rawPresent) actualOk++;
+                if (actualOk != okCount) throw new IllegalArgumentException("SPARSE cycle counts mismatch");
             } else if (predecessorIdentity == null || !identity.sameEpoch(predecessorIdentity) ||
                 predecessorIdentity.sequence == Long.MAX_VALUE || predecessorIdentity.sequence + 1L != identity.sequence) {
                 throw new IllegalArgumentException("invalid DELTA predecessor");
             }
             this.spoolOrder = spoolOrder;
+            this.recordVersion = recordVersion;
             this.kind = kind;
             this.identity = identity;
             this.catalogVersion = catalogVersion;
@@ -921,6 +1046,7 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
             this.okCount = okCount;
             this.errorCount = errorCount;
             this.values = copyValues(values);
+            this.sampledOrdinals = Collections.unmodifiableList(new ArrayList<>(sampledOrdinals));
             this.lossBefore = lossBefore;
             this.predecessorIdentity = predecessorIdentity;
         }
@@ -929,6 +1055,9 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
             if (kind == Kind.FULL) {
                 if (values.size() != fieldCount) throw new IllegalStateException("invalid FULL cardinality");
                 return copyValues(values);
+            }
+            if (kind == Kind.SPARSE) {
+                throw new IllegalStateException("SPARSE has no complete catalog materialization");
             }
             if (predecessorIdentity == null || !predecessorIdentity.equals(previousIdentity) ||
                 previous == null || previous.size() != fieldCount) {
@@ -1065,7 +1194,7 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
             if (record == null) throw new IllegalArgumentException("record is required");
             try {
                 JSONObject json = new JSONObject()
-                .put("record_version", RECORD_VERSION)
+                .put("record_version", record.recordVersion)
                 .put("spool_order", record.spoolOrder)
                 .put("kind", record.kind.name())
                 .put("identity", identity(record.identity))
@@ -1082,12 +1211,15 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
                 .put("group_failure_count", record.groupFailureCount)
                 .put("error", record.error == null ? JSONObject.NULL : record.error)
                 .put("field_count", record.fieldCount)
-                .put("attempted_count", record.fieldCount)
+                .put("attempted_count", record.sampledOrdinals.size())
                 .put("ok_count", record.okCount)
                 .put("error_count", record.errorCount)
                 .put("predecessor_identity", record.predecessorIdentity == null
                     ? JSONObject.NULL : identity(record.predecessorIdentity))
                 .put("loss_before", record.lossBefore == null ? JSONObject.NULL : record.lossBefore.encode());
+            JSONArray sampledOrdinals = new JSONArray();
+            for (Integer ordinal : record.sampledOrdinals) sampledOrdinals.put(ordinal);
+            json.put("sampled_ordinals", sampledOrdinals);
             JSONArray values = new JSONArray();
             for (Value value : record.values) {
                 values.put(new JSONObject()
@@ -1096,6 +1228,7 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
                     .put("raw_present", value.rawPresent)
                     .put("raw", value.raw == null ? JSONObject.NULL : value.raw)
                     .put("callback_cached", value.cached)
+                    .put("get_lineage", value.getLineage == null ? JSONObject.NULL : value.getLineage.toJson())
                     .put("error", value.error == null ? JSONObject.NULL : value.error));
             }
                 json.put("values", values);
@@ -1110,13 +1243,29 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
             try {
                 JSONObject json = new JSONObject(new String(bytes, StandardCharsets.UTF_8));
             int recordVersion = exactInt(json, "record_version");
-            if (recordVersion != RECORD_VERSION && recordVersion != LEGACY_RECORD_VERSION) {
+            if (recordVersion != RECORD_VERSION && recordVersion != LINEAGE_RECORD_VERSION && recordVersion != SAMPLED_RECORD_VERSION && recordVersion != PREVIOUS_RECORD_VERSION &&
+                recordVersion != LEGACY_RECORD_VERSION) {
                 throw new IllegalArgumentException("unsupported secondary record version");
             }
             Kind kind = Kind.valueOf(exactString(json, "kind"));
             int fieldCount = exactInt(json, "field_count");
             if (fieldCount <= 0) throw new IllegalArgumentException("invalid field count");
             JSONArray encoded = json.getJSONArray("values");
+            List<Integer> sampledOrdinals = new ArrayList<>();
+            if (recordVersion >= SAMPLED_RECORD_VERSION) {
+                JSONArray sampled = json.getJSONArray("sampled_ordinals");
+                int previousSample = -1;
+                for (int index = 0; index < sampled.length(); index++) {
+                    int ordinal = exactInt(sampled, index);
+                    if (ordinal < 0 || ordinal >= fieldCount || ordinal <= previousSample) {
+                        throw new IllegalArgumentException("invalid sampled ordinal");
+                    }
+                    sampledOrdinals.add(ordinal);
+                    previousSample = ordinal;
+                }
+            } else {
+                for (int ordinal = 0; ordinal < fieldCount; ordinal++) sampledOrdinals.add(ordinal);
+            }
             List<Value> values = new ArrayList<>(encoded.length());
             Set<Integer> ordinals = new HashSet<>();
             int previous = -1;
@@ -1130,16 +1279,21 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
                 boolean present = exactBoolean(value, "raw_present");
                 Integer raw = value.isNull("raw") ? null : exactInt(value, "raw");
                 values.add(new Value(ordinal, exactInt(value, "status"), present, raw,
-                    nullableString(value, "error"), recordVersion >= 2 && exactBoolean(value, "callback_cached")));
+                    nullableString(value, "error"), recordVersion >= 2 && exactBoolean(value, "callback_cached"),
+                    recordVersion >= LINEAGE_RECORD_VERSION && !value.isNull("get_lineage")
+                        ? HelperGetLineage.fromJson(value.getJSONObject("get_lineage")) : null));
             }
             if (kind == Kind.FULL && values.size() != fieldCount) {
                 throw new IllegalArgumentException("FULL field count mismatch");
             }
+            if (sampledOrdinals.isEmpty() || (kind == Kind.FULL && sampledOrdinals.size() != fieldCount)) {
+                throw new IllegalArgumentException("invalid sampled ordinal count");
+            }
             LossSummary loss = json.isNull("loss_before") ? null : LossSummary.decode(json.getJSONObject("loss_before"));
             CycleIdentity predecessor = json.isNull("predecessor_identity")
                 ? null : identity(json.getJSONObject("predecessor_identity"));
-            if (kind == Kind.FULL && predecessor != null) {
-                throw new IllegalArgumentException("FULL must not have predecessor");
+            if ((kind == Kind.FULL || kind == Kind.SPARSE) && predecessor != null) {
+                throw new IllegalArgumentException("independent record must not have predecessor");
             }
             CycleIdentity recordIdentity = identity(json.getJSONObject("identity"));
             if (kind == Kind.DELTA && (predecessor == null || !recordIdentity.sameEpoch(predecessor) ||
@@ -1149,18 +1303,20 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
             int attemptedCount = exactInt(json, "attempted_count");
             int okCount = exactInt(json, "ok_count");
             int errorCount = exactInt(json, "error_count");
-            if (attemptedCount != fieldCount || okCount < 0 || errorCount < 0 || okCount + errorCount != fieldCount) {
+            int expectedCount = kind == Kind.SPARSE ? sampledOrdinals.size() : fieldCount;
+            if (attemptedCount != sampledOrdinals.size() || okCount < 0 || errorCount < 0 ||
+                okCount + errorCount != expectedCount || (kind == Kind.SPARSE && recordVersion < RECORD_VERSION)) {
                 throw new IllegalArgumentException("cycle count mismatch");
             }
                 return new Record(
-                exactLong(json, "spool_order"), kind, recordIdentity,
+                recordVersion, exactLong(json, "spool_order"), kind, recordIdentity,
                 exactString(json, "catalog_version"), exactLong(json, "captured_wall_ms"),
                 exactLong(json, "captured_elapsed_ms"), exactLong(json, "cycle_elapsed_ms"),
                 exactInt(json, "batch_status"), exactInt(json, "batch_mode"),
                 exactBoolean(json, "native_available"), exactInt(json, "native_group_count"),
                 exactInt(json, "fallback_group_count"), exactInt(json, "fallback_read_count"),
                 exactInt(json, "group_failure_count"), nullableString(json, "error"),
-                fieldCount, okCount, errorCount, values, loss, predecessor
+                fieldCount, okCount, errorCount, values, sampledOrdinals, loss, predecessor
                 );
             } catch (JSONException error) {
                 throw new IllegalArgumentException("invalid secondary record JSON", error);
@@ -1193,6 +1349,16 @@ public final class SecondaryTelemetrySpool implements AutoCloseable {
                 return (Integer) value;
             } catch (JSONException error) {
                 throw new IllegalArgumentException("missing " + key, error);
+            }
+        }
+
+        private static int exactInt(JSONArray json, int index) {
+            try {
+                Object value = json.get(index);
+                if (!(value instanceof Integer)) throw new IllegalArgumentException("array value must be an exact int");
+                return (Integer) value;
+            } catch (JSONException error) {
+                throw new IllegalArgumentException("missing array item " + index, error);
             }
         }
 

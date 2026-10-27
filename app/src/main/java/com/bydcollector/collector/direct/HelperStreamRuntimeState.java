@@ -245,8 +245,9 @@ final class HelperStreamRuntimeState {
     }
 
     private void replace(StreamState state, boolean desired) {
+        boolean preserveAutonomy = state.desired && desired && state.autonomyAllowed;
         state.desired = desired;
-        state.autonomyAllowed = false;
+        state.autonomyAllowed = preserveAutonomy;
         state.paused = false;
         state.pausePending = false;
         state.epoch = nextEpoch(state.epoch);

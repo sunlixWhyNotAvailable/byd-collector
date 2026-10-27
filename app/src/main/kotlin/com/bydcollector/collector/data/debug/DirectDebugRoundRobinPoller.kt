@@ -1,8 +1,8 @@
 package com.bydcollector.collector.data.debug
 
 import com.bydcollector.collector.data.direct.DirectStreamCredentials
-import com.bydcollector.collector.data.direct.DirectHelperReadResult
 import com.bydcollector.collector.data.direct.DirectVehicleHelper
+import com.bydcollector.collector.data.direct.selectRequestedBatchResults
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import com.bydcollector.collector.direct.CollectorHelperProtocol
@@ -170,14 +170,16 @@ class DirectDebugRoundRobinPoller(
     private val handoverIdentity: () -> DirectStreamCredentials?,
     private val databaseMaintenanceGate: DatabaseMaintenanceGate? = null,
     private val ownerActive: () -> Boolean = { true },
-    private val onCycleDuration: (Long) -> Unit = {}
+    private val onCycleDuration: (Long) -> Unit = {},
+    private val catalogVersion: String = DirectDebugParameterAsset.SOURCE_VERSION
 ) {
     private val running = AtomicBoolean(false)
     private val stopRequested = AtomicBoolean(false)
     private val stoppedCallbackDelivered = AtomicBoolean(false)
     private val executor = newRoundRobinPollerExecutor(::onExecutorTerminated)
-    private val cursor = DirectDebugRoundRobinCursor(parameters)
-    private var retryBatch: List<DirectDebugParameter>? = null
+    // The helper returns stable full-catalog ordinals. Cache the matching ordered address list
+    // once so sparse cycles never rebuild or remap all 23k rows on the 500 ms loop.
+    private val secondaryEntries = parameters.map { it.toDirectFidEntry() }
     private val ownershipHandover = SecondaryOwnershipHandover(
         currentIdentity = handoverIdentity,
         pause = pauseSecondary,
@@ -205,7 +207,7 @@ class DirectDebugRoundRobinPoller(
                         //keeps round-robin work below ui/service priority on the car tablet
                         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
                     }
-                    val opened = withStoreRead { store.openSession(parameters, safeBatchSize) }
+                    val opened = withStoreRead { store.openSession(parameters, safeBatchSize, catalogVersion) }
                     openedSessionId = opened
                     sessionId = opened
                     onStarted(opened)
@@ -227,10 +229,12 @@ class DirectDebugRoundRobinPoller(
                             }
                             continue
                         }
-                        onCycle(summary)
+                        if (!summary.noReadDue) onCycle(summary)
                         handoverRetryAttempt = 0
                         //backs off when a cycle overruns so wide secondary polling does not peg a core continuously
-                        val sleepMs = nextSleepMs(clock.elapsedRealtimeMs() - cycleStartedElapsed)
+                        val advisedDelay = summary.nextDueDelayMs
+                        val sleepMs = advisedDelay?.let { nextSleepForDueMs(it) }
+                            ?: nextSleepMs(clock.elapsedRealtimeMs() - cycleStartedElapsed)
                         if (sleepMs > 0) Thread.sleep(sleepMs)
                     }
                 } catch (_: InterruptedException) {
@@ -307,11 +311,20 @@ class DirectDebugRoundRobinPoller(
     fun pollOnce(sessionId: Long, batchSize: Int, startedAt: String = clock.nowIso()): DirectDebugCycleSummary {
         val startedElapsed = clock.elapsedRealtimeMs()
         return ownershipHandover.run(sessionId) { owner ->
-            val batch = retryBatch ?: cursor.nextBatch(batchSize)
+            if (secondaryEntries.isEmpty()) {
+                return@run DirectDebugCycleSummary(
+                    cycleId = 0L,
+                    attemptedCount = 0,
+                    okCount = 0,
+                    changedCount = 0,
+                    errorCount = 0,
+                    elapsedMs = clock.elapsedRealtimeMs() - startedElapsed,
+                    noReadDue = true
+                )
+            }
             val nextCycleNumber = cycleNumber + 1L
-            val entries = batch.map { it.toDirectFidEntry() }
             val batchResult = try {
-                helper.readSecondaryBatch(entries)
+                helper.readSecondaryBatch(secondaryEntries, catalogVersion)
             } catch (error: RuntimeException) {
                 throw IllegalStateException(
                     "secondary live batch failed: ${error::class.java.simpleName}: ${error.message ?: "no message"}",
@@ -319,7 +332,6 @@ class DirectDebugRoundRobinPoller(
                 )
             }
             if (isOwnershipRetryStatus(batchResult.diagnostics.status)) {
-                retryBatch = batch
                 throw SecondaryReplayPendingException(
                     "secondary live batch ownership pending: ${batchResult.diagnostics.summary()}"
                 )
@@ -327,32 +339,50 @@ class DirectDebugRoundRobinPoller(
             check(batchResult.diagnostics.status == CollectorHelperProtocol.STATUS_OK) {
                 "secondary live batch rejected: ${batchResult.diagnostics.summary()}"
             }
-            check(batchResult.results.size == batch.size && batchResult.diagnostics.returnedCount == batch.size) {
-                "secondary live batch incomplete: expected=${batch.size} results=${batchResult.results.size} " +
-                    "returned=${batchResult.diagnostics.returnedCount}"
-            }
-            val reads = batch.mapIndexed { index, parameter ->
-                parameter to batchResult.results.getOrElse(index) {
-                    DirectHelperReadResult(-951, null, "batch result missing at index $index")
-                }
-            }
             val currentIdentity = handoverIdentity()
             if (currentIdentity == null || currentIdentity != owner) {
-                retryBatch = batch
                 throw SecondaryReplayPendingException("secondary ownership changed before live write")
+            }
+            if (batchResult.noWork) {
+                check(batchResult.results.isEmpty() && batchResult.requestedIndices.isEmpty() &&
+                    batchResult.diagnostics.returnedCount == 0 && batchResult.nextDueDelayMs > 0L
+                ) { "inconsistent secondary no-read-due reply" }
+                return@run DirectDebugCycleSummary(
+                    cycleId = 0L,
+                    attemptedCount = 0,
+                    okCount = 0,
+                    changedCount = 0,
+                    errorCount = 0,
+                    elapsedMs = clock.elapsedRealtimeMs() - startedElapsed,
+                    batchDiagnostics = batchResult.diagnostics,
+                    noReadDue = true,
+                    nextDueDelayMs = batchResult.nextDueDelayMs
+                )
+            }
+            check(batchResult.results.isNotEmpty() &&
+                batchResult.diagnostics.returnedCount == batchResult.results.size
+            ) {
+                "secondary live batch has no actual GET results or inconsistent diagnostics: " +
+                    "results=${batchResult.results.size} returned=${batchResult.diagnostics.returnedCount}"
+            }
+            val selected = selectRequestedBatchResults(
+                secondaryEntries, batchResult.requestedIndices, batchResult.results
+            )
+            val reads = selected.mapIndexed { resultIndex, (_, result) ->
+                parameters[batchResult.requestedIndices[resultIndex]] to result
             }
             val summary = withStoreRead {
                 store.recordCycle(
                     sessionId = sessionId,
                     cycleNumber = nextCycleNumber,
-                    batch = batch,
+                    batch = reads.map { it.first },
                     reads = reads,
                     startedAt = startedAt,
                     elapsedMs = clock.elapsedRealtimeMs() - startedElapsed
-                ).copy(batchDiagnostics = batchResult.diagnostics)
+                ).copy(batchDiagnostics = batchResult.diagnostics,
+                    nextDueDelayMs = batchResult.nextDueDelayMs)
             }
             cycleNumber = nextCycleNumber
-            retryBatch = null
             summary
         }
     }
@@ -399,5 +429,11 @@ class DirectDebugRoundRobinPoller(
                 cycleElapsedMs.coerceAtMost(MAX_OVERLOAD_BACKOFF_MS)
             }
         }
+
+        /** A cheap helper control check prevents registration recovery from sleeping past a seed. */
+        fun nextSleepForDueMs(nextDueDelayMs: Long): Long =
+            nextDueDelayMs.coerceIn(100L, MAX_CONTROL_WAIT_MS)
+
+        const val MAX_CONTROL_WAIT_MS = 1_000L
     }
 }

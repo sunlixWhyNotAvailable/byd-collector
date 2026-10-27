@@ -14,6 +14,8 @@ public final class CallbackSpoolBinder implements AutoCloseable {
     public static final int MAX_REPLY_BYTES = 256 * 1024;
     private final CallbackSpool main;
     private final CallbackSpool secondary;
+    private final String helperBootId;
+    private final String helperGeneration;
     @SuppressWarnings("unchecked")
     private final ArrayDeque<LiveRecord>[] live = new ArrayDeque[] {
         new ArrayDeque<>(), new ArrayDeque<>(), new ArrayDeque<>()
@@ -29,14 +31,27 @@ public final class CallbackSpoolBinder implements AutoCloseable {
     private volatile boolean closed;
 
     CallbackSpoolBinder() {
-        main = CallbackSpool.openMain();
-        secondary = CallbackSpool.openSecondary();
-        startAgeFlush();
+        this(CallbackSpool.openMain(), CallbackSpool.openSecondary(), "unknown", "unknown");
     }
 
     CallbackSpoolBinder(CallbackSpool main, CallbackSpool secondary) {
+        this(main, secondary, "test-boot", "test-generation");
+    }
+
+    CallbackSpoolBinder(String helperBootId, String helperGeneration) {
+        this(CallbackSpool.openMain(), CallbackSpool.openSecondary(), helperBootId, helperGeneration);
+    }
+
+    private CallbackSpoolBinder(
+        CallbackSpool main, CallbackSpool secondary, String helperBootId, String helperGeneration
+    ) {
         if (main == null || secondary == null) throw new IllegalArgumentException("callback spools are required");
+        if (helperBootId == null || helperBootId.isEmpty() || helperGeneration == null || helperGeneration.isEmpty()) {
+            throw new IllegalArgumentException("helper callback identity is required");
+        }
         this.main = main; this.secondary = secondary;
+        this.helperBootId = helperBootId;
+        this.helperGeneration = helperGeneration;
         startAgeFlush();
     }
 
@@ -117,18 +132,14 @@ public final class CallbackSpoolBinder implements AutoCloseable {
             while (!live[batch.stream].isEmpty()) {
                 CallbackSpool.AppendResult spilled = spillLocked(batch.stream);
                 if (spilled != CallbackSpool.AppendResult.SUCCESS && spilled != CallbackSpool.AppendResult.DUPLICATE) {
-                    TelemetryCallbackBatch.Event first = batch.events.get(0);
-                    TelemetryCallbackBatch.Event last = batch.events.get(batch.events.size() - 1);
-                    target.recordLoss(batch.events.size(), first.receivedWallMs, last.receivedWallMs, "blocked_behind_live");
+                    target.recordLoss(batch, "blocked_behind_live", null);
                     return CallbackSpool.AppendResult.REJECTED;
                 }
             }
             return target.append(batch);
         } catch (Exception error) {
             try {
-                TelemetryCallbackBatch.Event first = batch.events.get(0);
-                TelemetryCallbackBatch.Event last = batch.events.get(batch.events.size() - 1);
-                spool(batch.stream).recordLoss(batch.events.size(), first.receivedWallMs, last.receivedWallMs, "delivery");
+                spool(batch.stream).recordLoss(batch, "delivery", error);
             } catch (Exception ignored) { }
             return CallbackSpool.AppendResult.REJECTED;
         }
@@ -217,6 +228,10 @@ public final class CallbackSpoolBinder implements AutoCloseable {
         if (loss != null) spool(stream).recordLoss(loss.count, loss.firstWallMs, loss.lastWallMs, loss.reason);
     }
 
+    void recordLostBatch(TelemetryCallbackBatch batch, String reason, Throwable cause) {
+        if (batch != null) spool(batch.stream).recordLoss(batch, reason, cause);
+    }
+
     boolean onTransact(int code, int stream, Parcel data, Parcel reply) {
         if (reply == null) return true;
         try {
@@ -253,6 +268,8 @@ public final class CallbackSpoolBinder implements AutoCloseable {
                 reply.writeInt(CollectorHelperProtocol.STATUS_OK);
                 reply.writeString(null);
                 reply.writeInt(ready ? 1 : 0);
+                reply.writeString(helperBootId);
+                reply.writeString(helperGeneration);
                 return true;
             }
             if (code == CollectorHelperProtocol.TX_CALLBACK_STATUS) {
@@ -331,6 +348,7 @@ public final class CallbackSpoolBinder implements AutoCloseable {
         if (reply == null) return;
         if (code == CollectorHelperProtocol.TX_CALLBACK_AWAIT || code == CollectorHelperProtocol.TX_CALLBACK_CANCEL_WAIT) {
             reply.writeInt(status); reply.writeString(error); reply.writeInt(0);
+            reply.writeString(null); reply.writeString(null);
         } else if (code == CollectorHelperProtocol.TX_CALLBACK_PENDING_PAGE) {
             reply.writeInt(status); reply.writeString(error); writeDescriptor(reply, null);
             reply.writeLong(0L); reply.writeByteArray(new byte[0]);

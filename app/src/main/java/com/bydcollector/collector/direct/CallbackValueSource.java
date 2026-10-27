@@ -11,6 +11,8 @@ public final class CallbackValueSource {
     public final String helperGeneration;
     public final int stream;
     public final long epoch;
+    public final long sourceEpoch;
+    public final boolean hasSourceEpoch;
     public final long eventSequence;
     public final int device;
     public final int fid;
@@ -24,8 +26,30 @@ public final class CallbackValueSource {
     public CallbackValueSource(String bootId, String helperGeneration, int stream, long epoch,
         long eventSequence, int device, int fid, int nativeType, int rawBits,
         long receivedWallMs, long receivedElapsedMs, Long sourceWallMs, String quality) {
+        this(bootId, helperGeneration, stream, epoch, epoch, false, eventSequence, device, fid, nativeType,
+            rawBits, receivedWallMs, receivedElapsedMs, sourceWallMs, quality);
+    }
+
+    public CallbackValueSource(String bootId, String helperGeneration, int stream, long epoch, Long sourceEpoch,
+        long eventSequence, int device, int fid, int nativeType, int rawBits,
+        long receivedWallMs, long receivedElapsedMs, Long sourceWallMs, String quality) {
+        this(bootId, helperGeneration, stream, epoch, sourceEpoch == null ? epoch : sourceEpoch,
+            sourceEpoch != null, eventSequence, device, fid, nativeType, rawBits,
+            receivedWallMs, receivedElapsedMs, sourceWallMs, quality);
+    }
+
+    public CallbackValueSource(String bootId, String helperGeneration, int stream, long epoch, long sourceEpoch,
+        long eventSequence, int device, int fid, int nativeType, int rawBits,
+        long receivedWallMs, long receivedElapsedMs, Long sourceWallMs, String quality) {
+        this(bootId, helperGeneration, stream, epoch, sourceEpoch, true, eventSequence, device, fid, nativeType,
+            rawBits, receivedWallMs, receivedElapsedMs, sourceWallMs, quality);
+    }
+
+    private CallbackValueSource(String bootId, String helperGeneration, int stream, long epoch, long sourceEpoch,
+        boolean hasSourceEpoch, long eventSequence, int device, int fid, int nativeType, int rawBits,
+        long receivedWallMs, long receivedElapsedMs, Long sourceWallMs, String quality) {
         if (!validText(bootId, 256) || !validText(helperGeneration, 256) || !validText(quality, 128) ||
-            (stream != 1 && stream != 2) || epoch < 0 || eventSequence < 0 ||
+            (stream != 1 && stream != 2) || epoch < 0 || sourceEpoch < 0 || eventSequence < 0 ||
             (nativeType != TelemetryCallbackBatch.TYPE_INT && nativeType != TelemetryCallbackBatch.TYPE_FLOAT) ||
             receivedWallMs < 0 || receivedElapsedMs < 0 || (sourceWallMs != null && sourceWallMs < 0)) {
             throw new IllegalArgumentException("invalid callback value source");
@@ -34,6 +58,8 @@ public final class CallbackValueSource {
         this.helperGeneration = helperGeneration;
         this.stream = stream;
         this.epoch = epoch;
+        this.sourceEpoch = sourceEpoch;
+        this.hasSourceEpoch = hasSourceEpoch;
         this.eventSequence = eventSequence;
         this.device = device;
         this.fid = fid;
@@ -47,6 +73,7 @@ public final class CallbackValueSource {
 
     public static CallbackValueSource from(TelemetryCallbackBatch batch, TelemetryCallbackBatch.Event event) {
         return new CallbackValueSource(batch.bootId, batch.helperGeneration, batch.stream, batch.epoch,
+            batch.sourceEpoch, batch.formatVersion() >= TelemetryCallbackBatch.VERSION,
             event.sequence, event.device, event.fid, event.nativeType, event.rawBits,
             event.receivedWallMs, event.receivedElapsedMs, event.sourceWallMs, event.quality);
     }
@@ -58,10 +85,19 @@ public final class CallbackValueSource {
     }
 
     public static void writeNullable(DataOutput out, CallbackValueSource value) throws IOException {
+        writeNullable(out, value, false);
+    }
+
+    public static void writeNullable(DataOutput out, CallbackValueSource value, boolean includeSourceEpoch) throws IOException {
         out.writeByte(value == null ? 0 : 1);
         if (value == null) return;
         out.writeUTF(value.bootId); out.writeUTF(value.helperGeneration); out.writeInt(value.stream);
-        out.writeLong(value.epoch); out.writeLong(value.eventSequence);
+        out.writeLong(value.epoch);
+        if (includeSourceEpoch) {
+            out.writeLong(value.sourceEpoch);
+            out.writeByte(value.hasSourceEpoch ? 1 : 0);
+        }
+        out.writeLong(value.eventSequence);
         out.writeInt(value.device); out.writeInt(value.fid); out.writeInt(value.nativeType); out.writeInt(value.rawBits);
         out.writeLong(value.receivedWallMs); out.writeLong(value.receivedElapsedMs);
         out.writeByte(value.sourceWallMs == null ? 0 : 1);
@@ -70,27 +106,46 @@ public final class CallbackValueSource {
     }
 
     public static CallbackValueSource readNullable(DataInput in) throws IOException {
+        return readNullable(in, false);
+    }
+
+    public static CallbackValueSource readNullable(DataInput in, boolean includeSourceEpoch) throws IOException {
         int present = in.readUnsignedByte();
         if (present == 0) return null;
         if (present != 1) throw new IOException("invalid callback source marker");
         String boot = in.readUTF(), generation = in.readUTF(); int stream = in.readInt();
-        long epoch = in.readLong(), sequence = in.readLong();
+        long epoch = in.readLong();
+        long sourceEpoch = includeSourceEpoch ? in.readLong() : epoch;
+        int sourceEpochMarker = includeSourceEpoch ? in.readUnsignedByte() : 0;
+        if (sourceEpochMarker != 0 && sourceEpochMarker != 1) throw new IOException("invalid callback source epoch marker");
+        boolean hasSourceEpoch = sourceEpochMarker == 1;
+        long sequence = in.readLong();
         int device = in.readInt(), fid = in.readInt(), type = in.readInt(), raw = in.readInt();
         long wall = in.readLong(), elapsed = in.readLong();
         int hasSource = in.readUnsignedByte();
         if (hasSource != 0 && hasSource != 1) throw new IOException("invalid callback source time marker");
         Long source = hasSource == 0 ? null : in.readLong();
         try {
-            return new CallbackValueSource(boot, generation, stream, epoch, sequence, device, fid, type,
+            return new CallbackValueSource(boot, generation, stream, epoch, sourceEpoch, hasSourceEpoch,
+                sequence, device, fid, type,
                 raw, wall, elapsed, source, in.readUTF());
         } catch (IllegalArgumentException invalid) { throw new IOException("invalid callback source", invalid); }
     }
 
     public static void writeNullable(Parcel out, CallbackValueSource value) {
+        writeNullable(out, value, false);
+    }
+
+    public static void writeNullable(Parcel out, CallbackValueSource value, boolean includeSourceEpoch) {
         out.writeInt(value == null ? 0 : 1);
         if (value == null) return;
         out.writeString(value.bootId); out.writeString(value.helperGeneration); out.writeInt(value.stream);
-        out.writeLong(value.epoch); out.writeLong(value.eventSequence);
+        out.writeLong(value.epoch);
+        if (includeSourceEpoch) {
+            out.writeLong(value.sourceEpoch);
+            out.writeInt(value.hasSourceEpoch ? 1 : 0);
+        }
+        out.writeLong(value.eventSequence);
         out.writeInt(value.device); out.writeInt(value.fid); out.writeInt(value.nativeType); out.writeInt(value.rawBits);
         out.writeLong(value.receivedWallMs); out.writeLong(value.receivedElapsedMs);
         out.writeInt(value.sourceWallMs == null ? 0 : 1);
@@ -99,17 +154,29 @@ public final class CallbackValueSource {
     }
 
     public static CallbackValueSource readNullable(Parcel in) {
+        return readNullable(in, false);
+    }
+
+    public static CallbackValueSource readNullable(Parcel in, boolean includeSourceEpoch) {
         int present = in.readInt();
         if (present == 0) return null;
         if (present != 1) throw new IllegalArgumentException("invalid callback source marker");
         String boot = in.readString(), generation = in.readString(); int stream = in.readInt();
-        long epoch = in.readLong(), sequence = in.readLong();
+        long epoch = in.readLong();
+        long sourceEpoch = includeSourceEpoch ? in.readLong() : epoch;
+        int sourceEpochMarker = includeSourceEpoch ? in.readInt() : 0;
+        if (sourceEpochMarker != 0 && sourceEpochMarker != 1) {
+            throw new IllegalArgumentException("invalid callback source epoch marker");
+        }
+        boolean hasSourceEpoch = sourceEpochMarker == 1;
+        long sequence = in.readLong();
         int device = in.readInt(), fid = in.readInt(), type = in.readInt(), raw = in.readInt();
         long wall = in.readLong(), elapsed = in.readLong();
         int hasSource = in.readInt();
         if (hasSource != 0 && hasSource != 1) throw new IllegalArgumentException("invalid callback source time marker");
         Long source = hasSource == 0 ? null : in.readLong();
-        return new CallbackValueSource(boot, generation, stream, epoch, sequence, device, fid, type,
+        return new CallbackValueSource(boot, generation, stream, epoch, sourceEpoch, hasSourceEpoch,
+            sequence, device, fid, type,
             raw, wall, elapsed, source, in.readString());
     }
 

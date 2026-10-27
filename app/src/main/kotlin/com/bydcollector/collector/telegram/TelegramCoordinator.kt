@@ -7,6 +7,7 @@ import com.bydcollector.collector.data.local.TelegramOutboxEntry
 import com.bydcollector.collector.data.local.TelegramOutboxMessage
 import com.bydcollector.collector.diagnostics.diagnosticSha256
 import com.bydcollector.collector.data.local.PollReading
+import com.bydcollector.collector.data.input.BusinessInputContinuity
 import com.bydcollector.collector.data.normalized.VehicleStateNormalizer
 import com.bydcollector.collector.data.polling.PollOrigin
 import com.bydcollector.collector.data.polling.PollSampleSource
@@ -21,6 +22,7 @@ import com.bydcollector.collector.service.TelegramEventResult
 import com.bydcollector.collector.service.TelegramEventState
 import com.bydcollector.collector.service.TelegramLocationSnapshot
 import com.bydcollector.collector.service.TelegramPowerOffSnapshot
+import com.bydcollector.collector.util.diagnosticDetail
 import java.util.LinkedHashMap
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
@@ -71,6 +73,8 @@ class TelegramCoordinator internal constructor(
         origin: PollOrigin,
         currentBootId: String,
         energySnapshot: EnergySnapshot? = null,
+        continuityUpdates: Map<String, BusinessInputContinuity> = emptyMap(),
+        requireCommit: Boolean = false,
         onDiagnosticLegStarted: ((String) -> Unit)? = null
     ): Long? {
         activateEnabledRuntime() ?: return null
@@ -82,9 +86,11 @@ class TelegramCoordinator internal constructor(
         val result = engine.onSourcePoll(
             pollId, timestamp, source, readings, origin, currentBootId,
             eventConfig(), eventNowMs, normalizer, energySnapshot,
-            android.os.SystemClock.elapsedRealtime()
+            continuityUpdates = continuityUpdates,
+            nowElapsedMs = android.os.SystemClock.elapsedRealtime()
         )
         val committed = handle(result)
+        check(committed || !requireCommit) { "Telegram source batch rendering failed; input remains pending" }
         if (committed) {
             recordSourceDecisions(result, origin)
             result.chargingEtaStateDiagnosticDetail?.let { detail ->
@@ -266,7 +272,7 @@ class TelegramCoordinator internal constructor(
         onDurablySettled: () -> Unit
     ): Long? {
         val attempt = outcome.attempt
-        if (attempt.entry != null) {
+        if (attempt.persisted != null) {
             return delivery.settleReceivedAttempt(
                 attempt = attempt,
                 result = outcome.result,
@@ -377,18 +383,35 @@ class TelegramCoordinator internal constructor(
         return delivery.pendingDeadline()
     }
 
+    internal fun restoreDeliveryAttempt(): TelegramDeliveryAttempt? =
+        delivery.restorePersistedAttempt("app_recovery")
+
+    internal fun preparedAttemptAction(attempt: TelegramDeliveryAttempt): TelegramPreparedAttemptAction =
+        if (settings.isUserShutdownRequested()) TelegramPreparedAttemptAction.WAIT
+        else delivery.preparedAttemptAction(attempt)
+
+    internal fun discardPreparedAttempt(attempt: TelegramDeliveryAttempt): Long? =
+        delivery.discardPreparedAttempt(attempt)
+
+    internal fun acknowledgePersistedAttempt(attempt: TelegramDeliveryAttempt): Long? =
+        delivery.acknowledgePersistedAttempt(attempt)
+
     private fun pendingQueueDeadline(): Long? {
         return delivery.pendingDeadline()
     }
 
-    private fun commitDelivery(entry: TelegramOutboxEntry, messageId: Long?, deliveredAtMs: Long) {
+    private fun commitDelivery(
+        attempt: TelegramDeliveryAttempt,
+        entry: TelegramOutboxEntry,
+        messageId: Long?,
+        deliveredAtMs: Long
+    ) {
         val deliveredState = stateAfterTripSummaryDelivery(engine.state, entry.dedupeKey, deliveredAtMs)
         try {
-            val inserted = telegramStore.markTelegramDelivered(
-                entry = entry,
-                stateJson = deliveredState?.toJson(),
-                telegramMessageId = messageId,
-                deliveredAtMs = deliveredAtMs
+            val inserted = telegramStore.settleTelegramDeliverySuccess(
+                attemptId = checkNotNull(attempt.persisted).attemptId,
+                receipt = TelegramDeliveryReceipt(entry.dedupeKey, entry.eventType, deliveredAtMs, messageId),
+                stateJson = deliveredState?.toJson()
             )
             if (inserted && deliveredState != null) {
                 engine.markTripSummaryDelivered(entry.dedupeKey, deliveredAtMs)
@@ -399,15 +422,19 @@ class TelegramCoordinator internal constructor(
                 TelegramDeliveryReceipt(entry.dedupeKey, entry.eventType, deliveredAtMs, messageId),
                 error, "created_at_ms=${entry.createdAtMs} occurred_at_ms=${entry.occurredAtMs ?: "unknown"}"
             )
-            runCatching { telegramStore.telegramRuntimeState() }
-                .getOrNull()
-                ?.let { engine = createEngine(TelegramEventState.fromJson(it)) }
+            try {
+                telegramStore.telegramRuntimeState()
+                    ?.let { engine = createEngine(TelegramEventState.fromJson(it)) }
+            } catch (recoveryError: Exception) {
+                if (recoveryError is InterruptedException) Thread.currentThread().interrupt()
+                error.addSuppressed(recoveryError)
+            }
             throw error
         }
     }
 
     private fun recordLocalReceiptFailure(receipt: TelegramDeliveryReceipt, error: Exception, context: String) {
-        runCatching {
+        try {
             eventStore.recordEvent(
                 "telegram_message_local_commit_pending",
                 "Telegram HTTP success is waiting for its local receipt",
@@ -417,9 +444,12 @@ class TelegramCoordinator internal constructor(
                     location = knownLocationKind(receipt.dedupeKey),
                     extra = "delivery_state=known_success_local_commit_pending $context " +
                         "http_confirmed_at_ms=${receipt.confirmedAtMs} " +
-                        "message_id=${receipt.telegramMessageId ?: "none"} storage_error=${error::class.java.simpleName}"
+                        "message_id=${receipt.telegramMessageId ?: "none"} storage_error=${error.diagnosticDetail()}"
                 )
             )
+        } catch (recordError: Exception) {
+            if (recordError is InterruptedException) Thread.currentThread().interrupt()
+            error.addSuppressed(recordError)
         }
     }
 
@@ -485,7 +515,7 @@ class TelegramCoordinator internal constructor(
         val outcomes = try {
             telegramStore.commitTelegramEvents(
                 messages = messages,
-                stateJson = result.state.toJson().takeIf { result.shouldPersist },
+                stateJson = if (result.shouldPersist) result.state.toJson() else null,
                 nowMs = committedAt,
                 completionSequence = completion?.sequence,
                 completionIdentity = completion?.identity,

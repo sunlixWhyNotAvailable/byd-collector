@@ -4,6 +4,8 @@ import android.os.DeadObjectException
 import android.os.Binder
 import android.os.IBinder
 import android.os.Parcel
+import android.os.RemoteException
+import android.os.SystemClock
 import android.util.Log
 import com.bydcollector.collector.direct.CollectorHelperProtocol
 import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
@@ -12,9 +14,16 @@ import com.bydcollector.collector.direct.SecondaryTelemetrySpool
 import com.bydcollector.collector.direct.CallbackSpool
 import com.bydcollector.collector.direct.CallbackSpoolBinder
 import com.bydcollector.collector.direct.CallbackValueSource
+import com.bydcollector.collector.direct.HelperBatchMetadataCodec
+import com.bydcollector.collector.direct.HelperGetLineage
 import com.bydcollector.collector.direct.TelemetryCallbackBatch
 import com.bydcollector.collector.data.debug.DirectDebugParameterAsset
 import com.bydcollector.collector.data.callback.CallbackDelivery
+import com.bydcollector.collector.telegram.TelegramHelperAttemptKey
+import com.bydcollector.collector.telegram.TelegramHelperOutcome
+import com.bydcollector.collector.telegram.TelegramHelperProtocol
+import com.bydcollector.collector.telegram.TelegramSendMessage
+import com.bydcollector.collector.util.diagnosticDetail
 import java.io.ByteArrayOutputStream
 
 //wraps the helper binder so autoservice calls stay behind one read-only app-facing interface
@@ -24,6 +33,10 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
 
     @Volatile
     private var cached: IBinder? = null
+
+    private data class CallbackOwner(val binder: IBinder, val bootId: String, val generation: String)
+    @Volatile private var callbackOwner: CallbackOwner? = null
+    @Volatile private var callbackLossObserver: ((DirectCallbackSourceLoss) -> Unit)? = null
 
     // Observe the connection already used by reads; no extra Binder transaction.
     internal val connectionIdentity: Any? get() = cached
@@ -43,6 +56,24 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
     override fun ownerMode(): DirectHelperOwnerMode? = readOwnerMode(stopOnly = false)
 
     override fun ownerModeForStop(): DirectHelperOwnerMode? = readOwnerMode(stopOnly = true)
+
+    fun submitTelegram(key: TelegramHelperAttemptKey, request: TelegramSendMessage): TelegramHelperOutcome {
+        TelegramHelperProtocol.validateRequest(key, request)
+        return transactTelegram(CollectorHelperProtocol.TX_TELEGRAM_SUBMIT, "submit") { data ->
+            TelegramHelperProtocol.writeKey(data, key)
+            TelegramHelperProtocol.writeRequest(data, request)
+        }
+    }
+
+    fun queryTelegram(key: TelegramHelperAttemptKey): TelegramHelperOutcome =
+        transactTelegram(CollectorHelperProtocol.TX_TELEGRAM_QUERY, "query") { data ->
+            TelegramHelperProtocol.writeKey(data, key)
+        }
+
+    fun acknowledgeTelegram(key: TelegramHelperAttemptKey): TelegramHelperOutcome =
+        transactTelegram(CollectorHelperProtocol.TX_TELEGRAM_ACK, "acknowledge") { data ->
+            TelegramHelperProtocol.writeKey(data, key)
+        }
 
     private fun readOwnerMode(stopOnly: Boolean): DirectHelperOwnerMode? = synchronized(lock) {
         val binder = ensureBinder() ?: return@synchronized null
@@ -151,14 +182,14 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                 earlyKpiInvalidation = null
                 DirectKpiSubscriptionResult(status, id, boot, generation, listenerStatus, listenerError)
             } catch (error: DeadObjectException) {
+                onKpiHelperDeath(binder)
                 cached = null
                 clearKpiClientState()
-                kpiSubscriptionFailure(STATUS_DEAD_OBJECT, error.message ?: "dead binder")
+                kpiSubscriptionFailure(STATUS_DEAD_OBJECT, error.diagnosticDetail("KPI subscribe"))
             } catch (error: Exception) {
                 cached = null
                 clearKpiClientState()
-                kpiSubscriptionFailure(STATUS_CLIENT_ERROR,
-                    "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+                kpiSubscriptionFailure(STATUS_CLIENT_ERROR, error.diagnosticDetail("KPI subscribe"))
             } finally {
                 data.recycle()
                 reply.recycle()
@@ -224,22 +255,49 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                 val wall = reply.readLong()
                 val elapsed = reply.readLong()
                 val valueSequence = reply.readLong()
-                require(wall >= 0L && elapsed >= 0L && valueSequence in 0L..sequence) {
+                val sourceKind = reply.readInt()
+                val sourceEpoch = reply.readLong()
+                val sourceRecordSequence = reply.readLong()
+                val quality = reply.readString()
+                val sourceIdentity = reply.readString()
+                val startWall = reply.readLong().takeIf { it >= 0L }
+                val startElapsed = reply.readLong().takeIf { it >= 0L }
+                val lossReason = reply.readString()
+                val diagnostic = reply.readString()
+                require(wall >= 0L && elapsed >= 0L && valueSequence in 0L..sequence &&
+                    sourceKind in CollectorHelperProtocol.KPI_SOURCE_CALLBACK..CollectorHelperProtocol.KPI_SOURCE_LOST &&
+                    sourceEpoch >= 0L && sourceRecordSequence > 0L &&
+                    (quality == null || quality.length <= CollectorHelperProtocol.MAX_KPI_QUALITY_CHARS) &&
+                    (sourceIdentity == null || sourceIdentity.length <= CollectorHelperProtocol.MAX_KPI_IDENTITY_CHARS) &&
+                    (lossReason == null || lossReason.length <= CollectorHelperProtocol.MAX_KPI_REASON_CHARS) &&
+                    (diagnostic == null || diagnostic.length <= CollectorHelperProtocol.MAX_KPI_DIAGNOSTIC_CHARS) &&
+                    ((startWall == null) == (startElapsed == null)) &&
+                    (sourceIdentity == null) == (startWall == null && startElapsed == null) &&
+                    (startWall == null || startElapsed != null && startElapsed <= elapsed) &&
+                    (sourceKind != CollectorHelperProtocol.KPI_SOURCE_GET ||
+                        (sourceIdentity != null && valueStatus == CollectorHelperProtocol.STATUS_OK)) &&
+                    (sourceKind != CollectorHelperProtocol.KPI_SOURCE_CALLBACK ||
+                        (sourceIdentity == null && valueStatus == CollectorHelperProtocol.STATUS_OK)) &&
+                    (sourceKind != CollectorHelperProtocol.KPI_SOURCE_LOST ||
+                        (valueStatus != CollectorHelperProtocol.STATUS_OK && !lossReason.isNullOrBlank()))
+                ) {
                     "invalid KPI source metadata"
                 }
-                DirectKpiRawValue(tx, dev, fid, valueStatus, nativeType, raw, bytes, wall, elapsed, valueSequence)
+                DirectKpiRawValue(tx, dev, fid, valueStatus, nativeType, raw, bytes, wall, elapsed,
+                    valueSequence, sourceKind, sourceEpoch, sourceRecordSequence, quality,
+                    sourceIdentity, startWall, startElapsed, lossReason, diagnostic)
             }
             require(reply.dataAvail() == 0) { "unexpected KPI snapshot data" }
             DirectKpiMailboxSnapshot(status, id, boot, generation, sequence, listenerStatus, listenerError, values)
         } catch (error: DeadObjectException) {
+            onKpiHelperDeath(binder)
             cached = null
             clearKpiClientState()
-            kpiSnapshotFailure(subscriptionId, STATUS_DEAD_OBJECT, error.message ?: "dead binder")
+            kpiSnapshotFailure(subscriptionId, STATUS_DEAD_OBJECT, error.diagnosticDetail("KPI drain"))
         } catch (error: Exception) {
             cached = null
             clearKpiClientState()
-            kpiSnapshotFailure(subscriptionId, STATUS_CLIENT_ERROR,
-                "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+            kpiSnapshotFailure(subscriptionId, STATUS_CLIENT_ERROR, error.diagnosticDetail("KPI drain"))
         } finally {
             data.recycle()
             reply.recycle()
@@ -270,13 +328,14 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
             clearKpiClientState()
             result
         } catch (error: DeadObjectException) {
+            onKpiHelperDeath(binder)
             cached = null
             clearKpiClientState()
-            DirectKpiActionResult(STATUS_DEAD_OBJECT, error.message ?: "dead binder")
+            DirectKpiActionResult(STATUS_DEAD_OBJECT, error.diagnosticDetail("KPI unsubscribe"))
         } catch (error: Exception) {
             cached = null
             clearKpiClientState()
-            DirectKpiActionResult(STATUS_CLIENT_ERROR, "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+            DirectKpiActionResult(STATUS_CLIENT_ERROR, error.diagnosticDetail("KPI unsubscribe"))
         } finally {
             data.recycle()
             reply.recycle()
@@ -288,7 +347,15 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
             if (kpiHelperBinder !== binder) return
             val callback = kpiListener
             val invalidation = if (kpiSubscriptionId > 0L) DirectKpiInvalidation(
-                kpiSubscriptionId, kpiBootId.orEmpty(), kpiGeneration.orEmpty(), Long.MAX_VALUE
+                subscriptionId = kpiSubscriptionId,
+                helperBootId = kpiBootId.orEmpty(),
+                helperGeneration = kpiGeneration.orEmpty(),
+                sequence = null,
+                sourceLost = true,
+                reason = "helper_binder_died",
+                diagnostic = "IBinder.DeathRecipient confirmed helper Binder death",
+                observedWallMs = System.currentTimeMillis().coerceAtLeast(0L),
+                observedElapsedMs = SystemClock.elapsedRealtime().coerceAtLeast(0L)
             ) else null
             if (cached === binder) cached = null
             clearKpiClientState()
@@ -355,19 +422,50 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                 val helperElapsedMs = reply.readLong()
                 val returnedCount = reply.readInt()
                 val batchError = reply.readString()
-                require(returnedCount == entries.size) {
-                    "batch reply count mismatch: expected=${entries.size} actual=$returnedCount"
+                val noWorkMarker = reply.readInt()
+                require(noWorkMarker == 0 || noWorkMarker == 1) { "invalid no-work marker" }
+                val nextDueDelayMs = reply.readLong()
+                val indexBytes = reply.createByteArray() ?: error("missing batch result indices")
+                val errorBytes = reply.createByteArray() ?: error("missing batch error details")
+                val errorsTruncatedMarker = reply.readInt()
+                require(errorsTruncatedMarker == 0 || errorsTruncatedMarker == 1) { "invalid error truncation marker" }
+                require(indexBytes.size <= returnedCount * 3) { "oversize batch result indices" }
+                require(errorBytes.size <= HelperBatchMetadataCodec.MAX_ERROR_DETAIL_BYTES) { "oversize batch errors" }
+                require(nextDueDelayMs >= 0 && (batchError?.length ?: 0) <= 512) { "invalid batch diagnostics" }
+                require(returnedCount in 0..entries.size) {
+                    "batch reply count out of range: expected at most=${entries.size} actual=$returnedCount"
                 }
+                val noWork = noWorkMarker == 1
+                require(!noWork || (batchStatus == CollectorHelperProtocol.STATUS_OK && returnedCount == 0 &&
+                    nextDueDelayMs > 0L)) { "invalid empty no-work reply" }
+                require(noWork || batchStatus != CollectorHelperProtocol.STATUS_OK || returnedCount > 0) {
+                    "successful empty batch missing no-work state"
+                }
+                val requestedIndices = HelperBatchMetadataCodec.decodeIndices(indexBytes, returnedCount, entries.size).toList()
+                val fieldErrors = HelperBatchMetadataCodec.decodeErrors(errorBytes, returnedCount)
                 val results = List(returnedCount) {
                     val status = reply.readInt()
                     val hasRaw = reply.readInt()
                     require(hasRaw == 0 || hasRaw == 1) { "invalid raw marker: $hasRaw" }
                     val raw = if (hasRaw == 1) reply.readInt() else null
-                    val error = batchError.takeIf { status != 0 && mode == "rejected" }
-                    DirectHelperReadResult(status, raw, error, CallbackValueSource.readNullable(reply))
+                    val error = fieldErrors[it] ?: batchError.takeIf { status != 0 && mode == "rejected" }
+                    val callbackSource = CallbackValueSource.readNullable(reply, true)
+                    val lineage = HelperGetLineage.readNullable(reply)?.let {
+                        DirectGetLineage(
+                            it.helperBootId, it.helperGeneration, it.stream, it.sourceEpoch, it.readIdentity,
+                            it.recordSequence, it.startedWallMs, it.startedElapsedMs, it.completedWallMs,
+                            it.completedElapsedMs, it.callbackWatermarkStart, it.callbackWatermarkEnd,
+                            it.supersededByCallback
+                        )
+                    }
+                    DirectHelperReadResult(status, raw, error, callbackSource = callbackSource, getLineage = lineage)
                 }
+                require(reply.dataAvail() == 0) { "unexpected batch reply payload" }
                 DirectHelperBatchResult(
                     results = results,
+                    requestedIndices = requestedIndices,
+                    noWork = noWork,
+                    nextDueDelayMs = nextDueDelayMs,
                     diagnostics = DirectBatchDiagnostics(
                         mode = mode,
                         nativeAvailable = nativeAvailable,
@@ -378,7 +476,8 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                         helperElapsedMs = helperElapsedMs,
                         returnedCount = returnedCount,
                         error = batchError ?: if (batchStatus == 0) null else "batch_status=$batchStatus",
-                        status = batchStatus
+                        status = batchStatus,
+                        errorDetailsTruncated = errorsTruncatedMarker == 1
                     )
                 )
             } catch (error: DeadObjectException) {
@@ -393,9 +492,14 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
         }
     }
 
-    override fun readSecondaryBatch(entries: List<DirectFidEntry>): DirectHelperBatchResult {
-        if (entries.size != DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT) {
-            return batchFailure(entries.size, STATUS_CLIENT_ERROR, "secondary requires complete ordered catalog")
+    override fun readSecondaryBatch(entries: List<DirectFidEntry>): DirectHelperBatchResult =
+        readSecondaryBatch(entries, DirectDebugParameterAsset.SOURCE_VERSION)
+
+    override fun readSecondaryBatch(entries: List<DirectFidEntry>, catalogVersion: String): DirectHelperBatchResult {
+        val expectedCatalogCount = DirectDebugParameterAsset.parameterCountForCatalog(catalogVersion)
+            ?: return batchFailure(entries.size, STATUS_CLIENT_ERROR, "unsupported secondary catalog: $catalogVersion")
+        if (entries.size != expectedCatalogCount) {
+            return batchFailure(entries.size, STATUS_CLIENT_ERROR, "secondary requires complete ordered catalog $catalogVersion")
         }
         val owner = DirectStreamController.credentials(CollectorHelperProtocol.STREAM_SECONDARY)
             ?: return batchFailure(entries.size, CollectorHelperProtocol.STATUS_STALE_TOKEN, "Secondary stream is not claimed")
@@ -407,7 +511,7 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                 data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
                 data.writeLong(owner.controllerToken)
                 data.writeLong(owner.epoch)
-                data.writeString(DirectDebugParameterAsset.SOURCE_VERSION)
+                data.writeString(catalogVersion)
                 if (!binder.transact(CollectorHelperProtocol.TX_SECONDARY_READ_BATCH, data, reply, 0)) {
                     cached = null
                     return@synchronized batchFailure(entries.size, STATUS_TRANSACT_FALSE, "secondary live transact returned false")
@@ -423,6 +527,13 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                 val elapsed = reply.readLong()
                 val count = reply.readInt()
                 val batchError = reply.readString()
+                val noWorkMarker = reply.readInt()
+                require(noWorkMarker == 0 || noWorkMarker == 1) { "invalid secondary no-work marker" }
+                val nextDueDelayMs = reply.readLong()
+                val indexBytes = reply.createByteArray() ?: error("missing secondary result indices")
+                val errorBytes = reply.createByteArray() ?: error("missing secondary error details")
+                val errorsTruncatedMarker = reply.readInt()
+                require(errorsTruncatedMarker == 0 || errorsTruncatedMarker == 1) { "invalid secondary error truncation marker" }
                 val catalog = reply.readString()
                 val statuses = reply.createIntArray() ?: error("missing secondary statuses")
                 val presence = reply.createByteArray() ?: error("missing secondary presence")
@@ -431,24 +542,38 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                 require(count in 0..entries.size && statuses.size == count && raws.size == count &&
                     presence.size == (count + 7) / 8 && callbackCached.size == (count + 7) / 8
                 ) { "invalid secondary packed payload" }
+                require(indexBytes.size <= count * 3) { "oversize secondary result indices" }
+                require(errorBytes.size <= HelperBatchMetadataCodec.MAX_ERROR_DETAIL_BYTES) { "oversize secondary errors" }
                 require(reply.dataAvail() == 0) { "unexpected secondary callback payload" }
-                require(catalog == DirectDebugParameterAsset.SOURCE_VERSION) { "secondary catalog mismatch" }
-                require(elapsed >= 0 && listOf(nativeGroups, fallbackGroups, fallbackReads, groupFailures).all { it >= 0 }) {
+                require(catalog == catalogVersion) { "secondary catalog mismatch: expected=$catalogVersion actual=$catalog" }
+                require(elapsed >= 0 && nextDueDelayMs >= 0 && (batchError?.length ?: 0) <= 512 &&
+                    listOf(nativeGroups, fallbackGroups, fallbackReads, groupFailures).all { it >= 0 }) {
                     "invalid secondary diagnostics"
                 }
+                val noWork = noWorkMarker == 1
+                require(!noWork || (status == CollectorHelperProtocol.STATUS_OK && count == 0 && nextDueDelayMs > 0L)) {
+                    "invalid empty secondary no-work reply"
+                }
+                require(noWork || status != CollectorHelperProtocol.STATUS_OK || count > 0) {
+                    "successful empty secondary batch missing no-work state"
+                }
+                val requestedIndices = HelperBatchMetadataCodec.decodeIndices(indexBytes, count, entries.size).toList()
+                val fieldErrors = HelperBatchMetadataCodec.decodeErrors(errorBytes, count)
                 if (count == 0 && status != CollectorHelperProtocol.STATUS_OK) {
                     return@synchronized batchFailure(entries.size, status, batchError ?: "secondary live unavailable")
                 }
-                require(count == entries.size) { "incomplete secondary cycle" }
                 DirectHelperBatchResult(
-                    List(count) { i ->
+                    results = List(count) { i ->
                         val raw = if ((presence[i / 8].toInt() and (1 shl (i % 8))) != 0) raws[i] else null
                         val cachedValue = (callbackCached[i / 8].toInt() and (1 shl (i % 8))) != 0
                         require(!cachedValue || raw != null) { "secondary callback cache marker without raw" }
-                        DirectHelperReadResult(statuses[i], raw, callbackCached = cachedValue)
+                        DirectHelperReadResult(statuses[i], raw, fieldErrors[i], callbackCached = cachedValue)
                     },
-                    DirectBatchDiagnostics(mode, native, nativeGroups, fallbackGroups, fallbackReads,
-                        groupFailures, elapsed, count, batchError, status)
+                    requestedIndices = requestedIndices,
+                    noWork = noWork,
+                    nextDueDelayMs = nextDueDelayMs,
+                    diagnostics = DirectBatchDiagnostics(mode, native, nativeGroups, fallbackGroups, fallbackReads,
+                        groupFailures, elapsed, count, batchError, status, errorsTruncatedMarker == 1)
                 )
             } catch (error: DeadObjectException) {
                 cached = null
@@ -513,10 +638,19 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
             val ready = reply.readInt()
             val busy = reply.readInt()
             val error = reply.readString()
-            require(ready >= 0 && busy in 0..1 && reply.dataAvail() == 0 && (error?.length ?: 0) <= 512) {
+            val catalogVersion = reply.readString()
+            val catalogFieldCount = reply.readInt()
+            val catalogProfile = reply.readString()
+            val catalogDiagnostic = reply.readString()
+            require(ready >= 0 && busy in 0..1 && reply.dataAvail() == 0 && (error?.length ?: 0) <= 512 &&
+                (catalogVersion?.let { DirectDebugParameterAsset.parameterCountForCatalog(it) } == catalogFieldCount) &&
+                (catalogProfile == "CANFD" || catalogProfile == "NON_CANFD" || catalogProfile == "UNKNOWN") &&
+                (catalogDiagnostic?.length ?: 0) <= 512
+            ) {
                 "invalid secondary status"
             }
-            SecondarySpoolStatus(status, ready, busy == 1, error)
+            SecondarySpoolStatus(status, ready, busy == 1, error,
+                catalogVersion, catalogFieldCount, catalogProfile, catalogDiagnostic)
         } catch (error: DeadObjectException) {
             cached = null
             SecondarySpoolStatus(STATUS_DEAD_OBJECT, error = error.message ?: "dead binder")
@@ -528,8 +662,20 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
         }
     }
 
+    /** Capture live helper identity before draining an old spool; spool records can belong to dead owners. */
+    fun observeCallbackSource(stream: Int, onConfirmedDeath: (DirectCallbackSourceLoss) -> Unit) = synchronized(lock) {
+        callbackLossObserver = onConfirmedDeath
+        val binder = checkNotNull(ensureBinder()) { "helper binder unavailable" }
+        if (callbackOwner?.binder !== binder) awaitCallbackBatch(stream, {}, onConfirmedDeath).close()
+    }
+
     /** One-shot batch wake; the atomic helper-side queue check also covers attach/reconnect. */
-    fun awaitCallbackBatch(stream: Int, onReady: () -> Unit): AutoCloseable = synchronized(lock) {
+    fun awaitCallbackBatch(
+        stream: Int,
+        onReady: () -> Unit,
+        onConfirmedDeath: (DirectCallbackSourceLoss) -> Unit = {}
+    ): AutoCloseable = synchronized(lock) {
+        callbackLossObserver = onConfirmedDeath
         val owner = checkNotNull(DirectStreamController.credentials(stream)) { "Callback stream is not claimed" }
         val binder = checkNotNull(ensureBinder()) { "helper binder unavailable" }
         val pending = java.util.concurrent.atomic.AtomicBoolean(true)
@@ -543,7 +689,10 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                 return true
             }
         }
+        val dead = java.util.concurrent.atomic.AtomicBoolean(false)
         val death = IBinder.DeathRecipient {
+            dead.set(true)
+            reportCallbackSourceLoss(binder, "helper_binder_died", "Binder DeathRecipient notification")
             if (cached === binder) cached = null
             wake()
         }
@@ -554,8 +703,18 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                 data.writeStrongBinder(listener)
                 check(binder.transact(transaction, data, reply, 0)) { "callback wait transaction rejected" }
                 val status = reply.readInt(); val error = reply.readString(); val ready = reply.readInt()
+                val boot = reply.readString(); val generation = reply.readString()
                 check(status == CollectorHelperProtocol.STATUS_OK) { error ?: "callback wait failed: $status" }
-                require(ready in 0..1 && reply.dataAvail() == 0) { "invalid callback wait reply" }
+                require(ready in 0..1 && !boot.isNullOrBlank() && boot.length <= 256 &&
+                    !generation.isNullOrBlank() && generation.length <= 256 && reply.dataAvail() == 0) {
+                    "invalid callback wait reply"
+                }
+                val previous = callbackOwner
+                if (previous != null && (previous.bootId != boot || previous.generation != generation)) {
+                    reportCallbackSourceLoss(previous.binder, "helper_replaced", "Callback owner identity changed")
+                }
+                callbackOwner = CallbackOwner(binder, boot, generation)
+                if (dead.get()) reportCallbackSourceLoss(binder, "helper_binder_died", "Binder died during callback wait registration")
                 return ready == 1
             } finally { data.recycle(); reply.recycle() }
         }
@@ -571,8 +730,22 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
             if (exchange(CollectorHelperProtocol.TX_CALLBACK_AWAIT)) wake()
             subscription
         } catch (error: Exception) {
+            if (error is DeadObjectException) {
+                reportCallbackSourceLoss(binder, "helper_binder_died", error.stackTraceToString())
+            }
             subscription.close()
             throw error
+        }
+    }
+
+    private fun reportCallbackSourceLoss(binder: IBinder, reason: String, diagnostic: String) {
+        val owner = callbackOwner?.takeIf { it.binder === binder } ?: return
+        val loss = DirectCallbackSourceLoss(owner.bootId, owner.generation, reason, diagnostic,
+            System.currentTimeMillis().coerceAtLeast(0L), SystemClock.elapsedRealtime())
+        try {
+            callbackLossObserver?.invoke(loss)
+        } catch (error: Exception) {
+            Log.e("BydCollector", "Could not enqueue confirmed helper source loss: $reason", error)
         }
     }
 
@@ -601,6 +774,7 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
             ) { "invalid callback status reply" }
             CallbackSpoolStatus(status, footprint, ready, bad, loss, error, liveRetainedBytes)
         } catch (error: DeadObjectException) {
+            reportCallbackSourceLoss(binder, "helper_binder_died", error.stackTraceToString())
             cached = null; CallbackSpoolStatus(STATUS_DEAD_OBJECT, error = error.message ?: "dead binder")
         } catch (error: Exception) {
             CallbackSpoolStatus(STATUS_CLIENT_ERROR, error = "${error::class.java.simpleName}: ${error.message ?: "no message"}")
@@ -645,6 +819,7 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                 }
                 CallbackSpoolPage(status, selected, returnedOffset, bytes, responseError)
             } catch (error: DeadObjectException) {
+                reportCallbackSourceLoss(binder, "helper_binder_died", error.stackTraceToString())
                 cached = null; failure(STATUS_DEAD_OBJECT, error.message ?: "dead binder")
             } catch (error: Exception) {
                 failure(STATUS_CLIENT_ERROR, "${error::class.java.simpleName}: ${error.message ?: "no message"}")
@@ -722,6 +897,7 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
             require(affected in 0..1 && reply.dataAvail() == 0) { "invalid callback ACK reply" }
             CallbackSpoolActionResult(status, affected, error)
         } catch (error: DeadObjectException) {
+            reportCallbackSourceLoss(binder, "helper_binder_died", error.stackTraceToString())
             cached = null; CallbackSpoolActionResult(STATUS_DEAD_OBJECT, error = error.message ?: "dead binder")
         } catch (error: Exception) {
             CallbackSpoolActionResult(STATUS_CLIENT_ERROR, error = "${error::class.java.simpleName}: ${error.message ?: "no message"}")
@@ -950,6 +1126,8 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
     }
 
     private fun readWorkerSample(reply: Parcel): TelemetryWorkerSample {
+        val recordVersion = reply.readInt()
+        require(recordVersion in 1..4) { "unsupported worker sample version: $recordVersion" }
         val identity = TelemetryWorkerSampleIdentity(
             requireNotNull(reply.readString()) { "worker sample boot id missing" },
             requireNotNull(reply.readString()) { "worker sample generation missing" },
@@ -971,11 +1149,14 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
         require(fieldCount in 1..CollectorHelperProtocol.MAX_WORKER_FIELD_COUNT) {
             "invalid worker field count: $fieldCount"
         }
-        val values = List(fieldCount) { expectedIndex ->
+        var previousIndex = -1
+        val values = List(fieldCount) { ordinal ->
             val fieldIndex = reply.readInt()
-            require(fieldIndex == expectedIndex) {
-                "worker field order mismatch: expected=$expectedIndex actual=$fieldIndex"
+            require(fieldIndex > previousIndex && fieldIndex < CollectorHelperProtocol.MAX_BATCH_SIZE &&
+                (recordVersion >= 3 || fieldIndex == ordinal)) {
+                "worker field order/index mismatch at ordinal=$ordinal index=$fieldIndex version=$recordVersion"
             }
+            previousIndex = fieldIndex
             val tx = reply.readInt()
             require(tx == CollectorHelperProtocol.AUTO_TX_INT || tx == CollectorHelperProtocol.AUTO_TX_FLOAT) {
                 "unsupported worker read transaction: $tx"
@@ -993,7 +1174,15 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                 status = status,
                 raw = if (hasRaw == 1) reply.readInt() else null,
                 error = reply.readString(),
-                callbackSource = CallbackValueSource.readNullable(reply)
+                callbackSource = CallbackValueSource.readNullable(reply, recordVersion >= 4),
+                getLineage = if (recordVersion >= 4) HelperGetLineage.readNullable(reply)?.let {
+                    DirectGetLineage(
+                        it.helperBootId, it.helperGeneration, it.stream, it.sourceEpoch, it.readIdentity,
+                        it.recordSequence, it.startedWallMs, it.startedElapsedMs, it.completedWallMs,
+                        it.completedElapsedMs, it.callbackWatermarkStart, it.callbackWatermarkEnd,
+                        it.supersededByCallback
+                    )
+                } else null
             )
         }
         return TelemetryWorkerSample(
@@ -1007,7 +1196,8 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
             nativeAvailable = nativeAvailable == 1,
             groupFailureCount = groupFailureCount,
             error = error,
-            values = values
+            values = values,
+            recordVersion = recordVersion
         )
     }
 
@@ -1038,6 +1228,32 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
             }
         }
     }
+
+    private fun transactTelegram(code: Int, operation: String, writeArgs: (Parcel) -> Unit): TelegramHelperOutcome =
+        synchronized(lock) {
+            val binder = ensureBinder()
+                ?: throw IllegalStateException("helper binder unavailable during Telegram $operation")
+            val data = Parcel.obtain()
+            val reply = Parcel.obtain()
+            try {
+                data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
+                writeArgs(data)
+                if (!binder.transact(code, data, reply, 0)) {
+                    cached = null
+                    throw IllegalStateException("Telegram $operation transact returned false")
+                }
+                TelegramHelperProtocol.readReply(reply)
+            } catch (error: DeadObjectException) {
+                cached = null
+                throw error
+            } catch (error: RemoteException) {
+                cached = null
+                throw error
+            } finally {
+                data.recycle()
+                reply.recycle()
+            }
+        }
 
     private fun batchFailure(count: Int, status: Int, error: String): DirectHelperBatchResult {
         return DirectHelperBatchResult(
@@ -1076,12 +1292,16 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
         CollectorHelperProtocol.MODE_NATIVE -> "native"
         CollectorHelperProtocol.MODE_NATIVE_WITH_FALLBACK -> "native_with_fallback"
         CollectorHelperProtocol.MODE_SCALAR_FALLBACK -> "scalar_fallback"
+        CollectorHelperProtocol.MODE_NO_WORK -> "no_work"
         else -> "rejected"
     }
 
     private fun ensureBinder(): IBinder? {
         //reuses the service-manager lookup until android tells us the binder died
-        cached?.takeIf { it.isBinderAlive }?.let { return it }
+        cached?.let {
+            if (it.isBinderAlive) return it
+            reportCallbackSourceLoss(it, "helper_binder_died", "IBinder.isBinderAlive returned false")
+        }
         return resolveBinder()?.also { cached = it }
     }
 
@@ -1110,7 +1330,15 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
         private const val STATUS_EMPTY_REPLY = -902
         private const val STATUS_DEAD_OBJECT = -903
         private const val STATUS_CLIENT_ERROR = -904
-        private const val MAX_KPI_REPLY_BYTES =
-            CollectorHelperProtocol.MAX_KPI_VALUES * (CollectorHelperProtocol.MAX_KPI_RAW_BYTES + 64) + 1_024
+        private const val MAX_KPI_REPLY_BYTES = 256 * 1_024
     }
 }
+
+data class DirectCallbackSourceLoss(
+    val helperBootId: String,
+    val helperGeneration: String,
+    val reason: String,
+    val diagnostic: String,
+    val observedWallMs: Long,
+    val observedElapsedMs: Long
+)

@@ -82,18 +82,22 @@ public final class CallbackSpool implements AutoCloseable {
     }
 
     public AppendResult append(TelemetryCallbackBatch batch) {
-        return append(batch, true);
+        return append(batch, true, false);
     }
 
     AppendResult appendRetained(TelemetryCallbackBatch batch) {
-        return append(batch, false);
+        return append(batch, false, false);
     }
 
-    private AppendResult append(TelemetryCallbackBatch batch, boolean recordCapacityLoss) {
+    private AppendResult append(TelemetryCallbackBatch batch, boolean recordCapacityLoss, boolean useLossReserve) {
         if (batch == null) throw new IllegalArgumentException("callback batch is required");
         byte[] bytes;
         try { bytes = batch.encode(); }
-        catch (IOException error) { recordLoss(batch.events.size(), eventFirstWall(batch), eventLastWall(batch), "encode"); return AppendResult.REJECTED; }
+        catch (IOException error) {
+            recordLoss(batch.recordCount, batch.firstCaptureWallMs, batch.lastCaptureWallMs, "encode");
+            persistLostBoundary(batch, "encode", error);
+            return AppendResult.REJECTED;
+        }
         synchronized (persistenceLock) {
             ensureOpen();
             rootState.ensureFresh();
@@ -104,10 +108,10 @@ public final class CallbackSpool implements AutoCloseable {
                     Descriptor current = descriptor(existing);
                     if (current.length == bytes.length && current.sha256.equals(digest)) return AppendResult.DUPLICATE;
                     preserveBad(existing);
-                    mergeLoss(batch.events.size(), eventFirstWall(batch), eventLastWall(batch), "identity_conflict");
+                    mergeLoss(batch.recordCount, batch.firstCaptureWallMs, batch.lastCaptureWallMs, "identity_conflict");
                 } catch (Exception error) {
                     preserveBad(existing);
-                    mergeLoss(batch.events.size(), eventFirstWall(batch), eventLastWall(batch), "corruption");
+                    mergeLoss(batch.recordCount, batch.firstCaptureWallMs, batch.lastCaptureWallMs, "corruption");
                 }
             }
             long order = rootState.nextCallbackOrder();
@@ -115,10 +119,13 @@ public final class CallbackSpool implements AutoCloseable {
             File ready = new File(directory, stem + READY);
             File temporary = new File(directory, stem + TMP);
             long footprint = rootState.footprintBytes();
-            long ordinaryLimit = maxBytes - ordinaryReserveBytes;
+            long ordinaryLimit = useLossReserve ? maxBytes : maxBytes - ordinaryReserveBytes;
             if (bytes.length > ordinaryLimit || footprint > ordinaryLimit - bytes.length) {
-                if (recordCapacityLoss) mergeLoss(batch.events.size(), eventFirstWall(batch), eventLastWall(batch),
-                    bytes.length > ordinaryLimit ? "oversize" : "capacity");
+                String reason = bytes.length > ordinaryLimit ? "oversize" : "capacity";
+                if (recordCapacityLoss) {
+                    mergeLoss(batch.recordCount, batch.firstCaptureWallMs, batch.lastCaptureWallMs, reason);
+                    persistLostBoundary(batch, reason, null);
+                }
                 return AppendResult.CAP_REACHED;
             }
             try {
@@ -132,7 +139,8 @@ public final class CallbackSpool implements AutoCloseable {
                 try { preserveBad(temporary); }
                 catch (RuntimeException preserveError) { error.addSuppressed(preserveError); rootState.invalidate(); }
                 rootState.invalidate();
-                mergeLoss(batch.events.size(), eventFirstWall(batch), eventLastWall(batch), "io");
+                mergeLoss(batch.recordCount, batch.firstCaptureWallMs, batch.lastCaptureWallMs, "io");
+                persistLostBoundary(batch, "io", error);
                 return AppendResult.REJECTED;
             }
         }
@@ -143,6 +151,16 @@ public final class CallbackSpool implements AutoCloseable {
             ensureOpen();
             rootState.ensureFresh();
             mergeLoss(count, firstWallMs, lastWallMs, reason);
+        }
+    }
+
+    void recordLoss(TelemetryCallbackBatch batch, String reason, Throwable cause) {
+        if (batch == null || reason == null || reason.isEmpty()) throw new IllegalArgumentException("invalid callback batch loss");
+        synchronized (persistenceLock) {
+            ensureOpen();
+            rootState.ensureFresh();
+            mergeLoss(batch.recordCount, batch.firstCaptureWallMs, batch.lastCaptureWallMs, reason);
+            persistLostBoundary(batch, reason, cause);
         }
     }
 
@@ -219,12 +237,14 @@ public final class CallbackSpool implements AutoCloseable {
             if (!file.isFile()) return 0;
             validate(file, descriptor);
             int count = 1; long first = System.currentTimeMillis(); long last = first;
+            TelemetryCallbackBatch decoded = null;
             try {
-                TelemetryCallbackBatch batch = TelemetryCallbackBatch.decode(readBytes(file, TelemetryCallbackBatch.MAX_BYTES));
-                count = batch.events.size(); first = eventFirstWall(batch); last = eventLastWall(batch);
+                decoded = TelemetryCallbackBatch.decode(readBytes(file, TelemetryCallbackBatch.MAX_BYTES));
+                count = decoded.recordCount; first = decoded.firstCaptureWallMs; last = decoded.lastCaptureWallMs;
             } catch (Exception ignored) { }
             preserveBad(file);
             mergeLoss(count, first, last, "consumer_rejected");
+            if (decoded != null) persistLostBoundary(decoded, "consumer_rejected", null);
             return 1;
         }
     }
@@ -245,7 +265,8 @@ public final class CallbackSpool implements AutoCloseable {
                 rootState.invalidate();
                 throw new IllegalStateException("cannot preserve rejected callback memory batch", error);
             }
-            mergeLoss(batch.events.size(), eventFirstWall(batch), eventLastWall(batch), "consumer_rejected");
+            mergeLoss(batch.recordCount, batch.firstCaptureWallMs, batch.lastCaptureWallMs, "consumer_rejected");
+            persistLostBoundary(batch, "consumer_rejected", null);
         }
     }
 
@@ -432,8 +453,29 @@ public final class CallbackSpool implements AutoCloseable {
         if (parts.length < 5 || !"cb".equals(parts[0])) throw new IllegalArgumentException("invalid callback order filename");
         return Long.parseLong(parts[1]);
     }
-    private static long eventFirstWall(TelemetryCallbackBatch batch) { return batch.events.get(0).receivedWallMs; }
-    private static long eventLastWall(TelemetryCallbackBatch batch) { return batch.events.get(batch.events.size() - 1).receivedWallMs; }
+    private void persistLostBoundary(TelemetryCallbackBatch lost, String reason, Throwable cause) {
+        try {
+            TelemetryCallbackBatch.SourceBoundary boundary = new TelemetryCallbackBatch.SourceBoundary(
+                lost.firstRecordSequence,
+                TelemetryCallbackBatch.SourceBoundary.SCOPE_STREAM,
+                TelemetryCallbackBatch.SourceBoundary.STATE_LOST,
+                0, 0, 0, lost.firstCaptureWallMs, lost.firstCaptureElapsedMs,
+                reason, cause == null ? "callback records were not durably accepted" :
+                    cause.getClass().getName() + ": " + String.valueOf(cause.getMessage()),
+                null, null, null);
+            TelemetryCallbackBatch evidence = new TelemetryCallbackBatch(
+                lost.bootId, lost.helperGeneration, lost.stream, lost.epoch, lost.batchSequence,
+                lost.sourceEpoch, java.util.Collections.emptyList(), java.util.Collections.singletonList(boundary));
+            AppendResult result = append(evidence, false, true);
+            if (result != AppendResult.SUCCESS && result != AppendResult.DUPLICATE) {
+                throw new IllegalStateException("reserved callback loss boundary append rejected: " + result);
+            }
+        } catch (Throwable boundaryError) {
+            if (cause != null) cause.addSuppressed(boundaryError);
+            else throw boundaryError instanceof RuntimeException ? (RuntimeException) boundaryError
+                : new IllegalStateException("cannot persist callback loss boundary", boundaryError);
+        }
+    }
 
     private static byte[] readBytes(File file, long maxBytes) throws IOException {
         if (!file.isFile() || file.length() < 0 || file.length() > maxBytes) throw new IOException("callback file exceeds read bound");

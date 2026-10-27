@@ -130,13 +130,22 @@ internal fun directSnapshotResult(
             rawBody = snapshot.toJson(ok = false, includeFields = false)
         )
     }
+    if (snapshot.noReadDue) {
+        return TelemetryReadResult.NoReadDue(
+            elapsedMs = elapsedMs,
+            nextDueDelayMs = requireNotNull(snapshot.nextDueDelayMs) { "no-read-due reply has no next due delay" }
+        )
+    }
     return if (snapshot.readings.isEmpty()) {
         //records an explicit failed poll instead of pretending an empty autoservice snapshot is success
         TelemetryReadResult.Failure(
             category = "autoservice_snapshot_empty",
             message = snapshot.errorSummary().ifBlank { "Direct autoservice helper returned no usable readings" },
             rawBody = snapshot.toJson(ok = false, includeFields = false),
-            elapsedMs = elapsedMs
+            elapsedMs = elapsedMs,
+            attemptedKeys = snapshot.fields.map { it.entry.key },
+            nextDueDelayMs = snapshot.nextDueDelayMs,
+            attemptedReadings = snapshot.attemptedReadings
         )
     } else {
         val warningMessage = snapshot.errorSummary().takeIf { it.isNotBlank() }
@@ -145,10 +154,13 @@ internal fun directSnapshotResult(
             rawBody = snapshot.toJson(ok = true, includeFields = false),
             elapsedMs = elapsedMs,
             readings = snapshot.readings,
+            attemptedKeys = snapshot.fields.map { it.entry.key },
+            nextDueDelayMs = snapshot.nextDueDelayMs,
             warningCategory = warningMessage?.let { "autoservice_partial_failure" },
             warningMessage = warningMessage,
             diagnosticKey = snapshot.batchDiagnostics.stateKey,
-            diagnosticMessage = snapshot.batchDiagnostics.summary()
+            diagnosticMessage = snapshot.batchDiagnostics.summary(),
+            attemptedReadings = snapshot.attemptedReadings
         )
     }
 }

@@ -12,6 +12,10 @@ object EnergyStateCodec {
         putNullable("last_source_identity", state.lastSourceIdentity)
         putNullable("last_source_boot_id", state.lastSourceBootId)
         putNullable("last_source_elapsed_ms", state.lastSourceElapsedMs)
+        putNullable("last_business_generation", state.lastBusinessGeneration)
+        putNullable("last_business_input_id", state.lastBusinessInputId)
+        putNullable("last_evaluation_boot_id", state.lastEvaluationBootId)
+        putNullable("last_evaluation_elapsed_ms", state.lastEvaluationElapsedMs)
         putNullable("anchor", state.anchor?.let(::encodeAnchor))
         put("totals", encodeTotals(state.totals))
         put("integration_quality", state.integrationQuality.name)
@@ -34,6 +38,12 @@ object EnergyStateCodec {
             lastSourceIdentity = json.stringOrNull("last_source_identity"),
             lastSourceBootId = json.stringOrNull("last_source_boot_id"),
             lastSourceElapsedMs = json.longOrNull("last_source_elapsed_ms"),
+            lastBusinessGeneration = json.stringOrNull("last_business_generation"),
+            lastBusinessInputId = json.longOrNull("last_business_input_id"),
+            lastEvaluationBootId = json.stringOrNull("last_evaluation_boot_id")
+                ?: json.stringOrNull("last_source_boot_id"),
+            lastEvaluationElapsedMs = json.longOrNull("last_evaluation_elapsed_ms")
+                ?: json.longOrNull("last_source_elapsed_ms"),
             anchor = json.objectOrNull("anchor")?.let(::decodeAnchor),
             totals = decodeTotals(json.getJSONObject("totals")),
             integrationQuality = enumValueOf(json.getString("integration_quality")),

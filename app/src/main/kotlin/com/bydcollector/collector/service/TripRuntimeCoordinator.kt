@@ -5,6 +5,7 @@ import android.os.SystemClock
 import com.bydcollector.collector.data.local.PollReading
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.data.normalized.NormalizedQuality
+import com.bydcollector.collector.data.normalized.NormalizedSourceStamp
 import com.bydcollector.collector.data.trips.RoutePoint
 import com.bydcollector.collector.data.trips.TripId
 import com.bydcollector.collector.data.trips.TripMetrics
@@ -15,6 +16,7 @@ import com.bydcollector.collector.data.energy.EnergySnapshot
 import com.bydcollector.collector.data.trips.withEnergySnapshot
 import com.bydcollector.collector.data.trips.closedAtPowerOff
 import com.bydcollector.collector.data.trips.TripCompletionIntent
+import com.bydcollector.collector.data.trips.TripBusinessInputMutation
 import com.bydcollector.collector.data.trips.TripCompletionLocation
 import com.bydcollector.collector.location.AndroidGpsLocationSource
 import com.bydcollector.collector.location.GpsLocationSample
@@ -30,6 +32,15 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import com.bydcollector.collector.util.diagnosticDetail
+
+data class TripBusinessResult(
+    val consumed: Boolean,
+    val priorCompletionWatermark: Long,
+    val completionWatermark: Long,
+    val powerSessionId: String?,
+    val confirmedPowerOn: Boolean,
+    val closedPowerSession: Boolean = false
+)
 
 /** Serializes power-session, route, and normalized-location writes behind one owner. */
 class TripRuntimeCoordinator(
@@ -48,7 +59,7 @@ class TripRuntimeCoordinator(
     private val running = AtomicBoolean(true)
     private val paused = AtomicBoolean(false)
     private val executor: ExecutorService = namedSingleThreadExecutor(THREAD_NAME)
-    private val powerTracker = VehiclePowerBoundaryTracker()
+    private var powerTracker = VehiclePowerBoundaryTracker()
     private val bootId = bootIdProvider()
     private val segmentId = "$bootId:${System.currentTimeMillis()}"
     @Volatile private var ownerThread: Thread? = null
@@ -62,6 +73,7 @@ class TripRuntimeCoordinator(
     private var lastLocationTripId: String? = null
     private var latestBatteryPowerKw: Double? = null
     private var latestBatteryPowerAtMs = Long.MIN_VALUE
+    private var latestBatteryPowerBootId: String? = null
     private val vehicleSpeedReference = VehicleSpeedReference(nowElapsedMs = elapsedRealtimeMs)
     private val locationSource = AndroidGpsLocationSource(
         context = context,
@@ -101,7 +113,12 @@ class TripRuntimeCoordinator(
         beforeBoundary: (Long) -> Unit = {}
     ) {
         val receivedElapsedMs = elapsedRealtimeMs()
-        val snapshot = computeTelemetrySnapshot(observations, receivedElapsedMs).copy(energy = energySnapshot)
+        val telemetry = computeTelemetrySnapshot(observations, receivedElapsedMs)
+        val snapshot = telemetry.copy(
+            energy = energySnapshot,
+            eventElapsedMs = energySnapshot?.sourceElapsedMs ?: telemetry.eventElapsedMs,
+            eventBootId = energySnapshot?.sourceBootId ?: telemetry.eventBootId
+        )
         if (liveTelemetry) vehicleSpeedReference.observe(snapshot.speedKmh, receivedElapsedMs)
         dispatch(onDropped = { diagnosticPowerSession?.complete(null) }) {
             try {
@@ -111,6 +128,7 @@ class TripRuntimeCoordinator(
                 beforeBoundary(tripStore.completionWatermark())
                 latestBatteryPowerKw = snapshot.batteryPowerKw
                 latestBatteryPowerAtMs = snapshot.receivedElapsedMs
+                latestBatteryPowerBootId = bootId
 
                 val decodedPower = readings.firstOrNull { it.rawKey == POWER_FIELD_KEY }
                     ?.descValue
@@ -142,6 +160,153 @@ class TripRuntimeCoordinator(
                 diagnosticPowerSession?.complete(null)
             }
         }
+    }
+
+    /** Applies one durable business-input journal entry and completes only after its Trips transaction commits. */
+    fun onBusinessInput(
+        journalGeneration: String,
+        inputId: Long,
+        sourceIdentity: String,
+        timestamp: String,
+        readings: List<PollReading>,
+        observations: List<NormalizedObservation>,
+        liveTelemetry: Boolean,
+        energySnapshot: EnergySnapshot? = null,
+        eventSourceStamp: NormalizedSourceStamp? = null,
+        allowWhilePaused: Boolean = false
+    ): CompletableFuture<TripBusinessResult> {
+        val future = CompletableFuture<TripBusinessResult>()
+        if (!running.get()) {
+            future.completeExceptionally(IllegalStateException("Trips runtime is closed"))
+            return future
+        }
+        if (paused.get() && !allowWhilePaused) {
+            future.completeExceptionally(IllegalStateException("Trips runtime is paused"))
+            return future
+        }
+        val work: () -> Unit = task@ {
+            val priorBatteryPowerKw = latestBatteryPowerKw
+            val priorBatteryPowerAtMs = latestBatteryPowerAtMs
+            val priorBatteryPowerBootId = latestBatteryPowerBootId
+            try {
+                check(running.get()) { "Trips runtime is closed" }
+                check(allowWhilePaused || !paused.get()) { "Trips runtime is paused" }
+                val replay = tripStore.businessInputReplay(journalGeneration, inputId, sourceIdentity)
+                if (replay != null) {
+                    future.complete(
+                        TripBusinessResult(
+                            consumed = false,
+                            priorCompletionWatermark = replay.priorCompletionWatermark,
+                            completionWatermark = replay.completionWatermark,
+                            powerSessionId = replay.powerSessionId,
+                            confirmedPowerOn = false
+                        )
+                    )
+                    return@task
+                }
+
+                ensureInitialized()
+                val currentStamp = eventSourceStamp ?: observations.firstNotNullOfOrNull { observation ->
+                    observation.sourceStamp?.takeIf { it.identity == sourceIdentity }
+                }
+                val eventElapsedMs = currentStamp?.elapsedMs ?: Long.MIN_VALUE
+                val snapshot = computeTelemetrySnapshot(
+                    observations = observations,
+                    receivedElapsedMs = eventElapsedMs,
+                    sourceStamped = true,
+                    eventSourceStamp = currentStamp
+                ).copy(
+                    energy = energySnapshot?.takeIf {
+                        currentStamp != null && it.sourceBootId == currentStamp.bootId &&
+                            it.sourceElapsedMs == currentStamp.elapsedMs
+                    }
+                )
+                val speedElapsedMs = snapshot.speedElapsedMs
+                if (liveTelemetry && speedElapsedMs != null && snapshot.speedBootId == bootId) {
+                    vehicleSpeedReference.observe(snapshot.speedKmh, speedElapsedMs)
+                }
+                latestBatteryPowerKw = snapshot.batteryPowerKw
+                latestBatteryPowerAtMs = snapshot.batteryPowerElapsedMs
+                    ?.takeIf { snapshot.batteryPowerBootId == bootId }
+                    ?: Long.MIN_VALUE
+                latestBatteryPowerBootId = snapshot.batteryPowerBootId
+
+                val decodedPower = readings.firstOrNull { it.rawKey == POWER_FIELD_KEY }
+                    ?.descValue?.trim()?.toIntOrNull()
+                val willTransition = when {
+                    decodedPower == null || decodedPower < 0 -> false
+                    decodedPower > 0 -> powerTracker.current() != VehiclePowerState.ON
+                    else -> powerTracker.current() != VehiclePowerState.OFF
+                }
+                if (willTransition) {
+                    require(currentStamp != null && currentStamp.elapsedMs >= 0L && currentStamp.bootId.isNotBlank()) {
+                        "Business power boundary has no source acquisition stamp"
+                    }
+                }
+                val finalGpsStopped = willTransition && decodedPower == 0
+                if (finalGpsStopped) stopGps(markFinal = true)
+
+                val committed = tripStore.consumeBusinessInput(journalGeneration, inputId, sourceIdentity) { _ ->
+                    val mutation = applyBusinessInput(
+                        timestamp = timestamp,
+                        readings = readings,
+                        snapshot = snapshot,
+                        finalGpsStopped = finalGpsStopped
+                    )
+                    TripBusinessInputMutation(mutation, mutation.powerSessionId)
+                }
+                if (committed.applied) {
+                    val mutation = checkNotNull(committed.value)
+                    if (!allowWhilePaused && powerTracker.current() == VehiclePowerState.ON) {
+                        if (!locationCaptureEnabled()) stopGps()
+                        else if (liveTelemetry) ensureGpsRunning()
+                    }
+                    future.complete(
+                        TripBusinessResult(
+                            consumed = true,
+                            priorCompletionWatermark = committed.priorCompletionWatermark,
+                            completionWatermark = committed.completionWatermark,
+                            powerSessionId = committed.powerSessionId,
+                            confirmedPowerOn = mutation.confirmedPowerOn,
+                            closedPowerSession = mutation.closedPowerSession
+                        )
+                    )
+                } else {
+                    future.complete(
+                        TripBusinessResult(
+                            consumed = false,
+                            priorCompletionWatermark = committed.priorCompletionWatermark,
+                            completionWatermark = committed.completionWatermark,
+                            powerSessionId = committed.powerSessionId,
+                            confirmedPowerOn = false
+                        )
+                    )
+                }
+            } catch (error: Throwable) {
+                latestBatteryPowerKw = priorBatteryPowerKw
+                latestBatteryPowerAtMs = priorBatteryPowerAtMs
+                latestBatteryPowerBootId = priorBatteryPowerBootId
+                try {
+                    restoreRuntimeFromDurableState()
+                } catch (restoreError: Throwable) {
+                    error.addSuppressed(restoreError)
+                }
+                future.completeExceptionally(error)
+            }
+        }
+        if (Thread.currentThread() === ownerThread) {
+            work()
+        } else {
+            try {
+                executor.execute {
+                    ownerThread = Thread.currentThread()
+                    work()
+                }
+            } catch (error: Throwable) {
+                future.completeExceptionally(error)
+            }
+        }
+        return future
     }
 
     fun resume() {
@@ -197,6 +362,51 @@ class TripRuntimeCoordinator(
         }
     }
 
+    private data class BusinessMutation(
+        val powerSessionId: String?, val confirmedPowerOn: Boolean, val closedPowerSession: Boolean
+    )
+
+    private fun applyBusinessInput(
+        timestamp: String,
+        readings: List<PollReading>,
+        snapshot: TelemetrySnapshot,
+        finalGpsStopped: Boolean
+    ): BusinessMutation {
+        val decodedPower = readings.firstOrNull { it.rawKey == POWER_FIELD_KEY }
+            ?.descValue?.trim()?.toIntOrNull()
+        val transition = powerTracker.observe(decodedPower)
+        var boundaryTripId: String? = null
+        try {
+            when (transition?.current) {
+                VehiclePowerState.ON -> {
+                    handlePowerOn(timestamp, snapshot)
+                    boundaryTripId = session?.tripId
+                }
+                VehiclePowerState.OFF -> {
+                    boundaryTripId = handlePowerOff(
+                        timestamp = timestamp,
+                        snapshot = snapshot,
+                        diagnosticPowerSession = null,
+                        finalGpsStopped = finalGpsStopped,
+                        notifyCompletion = false
+                    )
+                }
+                else -> Unit
+            }
+            if (powerTracker.current() == VehiclePowerState.ON) {
+                updateOpenSession(timestamp, snapshot)
+            }
+            return BusinessMutation(
+                powerSessionId = boundaryTripId ?: session?.tripId ?: snapshot.energy?.powerSessionId,
+                confirmedPowerOn = transition?.current == VehiclePowerState.ON,
+                closedPowerSession = transition?.current == VehiclePowerState.OFF
+            )
+        } catch (error: Throwable) {
+            transition?.let(powerTracker::rollback)
+            throw error
+        }
+    }
+
     private fun handlePowerOn(timestamp: String, snapshot: TelemetrySnapshot) {
         if (session == null) {
             lastLocation = null
@@ -206,10 +416,10 @@ class TripRuntimeCoordinator(
             if (session == null) {
                 val startEnergy = snapshot.tripEnergyKwh?.takeIf { it.isFinite() && it >= 0.0 }
                 session = TripSession(
-                    tripId = snapshot.energy?.powerSessionId ?: TripId.forPowerSession(bootId, snapshot.receivedElapsedMs),
+                    tripId = snapshot.energy?.powerSessionId ?: TripId.forPowerSession(snapshot.eventBootId, snapshot.eventElapsedMs),
                     startedAt = snapshot.energy?.startedAt ?: timestamp,
-                    startElapsedMs = snapshot.energy?.sourceElapsedMs ?: snapshot.receivedElapsedMs,
-                    startBootId = snapshot.energy?.sourceBootId ?: bootId,
+                    startElapsedMs = snapshot.eventElapsedMs,
+                    startBootId = snapshot.eventBootId,
                     startSegmentId = segmentId,
                     startSoc = snapshot.soc,
                     endSoc = snapshot.soc,
@@ -276,9 +486,11 @@ class TripRuntimeCoordinator(
     private fun handlePowerOff(
         timestamp: String,
         snapshot: TelemetrySnapshot,
-        diagnosticPowerSession: CompletableFuture<String?>?
-    ) {
-        stopGps(markFinal = true)
+        diagnosticPowerSession: CompletableFuture<String?>?,
+        finalGpsStopped: Boolean = false,
+        notifyCompletion: Boolean = true
+    ): String? {
+        if (!finalGpsStopped) stopGps(markFinal = true)
         updateOpenSession(timestamp, snapshot)
         val current = session
         val trustedLocation = when {
@@ -293,13 +505,13 @@ class TripRuntimeCoordinator(
             markLastRoutePointFinal(current.tripId)
             current.closedAtPowerOff(
                 timestamp = timestamp,
-                elapsedMs = snapshot.energy?.sourceElapsedMs ?: snapshot.receivedElapsedMs,
-                bootId = snapshot.energy?.sourceBootId ?: bootId,
+                elapsedMs = snapshot.eventElapsedMs,
+                bootId = snapshot.eventBootId,
                 segmentId = segmentId
             )
         }
         val completion = if (completionEnabled()) TripCompletionIntent(
-            identity = "power_off:${closed?.tripId ?: snapshot.energy?.powerSessionId ?: "$bootId:${snapshot.receivedElapsedMs}"}",
+            identity = "power_off:${closed?.tripId ?: snapshot.energy?.powerSessionId ?: "${snapshot.eventBootId}:${snapshot.eventElapsedMs}"}",
             observedAt = timestamp,
             session = closed,
             lastLocation = trustedLocation?.let { TripCompletionLocation(it.latitude, it.longitude, it.observedAt) },
@@ -315,7 +527,8 @@ class TripRuntimeCoordinator(
         if (closed != null) runCatching {
             recordEvent("power_trip_finished", "Vehicle power session finished", "trip_id=${closed.tripId}")
         }
-        durableCompletion?.let { runCatching { onCompletionReady(it.sequence) } }
+        if (notifyCompletion) durableCompletion?.let { runCatching { onCompletionReady(it.sequence) } }
+        return closed?.tripId ?: current?.tripId
     }
 
     private fun ensureGpsRunning() {
@@ -350,7 +563,10 @@ class TripRuntimeCoordinator(
         persistLocation(LocationNormalizer.observations(sample, sample.receiveWallTimeMs))
         val current = session ?: return
         lastLocationTripId = current.tripId
-        val powerAgeMs = sample.receiveElapsedRealtimeNanos / 1_000_000L - latestBatteryPowerAtMs
+        val sampleElapsedMs = sample.receiveElapsedRealtimeNanos / 1_000_000L
+        val powerAgeMs = if (sample.bootId == latestBatteryPowerBootId && sample.bootId == bootId) {
+            sampleElapsedMs - latestBatteryPowerAtMs
+        } else Long.MIN_VALUE
         val power = latestBatteryPowerKw.takeIf {
             powerAgeMs in 0L..TELEMETRY_FRESH_MS
         }
@@ -398,6 +614,10 @@ class TripRuntimeCoordinator(
 
     private fun ensureInitialized() {
         if (initialized) return
+        restoreRuntimeFromDurableState()
+    }
+
+    private fun restoreRuntimeFromDurableState() {
         session = tripStore.loadOpenSession()
         nextRouteSequence = session?.let { tripStore.nextRouteSequence(it.tripId) } ?: 0L
         lastLocation = session?.let { current ->
@@ -408,6 +628,7 @@ class TripRuntimeCoordinator(
         // An open trip is durable evidence that ON still needs a matching OFF. Without
         // one (including when history is disabled), OFF is the restart baseline rather
         // than a new boundary. Establish it only after retryable store reads succeed.
+        powerTracker = VehiclePowerBoundaryTracker()
         powerTracker.restoreBaseline(hasOpenSession = session != null)
         initialized = true
     }
@@ -446,16 +667,25 @@ class TripRuntimeCoordinator(
 
     private fun computeTelemetrySnapshot(
         observations: List<NormalizedObservation>,
-        receivedElapsedMs: Long
+        receivedElapsedMs: Long,
+        sourceStamped: Boolean = false,
+        eventSourceStamp: NormalizedSourceStamp? = null
     ): TelemetrySnapshot {
         val values = observations.associateBy { it.field.fieldKey }
+        fun sourceStamp(key: String): NormalizedSourceStamp? = values[key]?.sourceStamp
         return TelemetrySnapshot(
             soc = values.number("soc"),
             odometerKm = values.number("odometer_km"),
             tripEnergyKwh = values.number("trip_energy_kwh"),
             speedKmh = values.number("speed_kmh"),
             batteryPowerKw = values.number("battery_power_kw"),
-            receivedElapsedMs = receivedElapsedMs
+            receivedElapsedMs = receivedElapsedMs,
+            eventElapsedMs = eventSourceStamp?.elapsedMs ?: receivedElapsedMs,
+            eventBootId = eventSourceStamp?.bootId ?: bootId,
+            speedElapsedMs = if (sourceStamped) sourceStamp("speed_kmh")?.elapsedMs else receivedElapsedMs,
+            speedBootId = if (sourceStamped) sourceStamp("speed_kmh")?.bootId else bootId,
+            batteryPowerElapsedMs = if (sourceStamped) sourceStamp("battery_power_kw")?.elapsedMs else receivedElapsedMs,
+            batteryPowerBootId = if (sourceStamped) sourceStamp("battery_power_kw")?.bootId else bootId
         )
     }
 
@@ -489,6 +719,12 @@ class TripRuntimeCoordinator(
         val speedKmh: Double?,
         val batteryPowerKw: Double?,
         val receivedElapsedMs: Long,
+        val eventElapsedMs: Long,
+        val eventBootId: String,
+        val speedElapsedMs: Long?,
+        val speedBootId: String?,
+        val batteryPowerElapsedMs: Long?,
+        val batteryPowerBootId: String?,
         val energy: EnergySnapshot? = null
     )
 

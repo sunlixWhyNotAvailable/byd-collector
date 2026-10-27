@@ -5,6 +5,7 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import com.bydcollector.collector.BuildConfig
 import com.bydcollector.collector.data.callback.CallbackRawSchema
+import com.bydcollector.collector.data.input.BusinessInputSchema
 
 //creates and upgrades the app-private sqlite database without dropping user telemetry on normal upgrades
 class TelemetryDatabaseHelper(
@@ -29,6 +30,8 @@ class TelemetryDatabaseHelper(
     override fun onCreate(db: SQLiteDatabase) {
         executeSqlAsset(db, COMPACT_SCHEMA_ASSET)
         CallbackRawSchema.create(db)
+        createPollGetLineage(db)
+        BusinessInputSchema.create(db)
         createCollectorEvents(db)
         createDeferredEnergyReceipts(db)
     }
@@ -38,13 +41,19 @@ class TelemetryDatabaseHelper(
         val compactV2 = isCompactV2(db)
         executeSqlAsset(db, if (compactV2) COMPACT_SCHEMA_ASSET else LEGACY_SCHEMA_ASSET)
         CallbackRawSchema.create(db)
+        createPollGetLineage(db)
+        if (oldVersion < DATABASE_VERSION) BusinessInputSchema.migrateToV17(db)
+        BusinessInputSchema.create(db)
         createCollectorEvents(db)
         createDeferredEnergyReceipts(db)
         if (!compactV2) ensureLegacySchemaCompatibility(db)
         //The compact schema asset is CREATE IF NOT EXISTS, so it cannot add this
         //column to an existing compact database. Keep the additive migration shared.
         ensureColumns(db, "mqtt_outbox", mapOf("destination_key" to "TEXT"))
+        ensureColumns(db, "normalized_source_inputs", mapOf("source_epoch" to "INTEGER"))
+        ensureColumns(db, "poll_callback_sources", mapOf("source_epoch" to "INTEGER"))
         ensureNormalizedQualityDetails(db)
+        if (oldVersion < DATABASE_VERSION) BusinessInputSchema.seedExistingSourceCheckpoint(db)
     }
 
     override fun onDowngrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -126,6 +135,36 @@ class TelemetryDatabaseHelper(
                 last_error TEXT,
                 created_at_ms INTEGER NOT NULL
             )
+            """.trimIndent()
+        )
+    }
+
+    private fun createPollGetLineage(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS poll_get_lineage (
+                poll_id INTEGER NOT NULL,
+                source_key TEXT NOT NULL,
+                helper_boot_id TEXT NOT NULL,
+                helper_generation TEXT NOT NULL,
+                stream INTEGER NOT NULL CHECK(stream IN (1, 2)),
+                source_epoch INTEGER NOT NULL CHECK(source_epoch >= 0),
+                read_identity TEXT NOT NULL,
+                record_sequence INTEGER NOT NULL CHECK(record_sequence >= 0),
+                device INTEGER NOT NULL,
+                fid INTEGER NOT NULL,
+                tx INTEGER NOT NULL CHECK(tx IN (5, 7)),
+                started_wall_ms INTEGER NOT NULL CHECK(started_wall_ms >= 0),
+                started_elapsed_ms INTEGER NOT NULL CHECK(started_elapsed_ms >= 0),
+                completed_wall_ms INTEGER NOT NULL CHECK(completed_wall_ms >= 0),
+                completed_elapsed_ms INTEGER NOT NULL CHECK(completed_elapsed_ms >= started_elapsed_ms),
+                callback_watermark_start INTEGER NOT NULL CHECK(callback_watermark_start >= -1),
+                callback_watermark_end INTEGER NOT NULL CHECK(callback_watermark_end >= -1),
+                superseded_by_callback INTEGER NOT NULL CHECK(superseded_by_callback IN (0, 1)),
+                PRIMARY KEY(poll_id, source_key),
+                UNIQUE(read_identity, record_sequence, source_key),
+                FOREIGN KEY(poll_id) REFERENCES polls(id) ON DELETE CASCADE
+            ) WITHOUT ROWID
             """.trimIndent()
         )
     }
@@ -468,7 +507,7 @@ class TelemetryDatabaseHelper(
 
     companion object {
         val DATABASE_NAME: String = BuildConfig.COLLECTOR_DATABASE_NAME
-        const val DATABASE_VERSION = 15
+        const val DATABASE_VERSION = 17
         const val LEGACY_SCHEMA_ASSET = "schema.sql"
         const val COMPACT_SCHEMA_ASSET = "schema_v2.sql"
         const val LEGACY_STORAGE_FORMAT = 1

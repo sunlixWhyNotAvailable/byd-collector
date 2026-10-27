@@ -31,8 +31,10 @@ import java.util.Base64;
 //helper-owned durable raw spool; the app acknowledges a sample only after its own transaction commits
 final class TelemetryWorkerSpool implements AutoCloseable {
     static final String SPOOL_DIRECTORY_PATH = "/data/local/tmp/bydcollector_telemetry_spool";
-    static final int RECORD_VERSION = 2;
-    static final int LEGACY_RECORD_VERSION = 1;
+    static final int RECORD_VERSION = 4;
+    static final int PREVIOUS_RECORD_VERSION = 3;
+    static final int LEGACY_RECORD_VERSION = 2;
+    static final int OLDEST_RECORD_VERSION = 1;
     static final long MAX_SPOOL_BYTES = 128L * 1024L * 1024L;
     private static final String READY_SUFFIX = ".ready";
     private static final String TMP_SUFFIX = ".tmp";
@@ -107,7 +109,10 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         if (sample == null) throw new IllegalArgumentException("sample is required");
         File ready = readyFile(sample.identity);
         File temporary = temporaryFile(sample.identity);
-        if (ready.exists() || temporary.exists() || readyFile(LEGACY_RECORD_VERSION, sample.identity).exists()) {
+        if (ready.exists() || temporary.exists() ||
+            readyFile(PREVIOUS_RECORD_VERSION, sample.identity).exists() ||
+            readyFile(LEGACY_RECORD_VERSION, sample.identity).exists() ||
+            readyFile(OLDEST_RECORD_VERSION, sample.identity).exists()) {
             notifyAppend(AppendResult.DUPLICATE, null);
             return AppendResult.DUPLICATE;
         }
@@ -311,7 +316,9 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         if (identity == null) throw new IllegalArgumentException("identity is required");
         if (acknowledgedAtMs < 0) throw new IllegalArgumentException("acknowledgedAtMs must be non-negative");
         File ready = readyFile(identity);
+        if (!ready.isFile()) ready = readyFile(PREVIOUS_RECORD_VERSION, identity);
         if (!ready.isFile()) ready = readyFile(LEGACY_RECORD_VERSION, identity);
+        if (!ready.isFile()) ready = readyFile(OLDEST_RECORD_VERSION, identity);
         if (!ready.isFile()) {
             AckResult result = AckResult.notFound();
             notifyAcknowledge(result);
@@ -443,6 +450,7 @@ final class TelemetryWorkerSpool implements AutoCloseable {
                 .put("status", value.status)
                 .put("raw", value.raw == null ? JSONObject.NULL : value.raw)
                 .put("callback_source", encodeSource(value.callbackSource))
+                .put("get_lineage", value.getLineage == null ? JSONObject.NULL : value.getLineage.toJson())
                 .put("error", value.error == null ? JSONObject.NULL : value.error));
         }
         json.put("values", values);
@@ -452,7 +460,8 @@ final class TelemetryWorkerSpool implements AutoCloseable {
     private static Sample decode(byte[] bytes) throws Exception {
         JSONObject json = new JSONObject(new String(bytes, StandardCharsets.UTF_8));
         int recordVersion = json.getInt("record_version");
-        if (recordVersion != RECORD_VERSION && recordVersion != LEGACY_RECORD_VERSION) {
+        if (recordVersion != RECORD_VERSION && recordVersion != PREVIOUS_RECORD_VERSION &&
+            recordVersion != LEGACY_RECORD_VERSION && recordVersion != OLDEST_RECORD_VERSION) {
             throw new IllegalArgumentException("unsupported telemetry worker record version");
         }
         JSONObject identity = json.getJSONObject("identity");
@@ -475,7 +484,9 @@ final class TelemetryWorkerSpool implements AutoCloseable {
                 value.getInt("status"),
                 nullableInteger(value, "raw"),
                 nullableString(value, "error"),
-                recordVersion >= 2 ? decodeSource(value) : null
+                recordVersion >= 2 ? decodeSource(value, recordVersion >= RECORD_VERSION) : null,
+                recordVersion >= RECORD_VERSION && value.has("get_lineage") && !value.isNull("get_lineage")
+                    ? HelperGetLineage.fromJson(value.getJSONObject("get_lineage")) : null
             ));
         }
         return new Sample(recordVersion,
@@ -506,15 +517,15 @@ final class TelemetryWorkerSpool implements AutoCloseable {
     private static Object encodeSource(CallbackValueSource source) throws IOException {
         if (source == null) return JSONObject.NULL;
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        try (DataOutputStream output = new DataOutputStream(bytes)) { CallbackValueSource.writeNullable(output, source); }
+        try (DataOutputStream output = new DataOutputStream(bytes)) { CallbackValueSource.writeNullable(output, source, true); }
         return Base64.getEncoder().encodeToString(bytes.toByteArray());
     }
 
-    private static CallbackValueSource decodeSource(JSONObject value) throws Exception {
+    private static CallbackValueSource decodeSource(JSONObject value, boolean includeSourceEpoch) throws Exception {
         if (!value.has("callback_source") || value.isNull("callback_source")) return null;
         byte[] bytes = Base64.getDecoder().decode(value.getString("callback_source"));
         try (DataInputStream input = new DataInputStream(new ByteArrayInputStream(bytes))) {
-            CallbackValueSource source = CallbackValueSource.readNullable(input);
+            CallbackValueSource source = CallbackValueSource.readNullable(input, includeSourceEpoch);
             if (input.available() != 0) throw new IOException("trailing callback source");
             return source;
         }
@@ -710,7 +721,10 @@ final class TelemetryWorkerSpool implements AutoCloseable {
             String error,
             List<Value> values
         ) {
-            if (recordVersion != RECORD_VERSION && recordVersion != LEGACY_RECORD_VERSION) throw new IllegalArgumentException("recordVersion");
+            if (recordVersion != RECORD_VERSION && recordVersion != PREVIOUS_RECORD_VERSION &&
+                recordVersion != LEGACY_RECORD_VERSION && recordVersion != OLDEST_RECORD_VERSION) {
+                throw new IllegalArgumentException("recordVersion");
+            }
             if (identity == null) throw new IllegalArgumentException("identity is required");
             if (catalogVersion == null || catalogVersion.trim().isEmpty()) {
                 throw new IllegalArgumentException("catalogVersion must not be blank");
@@ -724,14 +738,17 @@ final class TelemetryWorkerSpool implements AutoCloseable {
                 throw new IllegalArgumentException("too many worker fields: " + values.size());
             }
             Set<Integer> indexes = new HashSet<Integer>();
-            for (int index = 0; index < values.size(); index++) {
-                Value value = values.get(index);
+            int previousIndex = -1;
+            for (Value value : values) {
                 if (value == null) throw new IllegalArgumentException("values must not contain null");
-                if (value.fieldIndex != index) throw new IllegalArgumentException("values must be in fieldIndex order");
+                if (value.fieldIndex <= previousIndex || value.fieldIndex >= CollectorHelperProtocol.MAX_BATCH_SIZE) {
+                    throw new IllegalArgumentException("values must have increasing in-range fieldIndex values");
+                }
+                if (recordVersion < PREVIOUS_RECORD_VERSION && value.fieldIndex != indexes.size()) {
+                    throw new IllegalArgumentException("legacy values must be dense");
+                }
                 if (!indexes.add(value.fieldIndex)) throw new IllegalArgumentException("duplicate fieldIndex: " + value.fieldIndex);
-            }
-            for (int index = 0; index < values.size(); index++) {
-                if (!indexes.contains(index)) throw new IllegalArgumentException("missing fieldIndex: " + index);
+                previousIndex = value.fieldIndex;
             }
             this.recordVersion = recordVersion;
             this.identity = identity;
@@ -757,6 +774,7 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         final Integer raw;
         final String error;
         final CallbackValueSource callbackSource;
+        final HelperGetLineage getLineage;
 
         Value(int fieldIndex, int tx, int dev, int fid, int status, Integer raw, String error) {
             this(fieldIndex, tx, dev, fid, status, raw, error, null);
@@ -764,6 +782,11 @@ final class TelemetryWorkerSpool implements AutoCloseable {
 
         Value(int fieldIndex, int tx, int dev, int fid, int status, Integer raw, String error,
               CallbackValueSource callbackSource) {
+            this(fieldIndex, tx, dev, fid, status, raw, error, callbackSource, null);
+        }
+
+        Value(int fieldIndex, int tx, int dev, int fid, int status, Integer raw, String error,
+              CallbackValueSource callbackSource, HelperGetLineage getLineage) {
             if (fieldIndex < 0) throw new IllegalArgumentException("fieldIndex must be non-negative");
             if (tx != CollectorHelperProtocol.AUTO_TX_INT && tx != CollectorHelperProtocol.AUTO_TX_FLOAT) {
                 throw new IllegalArgumentException("unsupported read transaction: " + tx);
@@ -778,6 +801,7 @@ final class TelemetryWorkerSpool implements AutoCloseable {
             if (callbackSource != null && (status != CollectorHelperProtocol.STATUS_OK || raw == null ||
                 !callbackSource.matches(tx, dev, fid, raw))) throw new IllegalArgumentException("callback source mismatch");
             this.callbackSource = callbackSource;
+            this.getLineage = getLineage;
         }
     }
 }

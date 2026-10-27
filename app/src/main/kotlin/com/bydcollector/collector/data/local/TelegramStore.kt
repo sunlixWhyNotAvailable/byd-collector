@@ -5,6 +5,7 @@ import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import com.bydcollector.collector.service.TelegramEventState
 import java.io.Closeable
+import java.util.UUID
 
 /** Durable Telegram outbox/state facade. The database lives outside Main archives. */
 class TelegramStore(
@@ -74,7 +75,9 @@ class TelegramStore(
         require(message.dedupeKey.isNotBlank()) { "Telegram dedupe key must not be blank" }
         require(message.eventType.isNotBlank()) { "Telegram event type must not be blank" }
         require(message.payload.isNotBlank()) { "Telegram payload must not be blank" }
-        val (protectedClause, protectedArgs) = protectedIdFilter(protectedTelegramIds)
+        val protectedIds = protectedTelegramIds +
+            readActiveTelegramDeliveryAttempt(db)?.outboxId?.let(::setOf).orEmpty()
+        val (protectedClause, protectedArgs) = protectedIdFilter(protectedIds)
         pruneDeliveryReceipts(db, nowMs)
         telegramDeliveryReceipt(db, message.dedupeKey)?.let { receipt ->
             check(receipt.eventType == message.eventType) {
@@ -179,7 +182,10 @@ class TelegramStore(
     )
 
     private fun queryTelegramMessage(sql: String, args: Array<String>): TelegramOutboxEntry? =
-        helper.readableDatabase.rawQuery(sql, args).use { cursor ->
+        queryTelegramMessage(helper.readableDatabase, sql, args)
+
+    private fun queryTelegramMessage(db: SQLiteDatabase, sql: String, args: Array<String>): TelegramOutboxEntry? =
+        db.rawQuery(sql, args).use { cursor ->
             if (!cursor.moveToFirst()) return@use null
             TelegramOutboxEntry(
                 id = cursor.getLong(0),
@@ -196,6 +202,200 @@ class TelegramStore(
                 occurredAtMs = if (cursor.isNull(11)) null else cursor.getLong(11)
             )
         }
+
+    override fun activeTelegramDeliveryAttempt(): TelegramPersistedDeliveryAttempt? =
+        readActiveTelegramDeliveryAttempt(helper.readableDatabase)
+
+    override fun prepareTelegramDeliveryAttempt(
+        entry: TelegramOutboxEntry,
+        requestDigest: String,
+        destinationDigest: String,
+        dedupeRef: String,
+        botScope: String,
+        startedAtMs: Long
+    ): TelegramPersistedDeliveryAttempt {
+        require(entry.id > 0L && entry.dedupeKey.isNotBlank() && entry.eventType.isNotBlank())
+        requireDigest(requestDigest, "request digest")
+        requireDigest(destinationDigest, "destination digest")
+        requireDigest(dedupeRef, "dedupe reference")
+        require(botScope.isNotBlank() && startedAtMs >= 0L)
+        val db = helper.writableDatabase
+        db.beginTransactionNonExclusive()
+        try {
+            readActiveTelegramDeliveryAttempt(db)?.let { active ->
+                check(active.outboxId == entry.id && active.dedupeKey == entry.dedupeKey &&
+                    active.eventType == entry.eventType && active.requestDigest == requestDigest &&
+                    active.destinationDigest == destinationDigest && active.dedupeRef == dedupeRef &&
+                    active.botScope == botScope) {
+                    "A different Telegram outbox attempt is already active"
+                }
+                db.setTransactionSuccessful()
+                return active
+            }
+            val current = queryTelegramMessage(
+                db,
+                "SELECT id, dedupe_key, event_type, payload, attempt_count, next_attempt_at_ms, blocked, " +
+                    "waits_for_summary_key, created_at_ms, failure_count, last_error, occurred_at_ms " +
+                    "FROM telegram_outbox WHERE id = ? LIMIT 1",
+                arrayOf(entry.id.toString())
+            ) ?: error("Telegram outbox row disappeared before attempt persistence")
+            check(current.dedupeKey == entry.dedupeKey && current.eventType == entry.eventType &&
+                current.payload == entry.payload) {
+                "Telegram outbox row changed before attempt persistence"
+            }
+            check(!current.blocked && current.waitsForSummaryKey == null) {
+                "Telegram outbox row is no longer deliverable"
+            }
+            check(current.attemptCount < Int.MAX_VALUE) { "Telegram attempt count exhausted" }
+            val ownerId = ensureTelegramDeliveryOwner(db)
+            val sequence = db.rawQuery(
+                "SELECT last_sequence FROM telegram_delivery_owner WHERE id = 1",
+                emptyArray()
+            ).use { cursor ->
+                check(cursor.moveToFirst()) { "Telegram delivery owner disappeared" }
+                val previous = cursor.getLong(0)
+                check(previous < Long.MAX_VALUE) { "Telegram delivery sequence exhausted" }
+                previous + 1L
+            }
+            check(db.update(
+                "telegram_delivery_owner",
+                ContentValues().apply { put("last_sequence", sequence) },
+                "id = 1 AND owner_id = ?",
+                arrayOf(ownerId)
+            ) == 1) { "Telegram delivery sequence could not be persisted" }
+            check(db.update(
+                "telegram_outbox",
+                ContentValues().apply {
+                    put("attempt_count", current.attemptCount + 1)
+                    put("last_attempt_at_ms", startedAtMs)
+                },
+                "id = ? AND dedupe_key = ? AND event_type = ?",
+                arrayOf(entry.id.toString(), entry.dedupeKey, entry.eventType)
+            ) == 1) { "Telegram attempt accounting could not be persisted" }
+            val attempt = TelegramPersistedDeliveryAttempt(
+                ownerId = ownerId,
+                attemptId = UUID.randomUUID().toString(),
+                sequence = sequence,
+                outboxId = entry.id,
+                dedupeKey = entry.dedupeKey,
+                eventType = entry.eventType,
+                requestDigest = requestDigest,
+                destinationDigest = destinationDigest,
+                dedupeRef = dedupeRef,
+                botScope = botScope,
+                startedAtMs = startedAtMs,
+                localSettled = false
+            )
+            db.insertOrThrow("telegram_delivery_attempt", null, ContentValues().apply {
+                put("id", 1)
+                put("owner_id", attempt.ownerId)
+                put("attempt_id", attempt.attemptId)
+                put("sequence", attempt.sequence)
+                put("outbox_id", attempt.outboxId)
+                put("dedupe_key", attempt.dedupeKey)
+                put("event_type", attempt.eventType)
+                put("request_digest", attempt.requestDigest)
+                put("destination_digest", attempt.destinationDigest)
+                put("dedupe_ref", attempt.dedupeRef)
+                put("bot_scope", attempt.botScope)
+                put("started_at_ms", attempt.startedAtMs)
+                put("local_settled", 0)
+            })
+            db.setTransactionSuccessful()
+            return attempt
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    override fun protectedTelegramOutboxIds(): Set<Long> = activeTelegramDeliveryAttempt()
+        ?.outboxId
+        ?.let(::setOf)
+        ?: emptySet()
+
+    override fun acknowledgeTelegramDeliveryAttempt(attemptId: String): Boolean {
+        val db = helper.writableDatabase
+        db.beginTransactionNonExclusive()
+        try {
+            val attempt = readActiveTelegramDeliveryAttempt(db) ?: return false
+            check(attempt.attemptId == attemptId) { "Telegram delivery ACK does not match the active attempt" }
+            check(attempt.localSettled) { "Telegram delivery cannot be ACKed before local settlement" }
+            check(db.delete(
+                "telegram_delivery_attempt",
+                "id = 1 AND attempt_id = ? AND local_settled = 1",
+                arrayOf(attemptId)
+            ) == 1) { "Telegram delivery attempt disappeared before APP ACK" }
+            db.setTransactionSuccessful()
+            return true
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    override fun discardPreparedTelegramDeliveryAttempt(attemptId: String): Boolean {
+        val db = helper.writableDatabase
+        db.beginTransactionNonExclusive()
+        try {
+            val attempt = readActiveTelegramDeliveryAttempt(db) ?: return false
+            check(attempt.attemptId == attemptId) { "Telegram delivery discard does not match the active attempt" }
+            check(!attempt.localSettled) { "A locally settled Telegram attempt cannot be discarded" }
+            check(attempt.sequence > 0L) { "Telegram delivery sequence is invalid" }
+            check(db.update(
+                "telegram_delivery_owner",
+                ContentValues().apply { put("last_sequence", attempt.sequence - 1L) },
+                "id = 1 AND owner_id = ? AND last_sequence = ?",
+                arrayOf(attempt.ownerId, attempt.sequence.toString())
+            ) == 1) { "Telegram delivery sequence changed before safe discard" }
+            check(db.delete("telegram_delivery_attempt", "id = 1 AND attempt_id = ?", arrayOf(attemptId)) == 1) {
+                "Telegram delivery attempt disappeared during safe discard"
+            }
+            db.setTransactionSuccessful()
+            return true
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    private fun ensureTelegramDeliveryOwner(db: SQLiteDatabase): String {
+        db.rawQuery("SELECT owner_id FROM telegram_delivery_owner WHERE id = 1", emptyArray()).use { cursor ->
+            if (cursor.moveToFirst()) return cursor.getString(0)
+        }
+        val ownerId = UUID.randomUUID().toString()
+        db.insertOrThrow("telegram_delivery_owner", null, ContentValues().apply {
+            put("id", 1)
+            put("owner_id", ownerId)
+            put("last_sequence", 0L)
+        })
+        return ownerId
+    }
+
+    private fun readActiveTelegramDeliveryAttempt(db: SQLiteDatabase): TelegramPersistedDeliveryAttempt? =
+        db.rawQuery(
+            "SELECT owner_id, attempt_id, sequence, outbox_id, dedupe_key, event_type, " +
+                "request_digest, destination_digest, dedupe_ref, bot_scope, started_at_ms, local_settled " +
+                "FROM telegram_delivery_attempt WHERE id = 1",
+            emptyArray()
+        ).use { cursor ->
+            if (!cursor.moveToFirst()) return@use null
+            TelegramPersistedDeliveryAttempt(
+                ownerId = cursor.getString(0),
+                attemptId = cursor.getString(1),
+                sequence = cursor.getLong(2),
+                outboxId = cursor.getLong(3),
+                dedupeKey = cursor.getString(4),
+                eventType = cursor.getString(5),
+                requestDigest = cursor.getString(6),
+                destinationDigest = cursor.getString(7),
+                dedupeRef = cursor.getString(8),
+                botScope = cursor.getString(9),
+                startedAtMs = cursor.getLong(10),
+                localSettled = cursor.getInt(11) != 0
+            )
+        }
+
+    private fun requireDigest(value: String, label: String) {
+        require(value.matches(Regex("[0-9a-f]{64}"))) { "Telegram $label must be lowercase SHA-256 hex" }
+    }
 
     fun telegramDeliveryReceipt(dedupeKey: String): TelegramDeliveryReceipt? =
         telegramDeliveryReceipt(helper.readableDatabase, dedupeKey)
@@ -289,6 +489,130 @@ class TelegramStore(
         } finally {
             db.endTransaction()
         }
+    }
+
+    override fun settleTelegramDeliverySuccess(
+        attemptId: String,
+        receipt: TelegramDeliveryReceipt,
+        stateJson: String?
+    ): Boolean {
+        require(receipt.dedupeKey.isNotBlank()) { "Telegram dedupe key must not be blank" }
+        require(receipt.eventType.isNotBlank()) { "Telegram event type must not be blank" }
+        require(receipt.confirmedAtMs >= 0L) { "Telegram delivery time must not be negative" }
+        require(receipt.telegramMessageId == null || receipt.telegramMessageId > 0L) {
+            "Telegram message ID must be positive"
+        }
+        stateJson?.let { require(it.isNotBlank()) { "Telegram runtime state must not be blank" } }
+        val db = helper.writableDatabase
+        db.beginTransactionNonExclusive()
+        try {
+            val attempt = requireActiveAttempt(db, attemptId)
+            check(attempt.dedupeKey == receipt.dedupeKey && attempt.eventType == receipt.eventType) {
+                "Telegram success receipt does not match the active attempt"
+            }
+            if (attempt.localSettled) {
+                db.setTransactionSuccessful()
+                return false
+            }
+            val statement = db.compileStatement(TelegramDatabaseSql.INSERT_DELIVERY_RECEIPT)
+            val inserted = try {
+                statement.bindString(1, receipt.dedupeKey)
+                statement.bindString(2, receipt.eventType)
+                statement.bindLong(3, receipt.confirmedAtMs)
+                if (receipt.telegramMessageId == null) statement.bindNull(4)
+                else statement.bindLong(4, receipt.telegramMessageId)
+                statement.executeInsert() != -1L
+            } finally {
+                statement.close()
+            }
+            if (!inserted) {
+                val existing = checkNotNull(telegramDeliveryReceipt(db, receipt.dedupeKey)) {
+                    "Telegram receipt insert was ignored without an existing receipt"
+                }
+                check(existing.eventType == receipt.eventType &&
+                    (existing.telegramMessageId == null || receipt.telegramMessageId == null ||
+                        existing.telegramMessageId == receipt.telegramMessageId)) {
+                    "Telegram delivery receipt conflicts with the persisted receipt"
+                }
+            }
+            check(db.delete("telegram_outbox", "id = ? AND dedupe_key = ?", arrayOf(
+                attempt.outboxId.toString(), receipt.dedupeKey
+            )) == 1) { "Telegram outbox row disappeared before local success settlement" }
+            db.execSQL(TelegramDatabaseSql.RELEASE_SUMMARY_DEPENDENTS, arrayOf(receipt.dedupeKey))
+            stateJson?.let { saveTelegramRuntimeState(db, it, receipt.confirmedAtMs) }
+            check(db.update(
+                "telegram_delivery_attempt",
+                ContentValues().apply { put("local_settled", 1) },
+                "id = 1 AND attempt_id = ? AND local_settled = 0",
+                arrayOf(attemptId)
+            ) == 1) { "Telegram delivery attempt changed before local success settlement" }
+            db.setTransactionSuccessful()
+            return inserted
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    override fun settleTelegramDeliveryFailure(
+        attemptId: String,
+        error: String,
+        attemptedAtMs: Long,
+        nextAttemptAtMs: Long?
+    ): Boolean {
+        require(error.isNotBlank()) { "Telegram failure detail must not be blank" }
+        require(attemptedAtMs >= 0L && (nextAttemptAtMs == null || nextAttemptAtMs >= 0L)) {
+            "Telegram failure time must not be negative"
+        }
+        val db = helper.writableDatabase
+        db.beginTransactionNonExclusive()
+        try {
+            val attempt = requireActiveAttempt(db, attemptId)
+            if (attempt.localSettled) {
+                db.setTransactionSuccessful()
+                return false
+            }
+            val current = queryTelegramMessage(
+                db,
+                "SELECT id, dedupe_key, event_type, payload, attempt_count, next_attempt_at_ms, blocked, " +
+                    "waits_for_summary_key, created_at_ms, failure_count, last_error, occurred_at_ms " +
+                    "FROM telegram_outbox WHERE id = ? AND dedupe_key = ? LIMIT 1",
+                arrayOf(attempt.outboxId.toString(), attempt.dedupeKey)
+            ) ?: error("Telegram outbox row disappeared before local failure settlement")
+            check(current.failureCount < Int.MAX_VALUE) { "Telegram failure count exhausted" }
+            check(db.update(
+                "telegram_outbox",
+                ContentValues().apply {
+                    put("failure_count", current.failureCount + 1)
+                    put("last_attempt_at_ms", attemptedAtMs)
+                    put("last_error", error.truncateForStorage(MAX_ERROR_TEXT_LENGTH))
+                    if (nextAttemptAtMs == null) put("blocked", 1)
+                    else {
+                        put("next_attempt_at_ms", nextAttemptAtMs)
+                        put("blocked", 0)
+                    }
+                },
+                "id = ? AND dedupe_key = ?",
+                arrayOf(attempt.outboxId.toString(), attempt.dedupeKey)
+            ) == 1) { "Telegram outbox row changed before local failure settlement" }
+            check(db.update(
+                "telegram_delivery_attempt",
+                ContentValues().apply { put("local_settled", 1) },
+                "id = 1 AND attempt_id = ? AND local_settled = 0",
+                arrayOf(attemptId)
+            ) == 1) { "Telegram delivery attempt changed before local failure settlement" }
+            db.setTransactionSuccessful()
+            return true
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    private fun requireActiveAttempt(db: SQLiteDatabase, attemptId: String): TelegramPersistedDeliveryAttempt {
+        val attempt = checkNotNull(readActiveTelegramDeliveryAttempt(db)) {
+            "Telegram delivery attempt disappeared before local settlement"
+        }
+        check(attempt.attemptId == attemptId) { "Telegram result does not match the active attempt" }
+        return attempt
     }
 
     private fun pruneDeliveryReceipts(db: SQLiteDatabase, nowMs: Long) {
@@ -908,6 +1232,7 @@ class TelegramStore(
     }
 
     companion object {
-        private const val MAX_ERROR_TEXT_LENGTH = 2_048
+        private const val MAX_ERROR_TEXT_LENGTH =
+            com.bydcollector.collector.telegram.TelegramHelperProtocol.MAX_DIAGNOSTIC_CHARS + 1_024
     }
 }

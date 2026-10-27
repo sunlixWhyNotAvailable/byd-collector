@@ -8,7 +8,7 @@ public final class CollectorHelperProtocol {
     public static final String SPOOL_MODE_ARG = "spool";
     public static final String LOG_PATH = "/data/local/tmp/bydcollector_helper.log";
     public static final String LOCK_PATH = "/data/local/tmp/bydcollector_helper.lock";
-    public static final int PROTOCOL_VERSION = 17;
+    public static final int PROTOCOL_VERSION = 19;
     // PING's status/version/owner and STOP_OWNER layout is verified for these versions.
     public static final int MIN_STOP_PROTOCOL_VERSION = 13;
     public static final int TX_PING = 1;
@@ -33,6 +33,9 @@ public final class CollectorHelperProtocol {
     public static final int TX_KPI_DRAIN = 20;
     public static final int TX_CALLBACK_AWAIT = 21;
     public static final int TX_CALLBACK_CANCEL_WAIT = 22;
+    public static final int TX_TELEGRAM_SUBMIT = 23;
+    public static final int TX_TELEGRAM_QUERY = 24;
+    public static final int TX_TELEGRAM_ACK = 25;
     public static final String CALLBACK_LISTENER_DESCRIPTOR = "com.bydcollector.collector.direct.ICallbackReadyListener";
     public static final int CALLBACK_TX_READY = 1;
     public static final String KPI_LISTENER_DESCRIPTOR = "com.bydcollector.collector.direct.ICollectorKpiListener";
@@ -45,6 +48,13 @@ public final class CollectorHelperProtocol {
     public static final int KPI_LISTENER_UNAVAILABLE = 5;
     public static final int MAX_KPI_VALUES = 24;
     public static final int MAX_KPI_RAW_BYTES = 4_096;
+    public static final int MAX_KPI_QUALITY_CHARS = 64;
+    public static final int MAX_KPI_IDENTITY_CHARS = 256;
+    public static final int MAX_KPI_REASON_CHARS = 128;
+    public static final int MAX_KPI_DIAGNOSTIC_CHARS = 512;
+    public static final int KPI_SOURCE_CALLBACK = 1;
+    public static final int KPI_SOURCE_GET = 2;
+    public static final int KPI_SOURCE_LOST = 3;
     public static final int STREAM_MAIN = 1;
     public static final int STREAM_SECONDARY = 2;
     public static final int CONTROL_CLAIM = 1;
@@ -77,6 +87,7 @@ public final class CollectorHelperProtocol {
     public static final int MODE_NATIVE = 1;
     public static final int MODE_NATIVE_WITH_FALLBACK = 2;
     public static final int MODE_SCALAR_FALLBACK = 3;
+    public static final int MODE_NO_WORK = 4;
 
     private CollectorHelperProtocol() {
     }

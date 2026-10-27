@@ -9,10 +9,14 @@ public final class SecondarySpoolBinder implements AutoCloseable {
     private final String openError;
 
     SecondarySpoolBinder() {
+        this(SecondaryTelemetrySpool.EXPECTED_FIELD_COUNT);
+    }
+
+    SecondarySpoolBinder(int expectedFieldCount) {
         SecondaryTelemetrySpool opened = null;
         String failure = null;
         try {
-            opened = SecondaryTelemetrySpool.open();
+            opened = SecondaryTelemetrySpool.open(expectedFieldCount);
         } catch (Exception error) {
             failure = errorText(error);
         }

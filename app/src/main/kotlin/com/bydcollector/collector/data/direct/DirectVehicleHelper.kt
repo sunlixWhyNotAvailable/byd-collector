@@ -46,6 +46,8 @@ interface DirectVehicleHelper {
 
     /** Dedicated secondary stream; scalar/test helpers retain compatible readBatch behavior. */
     fun readSecondaryBatch(entries: List<DirectFidEntry>): DirectHelperBatchResult = readBatch(entries)
+    fun readSecondaryBatch(entries: List<DirectFidEntry>, catalogVersion: String): DirectHelperBatchResult =
+        readSecondaryBatch(entries)
 }
 
 enum class DirectHelperOwnerMode(val protocolValue: Int) {
@@ -62,15 +64,31 @@ data class DirectHelperReadResult(
     val raw: Int?,
     val error: String? = null,
     val callbackSource: CallbackValueSource? = null,
-    val callbackCached: Boolean = callbackSource != null
+    val callbackCached: Boolean = callbackSource != null,
+    val getLineage: DirectGetLineage? = null
 ) {
     val ok: Boolean = status == 0 && raw != null
 }
 
 data class DirectHelperBatchResult(
     val results: List<DirectHelperReadResult>,
-    val diagnostics: DirectBatchDiagnostics
-)
+    val diagnostics: DirectBatchDiagnostics,
+    val requestedIndices: List<Int> = results.indices.toList(),
+    val noWork: Boolean = false,
+    val nextDueDelayMs: Long = 0L
+) {
+    init {
+        require(results.size == requestedIndices.size) { "result/index count mismatch" }
+        require(requestedIndices.all { it >= 0 } && requestedIndices.distinct().size == requestedIndices.size) {
+            "invalid requested result indices"
+        }
+        require(nextDueDelayMs >= 0L) { "next due delay must be non-negative" }
+        require(!noWork || (diagnostics.status == CollectorHelperProtocol.STATUS_OK &&
+            results.isEmpty() && requestedIndices.isEmpty() && nextDueDelayMs > 0L)) {
+            "invalid no-work result"
+        }
+    }
+}
 
 data class DirectBatchDiagnostics(
     val mode: String,
@@ -82,7 +100,8 @@ data class DirectBatchDiagnostics(
     val helperElapsedMs: Long,
     val returnedCount: Int,
     val error: String? = null,
-    val status: Int = CollectorHelperProtocol.STATUS_OK
+    val status: Int = CollectorHelperProtocol.STATUS_OK,
+    val errorDetailsTruncated: Boolean = false
 ) {
     val stateKey: String = listOf(
         mode,
@@ -99,6 +118,7 @@ data class DirectBatchDiagnostics(
         append(" group_failures=").append(groupFailureCount)
         append(" helper_elapsed_ms=").append(helperElapsedMs)
         append(" returned=").append(returnedCount)
+        if (errorDetailsTruncated) append(" error_details_truncated=true")
         if (error != null) append(" error=").append(error)
     }
 }
@@ -122,7 +142,8 @@ data class TelemetryWorkerSample(
     val nativeAvailable: Boolean,
     val groupFailureCount: Int,
     val error: String?,
-    val values: List<TelemetryWorkerFieldValue>
+    val values: List<TelemetryWorkerFieldValue>,
+    val recordVersion: Int = 2
 )
 
 data class TelemetryWorkerFieldValue(
@@ -133,7 +154,8 @@ data class TelemetryWorkerFieldValue(
     val status: Int,
     val raw: Int?,
     val error: String?,
-    val callbackSource: CallbackValueSource? = null
+    val callbackSource: CallbackValueSource? = null,
+    val getLineage: DirectGetLineage? = null
 )
 
 data class TelemetryWorkerAckResult(
@@ -156,7 +178,12 @@ data class DirectKpiInvalidation(
     val subscriptionId: Long,
     val helperBootId: String,
     val helperGeneration: String,
-    val sequence: Long
+    val sequence: Long?,
+    val sourceLost: Boolean = false,
+    val reason: String? = null,
+    val diagnostic: String? = null,
+    val observedWallMs: Long? = null,
+    val observedElapsedMs: Long? = null
 )
 
 data class DirectKpiSubscriptionResult(
@@ -181,7 +208,16 @@ data class DirectKpiRawValue(
     val bytes: ByteArray?,
     val observedWallMs: Long,
     val observedElapsedMs: Long,
-    val sequence: Long
+    val sequence: Long,
+    val sourceKind: Int = 0,
+    val sourceEpoch: Long = 0L,
+    val sourceRecordSequence: Long = 0L,
+    val quality: String? = null,
+    val sourceIdentity: String? = null,
+    val sourceStartWallMs: Long? = null,
+    val sourceStartElapsedMs: Long? = null,
+    val lossReason: String? = null,
+    val diagnostic: String? = null
 )
 
 data class DirectKpiMailboxSnapshot(

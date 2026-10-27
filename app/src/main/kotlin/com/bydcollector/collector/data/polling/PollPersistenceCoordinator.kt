@@ -20,7 +20,9 @@ data class PollCycleResult(
     val errorMessage: String? = null,
     val pollRowsPersisted: Long = 0L,
     val valueRowsPersisted: Long = 0L,
-    val deferred: Boolean = false
+    val deferred: Boolean = false,
+    /** Remaining delay measured at helper batch-reply time; null keeps the existing poll interval. */
+    val nextDueDelayMs: Long? = null
 )
 
 interface PollCycleRunner {
@@ -77,7 +79,6 @@ class PollPersistenceCoordinator(
 
     override fun pollOnce(sessionId: Long): PollCycleResult {
         checkActive()
-        val parameters = store.getActiveCatalogParameters()
         val result = client.read()
         checkActive()
         if (result !is TelemetryReadResult.ReplayPending) replayPendingLogged = false
@@ -92,9 +93,20 @@ class PollPersistenceCoordinator(
                     PollCycleResult(null, ok = true, category = null, elapsedMs = result.elapsedMs,
                         requestCount = 0, deferred = true)
                 }
+                is TelemetryReadResult.NoReadDue -> PollCycleResult(
+                    pollId = null,
+                    ok = true,
+                    category = null,
+                    elapsedMs = result.elapsedMs,
+                    requestCount = 0,
+                    deferred = true,
+                    nextDueDelayMs = result.nextDueDelayMs
+                )
                 is TelemetryReadResult.Success -> {
                     val timestamp = clock.nowIso()
                     val source = liveSource.capture(clock.elapsedRealtimeMs())
+                    val attemptedReadings = materializeAttemptedReadings(result.attemptedKeys, result.attemptedReadings)
+                    val parameters = parametersForKeys(attemptedReadings.map { it.rawKey })
                     //stores raw readings before observers derive state for mqtt/influx consumers
                     val pollId = store.insertPoll(
                         sessionId,
@@ -109,7 +121,9 @@ class PollPersistenceCoordinator(
                             errorCategory = result.warningCategory,
                             errorMessage = result.warningMessage,
                             rawResponseBody = null,
-                            readings = result.readings
+                            readings = attemptedReadings,
+                            source = source,
+                            origin = PollOrigin.LIVE
                         ),
                         parameters = parameters
                     )
@@ -119,7 +133,7 @@ class PollPersistenceCoordinator(
                             sessionId,
                             pollId,
                             timestamp,
-                            result.readings,
+                            attemptedReadings,
                             PollOrigin.LIVE,
                             source
                         )
@@ -134,7 +148,8 @@ class PollPersistenceCoordinator(
                         requestCount = DIRECT_REQUEST_COUNT,
                         timestamp = timestamp,
                         pollRowsPersisted = 1L,
-                        valueRowsPersisted = 1L
+                        valueRowsPersisted = 1L,
+                        nextDueDelayMs = result.nextDueDelayMs
                     )
                 }
 
@@ -142,8 +157,10 @@ class PollPersistenceCoordinator(
                     val failureKey = "${result.category}:${result.message}"
                     val nowMs = clock.elapsedRealtimeMs()
                     val timestamp = clock.nowIso()
+                    val attemptedKeys = result.attemptedKeys.ifEmpty { result.attemptedReadings.map { it.rawKey } }
+                    val attemptedReadings = materializeAttemptedReadings(attemptedKeys, result.attemptedReadings)
                     //throttles identical failures so helper outages do not flood sqlite every second
-                    if (shouldSkipRepeatedFailure(failureKey, nowMs)) {
+                    if (attemptedReadings.isEmpty() && shouldSkipRepeatedFailure(failureKey, nowMs)) {
                         return PollCycleResult(
                             pollId = null,
                             ok = false,
@@ -151,10 +168,12 @@ class PollPersistenceCoordinator(
                             elapsedMs = result.elapsedMs,
                             requestCount = DIRECT_REQUEST_COUNT,
                             timestamp = timestamp,
-                            errorMessage = result.message
+                            errorMessage = result.message,
+                            nextDueDelayMs = result.nextDueDelayMs
                         )
                     }
                     val source = liveSource.capture(nowMs)
+                    val parameters = parametersForKeys(attemptedReadings.map { it.rawKey })
                     val pollId = store.insertPoll(
                         sessionId,
                         PersistedPollInput(
@@ -166,17 +185,25 @@ class PollPersistenceCoordinator(
                             errorCategory = result.category,
                             errorMessage = result.message,
                             rawResponseBody = result.rawBody,
-                            readings = emptyList()
+                            readings = attemptedReadings,
+                            source = source,
+                            origin = PollOrigin.LIVE
                         ),
                         parameters = parameters
                     )
                     lastPersistedFailureKey = failureKey
                     lastPersistedFailureAtMs = nowMs
                     notifyObserver {
-                        successfulPollObserver?.onSourceFailure(
-                            sessionId = sessionId, pollId = pollId, timestamp = timestamp,
-                            origin = PollOrigin.LIVE, source = source
-                        )
+                        if (attemptedReadings.isNotEmpty()) {
+                            successfulPollObserver?.onSourcePoll(
+                                sessionId, pollId, timestamp, attemptedReadings, PollOrigin.LIVE, source
+                            )
+                        } else {
+                            successfulPollObserver?.onSourceFailure(
+                                sessionId = sessionId, pollId = pollId, timestamp = timestamp,
+                                origin = PollOrigin.LIVE, source = source
+                            )
+                        }
                     }
                     recordEventSafely("poll_failure", "Poll failed: ${result.category}", result.message)
                     PollCycleResult(
@@ -187,7 +214,8 @@ class PollPersistenceCoordinator(
                         requestCount = DIRECT_REQUEST_COUNT,
                         timestamp = timestamp,
                         errorMessage = result.message,
-                        pollRowsPersisted = 1L
+                        pollRowsPersisted = 1L,
+                        nextDueDelayMs = result.nextDueDelayMs
                     )
                 }
             }
@@ -227,6 +255,23 @@ class PollPersistenceCoordinator(
     private fun shouldSkipRepeatedFailure(failureKey: String, nowMs: Long): Boolean {
         if (lastPersistedFailureKey != failureKey) return false
         return nowMs - lastPersistedFailureAtMs < REPEATED_FAILURE_PERSIST_INTERVAL_MS
+    }
+
+    private fun parametersForKeys(keys: List<String>): List<CatalogParameter> {
+        if (keys.isEmpty()) return emptyList()
+        val parameters = store.getActiveCatalogParameters().associateBy { it.key }
+        return keys.map { key -> requireNotNull(parameters[key]) { "GET result key is absent from active catalog: $key" } }
+    }
+
+    private fun materializeAttemptedReadings(
+        attemptedKeys: List<String>,
+        readings: List<PollReading>
+    ): List<PollReading> {
+        if (attemptedKeys.isEmpty()) return readings
+        val byKey = readings.associateBy { it.rawKey }
+        require(byKey.size == readings.size) { "GET result contains duplicate reading keys" }
+        require(byKey.keys.all { it in attemptedKeys }) { "GET readings include a key that was not attempted" }
+        return attemptedKeys.map { key -> byKey[key] ?: PollReading(key, null, null) }
     }
 
     private fun notifyObserver(action: () -> Unit) {

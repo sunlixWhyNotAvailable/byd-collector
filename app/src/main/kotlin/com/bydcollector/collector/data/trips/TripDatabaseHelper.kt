@@ -104,6 +104,7 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
         createEnergyQuarantine(db)
         createHistoricalEnergyBackfill(db)
         createTripCompletions(db)
+        createBusinessInputCursor(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -125,6 +126,7 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
             db.execSQL("ALTER TABLE historical_energy_backfill ADD COLUMN algorithm_version INTEGER NOT NULL DEFAULT 1")
         }
         if (oldVersion < 6) createTripCompletions(db)
+        if (oldVersion < 7) createBusinessInputCursor(db)
         onCreate(db)
     }
 
@@ -223,8 +225,24 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_trip_completion_outbox_fifo ON trip_completion_outbox(sequence)")
     }
 
+    private fun createBusinessInputCursor(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS trip_business_input_cursor (
+                singleton_id INTEGER PRIMARY KEY NOT NULL CHECK (singleton_id = 1),
+                journal_generation TEXT NOT NULL CHECK (length(journal_generation) BETWEEN 1 AND 512),
+                input_id INTEGER NOT NULL CHECK (input_id > 0),
+                source_identity TEXT NOT NULL CHECK (length(source_identity) BETWEEN 1 AND 512),
+                prior_completion_watermark INTEGER NOT NULL CHECK (prior_completion_watermark >= 0),
+                completion_watermark INTEGER NOT NULL CHECK (completion_watermark >= prior_completion_watermark),
+                power_session_id TEXT CHECK (power_session_id IS NULL OR length(power_session_id) BETWEEN 1 AND 520)
+            )
+            """.trimIndent()
+        )
+    }
+
     companion object {
         const val DATABASE_NAME = "bydcollector_trips.db"
-        const val DATABASE_VERSION = 6
+        const val DATABASE_VERSION = 7
     }
 }

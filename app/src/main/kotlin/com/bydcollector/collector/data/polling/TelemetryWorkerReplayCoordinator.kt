@@ -12,6 +12,8 @@ import com.bydcollector.collector.data.direct.TelemetryWorkerSample
 import com.bydcollector.collector.data.local.CatalogParameter
 import com.bydcollector.collector.data.local.PersistedPollInput
 import com.bydcollector.collector.data.local.WorkerPollImportResult
+import com.bydcollector.collector.data.polling.PollOrigin
+import com.bydcollector.collector.data.polling.PollSampleSource
 import com.bydcollector.collector.direct.CollectorHelperProtocol
 import com.bydcollector.collector.direct.TelemetryWorkerSampleIdentity
 import com.bydcollector.collector.util.diagnosticDetail
@@ -36,6 +38,69 @@ data class WorkerReplayBatchResult(
     val needsReplay: Boolean,
     val cycleResult: PollCycleResult?
 )
+
+private class WorkerSampleFormatException(message: String) : IllegalArgumentException(message)
+
+internal object TelemetryWorkerSampleMapper {
+    fun snapshot(sample: TelemetryWorkerSample, entries: List<DirectFidEntry>): DirectAutoserviceSnapshot {
+        val sparse = sample.recordVersion == SPARSE_RECORD_VERSION
+        if (sample.recordVersion !in LEGACY_RECORD_VERSIONS && !sparse) {
+            throw WorkerSampleFormatException("unsupported worker record version: ${sample.recordVersion}")
+        }
+        if (!sparse && sample.values.size != entries.size) throw WorkerSampleFormatException(
+            "worker field count mismatch: expected=${entries.size} actual=${sample.values.size}")
+        if (sparse && sample.values.isEmpty()) throw WorkerSampleFormatException("sparse worker sample has no attempted fields")
+        val indices = sample.values.map { it.fieldIndex }
+        if (indices.distinct().size != indices.size || indices.any { it !in entries.indices } ||
+            indices.zipWithNext().any { (previous, next) -> previous >= next }
+        ) throw WorkerSampleFormatException("worker field indices are invalid or out of source order")
+        val fields = sample.values.map { value ->
+            val index = value.fieldIndex
+            val entry = entries[index]
+            if (!(value.tx == entry.tx && value.dev == entry.dev && value.fid == entry.fid)) {
+                throw WorkerSampleFormatException("worker field mismatch at index=$index")
+            }
+            value.callbackSource?.let { source ->
+                if (value.status != CollectorHelperProtocol.STATUS_OK || value.raw == null ||
+                    !source.matches(entry.tx, entry.dev, entry.fid, value.raw)
+                ) throw WorkerSampleFormatException("worker callback source mismatch at index=$index")
+            }
+            DirectAutoserviceField(
+                entry = entry,
+                status = value.status,
+                raw = value.raw,
+                decoded = value.raw?.let { DirectValueDecoders.decode(entry, it) },
+                error = value.error,
+                callbackSource = value.callbackSource,
+                getLineage = value.getLineage
+            )
+        }
+        return DirectAutoserviceSnapshot(
+            fields = fields,
+            batchDiagnostics = DirectBatchDiagnostics(
+                mode = modeName(sample.batchMode),
+                nativeAvailable = sample.nativeAvailable,
+                nativeGroupCount = 0,
+                fallbackGroupCount = 0,
+                fallbackReadCount = 0,
+                groupFailureCount = sample.groupFailureCount,
+                helperElapsedMs = sample.pollElapsedMs,
+                returnedCount = sample.values.size,
+                error = sample.error
+            )
+        )
+    }
+
+    private fun modeName(mode: Int): String = when (mode) {
+        CollectorHelperProtocol.MODE_NATIVE -> "native"
+        CollectorHelperProtocol.MODE_NATIVE_WITH_FALLBACK -> "native_with_fallback"
+        CollectorHelperProtocol.MODE_SCALAR_FALLBACK -> "scalar_fallback"
+        else -> "rejected"
+    }
+
+    private const val SPARSE_RECORD_VERSION = 3
+    private val LEGACY_RECORD_VERSIONS = 1..2
+}
 
 //replays durable helper samples before live polling so older observations cannot replace newer state
 class TelemetryWorkerReplayCoordinator(
@@ -109,16 +174,30 @@ class TelemetryWorkerReplayCoordinator(
             for (sample in pending.samples) {
                 checkActive()
                 lastIdentity = sample.identity
+                val source = PollSampleSource(
+                    "helper:${sample.identity}",
+                    sample.identity.bootId,
+                    sample.capturedElapsedMs,
+                    sample.identity.helperGeneration,
+                    sample.identity.pollSequence
+                )
                 val entries = replayEntriesForCatalog(sample.catalogVersion)
                 val input = try {
                     if (entries == null) throw WorkerSampleFormatException("unsupported worker catalog: ${sample.catalogVersion}")
-                    persistedInput(sample, entries)
+                    persistedInput(sample, entries, source)
                 } catch (error: WorkerSampleFormatException) {
-                    quarantinedInput(sample, error.message.orEmpty())
+                    quarantinedInput(sample, error.message.orEmpty(), source)
                 }
                 // Count the fields this helper actually requested, not newly added APP fields.
-                val parameters = if (input.errorCategory == "worker_sample_quarantined") emptyList() else entries.orEmpty().map { entry ->
-                    requireNotNull(parametersByKey[entry.key]) { "missing replay parameter: ${entry.key}" }
+                val parameters = if (input.errorCategory == "worker_sample_quarantined") {
+                    emptyList()
+                } else {
+                    val recordEntries = requireNotNull(entries)
+                    sample.values.map { value ->
+                        val entry = recordEntries.getOrNull(value.fieldIndex)
+                            ?: throw WorkerSampleFormatException("worker field index out of range: ${value.fieldIndex}")
+                        requireNotNull(parametersByKey[entry.key]) { "missing replay parameter: ${entry.key}" }
+                    }
                 }
                 importAttempts += 1L
                 val imported = store.insertWorkerPoll(sessionId, sample.identity, input, parameters)
@@ -128,14 +207,7 @@ class TelemetryWorkerReplayCoordinator(
                 lastTimestamp = input.timestamp
                 lastElapsedMs = sample.pollElapsedMs
 
-                val source = PollSampleSource(
-                    "helper:${sample.identity}",
-                    sample.identity.bootId,
-                    sample.capturedElapsedMs,
-                    sample.identity.helperGeneration,
-                    sample.identity.pollSequence
-                )
-                if (input.ok) {
+                if (input.readings.isNotEmpty()) {
                     successfulPollObserver?.onSourcePoll(
                         sessionId,
                         imported.pollId,
@@ -258,45 +330,12 @@ class TelemetryWorkerReplayCoordinator(
         }
     }
 
-    private fun persistedInput(sample: TelemetryWorkerSample, entries: List<DirectFidEntry>): PersistedPollInput {
-        if (sample.values.size != entries.size) throw WorkerSampleFormatException(
-            "worker field count mismatch: expected=${entries.size} actual=${sample.values.size}")
-        val fields = entries.mapIndexed { index, entry ->
-            val value = sample.values[index]
-            if (!(
-                value.fieldIndex == index &&
-                    value.tx == entry.tx &&
-                    value.dev == entry.dev &&
-                    value.fid == entry.fid
-            )) throw WorkerSampleFormatException("worker field mismatch at index=$index")
-            value.callbackSource?.let { source ->
-                if (value.status != CollectorHelperProtocol.STATUS_OK || value.raw == null ||
-                    !source.matches(entry.tx, entry.dev, entry.fid, value.raw)
-                ) throw WorkerSampleFormatException("worker callback source mismatch at index=$index")
-            }
-            DirectAutoserviceField(
-                entry = entry,
-                status = value.status,
-                raw = value.raw,
-                decoded = value.raw?.let { DirectValueDecoders.decode(entry, it) },
-                error = value.error,
-                callbackSource = value.callbackSource
-            )
-        }
-        val snapshot = DirectAutoserviceSnapshot(
-            fields = fields,
-            batchDiagnostics = DirectBatchDiagnostics(
-                mode = modeName(sample.batchMode),
-                nativeAvailable = sample.nativeAvailable,
-                nativeGroupCount = 0,
-                fallbackGroupCount = 0,
-                fallbackReadCount = 0,
-                groupFailureCount = sample.groupFailureCount,
-                helperElapsedMs = sample.pollElapsedMs,
-                returnedCount = sample.values.size,
-                error = sample.error
-            )
-        )
+    private fun persistedInput(
+        sample: TelemetryWorkerSample,
+        entries: List<DirectFidEntry>,
+        source: PollSampleSource
+    ): PersistedPollInput {
+        val snapshot = TelemetryWorkerSampleMapper.snapshot(sample, entries)
         val warning = listOfNotNull(
             snapshot.errorSummary().takeIf { it.isNotBlank() },
             sample.error?.takeIf { it.isNotBlank() },
@@ -319,17 +358,24 @@ class TelemetryWorkerReplayCoordinator(
             errorCategory = category,
             errorMessage = message,
             rawResponseBody = null,
-            readings = snapshot.readings
+            readings = snapshot.attemptedReadings,
+            source = source,
+            origin = PollOrigin.REPLAY
         )
     }
 
     // Only explicit shape/catalogue rejection is terminal. Preserve the entire raw
     // payload in Main before notifying a source gap and acknowledging the shell file.
-    private fun quarantinedInput(sample: TelemetryWorkerSample, reason: String): PersistedPollInput {
+    private fun quarantinedInput(
+        sample: TelemetryWorkerSample,
+        reason: String,
+        source: PollSampleSource
+    ): PersistedPollInput {
         val payload = JSONObject().apply {
             put("identity", JSONObject().put("boot_id", sample.identity.bootId)
                 .put("helper_generation", sample.identity.helperGeneration).put("poll_sequence", sample.identity.pollSequence))
             put("catalog_version", sample.catalogVersion)
+            put("record_version", sample.recordVersion)
             put("captured_wall_ms", sample.capturedWallMs); put("captured_elapsed_ms", sample.capturedElapsedMs)
             put("poll_elapsed_ms", sample.pollElapsedMs); put("batch_status", sample.batchStatus)
             put("batch_mode", sample.batchMode); put("native_available", sample.nativeAvailable)
@@ -361,10 +407,9 @@ class TelemetryWorkerReplayCoordinator(
         return PersistedPollInput(timestamp = Instant.ofEpochMilli(sample.capturedWallMs).toString(),
             ok = false, elapsedMs = sample.pollElapsedMs, requestCount = 1,
             errors = "worker_sample_quarantined: $reason", errorCategory = "worker_sample_quarantined",
-            errorMessage = reason, rawResponseBody = payload.toString(), readings = emptyList())
+            errorMessage = reason, rawResponseBody = payload.toString(), readings = emptyList(),
+            source = source, origin = PollOrigin.REPLAY)
     }
-
-    private class WorkerSampleFormatException(message: String) : IllegalArgumentException(message)
 
     private fun checkActive() {
         if (!isActive() || Thread.currentThread().isInterrupted) throw InterruptedException("Worker replay stopped")
@@ -472,13 +517,6 @@ class TelemetryWorkerReplayCoordinator(
 
     private fun bounded(value: String, limit: Int = ERROR_DETAIL_LIMIT): String =
         if (value.length <= limit) value else value.take(limit) + "..."
-
-    private fun modeName(mode: Int): String = when (mode) {
-        CollectorHelperProtocol.MODE_NATIVE -> "native"
-        CollectorHelperProtocol.MODE_NATIVE_WITH_FALLBACK -> "native_with_fallback"
-        CollectorHelperProtocol.MODE_SCALAR_FALLBACK -> "scalar_fallback"
-        else -> "rejected"
-    }
 
     private companion object {
         const val FAILURE_RECURRENCE_NANOS = 30_000_000_000L

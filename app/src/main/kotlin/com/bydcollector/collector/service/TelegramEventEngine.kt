@@ -3,6 +3,7 @@ package com.bydcollector.collector.service
 import com.bydcollector.collector.data.energy.EnergySnapshot
 import com.bydcollector.collector.data.energy.RemainingRangeResolver
 import com.bydcollector.collector.data.local.PollReading
+import com.bydcollector.collector.data.input.BusinessInputContinuity
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.data.normalized.NormalizedQuality
 import com.bydcollector.collector.data.normalized.NormalizedSourceOrder
@@ -472,7 +473,8 @@ class TelegramEventEngine(
         nowMs: Long,
         normalizer: VehicleStateNormalizer,
         energySnapshot: EnergySnapshot? = null,
-        nowElapsedMs: Long = source.capturedElapsedMs
+        nowElapsedMs: Long = source.capturedElapsedMs,
+        continuityUpdates: Map<String, BusinessInputContinuity> = emptyMap()
     ): TelegramEventResult {
         val original = state
         val pollStamp = normalizedPollSourceStamp(source, timestamp)
@@ -481,7 +483,8 @@ class TelegramEventEngine(
             readings = readings,
             pollStamp = pollStamp,
             pollId = pollId,
-            currentBootId = currentBootId
+            currentBootId = currentBootId,
+            continuityUpdates = continuityUpdates
         )
         val currentSocStamp = ordered.sourceStamp("soc", freshOnly = false)
         val currentEnergyStamp = ordered.sourceStamp("battery_remaining_energy_kwh", freshOnly = false)

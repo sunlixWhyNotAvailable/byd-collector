@@ -108,7 +108,9 @@ data class NormalizedSourceStamp(
     val generatorId: String?,
     val sequence: Long?,
     val wallMs: Long,
-    val elapsedMs: Long
+    val elapsedMs: Long,
+    /** Helper-owned source epoch; APP delivery epochs remain in legacy source fields. */
+    val sourceEpoch: Long? = null
 )
 
 data class NormalizedSourceInput(

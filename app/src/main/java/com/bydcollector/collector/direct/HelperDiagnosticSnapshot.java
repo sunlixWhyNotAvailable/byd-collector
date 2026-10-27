@@ -46,6 +46,9 @@ final class HelperDiagnosticSnapshot {
     final long callbackSecondaryQueueHighWaterBytes;
     final long callbackQueueLossCount;
     final String callbackRetryReason;
+    final long callbackInitialSeedGetAttempts;
+    final long callbackSourceRecoveryGetAttempts;
+    final long callbackSecondaryExceptionGetAttempts;
     final BoundedProcessWindow.Snapshot performanceWindow;
     final CallbackSpoolBinder.Footprint callbackFootprint;
     final String callbackFootprintError;
@@ -92,6 +95,9 @@ final class HelperDiagnosticSnapshot {
         long callbackSecondaryQueueHighWaterBytes,
         long callbackQueueLossCount,
         String callbackRetryReason,
+        long callbackInitialSeedGetAttempts,
+        long callbackSourceRecoveryGetAttempts,
+        long callbackSecondaryExceptionGetAttempts,
         BoundedProcessWindow.Snapshot performanceWindow,
         CallbackSpoolBinder.Footprint callbackFootprint,
         String callbackFootprintError,
@@ -137,6 +143,9 @@ final class HelperDiagnosticSnapshot {
         this.callbackSecondaryQueueHighWaterBytes = callbackSecondaryQueueHighWaterBytes;
         this.callbackQueueLossCount = callbackQueueLossCount;
         this.callbackRetryReason = callbackRetryReason;
+        this.callbackInitialSeedGetAttempts = callbackInitialSeedGetAttempts;
+        this.callbackSourceRecoveryGetAttempts = callbackSourceRecoveryGetAttempts;
+        this.callbackSecondaryExceptionGetAttempts = callbackSecondaryExceptionGetAttempts;
         this.performanceWindow = performanceWindow;
         this.callbackFootprint = callbackFootprint;
         this.callbackFootprintError = callbackFootprintError;
@@ -193,6 +202,9 @@ final class HelperDiagnosticSnapshot {
         json.put("callback_secondary_queue_high_water_bytes", callbackSecondaryQueueHighWaterBytes);
         json.put("callback_queue_loss_count", callbackQueueLossCount);
         json.put("callback_retry_reason", callbackRetryReason == null ? JSONObject.NULL : callbackRetryReason);
+        json.put("callback_initial_seed_get_attempts", callbackInitialSeedGetAttempts);
+        json.put("callback_source_recovery_get_attempts", callbackSourceRecoveryGetAttempts);
+        json.put("callback_secondary_poll_exception_get_attempts", callbackSecondaryExceptionGetAttempts);
         json.put("performance_window",
             performanceWindow == null ? JSONObject.NULL : performanceWindow.toJson());
         json.put("performance_window_scope", "vendor_read_batch");

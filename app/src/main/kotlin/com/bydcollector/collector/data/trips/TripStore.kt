@@ -13,6 +13,31 @@ import com.bydcollector.collector.runtime.RuntimeReads
 import com.bydcollector.collector.runtime.RuntimeClient
 import android.os.Bundle
 
+internal data class TripBusinessInputCursor(
+    val journalGeneration: String,
+    val inputId: Long,
+    val sourceIdentity: String,
+    val priorCompletionWatermark: Long,
+    val completionWatermark: Long,
+    val powerSessionId: String?
+)
+
+internal data class TripBusinessInputMutation<T>(val value: T, val powerSessionId: String?)
+
+internal data class TripBusinessInputConsumption<T>(
+    val applied: Boolean,
+    val priorCompletionWatermark: Long,
+    val completionWatermark: Long,
+    val powerSessionId: String?,
+    val value: T? = null
+)
+
+internal data class TripBusinessInputReplay(
+    val priorCompletionWatermark: Long,
+    val completionWatermark: Long,
+    val powerSessionId: String?
+)
+
 class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyRuntimeStorage {
     /** Serializes all TripStore access; Step 8 leases this monitor for cutover. */
     private val changedTripSequences = linkedMapOf<String, Long?>()
@@ -20,6 +45,7 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
     private var fileAccessSuspended = false
     private var historicalBackfillChanged = false
     private var tripCompletionsChanged = false
+    private var businessInputCursorChanged = false
 
     @Synchronized
     internal fun beginChangeTracking() {
@@ -27,6 +53,7 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
         changedTripSequences.clear()
         historicalBackfillChanged = false
         tripCompletionsChanged = false
+        businessInputCursorChanged = false
         changeTracking = true
     }
 
@@ -40,12 +67,16 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
     internal fun tripCompletionsChanged(): Boolean = tripCompletionsChanged
 
     @Synchronized
+    internal fun businessInputCursorChanged(): Boolean = businessInputCursorChanged
+
+    @Synchronized
     internal fun endChangeTracking() {
         check(changeTracking) { "Trips change tracking is not active" }
         changeTracking = false
         changedTripSequences.clear()
         historicalBackfillChanged = false
         tripCompletionsChanged = false
+        businessInputCursorChanged = false
     }
 
     private fun markSessionChanged(tripId: String) {
@@ -65,6 +96,176 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
 
     private fun markTripCompletionsChanged() {
         if (changeTracking) tripCompletionsChanged = true
+    }
+
+    private fun markBusinessInputCursorChanged() {
+        if (changeTracking) businessInputCursorChanged = true
+    }
+
+    @Synchronized
+    internal fun businessInputReplay(
+        journalGeneration: String,
+        inputId: Long,
+        sourceIdentity: String
+    ): TripBusinessInputReplay? {
+        validateBusinessInputKey(journalGeneration, inputId, sourceIdentity)
+        return businessInputReplay(readableDb, journalGeneration, inputId, sourceIdentity)
+    }
+
+    /** Commits the Trips effect and its one-row journal cursor together. */
+    @Synchronized
+    internal fun <T> consumeBusinessInput(
+        journalGeneration: String,
+        inputId: Long,
+        sourceIdentity: String,
+        apply: (priorCompletionWatermark: Long) -> TripBusinessInputMutation<T>
+    ): TripBusinessInputConsumption<T> {
+        validateBusinessInputKey(journalGeneration, inputId, sourceIdentity)
+        val db = writableDb
+        val changeState = changeTrackingSnapshot()
+        var failure: Throwable? = null
+        var outcome: TripBusinessInputConsumption<T>? = null
+        db.beginTransaction()
+        try {
+            val replay = businessInputReplay(db, journalGeneration, inputId, sourceIdentity)
+            if (replay != null) {
+                outcome = TripBusinessInputConsumption(
+                    applied = false,
+                    priorCompletionWatermark = replay.priorCompletionWatermark,
+                    completionWatermark = replay.completionWatermark,
+                    powerSessionId = replay.powerSessionId
+                )
+            } else {
+                val priorWatermark = completionWatermark(db)
+                val mutation = apply(priorWatermark)
+                val highWater = completionWatermark(db)
+                require(highWater >= priorWatermark) { "Trip completion watermark regressed" }
+                val cursor = TripBusinessInputCursor(
+                    journalGeneration,
+                    inputId,
+                    sourceIdentity,
+                    priorWatermark,
+                    highWater,
+                    mutation.powerSessionId
+                )
+                writeBusinessInputCursor(db, cursor)
+                markBusinessInputCursorChanged()
+                outcome = TripBusinessInputConsumption(
+                    applied = true,
+                    priorCompletionWatermark = priorWatermark,
+                    completionWatermark = highWater,
+                    powerSessionId = mutation.powerSessionId,
+                    value = mutation.value
+                )
+            }
+            db.setTransactionSuccessful()
+        } catch (error: Throwable) {
+            failure = error
+            restoreChangeTracking(changeState)
+            throw error
+        } finally {
+            try {
+                db.endTransaction()
+            } catch (endError: Throwable) {
+                restoreChangeTracking(changeState)
+                if (failure != null) failure.addSuppressed(endError) else throw endError
+            }
+        }
+        return checkNotNull(outcome)
+    }
+
+    @Synchronized
+    internal fun businessInputCursor(): TripBusinessInputCursor? = businessInputCursor(readableDb)
+
+    @Synchronized
+    internal fun replaceBusinessInputCursor(cursor: TripBusinessInputCursor?) {
+        val db = writableDb
+        db.beginTransaction()
+        try {
+            db.delete("trip_business_input_cursor", null, null)
+            cursor?.let { writeBusinessInputCursor(db, it) }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    private data class ChangeTrackingSnapshot(
+        val tripSequences: Map<String, Long?>,
+        val historicalBackfillChanged: Boolean,
+        val tripCompletionsChanged: Boolean,
+        val businessInputCursorChanged: Boolean
+    )
+
+    private fun changeTrackingSnapshot() = ChangeTrackingSnapshot(
+        tripSequences = changedTripSequences.toMap(),
+        historicalBackfillChanged = historicalBackfillChanged,
+        tripCompletionsChanged = tripCompletionsChanged,
+        businessInputCursorChanged = businessInputCursorChanged
+    )
+
+    private fun restoreChangeTracking(snapshot: ChangeTrackingSnapshot) {
+        changedTripSequences.clear()
+        changedTripSequences.putAll(snapshot.tripSequences)
+        historicalBackfillChanged = snapshot.historicalBackfillChanged
+        tripCompletionsChanged = snapshot.tripCompletionsChanged
+        businessInputCursorChanged = snapshot.businessInputCursorChanged
+    }
+
+    private fun validateBusinessInputKey(journalGeneration: String, inputId: Long, sourceIdentity: String) {
+        require(journalGeneration.isNotBlank() && journalGeneration.length <= 512) { "Invalid business input journal generation" }
+        require(inputId > 0L) { "Business input ID must be positive" }
+        require(sourceIdentity.isNotBlank() && sourceIdentity.length <= 512) { "Invalid business input identity" }
+    }
+
+    private fun businessInputReplay(
+        db: SQLiteDatabase,
+        journalGeneration: String,
+        inputId: Long,
+        sourceIdentity: String
+    ): TripBusinessInputReplay? {
+        val cursor = businessInputCursor(db) ?: return null
+        if (cursor.journalGeneration != journalGeneration) return null
+        if (inputId < cursor.inputId) return TripBusinessInputReplay(0L, 0L, null)
+        if (inputId > cursor.inputId) return null
+        require(sourceIdentity == cursor.sourceIdentity) {
+            "Business input $inputId was replayed with a different source identity"
+        }
+        return TripBusinessInputReplay(
+            cursor.priorCompletionWatermark,
+            cursor.completionWatermark,
+            cursor.powerSessionId
+        )
+    }
+
+    private fun businessInputCursor(db: SQLiteDatabase): TripBusinessInputCursor? = db.rawQuery(
+        "SELECT journal_generation, input_id, source_identity, prior_completion_watermark, completion_watermark, power_session_id " +
+            "FROM trip_business_input_cursor WHERE singleton_id = 1",
+        null
+    ).use { cursor ->
+        if (!cursor.moveToFirst()) null else TripBusinessInputCursor(
+            journalGeneration = cursor.getString(0),
+            inputId = cursor.getLong(1),
+            sourceIdentity = cursor.getString(2),
+            priorCompletionWatermark = cursor.getLong(3),
+            completionWatermark = cursor.getLong(4),
+            powerSessionId = cursor.getStringOrNull(5)
+        )
+    }
+
+    private fun writeBusinessInputCursor(db: SQLiteDatabase, cursor: TripBusinessInputCursor) {
+        val values = ContentValues().apply {
+            put("singleton_id", 1)
+            put("journal_generation", cursor.journalGeneration)
+            put("input_id", cursor.inputId)
+            put("source_identity", cursor.sourceIdentity)
+            put("prior_completion_watermark", cursor.priorCompletionWatermark)
+            put("completion_watermark", cursor.completionWatermark)
+            putNullable("power_session_id", cursor.powerSessionId)
+        }
+        if (db.update("trip_business_input_cursor", values, "singleton_id = 1", null) == 0) {
+            db.insertOrThrow("trip_business_input_cursor", null, values)
+        }
     }
 
     @Synchronized
@@ -92,6 +293,33 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
     }
 
     @Synchronized
+    internal fun historicalBusinessEnergyCandidatePage(
+        afterTripId: String?,
+        limit: Int,
+        businessGeneration: String
+    ): List<TripSession> {
+        require(limit in 1..100)
+        require(businessGeneration.isNotBlank())
+        val eligibility = "state = ? AND ended_at IS NOT NULL " +
+            "AND start_boot_id IS NOT NULL AND end_boot_id = start_boot_id " +
+            "AND start_elapsed_ms IS NOT NULL AND end_elapsed_ms IS NOT NULL " +
+            "AND start_elapsed_ms >= 0 AND end_elapsed_ms >= start_elapsed_ms " +
+            "AND discharged_kwh IS NULL AND regenerated_kwh IS NULL AND net_kwh IS NULL " +
+            "AND energy_covered_ms IS NULL AND energy_uncovered_ms IS NULL AND energy_partial IS NULL " +
+            "AND energy_observed_at IS NULL " +
+            "AND NOT EXISTS (SELECT 1 FROM historical_energy_backfill b " +
+            "WHERE b.trip_id = trip_sessions.trip_id " +
+            "AND b.algorithm_version >= ${HistoricalEnergyBackfillRecord.EVENT_ALGORITHM_VERSION} " +
+            "AND b.source_identity = ?)"
+        val args = arrayOf(TripSession.STATE_CLOSED, businessGeneration)
+        return if (afterTripId == null) {
+            querySessions(eligibility, args, "trip_id", limit)
+        } else {
+            querySessions("$eligibility AND trip_id > ?", args + afterTripId, "trip_id", limit)
+        }
+    }
+
+    @Synchronized
     internal fun closedTripBoundsPage(afterTripId: String?, limit: Int): List<TripSession> {
         require(limit in 1..100)
         return if (afterTripId == null) {
@@ -110,27 +338,44 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
     internal fun commitHistoricalEnergyBackfill(record: HistoricalEnergyBackfillRecord, snapshot: EnergySnapshot?): Boolean {
         require(record.tripId.isNotBlank() && record.startedAt.isNotBlank() && record.endedAt.isNotBlank())
         require(record.sourceIdentity.isNotBlank() && record.reason.isNotBlank() && record.updatedAt.isNotBlank())
-        require(record.algorithmVersion == HistoricalEnergyBackfillRecord.ALGORITHM_VERSION)
+        require(record.algorithmVersion == HistoricalEnergyBackfillRecord.ALGORITHM_VERSION ||
+            record.algorithmVersion == HistoricalEnergyBackfillRecord.EVENT_ALGORITHM_VERSION)
         require((snapshot == null) == (record.outcome == "rejected"))
         if (snapshot != null) require(snapshot.powerSessionId == record.tripId && !snapshot.energyPartial && snapshot.energyCoveredMs > 0L)
         val db = writableDb
         var committed = false
         db.beginTransaction()
         try {
+            val progressGuard = if (record.algorithmVersion == HistoricalEnergyBackfillRecord.EVENT_ALGORITHM_VERSION) {
+                "NOT EXISTS (SELECT 1 FROM historical_energy_backfill b WHERE b.trip_id = trip_sessions.trip_id " +
+                    "AND b.algorithm_version >= ${HistoricalEnergyBackfillRecord.EVENT_ALGORITHM_VERSION} " +
+                    "AND b.source_identity = ?)"
+            } else {
+                HISTORICAL_PROGRESS_ELIGIBLE
+            }
             val eligibleWhere = "trip_id = ? AND state = 'closed' AND started_at = ? AND ended_at = ? " +
                 "AND discharged_kwh IS NULL AND regenerated_kwh IS NULL AND net_kwh IS NULL " +
                 "AND energy_covered_ms IS NULL AND energy_uncovered_ms IS NULL AND energy_partial IS NULL " +
-                "AND energy_observed_at IS NULL AND $HISTORICAL_PROGRESS_ELIGIBLE"
-            val args = arrayOf(record.tripId, record.startedAt, record.endedAt)
+                "AND energy_observed_at IS NULL AND $progressGuard"
+            val args = if (record.algorithmVersion == HistoricalEnergyBackfillRecord.EVENT_ALGORITHM_VERSION) {
+                arrayOf(record.tripId, record.startedAt, record.endedAt, record.sourceIdentity)
+            } else {
+                arrayOf(record.tripId, record.startedAt, record.endedAt)
+            }
             val eligible = if (snapshot == null) {
                 db.rawQuery("SELECT 1 FROM trip_sessions WHERE $eligibleWhere", args).use { it.moveToFirst() }
             } else {
                 db.update("trip_sessions", snapshot.toEnergyContentValues(), eligibleWhere, args) == 1
             }
             if (eligible) {
-                db.delete("historical_energy_backfill", "trip_id = ? AND outcome = 'rejected' AND reason = ? AND algorithm_version < ?",
-                    arrayOf(record.tripId, HistoricalEnergyBackfillRecord.RETRY_REASON, record.algorithmVersion.toString()))
-                db.insertOrThrow("historical_energy_backfill", null, record.toContentValues())
+                if (record.algorithmVersion == HistoricalEnergyBackfillRecord.EVENT_ALGORITHM_VERSION) {
+                    val updated = db.update("historical_energy_backfill", record.toContentValues(), "trip_id = ?", arrayOf(record.tripId))
+                    if (updated == 0) db.insertOrThrow("historical_energy_backfill", null, record.toContentValues())
+                } else {
+                    db.delete("historical_energy_backfill", "trip_id = ? AND outcome = 'rejected' AND reason = ? AND algorithm_version < ?",
+                        arrayOf(record.tripId, HistoricalEnergyBackfillRecord.RETRY_REASON, record.algorithmVersion.toString()))
+                    db.insertOrThrow("historical_energy_backfill", null, record.toContentValues())
+                }
                 db.setTransactionSuccessful()
                 committed = true
             }
@@ -429,7 +674,23 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
                 db.insertOrThrow("energy_runtime_state", null, values)
             }
             snapshot?.powerSessionId?.let { tripId ->
-                if (db.update("trip_sessions", snapshot.toEnergyContentValues(), "trip_id = ?", arrayOf(tripId)) == 1) {
+                if (db.update(
+                        "trip_sessions",
+                        snapshot.toEnergyContentValues(),
+                        "trip_id = ? AND (discharged_kwh IS NOT ? OR regenerated_kwh IS NOT ? OR " +
+                            "net_kwh IS NOT ? OR energy_covered_ms IS NOT ? OR energy_uncovered_ms IS NOT ? OR " +
+                            "energy_partial IS NOT ? OR energy_observed_at IS NOT ?)",
+                        arrayOf(
+                            tripId,
+                            snapshot.dischargedKwh?.toString(),
+                            snapshot.regeneratedKwh?.toString(),
+                            snapshot.netKwh?.toString(),
+                            snapshot.energyCoveredMs.toString(),
+                            snapshot.energyUncoveredMs.toString(),
+                            if (snapshot.energyPartial) "1" else "0",
+                            snapshot.observedAt
+                        )
+                    ) == 1) {
                     mirroredTripId = tripId
                 }
             }

@@ -76,7 +76,7 @@ final class HelperDiagnostics implements AutoCloseable, TelemetryWorkerSpool.Dia
     private Long callbackFootprintSampleElapsedMs;
     private HelperCallbackController.DiagnosticsSnapshot callbackSnapshot =
         new HelperCallbackController.DiagnosticsSnapshot(0, 0, 0, 0, 0, 0L,
-            0L, -1L, 0L, 0L, -1L, 0L, 0L, null);
+            0L, -1L, 0L, 0L, -1L, 0L, 0L, null, 0L, 0L, 0L);
     private BoundedProcessWindow.Snapshot performanceWindowSnapshot;
     private long stateRevision;
 
@@ -299,7 +299,10 @@ final class HelperDiagnostics implements AutoCloseable, TelemetryWorkerSpool.Dia
                 old.secondaryQueueBytes != value.secondaryQueueBytes ||
                 old.secondaryQueueOldestAgeMs != value.secondaryQueueOldestAgeMs ||
                 old.secondaryQueueHighWaterBytes != value.secondaryQueueHighWaterBytes ||
-                old.queueLossCount != value.queueLossCount || !Objects.equals(old.retryReason, value.retryReason);
+                old.queueLossCount != value.queueLossCount || !Objects.equals(old.retryReason, value.retryReason) ||
+                old.initialSeedGetAttempts != value.initialSeedGetAttempts ||
+                old.sourceRecoveryGetAttempts != value.sourceRecoveryGetAttempts ||
+                old.secondaryExceptionGetAttempts != value.secondaryExceptionGetAttempts;
             if (changed) {
                 callbackSnapshot = value;
                 markChangedLocked();
@@ -543,6 +546,8 @@ final class HelperDiagnostics implements AutoCloseable, TelemetryWorkerSpool.Dia
                 callback.mainQueueBytes, callback.mainQueueOldestAgeMs, callback.mainQueueHighWaterBytes,
                 callback.secondaryQueueBytes, callback.secondaryQueueOldestAgeMs,
                 callback.secondaryQueueHighWaterBytes, callback.queueLossCount, callback.retryReason,
+                callback.initialSeedGetAttempts, callback.sourceRecoveryGetAttempts,
+                callback.secondaryExceptionGetAttempts,
                 performanceWindowSnapshot,
                 callbackFootprint,
                 callbackFootprintError,

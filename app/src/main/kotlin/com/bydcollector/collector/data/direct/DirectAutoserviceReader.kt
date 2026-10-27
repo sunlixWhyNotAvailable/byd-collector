@@ -12,14 +12,17 @@ class DirectAutoserviceReader(
 ) {
     fun readSnapshot(): DirectAutoserviceSnapshot {
         val batch = helper.readBatch(entries)
-        val fields = entries.mapIndexed { index, entry ->
-            val result = batch.results.getOrElse(index) {
-                DirectHelperReadResult(
-                    CollectorHelperProtocol.STATUS_SPOOL_UNAVAILABLE,
-                    null,
-                    "batch result missing at index $index"
-                )
-            }
+        val requestedIndices = batch.requestedIndices
+        val selected = selectRequestedBatchResults(entries, requestedIndices, batch.results)
+        if (batch.noWork) {
+            check(batch.diagnostics.status == CollectorHelperProtocol.STATUS_OK &&
+                batch.results.isEmpty() && requestedIndices.isEmpty() &&
+                batch.diagnostics.returnedCount == 0 && batch.nextDueDelayMs > 0L
+            ) { "inconsistent no-read-due batch" }
+        } else if (batch.diagnostics.status == CollectorHelperProtocol.STATUS_OK && entries.isNotEmpty()) {
+            check(batch.results.isNotEmpty()) { "successful batch returned no reads without noWork" }
+        }
+        val fields = selected.map { (entry, result) ->
             val raw = result.raw
             DirectAutoserviceField(
                 entry = entry,
@@ -27,30 +30,45 @@ class DirectAutoserviceReader(
                 raw = raw,
                 decoded = raw?.let { DirectValueDecoders.decode(entry, it) },
                 error = result.error,
-                callbackSource = result.callbackSource
+                callbackSource = result.callbackSource,
+                getLineage = result.getLineage
             )
         }
-        return DirectAutoserviceSnapshot(fields, batch.diagnostics)
+        return DirectAutoserviceSnapshot(
+            fields = fields,
+            batchDiagnostics = batch.diagnostics,
+            noReadDue = batch.noWork,
+            nextDueDelayMs = batch.nextDueDelayMs.takeIf { it > 0L }
+        )
     }
 }
 
 data class DirectAutoserviceSnapshot(
     val fields: List<DirectAutoserviceField>,
-    val batchDiagnostics: DirectBatchDiagnostics
+    val batchDiagnostics: DirectBatchDiagnostics,
+    val noReadDue: Boolean = false,
+    val nextDueDelayMs: Long? = null
 ) {
     private val errorFields: List<DirectAutoserviceField> = fields
         .filter { it.status != 0 || it.raw == null }
 
-    val readings: List<PollReading> = fields
-        .filter { it.status == 0 && it.raw != null }
-        .map { field ->
+    /** One entry per actual GET attempt; failed fields remain explicit null/null inputs. */
+    val attemptedReadings: List<PollReading> = fields.map { field ->
+        if (field.status == 0 && field.raw != null) {
             PollReading(
                 rawKey = field.entry.key,
-                rawValue = DirectValueDecoders.rawString(field.raw!!),
+                rawValue = DirectValueDecoders.rawString(field.raw),
                 descValue = field.decoded,
-                callbackSource = field.callbackSource
+                callbackSource = field.callbackSource,
+                getLineage = field.getLineage
             )
+        } else {
+            PollReading(rawKey = field.entry.key, rawValue = null, descValue = null, getLineage = field.getLineage)
         }
+    }
+
+    /** Only usable values count as received readings. */
+    val readings: List<PollReading> = attemptedReadings.filter { it.rawValue != null }
 
     val errors: List<String> = errorFields.map { field -> errorSummary(field) }
 
@@ -60,13 +78,26 @@ data class DirectAutoserviceSnapshot(
     val batchStatus: Int = batchDiagnostics.status
 
     fun errorSummary(maxSamples: Int = DEFAULT_ERROR_SAMPLE_LIMIT): String {
-        if (errors.isEmpty()) return ""
-        val sample = errors.take(maxSamples).joinToString(separator = "; ")
-        val omitted = (errors.size - maxSamples).coerceAtLeast(0)
         return buildString {
-            append("errors=").append(errors.size).append('/').append(fields.size)
-            append(" samples=[").append(sample).append(']')
-            if (omitted > 0) append(" omitted=").append(omitted)
+            if (errors.isNotEmpty()) {
+                val sample = errors.take(maxSamples).joinToString(separator = "; ")
+                val omitted = (errors.size - maxSamples).coerceAtLeast(0)
+                append("errors=").append(errors.size).append('/').append(fields.size)
+                append(" samples=[").append(sample).append(']')
+                if (omitted > 0) append(" omitted=").append(omitted)
+            }
+            batchDiagnostics.error?.let { error ->
+                if (isNotEmpty()) append("; ")
+                append("batch_error=").append(error)
+            }
+            if (batchDiagnostics.status != CollectorHelperProtocol.STATUS_OK) {
+                if (isNotEmpty()) append("; ")
+                append("batch_status=").append(batchDiagnostics.status)
+            }
+            if (batchDiagnostics.errorDetailsTruncated) {
+                if (isNotEmpty()) append("; ")
+                append("batch error details truncated")
+            }
         }
     }
 
@@ -91,6 +122,7 @@ data class DirectAutoserviceSnapshot(
             put("group_failures", batchDiagnostics.groupFailureCount)
             put("helper_elapsed_ms", batchDiagnostics.helperElapsedMs)
             put("returned_count", batchDiagnostics.returnedCount)
+            put("error_details_truncated", batchDiagnostics.errorDetailsTruncated)
             if (batchDiagnostics.error != null) put("error", batchDiagnostics.error)
         })
         if (includeFields) {
@@ -143,5 +175,6 @@ data class DirectAutoserviceField(
     val raw: Int?,
     val decoded: String?,
     val error: String?,
-    val callbackSource: com.bydcollector.collector.direct.CallbackValueSource? = null
+    val callbackSource: com.bydcollector.collector.direct.CallbackValueSource? = null,
+    val getLineage: DirectGetLineage? = null
 )

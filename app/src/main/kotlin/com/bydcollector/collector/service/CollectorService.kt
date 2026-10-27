@@ -33,6 +33,14 @@ import com.bydcollector.collector.adb.AdbLocalClient
 import com.bydcollector.collector.data.callback.CallbackBatchDrainCoordinator
 import com.bydcollector.collector.data.callback.CallbackIntakeWorker
 import com.bydcollector.collector.data.callback.CallbackNormalizationWorker
+import com.bydcollector.collector.data.input.BusinessInputKind
+import com.bydcollector.collector.data.input.BusinessInputOrigin
+import com.bydcollector.collector.data.input.BusinessInputCheckpointKeys
+import com.bydcollector.collector.data.input.BusinessInputContinuity
+import com.bydcollector.collector.data.input.BusinessInputProjection
+import com.bydcollector.collector.data.input.BusinessInputReducer
+import com.bydcollector.collector.data.input.BusinessInputTimerSource
+import com.bydcollector.collector.data.normalized.NormalizedSourceInput
 import com.bydcollector.collector.data.callback.CallbackQueueStatusTracker
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseHelper
 import com.bydcollector.collector.data.debug.DirectDebugDatabaseResolver
@@ -50,13 +58,13 @@ import com.bydcollector.collector.data.direct.DirectValueDecoders
 import com.bydcollector.collector.data.direct.DirectAutoserviceField
 import com.bydcollector.collector.data.direct.DirectAutoserviceSnapshot
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
+import com.bydcollector.collector.data.direct.DirectCallbackSourceLoss
 import com.bydcollector.collector.data.local.TelemetryStore
 import com.bydcollector.collector.data.local.EcCurrentMeanProvider
 import com.bydcollector.collector.data.local.EcMeanStatus
 import com.bydcollector.collector.data.local.EC_MEAN_MAX_AGE_MS
 import com.bydcollector.collector.data.energy.RangeFallbackReason
 import com.bydcollector.collector.data.energy.RangeSource
-import com.bydcollector.collector.data.energy.EnergyReceipt
 import com.bydcollector.collector.data.energy.EnergySessionCoordinator
 import com.bydcollector.collector.data.energy.EnergySessionSeed
 import com.bydcollector.collector.data.energy.EnergyTelemetryProjection
@@ -118,7 +126,6 @@ import com.bydcollector.collector.mqtt.PahoMqttClientFacade
 import com.bydcollector.collector.system.CollectorAutoStart
 import com.bydcollector.collector.telegram.TelegramCoordinator
 import com.bydcollector.collector.telegram.TelegramSendResult
-import com.bydcollector.collector.telegram.correlateTripDiagnostic
 import java.time.Instant
 import com.bydcollector.collector.ui.DashboardDebugPollState
 import com.bydcollector.collector.ui.DashboardMainPollState
@@ -200,6 +207,22 @@ class CollectorService : Service() {
     private lateinit var secondaryCallbackIntake: CallbackIntakeWorker
     private lateinit var callbackNormalizer: CallbackNormalizationWorker
     private lateinit var deferredEnergyWorker: CallbackNormalizationWorker
+    private lateinit var businessWorker: CallbackNormalizationWorker
+    private val businessDrainLock = Any()
+    private val pendingMainSourceLoss = java.util.concurrent.ConcurrentLinkedQueue<DirectCallbackSourceLoss>()
+    private val observedCallbackLoss = arrayOfNulls<String>(2)
+    private var businessGeneration: String? = null
+    private var businessInputs: Map<String, NormalizedSourceInput> = emptyMap()
+    private var businessContinuity: Map<String, BusinessInputContinuity> = emptyMap()
+    private val businessTimerSource = LivePollSource()
+    private var nextBusinessTimerElapsedMs = 0L
+    private val businessTimerScheduled = AtomicBoolean(false)
+    private val businessProcessed = AtomicLong(0L)
+    @Volatile private var businessOldestPageWallMs: Long? = null
+    private val businessTimerTask = Runnable {
+        businessTimerScheduled.set(false)
+        if (running.get() && ::businessWorker.isInitialized && businessWorker.isRunning()) businessWorker.signal()
+    }
     @Volatile private var kpiWorker: Thread? = null
     @Volatile private var kpiPowerOn = false
     private lateinit var energyCoordinator: EnergySessionCoordinator
@@ -299,7 +322,7 @@ class CollectorService : Service() {
     @Volatile private var lastDatabaseFootprintAtMs = Long.MIN_VALUE
     private var lastKpiPublishAtMs = Long.MIN_VALUE
     private val kpiFreshness = KpiFreshness(
-        com.bydcollector.collector.data.polling.LivePollSource.liveBootId, KPI_STALE_AFTER_MS)
+        com.bydcollector.collector.data.polling.LivePollSource.liveBootId)
     private var kpiPublishScheduled = false
     private var kpiFrameScheduled = false
     private val kpiChoreographer by lazy { Choreographer.getInstance() }
@@ -309,7 +332,7 @@ class CollectorService : Service() {
     private val kpiWakeLock = java.lang.Object()
     private var kpiWakeRevision = 0L
     private val kpiPendingLock = Any()
-    private val pendingKpiObservations = linkedMapOf<String, NormalizedObservation>()
+    private val pendingKpiObservations = linkedMapOf<String, NormalizedObservation?>()
     private var pendingKpiUiGeneration = 0L
     private var kpiIngestScheduled = false
     private var kpiVisibilityListenerAttached = false
@@ -317,9 +340,7 @@ class CollectorService : Service() {
     @Volatile private var kpiLiveMode = false
     private val kpiDiagnosticQueued = AtomicBoolean(false)
     private val kpiMailboxSnapshots = AtomicLong(0L)
-    private val kpiGetterFields = AtomicLong(0L)
     private val kpiUiPublications = AtomicLong(0L)
-    @Volatile private var kpiFallbackSources = 0
     @Volatile private var kpiFallbackReason = "not_subscribed"
     private var lastKpiDiagnosticMs = Long.MIN_VALUE
     @Volatile private var ecMeanRefreshRequestedAtElapsedMs = Long.MIN_VALUE
@@ -438,32 +459,25 @@ class CollectorService : Service() {
         if (KpiUiVisibility.visible) publishVehicleKpisNow() else scheduleKpiPublication()
     }
     private val kpiModeTask = Runnable {
-        kpiFreshness.discardExpiryDiagnostics()
         if (!KpiUiVisibility.visible || !kpiInteractive || !kpiPowerOn) cancelKpiFrame()
         if (!kpiInteractive || !kpiPowerOn) {
             mainHandler.removeCallbacks(kpiPublishTask)
-            mainHandler.removeCallbacks(kpiStaleTask)
             kpiPublishScheduled = false
         } else scheduleKpiPublication()
     }
     private val kpiIngestTask = Runnable {
         val (generation, observations) = synchronized(kpiPendingLock) {
-            val pending = pendingKpiObservations.values.toList()
+            val pending = pendingKpiObservations.toMap()
             pendingKpiObservations.clear()
             kpiIngestScheduled = false
             pendingKpiUiGeneration to pending
         }
         if (observations.isEmpty() || generation != kpiUiGeneration.get() || !running.get() ||
-            !kpiPowerOn || !kpiInteractive || settings.isUserShutdownRequested()
+            settings.isUserShutdownRequested()
         ) return@Runnable
         val nowMs = SystemClock.elapsedRealtime()
-        if (!kpiFreshness.accept(observations, nowMs)) return@Runnable
-        mainHandler.removeCallbacks(kpiStaleTask)
-        mainHandler.postDelayed(kpiStaleTask, kpiFreshness.remainingMs(nowMs))
+        if (!kpiFreshness.apply(observations, nowMs)) return@Runnable
         scheduleKpiPublication()
-    }
-    private val kpiStaleTask = Runnable {
-        if (KpiUiVisibility.visible) scheduleKpiPublication() else publishVehicleKpisNow()
     }
 
     override fun onCreate() {
@@ -603,6 +617,11 @@ class CollectorService : Service() {
             onFault = { error ->
                 store.recordEvent("energy_deferred_worker_error", "Deferred energy worker failed", error.diagnosticDetail())
             }
+        )
+        businessWorker = CallbackNormalizationWorker(
+            threadName = "byd-business-inputs",
+            drainPage = { drainBusinessPage() },
+            onFault = { error -> store.recordEvent("business_input_error", "Business input remains pending", error.diagnosticDetail()) }
         )
         poller = createTelemetryPoller()
         maintenanceCoordinator = DbMaintenanceCoordinator(
@@ -829,6 +848,8 @@ class CollectorService : Service() {
             kpiVisibilityListenerAttached = false
         }
         signalKpiWorker()
+        if (::businessWorker.isInitialized) businessWorker.stopAndJoin(0L)
+        scheduleBusinessTimer(false)
         if (::deferredEnergyWorker.isInitialized) deferredEnergyWorker.stopAndJoin(0L)
         kpiWorker?.interrupt()
         getSharedPreferences(CollectorSettings.PREFS_NAME, Context.MODE_PRIVATE)
@@ -842,7 +863,6 @@ class CollectorService : Service() {
         mainHandler.removeCallbacks(accessSelfCheckTask)
         mainHandler.removeCallbacks(dashboardHeartbeatTask)
         mainHandler.removeCallbacks(kpiPublishTask)
-        mainHandler.removeCallbacks(kpiStaleTask)
         cancelMqttRetry()
         cancelInfluxRetry("service_destroyed")
         cancelTelegramTick()
@@ -993,6 +1013,8 @@ class CollectorService : Service() {
                 if (ownsCurrentPollerSlot()) {
                     mainCallbackIntake.stopAndJoin(0L)
                     callbackNormalizer.stopAndJoin(0L)
+                    businessWorker.stopAndJoin(0L)
+                    scheduleBusinessTimer(false)
                 }
                 DirectStreamController.releaseLease(CollectorHelperProtocol.STREAM_MAIN, mainConsumerOwner)
             }
@@ -1010,8 +1032,13 @@ class CollectorService : Service() {
         return CallbackIntakeWorker(
             threadName = "byd-callback-intake-$stream",
             ready = { DirectStreamController.credentials(stream) != null },
-            drain = { drain.drain(maxBatches = 1) },
-            armBatchReady = { wake -> helper.awaitCallbackBatch(stream, wake) },
+            drain = {
+                helper.observeCallbackSource(stream) { loss -> onConfirmedCallbackSourceLoss(stream, loss) }
+                drain.drain(maxBatches = 1)
+            },
+            armBatchReady = { wake -> helper.awaitCallbackBatch(stream, wake) { loss ->
+                onConfirmedCallbackSourceLoss(stream, loss)
+            } },
             onStatus = { summary ->
                 queueCallbackDiagnostic(stream, summary.detail +
                     (summary.fault?.let { "\n${it.diagnosticDetail()}" } ?: ""))
@@ -1024,6 +1051,31 @@ class CollectorService : Service() {
             },
             queueStatusTracker = queueStatus
         )
+    }
+
+    private fun onConfirmedCallbackSourceLoss(stream: Int, loss: DirectCallbackSourceLoss) {
+        val identity = "${loss.helperBootId}:${loss.helperGeneration}"
+        synchronized(observedCallbackLoss) {
+            if (observedCallbackLoss[stream - 1] == identity) return
+            observedCallbackLoss[stream - 1] = identity
+        }
+        if (stream == CollectorHelperProtocol.STREAM_MAIN) {
+            // The existing business worker retries persistence failures; Binder callbacks never write SQLite.
+            pendingMainSourceLoss.add(loss)
+            businessWorker.signal()
+        }
+        try {
+            dashboardMetricsExecutor.execute {
+                runCatching {
+                    store.recordEvent("callback_source_lost", "Confirmed helper source loss",
+                        "stream=$stream helper_boot=${loss.helperBootId} helper_generation=${loss.helperGeneration} " +
+                            "reason=${loss.reason} observed_wall_ms=${loss.observedWallMs} " +
+                            "observed_elapsed_ms=${loss.observedElapsedMs}\n${loss.diagnostic}")
+                }.onFailure { error -> Log.e("BydCollector", "Could not persist helper-loss diagnostic", error) }
+            }
+        } catch (error: RejectedExecutionException) {
+            Log.w("BydCollector", "Helper-loss diagnostic owner is stopping: ${loss.reason}", error)
+        }
     }
 
     private fun queueCallbackDiagnostic(stream: Int, detail: String) {
@@ -1100,7 +1152,8 @@ class CollectorService : Service() {
             "process=app duration_scope=app_poll_cycle ${snapshot.toJson()} normalization_page_processed=${progress?.processed} " +
                 "normalization_page_oldest_age_ms=${progress?.oldestWallMs?.let { (now - it).coerceAtLeast(0L) }} " +
                 "normalization_last_completion_wall_ms=${progress?.completedWallMs} " +
-                "normalization_page_may_have_more=${progress?.hasMore}")
+                "normalization_page_may_have_more=${progress?.hasMore} business_processed=${businessProcessed.get()} " +
+                "business_last_page_oldest_wall_ms=$businessOldestPageWallMs")
     }
 
     private fun callbackDrain(
@@ -1123,6 +1176,7 @@ class CollectorService : Service() {
                 if (imported is com.bydcollector.collector.data.callback.CallbackImportResult.Committed && !imported.duplicate) {
                     if (stream == CollectorHelperProtocol.STREAM_MAIN) {
                         callbackNormalizer.signal()
+                        businessWorker.signal()
                     }
                 }
                 imported
@@ -1155,149 +1209,209 @@ class CollectorService : Service() {
     }
 
     private fun createSuccessfulPollObserver(): SuccessfulPollObserver {
-        val fallbackSource = com.bydcollector.collector.data.polling.LivePollSource()
-        //normalizes only after raw poll persistence so raw telemetry remains the source of truth
+        val fallbackSource = LivePollSource()
         return object : SuccessfulPollObserver {
-            private var lastEnergyFailureKey: String? = null
-
-            private fun processOrDefer(receipt: EnergyReceipt): com.bydcollector.collector.data.energy.EnergyProcessResult? =
-                synchronized(energyCoordinator) {
-                    if (store.hasDeferredEnergy()) {
-                        store.enqueueDeferredEnergy(receipt)
-                        deferredEnergyWorker.signal()
-                        return@synchronized null
-                    }
-                    try {
-                        prepareEnergyProjection()
-                        energyCoordinator.process(receipt).also { lastEnergyFailureKey = null }
-                    } catch (error: Exception) {
-                        if (error is InterruptedException) throw error
-                        // The receipt must be durable before a helper replay may be ACKed.
-                        store.enqueueDeferredEnergy(receipt)
-                        deferredEnergyWorker.signal()
-                        val detail = "${error::class.java.simpleName}: ${error.message.orEmpty()}"
-                        if (detail != lastEnergyFailureKey) {
-                            runCatching { store.recordEvent("energy_processing_error",
-                                "Energy processing deferred; raw collection continues", detail) }
-                            lastEnergyFailureKey = detail
-                        }
-                        null
-                    }
-                }
-
             override fun onSuccessfulPoll(
-                sessionId: Long,
-                pollId: Long,
-                timestamp: String,
-                readings: List<PollReading>,
-                origin: PollOrigin
-            ) {
-                onSourcePoll(sessionId, pollId, timestamp, readings, origin,
-                    fallbackSource.capture(android.os.SystemClock.elapsedRealtime()))
-            }
+                sessionId: Long, pollId: Long, timestamp: String, readings: List<PollReading>, origin: PollOrigin
+            ) = onSourcePoll(sessionId, pollId, timestamp, readings, origin,
+                fallbackSource.capture(SystemClock.elapsedRealtime()))
 
             override fun onSourcePoll(
                 sessionId: Long, pollId: Long, timestamp: String, readings: List<PollReading>,
                 origin: PollOrigin, source: com.bydcollector.collector.data.polling.PollSampleSource
             ) {
+                // Business consumers recover from the journal even if normalization fails here.
+                businessWorker.signal()
+                val normalized = store.applySourcePollNormalization(pollId, timestamp, source, readings, vehicleStateNormalizer)
+                publishNormalizedWrite(normalized.summary, normalized.appliedObservations)
                 if (origin == PollOrigin.LIVE) {
                     (applicationContext as BydCollectorApplication).scheduleHistoricalEnergyBackfill(historicalEnergyGeneration)
                 }
-                val observations = vehicleStateNormalizer.normalize(
-                    pollId = pollId,
-                    observedAt = timestamp,
-                    readings = readings
-                )
-                val receipt = EnergyTelemetryProjection.receipt(source, timestamp, readings, observations)
-                val energyResult = processOrDefer(receipt)?.takeUnless { it.stale }
-                val energySnapshot = energyResult?.snapshot
-                // Inactive cursor-only receipts retain the final snapshot, but must not
-                // republish it as fresh and oscillate an expired Main value between OK/STALE.
-                val energyObservations = energyResult?.pendingProjection?.snapshot
-                    ?.let(com.bydcollector.collector.data.energy.EnergyTelemetryProjection::observations).orEmpty()
-                val sourceResult = store.applySourcePollNormalization(pollId, timestamp, source, readings, vehicleStateNormalizer)
-                var energyProjectionWritten = false
-                val energySummary = try {
-                    store.applyNormalizedObservations(energyObservations).also { energyProjectionWritten = true }
-                } catch (error: Exception) {
-                    if (error is InterruptedException) throw error
-                    store.enqueueDeferredEnergy(receipt)
-                    deferredEnergyWorker.signal()
-                    NormalizedWriteSummary(0, 0, 0)
-                }
-                val summary = NormalizedWriteSummary(
-                    observedCount = sourceResult.summary.observedCount + energySummary.observedCount,
-                    changedCount = sourceResult.summary.changedCount + energySummary.changedCount,
-                    historyInsertedCount = sourceResult.summary.historyInsertedCount + energySummary.historyInsertedCount,
-                    currentInsertedCount = sourceResult.summary.currentInsertedCount + energySummary.currentInsertedCount,
-                    changedCategories = sourceResult.summary.changedCategories + energySummary.changedCategories
-                )
-                energyResult?.pendingProjection?.takeIf { energyProjectionWritten }?.let {
-                    try {
-                        check(energyCoordinator.confirmProjected(it.snapshot.snapshotId)) { "Energy projection receipt changed" }
-                    } catch (error: Exception) {
-                        if (error is InterruptedException) throw error
-                        store.enqueueDeferredEnergy(receipt)
-                        deferredEnergyWorker.signal()
-                    }
-                }
-                val diagnosticPowerSession = CompletableFuture<String?>()
-                tripRuntime.onSuccessfulPoll(
-                    timestamp,
-                    readings,
-                    observations,
-                    liveTelemetry = origin == PollOrigin.LIVE,
-                    diagnosticPowerSession = diagnosticPowerSession,
-                    energySnapshot = energySnapshot,
-                    beforeBoundary = { watermark ->
-                        val coordinator = telegramCoordinator
-                        if (coordinator != null) {
-                            val generation = telegramWorkGeneration.get()
-                            executeTelegram("telegram_event_error", onSuccess = ::postTelegramTickSchedule) {
-                                if (telegramCoordinator !== coordinator) return@executeTelegram null
-                                drainTripCompletions(coordinator, watermark)
-                                coordinator.onSourcePoll(
-                                    pollId, timestamp, source, readings, origin,
-                                    LivePollSource.liveBootId, energySnapshot
-                                ) { legId ->
-                                    correlateTripDiagnostic(
-                                        legId, diagnosticPowerSession,
-                                        isCurrent = {
-                                            running.get() && telegramCoordinator === coordinator &&
-                                                telegramWorkGeneration.get() == generation
-                                        },
-                                        enqueue = { action -> executeTelegram("telegram_diagnostic_correlation_error") { action() } },
-                                        bind = coordinator::bindTripDiagnosticParent
-                                    )
-                                }
-                            }
-                        }
-                    }
-                )
-                publishNormalizedWrite(summary, sourceResult.appliedObservations)
             }
 
             override fun onSourceFailure(
-                sessionId: Long,
-                pollId: Long,
-                timestamp: String,
-                origin: PollOrigin,
+                sessionId: Long, pollId: Long, timestamp: String, origin: PollOrigin,
                 source: com.bydcollector.collector.data.polling.PollSampleSource
             ) {
-                if (origin == PollOrigin.LIVE) {
-                    (applicationContext as BydCollectorApplication).scheduleHistoricalEnergyBackfill(historicalEnergyGeneration)
+                businessWorker.signal()
+            }
+        }
+    }
+
+    private fun drainBusinessPage(maintenanceDrain: Boolean = false): Boolean = synchronized(businessDrainLock) {
+        checkBusinessOwner()
+        val application = applicationContext as BydCollectorApplication
+        val selectedStore = store
+        repeat(4) {
+            val loss = pendingMainSourceLoss.peek() ?: return@repeat
+            application.withDatabaseRead {
+                selectedStore.recordAppObservedSourceLoss(loss.helperGeneration, CollectorHelperProtocol.STREAM_MAIN,
+                    BusinessInputCheckpointKeys.ALL, loss.reason, loss.diagnostic, LivePollSource.liveBootId,
+                    loss.observedWallMs, loss.observedElapsedMs)
+            }
+            pendingMainSourceLoss.remove(loss)
+        }
+        val generation = application.withDatabaseRead { selectedStore.businessInputGeneration() }
+        if (businessGeneration != generation) {
+            businessInputs = application.withDatabaseRead { selectedStore.loadBusinessInputCheckpoint() }
+            businessContinuity = application.withDatabaseRead { selectedStore.loadBusinessInputContinuityCheckpoint() }
+            businessGeneration = generation
+        }
+        val refs = application.withDatabaseRead { selectedStore.pendingBusinessInputs() }
+        if (refs.isEmpty()) {
+            val active = synchronized(energyCoordinator) { energyCoordinator.runtimeStatus().active }
+            if (!maintenanceDrain && active && mainPollingRunning.get() &&
+                SystemClock.elapsedRealtime() >= nextBusinessTimerElapsedMs) {
+                val elapsed = SystemClock.elapsedRealtime()
+                val source = businessTimerSource.capture(elapsed)
+                application.withDatabaseRead {
+                    selectedStore.enqueueEvaluation(BusinessInputTimerSource(source.identity, source.bootId,
+                        checkNotNull(source.generatorId), checkNotNull(source.sequence), System.currentTimeMillis(), elapsed), sessionId)
                 }
-                val receipt = EnergyTelemetryProjection.receipt(source, timestamp, emptyList(), emptyList())
-                val result = processOrDefer(receipt)
-                if (result?.stale != true) result?.pendingProjection?.let {
-                    try { persistEnergyProjection(it) }
-                    catch (error: Exception) {
-                        if (error is InterruptedException) throw error
-                        store.enqueueDeferredEnergy(receipt)
-                        deferredEnergyWorker.signal()
-                    }
+                nextBusinessTimerElapsedMs = elapsed + 1_000L
+                scheduleBusinessTimer(true)
+                return@synchronized true
+            }
+            scheduleBusinessTimer(!maintenanceDrain && active && mainPollingRunning.get())
+            return@synchronized false
+        }
+        var inputs = businessInputs
+        var continuity = businessContinuity
+        val finalUpdates = linkedMapOf<String, NormalizedSourceInput>()
+        val finalContinuityUpdates = linkedMapOf<String, BusinessInputContinuity>()
+        var evaluation = synchronized(energyCoordinator) { energyCoordinator.runtimeStatus() }
+        for (ref in refs) {
+            checkBusinessOwner()
+            val delta = application.withDatabaseRead { selectedStore.loadBusinessInputDelta(ref) }
+            val source = BusinessInputProjection.source(ref)
+            val timestamp = BusinessInputProjection.timestamp(ref)
+            val previousInputs = inputs
+            val previousContinuity = continuity
+            val merged = BusinessInputReducer.merge(inputs, BusinessInputProjection.incoming(delta), LivePollSource.liveBootId)
+            val mergedContinuity = BusinessInputReducer.mergeContinuity(
+                continuity, delta.continuityUpdates, LivePollSource.liveBootId, merged.inputs
+            )
+            inputs = merged.inputs
+            continuity = mergedContinuity.continuity
+            finalUpdates.putAll(merged.updates)
+            finalContinuityUpdates.putAll(mergedContinuity.updates)
+            val evaluatedElapsed = if (evaluation.lastEvaluationBootId == source.bootId)
+                maxOf(source.capturedElapsedMs, evaluation.lastEvaluationElapsedMs ?: source.capturedElapsedMs)
+                else source.capturedElapsedMs
+            val previousFresh = BusinessInputProjection.freshInputs(previousInputs, source.bootId, evaluatedElapsed, previousContinuity)
+            val fresh = BusinessInputProjection.freshInputs(inputs, source.bootId, evaluatedElapsed, continuity)
+            val changedEnergy = (previousFresh.keys + fresh.keys).any { key ->
+                if (key !in BusinessInputProjection.energyKeys) false else {
+                    val before = previousFresh[key]?.reading?.let { it.rawValue to it.descValue }
+                    val after = fresh[key]?.reading?.let { it.rawValue to it.descValue }
+                    before != after
                 }
             }
+            val observations = BusinessInputProjection.observations(vehicleStateNormalizer, fresh)
+            val readings = fresh.values.map { it.reading }
+            val energyDue = ref.kind == BusinessInputKind.TIMER || changedEnergy ||
+                merged.updates.keys.any { it in BusinessInputProjection.energyKeys }
+            val energyResult = if (energyDue) synchronized(energyCoordinator) {
+                if (application.withDatabaseRead { selectedStore.hasDeferredEnergy() }) {
+                    deferredEnergyWorker.signal()
+                    error("Legacy energy receipts must drain before business input ${ref.id}")
+                }
+                prepareEnergyProjection()
+                val receipt = EnergyTelemetryProjection.receipt(
+                    source.copy(identity = "business:$generation:${ref.id}"), timestamp, readings, observations
+                ).copy(businessGeneration = generation, businessInputId = ref.id,
+                    evaluationBootId = source.bootId, evaluationElapsedMs = evaluatedElapsed,
+                    lateRelevantSource = changedEnergy && evaluatedElapsed > source.capturedElapsedMs)
+                energyCoordinator.process(receipt).also { result ->
+                    if (!result.stale) result.pendingProjection?.let(::persistEnergyProjection)
+                }
+            } else null
+            val snapshot = energyResult?.takeUnless { it.stale }?.snapshot
+            if (energyDue) evaluation = synchronized(energyCoordinator) { energyCoordinator.runtimeStatus() }
+            if (ref.kind != BusinessInputKind.TIMER) {
+                val changedTripContinuity = mergedContinuity.updates.keys.any { it in BusinessInputCheckpointKeys.ALL }
+                val trip = if (merged.updates.isNotEmpty() || changedTripContinuity) {
+                    awaitBusinessResult(tripRuntime.onBusinessInput(
+                        generation, ref.id, source.identity, timestamp, readings, observations,
+                        !maintenanceDrain && ref.origin == BusinessInputOrigin.LIVE, snapshot,
+                        eventSourceStamp = NormalizedSourceStamp(
+                            if (ref.kind == BusinessInputKind.CALLBACK || ref.kind == BusinessInputKind.CONTINUITY)
+                                NormalizedSourceKind.CALLBACK else NormalizedSourceKind.POLL, source.identity,
+                            source.bootId, source.generatorId, source.sequence, checkNotNull(ref.acquiredWallMs), source.capturedElapsedMs),
+                        allowWhilePaused = maintenanceDrain
+                    ))
+                } else null
+                if (trip?.closedPowerSession == true) {
+                    application.historicalEnergyCandidatesChanged(historicalEnergyGeneration)
+                }
+                if (delta.readings.any { it.rawKey in TelegramOrderedInput.rawSourceKeys } ||
+                    mergedContinuity.updates.keys.any { it in TelegramOrderedInput.rawSourceKeys } || trip != null) {
+                    val coordinator = telegramCoordinator
+                    if (coordinator != null) {
+                        val telegramGeneration = telegramWorkGeneration.get()
+                        val finished = CompletableFuture<Long?>()
+                        try {
+                            synchronized(telegramExecutorLock) { telegramExecutor }.execute {
+                                try {
+                                    checkBusinessOwner()
+                                    check(telegramCoordinator === coordinator && telegramWorkGeneration.get() == telegramGeneration) {
+                                        "Telegram owner changed before business input ${ref.id}"
+                                    }
+                                    trip?.let { drainTripCompletions(coordinator, it.priorCompletionWatermark) }
+                                    var deadline = coordinator.onSourcePoll(ref.pollId ?: 0L, timestamp, source,
+                                        delta.readings, if (ref.origin == BusinessInputOrigin.REPLAY) PollOrigin.REPLAY else PollOrigin.LIVE,
+                                        LivePollSource.liveBootId, snapshot,
+                                        continuityUpdates = delta.continuityUpdates, requireCommit = true) { legId ->
+                                        trip?.powerSessionId?.let { coordinator.bindTripDiagnosticParent(legId, it) }
+                                    }
+                                    trip?.let { result ->
+                                        drainTripCompletions(coordinator, result.completionWatermark)?.let { next ->
+                                            deadline = deadline?.let { minOf(it, next) } ?: next
+                                        }
+                                    }
+                                    finished.complete(deadline)
+                                } catch (error: Throwable) { finished.completeExceptionally(error) }
+                            }
+                        } catch (error: RejectedExecutionException) { finished.completeExceptionally(error) }
+                        postTelegramTickSchedule(awaitBusinessResult(finished), telegramGeneration)
+                    }
+                }
+                if (trip?.confirmedPowerOn == true) requestTelegramRecovery(RECOVERY_VEHICLE_ON)
+            }
+        }
+        application.withDatabaseRead {
+            check(store === selectedStore && selectedStore.businessInputGeneration() == generation) {
+                "Main database changed before business completion"
+            }
+            selectedStore.completeBusinessInputs(refs, finalUpdates, finalContinuityUpdates)
+        }
+        businessInputs = inputs
+        businessContinuity = continuity
+        businessProcessed.addAndGet(refs.size.toLong())
+        businessOldestPageWallMs = refs.first().acquiredWallMs
+        // The worker immediately drains the next page; arm a timer only after the queue is empty.
+        true
+    }
+
+    private fun checkBusinessOwner() {
+        if (!running.get() || settings.isUserShutdownRequested() || Thread.currentThread().isInterrupted)
+            throw InterruptedException("Business input owner stopped")
+    }
+
+    private fun <T> awaitBusinessResult(future: CompletableFuture<T>): T = try {
+        // No Main maintenance read lease is held while another owner commits its database.
+        future.get()
+    } catch (error: ExecutionException) {
+        throw (error.cause ?: error)
+    }
+
+    private fun scheduleBusinessTimer(active: Boolean) {
+        if (!active) {
+            businessTimerScheduled.set(false)
+            mainHandler.removeCallbacks(businessTimerTask)
+        } else if (businessTimerScheduled.compareAndSet(false, true)) {
+            mainHandler.postDelayed(businessTimerTask,
+                (nextBusinessTimerElapsedMs - SystemClock.elapsedRealtime()).coerceAtLeast(1L))
         }
     }
 
@@ -1359,6 +1473,8 @@ class CollectorService : Service() {
             persistLocation = ::persistLocationObservations,
             completionEnabled = settings::isTelegramEnabled,
             onCompletionReady = { watermark ->
+                (applicationContext as BydCollectorApplication)
+                    .historicalEnergyCandidatesChanged(historicalEnergyGeneration)
                 executeTelegram("telegram_power_off_error", onSuccess = ::postTelegramTickSchedule) {
                     telegramCoordinator?.let { drainTripCompletions(it, watermark) }
                 }
@@ -1698,7 +1814,7 @@ class CollectorService : Service() {
     private fun startMainIfNeeded() {
         if (settings.isUserShutdownRequested()) return
         if (maintenanceBlocksRuntimeStart()) return
-        if (poller.isStopping() || mainCallbackIntake.isStopping() || callbackNormalizer.isStopping()) {
+        if (poller.isStopping() || mainCallbackIntake.isStopping() || callbackNormalizer.isStopping() || businessWorker.isStopping()) {
             setMainRuntime(RuntimeActionStatus.STARTING)
             if (!mainStartRetryScheduled) {
                 mainStartRetryScheduled = true
@@ -1736,11 +1852,14 @@ class CollectorService : Service() {
                             if (mainStartStillCurrent(startGeneration)) {
                                 sessionId = opened
                                 tripRuntime.resume()
+                                check(businessWorker.start()) { "Main previous business consumer has not stopped" }
                                 check(callbackNormalizer.start()) { "Main previous normalizer has not stopped" }
                                 check(mainCallbackIntake.start()) { "Main previous callback consumer has not stopped" }
                                 check(poller.start(opened)) { "Main previous worker has not stopped" }
                                 accepted = true
                                 mainPollingRunning.set(true)
+                                (applicationContext as BydCollectorApplication)
+                                    .historicalEnergyCandidatesChanged(historicalEnergyGeneration)
                                 setMainRuntime(RuntimeActionStatus.RUNNING)
                                 publishDashboardRuntimeFlags()
                                 flushPendingMqttAsync(force = false)
@@ -1817,7 +1936,6 @@ class CollectorService : Service() {
                     }
                     if (!debugStartStillCurrent(startGeneration)) return@execute
                     requestDashboardMetricsRefresh()
-                    val parameters = DirectDebugParameterAsset.load(applicationContext)
                     val helper = DirectVehicleHelperClient()
                     val launch = DirectBridgeManager.ensureRunning(
                         context = applicationContext,
@@ -1833,6 +1951,22 @@ class CollectorService : Service() {
                         }
                         return@execute
                     }
+                    val catalogStatus = helper.secondarySpoolStatus()
+                    val catalogVersion = checkNotNull(catalogStatus.catalogVersion) {
+                        "Secondary catalog negotiation failed: ${catalogStatus.error ?: catalogStatus.status}"
+                    }
+                    val expectedCatalogCount = checkNotNull(
+                        DirectDebugParameterAsset.parameterCountForCatalog(catalogVersion)
+                    ) { "Unsupported secondary catalog from helper: $catalogVersion" }
+                    check(catalogStatus.catalogFieldCount == expectedCatalogCount) {
+                        "Secondary catalog count mismatch: version=$catalogVersion expected=$expectedCatalogCount " +
+                            "actual=${catalogStatus.catalogFieldCount}"
+                    }
+                    val parameters = DirectDebugParameterAsset.loadForCatalog(applicationContext, catalogVersion)
+                    check(parameters.size == catalogStatus.catalogFieldCount) {
+                        "Secondary catalog asset mismatch: version=$catalogVersion expected=${catalogStatus.catalogFieldCount} " +
+                            "actual=${parameters.size}"
+                    }
                     configureDesiredStreams()
                     if (!DirectStreamController.ensureReady(CollectorHelperProtocol.STREAM_SECONDARY)) {
                         val detail = "Secondary stream claim/reconcile failed"
@@ -1843,7 +1977,7 @@ class CollectorService : Service() {
                         return@execute
                     }
                     if (!debugStartStillCurrent(startGeneration)) return@execute
-                    val batchSize = DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT
+                    val batchSize = parameters.size
                     var lastDebugReadModeKey: String? = null
                     val nextPoller = DirectDebugRoundRobinPoller(
                         parameters = parameters,
@@ -1851,6 +1985,7 @@ class CollectorService : Service() {
                         store = debugStore,
                         databaseMaintenanceGate = (applicationContext as BydCollectorApplication).secondaryDatabaseMaintenanceGate,
                         ownerActive = { running.get() && debugStartStillCurrent(startGeneration) },
+                        catalogVersion = catalogVersion,
                         handoverIdentity = {
                             if (debugStartStillCurrent(startGeneration) && !Thread.currentThread().isInterrupted &&
                                 DirectStreamController.setConsumerReady(
@@ -2144,6 +2279,8 @@ class CollectorService : Service() {
         runCatching { (applicationContext as BydCollectorApplication).updateRuntime.shutdown() }
         runCatching { (applicationContext as BydCollectorApplication).updateHints.shutdown() }
         deferredEnergyWorker.requestStopAfterCurrentPage()
+        businessWorker.stopAndJoin(0L)
+        scheduleBusinessTimer(false)
         kpiRuntimeGeneration.incrementAndGet()
         kpiLiveMode = false
         kpiInteractive = false
@@ -2212,7 +2349,8 @@ class CollectorService : Service() {
                 runCatching { callbackNormalizer.awaitStopped(remainingShutdownMs(deadlineElapsedMs)) }.getOrDefault(false)
             }
             val energyStop = workers.submit<Boolean> {
-                runCatching { deferredEnergyWorker.awaitStopped(remainingShutdownMs(deadlineElapsedMs)) }.getOrDefault(false)
+                val businessStopped = runCatching { businessWorker.awaitStopped(remainingShutdownMs(deadlineElapsedMs)) }.getOrDefault(false)
+                businessStopped && runCatching { deferredEnergyWorker.awaitStopped(remainingShutdownMs(deadlineElapsedMs)) }.getOrDefault(false)
             }
             val kpiStop = workers.submit<Boolean> {
                 val current = kpiWorker
@@ -2457,6 +2595,8 @@ class CollectorService : Service() {
     }
 
     private fun stopMain(reason: String) {
+        businessWorker.stopAndJoin(0L)
+        scheduleBusinessTimer(false)
         mainStartGeneration.incrementAndGet()
         mainHandler.removeCallbacks(mainStartRetryTask)
         mainStartRetryScheduled = false
@@ -2911,10 +3051,10 @@ class CollectorService : Service() {
         if (lastKpiDiagnosticMs != Long.MIN_VALUE && now - lastKpiDiagnosticMs < 30_000L) return
         lastKpiDiagnosticMs = now
         val detail = "power_on=$kpiPowerOn interactive=$kpiInteractive live=$kpiLiveMode " +
-            "fallback_sources=$kpiFallbackSources fallback_reason=$kpiFallbackReason " +
+            "source_status=$kpiFallbackReason " +
             "mailbox_snapshots=${kpiMailboxSnapshots.getAndSet(0L)} " +
-            "getter_fields=${kpiGetterFields.getAndSet(0L)} ui_publications=${kpiUiPublications.getAndSet(0L)} " +
-            "expiry=${if (kpiLiveMode) kpiFreshness.expiryDiagnostics(now).orEmpty() else "not_live"}"
+            "ui_publications=${kpiUiPublications.getAndSet(0L)} " +
+            "held_fields=${kpiFreshness.observations().size} validity=source_events"
         queueKpiDiagnostic("kpi_runtime_summary", detail)
     }
 
@@ -2980,7 +3120,6 @@ class CollectorService : Service() {
             kpiFreshness.clear()
             cancelKpiFrame()
             mainHandler.removeCallbacks(kpiPublishTask)
-            mainHandler.removeCallbacks(kpiStaleTask)
             kpiPublishScheduled = false
             lastKpiPublishAtMs = Long.MIN_VALUE
             if (kpiPowerOn) scheduleKpiPublication()
@@ -2991,19 +3130,39 @@ class CollectorService : Service() {
 
     private fun applyKpiSourceUpdate(update: KpiSourceUpdate): Long {
         val generation = if (update.helperGenerationChanged) invalidateKpiUiSources() else kpiUiGeneration.get()
-        if (update.cadenceChanged) signalKpiWorker()
-        if (update.observations.isNotEmpty() && kpiPowerOn && kpiInteractive) {
-            queueDashboardVehicleKpis(update.observations, generation)
+        if (update.powerStateChanged) {
+            val level = update.powerState?.level
+            val on = level != null && level > 0
+            val changed = on != kpiPowerOn
+            kpiPowerOn = on
+            mainHandler.post {
+                if (generation != kpiUiGeneration.get() || !running.get()) return@post
+                if (level == null && ::dashboardUiStateStore.isInitialized) dashboardUiStateStore.clearVehicleKpis()
+                if (level != null && settings.observeHaPower(level.toLong())) {
+                    val demand = settings.runtimeDemand()
+                    if (!demand.mqtt && mqttConnection.owned) stopMqttExport(manualStop = false)
+                    if (!demand.influx && influxConnection.owned) stopInfluxExport(manualStop = false)
+                }
+                if (changed) {
+                    kpiModeTask.run()
+                    if (on) requestEcMeanRefresh()
+                }
+            }
+            signalKpiWorker()
         }
+        if (update.sourceLosses.isNotEmpty()) queueKpiDiagnostic("kpi_source_lost",
+            update.sourceLosses.joinToString("; ") { it.toString() })
+        queueDashboardVehicleKpis(update.observations, generation, update.invalidatedFieldKeys)
         return generation
     }
 
     private fun queueDashboardVehicleKpis(
         observations: List<NormalizedObservation>,
-        sourceGeneration: Long = kpiUiGeneration.get()
+        sourceGeneration: Long = kpiUiGeneration.get(),
+        invalidatedFieldKeys: Set<String> = emptySet()
     ) {
-        if (observations.isEmpty() || sourceGeneration != kpiUiGeneration.get() || !kpiPowerOn ||
-            !kpiInteractive || settings.isUserShutdownRequested()
+        if ((observations.isEmpty() && invalidatedFieldKeys.isEmpty()) ||
+            sourceGeneration != kpiUiGeneration.get() || settings.isUserShutdownRequested()
         ) return
         synchronized(kpiPendingLock) {
             if (sourceGeneration != kpiUiGeneration.get()) return
@@ -3011,6 +3170,7 @@ class CollectorService : Service() {
                 pendingKpiObservations.clear()
                 pendingKpiUiGeneration = sourceGeneration
             }
+            invalidatedFieldKeys.forEach { pendingKpiObservations[it] = null }
             observations.forEach { incoming ->
                 val key = incoming.field.fieldKey
                 val previous = pendingKpiObservations[key]
@@ -3064,7 +3224,7 @@ class CollectorService : Service() {
     private fun publishVehicleKpisNow() {
         if (!running.get() || !kpiPowerOn || !kpiInteractive || settings.isUserShutdownRequested()) return
         val nowMs = SystemClock.elapsedRealtime()
-        val observations = kpiFreshness.freshObservations(nowMs)
+        val observations = kpiFreshness.observations()
         val ecMeanKwhPer100Km = ecCurrentMeanProvider.snapshot().meanKwhPer100Km
         val rangeEstimate = VehicleKpiMapper.rangeEstimateFromObservations(observations, ecMeanKwhPer100Km)
         val rangeDecision = rangeEstimate.source to rangeEstimate.fallbackReason
@@ -3081,9 +3241,6 @@ class CollectorService : Service() {
             VehicleKpiMapper.fromObservations(observations, VehicleKpiLanguage.UK, ecMeanKwhPer100Km),
             VehicleKpiMapper.fromObservations(observations, VehicleKpiLanguage.EN, ecMeanKwhPer100Km)
         )
-        mainHandler.removeCallbacks(kpiStaleTask)
-        val remainingMs = kpiFreshness.remainingMs(nowMs)
-        if (remainingMs > 0L) mainHandler.postDelayed(kpiStaleTask, remainingMs)
     }
 
     private fun clearDashboardVehicleKpis() {
@@ -3098,7 +3255,6 @@ class CollectorService : Service() {
         }
         mainHandler.removeCallbacks(kpiIngestTask)
         mainHandler.removeCallbacks(kpiPublishTask)
-        mainHandler.removeCallbacks(kpiStaleTask)
         kpiPublishScheduled = false
         lastKpiPublishAtMs = Long.MIN_VALUE
         kpiFreshness.clear()
@@ -3128,16 +3284,9 @@ class CollectorService : Service() {
         val helper = DirectVehicleHelperClient()
         val launcher = DirectTelemetryClient(applicationContext, helper = helper,
             expectedOwnerMode = DirectHelperOwnerMode.APP_GAP_SPOOL, ensureStreamReady = { true })
-        val powerEntry = DirectFidRegistry.entries.first { it.key == "bodywork_power_level" }
-        val entries = DirectFidRegistry.entries.filter { it.key in NormalizedFieldCatalog.kpiSourceKeys }
-        val sourceBuffer = KpiLiveSourceBuffer(entries)
-        val cadence = KpiPollCadence()
+        val sourceBuffer = KpiLiveSourceBuffer()
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        var forceSeed = true
-        val seedRequested = AtomicBoolean(false)
-        val cadenceResetRequested = AtomicBoolean(false)
-        var previousLiveMode = false
-        var helperWasReady = false
+        val helperWasReady = AtomicBoolean(false)
         var callbackWorker: KpiCallbackDrainWorker? = null
         var lastFault: String? = null
         var lastFaultAt = Long.MIN_VALUE
@@ -3148,97 +3297,61 @@ class CollectorService : Service() {
                 onSubscription = { result ->
                     if (isKpiRuntimeCurrent(generation)) {
                         kpiFallbackReason = result.listenerError?.take(256) ?: "listener_${result.listenerStatus}"
-                        val update = sourceBuffer.acceptSubscription(
-                            result.helperBootId, result.helperGeneration, result.listenerStatus
-                        )
-                        if (update.helperGenerationChanged) {
-                            cadenceResetRequested.set(true)
-                            seedRequested.set(true)
-                        }
-                        applyKpiSourceUpdate(update)
+                        applyKpiSourceUpdate(sourceBuffer.acceptSubscription(
+                            result.helperBootId, result.helperGeneration, result.listenerStatus))
                     }
                 },
                 onSnapshot = { snapshot ->
                     if (isKpiRuntimeCurrent(generation)) {
                         kpiMailboxSnapshots.incrementAndGet()
                         kpiFallbackReason = snapshot.listenerError?.take(256) ?: "listener_${snapshot.listenerStatus}"
-                        val update = sourceBuffer.acceptMailbox(snapshot, SystemClock.elapsedRealtime())
-                        if (update.helperGenerationChanged) {
-                            cadenceResetRequested.set(true)
-                            seedRequested.set(true)
-                        }
-                        applyKpiSourceUpdate(update)
+                        applyKpiSourceUpdate(sourceBuffer.acceptMailbox(snapshot, SystemClock.elapsedRealtime()))
                     }
                 },
                 onListenerStatus = { status ->
-                    if (isKpiRuntimeCurrent(generation) && sourceBuffer.setListenerStatus(status)) {
-                        signalKpiWorker()
-                    }
+                    kpiFallbackReason = "listener_$status"
                 },
                 onTransportLoss = { reason ->
                     if (isKpiRuntimeCurrent(generation)) {
                         kpiFallbackReason = reason.take(256)
-                        if (sourceBuffer.resetTransport()) invalidateKpiUiSources()
-                        cadenceResetRequested.set(true)
-                        seedRequested.set(true)
+                        queueKpiDiagnostic("kpi_transport_error", reason)
+                        helperWasReady.set(false)
+                        signalKpiWorker()
+                    }
+                },
+                onConfirmedSourceLoss = { loss ->
+                    if (isKpiRuntimeCurrent(generation)) {
+                        applyKpiSourceUpdate(sourceBuffer.confirmedHelperDeath(
+                            loss.helperBootId, loss.helperGeneration, loss.reason ?: "helper_binder_died",
+                            loss.diagnostic, requireNotNull(loss.observedWallMs),
+                            requireNotNull(loss.observedElapsedMs)))
+                        helperWasReady.set(false)
                         signalKpiWorker()
                     }
                 }
-            ).also { it.start() }
+            ).also { it.start(); it.setActive(true) }
             kpiDrainWorker = callbackWorker
             while (isKpiRuntimeCurrent(generation)) {
                 val observedWakeRevision = kpiWakeRevision()
                 try {
-                    if (cadenceResetRequested.getAndSet(false)) {
-                        cadence.clear()
-                    }
-                    if (seedRequested.getAndSet(false)) forceSeed = true
-                    val launchFailure = launcher.ensureHelperReady()
-                    if (launchFailure != null) {
-                        if (helperWasReady) callbackWorker?.requestReconnect()
-                        helperWasReady = false
-                        error("${launchFailure.category}: ${launchFailure.message}")
-                    }
-                    if (!helperWasReady) {
-                        helperWasReady = true
-                        // One bounded reconnect signal after the helper becomes available again.
+                    if (!helperWasReady.get()) {
+                        val launchFailure = launcher.ensureHelperReady()
+                        if (launchFailure != null) error("${launchFailure.category}: ${launchFailure.message}")
+                        helperWasReady.set(true)
                         callbackWorker?.requestReconnect()
                     }
-                    val power = helper.read(powerEntry)
-                    check(power.status == 0 && power.raw != null) {
-                        "KPI power read status=${power.status} ${power.error.orEmpty()}"
-                    }
-                    if (!isKpiRuntimeCurrent(generation)) break
-                    if (cadence.observeHelper(helper.connectionIdentity)) {
-                        sourceBuffer.resetTransport()
-                        invalidateKpiUiSources()
-                        forceSeed = true
-                    }
-                    val on = power.raw > 0
-                    val powerOnEdge = on && !kpiPowerOn
-                    mainHandler.post {
-                        if (isKpiRuntimeCurrent(generation) &&
-                            settings.observeHaPower(power.raw.toLong())
-                        ) {
-                            val demand = settings.runtimeDemand()
-                            if (!demand.mqtt && mqttConnection.owned) stopMqttExport(manualStop = false)
-                            if (!demand.influx && influxConnection.owned) stopInfluxExport(manualStop = false)
-                        }
-                    }
-                    // Charging notifications also use this mean while the vehicle is off.
-                    if (on || settings.isTelegramEnabled()) {
-                        val nowElapsed = SystemClock.elapsedRealtime()
-                        val lastRefresh = ecMeanRefreshRequestedAtElapsedMs
-                        if (powerOnEdge || lastRefresh == Long.MIN_VALUE ||
-                            nowElapsed - lastRefresh >= EC_MEAN_MAX_AGE_MS
-                        ) requestEcMeanRefresh()
-                    }
-                    if (on != kpiPowerOn) {
-                        kpiPowerOn = on
+                    val interactive = powerManager.isInteractive
+                    val live = kpiPowerOn && interactive && KpiUiVisibility.visible
+                    if (interactive != kpiInteractive || live != kpiLiveMode) {
+                        kpiInteractive = interactive
+                        kpiLiveMode = live
                         mainHandler.post(kpiModeTask)
-                        if (on) {
-                            cadence.clear()
-                            forceSeed = true
+                    }
+                    val nowElapsed = SystemClock.elapsedRealtime()
+                    if (kpiPowerOn || settings.isTelegramEnabled()) {
+                        val lastRefresh = ecMeanRefreshRequestedAtElapsedMs
+                        if (lastRefresh == Long.MIN_VALUE || nowElapsed - lastRefresh >= EC_MEAN_MAX_AGE_MS) {
+                            requestEcMeanRefresh()
                         }
                     }
                     val ecSnapshot = ecCurrentMeanProvider.snapshot()
@@ -3248,88 +3361,18 @@ class CollectorService : Service() {
                     ) {
                         observedEcMeanSnapshot = ecSnapshot
                         mainHandler.post {
-                            if (isKpiRuntimeCurrent(generation) &&
-                                kpiFreshness.freshObservations(SystemClock.elapsedRealtime()).isNotEmpty()
-                            ) scheduleKpiPublication()
-                        }
-                    }
-                    val interactive = powerManager.isInteractive
-                    kpiInteractive = interactive
-                    val liveMode = on && interactive && KpiUiVisibility.visible
-                    kpiLiveMode = liveMode
-                    if (liveMode != previousLiveMode) {
-                        mainHandler.post(kpiModeTask)
-                        if (liveMode) {
-                            cadence.clear()
-                            forceSeed = true
-                        }
-                        callbackWorker?.setActive(liveMode)
-                        previousLiveMode = liveMode
-                    }
-                    kpiFallbackSources = entries.count { !sourceBuffer.listenerReady() || !sourceBuffer.callbackProven(it.key) }
-                    if (on) {
-                        val nowElapsed = SystemClock.elapsedRealtime()
-                        val due = cadence.due(
-                            entries = entries,
-                            nowElapsedMs = nowElapsed,
-                            interactive = interactive,
-                            visibleLive = liveMode,
-                            listenerReady = sourceBuffer.listenerReady(),
-                            callbackProven = sourceBuffer::callbackProven,
-                            forceSeed = forceSeed
-                        )
-                        if (due.isNotEmpty()) {
-                            val transportEpoch = sourceBuffer.transportEpoch()
-                            val requestWall = System.currentTimeMillis()
-                            val requestElapsed = SystemClock.elapsedRealtime()
-                            val sourceGeneration = kpiUiGeneration.get()
-                            cadence.markStarted(due, requestElapsed)
-                            // An attempted seed becomes per-field retry, even when the batch fails.
-                            forceSeed = false
-                            kpiGetterFields.addAndGet(due.size.toLong())
-                            val batch = helper.readKpiBatch(due)
-                            if (!isKpiRuntimeCurrent(generation)) break
-                            if (sourceGeneration != kpiUiGeneration.get()) {
-                                cadence.clear()
-                                forceSeed = true
-                            } else {
-                                val now = SystemClock.elapsedRealtime()
-                                if (batch.diagnostics.status != CollectorHelperProtocol.STATUS_OK ||
-                                    batch.results.size != due.size
-                                ) {
-                                    cadence.markResults(due.zip(batch.results), requestElapsed, now)
-                                    error("KPI batch status=${batch.diagnostics.status} ${batch.diagnostics.error.orEmpty()}")
-                                }
-                                val update = sourceBuffer.acceptPoll(
-                                    due.zip(batch.results), requestWall, requestElapsed, now, generation.toString(),
-                                    expectedTransportEpoch = transportEpoch
-                                )
-                                val invalidSources = update.observations.asSequence()
-                                    .filter { it.quality != com.bydcollector.collector.data.normalized.NormalizedQuality.OK &&
-                                        it.field.sourceKeys.size == 1 }
-                                    .flatMap { it.field.sourceKeys.asSequence() }.toSet()
-                                cadence.markResults(due.zip(batch.results), requestElapsed, now, invalidSources)
-                                if (update.observations.isNotEmpty() && interactive) {
-                                    queueDashboardVehicleKpis(update.observations, sourceGeneration)
-                                }
-                                forceSeed = false
+                            if (isKpiRuntimeCurrent(generation) && kpiFreshness.observations().isNotEmpty()) {
+                                scheduleKpiPublication()
                             }
                         }
                     }
                     lastFault = null
-                    val nextPollDelay = if (on) cadence.nextDelayMs(
-                        entries, SystemClock.elapsedRealtime(), interactive, liveMode,
-                        sourceBuffer.listenerReady(), sourceBuffer::callbackProven
-                    ) else Long.MAX_VALUE
-                    val powerCheckDelay = if (on && interactive) 1_000L else 2_000L
-                    awaitKpiWorkerWake(
-                        observedWakeRevision,
-                        minOf(powerCheckDelay, nextPollDelay).coerceAtLeast(1L)
-                    )
+                    // Only a local EC-mean refresh deadline. Native reads are helper initial/recovery events.
+                    awaitKpiWorkerWake(observedWakeRevision, EC_MEAN_MAX_AGE_MS.coerceAtMost(30_000L))
                 } catch (interrupted: InterruptedException) {
                     throw interrupted
                 } catch (error: Exception) {
-                    helperWasReady = false
+                    helperWasReady.set(false)
                     val detail = error.diagnosticDetail()
                     val now = SystemClock.elapsedRealtime()
                     if (detail != lastFault || lastFaultAt == Long.MIN_VALUE || now - lastFaultAt >= 30_000L) {
@@ -3338,7 +3381,7 @@ class CollectorService : Service() {
                         lastFault = detail
                         lastFaultAt = now
                     }
-                    awaitKpiWorkerWake(observedWakeRevision, if (kpiInteractive) 1_000L else 2_000L)
+                    awaitKpiWorkerWake(observedWakeRevision, 2_000L)
                 }
             }
         } catch (_: InterruptedException) {
@@ -3468,6 +3511,9 @@ class CollectorService : Service() {
     private fun stopRuntimeForMaintenance(operation: DbMaintenanceOperation) {
         check(!isRuntimeOwner()) { "Database maintenance must not wait for workers on the main handler" }
         if (operation != DbMaintenanceOperation.DEBUG_ARCHIVE) {
+            businessWorker.requestStopAfterCurrentPage()
+            scheduleBusinessTimer(false)
+            check(businessWorker.awaitStopped(2_000L)) { "Business input worker did not stop" }
             deferredEnergyWorker.requestStopAfterCurrentPage()
             check(deferredEnergyWorker.awaitStopped(2_000L)) { "Deferred energy worker did not stop" }
         }
@@ -3505,6 +3551,10 @@ class CollectorService : Service() {
             maintenanceCoordinator.reportDrainProgress(operation, if (pending.hasMore) null else 0,
                 "нормалізація", "normalization", pending.processedCount > 0)
         } while (pending.hasMore)
+        while (drainBusinessPage(maintenanceDrain = true)) {
+            maintenanceCoordinator.checkDrainCancelled(operation)
+            maintenanceCoordinator.reportDrainProgress(operation, null, "події", "business inputs", true)
+        }
         if (!tripRuntime.pauseAndAwait("database_maintenance")) {
             maintenanceRuntimeRestoreAllowed.set(false)
             error("Trip runtime did not pause for database maintenance")
@@ -3672,8 +3722,23 @@ class CollectorService : Service() {
 
         fenceArchiveStream(CollectorHelperProtocol.STREAM_SECONDARY)
         val operation = DbMaintenanceOperation.DEBUG_ARCHIVE
-        val parameters = DirectDebugParameterAsset.load(applicationContext)
-        val archiveSessionId = debugStore.openSession(parameters, DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT)
+        val catalogStatus = helper.secondarySpoolStatus()
+        val catalogVersion = checkNotNull(catalogStatus.catalogVersion) {
+            "Secondary catalog negotiation failed: ${catalogStatus.error ?: catalogStatus.status}"
+        }
+        val expectedCatalogCount = checkNotNull(DirectDebugParameterAsset.parameterCountForCatalog(catalogVersion)) {
+            "Unsupported secondary catalog from helper: $catalogVersion"
+        }
+        check(catalogStatus.catalogFieldCount == expectedCatalogCount) {
+            "Secondary catalog count mismatch: version=$catalogVersion expected=$expectedCatalogCount " +
+                "actual=${catalogStatus.catalogFieldCount}"
+        }
+        val parameters = DirectDebugParameterAsset.loadForCatalog(applicationContext, catalogVersion)
+        check(parameters.size == catalogStatus.catalogFieldCount) {
+            "Secondary catalog asset mismatch: version=$catalogVersion expected=${catalogStatus.catalogFieldCount} " +
+                "actual=${parameters.size}"
+        }
+        val archiveSessionId = debugStore.openSession(parameters, parameters.size, catalogVersion)
         try {
             drainArchiveCallbacks(helper, operation, CollectorHelperProtocol.STREAM_SECONDARY)
             var remaining = helper.secondarySpoolStatus().takeIf { it.ok && !it.inFlight }?.readyRecords?.toLong()
@@ -3755,6 +3820,10 @@ class CollectorService : Service() {
         dashboardMetricsGeneration.incrementAndGet()
         dashboardUiStateStore.invalidateRowCounts()
         store = newStore
+        businessGeneration = null
+        businessInputs = emptyMap()
+        businessContinuity = emptyMap()
+        energyHydrated = false
         settings = CollectorSettings(applicationContext, store)
         dashboardStateProvider = DashboardStateProvider(applicationContext, { store }, settings)
         keepAliveSupervisor.shutdown()
@@ -4451,6 +4520,8 @@ class CollectorService : Service() {
         if (::poller.isInitialized) poller.stop()
         if (::mainCallbackIntake.isInitialized) mainCallbackIntake.stopAndJoin(0L)
         if (::callbackNormalizer.isInitialized) callbackNormalizer.stopAndJoin(0L)
+        if (::businessWorker.isInitialized) businessWorker.stopAndJoin(0L)
+        scheduleBusinessTimer(false)
         mainPollingRunning.set(false)
         sessionId?.let { openedSessionId ->
             runCatching { store.endSession(openedSessionId, "main_start_error") }
@@ -5036,8 +5107,16 @@ class CollectorService : Service() {
     }
 
     private fun handleTelegramExecutionFailure(error: Throwable) {
+        runCatching {
+            store.recordEvent(
+                "telegram_delivery_runtime_error",
+                "Telegram delivery result remains pending",
+                error.diagnosticDetail()
+            )
+        }.onFailure(error::addSuppressed)
         if (error !is SQLiteException) {
             if (telegramDeliveryRuntime.hasPendingResult) mainHandler.post { scheduleTelegramTick() }
+            else if (telegramDeliveryRuntime.hasInFlightDelivery) mainHandler.post { scheduleTelegramTick() }
             return
         }
         (applicationContext as BydCollectorApplication).markTelegramStorageUnavailable(store, error)
@@ -5700,24 +5779,15 @@ class CollectorService : Service() {
 
     private fun createTelegramCoordinator(): TelegramCoordinator? {
         val application = applicationContext as BydCollectorApplication
-        telegramDeliveryRuntime.attach(
-            this,
-            onReady = { postTelegramTickSchedule(it, telegramWorkGeneration.get()) },
-            onFailure = ::handleTelegramExecutionFailure,
-            onPendingResult = { outcome, acknowledge ->
-                telegramCoordinator?.settlePendingResult(outcome, acknowledge)
+        val coordinator = telegramCoordinator ?: run {
+            val telegramStore = application.telegramStoreOrNull() ?: run {
+                settings.setTelegramConnectionStatus(
+                    "storage_error",
+                    BydCollectorApplication.TELEGRAM_STORAGE_ERROR
+                )
+                return null
             }
-        )
-        telegramDeliveryRuntime.resume()
-        telegramCoordinator?.let { return it }
-        val telegramStore = application.telegramStoreOrNull() ?: run {
-            settings.setTelegramConnectionStatus(
-                "storage_error",
-                BydCollectorApplication.TELEGRAM_STORAGE_ERROR
-            )
-            return null
-        }
-        return TelegramCoordinator(
+            TelegramCoordinator(
             eventStore = store,
             telegramStore = telegramStore,
             settings = settings,
@@ -5737,7 +5807,20 @@ class CollectorService : Service() {
                 }
             },
             ecMeanKwhPer100Km = { ecCurrentMeanProvider.snapshot().meanKwhPer100Km }
+            )
+        }
+        telegramDeliveryRuntime.attach(
+            token = this,
+            onReady = { postTelegramTickSchedule(it, telegramWorkGeneration.get()) },
+            onFailure = ::handleTelegramExecutionFailure,
+            onPendingResult = { outcome, acknowledge -> coordinator.settlePendingResult(outcome, acknowledge) },
+            restoreAttempt = coordinator::restoreDeliveryAttempt,
+            preparedAttemptAction = coordinator::preparedAttemptAction,
+            discardPreparedAttempt = coordinator::discardPreparedAttempt,
+            acknowledgeAttempt = coordinator::acknowledgePersistedAttempt
         )
+        telegramDeliveryRuntime.resume()
+        return coordinator
     }
 
     private fun updateNotification(text: String) {
@@ -5825,7 +5908,6 @@ class CollectorService : Service() {
         private const val DASHBOARD_RUNTIME_HEARTBEAT_MS = 2_000L
         private const val DATABASE_FOOTPRINT_INTERVAL_MS = 10_000L
         private const val KPI_PUBLISH_INTERVAL_MS = 1_000L
-        private const val KPI_STALE_AFTER_MS = 3_000L
         private const val ACCESS_SELF_CHECK_INTERVAL_MS = 5 * 60_000L
         private const val ARCHIVE_RETRY_BLOCKED_DELAY_MS = 60_000L
         private const val TELEGRAM_TICK_INTERVAL_MS = 15_000L

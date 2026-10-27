@@ -37,7 +37,53 @@ public interface TelegramDeliveryStore {
     fun extendTelegramServerNotBefore(botScope: String, notBeforeMs: Long)
 
     fun expediteNetworkRetries(nowMs: Long, excludeIds: Set<Long> = emptySet()): Int
+
+    fun activeTelegramDeliveryAttempt(): TelegramPersistedDeliveryAttempt?
+
+    fun prepareTelegramDeliveryAttempt(
+        entry: TelegramOutboxEntry,
+        requestDigest: String,
+        destinationDigest: String,
+        dedupeRef: String,
+        botScope: String,
+        startedAtMs: Long
+    ): TelegramPersistedDeliveryAttempt
+
+    fun settleTelegramDeliverySuccess(
+        attemptId: String,
+        receipt: TelegramDeliveryReceipt,
+        stateJson: String?
+    ): Boolean
+
+    fun settleTelegramDeliveryFailure(
+        attemptId: String,
+        error: String,
+        attemptedAtMs: Long,
+        nextAttemptAtMs: Long?
+    ): Boolean
+
+    fun acknowledgeTelegramDeliveryAttempt(attemptId: String): Boolean
+
+    fun discardPreparedTelegramDeliveryAttempt(attemptId: String): Boolean
+
+    fun protectedTelegramOutboxIds(): Set<Long>
 }
+
+/** Secret-free APP-side identity for the single serialized helper delivery lane. */
+data class TelegramPersistedDeliveryAttempt(
+    val ownerId: String,
+    val attemptId: String,
+    val sequence: Long,
+    val outboxId: Long,
+    val dedupeKey: String,
+    val eventType: String,
+    val requestDigest: String,
+    val destinationDigest: String,
+    val dedupeRef: String,
+    val botScope: String,
+    val startedAtMs: Long,
+    val localSettled: Boolean
+)
 
 data class TelegramEnqueueResult(
     val inserted: Boolean,

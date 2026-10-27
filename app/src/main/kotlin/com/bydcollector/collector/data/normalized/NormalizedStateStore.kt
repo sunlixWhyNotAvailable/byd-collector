@@ -3,6 +3,7 @@ package com.bydcollector.collector.data.normalized
 import android.content.ContentValues
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
+import android.database.sqlite.SQLiteStatement
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
@@ -76,34 +77,49 @@ class NormalizedStateStore(
         observations: List<NormalizedObservation>
     ): NormalizedWriteSummary {
         check(db.inTransaction()) { "normalized callback writes require an active transaction" }
+        if (observations.isEmpty()) return NormalizedWriteSummary(0, 0, 0)
+
+        val currentByKey = loadCurrentStates(db, observations.map { it.field.fieldKey }.distinct())
         var changedCount = 0
         var historyInsertedCount = 0
         var currentInsertedCount = 0
         val changedCategories = mutableSetOf<String>()
 
-        observations.forEach { observation ->
-            val next = observation.toStoredState()
-            val previous = currentStateForField(db, next.fieldKey)
-            if (previous == null) currentInsertedCount += 1
-            //dedupes unchanged semantic values so history represents changes instead of every poll tick
-            val decision = NormalizedStateReducer.decide(previous, next)
+        return db.compileStatement(CURRENT_UPDATE_SQL).use { updateCurrent ->
+            db.compileStatement(CURRENT_INSERT_SQL).use { insertCurrent ->
+                db.compileStatement(if (compactV2) COMPACT_HISTORY_INSERT_SQL else LEGACY_HISTORY_INSERT_SQL).use {
+                    historyStatement ->
+                    observations.forEach { observation ->
+                        val next = observation.toStoredState()
+                        val previous = currentByKey[next.fieldKey]
+                        if (previous == null) currentInsertedCount += 1
+                        //dedupes unchanged semantic values so history represents changes instead of every poll tick
+                        val decision = NormalizedStateReducer.decide(previous, next)
 
-            if (decision.insertHistory) {
-                changedCount += 1
-                insertHistory(db, decision.current)
-                historyInsertedCount += 1
-                changedCategories += decision.current.category
+                        if (decision.insertHistory) {
+                            changedCount += 1
+                            insertHistory(db, historyStatement, decision.current)
+                            historyInsertedCount += 1
+                            changedCategories += decision.current.category
+                        }
+                        if (previous == null) {
+                            insertCurrent(insertCurrent, decision.current)
+                        } else if (updateCurrent(updateCurrent, decision.current) == 0) {
+                            //Retain the old update-then-insert fallback if a row vanishes during this transaction.
+                            insertCurrent(insertCurrent, decision.current)
+                        }
+                        currentByKey[next.fieldKey] = decision.current
+                    }
+                    NormalizedWriteSummary(
+                        observedCount = observations.size,
+                        changedCount = changedCount,
+                        historyInsertedCount = historyInsertedCount,
+                        currentInsertedCount = currentInsertedCount,
+                        changedCategories = changedCategories
+                    )
+                }
             }
-            upsertCurrent(db, decision.current)
         }
-
-        return NormalizedWriteSummary(
-            observedCount = observations.size,
-            changedCount = changedCount,
-            historyInsertedCount = historyInsertedCount,
-            currentInsertedCount = currentInsertedCount,
-            changedCategories = changedCategories
-        )
     }
 
     fun currentState(categories: Set<String>? = null): List<StoredNormalizedState> {
@@ -134,10 +150,15 @@ class NormalizedStateStore(
 
     fun markStale(nowIso: String = clock.nowIso()): Int {
         val now = parseIso(nowIso) ?: return 0
+        val continuity = sourceContinuityStatus()
         //marks stale fields when polling stops so ha can see old values as degraded instead of fresh
         val staleRows = currentState()
             .filter { it.quality == NormalizedQuality.OK.name }
             .filter { row ->
+                val sourceKeys = row.sourceKeys.split(',').filter(String::isNotBlank)
+                val sourceStates = sourceKeys.mapNotNull(continuity::get)
+                if (sourceStates.any { it.lostCurrent }) return@filter true
+                if (sourceStates.any { it.availableCurrent }) return@filter false
                 val observedAt = parseIso(row.observedAt) ?: return@filter false
                 val ttl = staleAfterMs(row.category) ?: return@filter false
                 ChronoUnit.MILLIS.between(observedAt, now) > ttl
@@ -158,6 +179,39 @@ class NormalizedStateStore(
             db.endTransaction()
         }
         return staleRows.size
+    }
+
+    private data class SourceContinuityStatus(val lostCurrent: Boolean, val availableCurrent: Boolean)
+
+    private fun sourceContinuityStatus(): Map<String, SourceContinuityStatus> {
+        val db = helper.readableDatabase
+        val tables = db.rawQuery("SELECT name FROM sqlite_master WHERE type = 'table'", emptyArray()).use { cursor ->
+            buildSet { while (cursor.moveToNext()) add(cursor.getString(0)) }
+        }
+        if ("business_input_source_continuity" !in tables || "normalized_source_inputs" !in tables) return emptyMap()
+        val latestInputs = db.rawQuery(
+            "SELECT source_key, source_identity, source_boot_id, source_elapsed_ms FROM normalized_source_inputs",
+            emptyArray()
+        ).use { cursor ->
+            buildMap { while (cursor.moveToNext()) put(cursor.getString(0), Triple(cursor.getString(1), cursor.getString(2), cursor.getLong(3))) }
+        }
+        return db.rawQuery(
+            "SELECT source_key, state, source_identity, source_boot_id, source_elapsed_ms, seed_identity, seed_valid " +
+                "FROM business_input_source_continuity",
+            emptyArray()
+        ).use { cursor ->
+            buildMap {
+                while (cursor.moveToNext()) {
+                    val key = cursor.getString(0)
+                    val input = latestInputs[key]
+                    val sameBoot = input != null && input.second == cursor.getString(3)
+                    val lostCurrent = cursor.getString(1) == "lost" && sameBoot && cursor.getLong(4) >= input!!.third
+                    val availableCurrent = cursor.getString(1) == "available" && cursor.getInt(6) == 1 &&
+                        input?.first == cursor.getString(5)
+                    put(key, SourceContinuityStatus(lostCurrent, availableCurrent))
+                }
+            }
+        }
     }
 
     private fun upsertCatalogField(db: SQLiteDatabase, field: NormalizedFieldDefinition) {
@@ -218,18 +272,109 @@ class NormalizedStateStore(
         )
     }
 
-    private fun currentStateForField(db: SQLiteDatabase, fieldKey: String): StoredNormalizedState? {
-        db.rawQuery(
-            """
-            SELECT field_key, category, value_type, value_text, value_number, value_bool,
-                quality, unit, source_poll_id, source_keys, observed_at, changed_at, quality_detail
-            FROM vehicle_state_current
-            WHERE field_key = ?
-            LIMIT 1
-            """.trimIndent(),
-            arrayOf(fieldKey)
-        ).use { cursor ->
-            return if (cursor.moveToFirst()) cursor.toStoredNormalizedState() else null
+    private fun loadCurrentStates(
+        db: SQLiteDatabase,
+        fieldKeys: List<String>
+    ): MutableMap<String, StoredNormalizedState> = buildMap {
+        fieldKeys.chunked(CURRENT_STATE_SELECT_CHUNK_SIZE).forEach { chunk ->
+            val placeholders = List(chunk.size) { "?" }.joinToString(",")
+            db.rawQuery(
+                "SELECT $CURRENT_STATE_COLUMNS FROM vehicle_state_current WHERE field_key IN ($placeholders)",
+                chunk.toTypedArray()
+            ).use { cursor ->
+                while (cursor.moveToNext()) {
+                    val state = cursor.toStoredNormalizedState()
+                    put(state.fieldKey, state)
+                }
+            }
+        }
+    }.toMutableMap()
+
+    private fun updateCurrent(statement: SQLiteStatement, state: StoredNormalizedState): Int {
+        statement.clearBindings()
+        statement.bindString(1, state.category)
+        statement.bindString(2, state.valueType)
+        statement.bindNullableString(3, state.valueText)
+        statement.bindNullableDouble(4, state.valueNumber)
+        statement.bindNullableBoolean(5, state.valueBool)
+        statement.bindString(6, state.quality)
+        statement.bindNullableString(7, state.qualityDetail)
+        statement.bindNullableString(8, state.unit)
+        statement.bindNullableLong(9, state.sourcePollId)
+        statement.bindString(10, state.sourceKeys)
+        statement.bindString(11, state.observedAt)
+        statement.bindString(12, state.changedAt)
+        statement.bindString(13, clock.nowIso())
+        statement.bindString(14, state.fieldKey)
+        return statement.executeUpdateDelete()
+    }
+
+    private fun insertCurrent(statement: SQLiteStatement, state: StoredNormalizedState) {
+        statement.clearBindings()
+        statement.bindString(1, state.fieldKey)
+        statement.bindString(2, state.category)
+        statement.bindString(3, state.valueType)
+        statement.bindNullableString(4, state.valueText)
+        statement.bindNullableDouble(5, state.valueNumber)
+        statement.bindNullableBoolean(6, state.valueBool)
+        statement.bindString(7, state.quality)
+        statement.bindNullableString(8, state.qualityDetail)
+        statement.bindNullableString(9, state.unit)
+        statement.bindNullableLong(10, state.sourcePollId)
+        statement.bindString(11, state.sourceKeys)
+        statement.bindString(12, state.observedAt)
+        statement.bindString(13, state.changedAt)
+        statement.bindString(14, clock.nowIso())
+        check(statement.executeInsert() != -1L) { "normalized current insert returned no row ID: ${state.fieldKey}" }
+    }
+
+    private fun insertHistory(db: SQLiteDatabase, statement: SQLiteStatement, state: StoredNormalizedState) {
+        statement.clearBindings()
+        if (compactV2) {
+            statement.bindLong(1, state.compactHistoryFieldId(db))
+            statement.bindNullableString(2, state.valueText)
+            statement.bindNullableDouble(3, state.valueNumber)
+            statement.bindNullableBoolean(4, state.valueBool)
+            statement.bindLong(5, NormalizedQuality.valueOf(state.quality).storageCode.toLong())
+            statement.bindNullableString(6, state.qualityDetail)
+            statement.bindNullableLong(7, state.sourcePollId)
+            statement.bindLong(8, normalizedEpochMillis(state.observedAt))
+            statement.bindLong(9, normalizedEpochMillis(state.changedAt))
+        } else {
+            statement.bindString(1, state.fieldKey)
+            statement.bindString(2, state.category)
+            statement.bindString(3, state.valueType)
+            statement.bindNullableString(4, state.valueText)
+            statement.bindNullableDouble(5, state.valueNumber)
+            statement.bindNullableBoolean(6, state.valueBool)
+            statement.bindString(7, state.quality)
+            statement.bindNullableString(8, state.qualityDetail)
+            statement.bindNullableString(9, state.unit)
+            statement.bindNullableLong(10, state.sourcePollId)
+            statement.bindString(11, state.sourceKeys)
+            statement.bindString(12, state.observedAt)
+            statement.bindString(13, state.changedAt)
+        }
+        check(statement.executeInsert() != -1L) { "normalized history insert returned no row ID: ${state.fieldKey}" }
+    }
+
+    private fun SQLiteStatement.bindNullableString(index: Int, value: String?) {
+        if (value == null) bindNull(index) else bindString(index, value)
+    }
+
+    private fun SQLiteStatement.bindNullableDouble(index: Int, value: Double?) {
+        if (value == null) bindNull(index) else bindDouble(index, value)
+    }
+
+    private fun SQLiteStatement.bindNullableLong(index: Int, value: Long?) {
+        if (value == null) bindNull(index) else bindLong(index, value)
+    }
+
+    private fun SQLiteStatement.bindNullableBoolean(index: Int, value: Boolean?) {
+        when (value) {
+            null -> bindNull(index)
+            true -> bindLong(index, 1L)
+            false -> bindLong(index, 0L)
         }
     }
 
@@ -381,6 +526,37 @@ class NormalizedStateStore(
         return NormalizedCategory.entries
             .firstOrNull { it.mqttKey == category }
             ?.staleAfterMs
+    }
+
+    private companion object {
+        // Stay below SQLite's bind-variable cap while keeping the number of SELECTs bounded.
+        const val CURRENT_STATE_SELECT_CHUNK_SIZE = 400
+        const val CURRENT_STATE_COLUMNS =
+            "field_key, category, value_type, value_text, value_number, value_bool, " +
+                "quality, unit, source_poll_id, source_keys, observed_at, changed_at, quality_detail"
+        const val CURRENT_UPDATE_SQL = """
+            UPDATE vehicle_state_current SET category = ?, value_type = ?, value_text = ?, value_number = ?,
+                value_bool = ?, quality = ?, quality_detail = ?, unit = ?, source_poll_id = ?, source_keys = ?,
+                observed_at = ?, changed_at = ?, updated_at = ? WHERE field_key = ?
+        """
+        const val CURRENT_INSERT_SQL = """
+            INSERT INTO vehicle_state_current(
+                field_key, category, value_type, value_text, value_number, value_bool, quality,
+                quality_detail, unit, source_poll_id, source_keys, observed_at, changed_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        const val LEGACY_HISTORY_INSERT_SQL = """
+            INSERT INTO vehicle_state_history(
+                field_key, category, value_type, value_text, value_number, value_bool, quality,
+                quality_detail, unit, source_poll_id, source_keys, observed_at, changed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        const val COMPACT_HISTORY_INSERT_SQL = """
+            INSERT INTO vehicle_state_history(
+                field_id, value_text, value_number, value_bool, quality_code, quality_detail,
+                source_poll_id, observed_at_ms, changed_at_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
     }
 }
 

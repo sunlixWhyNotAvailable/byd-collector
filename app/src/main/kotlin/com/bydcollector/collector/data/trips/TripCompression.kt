@@ -79,6 +79,7 @@ internal class TripCompression(
                 snapshotStore.completionWatermark(),
                 snapshotStore.allPendingCompletions()
             )
+            candidateStore.replaceBusinessInputCursor(snapshotStore.businessInputCursor())
             onPhase(TripCompressionPhase.CANDIDATE_BUILT)
             onStep(2)
             check(sameSessions(snapshotStore, candidateStore)) { "Trip sessions changed during compression" }
@@ -86,6 +87,7 @@ internal class TripCompression(
             check(snapshotStore.energyQuarantineRecords() == candidateStore.energyQuarantineRecords()) { "Energy recovery evidence changed during compression" }
             check(sameHistoricalEnergyBackfill(snapshotStore, candidateStore)) { "Historical energy progress changed during compression" }
             check(sameTripCompletions(snapshotStore, candidateStore)) { "Trip completion intents changed during compression" }
+            check(sameBusinessInputCursor(snapshotStore, candidateStore)) { "Business input cursor changed during compression" }
             sessions.forEach { session ->
                 checkInterrupted()
                 check(sameRoute(snapshotStore, candidateStore, session.tripId)) { "Route equality verification failed" }
@@ -121,16 +123,21 @@ internal class TripCompression(
                             store.allPendingCompletions()
                         )
                     }
+                    if (store.businessInputCursorChanged()) {
+                        candidateStore.replaceBusinessInputCursor(store.businessInputCursor())
+                    }
                     check(sameSessions(store, candidateStore)) { "Concurrent trip state was not preserved" }
                     check(sameEnergyRuntime(store, candidateStore)) { "Concurrent energy runtime state was not preserved" }
                     check(sameHistoricalEnergyBackfill(store, candidateStore)) { "Concurrent historical energy progress was not preserved" }
                     check(sameTripCompletions(store, candidateStore)) { "Concurrent trip completion intents were not preserved" }
+                    check(sameBusinessInputCursor(store, candidateStore)) { "Concurrent business input cursor was not preserved" }
                     val expectedCount = candidateStore.sessionCount()
                     val expectedEnergyRuntime = candidateStore.readEnergyRuntimeRow()
                     val expectedEnergyQuarantine = candidateStore.energyQuarantineRecords()
                     val expectedHistoricalBackfill = candidateStore.historicalEnergyBackfillRecords()
                     val expectedCompletionWatermark = candidateStore.completionWatermark()
                     val expectedCompletions = candidateStore.allPendingCompletions()
+                    val expectedBusinessInputCursor = candidateStore.businessInputCursor()
                     candidateStore.checkpointTruncate()
                     candidateStore.closeDatabase()
                     store.checkpointTruncate()
@@ -147,7 +154,8 @@ internal class TripCompression(
                             expectedHistoricalBackfill,
                             expectedEnergyQuarantine,
                             expectedCompletionWatermark,
-                            expectedCompletions
+                            expectedCompletions,
+                            expectedBusinessInputCursor
                         )
                         TripCompressionResult(before, after)
                     }
@@ -177,7 +185,8 @@ internal class TripCompression(
         expectedHistoricalBackfill: List<HistoricalEnergyBackfillRecord>,
         expectedEnergyQuarantine: List<EnergyQuarantineRecord>,
         expectedCompletionWatermark: Long,
-        expectedCompletions: List<TripCompletionIntent>
+        expectedCompletions: List<TripCompletionIntent>,
+        expectedBusinessInputCursor: TripBusinessInputCursor?
     ) {
         store.closeForReplacement()
         try {
@@ -199,7 +208,8 @@ internal class TripCompression(
                     store.historicalEnergyBackfillRecords() == expectedHistoricalBackfill &&
                     store.energyQuarantineRecords() == expectedEnergyQuarantine &&
                     store.completionWatermark() == expectedCompletionWatermark &&
-                    store.allPendingCompletions() == expectedCompletions
+                    store.allPendingCompletions() == expectedCompletions &&
+                    store.businessInputCursor() == expectedBusinessInputCursor
             ) {
                 "Compressed Trips reopen verification failed"
             }
@@ -402,6 +412,9 @@ internal class TripCompression(
         private fun sameTripCompletions(left: TripStore, right: TripStore): Boolean =
             left.completionWatermark() == right.completionWatermark() &&
                 left.allPendingCompletions() == right.allPendingCompletions()
+
+        private fun sameBusinessInputCursor(left: TripStore, right: TripStore): Boolean =
+            left.businessInputCursor() == right.businessInputCursor()
 
         private fun sameRoute(left: TripStore, right: TripStore, tripId: String, firstSequence: Long = 0L): Boolean =
             routeDigest(left, tripId, firstSequence).contentEquals(routeDigest(right, tripId, firstSequence))

@@ -18,8 +18,11 @@ import com.bydcollector.collector.data.trips.TripStore
 import com.bydcollector.collector.data.trips.TripCompression
 import com.bydcollector.collector.data.trips.HistoricalEnergyBackfillRecord
 import com.bydcollector.collector.data.energy.HistoricalEnergyAccumulator
+import com.bydcollector.collector.data.energy.HistoricalBusinessEnergyAccumulator
 import com.bydcollector.collector.data.energy.HistoricalEnergyResult
 import com.bydcollector.collector.data.energy.HistoricalBackfillFinalizationGate
+import com.bydcollector.collector.data.input.BusinessInputProjection
+import com.bydcollector.collector.data.local.HistoricalBusinessInputSource
 import java.util.concurrent.locks.ReentrantLock
 import com.bydcollector.collector.diagnostics.OperationalEventJournal
 import com.bydcollector.collector.diagnostics.ProcessExitDiagnostics
@@ -42,6 +45,7 @@ import com.bydcollector.collector.update.UpdateCheckSession
 import com.bydcollector.collector.util.dispatchOperationalEvent
 import com.bydcollector.collector.util.namedSingleThreadExecutor
 import com.bydcollector.collector.util.sharedOperationalEventExecutor
+import com.bydcollector.collector.util.diagnosticDetail
 import java.io.File
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicBoolean
@@ -124,8 +128,15 @@ class BydCollectorApplication : Application() {
     private val telegramDeliveryRuntimeDelegate = lazy { TelegramDeliveryRuntime() }
     private val historicalEnergyScheduled = AtomicBoolean(false)
     private val historicalEnergyFinished = AtomicBoolean(false)
+    private val historicalEnergyRescanRequested = AtomicBoolean(false)
     private val historicalEnergyFinalization = HistoricalBackfillFinalizationGate()
     private var historicalEndpointIndex: HistoricalEndpointIndex? = null
+    private val historicalBusinessScanLock = Any()
+    private var historicalBusinessScanKey: String? = null
+    private var historicalBusinessScanAfterTripId: String? = null
+    private var historicalBusinessScanExhausted = false
+    private var historicalBusinessScanEpoch = 0L
+    private val historicalBusinessNoCoverageTrips = mutableSetOf<String>()
     private var historicalLastRetry: String? = null
     private var historicalLastRetryAtElapsedMs = Long.MIN_VALUE
     internal val updateChecks by lazy {
@@ -226,13 +237,43 @@ class BydCollectorApplication : Application() {
     internal fun scheduleHistoricalEnergyBackfill(generation: Long) {
         if (!historicalEnergyCanContinue(generation)) return
         if (historicalEnergyFinished.get()) return
-        if (!historicalEnergyScheduled.compareAndSet(false, true)) return
+        if (!historicalEnergyScheduled.compareAndSet(false, true)) {
+            historicalEnergyRescanRequested.set(true)
+            if (!historicalEnergyScheduled.get() && historicalEnergyRescanRequested.getAndSet(false)) {
+                historicalEnergyFinished.set(false)
+                scheduleHistoricalEnergyBackfill(generation)
+            }
+            return
+        }
         historicalEnergyExecutorDelegate.value.execute {
             val progressed = runCatching { runHistoricalEnergyBackfillTrip(generation) }
-                .onFailure { recordHistoricalEnergyEvent("retry", it.message ?: it::class.java.simpleName) }
+                .onFailure { recordHistoricalEnergyEvent("retry", it.diagnosticDetail("stage=historical_energy_backfill")) }
                 .getOrDefault(false)
             historicalEnergyScheduled.set(false)
-            if (progressed && historicalEnergyCanContinue(generation)) scheduleHistoricalEnergyBackfill(generation)
+            val requested = historicalEnergyRescanRequested.getAndSet(false)
+            if ((progressed || requested) && historicalEnergyCanContinue(generation)) {
+                historicalEnergyFinished.set(false)
+                scheduleHistoricalEnergyBackfill(generation)
+            }
+        }
+    }
+
+    /** Called after a Trip closes or the Main source set is rebound. */
+    internal fun historicalEnergyCandidatesChanged(generation: Long) {
+        if (!historicalEnergyCanContinue(generation)) return
+        historicalEnergyFinished.set(false)
+        synchronized(historicalBusinessScanLock) {
+            historicalBusinessScanEpoch++
+            historicalBusinessScanAfterTripId = null
+            historicalBusinessScanExhausted = false
+        }
+        if (historicalEnergyScheduled.get()) {
+            historicalEnergyRescanRequested.set(true)
+            if (!historicalEnergyScheduled.get() && historicalEnergyRescanRequested.getAndSet(false)) {
+                scheduleHistoricalEnergyBackfill(generation)
+            }
+        } else {
+            scheduleHistoricalEnergyBackfill(generation)
         }
     }
 
@@ -243,6 +284,18 @@ class BydCollectorApplication : Application() {
     private fun runHistoricalEnergyBackfillTrip(generation: Long): Boolean {
         if (!historicalEnergyCanContinue(generation)) return false
         val trips = tripsStoreOrNull() ?: return false
+        val businessSource = tryDatabaseRead {
+            StoreReadResult(telemetryStore?.historicalBusinessInputSource())
+        }?.value
+        if (businessSource != null) {
+            when (val search = findHistoricalBusinessEnergyCandidate(trips, generation, businessSource)) {
+                is HistoricalBusinessCandidateSearch.Found -> return runHistoricalBusinessEnergyTrip(
+                    trips, generation, businessSource, search
+                )
+                is HistoricalBusinessCandidateSearch.Retry -> return historicalEnergyRetry(search.reason)
+                HistoricalBusinessCandidateSearch.None -> Unit
+            }
+        }
         if (!tripsFileOperationLock.tryLock()) return historicalEnergyRetry("trips_maintenance_busy")
         val candidate = try {
             trips.nextHistoricalEnergyCandidate()
@@ -331,6 +384,170 @@ class BydCollectorApplication : Application() {
         return committed
     }
 
+    private fun findHistoricalBusinessEnergyCandidate(
+        trips: TripStore,
+        generation: Long,
+        source: HistoricalBusinessInputSource
+    ): HistoricalBusinessCandidateSearch {
+        val scanKey = "${source.sourceIdentity.stableKey}|${source.businessGeneration}"
+        val scanState = synchronized(historicalBusinessScanLock) {
+            if (historicalBusinessScanKey != scanKey) {
+                historicalBusinessScanKey = scanKey
+                historicalBusinessScanAfterTripId = null
+                historicalBusinessScanExhausted = false
+                historicalBusinessNoCoverageTrips.clear()
+            }
+            if (historicalBusinessScanExhausted) null
+            else HistoricalBusinessScanState(historicalBusinessScanEpoch, historicalBusinessScanAfterTripId)
+        } ?: return HistoricalBusinessCandidateSearch.None
+
+        var afterTripId = scanState.afterTripId
+        while (historicalEnergyCanContinue(generation)) {
+            val page = tryTripsRead(trips) {
+                historicalBusinessEnergyCandidatePage(
+                    afterTripId, HISTORICAL_TRIP_PAGE_SIZE, source.businessGeneration
+                )
+            } ?: return HistoricalBusinessCandidateSearch.Retry("trips_maintenance_busy")
+            if (page.isEmpty()) {
+                markHistoricalBusinessScanExhausted(scanKey, scanState.epoch)
+                return HistoricalBusinessCandidateSearch.None
+            }
+            for (candidate in page) {
+                val alreadyUncovered = synchronized(historicalBusinessScanLock) {
+                    historicalBusinessScanKey == scanKey && scanState.epoch == historicalBusinessScanEpoch &&
+                        candidate.tripId in historicalBusinessNoCoverageTrips
+                }
+                if (alreadyUncovered) {
+                    if (!advanceHistoricalBusinessScan(scanKey, scanState.epoch, candidate.tripId, false)) {
+                        return HistoricalBusinessCandidateSearch.Retry("historical_candidates_changed")
+                    }
+                    afterTripId = candidate.tripId
+                    continue
+                }
+                val bootId = candidate.startBootId ?: continue
+                val startElapsed = candidate.startElapsedMs ?: continue
+                val endElapsed = candidate.endElapsedMs ?: continue
+                val coverage = tryDatabaseRead {
+                    StoreReadResult(telemetryStore?.historicalBusinessInputCoverage(bootId, startElapsed, endElapsed))
+                }?.value ?: return HistoricalBusinessCandidateSearch.Retry("main_maintenance_busy")
+                if (coverage.source != source) {
+                    return HistoricalBusinessCandidateSearch.Retry("active_main_replaced")
+                }
+                if (coverage.startCovered && coverage.endCovered) {
+                    return HistoricalBusinessCandidateSearch.Found(candidate, scanKey, scanState.epoch)
+                }
+                if (!advanceHistoricalBusinessScan(scanKey, scanState.epoch, candidate.tripId, true)) {
+                    return HistoricalBusinessCandidateSearch.Retry("historical_candidates_changed")
+                }
+                afterTripId = candidate.tripId
+            }
+            if (page.size < HISTORICAL_TRIP_PAGE_SIZE) {
+                markHistoricalBusinessScanExhausted(scanKey, scanState.epoch)
+                return HistoricalBusinessCandidateSearch.None
+            }
+        }
+        return HistoricalBusinessCandidateSearch.None
+    }
+
+    private fun advanceHistoricalBusinessScan(
+        scanKey: String,
+        epoch: Long,
+        tripId: String,
+        noCoverage: Boolean
+    ): Boolean = synchronized(historicalBusinessScanLock) {
+        if (historicalBusinessScanKey != scanKey || historicalBusinessScanEpoch != epoch) return@synchronized false
+        historicalBusinessScanAfterTripId = tripId
+        if (noCoverage) historicalBusinessNoCoverageTrips += tripId
+        true
+    }
+
+    private fun markHistoricalBusinessScanExhausted(scanKey: String, epoch: Long) {
+        synchronized(historicalBusinessScanLock) {
+            if (historicalBusinessScanKey == scanKey && historicalBusinessScanEpoch == epoch) {
+                historicalBusinessScanExhausted = true
+            }
+        }
+    }
+
+    private fun runHistoricalBusinessEnergyTrip(
+        trips: TripStore,
+        generation: Long,
+        source: HistoricalBusinessInputSource,
+        search: HistoricalBusinessCandidateSearch.Found
+    ): Boolean {
+        val candidate = search.trip
+        val tripBoot = candidate.startBootId ?: return historicalEnergyRetry("missing_trip_boot")
+        val tripStart = candidate.startElapsedMs ?: return historicalEnergyRetry("missing_trip_start_elapsed")
+        val tripEnd = candidate.endElapsedMs ?: return historicalEnergyRetry("missing_trip_end_elapsed")
+        val seedRead = tryDatabaseRead {
+            val store = telemetryStore
+            StoreReadResult(store?.let {
+                val before = it.historicalBusinessInputSource()
+                val seed = it.loadBusinessInputInitialCheckpoint()
+                val after = it.historicalBusinessInputSource()
+                HistoricalBusinessSeedRead(before, after, seed)
+            })
+        }?.value ?: return historicalEnergyRetry("main_maintenance_busy")
+        if (seedRead.before != source || seedRead.after != source) {
+            return historicalEnergyRetry("active_main_replaced")
+        }
+        val accumulator = HistoricalBusinessEnergyAccumulator(candidate, source.businessGeneration, seedRead.seed)
+        val lookback = BusinessInputProjection.energyHistoryLookbackMs
+        val fromElapsed = if (tripStart < lookback) 0L else tripStart - lookback
+        var afterInputId = 0L
+        while (true) {
+            if (!historicalEnergyCanContinue(generation)) return false
+            val page = tryDatabaseRead {
+                StoreReadResult(
+                    telemetryStore?.historicalBusinessInputPage(
+                        tripBoot, fromElapsed, tripEnd, afterInputId, HISTORICAL_BUSINESS_PAGE_SIZE
+                    )
+                )
+            }?.value ?: return historicalEnergyRetry("main_maintenance_busy")
+            if (page.sourceIdentity != source.sourceIdentity || page.businessGeneration != source.businessGeneration) {
+                return historicalEnergyRetry("active_main_replaced")
+            }
+            if (page.inputs.isEmpty()) break
+            for (ref in page.inputs) {
+                if (!historicalEnergyCanContinue(generation)) return false
+                val delta = tryDatabaseRead {
+                    StoreReadResult(telemetryStore?.loadBusinessInputDelta(ref))
+                }?.value ?: return historicalEnergyRetry("main_maintenance_busy")
+                accumulator.accept(ref, delta)
+            }
+            val next = page.inputs.last().id
+            if (next <= afterInputId) return historicalEnergyRetry("non_monotonic_business_input_history")
+            afterInputId = next
+            if (page.inputs.size < HISTORICAL_BUSINESS_PAGE_SIZE) break
+        }
+        val finalSource = tryDatabaseRead {
+            StoreReadResult(telemetryStore?.historicalBusinessInputSource())
+        }?.value ?: return historicalEnergyRetry("main_maintenance_busy")
+        if (finalSource != source) return historicalEnergyRetry("active_main_replaced")
+
+        val result = accumulator.finish()
+        val record = HistoricalEnergyBackfillRecord(
+            tripId = candidate.tripId,
+            startedAt = candidate.startedAt,
+            endedAt = candidate.endedAt ?: return historicalEnergyRetry("missing_trip_end_time"),
+            sourceIdentity = source.businessGeneration,
+            outcome = if (result is HistoricalEnergyResult.Complete) "complete" else "rejected",
+            reason = when (result) {
+                is HistoricalEnergyResult.Complete -> "complete"
+                is HistoricalEnergyResult.Rejected -> result.reason
+            }.take(128),
+            updatedAt = Instant.now().toString(),
+            algorithmVersion = HistoricalEnergyBackfillRecord.EVENT_ALGORITHM_VERSION
+        )
+        val snapshot = (result as? HistoricalEnergyResult.Complete)?.snapshot
+        val committed = finalizeHistoricalEnergy(generation, trips, record, snapshot)
+        if (committed) {
+            advanceHistoricalBusinessScan(search.scanKey, search.scanEpoch, candidate.tripId, false)
+            recordHistoricalEnergyEvent(record.outcome, "trip=${candidate.tripId.take(80)} reason=${record.reason}")
+        }
+        return committed
+    }
+
     private fun buildHistoricalEndpointIndex(trips: TripStore, generation: Long): HistoricalEndpointIndex? {
         val candidates = mutableListOf<com.bydcollector.collector.data.trips.TripSession>()
         var afterTripId: String? = null
@@ -408,7 +625,7 @@ class BydCollectorApplication : Application() {
         }
         dispatchOperationalEvent(sharedOperationalEventExecutor) {
             operationalEventJournal.append(
-                Instant.now().toString(), SystemClock.elapsedRealtime(), "historical_energy", message, detail.take(320)
+                Instant.now().toString(), SystemClock.elapsedRealtime(), "historical_energy", message, detail
             )
         }
     }
@@ -545,6 +762,7 @@ class BydCollectorApplication : Application() {
     companion object {
         const val TELEGRAM_STORAGE_ERROR = "telegram_storage_migration_failed"
         private const val HISTORICAL_TRIP_PAGE_SIZE = 64
+        private const val HISTORICAL_BUSINESS_PAGE_SIZE = 128
         private const val HISTORICAL_POLL_PAGE_SIZE = 128
         private const val HISTORICAL_HEADER_PAGE_SIZE = 512
         private const val HISTORICAL_RETRY_LOG_INTERVAL_MS = 30_000L
@@ -597,6 +815,24 @@ class BydCollectorApplication : Application() {
     }
 
     private data class StoreReadResult<T>(val value: T)
+
+    private data class HistoricalBusinessScanState(val epoch: Long, val afterTripId: String?)
+
+    private data class HistoricalBusinessSeedRead(
+        val before: HistoricalBusinessInputSource,
+        val after: HistoricalBusinessInputSource,
+        val seed: Map<String, com.bydcollector.collector.data.normalized.NormalizedSourceInput>
+    )
+
+    private sealed class HistoricalBusinessCandidateSearch {
+        data class Found(
+            val trip: com.bydcollector.collector.data.trips.TripSession,
+            val scanKey: String,
+            val scanEpoch: Long
+        ) : HistoricalBusinessCandidateSearch()
+        data class Retry(val reason: String) : HistoricalBusinessCandidateSearch()
+        object None : HistoricalBusinessCandidateSearch()
+    }
 
     private data class HistoricalEndpointIndex(
         val sourceIdentity: HistoricalMainIdentity,

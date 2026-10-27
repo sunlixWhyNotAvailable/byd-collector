@@ -204,6 +204,8 @@ class DashboardUiStateStore(
 
     fun publishVehicleKpis(uk: VehicleKpis, en: VehicleKpis) {
         synchronized(lock) {
+            if (localizedVehicleKpis[VehicleKpiLanguage.UK] == uk &&
+                localizedVehicleKpis[VehicleKpiLanguage.EN] == en) return
             localizedVehicleKpis = mapOf(
                 VehicleKpiLanguage.UK to uk,
                 VehicleKpiLanguage.EN to en

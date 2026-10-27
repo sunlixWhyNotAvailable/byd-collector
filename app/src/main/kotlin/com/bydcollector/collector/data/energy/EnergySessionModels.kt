@@ -13,18 +13,55 @@ data class EnergySessionSeed(
 data class EnergyReceipt(
     val sourceIdentity: String,
     val observedAt: String,
-    val input: EnergyInput
+    // The receipt clock remains the real acquisition clock, including on timer evaluations.
+    val input: EnergyInput,
+    val businessGeneration: String? = null,
+    val businessInputId: Long? = null,
+    // Timer deadlines use this clock without rewriting the retained source clock above.
+    val evaluationBootId: String? = null,
+    val evaluationElapsedMs: Long? = null,
+    // Set only when a late input changed energy-relevant retained values.
+    val lateRelevantSource: Boolean = false
 ) {
     init {
         require(sourceIdentity.isNotBlank()) { "Energy source identity is blank" }
         require(sourceIdentity.length <= MAX_IDENTITY_LENGTH) { "Energy source identity is too long" }
         require(observedAt.isNotBlank()) { "Energy observed time is blank" }
         require(observedAt.length <= MAX_TIME_LENGTH) { "Energy observed time is too long" }
+        require((businessGeneration == null) == (businessInputId == null)) {
+            "Energy business generation and input ID must be provided together"
+        }
+        require(businessGeneration == null || businessGeneration.isNotBlank()) {
+            "Energy business generation is blank"
+        }
+        require(businessGeneration == null || businessGeneration.length <= MAX_GENERATION_LENGTH) {
+            "Energy business generation is too long"
+        }
+        require(businessInputId == null || businessInputId > 0L) { "Energy business input ID is invalid" }
+        if (businessGeneration != null && businessInputId != null) {
+            require(sourceIdentity == businessIdentity(businessGeneration, businessInputId)) {
+                "Energy business source identity mismatch"
+            }
+        }
+        require((evaluationBootId == null) == (evaluationElapsedMs == null)) {
+            "Energy evaluation boot ID and elapsed time must be provided together"
+        }
+        require(evaluationBootId == null || evaluationBootId.isNotBlank()) { "Energy evaluation boot ID is blank" }
+        require(evaluationBootId == null || evaluationBootId.length <= MAX_BOOT_ID_LENGTH) {
+            "Energy evaluation boot ID is too long"
+        }
+        require(evaluationElapsedMs == null || evaluationElapsedMs >= 0L) {
+            "Energy evaluation elapsed time is negative"
+        }
     }
 
     companion object {
         private const val MAX_IDENTITY_LENGTH = 512
         private const val MAX_TIME_LENGTH = 128
+        private const val MAX_GENERATION_LENGTH = 480
+        private const val MAX_BOOT_ID_LENGTH = 256
+
+        fun businessIdentity(generation: String, inputId: Long): String = "business:$generation:$inputId"
     }
 }
 
@@ -52,6 +89,7 @@ data class EnergySnapshot(
     val powerSessionId: String?,
     val startedAt: String?,
     val observedAt: String,
+    // These legacy-named snapshot fields carry the evaluation clock; acquisition clocks stay in the input journal.
     val sourceBootId: String,
     val sourceElapsedMs: Long,
     val active: Boolean,
@@ -121,7 +159,11 @@ data class EnergyRuntimeState(
     val integrationQuality: EnergyIntegrationQuality = EnergyIntegrationQuality.EXCLUDED,
     val reason: String = REASON_UNAVAILABLE,
     val currentSnapshot: EnergySnapshot? = null,
-    val recoveryState: EnergyRecoveryState = EnergyRecoveryState.NONE
+    val recoveryState: EnergyRecoveryState = EnergyRecoveryState.NONE,
+    val lastBusinessGeneration: String? = null,
+    val lastBusinessInputId: Long? = null,
+    val lastEvaluationBootId: String? = null,
+    val lastEvaluationElapsedMs: Long? = null
 ) {
     init {
         require(schemaVersion == CURRENT_SCHEMA_VERSION)
@@ -134,13 +176,19 @@ data class EnergyRuntimeState(
         require(lastSourceIdentity == null || (lastSourceIdentity.isNotBlank() && lastSourceIdentity.length <= 512))
         require(lastSourceBootId == null || (lastSourceBootId.isNotBlank() && lastSourceBootId.length <= 256))
         require(lastSourceElapsedMs == null || lastSourceElapsedMs >= 0L)
+        require((lastBusinessGeneration == null) == (lastBusinessInputId == null))
+        require(lastBusinessGeneration == null || (lastBusinessGeneration.isNotBlank() && lastBusinessGeneration.length <= 480))
+        require(lastBusinessInputId == null || lastBusinessInputId > 0L)
+        require((lastEvaluationBootId == null) == (lastEvaluationElapsedMs == null))
+        require(lastEvaluationBootId == null || (lastEvaluationBootId.isNotBlank() && lastEvaluationBootId.length <= 256))
+        require(lastEvaluationElapsedMs == null || lastEvaluationElapsedMs >= 0L)
         require(reason.isNotBlank() && reason.length <= 128)
         anchor?.let {
             require(active)
             require(it.bootId.isNotBlank() && it.bootId.length <= 256)
             require(it.elapsedMs >= 0L && it.powerKw.isFinite())
-            require(it.bootId == lastSourceBootId)
-            require(it.elapsedMs == lastSourceElapsedMs)
+            require(it.bootId == lastEvaluationBootId)
+            require(it.elapsedMs == lastEvaluationElapsedMs)
         }
         currentSnapshot?.let {
             require(it.powerSessionId == powerSessionId)
@@ -156,8 +204,8 @@ data class EnergyRuntimeState(
             require(it.reason == reason)
             if (active) {
                 require(it.sourceIdentity == lastSourceIdentity)
-                require(it.sourceBootId == lastSourceBootId)
-                require(it.sourceElapsedMs == lastSourceElapsedMs)
+                require(it.sourceBootId == lastEvaluationBootId)
+                require(it.sourceElapsedMs == lastEvaluationElapsedMs)
             }
         }
         require(recoveryState == EnergyRecoveryState.NONE || (!active && anchor == null && currentSnapshot == null))
@@ -171,6 +219,14 @@ data class EnergyRuntimeState(
         const val REASON_CORRUPT_STATE = "corrupt_state_waiting_for_power_cycle"
     }
 }
+
+data class EnergyRuntimeStatus(
+    val active: Boolean,
+    val lastEvaluationBootId: String?,
+    val lastEvaluationElapsedMs: Long?,
+    val lastBusinessGeneration: String?,
+    val lastBusinessInputId: Long?
+)
 
 data class EnergyRuntimeRow(
     val stateJson: String,

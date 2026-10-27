@@ -1,6 +1,9 @@
 package com.bydcollector.collector.data.local
 
 import com.bydcollector.collector.direct.CallbackValueSource
+import com.bydcollector.collector.data.direct.DirectGetLineage
+import com.bydcollector.collector.data.polling.PollOrigin
+import com.bydcollector.collector.data.polling.PollSampleSource
 
 data class CatalogSeedRow(
     val sourceId: String?,
@@ -26,7 +29,8 @@ data class PollReading(
     val rawKey: String,
     val rawValue: String?,
     val descValue: String? = null,
-    val callbackSource: CallbackValueSource? = null
+    val callbackSource: CallbackValueSource? = null,
+    val getLineage: DirectGetLineage? = null
 ) {
     val rawInt: Int? get() = rawValue?.toIntOrNull()
 }
@@ -40,7 +44,9 @@ data class PersistedPollInput(
     val errorCategory: String? = null,
     val errorMessage: String? = null,
     val rawResponseBody: String?,
-    val readings: List<PollReading>
+    val readings: List<PollReading>,
+    val source: PollSampleSource? = null,
+    val origin: PollOrigin? = null
 )
 
 data class WorkerPollImportResult(

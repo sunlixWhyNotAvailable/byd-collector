@@ -40,6 +40,12 @@ class NativeSqliteInstrumentation : Instrumentation() {
             finish(Activity.RESULT_CANCELED, Bundle().apply { putString("stream", "Tests require an emulator") })
             return
         }
+        if (gateArguments.getString("businessCompressionGate") == "true") {
+            val result = runCatching { BusinessInputCompressionGate.run(targetContext) }
+            finish(if (result.isSuccess) Activity.RESULT_OK else Activity.RESULT_CANCELED,
+                Bundle().apply { putString("stream", result.getOrElse { "BUSINESS_COMPRESSION_GATE_FAIL ${it.stackTraceToString()}" }) })
+            return
+        }
         if (runtimeBoundaryFixture) {
             val result = runCatching { RuntimeBoundaryGate.run(this) }
             finish(if (result.isSuccess) Activity.RESULT_OK else Activity.RESULT_CANCELED,

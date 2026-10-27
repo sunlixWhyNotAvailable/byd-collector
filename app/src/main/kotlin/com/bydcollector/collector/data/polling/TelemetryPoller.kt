@@ -75,8 +75,12 @@ class TelemetryPoller(
             runCatching(onStarted)
             while (running.get()) {
                 val startedAt = clock.elapsedRealtimeMs()
+                var completedResult: PollCycleResult? = null
                 try {
-                    coordinator.pollOnce(sessionId)?.let(onCycleResult)
+                    coordinator.pollOnce(sessionId)?.let { result ->
+                        onCycleResult(result)
+                        completedResult = result
+                    }
                 } catch (error: Throwable) {
                     if (error is InterruptedException || !running.get() || Thread.currentThread().isInterrupted) {
                         running.set(false)
@@ -94,7 +98,13 @@ class TelemetryPoller(
 
                 val elapsed = clock.elapsedRealtimeMs() - startedAt
                 runCatching { onCycleDuration(elapsed.coerceAtLeast(0L)) }
-                val sleepMs = intervalMs - elapsed
+                val sleepMs = completedResult?.nextDueDelayMs?.let { dueDelay ->
+                    nextDueSleepMs(
+                        requestedDelayMs = dueDelay,
+                        pollCycleElapsedMs = elapsed,
+                        sourceReadElapsedMs = completedResult?.elapsedMs ?: 0L
+                    )
+                } ?: (intervalMs - elapsed)
                 //keeps the period close to intervalMs without overlapping poll cycles
                 if (running.get() && sleepMs > 0) {
                     try {
@@ -111,5 +121,18 @@ class TelemetryPoller(
 
     companion object {
         const val DEFAULT_INTERVAL_MS = 500L
+        private const val MIN_NEXT_DUE_DELAY_MS = 100L
+        private const val MAX_NEXT_DUE_DELAY_MS = 30_000L
+
+        /** Bounds helper scheduling and accounts only for APP work after the helper reply. */
+        internal fun nextDueSleepMs(
+            requestedDelayMs: Long,
+            pollCycleElapsedMs: Long,
+            sourceReadElapsedMs: Long
+        ): Long {
+            val boundedDelay = requestedDelayMs.coerceIn(MIN_NEXT_DUE_DELAY_MS, MAX_NEXT_DUE_DELAY_MS)
+            val postReadWork = (pollCycleElapsedMs - sourceReadElapsedMs.coerceAtLeast(0L)).coerceAtLeast(0L)
+            return (boundedDelay - postReadWork).coerceAtLeast(0L)
+        }
     }
 }

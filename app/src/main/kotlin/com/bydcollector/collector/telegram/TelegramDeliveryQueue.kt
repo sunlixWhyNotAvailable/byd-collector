@@ -2,6 +2,7 @@ package com.bydcollector.collector.telegram
 
 import com.bydcollector.collector.data.local.TelegramDeliveryStore
 import com.bydcollector.collector.data.local.TelegramOutboxEntry
+import com.bydcollector.collector.data.local.TelegramPersistedDeliveryAttempt
 import java.security.MessageDigest
 import java.util.UUID
 
@@ -15,7 +16,8 @@ internal data class TelegramDeliveryAttempt(
     val trigger: String,
     val startedAtMs: Long,
     val dedupeKey: String? = entry?.dedupeKey,
-    val eventType: String = entry?.eventType ?: "connection_test"
+    val eventType: String = entry?.eventType ?: "connection_test",
+    var persisted: TelegramPersistedDeliveryAttempt? = null
 )
 
 internal data class TelegramPendingResult(
@@ -30,6 +32,8 @@ internal sealed class TelegramConnectionSelection {
     object Busy : TelegramConnectionSelection()
 }
 
+internal enum class TelegramPreparedAttemptAction { SUBMIT, WAIT, DISCARD }
+
 /** One sender, shared by ordinary, startup, OFF and manual-test paths. No Android clock/network dependency. */
 internal class TelegramDeliveryQueue(
     private val store: TelegramDeliveryStore,
@@ -37,7 +41,7 @@ internal class TelegramDeliveryQueue(
     private val send: (TelegramSendMessage) -> TelegramSendResult = {
         error("Synchronous Telegram delivery is unavailable")
     },
-    private val commitDelivery: (TelegramOutboxEntry, Long?, Long) -> Unit,
+    private val commitDelivery: (TelegramDeliveryAttempt, TelegramOutboxEntry, Long?, Long) -> Unit,
     private val record: (String, TelegramOutboxEntry?, String) -> Unit,
     private val nowMs: () -> Long,
     private val retryPolicy: TelegramRetryPolicy = TelegramRetryPolicy(),
@@ -60,6 +64,69 @@ internal class TelegramDeliveryQueue(
     fun resetSession() {
         attemptedInDrain.clear()
         lastWait = null
+    }
+
+    @Synchronized
+    fun restorePersistedAttempt(trigger: String): TelegramDeliveryAttempt? {
+        val persisted = store.activeTelegramDeliveryAttempt() ?: return null
+        inFlight?.let { current ->
+            check(current.persisted?.attemptId == persisted.attemptId) {
+                "A different Telegram delivery attempt is already active"
+            }
+            return current
+        }
+        val entry = store.telegramMessageByDedupeKey(persisted.dedupeKey)
+        if (!persisted.localSettled) {
+            check(entry != null && entry.id == persisted.outboxId && entry.eventType == persisted.eventType) {
+                "Unsettled Telegram delivery lost its protected outbox row"
+            }
+        }
+        val config = credentials()
+        return TelegramDeliveryAttempt(
+            token = allocateAttemptToken(),
+            entry = entry,
+            request = TelegramSendMessage(config.token, config.chatId, entry?.payload.orEmpty()),
+            trigger = trigger,
+            startedAtMs = persisted.startedAtMs,
+            dedupeKey = persisted.dedupeKey,
+            eventType = persisted.eventType,
+            persisted = persisted
+        ).also { inFlight = it }
+    }
+
+    @Synchronized
+    fun preparedAttemptAction(attempt: TelegramDeliveryAttempt): TelegramPreparedAttemptAction {
+        val persisted = checkNotNull(attempt.persisted) { "Attempt is not persisted" }
+        check(!persisted.localSettled) { "A settled Telegram attempt cannot be submitted" }
+        val entry = checkNotNull(attempt.entry) { "Unsettled Telegram attempt has no outbox row" }
+        val config = credentials()
+        val request = TelegramSendMessage(config.token, config.chatId, entry.payload)
+        if (request != attempt.request ||
+            TelegramHelperProtocol.requestDigest(attempt.request) != persisted.requestDigest ||
+            TelegramHelperProtocol.destinationDigest(attempt.request) != persisted.destinationDigest ||
+            TelegramHelperProtocol.requestDigest(request) != persisted.requestDigest ||
+            TelegramHelperProtocol.destinationDigest(request) != persisted.destinationDigest ||
+            TelegramHelperProtocol.dedupeReference(entry.dedupeKey) != persisted.dedupeRef) {
+            return TelegramPreparedAttemptAction.DISCARD
+        }
+        return if (config.enabled) TelegramPreparedAttemptAction.SUBMIT else TelegramPreparedAttemptAction.WAIT
+    }
+
+    @Synchronized
+    fun discardPreparedAttempt(attempt: TelegramDeliveryAttempt): Long? {
+        val persisted = checkNotNull(attempt.persisted) { "Attempt is not persisted" }
+        check(inFlight == attempt) { "Telegram prepared attempt is not active" }
+        store.discardPreparedTelegramDeliveryAttempt(persisted.attemptId)
+        inFlight = null
+        return pendingDeadline()
+    }
+
+    @Synchronized
+    fun acknowledgePersistedAttempt(attempt: TelegramDeliveryAttempt): Long? {
+        val persisted = checkNotNull(attempt.persisted) { "Attempt is not persisted" }
+        store.acknowledgeTelegramDeliveryAttempt(persisted.attemptId)
+        if (inFlight == attempt) inFlight = null
+        return pendingDeadline()
     }
 
     @Synchronized
@@ -116,26 +183,38 @@ internal class TelegramDeliveryQueue(
         }
         lastWait = null
         attemptedInDrain.add(entry.id)
+        val request = TelegramSendMessage(config.token, config.chatId, entry.payload)
+        val persisted = store.prepareTelegramDeliveryAttempt(
+            entry = entry,
+            requestDigest = TelegramHelperProtocol.requestDigest(request),
+            destinationDigest = TelegramHelperProtocol.destinationDigest(request),
+            dedupeRef = TelegramHelperProtocol.dedupeReference(entry.dedupeKey),
+            botScope = botScope(config.token),
+            startedAtMs = now
+        )
+        val attempt = TelegramDeliveryAttempt(
+            token = allocateAttemptToken(),
+            entry = entry,
+            request = request,
+            trigger = trigger,
+            startedAtMs = now,
+            persisted = persisted
+        )
         record(
             "attempt",
             entry,
             "trigger=$trigger age_ms=${(now - entry.createdAtMs).coerceAtLeast(0)} " +
                 "created_at_ms=${entry.createdAtMs} occurred_at_ms=${entry.occurredAtMs ?: "unknown"} " +
-                "attempt=${entry.attemptCount + 1}"
+                "attempt=${entry.attemptCount + 1} sequence=${persisted.sequence}"
         )
-        return TelegramDeliveryAttempt(
-            token = allocateAttemptToken(),
-            entry = entry,
-            request = TelegramSendMessage(config.token, config.chatId, entry.payload),
-            trigger = trigger,
-            startedAtMs = now
-        ).also { inFlight = it }
+        return attempt.also { inFlight = it }
     }
 
     /** Expedites eligible local network failures, then reserves one recovery delivery. */
     @Synchronized
     fun beginRecovery(trigger: String): TelegramDeliveryAttempt? {
         if (inFlight != null || !deliveryLaneAvailable()) return null
+        if (store.activeTelegramDeliveryAttempt() != null) return null
         if (!canDeliver(credentials())) {
             finishDrain(null)
             return null
@@ -159,15 +238,21 @@ internal class TelegramDeliveryQueue(
         confirmedAtMs: Long,
         onDurablySettled: () -> Unit
     ): Long? {
-        check(attempt.entry != null) { "Telegram outbox attempt has no entry" }
+        check(attempt.persisted != null) { "Telegram result has no persisted outbox attempt" }
         check(inFlight == null || inFlight == attempt) { "Telegram delivery queue is busy" }
         if (inFlight == null) inFlight = attempt
-        val entry = requireNotNull(attempt.entry)
+        val entry = attempt.entry
         try {
+            if (attempt.persisted?.localSettled == true) {
+                onDurablySettled()
+                return finishDrain(pendingDeadline())
+            }
+            checkNotNull(entry) { "Unsettled Telegram outbox attempt has no queue row" }
             when (result) {
                 is TelegramSendResult.Success -> {
                     // The owner atomically commits outbox removal, dependency release and semantic receipt.
-                    commitDelivery(entry, result.messageId, confirmedAtMs)
+                    commitDelivery(attempt, entry, result.messageId, confirmedAtMs)
+                    attempt.persisted = attempt.persisted?.copy(localSettled = true)
                     onDurablySettled()
                     runCatching {
                         record(
@@ -184,15 +269,22 @@ internal class TelegramDeliveryQueue(
                     val failedAt = confirmedAtMs
                     val error = telegramFailureCode(result)
                     val localAt = deadlineAfter(failedAt, retryPolicy.delayForFailure(entry.failureCount + 1))
-                    val serverDeadline = recordServerLimit(attempt.request.botToken, result, failedAt, localAt)
+                    val serverDeadline = recordServerLimit(
+                        attempt.persisted?.botScope ?: botScope(attempt.request.botToken), result, failedAt, localAt
+                    )
                     val next = if (result.kind.retryable) {
                         maxOf(localAt, serverDeadline).also {
-                            store.markTelegramRetry(entry.id, error, attempt.startedAtMs, it)
+                            store.settleTelegramDeliveryFailure(
+                                checkNotNull(attempt.persisted).attemptId, error, attempt.startedAtMs, it
+                            )
                         }
                     } else {
-                        store.markTelegramBlocked(entry.id, error, attempt.startedAtMs)
+                        store.settleTelegramDeliveryFailure(
+                            checkNotNull(attempt.persisted).attemptId, error, attempt.startedAtMs, null
+                        )
                         null
                     }
+                    attempt.persisted = attempt.persisted?.copy(localSettled = true)
                     onDurablySettled()
                     runCatching {
                         record(
@@ -209,14 +301,14 @@ internal class TelegramDeliveryQueue(
             if (inFlight == attempt) inFlight = null
         }
         // A future retry of this row must not hide another due row.
-        return runCatching { finishDrain(pendingDeadline()) }.getOrNull()
+        return finishDrain(pendingDeadline())
     }
 
     @Synchronized
     fun pendingDeadline(): Long? {
         // Completion posts the next owner callback. Returning an immediate deadline here while HTTP
         // is active would make the local executor spin on a lane that cannot yet make progress.
-        if (inFlight != null || !deliveryLaneAvailable()) return null
+        if (inFlight != null || store.activeTelegramDeliveryAttempt() != null || !deliveryLaneAvailable()) return null
         val config = credentials()
         if (!canDeliver(config)) return null
         val localAt = store.nextTelegramAttemptAtMs() ?: return null
@@ -316,7 +408,7 @@ internal class TelegramDeliveryQueue(
                 is TelegramSendResult.Failure -> {
                     val failedAt = confirmedAtMs
                     recordServerLimit(
-                        attempt.request.botToken,
+                        botScope(attempt.request.botToken),
                         result,
                         failedAt,
                         deadlineAfter(failedAt, retryPolicy.delayForFailure(1))
@@ -368,12 +460,12 @@ internal class TelegramDeliveryQueue(
         return next
     }
 
-    private fun recordServerLimit(token: String, failure: TelegramSendResult.Failure, now: Long, fallbackAt: Long): Long {
+    private fun recordServerLimit(botScope: String, failure: TelegramSendResult.Failure, now: Long, fallbackAt: Long): Long {
         if (failure.kind != TelegramSendFailureKind.RATE_LIMITED && failure.retryAfterSeconds == null) return 0L
         val seconds = failure.retryAfterSeconds?.coerceAtLeast(0L)
         val until = seconds?.let { deadlineAfter(now, if (it > Long.MAX_VALUE / 1_000L) Long.MAX_VALUE else it * 1_000L) }
             ?: fallbackAt
-        store.extendTelegramServerNotBefore(botScope(token), until)
+        store.extendTelegramServerNotBefore(botScope, until)
         return until
     }
 
@@ -399,7 +491,8 @@ internal class TelegramDeliveryQueue(
 }
 
 internal fun telegramFailureCode(result: TelegramSendResult.Failure): String = listOfNotNull(
-    result.kind.name.lowercase(), result.httpStatus?.toString(), result.exceptionClass
+    result.kind.name.lowercase(), result.httpStatus?.toString(), result.exceptionClass,
+    result.diagnostic
 ).joinToString(":")
 
 internal fun telegramFailureDetail(result: TelegramSendResult.Failure): String {
@@ -412,5 +505,6 @@ internal fun telegramFailureDetail(result: TelegramSendResult.Failure): String {
         else -> "rejected"
     }
     return "kind=${result.kind.name.lowercase()} status=${result.httpStatus ?: "none"} " +
-        "exception=${result.exceptionClass ?: "none"} delivery_state=$deliveryState"
+        "exception=${result.exceptionClass ?: "none"} delivery_state=$deliveryState " +
+        "diagnostic=${result.diagnostic ?: "none"}"
 }

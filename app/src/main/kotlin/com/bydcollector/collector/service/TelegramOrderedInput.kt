@@ -1,6 +1,10 @@
 package com.bydcollector.collector.service
 
 import com.bydcollector.collector.data.local.PollReading
+import com.bydcollector.collector.data.input.BusinessContinuityState
+import com.bydcollector.collector.data.input.BusinessInputContinuity
+import com.bydcollector.collector.data.direct.DirectFidRegistry
+import com.bydcollector.collector.data.direct.DirectValueDecoders
 import com.bydcollector.collector.data.normalized.NormalizedFieldCatalog
 import com.bydcollector.collector.data.normalized.NormalizedSourceInput
 import com.bydcollector.collector.data.normalized.NormalizedSourceKind
@@ -8,6 +12,7 @@ import com.bydcollector.collector.data.normalized.NormalizedSourceOrder
 import com.bydcollector.collector.data.normalized.NormalizedSourceOrdering
 import com.bydcollector.collector.data.normalized.NormalizedSourceStamp
 import com.bydcollector.collector.data.normalized.normalizedSourceInputForPollReading
+import com.bydcollector.collector.data.normalized.normalizedSourceMatchesSeed
 import com.bydcollector.collector.diagnostics.diagnosticSha256
 import org.json.JSONArray
 import org.json.JSONObject
@@ -15,10 +20,14 @@ import org.json.JSONObject
 data class TelegramRawSourceCursor(
     val rawValue: String?,
     val descValue: String?,
-    val stamp: NormalizedSourceStamp
+    val stamp: NormalizedSourceStamp,
+    val valid: Boolean = true,
+    val continuityBarrier: NormalizedSourceStamp? = null,
+    val continuitySeedIdentity: String? = null,
+    val continuitySeedRecordSequence: Long? = null
 ) {
     fun toInput(rawKey: String) = NormalizedSourceInput(
-        reading = PollReading(rawKey, rawValue, descValue),
+        reading = if (valid) PollReading(rawKey, rawValue, descValue) else PollReading(rawKey, null, null),
         stamp = stamp,
         sourcePollId = null
     )
@@ -34,6 +43,11 @@ data class TelegramRawSourceCursor(
         putNullable("sequence", stamp.sequence)
         put("wall_ms", stamp.wallMs)
         put("elapsed_ms", stamp.elapsedMs)
+        putNullable("source_epoch", stamp.sourceEpoch)
+        put("valid", valid)
+        continuityBarrier?.let { put("continuity_barrier", it.toJson()) }
+        putNullable("continuity_seed_identity", continuitySeedIdentity)
+        putNullable("continuity_seed_record_sequence", continuitySeedRecordSequence)
     }
 
     companion object {
@@ -54,9 +68,24 @@ data class TelegramRawSourceCursor(
                     generatorId = json.optStringOrNull("generator"),
                     sequence = json.optLongOrNull("sequence"),
                     wallMs = wall,
-                    elapsedMs = elapsed
-                )
+                    elapsedMs = elapsed,
+                    sourceEpoch = json.optLongOrNull("source_epoch")
+                ),
+                valid = if (json.has("valid")) json.optBoolean("valid") else true,
+                continuityBarrier = json.optJSONObject("continuity_barrier")?.let(::stampFromJson),
+                continuitySeedIdentity = json.optStringOrNull("continuity_seed_identity"),
+                continuitySeedRecordSequence = json.optLongOrNull("continuity_seed_record_sequence")
             )
+        }.getOrNull()
+
+        private fun stampFromJson(json: JSONObject): NormalizedSourceStamp? = runCatching {
+            val kind = NormalizedSourceKind.entries.first { it.storageValue == json.optString("kind") }
+            val identity = json.optString("identity").takeIf(String::isNotBlank) ?: return null
+            val boot = json.optString("boot").takeIf(String::isNotBlank) ?: return null
+            val wall = json.optLong("wall_ms", -1L).takeIf { it >= 0L } ?: return null
+            val elapsed = json.optLong("elapsed_ms", -1L).takeIf { it >= 0L } ?: return null
+            NormalizedSourceStamp(kind, identity, boot, json.optStringOrNull("generator"),
+                json.optLongOrNull("sequence"), wall, elapsed, json.optLongOrNull("source_epoch"))
         }.getOrNull()
     }
 }
@@ -86,24 +115,24 @@ internal data class TelegramOrderedPollInput(
     fun sourceKeys(fieldKey: String): List<String> =
         TELEGRAM_FIELDS_BY_KEY[fieldKey]?.sourceKeys.orEmpty()
 
-    fun hasFresh(fieldKey: String): Boolean = sourceKeys(fieldKey).any { it in freshSourceKeys }
+    fun hasFresh(fieldKey: String): Boolean = sourceKeys(fieldKey).any { it in freshSourceKeys && cursors[it]?.valid == true }
 
     fun hasFreshSource(fieldKey: String): Boolean = hasFresh(fieldKey)
 
     fun hasSingleBoot(fieldKey: String): Boolean {
         val keys = sourceKeys(fieldKey)
-        val stamps = keys.mapNotNull { inputs[it]?.stamp }
+        val stamps = keys.mapNotNull { key -> inputs[key]?.takeIf { cursors[key]?.valid == true }?.stamp }
         return stamps.size == keys.size && stamps.map { it.bootId }.distinct().size == 1
     }
 
     fun hasCurrentBoot(fieldKey: String): Boolean {
         val bootId = currentBootId ?: return false
         val keys = sourceKeys(fieldKey)
-        return keys.isNotEmpty() && keys.all { inputs[it]?.stamp?.bootId == bootId }
+        return keys.isNotEmpty() && keys.all { cursors[it]?.valid == true && inputs[it]?.stamp?.bootId == bootId }
     }
 
     fun sourceStamp(fieldKey: String, freshOnly: Boolean = true): NormalizedSourceStamp? {
-        val keys = sourceKeys(fieldKey).filter { !freshOnly || it in freshSourceKeys }
+        val keys = sourceKeys(fieldKey).filter { cursors[it]?.valid == true && (!freshOnly || it in freshSourceKeys) }
         if (keys.isEmpty()) return null
         if (sourceKeys(fieldKey).size > 1 && !hasSingleBoot(fieldKey)) return null
         return newest(keys.mapNotNull { inputs[it]?.stamp })
@@ -116,10 +145,10 @@ internal data class TelegramOrderedPollInput(
     }
 
     fun latestStamp(vararg fieldKeys: String): NormalizedSourceStamp? =
-        newest(fieldKeys.flatMap(::sourceKeys).distinct().mapNotNull { inputs[it]?.stamp })
+        newest(fieldKeys.flatMap(::sourceKeys).distinct().filter { cursors[it]?.valid == true }.mapNotNull { inputs[it]?.stamp })
 
     fun latestFreshStamp(vararg fieldKeys: String): NormalizedSourceStamp? =
-        newest(fieldKeys.flatMap(::sourceKeys).distinct().filter { it in freshSourceKeys }
+        newest(fieldKeys.flatMap(::sourceKeys).distinct().filter { it in freshSourceKeys && cursors[it]?.valid == true }
             .mapNotNull { inputs[it]?.stamp })
 
     private fun newest(stamps: List<NormalizedSourceStamp>): NormalizedSourceStamp? =
@@ -140,7 +169,8 @@ internal object TelegramOrderedInput {
         readings: List<PollReading>,
         pollStamp: NormalizedSourceStamp,
         pollId: Long,
-        currentBootId: String?
+        currentBootId: String?,
+        continuityUpdates: Map<String, BusinessInputContinuity> = emptyMap()
     ): TelegramOrderedPollInput {
         val cursors = previous.filterKeys { it in rawSourceKeys }.toMutableMap()
         val accepted = linkedSetOf<String>()
@@ -168,6 +198,54 @@ internal object TelegramOrderedInput {
                 }
                 val key = reading.rawKey
                 val previousCursor = cursors[key]
+                val entry = DirectFidRegistry.entries.firstOrNull { it.key == key }
+                val bits = incoming.reading.rawInt
+                val validValue = entry != null && bits != null && DirectValueDecoders.decode(entry, bits) != null
+                val approvedSeed = continuityUpdates[key]?.let { update ->
+                    update.state == BusinessContinuityState.AVAILABLE && update.seedValid &&
+                        normalizedSourceMatchesSeed(incoming.stamp, update.seedKind, update.seedIdentity, update.seedRecordSequence)
+                } == true
+                val matchingStoredSeed = previousCursor?.let {
+                    normalizedSourceMatchesSeed(incoming.stamp, "get", it.continuitySeedIdentity, it.continuitySeedRecordSequence) ||
+                        normalizedSourceMatchesSeed(incoming.stamp, "callback", it.continuitySeedIdentity, it.continuitySeedRecordSequence)
+                } == true
+                val barrier = previousCursor?.continuityBarrier
+                val qualifiedAfterBreak = barrier != null && incoming.stamp.bootId == barrier.bootId &&
+                    incoming.stamp.sourceEpoch != null &&
+                    NormalizedSourceOrdering.compare(incoming.stamp, barrier, currentBootId) == NormalizedSourceOrder.NEWER
+                val canUsePendingSeed = previousCursor?.valid != true && barrier != null &&
+                    (approvedSeed || matchingStoredSeed) && previousCursor.stamp.identity == barrier.identity
+                if (!validValue) {
+                    if (previousCursor?.valid == false && barrier != null && !qualifiedAfterBreak && !canUsePendingSeed) {
+                        invalid += 1
+                        sourceRefs += diagnosticSha256(incoming.stamp.identity)
+                        keyRefs += diagnosticSha256(key)
+                        return@forEach
+                    }
+                    val order = previousCursor?.let {
+                        NormalizedSourceOrdering.compare(incoming.stamp, it.stamp, currentBootId)
+                    }
+                    if (previousCursor == null || order == NormalizedSourceOrder.NEWER || order == NormalizedSourceOrder.EQUAL) {
+                        cursors[key] = TelegramRawSourceCursor(
+                            rawValue = null,
+                            descValue = null,
+                            stamp = incoming.stamp,
+                            valid = false,
+                            continuityBarrier = barrier,
+                            continuitySeedIdentity = previousCursor?.continuitySeedIdentity,
+                            continuitySeedRecordSequence = previousCursor?.continuitySeedRecordSequence
+                        )
+                        accepted += key
+                    } else if (order == NormalizedSourceOrder.OLDER) {
+                        older += 1
+                    } else {
+                        incomparable += 1
+                    }
+                    invalid += 1
+                    sourceRefs += diagnosticSha256(incoming.stamp.identity)
+                    keyRefs += diagnosticSha256(key)
+                    return@forEach
+                }
                 if (previousCursor == null) {
                     cursors[key] = TelegramRawSourceCursor(
                         incoming.reading.rawValue, incoming.reading.descValue, incoming.stamp
@@ -175,6 +253,22 @@ internal object TelegramOrderedInput {
                     accepted += key
                     seeded += 1
                     return@forEach
+                }
+                if (!previousCursor.valid && barrier != null) {
+                    if (!qualifiedAfterBreak && !canUsePendingSeed) {
+                        invalid += 1
+                        sourceRefs += diagnosticSha256(incoming.stamp.identity)
+                        keyRefs += diagnosticSha256(key)
+                        return@forEach
+                    }
+                    if (canUsePendingSeed) {
+                        cursors[key] = TelegramRawSourceCursor(
+                            incoming.reading.rawValue, incoming.reading.descValue, incoming.stamp
+                        )
+                        accepted += key
+                        fresh += key
+                        return@forEach
+                    }
                 }
                 when (NormalizedSourceOrdering.compare(incoming.stamp, previousCursor.stamp, currentBootId)) {
                     NormalizedSourceOrder.NEWER -> {
@@ -208,6 +302,53 @@ internal object TelegramOrderedInput {
                 }
             }
 
+        continuityUpdates.filterKeys { it in rawSourceKeys }.forEach { (key, update) ->
+            val cursor = cursors[key]
+            if (update.state == BusinessContinuityState.LOST || !update.seedValid) {
+                if (cursor == null) {
+                    cursors[key] = TelegramRawSourceCursor(null, null, update.stamp, valid = false,
+                        continuityBarrier = update.stamp)
+                } else {
+                    when (NormalizedSourceOrdering.compare(update.stamp, cursor.stamp, currentBootId)) {
+                        NormalizedSourceOrder.NEWER,
+                        NormalizedSourceOrder.EQUAL -> cursors[key] = cursor.copy(
+                            valid = false,
+                            continuityBarrier = update.stamp,
+                            continuitySeedIdentity = null,
+                            continuitySeedRecordSequence = null
+                        )
+                        NormalizedSourceOrder.OLDER,
+                        NormalizedSourceOrder.INCOMPARABLE -> Unit
+                    }
+                }
+                return@forEach
+            }
+            val isSeed = cursor != null && normalizedSourceMatchesSeed(
+                cursor.stamp, update.seedKind, update.seedIdentity, update.seedRecordSequence
+            )
+            if (isSeed) {
+                cursors[key] = cursor!!.copy(valid = true, continuityBarrier = null,
+                    continuitySeedIdentity = null, continuitySeedRecordSequence = null)
+                return@forEach
+            }
+            if (cursor == null) {
+                cursors[key] = TelegramRawSourceCursor(null, null, update.stamp, valid = false,
+                    continuityBarrier = update.stamp, continuitySeedIdentity = update.seedIdentity,
+                    continuitySeedRecordSequence = update.seedRecordSequence)
+                return@forEach
+            }
+            when (NormalizedSourceOrdering.compare(update.stamp, cursor.stamp, currentBootId)) {
+                NormalizedSourceOrder.NEWER,
+                NormalizedSourceOrder.EQUAL -> cursors[key] = cursor.copy(
+                    valid = false,
+                    continuityBarrier = update.stamp,
+                    continuitySeedIdentity = update.seedIdentity,
+                    continuitySeedRecordSequence = update.seedRecordSequence
+                )
+                NormalizedSourceOrder.OLDER,
+                NormalizedSourceOrder.INCOMPARABLE -> Unit
+            }
+        }
         val inputs = cursors.mapValues { (key, cursor) -> cursor.toInput(key) }
         return TelegramOrderedPollInput(
             cursors = cursors,
@@ -278,3 +419,14 @@ private fun JSONObject.optStringOrNull(key: String): String? =
 
 private fun JSONObject.optLongOrNull(key: String): Long? =
     if (!has(key) || isNull(key)) null else optLong(key)
+
+private fun NormalizedSourceStamp.toJson() = JSONObject().apply {
+    put("kind", kind.storageValue)
+    put("identity", identity)
+    put("boot", bootId)
+    putNullable("generator", generatorId)
+    putNullable("sequence", sequence)
+    put("wall_ms", wallMs)
+    put("elapsed_ms", elapsedMs)
+    putNullable("source_epoch", sourceEpoch)
+}

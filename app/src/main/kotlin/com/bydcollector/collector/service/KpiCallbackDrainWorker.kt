@@ -5,6 +5,7 @@ import com.bydcollector.collector.data.direct.DirectKpiMailboxSnapshot
 import com.bydcollector.collector.data.direct.DirectKpiSubscriptionResult
 import com.bydcollector.collector.data.direct.DirectVehicleHelper
 import com.bydcollector.collector.direct.CollectorHelperProtocol
+import com.bydcollector.collector.util.diagnosticDetail
 
 /** Owns only KPI subscribe/drain/unsubscribe Binder calls; vendor reads stay on the poll worker. */
 internal class KpiCallbackDrainWorker(
@@ -13,6 +14,7 @@ internal class KpiCallbackDrainWorker(
     private val onSnapshot: (DirectKpiMailboxSnapshot) -> Unit,
     private val onListenerStatus: (Int) -> Unit,
     private val onTransportLoss: (String) -> Unit,
+    private val onConfirmedSourceLoss: (DirectKpiInvalidation) -> Unit = {},
     private val nowMs: () -> Long = { System.nanoTime() / 1_000_000L }
 ) {
     private val lock = Object()
@@ -103,9 +105,14 @@ internal class KpiCallbackDrainWorker(
                         if (pendingRevision > handledInvalidationRevision) {
                             handledInvalidationRevision = pendingRevision
                             val invalidation = latestInvalidation
-                            if (current != null && matches(current, invalidation) &&
-                                invalidation!!.sequence > lastDrainedSequence
-                            ) return@synchronized DrainStep.Drain(current, invalidation)
+                            if (current != null && matches(current, invalidation)) {
+                                if (invalidation!!.sourceLost) {
+                                    return@synchronized DrainStep.SourceLoss(current, invalidation)
+                                }
+                                if (invalidation.sequence?.let { it > lastDrainedSequence } == true) {
+                                    return@synchronized DrainStep.Drain(current, invalidation)
+                                }
+                            }
                             continue
                         }
                         val observed = revision
@@ -145,7 +152,7 @@ internal class KpiCallbackDrainWorker(
                         synchronized(lock) { reconnectRequested = false }
                         val result = runCatching { helper.subscribeKpi(::onInvalidated) }
                             .getOrElse { error ->
-                                onTransportLoss(error.message ?: error.javaClass.simpleName)
+                                onTransportLoss(error.diagnosticDetail("KPI subscribe"))
                                 null
                             }
                         if (result?.ok == true) {
@@ -166,7 +173,10 @@ internal class KpiCallbackDrainWorker(
                     is DrainStep.Drain -> {
                         val event = step.invalidation
                         val snapshot = runCatching { helper.drainKpi(step.subscription.subscriptionId) }
-                            .getOrNull()
+                            .getOrElse { error ->
+                                onTransportLoss(error.diagnosticDetail("KPI drain"))
+                                null
+                            }
                         if (snapshot == null || !snapshot.ok ||
                             snapshot.subscriptionId != step.subscription.subscriptionId ||
                             snapshot.helperBootId != step.subscription.helperBootId ||
@@ -180,7 +190,7 @@ internal class KpiCallbackDrainWorker(
                             onListenerStatus(CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE)
                             retryAtMs = nowMs() + retryDelay(++failures)
                         } else {
-                            if (event != null) lastDrainedSequence = maxOf(lastDrainedSequence, event.sequence)
+                            event?.sequence?.let { lastDrainedSequence = maxOf(lastDrainedSequence, it) }
                             lastDrainedSequence = maxOf(lastDrainedSequence, snapshot.sequence)
                             failures = if (snapshot.listenerStatus == CollectorHelperProtocol.KPI_LISTENER_READY) 0 else failures
                             retryAtMs = if (snapshot.listenerStatus == CollectorHelperProtocol.KPI_LISTENER_READY) null
@@ -191,6 +201,14 @@ internal class KpiCallbackDrainWorker(
                                 onSnapshot(snapshot)
                             }
                         }
+                    }
+                    is DrainStep.SourceLoss -> {
+                        subscription = null
+                        forceDrain = false
+                        lastDrainedSequence = -1L
+                        onListenerStatus(CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE)
+                        retryAtMs = nowMs() + retryDelay(++failures)
+                        onConfirmedSourceLoss(step.invalidation)
                     }
                 }
             }
@@ -220,5 +238,6 @@ internal class KpiCallbackDrainWorker(
         data class Deactivate(val subscription: DirectKpiSubscriptionResult) : DrainStep()
         data class Subscribe(val previous: DirectKpiSubscriptionResult?) : DrainStep()
         data class Drain(val subscription: DirectKpiSubscriptionResult, val invalidation: DirectKpiInvalidation?) : DrainStep()
+        data class SourceLoss(val subscription: DirectKpiSubscriptionResult, val invalidation: DirectKpiInvalidation) : DrainStep()
     }
 }

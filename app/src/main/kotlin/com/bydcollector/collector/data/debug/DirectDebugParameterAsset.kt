@@ -52,9 +52,22 @@ object DirectDebugParameterAsset {
     const val MAX_SHARD_SIZE = 7_698
     const val DEFINITION_COUNT = TelemetryCatalogPolicy.SECONDARY_DEFINITION_COUNT
     const val TOTAL_PARAMETER_COUNT = TelemetryCatalogPolicy.SECONDARY_ACTIVE_COUNT
+    const val PREVIOUS_PARAMETER_COUNT = TelemetryCatalogPolicy.SECONDARY_PREVIOUS_ACTIVE_COUNT
     const val LEGACY_SOURCE_VERSION = "fid-catalog-20260908-main95-roundrobin23083-both-read-tx-v1"
-    const val SOURCE_VERSION = "fid-catalog-20260922-main95-roundrobin23069-exclusions7-v2"
+    const val PREVIOUS_SOURCE_VERSION = "fid-catalog-20260922-main95-roundrobin23069-exclusions7-v2"
+    const val SOURCE_VERSION = "fid-catalog-20261027-sl07-canfd-callback-addresses-v3"
     const val ACTIVE_FINGERPRINT = TelemetryCatalogPolicy.SECONDARY_ACTIVE_FINGERPRINT
+    const val PREVIOUS_ACTIVE_FINGERPRINT = TelemetryCatalogPolicy.SECONDARY_PREVIOUS_ACTIVE_FINGERPRINT
+    private val CANFD_SECONDARY_WINDOW = DirectDebugParameter(
+        key = "bodywork_1001_1267728400_5",
+        featureGroup = "BODYWORK",
+        dev = TelemetryCatalogPolicy.CANFD_SECONDARY_WINDOW_DEVICE,
+        fid = TelemetryCatalogPolicy.CANFD_SECONDARY_WINDOW_FID,
+        tx = TelemetryCatalogPolicy.CANFD_SECONDARY_WINDOW_TX,
+        featureNames = "BODYWORK_WINDOW_RIGHT_FRONT_PERCENT",
+        featureRefs = "Bodywork.BODYWORK_WINDOW_RIGHT_FRONT_PERCENT",
+        candidateSource = "sl07_canfd_framework_mapping_20261027"
+    )
     val EXPECTED_HEADER = listOf(
         "key",
         "feature_group",
@@ -66,10 +79,14 @@ object DirectDebugParameterAsset {
         "candidate_source"
     )
 
-    fun load(context: Context): List<DirectDebugParameter> {
-        return loadDefinitions(context).filter(::isRuntimeSelected).also { rows ->
-            require(rows.size == TOTAL_PARAMETER_COUNT) { "Unexpected active debug catalog size: ${rows.size}" }
-            require(fingerprint(rows) == ACTIVE_FINGERPRINT) { "Unexpected active debug catalog fingerprint" }
+    fun load(context: Context): List<DirectDebugParameter> = loadForCatalog(context, SOURCE_VERSION)
+
+    fun loadForCatalog(context: Context, catalogVersion: String): List<DirectDebugParameter> {
+        val definitions = loadDefinitions(context)
+        return when (catalogVersion) {
+            SOURCE_VERSION -> currentParameters(definitions)
+            PREVIOUS_SOURCE_VERSION -> previousParameters(definitions)
+            else -> throw IllegalArgumentException("Unsupported secondary catalog: $catalogVersion")
         }
     }
 
@@ -79,17 +96,45 @@ object DirectDebugParameterAsset {
         }
 
     fun isRuntimeSelected(parameter: DirectDebugParameter): Boolean =
-        TelemetryCatalogPolicy.isRuntimeSelected(parameter.dev, parameter.fid)
+        TelemetryCatalogPolicy.isSecondaryRuntimeSelected(parameter.dev, parameter.fid, parameter.tx)
+
+    fun isPreviousRuntimeSelected(parameter: DirectDebugParameter): Boolean =
+        TelemetryCatalogPolicy.isPreviousRuntimeSelected(parameter.dev, parameter.fid)
+
+    fun parameterCountForCatalog(catalogVersion: String): Int? = when (catalogVersion) {
+        SOURCE_VERSION -> TOTAL_PARAMETER_COUNT
+        PREVIOUS_SOURCE_VERSION -> PREVIOUS_PARAMETER_COUNT
+        else -> null
+    }
 
     fun parametersForCatalog(
         catalogVersion: String,
         definitions: List<DirectDebugParameter>,
-        active: List<DirectDebugParameter>
+        active: List<DirectDebugParameter>? = null
     ): List<DirectDebugParameter>? = when (catalogVersion) {
-        SOURCE_VERSION -> active
+        SOURCE_VERSION -> active ?: currentParameters(definitions)
+        PREVIOUS_SOURCE_VERSION -> previousParameters(definitions)
         LEGACY_SOURCE_VERSION -> definitions
         else -> null
     }
+
+    private fun currentParameters(definitions: List<DirectDebugParameter>): List<DirectDebugParameter> =
+        definitions.filter(::isRuntimeSelected).toMutableList().apply {
+            require(none { it.dev == CANFD_SECONDARY_WINDOW.dev && it.fid == CANFD_SECONDARY_WINDOW.fid &&
+                it.tx == CANFD_SECONDARY_WINDOW.tx }) { "CAN-FD window address already exists in secondary catalog" }
+            add(CANFD_SECONDARY_WINDOW)
+        }.also { rows ->
+            require(rows.size == TOTAL_PARAMETER_COUNT) { "Unexpected active debug catalog size: ${rows.size}" }
+            require(fingerprint(rows) == ACTIVE_FINGERPRINT) { "Unexpected active debug catalog fingerprint" }
+        }
+
+    private fun previousParameters(definitions: List<DirectDebugParameter>): List<DirectDebugParameter> =
+        definitions.filter(::isPreviousRuntimeSelected).also { rows ->
+            require(rows.size == PREVIOUS_PARAMETER_COUNT) { "Unexpected previous debug catalog size: ${rows.size}" }
+            require(fingerprint(rows) == PREVIOUS_ACTIVE_FINGERPRINT) {
+                "Unexpected previous debug catalog fingerprint"
+            }
+        }
 
     fun fingerprint(parameters: List<DirectDebugParameter>): String {
         val digest = TelemetryCatalogPolicy.newFingerprint()

@@ -3,89 +3,64 @@ package com.bydcollector.collector.service
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.data.normalized.NormalizedFieldCatalog
 import com.bydcollector.collector.data.normalized.NormalizedQuality
+import com.bydcollector.collector.data.normalized.NormalizedSourceOrder
+import com.bydcollector.collector.data.normalized.NormalizedSourceOrdering
 
-/** Main-thread-owned per-field source age; sparse events never refresh other fields. */
-internal class KpiFreshness(private val bootId: String, private val maxAgeMs: Long) {
-    private val fields = mutableMapOf<String, NormalizedObservation>()
+/** Indefinite held KPI state; only a confirmed loss/reset removes an observation. */
+internal class KpiFreshness(private val bootId: String) {
+    private val fields = linkedMapOf<String, NormalizedObservation>()
     private val kpiKeys = NormalizedFieldCatalog.kpiKeys
-    private val lastRejected = mutableMapOf<String, String>()
-    private val expiredKeys = mutableSetOf<String>()
-    private val expiriesSinceReport = mutableMapOf<String, Long>()
-    private var lastDiagnosticMs = Long.MIN_VALUE
 
-    private fun isRecent(sourceBootId: String, sourceElapsedMs: Long, nowMs: Long): Boolean =
-        sourceBootId == bootId && sourceElapsedMs >= 0 && sourceElapsedMs <= nowMs &&
-            nowMs - sourceElapsedMs < maxAgeMs
-
-    fun accept(observations: List<NormalizedObservation>, nowMs: Long): Boolean {
-        var changed = false
+    fun accept(observations: List<NormalizedObservation>, nowElapsedMs: Long): Boolean {
+        var semanticChange = false
         observations.forEach { observation ->
             val key = observation.field.fieldKey
             if (key !in kpiKeys) return@forEach
-            val source = observation.sourceStamp
-            val rejection = when {
-                source == null -> "missing_source_clock"
-                source.bootId != bootId -> "boot_mismatch"
-                source.elapsedMs < 0 || source.elapsedMs > nowMs -> "invalid_source_clock"
-                nowMs - source.elapsedMs >= maxAgeMs -> "source_age"
-                fields[key]?.sourceStamp?.let { source.elapsedMs < it.elapsedMs } == true -> "old_replay"
-                else -> null
+            val source = observation.sourceStamp ?: return@forEach
+            if (source.bootId != bootId || source.elapsedMs < 0L || source.elapsedMs > nowElapsedMs) return@forEach
+            val previous = fields[key]
+            if (previous != null) {
+                val previousSource = previous.sourceStamp ?: return@forEach
+                when (NormalizedSourceOrdering.compare(source, previousSource, bootId)) {
+                    NormalizedSourceOrder.OLDER, NormalizedSourceOrder.EQUAL -> return@forEach
+                    NormalizedSourceOrder.INCOMPARABLE -> if (source.elapsedMs <= previousSource.elapsedMs) return@forEach
+                    NormalizedSourceOrder.NEWER -> Unit
+                }
             }
-            if (rejection != null) {
-                lastRejected[key] = rejection
-                return@forEach
-            }
-            lastRejected.remove(key)
-            expiredKeys.remove(key)
             fields[key] = observation
-            changed = true
+            if (previous == null || previous.value != observation.value || previous.quality != observation.quality) {
+                semanticChange = true
+            }
+        }
+        return semanticChange
+    }
+
+    /** Drops only values whose input lost validity; unrelated normalized fields remain held. */
+    fun clear(keys: Set<String>): Boolean {
+        var changed = false
+        keys.forEach { key ->
+            if (key in kpiKeys && fields.remove(key) != null) changed = true
         }
         return changed
     }
 
-    fun freshObservations(nowMs: Long): List<NormalizedObservation> = fields.values.filter {
-        val source = checkNotNull(it.sourceStamp)
-        isRecent(source.bootId, source.elapsedMs, nowMs).also { recent ->
-            val key = it.field.fieldKey
-            if (!recent && expiredKeys.add(key)) expiriesSinceReport[key] = (expiriesSinceReport[key] ?: 0L) + 1L
+    /** Applies a coalesced per-field state; null explicitly means invalidated. */
+    fun apply(changes: Map<String, NormalizedObservation?>, nowElapsedMs: Long): Boolean {
+        val before = semanticState()
+        changes.forEach { (key, observation) ->
+            if (key !in kpiKeys) return@forEach
+            if (observation == null) fields.remove(key) else accept(listOf(observation), nowElapsedMs)
         }
+        return before != semanticState()
     }
 
-    /** Next individual expiry, not the newest field's deadline. */
-    fun remainingMs(nowMs: Long): Long = freshObservations(nowMs)
-        .minOfOrNull { maxAgeMs - (nowMs - checkNotNull(it.sourceStamp).elapsedMs) } ?: 0L
-
-    /** Bounded catalog-sized evidence, at most once per 30 s; never guesses transport failure. */
-    fun expiryDiagnostics(nowMs: Long): String? {
-        if (lastDiagnosticMs != Long.MIN_VALUE && nowMs - lastDiagnosticMs < 30_000L) return null
-        lastDiagnosticMs = nowMs
-        freshObservations(nowMs) // Count expiry once, including short gaps recovered before this report.
-        val detail = NormalizedFieldCatalog.kpiFields.mapNotNull { field ->
-            val observation = fields[field.fieldKey]
-            val source = observation?.sourceStamp
-            val reason = when {
-                observation == null -> "not_observed"
-                source == null || !isRecent(source.bootId, source.elapsedMs, nowMs) -> "source_age"
-                observation.quality != NormalizedQuality.OK -> "quality_${observation.quality.name.lowercase()}"
-                (expiriesSinceReport[field.fieldKey] ?: 0L) > 0L -> "recovered_after_source_age"
-                else -> return@mapNotNull null
-            }
-            "field=${field.fieldKey} sources=${field.sourceKeys.joinToString(",")} reason=$reason " +
-                "age_ms=${source?.let { (nowMs - it.elapsedMs).coerceAtLeast(0L) }} " +
-                "last_rejection=${lastRejected[field.fieldKey]} expiries=${expiriesSinceReport[field.fieldKey] ?: 0L}"
-        }.takeIf { it.isNotEmpty() }?.joinToString("; ")
-        expiriesSinceReport.clear()
-        return detail
-    }
-
-    /** Hidden five-minute sampling naturally ages out; it is not a live-source outage. */
-    fun discardExpiryDiagnostics() {
-        expiriesSinceReport.clear()
-        lastDiagnosticMs = Long.MIN_VALUE
-    }
+    fun observations(): List<NormalizedObservation> = fields.values.toList()
 
     fun clear() {
-        fields.clear(); lastRejected.clear(); expiredKeys.clear(); expiriesSinceReport.clear()
-        lastDiagnosticMs = Long.MIN_VALUE
+        fields.clear()
+    }
+
+    private fun semanticState(): Map<String, Pair<Any, NormalizedQuality>> = fields.mapValues { (_, observation) ->
+        observation.value to observation.quality
     }
 }

@@ -52,7 +52,9 @@ enum class EnergyIntegrationReason {
     EXTERNAL_CHARGING,
     BOOT_CHANGED,
     NON_MONOTONIC_TIME,
-    GAP_EXCEEDED
+    GAP_EXCEEDED,
+    ZERO_INTERVAL,
+    LATE_SOURCE_REANCHORED
 }
 
 data class EnergyIntegrationResult(
@@ -130,12 +132,20 @@ object BatteryEnergyIntegrator {
         }
 
         val intervalMs = input.elapsedMs - previousAnchor.elapsedMs
-        if (intervalMs <= 0L) {
+        if (intervalMs < 0L) {
             return EnergyIntegrationResult(
                 totals = totals.copy(partial = true),
                 anchor = anchor,
                 quality = EnergyIntegrationQuality.PARTIAL,
                 reason = EnergyIntegrationReason.NON_MONOTONIC_TIME
+            )
+        }
+        if (intervalMs == 0L) {
+            return EnergyIntegrationResult(
+                totals = totals,
+                anchor = anchor,
+                quality = EnergyIntegrationQuality.ANCHOR_ONLY,
+                reason = EnergyIntegrationReason.ZERO_INTERVAL
             )
         }
         if (intervalMs > MAX_INTERVAL_MS) {
@@ -163,6 +173,35 @@ object BatteryEnergyIntegrator {
         )
     }
 
+    fun reanchorAfterLateSource(
+        previousAnchor: EnergyAnchor?,
+        totals: EnergyTotals,
+        input: EnergyInput
+    ): EnergyIntegrationResult {
+        val elapsedMs = previousAnchor
+            ?.takeIf { it.bootId == input.bootId && input.elapsedMs > it.elapsedMs }
+            ?.let { input.elapsedMs - it.elapsedMs }
+            ?: 0L
+        val anchor = if (
+            input.powerOn == true && input.externalCharging != true &&
+            input.gunDisconnected == true && validPower(input)
+        ) {
+            val powerKw = requireNotNull(input.voltage) * requireNotNull(input.current) / 1_000.0
+            EnergyAnchor(input.bootId, input.elapsedMs, powerKw)
+        } else {
+            null
+        }
+        return EnergyIntegrationResult(
+            totals = totals.copy(
+                uncoveredMs = addDuration(totals.uncoveredMs, elapsedMs),
+                partial = true
+            ),
+            anchor = anchor,
+            quality = EnergyIntegrationQuality.PARTIAL,
+            reason = EnergyIntegrationReason.LATE_SOURCE_REANCHORED
+        )
+    }
+
     fun finishSession(
         previousAnchor: EnergyAnchor?,
         totals: EnergyTotals,
@@ -181,7 +220,7 @@ object BatteryEnergyIntegrator {
             previousAnchor.bootId.isBlank() || previousAnchor.elapsedMs < 0L || !previousAnchor.powerKw.isFinite() ->
                 EnergyIntegrationReason.INVALID_SAMPLE
             previousAnchor.bootId != input.bootId -> EnergyIntegrationReason.BOOT_CHANGED
-            intervalMs == null || intervalMs <= 0L -> EnergyIntegrationReason.NON_MONOTONIC_TIME
+            intervalMs == null || intervalMs < 0L -> EnergyIntegrationReason.NON_MONOTONIC_TIME
             intervalMs > MAX_INTERVAL_MS -> EnergyIntegrationReason.GAP_EXCEEDED
             !validPower(input) -> EnergyIntegrationReason.INVALID_SAMPLE
             else -> null
@@ -201,6 +240,14 @@ object BatteryEnergyIntegrator {
 
         val closingAnchor = requireNotNull(previousAnchor)
         val durationMs = requireNotNull(intervalMs)
+        if (durationMs == 0L) {
+            return EnergyIntegrationResult(
+                totals = totals,
+                anchor = null,
+                quality = EnergyIntegrationQuality.ANCHOR_ONLY,
+                reason = EnergyIntegrationReason.ZERO_INTERVAL
+            )
+        }
         val powerKw = requireNotNull(input.voltage) * requireNotNull(input.current) / 1_000.0
         val energy = splitTrapezoid(closingAnchor.powerKw, powerKw, durationMs)
         return EnergyIntegrationResult(

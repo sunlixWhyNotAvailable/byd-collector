@@ -143,7 +143,9 @@ class DashboardStateProvider(
         } else null
         val debugStatusLoaded = loadedDebugStatus != null
         val debugStatus = loadedDebugStatus ?: lightweightDebugStatus()
-        val debugParameterCount = DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT
+        val debugParameterCount = debugStatus.candidateCount.takeIf { it > 0 }
+            ?: previous?.debugParameterCount?.takeIf { it > 0 }
+            ?: DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT
         val runtimeSettingsLoaded = profile.readsRuntimeSettings
         val keepAliveConfig = if (runtimeSettingsLoaded) settings.keepAliveConfig() else null
         val integrationSettingsLoaded = profile.readsIntegrationSettings
@@ -361,7 +363,7 @@ class DashboardStateProvider(
             integrationSettingsLoaded = integrationSettingsLoaded,
             runtimeSettingsLoaded = runtimeSettingsLoaded,
             archiveDetailsLoaded = archiveDetailsLoaded
-        ).copy(debugParameterCount = DirectDebugParameterAsset.TOTAL_PARAMETER_COUNT)
+        ).copy(debugParameterCount = debugParameterCount)
     }
 
     private fun recordArchiveItemsError(read: ArchiveStorageItemsRead.Corrupt, store: TelemetryStore?) {

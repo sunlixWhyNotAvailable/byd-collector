@@ -194,6 +194,41 @@ class DirectDebugDatabaseHelper(
         )
         db.execSQL(
             """
+            CREATE TABLE IF NOT EXISTS debug_secondary_get_lineage (
+                read_identity TEXT NOT NULL,
+                record_sequence INTEGER NOT NULL CHECK(record_sequence >= 0),
+                source_key TEXT NOT NULL,
+                cycle_id INTEGER NOT NULL,
+                candidate_id INTEGER NOT NULL,
+                helper_boot_id TEXT NOT NULL,
+                helper_generation TEXT NOT NULL,
+                stream INTEGER NOT NULL CHECK(stream = 2),
+                source_epoch INTEGER NOT NULL CHECK(source_epoch >= 0),
+                device INTEGER NOT NULL,
+                fid INTEGER NOT NULL,
+                tx INTEGER NOT NULL CHECK(tx IN (5, 7)),
+                started_wall_ms INTEGER NOT NULL CHECK(started_wall_ms >= 0),
+                started_elapsed_ms INTEGER NOT NULL CHECK(started_elapsed_ms >= 0),
+                completed_wall_ms INTEGER NOT NULL CHECK(completed_wall_ms >= 0),
+                completed_elapsed_ms INTEGER NOT NULL CHECK(completed_elapsed_ms >= started_elapsed_ms),
+                callback_watermark_start INTEGER NOT NULL CHECK(callback_watermark_start >= -1),
+                callback_watermark_end INTEGER NOT NULL CHECK(callback_watermark_end >= -1),
+                superseded_by_callback INTEGER NOT NULL CHECK(superseded_by_callback IN (0, 1)),
+                status INTEGER NOT NULL,
+                raw_present INTEGER NOT NULL CHECK(raw_present IN (0, 1)),
+                raw_int INTEGER,
+                error TEXT,
+                PRIMARY KEY(read_identity, record_sequence, source_key),
+                CHECK(raw_present = 0 OR raw_int IS NOT NULL)
+            ) WITHOUT ROWID
+            """.trimIndent()
+        )
+        db.execSQL(
+            "CREATE INDEX IF NOT EXISTS idx_debug_secondary_get_lineage_candidate " +
+                "ON debug_secondary_get_lineage(candidate_id, record_sequence)"
+        )
+        db.execSQL(
+            """
             CREATE TABLE IF NOT EXISTS debug_secondary_replay_cursor (
                 catalog_version_id INTEGER PRIMARY KEY,
                 boot_id TEXT NOT NULL,
