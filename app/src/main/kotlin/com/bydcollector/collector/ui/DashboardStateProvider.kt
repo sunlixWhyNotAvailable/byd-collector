@@ -215,6 +215,23 @@ class DashboardStateProvider(
         } else {
             previous?.influxStatus ?: formatInfluxStatus(influxState)
         }
+        // Keep branching/inline expressions outside the wide constructor to avoid DEX register aliasing.
+        val archiveStorageScanPending = profile == DashboardLoadProfile.INITIAL || archiveStorageResult.pending
+        val archiveStorageItemStates = when (val read = archiveStorageItemsRead) {
+            is ArchiveStorageItemsRead.Valid -> read.items
+            else -> emptyList()
+        }
+        val archiveStorageItemStatesAvailable = archiveStorageItemsRead != null &&
+            archiveStorageItemsRead !is ArchiveStorageItemsRead.Corrupt
+        val archiveStorageItemStateError = (archiveStorageItemsRead as? ArchiveStorageItemsRead.Corrupt)
+            ?.error?.let { error ->
+                error.message?.take(160)?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName
+            }
+        val archiveStorageScanError = if (archiveDetailsLoaded) {
+            archiveStorageResult.error?.let { error ->
+                error.message?.take(160)?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName
+            }
+        } else null
         val next = DashboardState(
             running = mainPollingRunning,
             serviceRunning = serviceRunning,
@@ -240,23 +257,12 @@ class DashboardStateProvider(
             archiveStorageLimitGb = archiveStorageLimitGb,
             archiveStorageSnapshot = archiveStorageResult.snapshot,
             // INITIAL does not list archives: an empty seed is not a completed empty scan.
-            archiveStorageScanPending = profile == DashboardLoadProfile.INITIAL || archiveStorageResult.pending,
+            archiveStorageScanPending = archiveStorageScanPending,
             archiveStorageJobStatus = archiveStorageJobStatus,
-            archiveStorageItemStates = when (val read = archiveStorageItemsRead) {
-                is ArchiveStorageItemsRead.Valid -> read.items
-                else -> emptyList()
-            },
-            archiveStorageItemStatesAvailable = archiveStorageItemsRead != null &&
-                archiveStorageItemsRead !is ArchiveStorageItemsRead.Corrupt,
-            archiveStorageItemStateError = (archiveStorageItemsRead as? ArchiveStorageItemsRead.Corrupt)
-                ?.error?.let { error ->
-                    error.message?.take(160)?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName
-                },
-            archiveStorageScanError = if (archiveDetailsLoaded) {
-                archiveStorageResult.error?.let { error ->
-                    error.message?.take(160)?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName
-                }
-            } else null,
+            archiveStorageItemStates = archiveStorageItemStates,
+            archiveStorageItemStatesAvailable = archiveStorageItemStatesAvailable,
+            archiveStorageItemStateError = archiveStorageItemStateError,
+            archiveStorageScanError = archiveStorageScanError,
             latestSoc = health.latestSoc,
             latestSpeed = health.latestSpeed,
             latestCharging = health.latestCharging,
