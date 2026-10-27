@@ -27,11 +27,20 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.Base64;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.Iterator;
+import java.util.regex.Pattern;
+import java.util.regex.Matcher;
+import java.io.StringWriter;
+import java.io.PrintWriter;
+import com.bydcollector.collector.diagnostics.DiagnosticShareSanitizer;
 
 //helper-owned durable raw spool; the app acknowledges a sample only after its own transaction commits
 final class TelemetryWorkerSpool implements AutoCloseable {
     static final String SPOOL_DIRECTORY_PATH = "/data/local/tmp/bydcollector_telemetry_spool";
     static final int RECORD_VERSION = 4;
+    static final int SPARSE_RECORD_VERSION = 3;
     static final int PREVIOUS_RECORD_VERSION = 3;
     static final int LEGACY_RECORD_VERSION = 2;
     static final int OLDEST_RECORD_VERSION = 1;
@@ -39,13 +48,16 @@ final class TelemetryWorkerSpool implements AutoCloseable {
     private static final String READY_SUFFIX = ".ready";
     private static final String TMP_SUFFIX = ".tmp";
     private static final String BAD_SUFFIX = ".bad";
+    private static final String REPLAY_SUFFIX = ".replay";
+    private static final String RECOVERED_SUFFIX = ".recovered";
+    private static final Pattern WORKER_FILE = Pattern.compile("^v[1-4]_(.+)\\.ready(?:\\.bad(?:\\.[0-9]+)?(?:\\.replay|\\.recovered)?)?$");
     private static final SampleValidator ACCEPT_ALL = sample -> { };
     private static final DiagnosticListener NO_DIAGNOSTICS = new DiagnosticListener() {
         @Override public void onObservation(Footprint footprint, boolean capacityBlocked) { }
         @Override public void onAppend(AppendResult result, Footprint footprint) { }
         @Override public void onPersistenceFailure(String operation, Throwable error) { }
         @Override public void onAcknowledge(AckResult result) { }
-        @Override public void onQuarantine(long recordBytes) { }
+        @Override public void onQuarantine(long recordBytes, String detail) { }
     };
 
     private final File directory;
@@ -57,6 +69,9 @@ final class TelemetryWorkerSpool implements AutoCloseable {
     // Ready records are immutable. Keep only ordering metadata, never their value arrays.
     private final Map<String, PendingRecord> pendingRecords = new HashMap<String, PendingRecord>();
     private long decodedRecordCount;
+    private Iterator<List<File>> recoveryGroups;
+    private int recoveryRemaining;
+    private IOException recoveryFailure;
     private boolean closed;
 
     static TelemetryWorkerSpool open() {
@@ -181,6 +196,93 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         }
     }
 
+    // Validate in bounded passes before exposing any restored records, preserving replay ordering.
+    synchronized boolean recoverQuarantined(SampleValidator validator) throws IOException {
+        ensureOpen();
+        synchronized (rootState.lock) {
+            if (recoveryFailure != null) throw recoveryFailure;
+            if (recoveryGroups == null) {
+                File[] files = directory.listFiles();
+                if (files == null) throw new IOException("cannot list quarantine: " + directory);
+                Map<String, List<File>> groups = new LinkedHashMap<>();
+                Set<String> candidates = new HashSet<>();
+                for (File file : files) {
+                    Matcher name = WORKER_FILE.matcher(file.getName());
+                    if (!file.isFile() || !name.matches()) continue;
+                    String key = name.group(1);
+                    groups.computeIfAbsent(key, ignored -> new ArrayList<>()).add(file);
+                    if (isQuarantined(file.getName())) candidates.add(key);
+                }
+                groups.keySet().retainAll(candidates);
+                recoveryRemaining = groups.size();
+                recoveryGroups = groups.values().iterator();
+            }
+            int restored = 0, rejected = 0, processed = 0;
+            long deadline = System.nanoTime() + 100_000_000L;
+            while (recoveryGroups.hasNext() && processed < 64 && (processed == 0 || System.nanoTime() < deadline)) {
+                List<File> group = recoveryGroups.next();
+                processed++;
+                recoveryRemaining--;
+                try {
+                    byte[] expected = null;
+                    boolean alreadyCommitted = false;
+                    for (File file : group) {
+                        byte[] bytes = readBytes(file);
+                        Sample sample = decode(bytes);
+                        validateFileIdentity(file, sample);
+                        validator.validate(sample);
+                        if (expected != null && !Arrays.equals(expected, bytes)) {
+                            throw new IOException("conflicting worker payloads for the same identity: " + file.getName());
+                        }
+                        expected = bytes;
+                        alreadyCommitted |= file.getName().endsWith(RECOVERED_SUFFIX);
+                    }
+                    for (File file : group) {
+                        if (!isQuarantined(file.getName())) continue;
+                        // Renaming retains the original bytes without doubling quota/IO; ACK retains them too.
+                        File target = new File(file.getPath() + (alreadyCommitted ? RECOVERED_SUFFIX : REPLAY_SUFFIX));
+                        moveWithoutReplacement(file, target);
+                        rootState.noteRename(file, target);
+                        if (!alreadyCommitted) restored++;
+                    }
+                } catch (Exception error) {
+                    rejected++;
+                    for (File file : group) {
+                        if (!file.isFile()) continue;
+                        if (isPendingFile(file.getName())) {
+                            try { quarantine(file, "quarantine_recovery", error); }
+                            catch (RuntimeException quarantineError) {
+                                recoveryFailure = new IOException("cannot isolate conflicting recovery records", quarantineError);
+                                throw recoveryFailure;
+                            }
+                        }
+                        else if (isQuarantined(file.getName())) recordFileError(file, "quarantine_recovery", error);
+                    }
+                    notifyPersistenceFailure("quarantine_recovery", error);
+                }
+            }
+            if (processed != 0) {
+                notifyObservation(footprint(), false);
+                try { diagnostics.onRecovery(restored, rejected, recoveryRemaining); }
+                catch (Throwable error) { error.printStackTrace(System.err); }
+            }
+            return !recoveryGroups.hasNext();
+        }
+    }
+
+    private static boolean isQuarantined(String name) {
+        return name.matches(".*\\.ready\\.bad(?:\\.[0-9]+)?");
+    }
+
+    static boolean isPendingFile(String name) {
+        return name.endsWith(READY_SUFFIX) || name.endsWith(REPLAY_SUFFIX) && name.matches(".*\\.ready\\.bad(?:\\.[0-9]+)?\\.replay");
+    }
+
+    private static void moveWithoutReplacement(File from, File to) throws IOException {
+        if (to.exists()) throw new IOException("refusing to overwrite " + to);
+        Files.move(from.toPath(), to.toPath());
+    }
+
     private List<Sample> pendingShared(int limit, SampleValidator validator) {
         ensureOpen();
         if (validator == null) throw new IllegalArgumentException("sample validator is required");
@@ -203,6 +305,7 @@ final class TelemetryWorkerSpool implements AutoCloseable {
             }
             Collections.sort(selected, ELAPSED_ORDER);
             List<Sample> result = new ArrayList<Sample>(Math.min(limit, selected.size()));
+            Set<TelemetryWorkerSampleIdentity> offered = new HashSet<>();
             boolean reordered = false;
             for (PendingRecord record : selected) {
                 if (result.size() == limit) break;
@@ -215,9 +318,9 @@ final class TelemetryWorkerSpool implements AutoCloseable {
                         reordered = true;
                         break;
                     }
-                    result.add(sample);
+                    if (offered.add(sample.identity)) result.add(sample);
                 } catch (Exception error) {
-                    quarantine(record.file);
+                    quarantine(record.file, "pending_validate", error);
                 }
             }
             if (reordered) {
@@ -234,7 +337,7 @@ final class TelemetryWorkerSpool implements AutoCloseable {
     }
 
     private void refreshPendingRecords() {
-        File[] files = directory.listFiles((dir, name) -> name.endsWith(READY_SUFFIX));
+        File[] files = directory.listFiles((dir, name) -> isPendingFile(name));
         if (files == null) {
             IllegalStateException error = new IllegalStateException("cannot list telemetry worker spool: " + directory);
             notifyPersistenceFailure("pending", error);
@@ -251,7 +354,7 @@ final class TelemetryWorkerSpool implements AutoCloseable {
                     pendingRecords.put(file.getName(), new PendingRecord(file, signature, readPendingSample(file)));
                 }
             } catch (Exception error) {
-                quarantine(file);
+                quarantine(file, "pending_decode", error);
             }
         }
         pendingRecords.keySet().retainAll(seen);
@@ -264,10 +367,14 @@ final class TelemetryWorkerSpool implements AutoCloseable {
     private Sample readPendingSample(File file) throws Exception {
         decodedRecordCount++;
         Sample sample = decode(readBytes(file));
-        if (!file.equals(readyFile(sample.recordVersion, sample.identity))) {
-            throw new IllegalArgumentException("record filename does not match identity");
-        }
+        validateFileIdentity(file, sample);
         return sample;
+    }
+
+    private void validateFileIdentity(File file, Sample sample) {
+        String readyName = readyFile(sample.recordVersion, sample.identity).getName();
+        if (!file.getName().matches(Pattern.quote(readyName) + "(?:\\.bad(?:\\.[0-9]+)?(?:\\.replay|\\.recovered)?)?"))
+            throw new IllegalArgumentException("record filename does not match identity: " + file.getName());
     }
 
     synchronized long decodedRecordCountForTest() { return decodedRecordCount; }
@@ -315,37 +422,54 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         ensureOpen();
         if (identity == null) throw new IllegalArgumentException("identity is required");
         if (acknowledgedAtMs < 0) throw new IllegalArgumentException("acknowledgedAtMs must be non-negative");
-        File ready = readyFile(identity);
-        if (!ready.isFile()) ready = readyFile(PREVIOUS_RECORD_VERSION, identity);
-        if (!ready.isFile()) ready = readyFile(LEGACY_RECORD_VERSION, identity);
-        if (!ready.isFile()) ready = readyFile(OLDEST_RECORD_VERSION, identity);
-        if (!ready.isFile()) {
+        List<File> records = new ArrayList<File>();
+        for (PendingRecord record : pendingRecords.values()) {
+            if (identity.equals(record.identity) && record.file.isFile()) records.add(record.file);
+        }
+        if (records.isEmpty()) {
+            for (int version = OLDEST_RECORD_VERSION; version <= RECORD_VERSION; version++) {
+                File file = readyFile(version, identity);
+                if (file.isFile()) records.add(file);
+            }
+        }
+        if (records.isEmpty()) {
             AckResult result = AckResult.notFound();
             notifyAcknowledge(result);
             return result;
         }
-        long recordBytes = ready.length();
-        try {
-            Sample sample = decode(readBytes(ready));
-            if (!identity.equals(sample.identity)) {
-                AckResult result = AckResult.failed("record identity mismatch");
-                notifyAcknowledge(result);
-                return result;
-            }
-        } catch (Exception error) {
-            AckResult result = AckResult.failed("cannot validate record: " + error.getMessage());
-            notifyAcknowledge(result);
-            return result;
-        }
+        File current = records.get(0);
         AckResult result;
-        if (ready.delete()) {
-            rootState.noteDelete(ready);
-            pendingRecords.remove(ready.getName());
+        try {
+            byte[] first = null;
+            for (File file : records) {
+                current = file;
+                byte[] bytes = readBytes(file);
+                Sample sample = decode(bytes);
+                validateFileIdentity(file, sample);
+                if (!identity.equals(sample.identity)) throw new IOException("record identity mismatch");
+                if (first != null && !Arrays.equals(first, bytes)) throw new IOException("conflicting payloads for " + file.getName());
+                first = bytes;
+            }
+            long releasedBytes = 0;
+            for (File file : records) {
+                current = file;
+                if (file.getName().endsWith(REPLAY_SUFFIX)) {
+                    File retained = new File(file.getPath().substring(0, file.getPath().length() - REPLAY_SUFFIX.length()) + RECOVERED_SUFFIX);
+                    moveWithoutReplacement(file, retained);
+                    rootState.noteRename(file, retained);
+                } else {
+                    long bytes = file.length();
+                    if (!file.delete()) throw new IOException("record delete failed: " + file);
+                    rootState.noteDelete(file);
+                    releasedBytes += bytes;
+                }
+                pendingRecords.remove(file.getName());
+            }
             capacityBlockedFootprint = null;
-            result = AckResult.released(recordBytes);
-        } else {
-            result = AckResult.failed("record delete failed");
-            notifyPersistenceFailure("acknowledge", new IOException(result.error));
+            result = new AckResult(AckStatus.RELEASED, records.size(), releasedBytes, null);
+        } catch (Exception error) {
+            result = AckResult.failed(recordFileError(current, "acknowledge", error));
+            notifyPersistenceFailure("acknowledge", error);
         }
         notifyAcknowledge(result);
         return result;
@@ -531,20 +655,56 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         }
     }
 
-    private void quarantine(File file) {
+    private void quarantine(File file, String stage, Exception error) {
         pendingRecords.remove(file.getName());
         long recordBytes = file.length();
-        File bad = new File(file.getPath() + BAD_SUFFIX);
+        String base = file.getPath().substring(0, file.getPath().lastIndexOf(READY_SUFFIX) + READY_SUFFIX.length());
+        File bad = new File(base + BAD_SUFFIX);
         int suffix = 1;
-        while (bad.exists()) bad = new File(file.getPath() + BAD_SUFFIX + "." + suffix++);
-        if (!file.renameTo(bad)) {
-            rootState.invalidate();
-            System.err.println("WARN: cannot quarantine malformed telemetry worker record: " + file);
-            notifyPersistenceFailure("quarantine", new IOException("rename failed: " + file));
-        } else {
+        while (bad.exists()) bad = new File(base + BAD_SUFFIX + "." + suffix++);
+        try {
+            moveWithoutReplacement(file, bad);
             rootState.noteRename(file, bad);
-            notifyQuarantine(recordBytes);
+        } catch (IOException renameError) {
+            error.addSuppressed(renameError);
+            rootState.invalidate();
+            recordFileError(file, stage, error);
+            notifyPersistenceFailure("quarantine_rename", error);
+            throw new IllegalStateException("cannot quarantine " + file, error);
         }
+        notifyQuarantine(recordBytes, recordFileError(bad, stage, error));
+    }
+
+    private String recordFileError(File file, String stage, Throwable error) {
+        DiagnosticShareSanitizer sanitizer = new DiagnosticShareSanitizer();
+        StringWriter trace = new StringWriter();
+        error.printStackTrace(new PrintWriter(trace));
+        String stack = sanitizer.sanitizeText(trace.toString());
+        boolean truncated = stack.length() > 65536;
+        if (truncated) stack = stack.substring(0, 65536) + "\n[truncated]";
+        File evidence = new File(file.getPath() + "." + stage + ".error.json");
+        File temporary = new File(evidence.getPath() + TMP_SUFFIX);
+        String detail = sanitizer.sanitizeText(stage + " file=" + file.getName() + " " + error.getClass().getName() + ": " + error.getMessage());
+        try {
+            JSONObject json = new JSONObject().put("stage", stage).put("file", file.getName())
+                .put("observed_wall_ms", System.currentTimeMillis()).put("exception_type", error.getClass().getName())
+                .put("exception_message", sanitizer.sanitizeText(String.valueOf(error.getMessage())))
+                .put("stack_trace", stack).put("truncated", truncated);
+            writeDurably(temporary, json.toString().getBytes(StandardCharsets.UTF_8));
+            rootState.noteFile(temporary);
+            Files.move(temporary.toPath(), evidence.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            rootState.noteRename(temporary, evidence);
+        } catch (Exception evidenceError) {
+            error.addSuppressed(evidenceError);
+            rootState.invalidate();
+            StringWriter combined = new StringWriter();
+            error.printStackTrace(new PrintWriter(combined));
+            System.err.println(sanitizer.sanitizeText(combined.toString()));
+            notifyPersistenceFailure("quarantine_diagnostics", error);
+            detail += " diagnostic_write_failed=" + sanitizer.sanitizeText(evidenceError.toString());
+        }
+        if (detail.length() > 440) detail = detail.substring(0, 440) + " [truncated; see .error.json]";
+        return detail;
     }
 
     private boolean isCapacityBlockedAt(Footprint footprint) {
@@ -571,8 +731,8 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         try { diagnostics.onAcknowledge(result); } catch (Throwable ignored) { }
     }
 
-    private void notifyQuarantine(long recordBytes) {
-        try { diagnostics.onQuarantine(recordBytes); } catch (Throwable ignored) { }
+    private void notifyQuarantine(long recordBytes, String detail) {
+        try { diagnostics.onQuarantine(recordBytes, detail); } catch (Throwable error) { error.printStackTrace(System.err); }
     }
 
     private static int compareLong(long left, long right) {
@@ -620,7 +780,8 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         void onAppend(AppendResult result, Footprint footprint);
         void onPersistenceFailure(String operation, Throwable error);
         void onAcknowledge(AckResult result);
-        void onQuarantine(long recordBytes);
+        void onQuarantine(long recordBytes, String detail);
+        default void onRecovery(int restored, int rejected, int remaining) { }
     }
 
     enum AppendResult {
@@ -744,7 +905,7 @@ final class TelemetryWorkerSpool implements AutoCloseable {
                 if (value.fieldIndex <= previousIndex || value.fieldIndex >= CollectorHelperProtocol.MAX_BATCH_SIZE) {
                     throw new IllegalArgumentException("values must have increasing in-range fieldIndex values");
                 }
-                if (recordVersion < PREVIOUS_RECORD_VERSION && value.fieldIndex != indexes.size()) {
+                if (recordVersion < SPARSE_RECORD_VERSION && value.fieldIndex != indexes.size()) {
                     throw new IllegalArgumentException("legacy values must be dense");
                 }
                 if (!indexes.add(value.fieldIndex)) throw new IllegalArgumentException("duplicate fieldIndex: " + value.fieldIndex);

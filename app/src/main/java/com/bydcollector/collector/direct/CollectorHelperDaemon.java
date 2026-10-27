@@ -477,13 +477,17 @@ public final class CollectorHelperDaemon {
                         } else {
                             try {
                                 List<TelemetryWorkerSpool.Sample> samples;
+                                boolean recovered;
+                                int limit = data.readInt();
                                 synchronized (readLock) {
-                                    samples = workerSpool.pending(data.readInt(), replaySampleValidator);
+                                    recovered = workerSpool.recoverQuarantined(replaySampleValidator);
+                                    samples = recovered ? workerSpool.pending(limit, replaySampleValidator)
+                                        : Collections.<TelemetryWorkerSpool.Sample>emptyList();
                                 }
                                 writeWorkerPendingReply(
                                     reply,
-                                    CollectorHelperProtocol.STATUS_OK,
-                                    null,
+                                    recovered ? CollectorHelperProtocol.STATUS_OK : CollectorHelperProtocol.STATUS_REPLAY_PENDING,
+                                    recovered ? null : "worker quarantine recovery in progress",
                                     samples
                                 );
                             } catch (IllegalArgumentException error) {
@@ -1333,7 +1337,7 @@ public final class CollectorHelperDaemon {
                 "worker catalog mismatch: expected=" + catalogVersion + " actual=" + sample.catalogVersion
             );
         }
-        if (sample.recordVersion < TelemetryWorkerSpool.RECORD_VERSION && sample.values.size() != rows.size()) {
+        if (sample.recordVersion < TelemetryWorkerSpool.SPARSE_RECORD_VERSION && sample.values.size() != rows.size()) {
             throw new IllegalArgumentException(
                 "worker field count mismatch: expected=" + rows.size() + " actual=" + sample.values.size()
             );

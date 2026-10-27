@@ -684,7 +684,7 @@ public final class CallbackSpool implements AutoCloseable {
         }
 
         private void adjustCounts(String name, int delta) {
-            if (name.endsWith(".ready")) readyRecords += delta;
+            if (TelemetryWorkerSpool.isPendingFile(name)) readyRecords += delta;
             if (isCallbackReady(name)) callbackReadyRecords += delta;
             if (name.contains(".cbbad")) callbackBadFiles += delta;
         }

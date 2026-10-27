@@ -44,7 +44,8 @@ object BusinessInputProjection {
         // A failed sparse GET invalidates only its recorded attempted fields. Only a
         // transport failure without any attempted keys is truly unscoped.
         if (delta.ref.kind != BusinessInputKind.GET || delta.ref.ok || delta.ref.readingKeys.isNotEmpty()) {
-            return delta.sourceInputs
+            // The shared journal also carries Telegram-only fields; its delta stays intact for Telegram.
+            return delta.sourceInputs.filterKeys { it in BusinessInputCheckpointKeys.ALL }
         }
         val source = source(delta.ref)
         val stamp = NormalizedSourceStamp(NormalizedSourceKind.POLL, source.identity,

@@ -43,7 +43,7 @@ private class WorkerSampleFormatException(message: String) : IllegalArgumentExce
 
 internal object TelemetryWorkerSampleMapper {
     fun snapshot(sample: TelemetryWorkerSample, entries: List<DirectFidEntry>): DirectAutoserviceSnapshot {
-        val sparse = sample.recordVersion == SPARSE_RECORD_VERSION
+        val sparse = sample.recordVersion in SPARSE_RECORD_VERSION..4
         if (sample.recordVersion !in LEGACY_RECORD_VERSIONS && !sparse) {
             throw WorkerSampleFormatException("unsupported worker record version: ${sample.recordVersion}")
         }

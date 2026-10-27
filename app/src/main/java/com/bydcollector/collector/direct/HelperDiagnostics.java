@@ -221,16 +221,20 @@ final class HelperDiagnostics implements AutoCloseable, TelemetryWorkerSpool.Dia
         else offer(new Signal(SIGNAL_CHANGE, null, (String) null));
     }
 
-    @Override public void onQuarantine(long recordBytes) {
+    @Override public void onQuarantine(long recordBytes, String detail) {
         Signal event;
         synchronized (stateLock) {
             quarantinedRecords.incrementAndGet();
             int pending = pendingReadyRecords.get();
             if (pending > 0) pendingReadyRecords.set(pending - 1);
             markChangedLocked();
-            event = immediateSignalLocked("spool_quarantine", null);
+            event = immediateSignalLocked("spool_quarantine", detail);
         }
         offer(event);
+    }
+
+    @Override public void onRecovery(int restored, int rejected, int remaining) {
+        context("spool_quarantine_recovery", "restored=" + restored + " rejected=" + rejected + " remaining=" + remaining);
     }
 
     void capSkippedPollCycle() {

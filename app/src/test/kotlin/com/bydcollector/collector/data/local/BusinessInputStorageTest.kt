@@ -38,6 +38,77 @@ import kotlin.test.assertTrue
 @Config(sdk = [29], application = Application::class)
 class BusinessInputStorageTest {
     @Test
+    fun capturedAuxVoltagePassesSharedJournalWithoutEnteringEnergyCheckpoint() {
+        // Real 27Oct vehicle GET payload, encoded as both GET and callback inputs; no Binder outcome is faked.
+        val sample = JSONObject(checkNotNull(javaClass.classLoader?.getResourceAsStream(
+            "com/bydcollector/collector/direct/worker-v3-20261027-24.json"
+        )).bufferedReader(Charsets.UTF_8).use { it.readText() })
+        val values = sample.getJSONArray("values")
+        val aux = (0 until values.length()).map(values::getJSONObject).single {
+            it.getInt("dev") == 1032 && it.getInt("fid") == 1150287896
+        }
+        val identity = sample.getJSONObject("identity")
+        val boot = identity.getString("boot_id")
+        val generation = identity.getString("helper_generation")
+        val sequence = identity.getLong("poll_sequence")
+        val wall = sample.getLong("captured_wall_ms")
+        val elapsed = sample.getLong("captured_elapsed_ms")
+        val raw = aux.getInt("raw")
+        val key = "ota_battery_voltage"
+        val context = RuntimeEnvironment.getApplication()
+        val name = "shared_aux_${System.nanoTime()}.db"
+        var store = newStore(context, name)
+        try {
+            val session = store.openSession()
+            val batch = TelemetryCallbackBatch(boot, generation, 1, 0L, sequence, listOf(
+                TelemetryCallbackBatch.Event(sequence, aux.getInt("dev"), aux.getInt("fid"),
+                    TelemetryCallbackBatch.TYPE_FLOAT, raw, null, wall, elapsed, null, "callback")
+            ))
+            assertIs<CallbackImportResult.Committed>(store.importCallbackBatch(
+                batch, TelemetryCallbackBatch.digest(batch.encode()), CallbackDelivery.REPLAY))
+            val entry = DirectFidRegistry.entries.single { it.key == key }
+            store.insertPoll(session, PersistedPollInput(
+                timestamp = java.time.Instant.ofEpochMilli(wall).toString(), ok = true,
+                elapsedMs = sample.getLong("poll_elapsed_ms"), requestCount = 1, errors = null,
+                rawResponseBody = null,
+                readings = listOf(PollReading(key, raw.toString(),
+                    com.bydcollector.collector.data.direct.DirectValueDecoders.decode(entry, raw))),
+                source = PollSampleSource("get:$boot:$generation:$sequence", boot, elapsed, generation, sequence),
+                origin = PollOrigin.REPLAY
+            ), store.getActiveCatalogParameters())
+
+            val kinds = mutableSetOf<BusinessInputKind>()
+            while (true) {
+                val ref = store.nextPendingBusinessInput() ?: break
+                kinds += ref.kind
+                val delta = store.loadBusinessInputDelta(ref)
+                val projected = BusinessInputProjection.incoming(delta)
+                assertFalse(key in projected)
+                val merged = BusinessInputReducer.merge(store.loadBusinessInputCheckpoint(), projected, boot)
+                val reading = delta.readings.single { it.rawKey == key }
+                assertEquals(raw.toString(), reading.rawValue)
+                val telegram = TelegramOrderedInput.merge(emptyMap(), delta.readings,
+                    com.bydcollector.collector.data.normalized.NormalizedSourceStamp(
+                        com.bydcollector.collector.data.normalized.NormalizedSourceKind.POLL,
+                        ref.sourceIdentity, boot, generation, sequence, wall, elapsed),
+                    ref.pollId ?: 0L, boot, delta.continuityUpdates)
+                assertEquals(raw.toString(), telegram.inputs.getValue(key).reading.rawValue)
+                assertTrue(store.completeBusinessInputs(listOf(ref), merged.updates, delta.continuityUpdates))
+            }
+            assertEquals(setOf(BusinessInputKind.CALLBACK, BusinessInputKind.GET), kinds)
+            store.close()
+            store = newStore(context, name)
+            assertNull(store.nextPendingBusinessInput())
+            assertFalse(key in store.loadBusinessInputCheckpoint())
+            assertEquals(1L, count(context, name, "raw_callback_events"))
+            assertEquals(2L, count(context, name, "business_input_receipts"))
+        } finally {
+            store.close()
+            context.deleteDatabase(name)
+        }
+    }
+
+    @Test
     fun mainCallbackImportQueuesOnceAndRemainsSeparateFromNormalizationReceiptsAfterReopen() {
         val context = RuntimeEnvironment.getApplication()
         val databaseName = "business_callback_${System.nanoTime()}.db"
