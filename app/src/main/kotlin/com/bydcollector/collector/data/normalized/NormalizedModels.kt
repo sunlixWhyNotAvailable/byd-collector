@@ -110,7 +110,9 @@ data class NormalizedSourceStamp(
     val wallMs: Long,
     val elapsedMs: Long,
     /** Helper-owned source epoch; APP delivery epochs remain in legacy source fields. */
-    val sourceEpoch: Long? = null
+    val sourceEpoch: Long? = null,
+    /** Transient dependency revisions for a derived observation; original acquisition clocks stay intact. */
+    val contributors: Map<String, NormalizedSourceStamp> = emptyMap()
 )
 
 data class NormalizedSourceInput(
@@ -134,6 +136,20 @@ object NormalizedSourceOrdering {
     ): NormalizedSourceOrder {
         if (incoming.identity == previous.identity) return NormalizedSourceOrder.EQUAL
         if (incoming.bootId == previous.bootId) {
+            if (incoming.contributors.isNotEmpty() && previous.contributors.isNotEmpty()) {
+                if (incoming.contributors.keys != previous.contributors.keys) return NormalizedSourceOrder.INCOMPARABLE
+                var advanced = false
+                for ((key, source) in incoming.contributors) {
+                    when (compare(source, previous.contributors.getValue(key), currentBootId)) {
+                        // Never accept a derived value that rolls back one of its dependencies.
+                        NormalizedSourceOrder.OLDER -> return NormalizedSourceOrder.OLDER
+                        NormalizedSourceOrder.INCOMPARABLE -> return NormalizedSourceOrder.INCOMPARABLE
+                        NormalizedSourceOrder.NEWER -> advanced = true
+                        NormalizedSourceOrder.EQUAL -> Unit
+                    }
+                }
+                return if (advanced) NormalizedSourceOrder.NEWER else NormalizedSourceOrder.EQUAL
+            }
             compareLong(incoming.elapsedMs, previous.elapsedMs)?.let { return it }
             if (incoming.generatorId != null && incoming.generatorId == previous.generatorId &&
                 incoming.sequence != null && previous.sequence != null

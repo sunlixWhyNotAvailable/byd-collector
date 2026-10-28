@@ -251,14 +251,32 @@ class VehicleStateNormalizer(
                 }
                 val contributors = contributorKeys.mapNotNull(inputs::get)
                 if (contributors.size != contributorKeys.size || contributors.isEmpty()) return@mapNotNull null
+                if (composite && contributors.any { it.stamp.bootId != contributors.first().stamp.bootId }) {
+                    return@mapNotNull null
+                }
+                val latest = contributors.maxWith(compareBy<NormalizedSourceInput> { it.stamp.elapsedMs }
+                    .thenBy { it.stamp.wallMs }).stamp
+                val stamp = if (composite) {
+                    val sources = contributorKeys.associateWith { inputs.getValue(it).stamp }
+                    latest.copy(
+                        identity = buildString {
+                            append("derived:${field.fieldKey}:")
+                            sources.forEach { (key, source) ->
+                                append("${key.length}:$key:${source.identity.length}:${source.identity};")
+                            }
+                        },
+                        generatorId = null,
+                        sequence = null,
+                        sourceEpoch = null,
+                        contributors = sources
+                    )
+                } else latest
                 val pollIds = contributors.mapNotNull { it.sourcePollId }.distinct()
                 provisional.copy(
                     sourcePollId = pollIds.singleOrNull()
                         ?.takeIf { contributors.all { input -> input.sourcePollId == it } },
-                    observedAt = Instant.ofEpochMilli(contributors.minOf { it.stamp.wallMs }).toString(),
-                    sourceStamp = contributors.takeIf { sources ->
-                        sources.all { it.stamp.bootId == sources.first().stamp.bootId }
-                    }?.minByOrNull { it.stamp.elapsedMs }?.stamp
+                    observedAt = Instant.ofEpochMilli(stamp.wallMs).toString(),
+                    sourceStamp = stamp
                 )
             }
             .toList()
