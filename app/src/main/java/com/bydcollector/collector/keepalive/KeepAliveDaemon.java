@@ -116,7 +116,7 @@ public final class KeepAliveDaemon {
             return;
         }
 
-        try {
+        try (CellularApnRecovery cellularRecovery = new CellularApnRecovery()) {
             UsbKeepAliveState usbState = UsbKeepAliveState.open(new File(KeepAliveProtocol.USB_STATE_PATH));
             UsbKeepAliveState.Snapshot usbSnapshot = usbState.snapshot();
             log("usb_state_open usable=" + usbSnapshot.usable
@@ -128,6 +128,7 @@ public final class KeepAliveDaemon {
                     + " history_recovered=" + usbSnapshot.historyRecovered
                     + " error=" + sanitizeUsbError(usbSnapshot.error));
             log("ready");
+            cellularRecovery.start();
             while (true) {
                 try {
                     log("heartbeat_start");
@@ -782,11 +783,14 @@ public final class KeepAliveDaemon {
         return value.replace('\n', ' ').replace('\r', ' ').trim();
     }
 
-    private static void log(String message) {
+    static void log(String message) {
         //stdout is inherited with O_APPEND, so truncating the same file keeps future writes at the new EOF
-        truncateLogIfNeeded(LOG_FILE, LOG_MAX_BYTES);
-        System.out.println(System.currentTimeMillis() + " " + message);
-        System.out.flush();
+        // Do not share radioManagers' class lock: a stuck Binder initialization must not block logging.
+        synchronized (LOG_FILE) {
+            truncateLogIfNeeded(LOG_FILE, LOG_MAX_BYTES);
+            System.out.println(System.currentTimeMillis() + " " + message);
+            System.out.flush();
+        }
     }
 
     static boolean truncateLogIfNeeded(File logFile, long maxBytes) {
@@ -903,6 +907,10 @@ public final class KeepAliveDaemon {
             }
         }
         return current;
+    }
+
+    static Context shellContext() throws Exception {
+        return radioManagers().shellContext;
     }
 
     private static OwnerLock acquireSingleOwnerLock() {

@@ -1,0 +1,5 @@
+{
+  "source": "BYD Sealion07, 2026-10-29; byd-bluetooth/diagnostics/screen_apn2_20261029_120216_889_604d1b27/before.json and apn2_traffic_20261029_122540_487_25717b85/traffic.log",
+  "before": {"interface": "", "ip": "10.33.120.97"},
+  "traffic": {"utc_ms": 1793269539406, "network": "116", "interface": "rmnet_data1", "source": "10.39.208.17", "http_received": true, "apn2_stable": true}
+}
