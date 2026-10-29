@@ -1,8 +1,10 @@
 package com.bydcollector.collector.keepalive;
 
+import android.net.ConnectivityManager;
 import android.net.LinkAddress;
 import android.net.LinkProperties;
 import android.net.Network;
+import android.net.NetworkInfo;
 import android.os.IBinder;
 import android.os.Parcel;
 import android.os.Process;
@@ -99,6 +101,16 @@ final class CellularApnPlatform {
         if (info == null) throw new IOException("Main display information unavailable");
         return new DisplayState(interactive, info.getClass().getField("state").getInt(info),
                 property("sys.accanim.status"));
+    }
+
+    @SuppressWarnings("deprecation")
+    boolean wifiConnected() throws Exception {
+        Object connectivity = service("connectivity", networkApi);
+        // Read the Wi-Fi network itself, even when cellular or a VPN is the default.
+        NetworkInfo info = (NetworkInfo) networkApi.getMethod("getNetworkInfo", int.class)
+                .invoke(connectivity, ConnectivityManager.TYPE_WIFI);
+        checkActive();
+        return info != null && info.isConnected();
     }
 
     ApnState apn2() throws Exception {

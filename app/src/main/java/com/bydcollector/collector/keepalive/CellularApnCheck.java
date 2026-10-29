@@ -76,6 +76,10 @@ public final class CellularApnCheck {
         stage = "settings";
         String disabled = platform.disabledReason();
         if (disabled != null) { event("check_skipped", "reason=" + disabled); return; }
+        stage = "wifi";
+        boolean wifiConnected = platform.wifiConnected();
+        event("wifi", "connected=" + wifiConnected);
+        if (wifiConnected) { event("wake_skipped", "reason=wifi_connected"); return; }
         stage = "network";
         CellularApnPlatform.ApnState apn = platform.apn2();
         if (apn.ready) { event("ready", apn.toString()); return; }
@@ -95,9 +99,13 @@ public final class CellularApnCheck {
         if (power != 0 || !display.blackAsleep()) { event("wake_skipped", "reason=guards_changed " + display); return; }
         disabled = platform.disabledReason();
         if (disabled != null) { event("wake_skipped", "reason=" + disabled); return; }
+        stage = "wifi_recheck";
+        wifiConnected = platform.wifiConnected();
+        event("wifi", "connected=" + wifiConnected + " before_dispatch=true");
+        if (wifiConnected) { event("wake_skipped", "reason=wifi_connected before_dispatch=true"); return; }
         platform.checkActive();
         stage = "wake_dispatch";
-        event("wake_attempt", "power=0 reason=" + reason + " reason_source=" + source + " " + apn + " " + display);
+        event("wake_attempt", "power=0 wifi_connected=false reason=" + reason + " reason_source=" + source + " " + apn + " " + display);
         platform.wake(reason);
         event("wake_returned", "display_and_apn2_not_yet_verified=true");
         stage = "display_verify";
