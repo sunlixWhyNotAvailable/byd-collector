@@ -26,6 +26,8 @@ public final class CellularApnCheck {
             result = 0;
         } catch (Throwable error) {
             event("check_error", KeepAliveDaemon.diagnosticDetail(error, "stage=apn2_" + check.stage));
+            if (error instanceof OwnedShellProcess.StaleGenerationException)
+                result = OwnedShellProcess.StaleGenerationException.EXIT_CODE;
         }
         System.exit(result);
     }
@@ -48,6 +50,7 @@ public final class CellularApnCheck {
             killGroup();
         }, "byd-child-owner");
         watch.setDaemon(true); watch.start();
+        OwnedShellProcess.verifyChildGeneration();
     }
 
     private static void killGroup() {

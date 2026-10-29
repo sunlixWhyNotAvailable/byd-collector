@@ -27,6 +27,8 @@ public final class OemWakeDiscoveryMain {
             exit = 0;
         } catch (Throwable error) {
             System.out.println("WAKE_ERROR " + KeepAliveDaemon.diagnosticDetail(error, "stage=wake_discovery"));
+            if (error instanceof OwnedShellProcess.StaleGenerationException)
+                exit = OwnedShellProcess.StaleGenerationException.EXIT_CODE;
         }
         System.out.flush();
         System.exit(exit);

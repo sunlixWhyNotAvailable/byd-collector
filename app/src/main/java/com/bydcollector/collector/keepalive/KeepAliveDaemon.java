@@ -2,6 +2,7 @@ package com.bydcollector.collector.keepalive;
 
 import android.content.Context;
 import android.net.wifi.WifiManager;
+import android.os.IBinder;
 import android.os.SystemClock;
 import android.telephony.SubscriptionManager;
 import android.telephony.TelephonyManager;
@@ -847,33 +848,53 @@ public final class KeepAliveDaemon {
     }
 
     static Boolean readWifiEnabled() {
-        return readRadioState(KeepAliveDaemon::queryWifiEnabled);
+        return readRadioState("wifi", KeepAliveDaemon::queryWifiEnabled);
     }
 
     private static Boolean queryWifiEnabled() throws Exception {
         RadioManagers managers = radioManagers();
-        return managers.wifiManager == null ? null : managers.wifiManager.isWifiEnabled();
+        if (managers.wifiManager == null) throw new IOException("Wi-Fi manager unavailable");
+        return managers.wifiManager.isWifiEnabled();
     }
 
     static Boolean readMobileDataEnabled() {
-        return readRadioState(KeepAliveDaemon::queryMobileDataEnabled);
+        return readRadioState("mobile_data", KeepAliveDaemon::queryMobileDataEnabled);
     }
 
     private static Boolean queryMobileDataEnabled() throws Exception {
-        RadioManagers managers = radioManagers();
-        if (managers.telephonyManager == null) return null;
-        int subId = SubscriptionManager.getDefaultDataSubscriptionId();
-        if (subId == SubscriptionManager.INVALID_SUBSCRIPTION_ID) return null;
-        TelephonyManager defaultDataManager = managers.telephonyManager.createForSubscriptionId(subId);
-        return defaultDataManager.isDataEnabled();
+        if (android.os.Process.myUid() != 2000) throw new SecurityException("Mobile data read requires shell UID 2000");
+        String stage = "default_subscription";
+        try {
+            // app_process lacks TelephonyServiceManager; the public getter hides its NPE as subId=-1.
+            Class<?> subApi = Class.forName("com.android.internal.telephony.ISub");
+            int subId = (Integer) subApi.getMethod("getDefaultDataSubId")
+                    .invoke(telephonyService("isub", subApi));
+            if (subId < 0 || subId == SubscriptionManager.DEFAULT_SUBSCRIPTION_ID)
+                throw new IOException("Invalid default data subscription: " + subId);
+            stage = "user_data_enabled sub_id=" + subId;
+            Class<?> phoneApi = Class.forName("com.android.internal.telephony.ITelephony");
+            return (Boolean) phoneApi.getMethod("isDataEnabledForReason", int.class, int.class)
+                    .invoke(telephonyService("phone", phoneApi), subId, TelephonyManager.DATA_ENABLED_REASON_USER);
+        } catch (Exception error) {
+            throw new IOException("Mobile data read failed at " + stage, error);
+        }
     }
 
-    static Boolean readRadioState(Callable<Boolean> readEnabled) {
+    private static Object telephonyService(String name, Class<?> api) throws Exception {
+        if (Thread.currentThread().isInterrupted()) throw new java.io.InterruptedIOException("Mobile data read cancelled");
+        IBinder binder = (IBinder) Class.forName("android.os.ServiceManager")
+                .getMethod("getService", String.class).invoke(null, name);
+        if (binder == null) throw new IOException("Telephony service unavailable: " + name);
+        return Class.forName(api.getName() + "$Stub").getMethod("asInterface", IBinder.class)
+                .invoke(null, binder);
+    }
+
+    static Boolean readRadioState(String name, Callable<Boolean> readEnabled) {
         final Future<Boolean> read;
         try {
-            read = RADIO_STATE_READER.submit(() -> readStateOrUnavailable(readEnabled));
+            read = RADIO_STATE_READER.submit(readEnabled);
         } catch (RejectedExecutionException error) {
-            log("radio_state_read_unavailable reason=reader_busy");
+            log("radio_state_read_unavailable " + diagnosticDetail(error, "radio=" + name + " stage=reader_busy"));
             return null;
         }
 
@@ -881,25 +902,15 @@ public final class KeepAliveDaemon {
             return read.get(RADIO_STATE_READ_TIMEOUT_MS, TimeUnit.MILLISECONDS);
         } catch (TimeoutException error) {
             read.cancel(true);
-            log("radio_state_read_unavailable reason=timeout");
+            log("radio_state_read_unavailable " + diagnosticDetail(error, "radio=" + name + " stage=timeout"));
             return null;
         } catch (InterruptedException error) {
             read.cancel(true);
             Thread.currentThread().interrupt();
-            log("radio_state_read_unavailable reason=interrupted");
+            log("radio_state_read_unavailable " + diagnosticDetail(error, "radio=" + name + " stage=interrupted"));
             return null;
         } catch (ExecutionException error) {
-            Throwable failure = error.getCause();
-            log("radio_state_read_unavailable reason=" +
-                    (failure == null ? "reader_failed" : failure.getClass().getSimpleName()));
-            return null;
-        }
-    }
-
-    static Boolean readStateOrUnavailable(Callable<Boolean> readEnabled) {
-        try {
-            return readEnabled.call();
-        } catch (Exception error) {
+            log("radio_state_read_unavailable " + diagnosticDetail(error, "radio=" + name + " stage=reader_failed"));
             return null;
         }
     }
@@ -917,8 +928,7 @@ public final class KeepAliveDaemon {
                 Context context = HelperWakeLockPlatform.createShellContext();
                 current = new RadioManagers(
                         context,
-                        context.getSystemService(WifiManager.class),
-                        context.getSystemService(TelephonyManager.class)
+                        context.getSystemService(WifiManager.class)
                 );
                 radioManagers = current;
             }
@@ -962,12 +972,10 @@ public final class KeepAliveDaemon {
         //Keep the attribution context alive with the cached system-service managers.
         private final Context shellContext;
         private final WifiManager wifiManager;
-        private final TelephonyManager telephonyManager;
 
-        private RadioManagers(Context shellContext, WifiManager wifiManager, TelephonyManager telephonyManager) {
+        private RadioManagers(Context shellContext, WifiManager wifiManager) {
             this.shellContext = shellContext;
             this.wifiManager = wifiManager;
-            this.telephonyManager = telephonyManager;
         }
     }
 

@@ -38,6 +38,7 @@ final class OemWakeDiscovery implements AutoCloseable {
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
         while (!stopped) {
             try { reconcile(); }
+            catch (OwnedShellProcess.StaleGenerationException replaced) { logError(replaced, "apk_replaced"); }
             catch (Exception error) {
                 if (stopped) return;
                 selected = WakeDiscoveryState.DEFAULT;
@@ -107,6 +108,8 @@ final class OemWakeDiscovery implements AutoCloseable {
             if (found.getInt("reason") < 0 || found.getString("evidence").isEmpty()) throw new IOException("Invalid analyzer result");
             completed = WakeDiscoveryState.record(identity, generation, "found", found.getInt("reason"))
                     .put("evidence", found.getString("evidence")).put("hashes", found.getJSONObject("hashes"));
+        } catch (OwnedShellProcess.StaleGenerationException replaced) {
+            throw replaced;
         } catch (Exception e) {
             logError(e, "analyzer");
             completed = WakeDiscoveryState.record(identity, generation, "failed", 13)
@@ -115,6 +118,8 @@ final class OemWakeDiscovery implements AutoCloseable {
         }
         synchronized (lock) {
             if (stopped || !request.equals(request()) || token != child.token()) return;
+            // An update cancellation is not a firmware-analysis failure to cache for the next daemon.
+            OwnedShellProcess.verifyOwnerGeneration();
             if (!identity.equals(WakeDiscoveryState.identity(sources))) { observedRequest = ""; return; }
             completed.put("started_wall_ms", record.getLong("wall_ms"));
             if (completed.getString("status").equals("failed")) failedInMemory = completed;
