@@ -26,6 +26,7 @@ class KeepAliveSupervisor(
     private val executor: ExecutorService = namedSingleThreadExecutor("byd-keepalive")
     private val reconcileState = KeepAliveReconcileState(ALIVE_TTL_MS)
     private var installedApkIdentityUnavailableReason = "unknown"
+    private var mirroredDiscoveryRequest: String? = null
     private val wifiPolicy = WifiPolicyRecovery(
         context.applicationContext.getSharedPreferences(CollectorSettings.PREFS_NAME, Context.MODE_PRIVATE),
         shellFactory
@@ -120,6 +121,19 @@ class KeepAliveSupervisor(
 
     private fun runReconcileSerialized(config: KeepAliveConfig, forceStatusCheck: Boolean): Boolean {
         return synchronized(PROCESS_RECONCILE_LOCK) {
+            // Publish initialization input before starting the daemon; failure must not block recovery.
+            try {
+                val settings = CollectorSettings(context.applicationContext, store)
+                val shutdown = settings.isUserShutdownRequested()
+                val command = KeepAliveShellPlanner.wakeDiscoveryRequestCommand(
+                    resolveEffectiveConfig(settings, !config.anyEnabled, shutdown), shutdown)
+                if (command != mirroredDiscoveryRequest &&
+                    runCommand(shellFactory(), command, "wake_discovery_request_sync").ok) {
+                    mirroredDiscoveryRequest = command
+                }
+            } catch (error: Exception) {
+                recordFailure("wake_discovery_request_failed", "Could not publish wake discovery request", error)
+            }
             try {
                 runReconcile(config, forceStatusCheck)
             } finally {

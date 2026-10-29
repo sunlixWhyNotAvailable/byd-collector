@@ -112,7 +112,9 @@ class RuntimePreferences private constructor(private val context: Context) : Sha
             val changes = Bundle(incomingChanges).apply {
                 remove(MQTT_USERNAME_EDIT_KEY)
                 remove(MQTT_PASSWORD_EDIT_KEY)
+                remove(com.bydcollector.collector.keepalive.WakeDiscoveryRequest.KEY)
             }
+            removals.remove(com.bydcollector.collector.keepalive.WakeDiscoveryRequest.KEY)
             val guardedKeys = changes.keySet() + removals + buildSet {
                 if (usernameUpdateRequested) add(CollectorSettings.KEY_MQTT_USERNAME)
                 if (passwordUpdateRequested) add(CollectorSettings.KEY_MQTT_PASSWORD)
@@ -181,6 +183,8 @@ class RuntimePreferences private constructor(private val context: Context) : Sha
                             else -> preferences.getBoolean(key, false)
                         }
                         com.bydcollector.collector.keepalive.WifiPolicyState.stageToggle(
+                            preferences, editor, nextEnabled(wifiKey) || nextEnabled(mobileKey))
+                        com.bydcollector.collector.keepalive.WakeDiscoveryRequest.stage(
                             preferences, editor, nextEnabled(wifiKey) || nextEnabled(mobileKey))
                     }
                     editor.commit()

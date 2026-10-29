@@ -116,7 +116,8 @@ public final class KeepAliveDaemon {
             return;
         }
 
-        try (CellularApnRecovery cellularRecovery = new CellularApnRecovery()) {
+        try (OemWakeDiscovery discovery = new OemWakeDiscovery();
+             CellularApnRecovery cellularRecovery = new CellularApnRecovery(discovery)) {
             UsbKeepAliveState usbState = UsbKeepAliveState.open(new File(KeepAliveProtocol.USB_STATE_PATH));
             UsbKeepAliveState.Snapshot usbSnapshot = usbState.snapshot();
             log("usb_state_open usable=" + usbSnapshot.usable
@@ -128,6 +129,7 @@ public final class KeepAliveDaemon {
                     + " history_recovered=" + usbSnapshot.historyRecovered
                     + " error=" + sanitizeUsbError(usbSnapshot.error));
             log("ready");
+            discovery.start();
             cellularRecovery.start();
             while (true) {
                 try {

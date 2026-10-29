@@ -140,11 +140,11 @@ final class CellularApnPlatform {
         return new ApnState(false, iface, ip, "no_matching_current_network");
     }
 
-    void wake() throws Exception {
+    void wake(int reason) throws Exception {
         Object power = service("power", powerApi);
         Method wake = powerApi.getMethod("wakeUp", long.class, int.class, String.class, String.class);
         checkActive();
-        wake.invoke(power, SystemClock.uptimeMillis(), 13, "BYDCollector:APN2Recovery", "com.android.shell");
+        wake.invoke(power, SystemClock.uptimeMillis(), reason, "BYDCollector:APN2Recovery", "com.android.shell");
         checkActive();
     }
 

@@ -2842,6 +2842,22 @@ private fun ExtraTab(
                     )
                     Text(strings.restoreConnectivityDescription, color = LocalBydPalette.current.muted,
                         fontSize = 12.sp, lineHeight = 16.sp, modifier = Modifier.padding(bottom = 6.dp))
+                    val discovery = state?.wakeDiscoveryStatus.orEmpty()
+                    Text(
+                        when (discovery) {
+                            "pending" -> strings.wakeDiscoveryPending
+                            "found" -> strings.wakeDiscoveryFound
+                            "failed" -> strings.wakeDiscoveryFailed
+                            else -> ""
+                        },
+                        color = when (discovery) {
+                            "found" -> LocalBydPalette.current.green
+                            "failed" -> LocalBydPalette.current.red
+                            else -> LocalBydPalette.current.muted
+                        },
+                        fontSize = 12.sp, lineHeight = 16.sp, minLines = 2,
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)
+                    )
                     Box(Modifier.fillMaxWidth().height(1.dp).background(LocalBydPalette.current.border))
                     SwitchRow(
                         strings.keepBluetooth,

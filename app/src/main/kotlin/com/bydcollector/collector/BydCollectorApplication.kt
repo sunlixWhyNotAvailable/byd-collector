@@ -190,6 +190,7 @@ class BydCollectorApplication : Application() {
             }
         }.onFailure { android.util.Log.w("BYDCollectorExit", "Exit evidence initialization failed", it) }
         CollectorSettings.resetCollectionAfterProcessDeath(this)
+        com.bydcollector.collector.keepalive.WakeDiscoveryStatus.start(this)
         sharedOperationalEventExecutor.execute {
             runCatching { com.bydcollector.collector.runtime.RuntimeJobsService.recover(this) }
                 .onFailure { android.util.Log.e("CollectorRuntime", "Background task recovery failed", it) }

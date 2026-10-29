@@ -16,32 +16,38 @@ public final class CellularApnCheck {
         CellularApnCheck check = new CellularApnCheck();
         int result = 1;
         try {
-            if (Process.myUid() != 2000 || !ownsGroup(Process.myPid()) || args.length != 1) {
-                throw new SecurityException("APN2 check requires its own shell process group and deadline");
-            }
+            if (args.length != 3) throw new IllegalArgumentException("Expected deadline, reason, source");
             long deadline = Long.parseLong(args[0]);
-            BufferedReader parent = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
-            if (!"start".equals(parent.readLine())) throw new java.io.IOException("APN2 owner cancelled before start");
-            Thread ownerWatch = new Thread(() -> {
-                try { while (parent.read() != -1) { } }
-                catch (Exception error) { event("owner_pipe_error", KeepAliveDaemon.diagnosticDetail(error, "stage=owner_watch")); }
-                killGroup();
-            }, "byd-apn2-owner-watch");
-            ownerWatch.setDaemon(true);
-            ownerWatch.start();
-            Thread deadlineWatch = new Thread(() -> {
-                SystemClock.sleep(Math.max(0L, deadline - SystemClock.elapsedRealtime()));
-                event("deadline", "remote_completion_unknown=true stage=" + check.stage);
-                killGroup();
-            }, "byd-apn2-deadline");
-            deadlineWatch.setDaemon(true);
-            deadlineWatch.start();
-            check.run(deadline);
+            ownLifetime(deadline, () -> check.stage);
+            int reason = Integer.parseInt(args[1]);
+            if (reason < 0 || !(args[2].equals("detected") || args[2].equals("default")))
+                throw new IllegalArgumentException("Invalid wake selection");
+            check.run(deadline, reason, args[2]);
             result = 0;
         } catch (Throwable error) {
             event("check_error", KeepAliveDaemon.diagnosticDetail(error, "stage=apn2_" + check.stage));
         }
         System.exit(result);
+    }
+
+    static void ownLifetime(long deadline, java.util.function.Supplier<String> stage) throws Exception {
+        if (Process.myUid() != 2000 || !ownsGroup(Process.myPid()))
+            throw new SecurityException("Child requires its own shell process group");
+        // Start the deadline before the parent handshake so an abandoned launcher also expires.
+        Thread timer = new Thread(() -> {
+            SystemClock.sleep(Math.max(0L, deadline - SystemClock.elapsedRealtime()));
+            event("deadline", "stage=" + stage.get());
+            killGroup();
+        }, "byd-child-deadline");
+        timer.setDaemon(true); timer.start();
+        BufferedReader parent = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
+        if (!"start".equals(parent.readLine())) throw new java.io.IOException("Child owner cancelled before start");
+        Thread watch = new Thread(() -> {
+            try { while (parent.read() != -1) { } }
+            catch (Exception e) { event("owner_pipe_error", KeepAliveDaemon.diagnosticDetail(e, "stage=owner_watch")); }
+            killGroup();
+        }, "byd-child-owner");
+        watch.setDaemon(true); watch.start();
     }
 
     private static void killGroup() {
@@ -61,7 +67,7 @@ public final class CellularApnCheck {
         return fields.length > 3 && Integer.parseInt(fields[2]) == pid && Integer.parseInt(fields[3]) == pid;
     }
 
-    private void run(long deadline) throws Exception {
+    private void run(long deadline, int reason, String source) throws Exception {
         CellularApnPlatform platform = new CellularApnPlatform(deadline);
         stage = "vehicle_power";
         int power = platform.vehiclePower();
@@ -91,8 +97,8 @@ public final class CellularApnCheck {
         if (disabled != null) { event("wake_skipped", "reason=" + disabled); return; }
         platform.checkActive();
         stage = "wake_dispatch";
-        event("wake_attempt", "power=0 reason=13 " + apn + " " + display);
-        platform.wake();
+        event("wake_attempt", "power=0 reason=" + reason + " reason_source=" + source + " " + apn + " " + display);
+        platform.wake(reason);
         event("wake_returned", "display_and_apn2_not_yet_verified=true");
         stage = "display_verify";
         long until = Math.min(deadline, SystemClock.elapsedRealtime() + 1500L);

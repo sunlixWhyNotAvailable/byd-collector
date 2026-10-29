@@ -1308,13 +1308,17 @@ class CollectorSettings(
             keepMobileData = recoverConnectivity,
             keepBluetooth = isKeepBluetoothEnabled(),
             recoverCollectorService = isRecoverCollectorServiceEnabled(),
-            keepUsb = isKeepUsbEnabled()
+            keepUsb = isKeepUsbEnabled(),
+            wakeDiscoveryRequest = prefs.getLong(com.bydcollector.collector.keepalive.WakeDiscoveryRequest.KEY, 0L)
         )
     }
 
     fun isKeepWifiEnabled(): Boolean = prefs.getBoolean(KEY_KEEP_WIFI, false)
 
     fun isKeepMobileDataEnabled(): Boolean = prefs.getBoolean(KEY_KEEP_MOBILE_DATA, false)
+
+    fun wakeDiscoveryStatus(): String = com.bydcollector.collector.keepalive.WakeDiscoveryStatus.cached(
+        prefs, isKeepWifiEnabled() || isKeepMobileDataEnabled())
 
     fun hasPendingWifiPolicy(): Boolean = !isUserShutdownRequested() &&
         com.bydcollector.collector.keepalive.WifiPolicyState(prefs)
@@ -1326,6 +1330,7 @@ class CollectorSettings(
             // The UI cache forwards the edit; only the owner may create the policy generation.
             if (!com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) {
                 com.bydcollector.collector.keepalive.WifiPolicyState.stageToggle(prefs, edit, enabled)
+                com.bydcollector.collector.keepalive.WakeDiscoveryRequest.stage(prefs, edit, enabled)
             }
             check(edit.commit()) { "Connectivity recovery setting was not persisted" }
         }

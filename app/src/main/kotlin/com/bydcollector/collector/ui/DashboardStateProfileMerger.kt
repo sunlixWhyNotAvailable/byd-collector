@@ -135,6 +135,7 @@ internal object DashboardStateProfileMerger {
                 debugAutoStartEnabled = previous.debugAutoStartEnabled,
                 keepWifiEnabled = previous.keepWifiEnabled,
                 keepMobileDataEnabled = previous.keepMobileDataEnabled,
+                wakeDiscoveryStatus = previous.wakeDiscoveryStatus,
                 keepBluetoothEnabled = previous.keepBluetoothEnabled,
                 recoverCollectorServiceEnabled = previous.recoverCollectorServiceEnabled,
                 keepUsbEnabled = previous.keepUsbEnabled,

@@ -71,6 +71,7 @@ android.sourceSets.getByName("main").assets.srcDir(layout.buildDirectory.dir("ge
 tasks.named("preBuild") { dependsOn(bundledUi) }
 
 dependencies {
+    implementation("com.android.tools.smali:smali-dexlib2:3.0.9")
     implementation("org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5")
     implementation("androidx.core:core:1.13.1")
     implementation(platform("androidx.compose:compose-bom:2024.10.00"))

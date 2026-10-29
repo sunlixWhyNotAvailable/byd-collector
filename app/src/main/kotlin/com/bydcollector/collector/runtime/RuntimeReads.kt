@@ -86,7 +86,10 @@ internal object RuntimeReads {
                 CollectorSettings(context)).loadInitial()
             val language = VehicleKpiLanguage.valueOf(requireNotNull(args.getString("language")))
             return app.dashboardUiStateStore.snapshotForClient(source, language)
-                .copy(logRecording = com.bydcollector.collector.diagnostics.DiagnosticLogRecorder.isRecording())
+                .copy(
+                    logRecording = com.bydcollector.collector.diagnostics.DiagnosticLogRecorder.isRecording(),
+                    wakeDiscoveryStatus = CollectorSettings(context).wakeDiscoveryStatus()
+                )
         }
         return when (operation) {
             "jobs" -> RuntimeJobsService.snapshot(context)
@@ -112,7 +115,11 @@ internal object RuntimeReads {
                         .also { snapshots[profile] = it }
                 app.dashboardUiStateStore.snapshotForClient(
                     source, language
-                ).copy(logRecording = com.bydcollector.collector.diagnostics.DiagnosticLogRecorder.isRecording())
+                ).copy(
+                    logRecording = com.bydcollector.collector.diagnostics.DiagnosticLogRecorder.isRecording(),
+                    // Discovery changes asynchronously even when Options reuses its tab snapshot.
+                    wakeDiscoveryStatus = CollectorSettings(context).wakeDiscoveryStatus()
+                )
             }
             "mainPreflight" -> app.withTelemetryStoreRead {
                 StorageFormatCutoverCoordinator.readMainPreflight(it.databaseFile())

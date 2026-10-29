@@ -279,6 +279,7 @@ object DiagnosticLogRecorder {
                 val databaseStatus = writeCollectorEventsSnapshot(appContext, snapshotDir)
                 val helperStatus = writeKeepAliveLogSnapshot(appContext, snapshotDir)
                 val usbStateStatus = writeUsbStateSnapshot(appContext, snapshotDir)
+                val wakeDiscoveryStatus = writeWakeDiscoverySnapshot(appContext, snapshotDir)
                 val telemetryHelperStatus = writeTelemetryHelperSnapshot(appContext, snapshotDir)
                 val tripsTelegramStatus = writeTripsTelegramEvidence(appContext, snapshotDir)
                 val influxStatus = writeInfluxEvidence(appContext, snapshotDir)
@@ -294,6 +295,7 @@ object DiagnosticLogRecorder {
                         appendLine("collector_events=$databaseStatus")
                         appendLine("keep_alive_log=$helperStatus")
                         appendLine("keep_alive_usb_state=$usbStateStatus")
+                        appendLine("wake_discovery=$wakeDiscoveryStatus")
                         appendLine("telemetry_helper=$telemetryHelperStatus")
                         appendLine("trips_telegram_evidence=$tripsTelegramStatus")
                         appendLine("influx_evidence=$influxStatus")
@@ -625,6 +627,22 @@ object DiagnosticLogRecorder {
                 )
             }
             "error"
+        }
+    }
+
+    private fun writeWakeDiscoverySnapshot(context: Context, runDir: File): String {
+        val source = "/data/local/tmp/bydcollector_wake_discovery.json"
+        return try {
+            val result = AdbLocalClient(File(context.filesDir, "adb_keys")).execShell(
+                "head -c 65537 $source", timeoutMs = 5_000, allowAuthorizationPrompt = false)
+            check(result.ok) { "Discovery snapshot failed: ${result.error}; output=${result.output}" }
+            check(result.output.toByteArray(Charsets.UTF_8).size <= 65_536) { "Discovery snapshot exceeds size limit" }
+            File(runDir, "bydcollector_wake_discovery.json").writeText(result.output, Charsets.UTF_8)
+            "ok"
+        } catch (error: Exception) {
+            val detail = error.diagnosticDetail("stage=wake_discovery_snapshot")
+            File(runDir, "bydcollector_wake_discovery_status.txt").writeText(detail, Charsets.UTF_8)
+            "error=$detail"
         }
     }
 

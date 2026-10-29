@@ -2,6 +2,13 @@ package com.bydcollector.collector.keepalive
 
 //builds the only shell commands the keep-alive supervisor is allowed to send over local adb
 object KeepAliveShellPlanner {
+    fun wakeDiscoveryRequestCommand(config: KeepAliveConfig, shutdown: Boolean): String {
+        require(config.wakeDiscoveryRequest in 0..999_999_999_999_999_999L)
+        val value = "${config.wakeDiscoveryRequest}:${flag(config.keepMobileData)}:${flag(shutdown)}"
+        val path = "/data/local/tmp/bydcollector_wake_discovery_request"
+        return "umask 077; [ ! -L $path.tmp ] && printf '%s' '$value' > $path.tmp && chmod 600 $path.tmp && mv -f $path.tmp $path"
+    }
+
     fun mirrorSettingsCommands(config: KeepAliveConfig, userShutdown: Boolean): List<String> {
         return listOf(
             "settings put global bydcollector_keep_wifi ${flag(config.keepWifi)}",

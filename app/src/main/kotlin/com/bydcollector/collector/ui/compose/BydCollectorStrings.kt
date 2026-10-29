@@ -117,6 +117,13 @@ data class UpdateDownloadStrings(
     val cancelFailed: String,
 )
 
+data class ConnectivityRecoveryStrings(
+    val description: String,
+    val pending: String,
+    val found: String,
+    val failed: String,
+)
+
 data class UiStrings(
     val appSubtitle: String,
     val topBarSubtitle: String,
@@ -290,7 +297,7 @@ data class UiStrings(
     val restoreCollector: String,
     val restoreUsb: String,
     val restoreUsbDescription: String,
-    val restoreConnectivityDescription: String,
+    val connectivityRecovery: ConnectivityRecoveryStrings,
     val activateTailscale: String,
     val activateTailscaleDescription: String,
     val keepAlive: String,
@@ -372,6 +379,11 @@ data class UiStrings(
     val dbMaintenanceGenericError: String,
     val dbMaintenanceArchivePath: String
 ) {
+    // Keep the constructor below DEX's invocation-register limit.
+    val restoreConnectivityDescription: String get() = connectivityRecovery.description
+    val wakeDiscoveryPending: String get() = connectivityRecovery.pending
+    val wakeDiscoveryFound: String get() = connectivityRecovery.found
+    val wakeDiscoveryFailed: String get() = connectivityRecovery.failed
     val downloadingUpdate: String get() = updateDownload.downloading
     val updateCancelling: String get() = updateDownload.cancelling
     val updateCancelled: String get() = updateDownload.cancelled
@@ -827,7 +839,12 @@ private fun buildStrings(language: UiLanguage): UiStrings {
             restoreCollector = "Відновлювати сервіс",
             restoreUsb = "Відновлювати USB",
             restoreUsbDescription = "Одна спроба ввімкнути порт даних після вимкнення авто.\nНе для зарядного USB-C; без команд вимкнення USB. Може збільшувати споживання.",
-            restoreConnectivityDescription = "Відновлення зв'язку може збільшувати споживання.",
+            connectivityRecovery = ConnectivityRecoveryStrings(
+                description = "Відновлення зв'язку може збільшувати споживання.",
+                pending = "Визначення команди відновлення…",
+                found = "Команду відновлення визначено",
+                failed = "Автовизначення не вдалося. Використовується код за замовчуванням",
+            ),
             activateTailscale = "Активувати Tailscale",
             activateTailscaleDescription = "Перевіряти наявність Tailscale та активувати VPN",
             keepAlive = "Підтримка роботи",
@@ -1116,7 +1133,12 @@ private fun buildStrings(language: UiLanguage): UiStrings {
             restoreCollector = "Restore collector service",
             restoreUsb = "Restore USB",
             restoreUsbDescription = "One attempt to enable the data port after vehicle shutdown.\nNot the charging USB-C; no USB OFF commands. May increase power consumption.",
-            restoreConnectivityDescription = "Restoring connectivity may increase power consumption.",
+            connectivityRecovery = ConnectivityRecoveryStrings(
+                description = "Restoring connectivity may increase power consumption.",
+                pending = "Identifying the recovery command…",
+                found = "Recovery command identified",
+                failed = "Automatic detection failed. Using the default code",
+            ),
             activateTailscale = "Activate Tailscale",
             activateTailscaleDescription = "Check for Tailscale and activate VPN",
             keepAlive = "Keep alive",
