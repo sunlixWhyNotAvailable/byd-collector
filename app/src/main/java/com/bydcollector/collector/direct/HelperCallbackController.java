@@ -994,7 +994,20 @@ final class HelperCallbackController implements AutoCloseable {
         kpiMailbox.put(row, new KpiValue(row, status, nativeType, hasRaw, rawBits, bytes,
             wall, elapsed, kpiSequence, sourceKind, sourceEpoch, state.recordSequence, quality,
             sourceIdentity, sourceStartWallMs, sourceStartElapsedMs, lossReason, diagnostic));
+        if (row.equals(kpiPowerRow)) {
+            publishPowerSignal(status == CollectorHelperProtocol.STATUS_OK && hasRaw ? rawBits : -1, elapsed);
+        }
         kpiNotificationPending = true;
+    }
+
+    private void publishPowerSignal(int power, long elapsed) {
+        try {
+            com.bydcollector.collector.keepalive.VehiclePowerSignal.publish(bootId, generation, power, elapsed);
+        } catch (Exception error) {
+            java.io.StringWriter detail = new java.io.StringWriter();
+            error.printStackTrace(new java.io.PrintWriter(detail));
+            host.noteError("POWER signal publish failed: " + detail);
+        }
     }
 
     private void recordKpiLossLocked(
@@ -2023,6 +2036,7 @@ final class HelperCallbackController implements AutoCloseable {
                 closed = true;
                 KpiSubscriber kpiToClose;
                 synchronized (kpiLock) {
+                    publishPowerSignal(-1, android.os.SystemClock.elapsedRealtime());
                     kpiToClose = kpiSubscriber;
                     kpiSubscriber = null;
                     kpiMailbox.clear();

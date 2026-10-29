@@ -1,6 +1,5 @@
 package com.bydcollector.collector.keepalive;
 
-import android.content.Context;
 import android.net.LinkAddress;
 import android.net.LinkProperties;
 import android.net.Network;
@@ -8,7 +7,6 @@ import android.os.IBinder;
 import android.os.Parcel;
 import android.os.Process;
 import android.os.SystemClock;
-import android.provider.Settings;
 
 import java.io.IOException;
 import java.io.InterruptedIOException;
@@ -19,17 +17,15 @@ import java.util.List;
 /** Shell-only adapter for the SL07 logical-display/APN2 path. Never puts the display to sleep. */
 final class CellularApnPlatform {
     private final long deadline;
-    private final Context context;
     private final Class<?> powerApi = Class.forName("android.os.IPowerManager");
     private final Class<?> displayApi = Class.forName("android.hardware.display.IDisplayManager");
     private final Class<?> networkApi = Class.forName("android.net.IConnectivityManager");
     private final Method propertyGet = Class.forName("android.os.SystemProperties").getMethod("get", String.class);
 
-    CellularApnPlatform(Context context, long deadline) throws Exception {
-        if (Process.myUid() != 2000 || !"com.android.shell".equals(context.getOpPackageName())) {
-            throw new SecurityException("APN2 recovery requires shell UID 2000 and shell attribution");
+    CellularApnPlatform(long deadline) throws Exception {
+        if (Process.myUid() != 2000) {
+            throw new SecurityException("APN2 recovery requires shell UID 2000");
         }
-        this.context = context;
         this.deadline = deadline;
     }
 
@@ -62,11 +58,9 @@ final class CellularApnPlatform {
 
     private boolean flag(String key) throws Exception {
         checkActive();
-        String value = Settings.Global.getString(context.getContentResolver(), key);
+        boolean value = KeepAliveDaemon.readGlobalFlag(key, deadline - SystemClock.elapsedRealtime());
         checkActive();
-        if ("1".equals(value)) return true;
-        if ("0".equals(value)) return false;
-        throw new IOException("Unknown global flag " + key + "=" + value);
+        return value;
     }
 
     String disabledReason() throws Exception {

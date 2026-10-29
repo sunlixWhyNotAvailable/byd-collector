@@ -405,6 +405,21 @@ public final class KeepAliveDaemon {
         return new FlagRead(null, shell.output, "invalid_setting_value");
     }
 
+    static boolean readGlobalFlag(String key, long timeoutMs) throws IOException {
+        if (!KeepAliveProtocol.KEY_KEEP_MOBILE_DATA.equals(key) &&
+                !KeepAliveProtocol.KEY_USER_SHUTDOWN.equals(key)) {
+            throw new IOException("Unsupported APN2 settings key: " + key);
+        }
+        if (timeoutMs <= 0) throw new java.io.InterruptedIOException("APN2 settings deadline expired");
+        ShellResult result = run("settings get global " + key, Math.min(timeoutMs, 5_000L));
+        if (!result.ok) throw new IOException("settings get global " + key + " failed: " +
+                result.error + " output=" + result.output + " elapsed_ms=" + result.elapsedMs);
+        String value = result.output.trim();
+        if ("1".equals(value)) return true;
+        if ("0".equals(value)) return false;
+        throw new IOException("Unknown global flag " + key + "=" + value);
+    }
+
     private static String usbDisabledReason(FlagRead enabled, FlagRead shutdown) {
         if (enabled.value == null) return "keep_usb_setting_unavailable:" + enabled.error;
         if (!enabled.value) return "feature_disabled";
@@ -907,10 +922,6 @@ public final class KeepAliveDaemon {
             }
         }
         return current;
-    }
-
-    static Context shellContext() throws Exception {
-        return radioManagers().shellContext;
     }
 
     private static OwnerLock acquireSingleOwnerLock() {
