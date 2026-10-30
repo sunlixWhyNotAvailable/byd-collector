@@ -7,7 +7,7 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.UUID;
 
-/** POWER edges schedule checks; ON cancels all OFF work without stopping the observer. */
+/** POWER edges schedule checks; ON restores only a backlight previously darkened by us. */
 final class CellularApnRecovery implements AutoCloseable {
     private static final long CHECK_BUDGET_MS = 5_000L;
     private final Object lock = new Object();
@@ -49,8 +49,9 @@ final class CellularApnRecovery implements AutoCloseable {
             if (stopping || power == value) return;
             power = value;
             epoch++;
-            nextCheck = value > 0 ? Long.MAX_VALUE : 0L;
-            child.cancel();
+            nextCheck = 0L;
+            // Let a bounded OFF call persist its result before the ON cleanup checks ownership.
+            if (value <= 0) child.cancel();
             log("power_transition", "power=" + value + " epoch=" + epoch + " source=telemetry_callback");
             lock.notifyAll();
         }
@@ -73,7 +74,8 @@ final class CellularApnRecovery implements AutoCloseable {
                 catch (InterruptedException error) { throw error; }
                 catch (Exception error) { log("check_error", KeepAliveDaemon.diagnosticDetail(error, "stage=check_process")); }
                 synchronized (lock) {
-                    if (epoch == checkEpoch) nextCheck = power > 0 ? Long.MAX_VALUE
+                    if (epoch == checkEpoch) nextCheck = power > 0 &&
+                            !Files.exists(BacklightRecoveryState.PATH) ? Long.MAX_VALUE
                             : SystemClock.elapsedRealtime() + KeepAliveProtocol.LOOP_INTERVAL_MS;
                 }
             }

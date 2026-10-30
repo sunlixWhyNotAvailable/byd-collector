@@ -93,6 +93,30 @@ final class CellularApnPlatform {
         checkActive();
     }
 
+    void backlightOn() throws Exception {
+        Object display = service("display", displayApi);
+        Method on = displayApi.getMethod("turnBacklightOn", int.class, long.class);
+        checkActive();
+        on.invoke(display, 0, SystemClock.uptimeMillis());
+        checkActive();
+    }
+
+    BacklightRecoveryState backlightOwner() throws Exception {
+        java.nio.file.Path path = BacklightRecoveryState.PATH;
+        if (java.nio.file.Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS) &&
+                android.system.Os.lstat(path.toString()).st_uid != 2000)
+            throw new IOException("Invalid backlight ownership UID");
+        return new BacklightRecoveryState(path);
+    }
+
+    String bootId() throws Exception {
+        String boot = new String(java.nio.file.Files.readAllBytes(
+                java.nio.file.Paths.get(KeepAliveProtocol.KERNEL_BOOT_ID_PATH)),
+                java.nio.charset.StandardCharsets.UTF_8).trim();
+        if (boot.isEmpty()) throw new IOException("Kernel boot ID unavailable");
+        return boot;
+    }
+
     int vehiclePower() throws Exception {
         IBinder service = binder("autoservice");
         Parcel request = Parcel.obtain(), reply = Parcel.obtain();

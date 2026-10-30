@@ -191,6 +191,8 @@ class CollectorService : Service() {
     private val debugPollerLock = Any()
     private var normalizedStateChangedCallback: ((Set<String>) -> Unit)? = null
     private val debugStartExecutor = namedSingleThreadExecutor("byd-debug-start")
+    private val helperReconcileQueued = AtomicBoolean(false)
+    private val helperReconcileRequested = AtomicBoolean(false)
     private val startupExecutor = namedSingleThreadExecutor("byd-runtime-start")
     private val serviceDestroyed = AtomicBoolean(false)
     private var runtimeInitialized = false // main-handler owned
@@ -1801,18 +1803,29 @@ class CollectorService : Service() {
 
     private fun reconcilePersistedHelperStateAsync() {
         if (settings.isUserShutdownRequested()) return
+        helperReconcileRequested.set(true)
+        if (!helperReconcileQueued.compareAndSet(false, true)) return
         try {
             debugStartExecutor.execute {
-                if (settings.isUserShutdownRequested()) return@execute
-                val helper = DirectVehicleHelperClient()
-                if (helper.isAlive() && !DirectStreamController.ensureReady()) {
-                    store.recordEvent(
-                        "direct_stream_reconcile_failed",
-                        "Persisted direct stream state could not be reconciled"
-                    )
+                try {
+                    while (helperReconcileRequested.getAndSet(false)) {
+                        if (settings.isUserShutdownRequested()) return@execute
+                        val helper = DirectVehicleHelperClient()
+                        if (helper.isAlive() && !DirectStreamController.ensureReady()) {
+                            store.recordEvent("direct_stream_reconcile_failed",
+                                "Persisted direct stream state could not be reconciled")
+                        }
+                    }
+                } catch (error: Exception) {
+                    store.recordEvent("direct_stream_reconcile_failed",
+                        "Persisted direct stream state could not be reconciled", error.diagnosticDetail())
+                } finally {
+                    helperReconcileQueued.set(false)
+                    if (helperReconcileRequested.get()) reconcilePersistedHelperStateAsync()
                 }
             }
         } catch (_: RejectedExecutionException) {
+            helperReconcileQueued.set(false)
             // Service teardown owns executor rejection; helper fallback retains desired collection.
         }
     }
@@ -2687,7 +2700,8 @@ class CollectorService : Service() {
         if (reason != "service_destroyed" && reason != "database_maintenance" && reason != "user_shutdown" &&
             (!settings.isPollingEnabled() || settings.isMainManuallyStopped())
         ) {
-            DirectStreamController.setDesired(CollectorHelperProtocol.STREAM_MAIN, false)
+            DirectStreamController.setDesiredLocally(CollectorHelperProtocol.STREAM_MAIN, false)
+            reconcilePersistedHelperStateAsync()
         }
         val wasActive = mainRuntimeStatus != RuntimeActionStatus.STOPPED
         if (wasActive) setMainRuntime(RuntimeActionStatus.STOPPING)
@@ -2969,7 +2983,8 @@ class CollectorService : Service() {
         if (reason != "service_destroyed" && reason != "debug_database_maintenance" && reason != "user_shutdown" &&
             (!settings.isDebugPollingEnabled() || settings.isDebugManuallyStopped())
         ) {
-            DirectStreamController.setDesired(CollectorHelperProtocol.STREAM_SECONDARY, false)
+            DirectStreamController.setDesiredLocally(CollectorHelperProtocol.STREAM_SECONDARY, false)
+            reconcilePersistedHelperStateAsync()
         }
         val stopGeneration = debugWorkGeneration.incrementAndGet()
         debugStartQueued.set(false)

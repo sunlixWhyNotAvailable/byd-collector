@@ -2134,6 +2134,9 @@ final class HelperCallbackController implements AutoCloseable {
         private final Class<?> listenerType;
         private final Map<Integer, LinkedHashSet<Integer>> accepted = new LinkedHashMap<>();
         private final Set<NativeKey> failed = new LinkedHashSet<>();
+        // The vendor thread must never wait for apply(), which waits for that same thread.
+        private volatile Set<NativeKey> acceptedSnapshot = java.util.Collections.emptySet();
+        private volatile Set<NativeKey> failedSnapshot = java.util.Collections.emptySet();
         private Listener sink;
         private Object proxy;
         private boolean registered;
@@ -2191,7 +2194,7 @@ final class HelperCallbackController implements AutoCloseable {
             if (manager == null) return;
             List<Integer> devices = new ArrayList<>(accepted.keySet());
             accepted.clear();
-            acceptedCount = 0;
+            refreshDiagnosticCounts();
             if (registered) {
                 try { unregister(); }
                 catch (Throwable ignored) { registered = false; proxy = null; }
@@ -2289,15 +2292,18 @@ final class HelperCallbackController implements AutoCloseable {
         int acceptedCount() { return acceptedCount; }
         int failedCount() { return failedCount; }
         boolean available() { return manager != null; }
-        synchronized boolean accepts(NativeKey key) {
-            Set<Integer> device = accepted.get(key.dev);
-            return device != null && device.contains(key.fid);
-        }
-        synchronized boolean failed(NativeKey key) { return failed.contains(key); }
+        boolean accepts(NativeKey key) { return acceptedSnapshot.contains(key); }
+        boolean failed(NativeKey key) { return failedSnapshot.contains(key); }
 
         private void refreshDiagnosticCounts() {
             int total = 0;
-            for (Set<Integer> values : accepted.values()) total += values.size();
+            Set<NativeKey> snapshot = new LinkedHashSet<>();
+            for (Map.Entry<Integer, LinkedHashSet<Integer>> device : accepted.entrySet()) {
+                total += device.getValue().size();
+                for (int fid : device.getValue()) snapshot.add(new NativeKey(device.getKey(), fid));
+            }
+            acceptedSnapshot = java.util.Collections.unmodifiableSet(snapshot);
+            failedSnapshot = java.util.Collections.unmodifiableSet(new LinkedHashSet<>(failed));
             acceptedCount = total;
             failedCount = Math.max(failed.size(), Math.max(0, targetCount - total));
         }

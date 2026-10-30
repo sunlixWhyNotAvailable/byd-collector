@@ -113,6 +113,11 @@ internal class AppStreamController(
     }
 
     fun setDesired(stream: Int, enabled: Boolean): Boolean {
+        setDesiredLocally(stream, enabled)
+        return ensureReady(stream)
+    }
+
+    fun setDesiredLocally(stream: Int, enabled: Boolean) {
         index(stream)
         synchronized(stateLock) {
             wantedMask = if (enabled) wantedMask or stream else wantedMask and stream.inv()
@@ -126,7 +131,6 @@ internal class AppStreamController(
             }
             appReleased = false
         }
-        return ensureReady(stream)
     }
 
     /** Marks an actual poller/callback consumer ready and only then starts or renews its APP lease. */
@@ -414,6 +418,7 @@ object DirectStreamController {
     ) = controller.configureDesired(main, secondary, mainAutonomous, secondaryAutonomous)
     fun ensureReady(stream: Int = 0): Boolean = controller.ensureReady(stream)
     fun setDesired(stream: Int, enabled: Boolean): Boolean = controller.setDesired(stream, enabled)
+    fun setDesiredLocally(stream: Int, enabled: Boolean) = controller.setDesiredLocally(stream, enabled)
     fun pauseAndFence(stream: Int): Boolean = controller.pauseAndFence(stream)
     fun resume(stream: Int): Boolean = controller.resume(stream)
     fun credentials(stream: Int): DirectStreamCredentials? = controller.credentials(stream)

@@ -2860,14 +2860,17 @@ private fun ExtraTab(
                         modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)
                     )
                     Box(Modifier.fillMaxWidth().height(1.dp).background(LocalBydPalette.current.border))
-                    val screenOffEnabled = state?.keepWifiEnabled == true && state.keepMobileDataEnabled &&
-                        !actionUiState.isPending("connectivityRecovery") &&
-                        !actionUiState.isPending("screenOffAfterRecovery")
+                    val screenOffEnabled = state?.keepWifiEnabled == true && state.keepMobileDataEnabled
                     Box(Modifier.alpha(if (screenOffEnabled) 1f else 0.62f)) {
                         SwitchRow(
                             strings.screenOffAfterRecovery,
                             state?.screenOffAfterRecoveryEnabled ?: true,
-                            actions::onToggleScreenOffAfterRecovery,
+                            { enabled ->
+                                if (!actionUiState.isPending("connectivityRecovery") &&
+                                    !actionUiState.isPending("screenOffAfterRecovery")) {
+                                    actions.onToggleScreenOffAfterRecovery(enabled)
+                                }
+                            },
                             enabled = screenOffEnabled
                         )
                     }

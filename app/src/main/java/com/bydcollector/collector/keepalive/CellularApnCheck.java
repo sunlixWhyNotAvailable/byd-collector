@@ -75,7 +75,11 @@ public final class CellularApnCheck {
         stage = "vehicle_power";
         int power = platform.vehiclePower();
         event("power", Integer.toString(power));
-        if (power != 0) { event("check_skipped", "reason=vehicle_on"); return; }
+        if (power != 0) {
+            restoreOwnedBacklight(platform);
+            event("check_skipped", "reason=vehicle_on");
+            return;
+        }
         stage = "settings";
         String disabled = platform.disabledReason();
         if (disabled != null) { event("check_skipped", "reason=" + disabled); return; }
@@ -155,6 +159,8 @@ public final class CellularApnCheck {
         if (power != 0 || !display.blackAwake()) {
             event("backlight_skipped", "reason=guards_changed " + display); return;
         }
+        BacklightRecoveryState owner = platform.backlightOwner();
+        String boot = platform.bootId();
         stage = "backlight_dispatch";
         platform.checkActive();
         event("backlight_attempt", "display_id=0 wake_uptime=" + wakeUptime + " power=0");
@@ -165,6 +171,41 @@ public final class CellularApnCheck {
         event("backlight_result", "status=" + status + " " + display + " physical_visibility_unverified=true");
         if (status != 0 || !display.interactive)
             throw new java.io.IOException("Backlight-only OFF not confirmed: status=" + status + " " + display);
+        stage = "backlight_owner_persist";
+        try {
+            owner.confirmOff(boot, wakeUptime);
+        } catch (Exception error) {
+            // Do not leave an untracked dark display if durable ownership could not be saved.
+            try { platform.backlightOn(); }
+            catch (Exception restore) { error.addSuppressed(restore); }
+            throw error;
+        }
+        event("backlight_owned", "boot_id=" + boot + " wake_uptime=" + wakeUptime);
+        if (platform.vehiclePower() > 0) restoreOwnedBacklight(platform);
+    }
+
+    private void restoreOwnedBacklight(CellularApnPlatform platform) throws Exception {
+        stage = "backlight_restore_owner";
+        BacklightRecoveryState owner = platform.backlightOwner();
+        if (!owner.owned(platform.bootId())) return;
+        stage = "backlight_restore_status";
+        if (platform.backlightStatus() == 1) {
+            owner.clear();
+            event("backlight_restore_skipped", "reason=already_on ownership_cleared=true");
+            return;
+        }
+        // Restoring our own OFF is cleanup, even if the user has since disabled recovery.
+        if (platform.vehiclePower() == 0) {
+            event("backlight_restore_skipped", "reason=vehicle_off"); return;
+        }
+        stage = "backlight_restore_dispatch";
+        event("backlight_restore_attempt", "display_id=0 power=on");
+        platform.backlightOn();
+        stage = "backlight_restore_verify";
+        int status = platform.backlightStatus();
+        event("backlight_restore_result", "status=" + status + " physical_visibility_unverified=true");
+        if (status != 1) throw new java.io.IOException("Backlight ON not confirmed: status=" + status);
+        owner.clear();
     }
 
     private static void event(String name, String detail) {
