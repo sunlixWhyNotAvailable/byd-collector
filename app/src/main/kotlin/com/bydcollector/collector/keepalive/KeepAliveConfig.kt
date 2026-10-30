@@ -6,7 +6,8 @@ data class KeepAliveConfig(
     val keepBluetooth: Boolean,
     val recoverCollectorService: Boolean,
     val keepUsb: Boolean = false,
-    val wakeDiscoveryRequest: Long = 0L
+    val wakeDiscoveryRequest: Long = 0L,
+    val screenOffAfterRecovery: Boolean = true
 ) {
     val anyEnabled: Boolean
         get() = keepWifi || keepMobileData || keepBluetooth || recoverCollectorService || keepUsb

@@ -53,6 +53,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.boundsInWindow
@@ -2859,6 +2860,17 @@ private fun ExtraTab(
                         modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)
                     )
                     Box(Modifier.fillMaxWidth().height(1.dp).background(LocalBydPalette.current.border))
+                    val screenOffEnabled = state?.keepWifiEnabled == true && state.keepMobileDataEnabled &&
+                        !actionUiState.isPending("connectivityRecovery") &&
+                        !actionUiState.isPending("screenOffAfterRecovery")
+                    Box(Modifier.alpha(if (screenOffEnabled) 1f else 0.62f)) {
+                        SwitchRow(
+                            strings.screenOffAfterRecovery,
+                            state?.screenOffAfterRecoveryEnabled ?: true,
+                            actions::onToggleScreenOffAfterRecovery,
+                            enabled = screenOffEnabled
+                        )
+                    }
                     SwitchRow(
                         strings.keepBluetooth,
                         state?.keepBluetoothEnabled == true,

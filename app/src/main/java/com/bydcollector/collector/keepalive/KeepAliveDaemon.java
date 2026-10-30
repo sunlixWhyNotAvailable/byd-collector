@@ -86,6 +86,7 @@ public final class KeepAliveDaemon {
     private static final String[] ALLOWED_COMMANDS = new String[]{
             "settings get global bydcollector_keep_wifi",
             "settings get global bydcollector_keep_mobile_data",
+            "settings get global " + KeepAliveProtocol.KEY_SCREEN_OFF_AFTER_RECOVERY,
             "settings get global bydcollector_keep_bluetooth",
             "settings get global bydcollector_recover_collector_service",
             KEEP_USB_COMMAND,
@@ -101,6 +102,7 @@ public final class KeepAliveDaemon {
             UsbKeepAliveTransport.READ_BODYWORK_POWER_LEVEL_COMMAND,
             UsbKeepAliveTransport.USB_DATA_PORT_ON_COMMAND,
             "dumpsys power | grep mWakefulness",
+            "dumpsys power",
             "pidof com.bydcollector.collector",
             "dumpsys activity services com.bydcollector.collector/.service.CollectorService",
             RECOVER_COLLECTOR_COMMAND
@@ -410,6 +412,8 @@ public final class KeepAliveDaemon {
 
     static boolean readGlobalFlag(String key, long timeoutMs) throws IOException {
         if (!KeepAliveProtocol.KEY_KEEP_MOBILE_DATA.equals(key) &&
+                !KeepAliveProtocol.KEY_KEEP_WIFI.equals(key) &&
+                !KeepAliveProtocol.KEY_SCREEN_OFF_AFTER_RECOVERY.equals(key) &&
                 !KeepAliveProtocol.KEY_USER_SHUTDOWN.equals(key)) {
             throw new IOException("Unsupported APN2 settings key: " + key);
         }
@@ -421,6 +425,15 @@ public final class KeepAliveDaemon {
         if ("1".equals(value)) return true;
         if ("0".equals(value)) return false;
         throw new IOException("Unknown global flag " + key + "=" + value);
+    }
+
+    static long readLastWakeUptime(long timeoutMs) throws IOException {
+        if (timeoutMs <= 0) throw new java.io.InterruptedIOException("Wake ownership deadline expired");
+        ShellResult result = run("dumpsys power", timeoutMs);
+        if (!result.ok) throw new IOException("dumpsys power failed: " + result.error + " output=" + result.output);
+        Matcher match = Pattern.compile("^\\s*mLastWakeTime=(\\d+)", Pattern.MULTILINE).matcher(result.output);
+        if (!match.find()) throw new IOException("mLastWakeTime missing; wake ownership unverified; output=" + result.output);
+        return Long.parseLong(match.group(1));
     }
 
     private static String usbDisabledReason(FlagRead enabled, FlagRead shutdown) {

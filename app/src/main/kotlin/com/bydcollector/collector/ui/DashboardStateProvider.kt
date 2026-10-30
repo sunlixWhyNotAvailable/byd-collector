@@ -283,6 +283,7 @@ class DashboardStateProvider(
             debugLastSessionId = debugStatus.lastSessionId,
             keepWifiEnabled = keepAliveConfig?.keepWifi == true,
             keepMobileDataEnabled = keepAliveConfig?.keepMobileData == true,
+            screenOffAfterRecoveryEnabled = keepAliveConfig?.screenOffAfterRecovery ?: true,
             wakeDiscoveryStatus = settings.wakeDiscoveryStatus(),
             keepBluetoothEnabled = keepAliveConfig?.keepBluetooth == true,
             recoverCollectorServiceEnabled = keepAliveConfig?.recoverCollectorService == true,

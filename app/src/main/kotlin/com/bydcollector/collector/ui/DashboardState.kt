@@ -79,6 +79,7 @@ data class DashboardState(
     val debugLastSessionId: Long?,
     val keepWifiEnabled: Boolean,
     val keepMobileDataEnabled: Boolean,
+    val screenOffAfterRecoveryEnabled: Boolean = true,
     val wakeDiscoveryStatus: String = "",
     val keepBluetoothEnabled: Boolean,
     val recoverCollectorServiceEnabled: Boolean,

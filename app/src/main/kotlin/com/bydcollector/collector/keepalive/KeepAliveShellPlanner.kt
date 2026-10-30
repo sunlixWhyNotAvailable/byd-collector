@@ -13,6 +13,7 @@ object KeepAliveShellPlanner {
         return listOf(
             "settings put global bydcollector_keep_wifi ${flag(config.keepWifi)}",
             "settings put global bydcollector_keep_mobile_data ${flag(config.keepMobileData)}",
+            "settings put global ${KeepAliveProtocol.KEY_SCREEN_OFF_AFTER_RECOVERY} ${flag(config.screenOffAfterRecovery)}",
             "settings put global bydcollector_keep_bluetooth ${flag(config.keepBluetooth)}",
             "settings put global bydcollector_keep_usb ${flag(config.keepUsb)}",
             "settings put global bydcollector_recover_collector_service ${flag(config.recoverCollectorService)}",

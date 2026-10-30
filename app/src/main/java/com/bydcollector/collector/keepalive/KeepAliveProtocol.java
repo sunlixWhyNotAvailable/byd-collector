@@ -9,6 +9,7 @@ public final class KeepAliveProtocol {
     public static final String KERNEL_BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id";
     public static final String KEY_KEEP_WIFI = "bydcollector_keep_wifi";
     public static final String KEY_KEEP_MOBILE_DATA = "bydcollector_keep_mobile_data";
+    public static final String KEY_SCREEN_OFF_AFTER_RECOVERY = "bydcollector_screen_off_after_recovery";
     public static final String KEY_KEEP_BLUETOOTH = "bydcollector_keep_bluetooth";
     public static final String KEY_KEEP_USB = "bydcollector_keep_usb";
     public static final String KEY_RECOVER_COLLECTOR_SERVICE = "bydcollector_recover_collector_service";

@@ -1309,6 +1309,7 @@ class CollectorSettings(
             keepBluetooth = isKeepBluetoothEnabled(),
             recoverCollectorService = isRecoverCollectorServiceEnabled(),
             keepUsb = isKeepUsbEnabled(),
+            screenOffAfterRecovery = isScreenOffAfterRecoveryEnabled(),
             wakeDiscoveryRequest = prefs.getLong(com.bydcollector.collector.keepalive.WakeDiscoveryRequest.KEY, 0L)
         )
     }
@@ -1316,6 +1317,15 @@ class CollectorSettings(
     fun isKeepWifiEnabled(): Boolean = prefs.getBoolean(KEY_KEEP_WIFI, false)
 
     fun isKeepMobileDataEnabled(): Boolean = prefs.getBoolean(KEY_KEEP_MOBILE_DATA, false)
+
+    fun isScreenOffAfterRecoveryEnabled(): Boolean = prefs.getBoolean(KEY_SCREEN_OFF_AFTER_RECOVERY, true)
+
+    fun setScreenOffAfterRecoveryEnabled(enabled: Boolean) {
+        check(prefs.edit().putBoolean(KEY_SCREEN_OFF_AFTER_RECOVERY, enabled).commit()) {
+            "Screen-off after recovery setting was not persisted"
+        }
+        recordEvent("screen_off_after_recovery_changed", "Screen-off after recovery enabled=$enabled")
+    }
 
     fun wakeDiscoveryStatus(): String = com.bydcollector.collector.keepalive.WakeDiscoveryStatus.cached(
         prefs, isKeepWifiEnabled() || isKeepMobileDataEnabled())
@@ -1595,6 +1605,7 @@ class CollectorSettings(
         const val KEY_DEBUG_AUTO_START = "debugAutoStart"
         const val KEY_KEEP_WIFI = "keepWifi"
         const val KEY_KEEP_MOBILE_DATA = "keepMobileData"
+        const val KEY_SCREEN_OFF_AFTER_RECOVERY = "screenOffAfterRecovery"
         const val KEY_KEEP_BLUETOOTH = "keepBluetooth"
         const val KEY_KEEP_USB = "keepUsb"
         const val KEY_RECOVER_COLLECTOR_SERVICE = "recoverCollectorService"

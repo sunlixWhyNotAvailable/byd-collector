@@ -294,6 +294,7 @@ interface BydCollectorActions {
     fun onInfluxDraftChanged(draft: InfluxDraft)
 
     fun onToggleConnectivityRecovery(enabled: Boolean)
+    fun onToggleScreenOffAfterRecovery(enabled: Boolean)
     fun onToggleKeepBluetooth(enabled: Boolean)
     fun onToggleKeepCollector(enabled: Boolean)
     fun onToggleKeepUsb(enabled: Boolean)

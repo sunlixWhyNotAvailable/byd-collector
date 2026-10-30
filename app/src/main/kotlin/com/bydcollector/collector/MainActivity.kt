@@ -1061,6 +1061,11 @@ class MainActivity : ComponentActivity() {
             updateKeepAliveSetting("bluetoothRecovery", enabled) { source.setKeepBluetoothEnabled(it) }
         }
 
+        override fun onToggleScreenOffAfterRecovery(enabled: Boolean) {
+            val source = settings
+            updateKeepAliveSetting("screenOffAfterRecovery", enabled) { source.setScreenOffAfterRecoveryEnabled(it) }
+        }
+
         override fun onToggleKeepCollector(enabled: Boolean) {
             val source = settings
             updateKeepAliveSetting("collectorRecovery", enabled) { source.setRecoverCollectorServiceEnabled(it) }

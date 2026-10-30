@@ -1,9 +1,6 @@
 package com.bydcollector.collector.keepalive;
 
 import android.net.ConnectivityManager;
-import android.net.LinkAddress;
-import android.net.LinkProperties;
-import android.net.Network;
 import android.net.NetworkInfo;
 import android.os.IBinder;
 import android.os.Parcel;
@@ -13,8 +10,7 @@ import android.os.SystemClock;
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.lang.reflect.Method;
-import java.util.ArrayList;
-import java.util.List;
+import java.net.NetworkInterface;
 
 /** Shell-only adapter for the SL07 logical-display/APN2 path. Never puts the display to sleep. */
 final class CellularApnPlatform {
@@ -71,6 +67,32 @@ final class CellularApnPlatform {
         return null;
     }
 
+    boolean screenOffEnabled() throws Exception {
+        return flag(KeepAliveProtocol.KEY_KEEP_WIFI) && flag(KeepAliveProtocol.KEY_SCREEN_OFF_AFTER_RECOVERY);
+    }
+
+    long lastWakeUptime() throws Exception {
+        checkActive();
+        long value = KeepAliveDaemon.readLastWakeUptime(deadline - SystemClock.elapsedRealtime());
+        checkActive();
+        return value;
+    }
+
+    int backlightStatus() throws Exception {
+        int value = (Integer) displayApi.getMethod("getPowerScreenStatus", int.class).invoke(service("display", displayApi), 0);
+        checkActive();
+        if (value != 0 && value != 1) throw new IOException("Unknown main backlight status=" + value);
+        return value;
+    }
+
+    void backlightOff() throws Exception {
+        Object display = service("display", displayApi);
+        Method off = displayApi.getMethod("turnBacklightOff", int.class, long.class);
+        checkActive();
+        off.invoke(display, 0, SystemClock.uptimeMillis());
+        checkActive();
+    }
+
     int vehiclePower() throws Exception {
         IBinder service = binder("autoservice");
         Parcel request = Parcel.obtain(), reply = Parcel.obtain();
@@ -116,48 +138,30 @@ final class CellularApnPlatform {
     ApnState apn2() throws Exception {
         String apnType = property("persist.sys.byd.apn_type");
         if (!"double_apn".equals(apnType)) throw new IOException("APN2 configuration unsupported or unknown: " + apnType);
-        String iface = property("net.lte.apn2.ifname"), ip = property("net.lte.apn2.ip");
-        List<LinkProperties> links = new ArrayList<>();
-        if (!iface.isEmpty() && !ip.isEmpty()) {
-            Object connectivity = service("connectivity", networkApi);
-            Network[] networks = (Network[]) networkApi.getMethod("getAllNetworks").invoke(connectivity);
-            checkActive();
-            if (networks == null) throw new IOException("Connectivity service returned null networks");
-            for (Network network : networks) {
-                checkActive();
-                links.add((LinkProperties) networkApi.getMethod("getLinkProperties", Network.class)
-                        .invoke(connectivity, network));
-            }
-        }
+        String iface = property("net.lte.apn2.ifname");
+        ApnState result = readApnInterface(iface);
         checkActive();
-        return assessApn2(iface, ip, links, property("net.lte.apn2.ifname"), property("net.lte.apn2.ip"));
+        if (!iface.equals(property("net.lte.apn2.ifname"))) throw new IOException("APN2 changed during observation");
+        return result;
     }
 
-    static ApnState assessApn2(String iface, String ip, List<LinkProperties> links,
-                              String afterIface, String afterIp) throws IOException {
-        if (iface == null || ip == null || afterIface == null || afterIp == null || links == null) {
-            throw new IOException("APN2 observation incomplete");
-        }
-        if (!iface.equals(afterIface) || !ip.equals(afterIp)) throw new IOException("APN2 changed during observation");
-        if (iface.isEmpty() || ip.isEmpty()) return new ApnState(false, iface, ip, "interface_or_ip_missing");
-        if (!iface.matches("rmnet_data\\d+") || !android.util.Patterns.IP_ADDRESS.matcher(ip).matches()) {
-            throw new IOException("Unsupported APN2 interface/IP value: " + iface + "/" + ip);
-        }
-        for (LinkProperties link : links) {
-            if (link == null || !iface.equals(link.getInterfaceName())) continue;
-            for (LinkAddress address : link.getLinkAddresses()) {
-                if (ip.equals(address.getAddress().getHostAddress())) return new ApnState(true, iface, ip, "network_matched");
-            }
-        }
-        return new ApnState(false, iface, ip, "no_matching_current_network");
+    static ApnState readApnInterface(String iface) throws IOException {
+        if (iface == null) throw new IOException("APN2 observation incomplete");
+        if (iface.isEmpty()) return new ApnState(false, iface, "interface_name_missing");
+        if (!iface.matches("[a-zA-Z0-9_.:-]{1,15}")) throw new IOException("Invalid APN2 interface name: " + iface);
+        // OEM identifies APN2; kernel presence does not require coverage, an IP or Internet validation.
+        boolean present = NetworkInterface.getByName(iface) != null;
+        return new ApnState(present, iface, present ? "interface_present" : "interface_missing");
     }
 
-    void wake(int reason) throws Exception {
+    long wake(int reason) throws Exception {
         Object power = service("power", powerApi);
         Method wake = powerApi.getMethod("wakeUp", long.class, int.class, String.class, String.class);
         checkActive();
-        wake.invoke(power, SystemClock.uptimeMillis(), reason, "BYDCollector:APN2Recovery", "com.android.shell");
+        long uptime = SystemClock.uptimeMillis();
+        wake.invoke(power, uptime, reason, "BYDCollector:APN2Recovery", "com.android.shell");
         checkActive();
+        return uptime;
     }
 
     static final class DisplayState {
@@ -181,12 +185,11 @@ final class CellularApnPlatform {
 
     static final class ApnState {
         final boolean ready;
-        final String iface, ip, reason;
+        final String iface, reason;
 
-        ApnState(boolean ready, String iface, String ip, String reason) {
+        ApnState(boolean ready, String iface, String reason) {
             this.ready = ready;
             this.iface = iface;
-            this.ip = ip;
             this.reason = reason;
         }
 
