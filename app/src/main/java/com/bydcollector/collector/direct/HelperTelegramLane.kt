@@ -58,6 +58,8 @@ class HelperTelegramLane @JvmOverloads constructor(
     private val lock = Object()
     private val activeByOwner = HashMap<UUID, TelegramHelperAttemptKey>()
     private val workerFailures = HashMap<UUID, WorkerFailure>()
+    private val pendingResults = HashMap<UUID, Ledger>()
+    private val lastPersistAttemptNs = HashMap<UUID, Long>()
     private val httpClient = TelegramHttpClient()
     private val executor = Executors.newSingleThreadExecutor(ThreadFactory { runnable ->
         Thread(runnable, "byd-helper-telegram").apply { isDaemon = true }
@@ -71,7 +73,7 @@ class HelperTelegramLane @JvmOverloads constructor(
             val previous = queryLocked(key)
             if (previous.state != TelegramHelperState.ABSENT) return previous
             check(!stopping && !closed) { "Telegram helper is stopping" }
-            check(activeByOwner.isEmpty()) { "Telegram helper already has an active HTTP attempt" }
+            check(activeByOwner.isEmpty() && pendingResults.isEmpty()) { "Telegram helper already has an unsettled attempt" }
             val ledger = readLedger(key.ownerId)
             val acknowledged = ledger?.acknowledgedSequence ?: 0L
             require(key.sequence == acknowledged + 1L) { "Telegram sequence does not follow the acknowledged helper state" }
@@ -80,7 +82,7 @@ class HelperTelegramLane @JvmOverloads constructor(
             activeByOwner[key.ownerId] = key
             workerFailures.remove(key.ownerId)
             try {
-                executor.execute { sendAndPersist(key, request) }
+                executor.execute { sendAndPersist(started, request) }
             } catch (error: Throwable) {
                 activeByOwner.remove(key.ownerId)
                 lock.notifyAll()
@@ -95,6 +97,7 @@ class HelperTelegramLane @JvmOverloads constructor(
     }
 
     fun telegramAck(key: TelegramHelperAttemptKey): TelegramHelperOutcome = synchronized(lock) {
+        persistPendingResult(key.ownerId)
         workerFailures[key.ownerId]?.takeIf { it.key == key }?.let {
             throw it.asRemoteFailure()
         }
@@ -137,11 +140,14 @@ class HelperTelegramLane @JvmOverloads constructor(
         val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
         synchronized(lock) {
             stopping = true
-            while (activeByOwner.isNotEmpty()) {
+            while (activeByOwner.isNotEmpty() || pendingResults.isNotEmpty()) {
+                pendingResults.keys.toList().forEach(::persistPendingResult)
+                if (activeByOwner.isEmpty() && pendingResults.isEmpty()) break
                 val remaining = deadline - System.nanoTime()
                 if (remaining <= 0L) return false
-                val millis = TimeUnit.NANOSECONDS.toMillis(remaining)
-                val nanos = (remaining - TimeUnit.MILLISECONDS.toNanos(millis)).toInt()
+                val waitNs = minOf(remaining, TimeUnit.MILLISECONDS.toNanos(RESULT_PERSIST_RETRY_MS))
+                val millis = TimeUnit.NANOSECONDS.toMillis(waitNs)
+                val nanos = (waitNs - TimeUnit.MILLISECONDS.toNanos(millis)).toInt()
                 try {
                     lock.wait(millis, nanos)
                 } catch (error: InterruptedException) {
@@ -156,7 +162,7 @@ class HelperTelegramLane @JvmOverloads constructor(
     fun closeAfterDrain(): Boolean {
         synchronized(lock) {
             stopping = true
-            if (activeByOwner.isNotEmpty()) return false
+            if (activeByOwner.isNotEmpty() || pendingResults.isNotEmpty()) return false
             closed = true
             executor.shutdown()
         }
@@ -169,6 +175,7 @@ class HelperTelegramLane @JvmOverloads constructor(
     }
 
     private fun queryLocked(key: TelegramHelperAttemptKey): TelegramHelperOutcome {
+        persistPendingResult(key.ownerId)
         val workerFailure = workerFailures[key.ownerId]
         if (workerFailure?.key == key) {
             throw workerFailure.asRemoteFailure()
@@ -202,7 +209,8 @@ class HelperTelegramLane @JvmOverloads constructor(
         throw IllegalArgumentException("Telegram helper has no exact ledger entry for this sequence")
     }
 
-    private fun sendAndPersist(key: TelegramHelperAttemptKey, request: TelegramSendMessage) {
+    private fun sendAndPersist(started: Ledger, request: TelegramSendMessage) {
+        val key = started.latest.key
         var result: TelegramSendResult? = null
         var failure: Throwable? = null
         var failureDiagnostic: String? = null
@@ -220,29 +228,40 @@ class HelperTelegramLane @JvmOverloads constructor(
                     key, "http_send", httpFailure.javaClass.name, checkNotNull(httpDiagnostic), httpFailure
                 )
             } else {
-                try {
-                    val ledger = checkNotNull(readLedger(key.ownerId)) { "Telegram helper ledger disappeared during HTTP" }
-                    requireSameKey(ledger.latest.key, key)
-                    check(ledger.latest.state == STARTED) { "Telegram helper attempt is not STARTED" }
-                    val completedAt = System.currentTimeMillis().coerceAtLeast(0L)
-                    writeLedger(ledger.copy(latest = ledger.latest.copy(
-                        state = RESULT,
-                        result = checkNotNull(result),
-                        confirmedAtMs = completedAt
-                    )))
-                    workerFailures.remove(key.ownerId)
-                } catch (error: Throwable) {
-                    workerFailures[key.ownerId] = WorkerFailure(
-                        key,
-                        "result_persist",
-                        error.javaClass.name,
-                        TelegramHelperProtocol.exceptionDiagnostic(error, "telegram_result_persist", request),
-                        error
-                    )
-                }
+                pendingResults[key.ownerId] = started.copy(latest = started.latest.copy(
+                    state = RESULT, result = checkNotNull(result),
+                    confirmedAtMs = System.currentTimeMillis().coerceAtLeast(0L)))
+                persistPendingResult(key.ownerId)
             }
             activeByOwner.remove(key.ownerId)
             lock.notifyAll()
+        }
+    }
+
+    /** A disk retry never re-enters HTTP; the exact result/time remain owned by this lane. */
+    private fun persistPendingResult(ownerId: UUID) {
+        val completed = pendingResults[ownerId] ?: return
+        val now = System.nanoTime()
+        val previousAttempt = lastPersistAttemptNs[ownerId]
+        if (previousAttempt != null && now - previousAttempt < TimeUnit.MILLISECONDS.toNanos(RESULT_PERSIST_RETRY_MS)) return
+        lastPersistAttemptNs[ownerId] = now
+        try {
+            readLedger(ownerId)?.let { stored ->
+                requireSameKey(stored.latest.key, completed.latest.key)
+                check(stored.latest.state == STARTED || stored == completed) { "Telegram result ledger changed before persistence" }
+            }
+            writeLedger(completed)
+            pendingResults.remove(ownerId)
+            lastPersistAttemptNs.remove(ownerId)
+            workerFailures.remove(ownerId)
+            lock.notifyAll()
+        } catch (error: Throwable) {
+            val first = workerFailures[ownerId]
+            val diagnostic = TelegramHelperProtocol.exceptionDiagnostic(error, "telegram_result_persist")
+            workerFailures[ownerId] = if (first == null) {
+                WorkerFailure(completed.latest.key, "result_persist", error.javaClass.name, diagnostic, error)
+            } else first.copy(diagnostic = TelegramHelperProtocol.exceptionDiagnostic(first.cause, "telegram_result_persist") +
+                "\nlast_retry: $diagnostic")
         }
     }
 
@@ -412,6 +431,7 @@ class HelperTelegramLane @JvmOverloads constructor(
         const val LEDGER_VERSION = 1
         const val MAX_LEDGER_BYTES = 32 * 1024
         const val CLOSE_WAIT_MS = 1_000L
+        const val RESULT_PERSIST_RETRY_MS = 5_000L
         const val STARTED = "STARTED"
         const val RESULT = "RESULT"
         const val ACKED = "ACKED"

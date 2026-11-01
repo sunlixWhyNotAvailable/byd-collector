@@ -118,7 +118,7 @@ class TelegramHttpClient(
         }
     }
 
-    private fun classify(httpStatus: Int, body: String, request: TelegramSendMessage): TelegramSendResult {
+    internal fun classify(httpStatus: Int, body: String, request: TelegramSendMessage): TelegramSendResult {
         val json = try {
             JSONObject(body)
         } catch (error: Exception) {
@@ -145,7 +145,10 @@ class TelegramHttpClient(
             kind = kindFor(errorCode ?: httpStatus),
             httpStatus = httpStatus,
             telegramErrorCode = errorCode,
-            retryAfterSeconds = retryAfter
+            retryAfterSeconds = retryAfter,
+            diagnostic = json.optString("description").takeIf(String::isNotBlank)?.let {
+                TelegramHelperProtocol.redactDiagnostic("stage=telegram_api_rejection description=$it", request)
+            }
         )
     }
 

@@ -423,6 +423,8 @@ class CollectorService : Service() {
             }
             telegramDeliveryRuntime.retryPendingResult()
             if (!settings.isTelegramEnabled()) return
+            // Only the ordered business worker may evaluate telemetry-dependent deadlines.
+            businessWorker.signal()
             executeOrderedTelegram(
                 "telegram_tick_error",
                 coordinator = coordinator,
@@ -1339,8 +1341,10 @@ class CollectorService : Service() {
         val refs = application.withDatabaseRead { selectedStore.pendingBusinessInputs() }
         if (refs.isEmpty()) {
             val active = synchronized(energyCoordinator) { energyCoordinator.runtimeStatus().active }
-            if (!maintenanceDrain && active && mainPollingRunning.get() &&
-                SystemClock.elapsedRealtime() >= nextBusinessTimerElapsedMs) {
+            val telegramDue = settings.isTelegramEnabled() &&
+                telegramCoordinator?.detectorDeadlineAtMs?.let { it <= System.currentTimeMillis() } == true
+            if (!maintenanceDrain && (telegramDue || (active && mainPollingRunning.get() &&
+                SystemClock.elapsedRealtime() >= nextBusinessTimerElapsedMs))) {
                 val elapsed = SystemClock.elapsedRealtime()
                 val source = businessTimerSource.capture(elapsed)
                 application.withDatabaseRead {
@@ -1456,6 +1460,23 @@ class CollectorService : Service() {
                     }
                 }
                 if (trip?.confirmedPowerOn == true) requestTelegramRecovery(RECOVERY_VEHICLE_ON)
+            } else if (telegramCoordinator?.detectorDeadlineAtMs?.let { it <= checkNotNull(ref.acquiredWallMs) } == true) {
+                val coordinator = telegramCoordinator
+                if (coordinator != null) {
+                    val telegramGeneration = telegramWorkGeneration.get()
+                    val finished = CompletableFuture<Long?>()
+                    synchronized(telegramExecutorLock) { telegramExecutor }.execute {
+                        try {
+                            checkBusinessOwner()
+                            check(telegramCoordinator === coordinator && telegramWorkGeneration.get() == telegramGeneration) {
+                                "Telegram owner changed before timer ${ref.id}"
+                            }
+                            finished.complete(coordinator.evaluateDetectors(checkNotNull(ref.acquiredWallMs),
+                                source.bootId, source.capturedElapsedMs))
+                        } catch (error: Throwable) { finished.completeExceptionally(error) }
+                    }
+                    postTelegramTickSchedule(awaitBusinessResult(finished), telegramGeneration)
+                }
             }
         }
         application.withDatabaseRead {

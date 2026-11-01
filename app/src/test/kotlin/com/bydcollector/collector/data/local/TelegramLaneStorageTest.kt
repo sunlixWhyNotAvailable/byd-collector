@@ -30,6 +30,60 @@ import kotlin.test.assertTrue
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
 class TelegramLaneStorageTest {
+    @Test fun overflowEvictsWholeDependencyGroupAndRepairsOldOrphans() {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "tg_groups_${System.nanoTime()}.db"
+        val helper = TelegramDatabaseHelper(context, name)
+        val store = TelegramStore(context, helper)
+        try {
+            store.commitTelegramEvents(listOf(
+                TelegramOutboxMessage("leg:summary", "trip_summary", "summary"),
+                TelegramOutboxMessage("leg:location", "trip_summary", "location", "leg:summary")), null, 1000L)
+            val result = store.commitTelegramEvents((1..999).map {
+                TelegramOutboxMessage("extra:$it", "trip_summary", "message $it")
+            }, null, 2000L)
+            assertEquals(2, result.sumOf { it.overflowCount })
+            assertNull(store.telegramMessageByDedupeKey("leg:summary"))
+            assertNull(store.telegramMessageByDedupeKey("leg:location"))
+            // A database created by the previous eviction algorithm may contain this orphan.
+            helper.writableDatabase.execSQL("INSERT INTO telegram_outbox " +
+                "(dedupe_key,event_type,payload,created_at_ms,next_attempt_at_ms,waits_for_summary_key) " +
+                "VALUES ('old:location','trip_summary','location',0,0,'old:summary')")
+            assertEquals(0 to 1, store.repairTelegramDependencies())
+            assertNull(store.telegramMessageByDedupeKey("old:location"))
+            val protected = assertNotNull(store.telegramMessageByDedupeKey("extra:1"))
+            store.commitTelegramEvents(listOf(
+                TelegramOutboxMessage("extra:1:location", "trip_summary", "location", "extra:1"),
+                TelegramOutboxMessage("tail", "trip_summary", "tail")), null, 3000L,
+                protectedTelegramIds = setOf(protected.id))
+            assertNotNull(store.telegramMessageByDedupeKey("extra:1"))
+            assertNotNull(store.telegramMessageByDedupeKey("extra:1:location"))
+            assertNull(store.telegramMessageByDedupeKey("extra:2"))
+        } finally {
+            store.close()
+            context.deleteDatabase(name)
+        }
+    }
+
+    @Test fun apiRejectionKeepsItsDescriptionAndRedactsSecretsAcrossIpc() {
+        val request = TelegramSendMessage("123:private_token", "private-chat", "private payload")
+        val parsed = com.bydcollector.collector.telegram.TelegramHttpClient().classify(400,
+            org.json.JSONObject().put("ok", false).put("error_code", 400)
+                .put("description", "Bad Request: chat not found ${request.chatId} ${request.botToken} ${request.text}").toString(), request)
+        val failure = assertIs<TelegramSendResult.Failure>(parsed)
+        assertEquals(400, failure.telegramErrorCode)
+        val diagnostic = assertNotNull(failure.diagnostic)
+        assertTrue(diagnostic.contains("Bad Request: chat not found"))
+        listOf(request.botToken, request.chatId, request.text).forEach { assertFalse(diagnostic.contains(it)) }
+        val parcel = Parcel.obtain()
+        try {
+            TelegramHelperProtocol.writeSuccessReply(parcel, com.bydcollector.collector.telegram.TelegramHelperOutcome(
+                TelegramHelperState.RESULT, failure, 123L))
+            parcel.setDataPosition(0)
+            assertEquals(failure, TelegramHelperProtocol.readReply(parcel).result)
+        } finally { parcel.recycle() }
+    }
+
     @Test
     fun reopen() {
         val context = RuntimeEnvironment.getApplication()

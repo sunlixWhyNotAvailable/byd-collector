@@ -88,7 +88,8 @@ data class TelegramPersistedDeliveryAttempt(
 data class TelegramEnqueueResult(
     val inserted: Boolean,
     val expiredCount: Int,
-    val overflowCount: Int
+    val overflowCount: Int,
+    val orphanCount: Int = 0
 )
 
 data class TelegramOutboxMessage(

@@ -6,6 +6,7 @@ import com.bydcollector.collector.data.local.PollReading
 import com.bydcollector.collector.data.input.BusinessInputContinuity
 import com.bydcollector.collector.data.normalized.NormalizedObservation
 import com.bydcollector.collector.data.normalized.NormalizedQuality
+import com.bydcollector.collector.data.normalized.NormalizedSourceKind
 import com.bydcollector.collector.data.normalized.NormalizedSourceOrder
 import com.bydcollector.collector.data.normalized.NormalizedSourceOrdering
 import com.bydcollector.collector.data.normalized.NormalizedSourceStamp
@@ -160,7 +161,8 @@ data class TelegramEventState(
     val bootTotalEndedAtMs: Long? = null,
     val lastTripEnergyCounterKwh: Double? = null,
     val lastPersistedAtMs: Long = 0L,
-    val rawSourceInputs: Map<String, TelegramRawSourceCursor> = emptyMap()
+    val rawSourceInputs: Map<String, TelegramRawSourceCursor> = emptyMap(),
+    val detectorTiming: TelegramDetectorTiming = TelegramDetectorTiming()
 ) {
     fun hasDeferredStorageWork(): Boolean {
         return tripId != null ||
@@ -196,6 +198,7 @@ data class TelegramEventState(
     }
 
     fun toJson(): String = JSONObject().apply {
+        put("detectorTiming", detectorTiming.toJson())
         put("initialized", initialized)
         putNullable("charging", charging)
         putNullable("chargingCandidate", chargingCandidate)
@@ -347,7 +350,8 @@ data class TelegramEventState(
                     lastTripEnergyCounterKwh = json.optDoubleOrNull("lastTripEnergyCounterKwh")
                         ?.takeIf { it.isFinite() && it >= 0.0 },
                     lastPersistedAtMs = json.optLong("lastPersistedAtMs"),
-                    rawSourceInputs = TelegramOrderedInput.decodeCursors(json.optJSONArray("rawSourceInputs"))
+                    rawSourceInputs = TelegramOrderedInput.decodeCursors(json.optJSONArray("rawSourceInputs")),
+                    detectorTiming = TelegramDetectorTiming.fromJson(json.optJSONObject("detectorTiming"))
                 )
             }.getOrNull()
         }
@@ -364,10 +368,6 @@ class TelegramEventEngine(
     private var chargingEtaPaused = false
     private var chargingEtaLastPowerElapsedMs: Long? = null
 
-    private val resumePendingChargingTransition =
-        initialState.chargingActiveCandidate != null &&
-            initialState.chargingActiveCandidateCount > 0 &&
-            initialState.chargingActiveCandidateSource != null
     private val recoverableFirstTripSoc = initialState.tripStartSoc
         ?.takeIf { initialState.tripId != null }
         ?.takeIf {
@@ -379,13 +379,6 @@ class TelegramEventEngine(
         charging = null,
         chargingCandidate = null,
         chargingCandidateCount = 0,
-        chargingActive = initialState.chargingActive.takeIf { resumePendingChargingTransition },
-        chargingActiveCandidate = initialState.chargingActiveCandidate.takeIf { resumePendingChargingTransition },
-        chargingActiveCandidateCount = initialState.chargingActiveCandidateCount.takeIf { resumePendingChargingTransition } ?: 0,
-        chargingActiveCandidateSource = initialState.chargingActiveCandidateSource.takeIf { resumePendingChargingTransition },
-        chargingEvidenceSource = null,
-        chargingLowPowerSinceMs = null,
-        fullCandidateCount = 0,
         bootStartSoc = validSoc(initialState.bootStartSoc) ?: validSoc(recoverableFirstTripSoc),
         bootEndSoc = validSoc(initialState.bootEndSoc)
             ?: validSoc(initialState.tripEndSoc)
@@ -394,7 +387,23 @@ class TelegramEventEngine(
         private set
 
     fun reset(): TelegramEventState {
-        state = TelegramEventState()
+        val previous = state
+        state = TelegramEventState(
+            bootStartSoc = previous.bootStartSoc, bootEndSoc = previous.bootEndSoc,
+            bootTotalDistanceKm = previous.bootTotalDistanceKm,
+            bootTotalEnergyKwh = previous.bootTotalEnergyKwh,
+            bootTotalDurationMs = previous.bootTotalDurationMs,
+            bootTotalStartedAtMs = previous.bootTotalStartedAtMs,
+            bootTotalEndedAtMs = previous.bootTotalEndedAtMs,
+            tripSummaryCreatedInPowerSession = previous.tripSummaryCreatedInPowerSession,
+            powerEnergyPoint = previous.powerEnergyPoint,
+            pendingPowerOffLocationTripId = previous.pendingPowerOffLocationTripId,
+            pendingPowerOffLocationPowerSessionId = previous.pendingPowerOffLocationPowerSessionId,
+            pendingPowerOffLocationSummaryDelivered = previous.pendingPowerOffLocationSummaryDelivered,
+            detectorTiming = TelegramDetectorTiming(
+                reportedPowerSessionId = previous.detectorTiming.reportedPowerSessionId
+                    ?: previous.pendingPowerOffLocationPowerSessionId)
+        )
         clearChargingEtaHistory()
         return state
     }
@@ -456,15 +465,19 @@ class TelegramEventEngine(
         config: TelegramEventConfig,
         nowMs: Long,
         energySnapshot: EnergySnapshot? = null
-    ): TelegramEventResult = processSuccessfulPoll(
+    ): TelegramEventResult {
+        val original = state
+        advanceDetectorClock("normalized-input", nowMs, nowMs)
+        return processSuccessfulPoll(
         observations = observations,
         config = config,
         nowMs = nowMs,
         energySnapshot = energySnapshot,
         freshness = null,
         origin = PollOrigin.LIVE,
-        original = state
-    )
+        original = original
+        )
+    }
 
     fun onSourcePoll(
         pollId: Long,
@@ -482,6 +495,21 @@ class TelegramEventEngine(
     ): TelegramEventResult {
         val original = state
         val pollStamp = normalizedPollSourceStamp(source, timestamp)
+        // Replay time advances only after decisions strictly before this input.
+        // An input exactly at a deadline gets the first chance to cancel it.
+        val priorEvents = mutableListOf<TelegramDetectedEvent>()
+        while (state.detectorTiming.bootId == source.bootId) {
+            val dueAt = state.detectorTiming.pending.values.minOfOrNull { it.elapsedMs }
+                ?.takeIf { it < source.capturedElapsedMs } ?: break
+            priorEvents += onDetectorTimer(config,
+                pollStamp.wallMs - (source.capturedElapsedMs - dueAt), source.bootId, dueAt, normalizer).events
+            check(state.detectorTiming.pending.values.none { it.elapsedMs <= dueAt }) {
+                "Telegram detector did not settle elapsed deadline $dueAt"
+            }
+        }
+        if (source.bootId == currentBootId || state.detectorTiming.bootId != currentBootId) {
+            advanceDetectorClock(source.bootId, source.capturedElapsedMs, pollStamp.wallMs)
+        }
         val ordered = TelegramOrderedInput.merge(
             previous = state.rawSourceInputs,
             readings = readings,
@@ -524,10 +552,65 @@ class TelegramEventEngine(
             etaPreviousEnergyStamp = previousEnergyCursor?.stamp
         )
         return result.copy(
+            events = priorEvents + result.events,
+            shouldPersist = result.shouldPersist || priorEvents.isNotEmpty(),
             sourceOrderStats = ordered.stats,
             detectorDecisions = detectorDecisions(original, result.state, ordered, result.events, nowMs)
         )
     }
+
+    /** Called behind durable source input, never directly by the wall-clock sender tick. */
+    fun onDetectorTimer(
+        config: TelegramEventConfig,
+        nowMs: Long,
+        bootId: String,
+        elapsedMs: Long,
+        normalizer: VehicleStateNormalizer
+    ): TelegramEventResult {
+        val original = state
+        advanceDetectorClock(bootId, elapsedMs, nowMs)
+        val stamp = NormalizedSourceStamp(NormalizedSourceKind.POLL,
+            "telegram-timer:$bootId:$elapsedMs", bootId, null, null, nowMs, elapsedMs)
+        val input = TelegramOrderedInput.merge(state.rawSourceInputs, emptyList(), stamp, 0L, bootId)
+        return processSuccessfulPoll(
+            observations = normalizer.normalizeSparse(input.inputs, input.inputs.keys),
+            config = config, nowMs = nowMs, energySnapshot = null, freshness = input,
+            origin = PollOrigin.REPLAY, original = original, timerEvaluation = true
+        )
+    }
+
+    private fun advanceDetectorClock(bootId: String, elapsedMs: Long, wallMs: Long) {
+        val old = state.detectorTiming
+        if (old.bootId != bootId) {
+            state = state.copy(
+                chargeGunCandidate = null, chargeGunCandidateCount = 0,
+                chargingActiveCandidate = null, chargingActiveCandidateCount = 0,
+                chargingActiveCandidateSource = null, chargingLowPowerSinceMs = null,
+                fullCandidateCount = 0, lowVoltageSinceMs = null,
+                detectorTiming = old.copy(bootId = bootId, evaluatedElapsedMs = elapsedMs,
+                    evaluatedWallMs = wallMs, pending = emptyMap(), pendingStopAtMs = null)
+            )
+        } else if (elapsedMs >= old.evaluatedElapsedMs) {
+            state = state.copy(detectorTiming = old.copy(evaluatedElapsedMs = elapsedMs, evaluatedWallMs = wallMs))
+        }
+    }
+
+    private fun deadline(key: String, delayMs: Long, observedAtMs: Long, sourceIdentity: String? = null): TelegramDetectorDeadline {
+        state.detectorTiming.pending[key]?.let { return it }
+        val timing = state.detectorTiming
+        val value = TelegramDetectorDeadline(timing.evaluatedElapsedMs + delayMs, observedAtMs, sourceIdentity)
+        state = state.copy(detectorTiming = timing.copy(pending = timing.pending + (key to value)))
+        return value
+    }
+
+    private fun cancelDeadline(vararg keys: String) {
+        val timing = state.detectorTiming
+        if (keys.any { it in timing.pending }) {
+            state = state.copy(detectorTiming = timing.copy(pending = timing.pending - keys.toSet()))
+        }
+    }
+
+    private fun due(value: TelegramDetectorDeadline): Boolean = state.detectorTiming.evaluatedElapsedMs >= value.elapsedMs
 
     private fun detectorDecisions(
         before: TelegramEventState,
@@ -629,7 +712,8 @@ class TelegramEventEngine(
         etaCycleElapsedMs: Long? = null,
         etaNowElapsedMs: Long? = null,
         etaPreviousEnergyKwh: Double? = null,
-        etaPreviousEnergyStamp: NormalizedSourceStamp? = null
+        etaPreviousEnergyStamp: NormalizedSourceStamp? = null,
+        timerEvaluation: Boolean = false
     ): TelegramEventResult {
         val values = observations.asSequence()
             .filter { it.quality == NormalizedQuality.OK }
@@ -665,38 +749,43 @@ class TelegramEventEngine(
         val events = mutableListOf<TelegramDetectedEvent>()
         val currentEnergyPoint = observeEnergySnapshot(energySnapshot, allowInactive = false)
         val tripEnergyFresh = freshness?.hasFresh("trip_energy_kwh") ?: true
-        val socFresh = freshness?.hasFresh("soc") ?: true
-        val gunFresh = freshness?.hasFresh("charge_gun_connected_raw") ?: true
-        val gearFresh = freshness?.hasFresh("gear_auto_mode_raw") ?: true
-        val bmsFresh = freshness?.hasFresh("charging_battery_device_state") ?: true
-        val powerRawFresh = freshness?.hasFresh("battery_charge_power_kw") ?: true
-        val powerFresh = powerRawFresh &&
-            (freshness == null || freshness.hasSingleBoot("battery_charge_power_kw")) &&
-            batteryChargePower != null
-        val voltageFresh = freshness?.hasFresh("aux_voltage_v") ?: true
+        val socFresh = freshness?.hasAccepted("soc") ?: true
+        val gunFresh = freshness?.hasAccepted("charge_gun_connected_raw") ?: true
+        val gearFresh = freshness?.hasAccepted("gear_auto_mode_raw") ?: true
+        val bmsFresh = freshness?.hasAccepted("charging_battery_device_state") ?: true
+        val powerRawFresh = freshness?.hasAccepted("battery_charge_power_kw") ?: true
+        val voltageFresh = freshness?.hasAccepted("aux_voltage_v") ?: true
+        fun usable(key: String): Boolean = freshness == null || freshness.hasValid(key, state.detectorTiming.bootId)
+        if (!usable("charge_gun_connected_raw") || rawGun == null) {
+            cancelDeadline("gun")
+            state = state.copy(chargeGunCandidate = null, chargeGunCandidateCount = 0)
+        }
+        if (!usable("soc") || soc == null) {
+            cancelDeadline("full")
+            state = state.copy(fullCandidateCount = 0)
+        }
+        if (!usable("aux_voltage_v") || auxVoltage == null) {
+            cancelDeadline("low_12v")
+            state = state.copy(lowVoltageSinceMs = null)
+        }
+        if (!usable("gear_auto_mode_raw") || rawGear == null) cancelDeadline("park")
         val tripCounterResetObserved = tripEnergyFresh && observeTripEnergyCounter(tripEnergy)
         val firstPoll = !state.initialized
         if (socFresh) updatePowerSessionSoc(soc)
-        finalizePendingTrip(config, nowMs, events)
-        val gearStamp = freshness?.sourceStamp("gear_auto_mode_raw", freshOnly = !firstPoll)
+        val gearStamp = freshness?.sourceStamp("gear_auto_mode_raw", freshOnly = false)
         val gearAtMs = gearStamp?.wallMs ?: nowMs
-        val gunStamp = freshness?.sourceStamp("charge_gun_connected_raw")
+        val gunStamp = freshness?.sourceStamp("charge_gun_connected_raw", freshOnly = false)
         val gunAtMs = gunStamp?.wallMs ?: nowMs
 
         if (firstPoll) {
             state = state.copy(
                 initialized = true,
-                chargeGunConnected = rawGun,
-                gear = rawGear,
-                awaitingInitialTripGear = rawGear == null && state.tripId == null,
+                awaitingInitialTripGear = state.gear == null && state.tripId == null,
                 lastSuccessfulPollAtMs = if (origin == PollOrigin.LIVE) nowMs else state.lastSuccessfulPollAtMs,
                 telemetryExpectedSinceMs = if (origin == PollOrigin.LIVE) {
                     state.telemetryExpectedSinceMs ?: nowMs
                 } else state.telemetryExpectedSinceMs
             )
-            if (state.tripId == null && rawGear != null && rawGear != PARK) {
-                startTrip(gearAtMs, odometer, soc, tripEnergy, currentEnergyPoint)
-            }
         } else {
             if (origin == PollOrigin.LIVE) {
                 state = state.copy(
@@ -704,29 +793,32 @@ class TelegramEventEngine(
                     telemetryExpectedSinceMs = state.telemetryExpectedSinceMs ?: nowMs
                 )
             }
-            if (gunFresh) confirmChargeGun(
-                rawGun, gunAtMs, soc, config, events,
-                gunStamp?.identity
-            )
-            if (gearFresh) confirmGear(
-                rawGear, gearAtMs, odometer, soc, tripEnergy, currentEnergyPoint, config
-            )
         }
-        if (!firstPoll && socFresh) updatePowerSessionSoc(soc)
+        if (usable("charge_gun_connected_raw") && (gunFresh || timerEvaluation)) confirmChargeGun(
+            rawGun, gunAtMs, soc, config, events, gunStamp?.identity
+        )
+        if (usable("gear_auto_mode_raw") && gearFresh) confirmGear(
+            rawGear, gearAtMs, odometer, soc, tripEnergy, currentEnergyPoint, config
+        )
+        if (usable("gear_auto_mode_raw") && rawGear == PARK && state.tripParkedSinceMs != null) {
+            // A restored/lost-source parked interval starts a new confirmation window.
+            deadline("park", config.tripEndDelayMs, state.tripParkedSinceMs!!)
+            finalizePendingTrip(config, state.detectorTiming.evaluatedWallMs, events)
+        }
         if (state.gear == PARK && state.tripParkedSinceMs != null &&
             (freshness == null || freshness.hasFresh("odometer_km") || socFresh || tripEnergyFresh)
         ) {
             updatePendingTripSnapshot(odometer, soc, tripEnergy, currentEnergyPoint)
         }
 
-        val evidence = chargingEvidence(rawGun, batteryChargePower, bmsState)
-        val chargeEvidenceFresh = freshness == null || when (evidence.source) {
-            ChargingEvidenceSource.PRIMARY_DISCONNECTED -> gunFresh
-            ChargingEvidenceSource.BMS_CHARGING -> gunFresh || bmsFresh
-            ChargingEvidenceSource.BMS_FINISHED -> bmsFresh || powerFresh
-            ChargingEvidenceSource.PRIMARY_POWER,
-            ChargingEvidenceSource.PRIMARY_LOW_POWER -> powerFresh
-            ChargingEvidenceSource.UNKNOWN -> gunFresh || bmsFresh || powerRawFresh
+        val evidence = chargingEvidence(rawGun.takeIf { usable("charge_gun_connected_raw") },
+            batteryChargePower.takeIf { usable("battery_charge_power_kw") },
+            bmsState.takeIf { usable("charging_battery_device_state") })
+        val chargeEvidenceFresh = freshness == null || gunFresh || bmsFresh || powerRawFresh || timerEvaluation
+        if (evidence.active == null) {
+            cancelDeadline("charging", "low_power", "full")
+            state = state.copy(chargingActiveCandidate = null, chargingActiveCandidateCount = 0,
+                chargingActiveCandidateSource = null, chargingLowPowerSinceMs = null, fullCandidateCount = 0)
         }
         if (freshness == null || gunFresh || bmsFresh || powerRawFresh) {
             val bmsFinishHighPowerConflict = rawGun != false &&
@@ -748,7 +840,7 @@ class TelegramEventEngine(
                 "charge_gun_connected_raw", "charging_battery_device_state", "battery_charge_power_kw"
             )
         }
-        val evidenceAtMs = evidenceStamp?.wallMs ?: nowMs
+        val evidenceAtMs = evidenceStamp?.wallMs ?: state.detectorTiming.evaluatedWallMs
         val evidenceSourceIdentity = evidenceStamp?.identity
         val stopCharging = if (chargeEvidenceFresh) confirmChargingEvidence(
             evidence = evidence,
@@ -786,7 +878,7 @@ class TelegramEventEngine(
             }
         } else null
         val fullFinished = evidence.active != null && (state.chargingSessionId != null || stopCharging) &&
-            if (socFresh) evaluateChargingProgress(
+            if (usable("soc") && (socFresh || timerEvaluation)) evaluateChargingProgress(
                 freshness?.sourceStamp("soc")?.wallMs ?: nowMs,
                 soc, remainingEnergy, batteryChargePower, range, config, events,
                 freshness?.sourceStamp("soc")?.identity,
@@ -817,13 +909,14 @@ class TelegramEventEngine(
         if (freshness != null && socFresh && soc == null && state.chargingSessionId != null) {
             state = state.copy(fullCandidateCount = 0)
         }
-        if (stopCharging && !fullFinished && state.chargingSessionId != null) {
-            stopChargingSession(evidenceAtMs, soc, remainingEnergy, batteryChargePower, config, events,
+        val stopPending = stopCharging || state.detectorTiming.pendingStopAtMs != null
+        if (stopPending && !fullFinished && state.chargingSessionId != null && "full" !in state.detectorTiming.pending) {
+            stopChargingSession(state.detectorTiming.pendingStopAtMs ?: evidenceAtMs, soc, remainingEnergy, batteryChargePower, config, events,
                 evidenceSourceIdentity)
         } else if (stopCharging && !fullFinished) {
             state = state.copy(fullSent = false)
         }
-        if (voltageFresh) {
+        if (usable("aux_voltage_v") && (voltageFresh || timerEvaluation)) {
             if (freshness != null && auxVoltage == null) {
                 state = state.copy(lowVoltageSinceMs = null)
             } else {
@@ -861,7 +954,6 @@ class TelegramEventEngine(
     ): TelegramEventResult {
         val events = mutableListOf<TelegramDetectedEvent>()
         val original = state
-        finalizePendingTrip(config, nowMs, events)
         if (!mainCollectionExpected || health.confirmedHealthy) {
             state = state.copy(telemetryExpectedSinceMs = null, telemetryOutageSent = false,
                 telemetryFailureSinceMs = null)
@@ -1084,6 +1176,7 @@ class TelegramEventEngine(
         sourceIdentity: String? = null
     ): Boolean {
         if (evidence.active == null) {
+            cancelDeadline("charging", "low_power")
             clearTentativeChargingBaseline()
             state = state.copy(
                 chargingActiveCandidate = null,
@@ -1099,7 +1192,9 @@ class TelegramEventEngine(
             evidence.source == ChargingEvidenceSource.PRIMARY_LOW_POWER &&
             (state.chargingActive == true || state.chargingSessionId != null)
         ) {
-            val lowPowerSince = state.chargingLowPowerSinceMs ?: nowMs
+            cancelDeadline("charging")
+            val confirmation = deadline("low_power", CHARGING_LOW_POWER_CONFIRM_MS, nowMs, sourceIdentity)
+            val lowPowerSince = confirmation.observedAtMs
             state = state.copy(
                 chargingActiveCandidate = null,
                 chargingActiveCandidateCount = 0,
@@ -1107,13 +1202,31 @@ class TelegramEventEngine(
                 chargingEvidenceSource = evidence.source.key,
                 chargingLowPowerSinceMs = lowPowerSince
             )
-            if (nowMs - lowPowerSince < CHARGING_LOW_POWER_CONFIRM_MS) return false
-            state = state.copy(chargingActive = false, chargingLowPowerSinceMs = null)
+            if (!due(confirmation)) return false
+            cancelDeadline("low_power")
+            state = state.copy(chargingActive = false, chargingLowPowerSinceMs = null,
+                detectorTiming = state.detectorTiming.copy(pendingStopAtMs = lowPowerSince))
             return true
         }
 
+        cancelDeadline("low_power")
         state = state.copy(chargingLowPowerSinceMs = null)
+        if (state.chargingActive == null) {
+            // A first usable snapshot establishes the baseline, not a historical edge.
+            cancelDeadline("charging")
+            state = state.copy(chargingActive = evidence.active, chargingEvidenceSource = evidence.source.key,
+                chargingActiveCandidate = null, chargingActiveCandidateCount = 0, chargingActiveCandidateSource = null)
+            if (evidence.active && state.chargingSessionId == null) {
+                startChargingSession(nowMs, soc, remainingEnergy, config.chargeStepPercent,
+                    fullAlreadySent = state.fullSent && soc?.let { it >= FULL_SOC_THRESHOLD } == true)
+            } else if (!evidence.active && state.chargingSessionId != null) {
+                state = state.copy(detectorTiming = state.detectorTiming.copy(pendingStopAtMs = nowMs))
+                return true
+            }
+            return false
+        }
         if (evidence.active == state.chargingActive) {
+            cancelDeadline("charging")
             if (evidence.active == false) clearTentativeChargingBaseline()
             state = state.copy(
                 chargingActiveCandidate = null,
@@ -1126,7 +1239,7 @@ class TelegramEventEngine(
         if (
             evidence.active &&
             state.chargingSessionId == null &&
-            (state.chargingActiveCandidate != true || state.chargingActiveCandidateSource != evidence.source.key)
+            state.chargingActiveCandidate != true
         ) {
             val baselineSoc = soc?.takeIf { it.isFinite() && it >= 0.0 }
             val baselineEnergy = remainingEnergy?.takeIf { it.isFinite() && it >= 0.0 }
@@ -1141,20 +1254,15 @@ class TelegramEventEngine(
         } else if (!evidence.active) {
             clearTentativeChargingBaseline()
         }
-        val count = if (
-            state.chargingActiveCandidate == evidence.active &&
-            state.chargingActiveCandidateSource == evidence.source.key
-        ) {
-            state.chargingActiveCandidateCount + 1
-        } else {
-            1
-        }
+        if (state.chargingActiveCandidate != evidence.active) cancelDeadline("charging")
+        val confirmation = deadline("charging", CONFIRMATION_MS, nowMs, sourceIdentity)
         state = state.copy(
             chargingActiveCandidate = evidence.active,
-            chargingActiveCandidateCount = count,
+            chargingActiveCandidateCount = 1,
             chargingActiveCandidateSource = evidence.source.key
         )
-        if (count < CONFIRMATION_SAMPLES) return false
+        if (!due(confirmation)) return false
+        cancelDeadline("charging")
         val previous = state.chargingActive
         state = state.copy(
             chargingActive = evidence.active,
@@ -1164,6 +1272,7 @@ class TelegramEventEngine(
             chargingEvidenceSource = evidence.source.key
         )
         if (evidence.active) {
+            state = state.copy(detectorTiming = state.detectorTiming.copy(pendingStopAtMs = null))
             if (state.chargingSessionId == null) {
                 startChargingSession(
                     nowMs,
@@ -1189,23 +1298,15 @@ class TelegramEventEngine(
                 addIfEnabled(
                     events, config, TelegramEventType.CHARGING_STARTED,
                     "${state.chargingSessionId}:started",
-                    chargingVariables(nowMs, soc, remainingEnergy, batteryChargePower, config.language),
-                    occurredAtMs = nowMs,
-                    sourceIdentity = sourceIdentity
+                    chargingVariables(confirmation.observedAtMs, soc, remainingEnergy, batteryChargePower, config.language),
+                    occurredAtMs = confirmation.observedAtMs,
+                    sourceIdentity = confirmation.sourceIdentity
                 )
             }
             return false
         }
-        if (
-            previous == null &&
-            state.chargingSessionId != null &&
-            evidence.source == ChargingEvidenceSource.BMS_FINISHED
-        ) {
-            return true
-        }
-        if (previous == null && state.chargingSessionId != null) {
-            finishChargingSession(full = false)
-        }
+        if (previous == true) state = state.copy(
+            detectorTiming = state.detectorTiming.copy(pendingStopAtMs = confirmation.observedAtMs))
         return previous == true
     }
 
@@ -1217,21 +1318,29 @@ class TelegramEventEngine(
         events: MutableList<TelegramDetectedEvent>,
         sourceIdentity: String? = null
     ) {
+        if (state.chargeGunConnected == null && raw != null) {
+            cancelDeadline("gun")
+            state = state.copy(chargeGunConnected = raw, chargeGunCandidate = null, chargeGunCandidateCount = 0)
+            return
+        }
         if (raw == null || raw == state.chargeGunConnected) {
+            cancelDeadline("gun")
             state = state.copy(chargeGunCandidate = null, chargeGunCandidateCount = 0)
             return
         }
-        val count = if (state.chargeGunCandidate == raw) state.chargeGunCandidateCount + 1 else 1
-        state = state.copy(chargeGunCandidate = raw, chargeGunCandidateCount = count)
-        if (count < CONFIRMATION_SAMPLES) return
+        if (state.chargeGunCandidate != raw) cancelDeadline("gun")
+        val confirmation = deadline("gun", CONFIRMATION_MS, nowMs, sourceIdentity)
+        state = state.copy(chargeGunCandidate = raw, chargeGunCandidateCount = 1)
+        if (!due(confirmation)) return
+        cancelDeadline("gun")
         state = state.copy(chargeGunConnected = raw, chargeGunCandidate = null, chargeGunCandidateCount = 0)
         val type = if (raw) TelegramEventType.CHARGE_GUN_CONNECTED else TelegramEventType.CHARGE_GUN_DISCONNECTED
         addIfEnabled(
             events, config, type,
-            "charge-gun:${diagnosticSha256(sourceIdentity ?: "time:$nowMs")}:${if (raw) 1 else 0}",
-            mapOf("soc" to formatNumber(soc), "time" to formatTime(nowMs)),
-            occurredAtMs = nowMs,
-            sourceIdentity = sourceIdentity
+            "charge-gun:${diagnosticSha256(confirmation.sourceIdentity ?: "time:${confirmation.observedAtMs}")}:${if (raw) 1 else 0}",
+            mapOf("soc" to formatNumber(soc), "time" to formatTime(confirmation.observedAtMs)),
+            occurredAtMs = confirmation.observedAtMs,
+            sourceIdentity = confirmation.sourceIdentity
         )
     }
 
@@ -1245,11 +1354,9 @@ class TelegramEventEngine(
         config: TelegramEventConfig
     ) {
         if (raw != null && raw != state.gear) {
-            val count = if (state.gearCandidate == raw) state.gearCandidateCount + 1 else 1
-            state = state.copy(gearCandidate = raw, gearCandidateCount = count)
-            if (count >= CONFIRMATION_SAMPLES) {
+            run {
                 val previous = state.gear
-                val initialGearRecovered = previous == null && state.awaitingInitialTripGear && state.tripId == null
+                val initialGearRecovered = previous == null && state.tripId == null
                 state = state.copy(
                     gear = raw, gearCandidate = null, gearCandidateCount = 0,
                     awaitingInitialTripGear = false
@@ -1257,10 +1364,7 @@ class TelegramEventEngine(
                 if (initialGearRecovered && raw != PARK) {
                     startTrip(nowMs, odometer, soc, tripEnergy, energyPoint)
                 } else if (previous == PARK && raw != PARK) {
-                    val parkedLongEnough = state.tripParkedSinceMs?.let {
-                        nowMs - it >= config.tripEndDelayMs
-                    } == true
-                    if (state.tripId == null || parkedLongEnough) {
+                    if (state.tripId == null) {
                         startTrip(nowMs, odometer, soc, tripEnergy, energyPoint)
                     } else {
                         clearPendingTrip()
@@ -1268,6 +1372,7 @@ class TelegramEventEngine(
                 }
                 if (raw == PARK && previous != PARK && state.tripId != null) {
                     state = state.copy(tripParkedSinceMs = nowMs, tripEndedAtMs = nowMs)
+                    deadline("park", config.tripEndDelayMs, nowMs)
                     updatePendingTripSnapshot(odometer, soc, tripEnergy, energyPoint)
                 }
                 if (raw != PARK && previous != PARK) clearPendingTrip()
@@ -1298,31 +1403,32 @@ class TelegramEventEngine(
         val sessionId = state.chargingSessionId ?: return false
         val currentSoc = soc ?: return false
         val fullNow = currentSoc >= FULL_SOC_THRESHOLD
-        val fullCount = if (fullNow) state.fullCandidateCount + 1 else 0
-        state = state.copy(fullCandidateCount = fullCount)
-        if (fullCount >= CONFIRMATION_SAMPLES) {
+        if (!fullNow) cancelDeadline("full")
+        val confirmation = if (fullNow) deadline("full", CONFIRMATION_MS, nowMs, sourceIdentity) else null
+        state = state.copy(fullCandidateCount = if (fullNow) 1 else 0)
+        if (confirmation != null && due(confirmation)) {
             if (!state.fullSent) {
                 if (TelegramEventType.CHARGED_TO_100 in config.enabledEvents) {
                     addIfEnabled(
                         events, config, TelegramEventType.CHARGED_TO_100, "$sessionId:full",
-                        chargingVariables(nowMs, soc, remainingEnergy, batteryChargePower, config.language) +
+                        chargingVariables(confirmation.observedAtMs, soc, remainingEnergy, batteryChargePower, config.language) +
                             mapOf("remaining_energy_kwh" to formatNumber(remainingEnergy), "range_km" to formatNumber(range)),
-                        occurredAtMs = nowMs,
-                        sourceIdentity = sourceIdentity
+                        occurredAtMs = confirmation.observedAtMs,
+                        sourceIdentity = confirmation.sourceIdentity
                     )
                 } else {
                     val eta = progressEta?.takeIf {
                         TelegramEventType.CHARGING_PROGRESS in config.enabledEvents
                     }?.invoke()
                     val variables = chargingProgressVariables(
-                        nowMs, soc, remainingEnergy, batteryChargePower, config.language, eta
+                        confirmation.observedAtMs, soc, remainingEnergy, batteryChargePower, config.language, eta
                     )
                     advanceChargingProgressBaseline(nowMs, soc, remainingEnergy)
                     addIfEnabled(
                         events, config, TelegramEventType.CHARGING_PROGRESS, "$sessionId:progress:100",
                         variables,
-                        occurredAtMs = nowMs,
-                        sourceIdentity = sourceIdentity,
+                        occurredAtMs = confirmation.observedAtMs,
+                        sourceIdentity = confirmation.sourceIdentity,
                         chargingEtaDiagnosticDetail = eta?.diagnosticDetail(soc, batteryChargePower)
                     )
                 }
@@ -1333,7 +1439,15 @@ class TelegramEventEngine(
         val step = config.chargeStepPercent.coerceIn(1, 99)
         var threshold = (floor(currentSoc / step) * step).toInt()
         if (threshold >= 100 && TelegramEventType.CHARGED_TO_100 in config.enabledEvents) threshold = 100 - step
-        val previousThreshold = state.lastProgressThreshold ?: return false
+        val previousThreshold = state.lastProgressThreshold ?: run {
+            state = state.copy(lastProgressThreshold = threshold,
+                chargingProgressBaselineSoc = currentSoc,
+                chargingProgressBaselineEnergyKwh = remainingEnergy,
+                chargingStepStartedAtMs = nowMs,
+                chargingStartSoc = state.chargingStartSoc ?: currentSoc,
+                chargingStartEnergyKwh = state.chargingStartEnergyKwh ?: remainingEnergy)
+            return false
+        }
         if (threshold <= previousThreshold) return false
         state = state.copy(lastProgressThreshold = threshold)
         val eta = progressEta?.takeIf {
@@ -1362,19 +1476,27 @@ class TelegramEventEngine(
     ) {
         val current = voltage ?: return
         if (current < config.lowVoltageThreshold) {
-            val since = state.lowVoltageSinceMs ?: nowMs
+            if (state.lowVoltageSent) {
+                cancelDeadline("low_12v")
+                return
+            }
+            val confirmation = deadline("low_12v", LOW_VOLTAGE_CONFIRM_MS, nowMs, sourceIdentity)
+            val since = confirmation.observedAtMs
             state = state.copy(lowVoltageSinceMs = since)
-            if (!state.lowVoltageSent && nowMs - since >= LOW_VOLTAGE_CONFIRM_MS) {
+            if (!state.lowVoltageSent && due(confirmation)) {
                 addIfEnabled(
                     events, config, TelegramEventType.LOW_12V_VOLTAGE, "low-12v:$since",
                     mapOf("battery_12v" to formatNumber(current), "time" to formatTime(nowMs)),
                     occurredAtMs = nowMs,
-                    sourceIdentity = sourceIdentity
+                    sourceIdentity = confirmation.sourceIdentity
                 )
                 state = state.copy(lowVoltageSent = true)
+                cancelDeadline("low_12v")
             }
-        } else if (current >= config.lowVoltageThreshold + LOW_VOLTAGE_HYSTERESIS) {
-            state = state.copy(lowVoltageSinceMs = null, lowVoltageSent = false)
+        } else {
+            cancelDeadline("low_12v")
+            state = state.copy(lowVoltageSinceMs = null,
+                lowVoltageSent = state.lowVoltageSent && current < config.lowVoltageThreshold + LOW_VOLTAGE_HYSTERESIS)
         }
     }
 
@@ -1426,6 +1548,7 @@ class TelegramEventEngine(
 
     private fun finishChargingSession(full: Boolean) {
         clearChargingEtaHistory()
+        cancelDeadline("full", "low_power", "charging")
         state = state.copy(
             chargingSessionId = null,
             chargingStartedAtMs = null,
@@ -1436,7 +1559,8 @@ class TelegramEventEngine(
             chargingStepStartedAtMs = null,
             lastProgressThreshold = null,
             fullCandidateCount = 0,
-            fullSent = full
+            fullSent = full,
+            detectorTiming = state.detectorTiming.copy(pendingStopAtMs = null)
         )
     }
 
@@ -1448,7 +1572,7 @@ class TelegramEventEngine(
     ) {
         val parkedSince = state.tripParkedSinceMs ?: return
         val tripId = state.tripId ?: return
-        if (!ignoreDeadline && (state.gear != PARK || nowMs < parkedSince + config.tripEndDelayMs)) return
+        if (!ignoreDeadline && (state.gear != PARK || state.detectorTiming.pending["park"]?.let(::due) != true)) return
         val tripEndAtMs = state.tripEndedAtMs ?: parkedSince
         val tripStartOdometer = state.tripStartOdometerKm
         val tripEndOdometer = state.tripEndOdometerKm
@@ -1550,6 +1674,7 @@ class TelegramEventEngine(
     }
 
     private fun clearPendingTrip() {
+        cancelDeadline("park")
         state = state.copy(
             tripParkedSinceMs = null,
             tripEndedAtMs = null,
@@ -1561,6 +1686,7 @@ class TelegramEventEngine(
     }
 
     private fun clearTrip() {
+        cancelDeadline("park")
         state = state.copy(
             tripId = null,
             tripPowerSessionId = null,
@@ -1749,6 +1875,10 @@ class TelegramEventEngine(
         if (!allowInactive && snapshot?.active != true && !belongsToActiveLeg) return null
 
         val previous = state.powerEnergyPoint
+        if (previous != null && previous.powerSessionId != point.powerSessionId && state.tripId == null) {
+            clearPowerSessionTotals()
+            clearPendingPowerOffLocation()
+        }
         if (previous != null && previous.powerSessionId == point.powerSessionId) {
             if (previous.snapshotId == point.snapshotId) return previous
             if (previous.sourceBootId == point.sourceBootId && point.sourceElapsedMs <= previous.sourceElapsedMs) {
@@ -1821,7 +1951,10 @@ class TelegramEventEngine(
                 sourceIdentityHash = sourceIdentity?.let(::diagnosticSha256),
                 chargingEtaDiagnosticDetail = chargingEtaDiagnosticDetail
             )
-            if (fullTripSummary) state = state.copy(tripSummaryCreatedInPowerSession = true)
+            if (fullTripSummary) state = state.copy(tripSummaryCreatedInPowerSession = true,
+                detectorTiming = state.detectorTiming.copy(reportedPowerSessionId =
+                    state.tripPowerSessionId ?: state.powerEnergyPoint?.powerSessionId
+                        ?: state.detectorTiming.reportedPowerSessionId))
         }
     }
 
@@ -1838,14 +1971,13 @@ class TelegramEventEngine(
             state = state,
             events = events,
             shouldPersist = persist,
-            nextWakeAtMs = pendingTripDeadline(config),
+            nextWakeAtMs = nextDetectorDeadlineAtMs(),
             locationEligibilityReason = locationEligibilityReason
         )
     }
 
-    private fun pendingTripDeadline(config: TelegramEventConfig): Long? {
-        if (state.tripId == null || state.gear != PARK) return null
-        return state.tripParkedSinceMs?.plus(config.tripEndDelayMs)
+    fun nextDetectorDeadlineAtMs(): Long? = state.detectorTiming.let { timing ->
+        timing.pending.values.minOfOrNull { timing.evaluatedWallMs + (it.elapsedMs - timing.evaluatedElapsedMs).coerceAtLeast(0L) }
     }
 
     private fun Map<String, NormalizedObservation>.number(key: String): Double? = get(key)?.value?.number
@@ -1854,7 +1986,7 @@ class TelegramEventEngine(
 
     companion object {
         private const val PARK = "P"
-        private const val CONFIRMATION_SAMPLES = 2
+        private const val CONFIRMATION_MS = 1_000L
         private const val FULL_SOC_THRESHOLD = 99.5
         private const val CHARGING_POWER_THRESHOLD_KW = 0.5
         private const val CHARGING_LOW_POWER_CONFIRM_MS = 60_000L

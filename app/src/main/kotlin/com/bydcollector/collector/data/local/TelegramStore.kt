@@ -35,7 +35,13 @@ class TelegramStore(
                 db.setTransactionSuccessful()
                 return emptyList()
             }
-            val results = messages.map { enqueueTelegramMessage(db, it, nowMs, protectedTelegramIds) }
+            val results = messages.map { enqueueTelegramMessage(db, it, nowMs) }.toMutableList()
+            val protectedIds = protectedTelegramIds + readActiveTelegramDeliveryAttempt(db)?.outboxId?.let(::setOf).orEmpty()
+            if (results.isNotEmpty()) {
+                val repaired = repairTelegramDependencies(db, protectedIds)
+                val removed = trimTelegramGroups(db, protectedIds)
+                results[results.lastIndex] = results.last().copy(overflowCount = removed, orphanCount = repaired.second)
+            }
             stateJson?.let { saveTelegramRuntimeState(db, it, nowMs) }
             if (completionSequence != null) {
                 db.delete("telegram_trip_completion_receipt", "id = 1", emptyArray())
@@ -69,15 +75,11 @@ class TelegramStore(
     private fun enqueueTelegramMessage(
         db: SQLiteDatabase,
         message: TelegramOutboxMessage,
-        nowMs: Long,
-        protectedTelegramIds: Set<Long>
+        nowMs: Long
     ): TelegramEnqueueResult {
         require(message.dedupeKey.isNotBlank()) { "Telegram dedupe key must not be blank" }
         require(message.eventType.isNotBlank()) { "Telegram event type must not be blank" }
         require(message.payload.isNotBlank()) { "Telegram payload must not be blank" }
-        val protectedIds = protectedTelegramIds +
-            readActiveTelegramDeliveryAttempt(db)?.outboxId?.let(::setOf).orEmpty()
-        val (protectedClause, protectedArgs) = protectedIdFilter(protectedIds)
         pruneDeliveryReceipts(db, nowMs)
         telegramDeliveryReceipt(db, message.dedupeKey)?.let { receipt ->
             check(receipt.eventType == message.eventType) {
@@ -90,17 +92,6 @@ class TelegramStore(
         }
         val waitsForSummaryKey = message.waitsForSummaryKey?.takeUnless {
             telegramDeliveryReceipt(db, it) != null
-        }
-        val pending = db.rawQuery("SELECT COUNT(*) FROM telegram_outbox", emptyArray()).use { cursor ->
-            if (cursor.moveToFirst()) cursor.getLong(0) else 0L
-        }
-        val overflow = (pending - TelegramDatabaseHelper.MAX_PENDING + 1L).coerceAtLeast(0L).toInt()
-        if (overflow > 0) {
-            db.delete(
-                "telegram_outbox",
-                "id IN (SELECT id FROM telegram_outbox WHERE 1 = 1$protectedClause ORDER BY id LIMIT ?)",
-                protectedArgs + overflow.toString()
-            )
         }
         val inserted = db.insertWithOnConflict(
             "telegram_outbox",
@@ -116,7 +107,57 @@ class TelegramStore(
             },
             SQLiteDatabase.CONFLICT_IGNORE
         ) != -1L
-        return TelegramEnqueueResult(inserted, 0, overflow)
+        return TelegramEnqueueResult(inserted, 0, 0)
+    }
+
+    /** One-level summary/location groups are retained or evicted together. */
+    private fun trimTelegramGroups(db: SQLiteDatabase, protectedIds: Set<Long>): Int {
+        require(protectedIds.all { it > 0L })
+        var pending = db.rawQuery("SELECT COUNT(*) FROM telegram_outbox", emptyArray()).use {
+            it.moveToFirst(); it.getLong(0)
+        }
+        var removed = 0
+        val protected = if (protectedIds.isEmpty()) "0" else "id IN (${protectedIds.joinToString(",")})"
+        while (pending > TelegramDatabaseHelper.MAX_PENDING) {
+            val root = db.rawQuery("SELECT COALESCE(waits_for_summary_key, dedupe_key) AS root " +
+                "FROM telegram_outbox GROUP BY root HAVING SUM(CASE WHEN $protected THEN 1 ELSE 0 END) = 0 " +
+                "ORDER BY MIN(id) LIMIT 1", emptyArray()).use { if (it.moveToFirst()) it.getString(0) else null } ?: break
+            val count = db.delete("telegram_outbox", "dedupe_key = ? OR waits_for_summary_key = ?", arrayOf(root, root))
+            check(count > 0) { "Telegram retention selected an empty dependency group" }
+            pending -= count
+            removed += count
+        }
+        return removed
+    }
+
+    fun repairTelegramDependencies(protectedIds: Set<Long> = emptySet()): Pair<Int, Int> {
+        val db = helper.writableDatabase
+        db.beginTransaction()
+        try {
+            val result = repairTelegramDependencies(db,
+                protectedIds + readActiveTelegramDeliveryAttempt(db)?.outboxId?.let(::setOf).orEmpty())
+            db.setTransactionSuccessful()
+            return result
+        } finally { db.endTransaction() }
+    }
+
+    private fun repairTelegramDependencies(db: SQLiteDatabase, protectedIds: Set<Long>): Pair<Int, Int> {
+        var released = 0
+        var removed = 0
+        val missing = db.rawQuery("SELECT c.id, c.waits_for_summary_key FROM telegram_outbox c " +
+            "WHERE c.waits_for_summary_key IS NOT NULL AND NOT EXISTS " +
+            "(SELECT 1 FROM telegram_outbox p WHERE p.dedupe_key = c.waits_for_summary_key)", emptyArray()).use { cursor ->
+            buildList { while (cursor.moveToNext()) add(cursor.getLong(0) to cursor.getString(1)) }
+        }
+        for ((id, parent) in missing) {
+            if (telegramDeliveryReceipt(db, parent) != null) {
+                released += db.update("telegram_outbox", ContentValues().apply { putNull("waits_for_summary_key") },
+                    "id = ?", arrayOf(id.toString()))
+            } else if (id !in protectedIds) {
+                removed += db.delete("telegram_outbox", "id = ?", arrayOf(id.toString()))
+            }
+        }
+        return released to removed
     }
 
     fun oldestUnblockedTelegramMessage(eventType: String? = null): TelegramOutboxEntry? {

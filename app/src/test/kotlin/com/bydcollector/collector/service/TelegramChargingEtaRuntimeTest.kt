@@ -29,11 +29,11 @@ class TelegramChargingEtaRuntimeTest {
 
         var result = poll(engine, config, 0, 50.0)
         assertTrue(result.events.isEmpty())
-        result = poll(engine, config, 1, 50.0)
-        assertTrue(result.state.chargingSessionId == null)
-        result = poll(engine, config, 2, 50.0)
         val sessionId = assertNotNull(result.state.chargingSessionId)
-        assertTrue(result.chargingEtaStateDiagnosticDetail.orEmpty().contains("eta_reason=session_started"))
+        result = poll(engine, config, 1, 50.0)
+        assertEquals(sessionId, result.state.chargingSessionId)
+        result = poll(engine, config, 2, 50.0)
+        assertEquals(sessionId, result.state.chargingSessionId)
 
         for (sequence in 3L..14L) {
             result = poll(
@@ -202,9 +202,9 @@ class TelegramChargingEtaRuntimeTest {
             sequence = sequence
         )
         val readings = listOf(
-            floatReading("statistic_1014_1145045040_5", soc),
+            PollReading("statistic_1014_1145045040_5", soc.toInt().toString()),
             floatReading("power_battery_remain_electricity", 20.0),
-            floatReading("charging_charge_battery_volt", 400.0),
+            PollReading("charging_charge_battery_volt", "400"),
             floatReading("charging_charge_current", currentAmps),
             PollReading("charging_1009_876609586_5", gunType.toString(), gunType.toString()),
             PollReading("charging_1009_876609592_5", chargeType.toString(), chargeType.toString()),
@@ -229,7 +229,7 @@ class TelegramChargingEtaRuntimeTest {
 
     private fun floatReading(key: String, value: Double) = PollReading(
         rawKey = key,
-        rawValue = value.toString(),
+        rawValue = value.toFloat().toRawBits().toString(),
         descValue = value.toString()
     )
 

@@ -48,6 +48,8 @@ class TelegramCoordinator internal constructor(
     private val ecMeanKwhPer100Km: () -> Double? = { null }
 ) {
     private var engine = createEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
+    @Volatile var detectorDeadlineAtMs: Long? = engine.nextDetectorDeadlineAtMs()
+        private set
     private var enabledRuntimeStartedAtMs: Long? = null
     private var startupRecoveryPending = true
     private var lastTelemetryHealthDiagnostic: String? = null
@@ -128,8 +130,22 @@ class TelegramCoordinator internal constructor(
                 "bms_state=finished power_relation=gte_0_5_kw action=power_fallback"
             )
         }
-        return nextWakeAt(result.nextWakeAtMs, nextWakeAt(startupDeadline, pendingQueueDeadline()))
+        return nextWakeAt(futureDetectorDeadline(), nextWakeAt(startupDeadline, pendingQueueDeadline()))
     }
+
+    /** The caller consumes this timer in the same durable order as telemetry. */
+    fun evaluateDetectors(timestampMs: Long, bootId: String, elapsedMs: Long): Long? {
+        activateEnabledRuntime() ?: return null
+        val result = engine.onDetectorTimer(eventConfig(), timestampMs, bootId, elapsedMs, normalizer)
+        check(handle(result)) { "Telegram detector timer rendering failed; input remains pending" }
+        if (result.events.isNotEmpty()) eventStore.recordEvent(
+            "telegram_detector_deadline", "Telegram stable-state deadline completed",
+            "boot=$bootId elapsed_ms=$elapsedMs events=${result.events.joinToString(",") { it.type.key }}"
+        )
+        return nextWakeAt(futureDetectorDeadline(), pendingQueueDeadline())
+    }
+
+    private fun futureDetectorDeadline(): Long? = detectorDeadlineAtMs?.takeIf { it > nowMs() }
 
     /** Diagnostic writes never reset or disable the sender on failure. */
     internal fun bindTripDiagnosticParent(legId: String, powerSessionId: String) {
@@ -171,7 +187,7 @@ class TelegramCoordinator internal constructor(
             eventStore.recordEvent("telegram_telemetry_health", "Telemetry availability evidence", detail)
             lastTelemetryHealthDiagnostic = detail
         }
-        return nextWakeAt(result.nextWakeAtMs, nextWakeAt(startupDeadline, flushPending()))
+        return nextWakeAt(futureDetectorDeadline(), nextWakeAt(startupDeadline, flushPending()))
     }
 
     /** Accepts a durable Trips completion. The receipt and batch commit together. */
@@ -367,6 +383,7 @@ class TelegramCoordinator internal constructor(
         flushSourceDiagnostics(nowMs())
         delivery.resetSession()
         telegramStore.saveTelegramRuntimeState(engine.reset().toJson(), nowMs())
+        detectorDeadlineAtMs = engine.nextDetectorDeadlineAtMs()
         enabledRuntimeStartedAtMs = null
         startupRecoveryPending = true
     }
@@ -495,11 +512,13 @@ class TelegramCoordinator internal constructor(
 
     private fun recoverStartupLocally(energySnapshot: EnergySnapshot? = null, occurredAtMs: Long = nowMs()): TelegramEventResult? {
         if (!startupRecoveryPending) return null
-        val durableEnergySnapshot = energySnapshot ?: runCatching(currentEnergySnapshot).getOrNull()
-        val recovered = engine.recoverPendingTrip(eventConfig(), occurredAtMs, durableEnergySnapshot)
-        check(handle(recovered)) { "Telegram recovery batch could not be rendered atomically" }
+        val (released, removed) = telegramStore.repairTelegramDependencies(protectedTelegramIds())
+        if (released > 0 || removed > 0) eventStore.recordEvent(
+            "telegram_dependency_repaired", "Telegram summary dependencies repaired",
+            "released_by_receipt=$released removed_missing_parent=$removed")
+        // Detector state is already durable. Source replay must precede any parked deadline.
         startupRecoveryPending = false
-        return recovered
+        return null
     }
 
     private fun activateEnabledRuntime(): Long? {
@@ -517,6 +536,7 @@ class TelegramCoordinator internal constructor(
         val messages = renderTelegramBatch(result.events, ::render)
         if (messages == null) {
             engine = createEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
+            detectorDeadlineAtMs = engine.nextDetectorDeadlineAtMs()
             return false
         }
         val committedAt = nowMs()
@@ -532,8 +552,10 @@ class TelegramCoordinator internal constructor(
         } catch (error: Exception) {
             if (error is InterruptedException) throw error
             engine = createEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
+            detectorDeadlineAtMs = engine.nextDetectorDeadlineAtMs()
             throw error
         }
+        detectorDeadlineAtMs = engine.nextDetectorDeadlineAtMs()
         val eventsByDedupeKey = result.events.associateBy { it.dedupeKey }
         messages.zip(outcomes).forEach { (message, queued) ->
             if (queued.inserted) {
@@ -555,11 +577,11 @@ class TelegramCoordinator internal constructor(
                     )
                 )
             }
-            if (queued.expiredCount > 0 || queued.overflowCount > 0) {
+            if (queued.expiredCount > 0 || queued.overflowCount > 0 || queued.orphanCount > 0) {
                 eventStore.recordEvent(
                     "telegram_outbox_pruned",
                     "Telegram outbox retention removed messages",
-                    "expired=${queued.expiredCount} overflow=${queued.overflowCount}"
+                    "expired=${queued.expiredCount} overflow=${queued.overflowCount} orphan_missing_parent=${queued.orphanCount}"
                 )
             }
         }
@@ -727,6 +749,8 @@ class TelegramCoordinator internal constructor(
 internal fun recoverCompletionState(state: TelegramEventState, intent: TripCompletionIntent): TelegramEventState {
     if (state.tripId != null || state.pendingPowerOffLocationTripId != null) return state
     val trip = intent.session?.takeIf { it.movementObserved } ?: return state
+    // With no new observed leg, OFF must not rebuild an already reported power session.
+    if (state.detectorTiming.reportedPowerSessionId == trip.tripId) return state
     val tripStartedAtMs = TripTime.instant(trip.startedAt)?.toEpochMilli()
     val tripEndedAtMs = trip.endedAt?.let { TripTime.instant(it)?.toEpochMilli() }
     return state.copy(

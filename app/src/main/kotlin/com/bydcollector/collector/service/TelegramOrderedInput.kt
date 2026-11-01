@@ -117,6 +117,14 @@ internal data class TelegramOrderedPollInput(
 
     fun hasFresh(fieldKey: String): Boolean = sourceKeys(fieldKey).any { it in freshSourceKeys && cursors[it]?.valid == true }
 
+    fun hasAccepted(fieldKey: String): Boolean = sourceKeys(fieldKey).any {
+        it in acceptedSourceKeys && cursors[it]?.valid == true
+    }
+
+    fun hasValid(fieldKey: String, bootId: String?): Boolean = sourceKeys(fieldKey).let { keys ->
+        keys.isNotEmpty() && keys.all { cursors[it]?.let { c -> c.valid && c.stamp.bootId == bootId } == true }
+    }
+
     fun hasFreshSource(fieldKey: String): Boolean = hasFresh(fieldKey)
 
     fun hasSingleBoot(fieldKey: String): Boolean {

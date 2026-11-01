@@ -203,7 +203,11 @@ object TelegramHelperProtocol {
         operation: String,
         request: TelegramSendMessage? = null
     ): String {
-        var detail = error.diagnosticDetail("stage=$operation")
+        return redactDiagnostic(error.diagnosticDetail("stage=$operation"), request)
+    }
+
+    fun redactDiagnostic(value: String, request: TelegramSendMessage? = null): String {
+        var detail = value
         val sensitiveValues = request?.let {
             listOf(it.botToken, it.chatId, it.text, URLEncoder.encode(it.chatId, "UTF-8"), URLEncoder.encode(it.text, "UTF-8"))
         }.orEmpty().filter(String::isNotEmpty).distinct().sortedByDescending(String::length)
