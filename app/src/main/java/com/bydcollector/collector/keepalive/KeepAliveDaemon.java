@@ -932,6 +932,10 @@ public final class KeepAliveDaemon {
         return !Boolean.TRUE.equals(enabled);
     }
 
+    static Context shellContext() throws Exception {
+        return radioManagers().shellContext;
+    }
+
     private static RadioManagers radioManagers() throws Exception {
         RadioManagers current = radioManagers;
         if (current != null) return current;

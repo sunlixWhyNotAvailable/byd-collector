@@ -11,6 +11,8 @@ import java.util.UUID;
 final class CellularApnRecovery implements AutoCloseable {
     private static final long CHECK_BUDGET_MS = 5_000L;
     private final Object lock = new Object();
+    private final CellularApnSchedule schedule = new CellularApnSchedule();
+    private final CellularNetworkObserver networks = new CellularNetworkObserver(this::networkLost, this::log);
     private final String generation = UUID.randomUUID().toString();
     private final Thread monitor = new Thread(this::monitor, "byd-apn2-monitor");
     private final FileObserver powerObserver = new FileObserver(VehiclePowerSignal.DIRECTORY,
@@ -25,9 +27,8 @@ final class CellularApnRecovery implements AutoCloseable {
         }
     };
     private boolean stopping;
-    private int power = -1;
-    private long epoch, nextCheck;
-    private long attempts;
+    private long epoch;
+    private volatile long attempts;
     private final OwnedShellProcess child = new OwnedShellProcess();
     private final OemWakeDiscovery discovery;
     private String bootId = "unavailable";
@@ -40,16 +41,30 @@ final class CellularApnRecovery implements AutoCloseable {
                     StandardCharsets.UTF_8).trim();
         } catch (Exception error) { log("boot_id_error", KeepAliveDaemon.diagnosticDetail(error, "stage=boot_id")); }
         powerObserver.startWatching();
+        try {
+            if (Files.exists(Paths.get(VehiclePowerSignal.DIRECTORY, VehiclePowerSignal.NAME)))
+                powerChanged(VehiclePowerSignal.read(bootId));
+        } catch (Exception error) { log("power_signal_error", KeepAliveDaemon.diagnosticDetail(error, "stage=initial_power_signal")); }
         monitor.setDaemon(true);
         monitor.start();
+        networks.start();
+    }
+
+    private void networkLost(int reason, String detail) {
+        synchronized (lock) {
+            if (stopping) return;
+            String before = schedule.describe(SystemClock.elapsedRealtime());
+            boolean scheduled = schedule.networkLost(reason);
+            log("network_lost", "trigger=" + CellularApnSchedule.reason(reason) + " scheduled=" + scheduled
+                    + " " + detail + " " + before);
+            if (scheduled) lock.notifyAll();
+        }
     }
 
     private void powerChanged(int value) {
         synchronized (lock) {
-            if (stopping || power == value) return;
-            power = value;
+            if (stopping || !schedule.powerChanged(value, SystemClock.elapsedRealtime())) return;
             epoch++;
-            nextCheck = 0L;
             // Let a bounded OFF call persist its result before the ON cleanup checks ownership.
             if (value <= 0) child.cancel();
             log("power_transition", "power=" + value + " epoch=" + epoch + " source=telemetry_callback");
@@ -58,25 +73,28 @@ final class CellularApnRecovery implements AutoCloseable {
     }
 
     private void monitor() {
-        log("monitor_started", "off_interval_ms=" + KeepAliveProtocol.LOOP_INTERVAL_MS);
+        log("monitor_started", "off_fast_interval_ms=5000 off_fast_window_ms=30000 off_interval_ms=30000");
         try {
             while (true) {
                 long checkEpoch;
+                int trigger;
                 synchronized (lock) {
-                    while (!stopping && nextCheck > SystemClock.elapsedRealtime()) {
-                        if (nextCheck == Long.MAX_VALUE) lock.wait();
-                        else lock.wait(Math.max(1L, nextCheck - SystemClock.elapsedRealtime()));
+                    while (!stopping && schedule.dueAt() > SystemClock.elapsedRealtime()) {
+                        if (schedule.dueAt() == Long.MAX_VALUE) lock.wait();
+                        else lock.wait(Math.max(1L, schedule.dueAt() - SystemClock.elapsedRealtime()));
                     }
                     if (stopping) return;
+                    trigger = schedule.beginCheck(SystemClock.elapsedRealtime());
+                    if (trigger == 0) continue;
                     checkEpoch = epoch;
+                    log("check_started", "epoch=" + checkEpoch + " trigger=" + CellularApnSchedule.reason(trigger)
+                            + " " + schedule.describe(SystemClock.elapsedRealtime()));
                 }
                 try { runCheck(checkEpoch); }
                 catch (InterruptedException error) { throw error; }
                 catch (Exception error) { log("check_error", KeepAliveDaemon.diagnosticDetail(error, "stage=check_process")); }
                 synchronized (lock) {
-                    if (epoch == checkEpoch) nextCheck = power > 0 &&
-                            !Files.exists(BacklightRecoveryState.PATH) ? Long.MAX_VALUE
-                            : SystemClock.elapsedRealtime() + KeepAliveProtocol.LOOP_INTERVAL_MS;
+                    schedule.finishCheck(SystemClock.elapsedRealtime(), Files.exists(BacklightRecoveryState.PATH));
                 }
             }
         } catch (InterruptedException error) { Thread.currentThread().interrupt(); }
@@ -109,7 +127,7 @@ final class CellularApnRecovery implements AutoCloseable {
             synchronized (lock) {
                 if (line.startsWith("APN2 wake_attempt ")) attempts++;
                 if (!stopping && epoch == checkEpoch && line.matches("APN2 power [0-4]"))
-                    power = line.endsWith(" 0") ? 0 : 1;
+                    schedule.observePower(line.endsWith(" 0") ? 0 : 1, SystemClock.elapsedRealtime());
                 log("check_output", "epoch=" + checkEpoch + " " + line);
             }
         }
@@ -123,10 +141,12 @@ final class CellularApnRecovery implements AutoCloseable {
         powerObserver.stopWatching();
         synchronized (lock) {
             stopping = true;
+            schedule.stop();
             epoch++;
             child.cancel();
             lock.notifyAll();
         }
         monitor.interrupt();
+        networks.close();
     }
 }
