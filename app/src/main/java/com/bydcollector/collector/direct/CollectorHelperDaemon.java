@@ -1759,8 +1759,7 @@ public final class CollectorHelperDaemon {
             }
             return new OwnerLock(file, channel, lock);
         } catch (Exception error) {
-            System.err.println("WARN: helper lock unavailable: " + error.getMessage());
-            return new OwnerLock(null, null, null);
+            throw new IllegalStateException("helper owner lock unavailable: " + CollectorHelperProtocol.LOCK_PATH, error);
         }
     }
 

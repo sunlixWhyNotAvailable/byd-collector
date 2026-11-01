@@ -77,22 +77,35 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
 
     private fun readOwnerMode(stopOnly: Boolean): DirectHelperOwnerMode? = synchronized(lock) {
         val binder = ensureBinder() ?: return@synchronized null
+        readOwnerMode(binder, stopOnly)
+    }
+
+    private fun readOwnerMode(binder: IBinder, stopOnly: Boolean, preserveFailure: Boolean = false): DirectHelperOwnerMode? {
         val data = Parcel.obtain()
         val reply = Parcel.obtain()
         try {
             data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
             if (!binder.transact(CollectorHelperProtocol.TX_PING, data, reply, 0)) {
                 cached = null
-                return@synchronized null
+                check(!preserveFailure) { "old helper ping transact returned false" }
+                return null
             }
-            if (reply.dataAvail() < 12) return@synchronized null
+            if (reply.dataAvail() < 12) {
+                check(!preserveFailure) { "old helper ping reply truncated: ${reply.dataAvail()} bytes" }
+                return null
+            }
             val status = reply.readInt()
             val protocolVersion = reply.readInt()
             val ownerMode = reply.readInt()
-            ownerFromPing(status, protocolVersion, ownerMode, stopOnly)
-        } catch (_: Exception) {
+            val owner = ownerFromPing(status, protocolVersion, ownerMode, stopOnly)
+            check(!preserveFailure || owner != null) {
+                "old helper ping rejected: status=$status protocol=$protocolVersion mode=$ownerMode"
+            }
+            return owner
+        } catch (error: Exception) {
             cached = null
-            null
+            if (preserveFailure) throw error
+            return null
         } finally {
             data.recycle()
             reply.recycle()
@@ -1092,36 +1105,52 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
         return synchronized(lock) {
             val binder = ensureBinder()
                 ?: return@synchronized stopFailure(STATUS_NO_BINDER, "helper binder unavailable")
-            val data = Parcel.obtain()
-            val reply = Parcel.obtain()
-            try {
-                data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
-                data.writeInt(ownerMode.protocolValue)
-                if (!binder.transact(CollectorHelperProtocol.TX_STOP_OWNER, data, reply, 0)) {
-                    cached = null
-                    return@synchronized stopFailure(STATUS_TRANSACT_FALSE, "stop transact returned false")
-                }
-                val status = reply.readInt()
-                val acceptedMarker = reply.readInt()
-                require(acceptedMarker == 0 || acceptedMarker == 1) {
-                    "invalid stop accepted marker: $acceptedMarker"
-                }
-                val accepted = acceptedMarker == 1
-                require((status == CollectorHelperProtocol.STATUS_OK) == accepted) {
-                    "inconsistent stop reply: status=$status accepted=$acceptedMarker"
-                }
-                val result = DirectHelperStopResult(status, accepted, reply.readString())
-                if (result.ok) cached = null
-                result
-            } catch (error: DeadObjectException) {
+            requestStop(binder, ownerMode)
+        }
+    }
+
+    /** Keep the original Binder: a timed-out stop must never resolve the replacement's service. */
+    fun requestStopForReplacement(): DirectHelperStopResult = synchronized(lock) {
+        val binder = ensureBinder()
+            ?: return@synchronized stopFailure(STATUS_NO_BINDER, "helper binder unavailable")
+        val mode = readOwnerMode(binder, stopOnly = true, preserveFailure = true)
+            ?: return@synchronized stopFailure(STATUS_NO_BINDER, "old helper lifecycle handshake unavailable")
+        if (Thread.currentThread().isInterrupted) {
+            return@synchronized stopFailure(STATUS_CLIENT_ERROR, "old helper stop cancelled")
+        }
+        requestStop(binder, mode)
+    }
+
+    private fun requestStop(binder: IBinder, ownerMode: DirectHelperOwnerMode): DirectHelperStopResult {
+        val data = Parcel.obtain()
+        val reply = Parcel.obtain()
+        try {
+            data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
+            data.writeInt(ownerMode.protocolValue)
+            if (!binder.transact(CollectorHelperProtocol.TX_STOP_OWNER, data, reply, 0)) {
                 cached = null
-                stopFailure(STATUS_DEAD_OBJECT, error.message ?: "dead binder")
-            } catch (error: Exception) {
-                stopFailure(STATUS_CLIENT_ERROR, "${error::class.java.simpleName}: ${error.message ?: "no message"}")
-            } finally {
-                data.recycle()
-                reply.recycle()
+                return stopFailure(STATUS_TRANSACT_FALSE, "stop transact returned false")
             }
+            val status = reply.readInt()
+            val acceptedMarker = reply.readInt()
+            require(acceptedMarker == 0 || acceptedMarker == 1) {
+                "invalid stop accepted marker: $acceptedMarker"
+            }
+            val accepted = acceptedMarker == 1
+            require((status == CollectorHelperProtocol.STATUS_OK) == accepted) {
+                "inconsistent stop reply: status=$status accepted=$acceptedMarker"
+            }
+            val result = DirectHelperStopResult(status, accepted, reply.readString())
+            if (result.ok) cached = null
+            return result
+        } catch (error: DeadObjectException) {
+            cached = null
+            return stopFailure(STATUS_DEAD_OBJECT, error.diagnosticDetail())
+        } catch (error: Exception) {
+            return stopFailure(STATUS_CLIENT_ERROR, error.diagnosticDetail())
+        } finally {
+            data.recycle()
+            reply.recycle()
         }
     }
 

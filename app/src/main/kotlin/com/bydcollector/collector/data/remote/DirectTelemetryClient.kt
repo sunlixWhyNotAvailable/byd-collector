@@ -49,8 +49,9 @@ class DirectTelemetryClient(
         startedAt: Long,
         ownerMode: DirectHelperOwnerMode
     ): TelemetryReadResult.Failure? {
-        val helperAlive = helper.isAlive()
         val updatePending = helperPreferences.getBoolean(CollectorSettings.KEY_HELPER_REPLACEMENT_PENDING, false)
+        // An old Binder can be stuck; let the bounded replacement path run before probing it.
+        val helperAlive = !bridgeCheckPending.get() && !updatePending && helper.isAlive()
         if (!helperAlive || bridgeCheckPending.get() || updatePending) {
             val now = clock.elapsedRealtimeMs()
             //backs off helper launch failures because adb/app_process startup can block for seconds
