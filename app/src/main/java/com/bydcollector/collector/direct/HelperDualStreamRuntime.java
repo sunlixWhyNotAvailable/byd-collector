@@ -117,14 +117,16 @@ final class HelperDualStreamRuntime implements AutoCloseable {
             new ThreadPoolExecutor.AbortPolicy()
         );
         HelperCallbackController.Platform callbackPlatform;
+        AutoserviceConnection connection = scalarReader instanceof AutoserviceConnection
+            ? (AutoserviceConnection) scalarReader : null;
         try {
             Object manager = nativeReader instanceof CollectorHelperDaemon.NativeArrayReader
                 ? ((CollectorHelperDaemon.NativeArrayReader) nativeReader).manager() : null;
             callbackPlatform = manager == null
-                ? new HelperCallbackController.Platform()
-                : new HelperCallbackController.Platform(manager, vendor);
+                ? new HelperCallbackController.Platform(connection, vendor)
+                : new HelperCallbackController.Platform(manager, vendor, connection);
         } catch (Throwable error) {
-            callbackPlatform = new HelperCallbackController.Platform();
+            callbackPlatform = new HelperCallbackController.Platform(connection, vendor);
             noteError("callback platform unavailable: " + describe(error));
         }
         this.callbacks = new HelperCallbackController(bootId, helperGeneration, mainRows, secondaryRows,
@@ -150,6 +152,9 @@ final class HelperDualStreamRuntime implements AutoCloseable {
                 @Override public void noteError(String message) { HelperDualStreamRuntime.this.noteError(message); }
                 @Override public void noteContext(String event, String message) { diagnostics.context(event, message); }
             });
+        if (scalarReader instanceof AutoserviceConnection) {
+            callbacks.attachAutoservice((AutoserviceConnection) scalarReader);
+        }
     }
 
     void start() {
@@ -729,6 +734,7 @@ final class HelperDualStreamRuntime implements AutoCloseable {
 
     private void stopNewWork() {
         closed = true;
+        if (scalarReader instanceof AutoserviceConnection) ((AutoserviceConnection) scalarReader).close();
         ownerHandler.removeCallbacks(tick);
         synchronized (monitor) { monitor.notifyAll(); }
     }

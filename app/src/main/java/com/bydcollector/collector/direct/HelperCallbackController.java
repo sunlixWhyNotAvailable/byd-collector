@@ -126,6 +126,9 @@ final class HelperCallbackController implements AutoCloseable {
     private volatile boolean streamWorkersShutdown;
     private volatile boolean streamWorkersTerminated;
     private volatile boolean restartListener;
+    private volatile AutoserviceConnection autoservice;
+    private long handledTransportLoss;
+    private long registeredTransportEpisode;
     private volatile String retryReason;
     private KpiSubscriber kpiSubscriber;
     private long nextKpiSubscriptionId;
@@ -225,10 +228,10 @@ final class HelperCallbackController implements AutoCloseable {
                 return thread;
             }, new ThreadPoolExecutor.AbortPolicy());
         platform.setListener(new Listener() {
-            @Override public void changed(int dev, int fid, int type, int rawBits, byte[] bytes) {
-                onCallback(dev, fid, type, rawBits, bytes);
+            @Override public void changed(int dev, int fid, int type, int rawBits, byte[] bytes, long binding) {
+                onCallback(dev, fid, type, rawBits, bytes, binding);
             }
-            @Override public void error(int code, String message) { onListenerError(code, message); }
+            @Override public void error(int code, String message, long binding) { onListenerError(code, message, binding); }
         });
     }
 
@@ -359,9 +362,14 @@ final class HelperCallbackController implements AutoCloseable {
                 if (!current) continue;
 
                 CollectorHelperDaemon.ReadValue actual = result.values[index];
+                if (actual != null && !actual.attempted) {
+                    state.nextDueElapsedMs = Long.MAX_VALUE;
+                    continue;
+                }
                 String quality = actual != null && actual.status == CollectorHelperProtocol.STATUS_OK && actual.raw != null
                     ? kpiQuality(row, expectedNativeType(row), actual.raw, null) : "read_error";
                 if (quality == null) {
+                    if (autoservice != null) autoservice.noteData("kpi_seed");
                     long elapsed = Math.max(0L, completedElapsedMs);
                     KpiValue previous = kpiMailbox.get(row);
                     if (previous != null && elapsed < previous.observedElapsedMs) continue;
@@ -553,11 +561,6 @@ final class HelperCallbackController implements AutoCloseable {
                     SECONDARY_POLL_SOURCES.contains(row)
                         ? "secondary_poll_exception" : state.nextSeedReason;
                 getReasons.put(row, reason);
-                if ("initial_seed".equals(reason)) initialSeedGetAttempts = saturatedIncrement(initialSeedGetAttempts);
-                else if ("source_recovery".equals(reason)) sourceRecoveryGetAttempts = saturatedIncrement(sourceRecoveryGetAttempts);
-                else if ("secondary_poll_exception".equals(reason)) {
-                    secondaryExceptionGetAttempts = saturatedIncrement(secondaryExceptionGetAttempts);
-                }
             }
         }
         CollectorHelperDaemon.BatchResult polled;
@@ -580,7 +583,8 @@ final class HelperCallbackController implements AutoCloseable {
         }
         long readCompletedElapsedMs = nowElapsed();
         long readCompletedWallMs = wallClock.getAsLong();
-        CollectorHelperDaemon.ReadValue[] lineagedValues = new CollectorHelperDaemon.ReadValue[polled.values.length];
+        List<CollectorHelperDaemon.ReadValue> lineagedValues = new ArrayList<>();
+        List<Integer> attemptedIndexes = new ArrayList<>();
         List<TelemetryCallbackBatch> displaced = new ArrayList<>();
         synchronized (lock) {
             long readIdSequence = readIdentitySequence[stream]++;
@@ -591,6 +595,17 @@ final class HelperCallbackController implements AutoCloseable {
                 AcquisitionState state = acquisition(stream).get(row);
                 CallbackValueSource current = sources(stream).get(row);
                 CollectorHelperDaemon.ReadValue actual = polled.values[resultIndex];
+                if (!actual.attempted) {
+                    state.nextDueElapsedMs = Long.MAX_VALUE;
+                    scheduleAddress(stream, row, Long.MAX_VALUE);
+                    continue;
+                }
+                String reason = getReasons.get(row);
+                if ("initial_seed".equals(reason)) initialSeedGetAttempts = saturatedIncrement(initialSeedGetAttempts);
+                else if ("source_recovery".equals(reason)) sourceRecoveryGetAttempts = saturatedIncrement(sourceRecoveryGetAttempts);
+                else if ("secondary_poll_exception".equals(reason)) {
+                    secondaryExceptionGetAttempts = saturatedIncrement(secondaryExceptionGetAttempts);
+                }
                 long watermarkStart = callbackWatermarkBefore.getOrDefault(row, -1L);
                 long watermarkEnd = callbackWatermarks(stream).getOrDefault(row, -1L);
                 boolean supersededByCallback = watermarkEnd > watermarkStart;
@@ -608,8 +623,9 @@ final class HelperCallbackController implements AutoCloseable {
                 String valueError = nativeSuccess && !usable
                     ? "typed or sentinel telemetry value rejected: raw=0x" +
                         Integer.toUnsignedString(actual.raw, 16) : actual.error;
-                lineagedValues[resultIndex] = new CollectorHelperDaemon.ReadValue(
-                    valueStatus, actual.raw, valueError, null, lineage);
+                lineagedValues.add(new CollectorHelperDaemon.ReadValue(
+                    valueStatus, actual.raw, valueError, null, lineage));
+                attemptedIndexes.add(indexes.get(resultIndex));
                 boolean registrationAccepted = platform.accepts(new NativeKey(row.dev, row.fid));
                 boolean periodicException = "secondary_poll_exception".equals(getReasons.get(row));
                 boolean sourceEpochCurrent = capturedSourceEpoch == sourceEpoch[stream];
@@ -625,6 +641,7 @@ final class HelperCallbackController implements AutoCloseable {
                     }
                     else scheduleAfterAvailable(stream, row, state, readCompletedElapsedMs);
                 } else if (usable && registrationAccepted && sourceEpochCurrent && listenerCurrent) {
+                    if (autoservice != null) autoservice.noteData("stream_" + stream + "_seed");
                     if (!state.sourceAvailable) enqueueGetAvailableLocked(
                         stream, row, lineage, readCompletedWallMs, readCompletedElapsedMs, displaced);
                     state.sourceAvailable = true;
@@ -669,13 +686,16 @@ final class HelperCallbackController implements AutoCloseable {
             for (TelemetryCallbackBatch batch : displaced) submitBatch(batch);
         }
         long replyNow = nowElapsed();
-        int[] requestedIndices = new int[indexes.size()];
-        for (int i = 0; i < indexes.size(); i++) requestedIndices[i] = indexes.get(i);
+        int[] requestedIndices = new int[attemptedIndexes.size()];
+        for (int i = 0; i < attemptedIndexes.size(); i++) requestedIndices[i] = attemptedIndexes.get(i);
         if (nextDue == Long.MAX_VALUE) nextDue = saturatedAdd(replyNow, IDLE_CONTROL_WAKE_MS);
-        return new CollectorHelperDaemon.BatchResult(polled.batchStatus, polled.mode, polled.nativeAvailable,
+        boolean noWork = lineagedValues.isEmpty();
+        return new CollectorHelperDaemon.BatchResult(polled.batchStatus,
+            noWork ? CollectorHelperProtocol.MODE_NO_WORK : polled.mode, polled.nativeAvailable,
             polled.nativeGroupCount, polled.fallbackGroupCount, polled.fallbackReadCount,
-            polled.groupFailureCount, polled.elapsedMs, lineagedValues, requestedIndices,
-            false, positiveDelay(replyNow, nextDue), polled.error);
+            polled.groupFailureCount, polled.elapsedMs,
+            lineagedValues.toArray(new CollectorHelperDaemon.ReadValue[0]), requestedIndices,
+            noWork, positiveDelay(replyNow, nextDue), polled.error);
     }
 
     private void rescheduleFailedPoll(
@@ -884,14 +904,14 @@ final class HelperCallbackController implements AutoCloseable {
     }
 
     private void captureKpi(int dev, int fid, int type, int rawBits, byte[] bytes,
-                            long wall, long elapsed) {
+                            long wall, long elapsed, long binding) {
         NativeKey key = new NativeKey(dev, fid);
         if (!kpiKeys.contains(key)) return;
         boolean captured = false;
         boolean registrationChanged = false;
         Boolean confirmedPower = null;
         synchronized (kpiLock) {
-            if (closed) return;
+            if (closed || !currentBinding(binding)) return;
             List<CollectorHelperDaemon.Address> rows = kpiRowsByNative.get(key);
             if (rows == null) return;
             for (CollectorHelperDaemon.Address row : rows) {
@@ -1352,17 +1372,25 @@ final class HelperCallbackController implements AutoCloseable {
             ? mainKeys.contains(key) : secondaryKeys.contains(key);
     }
 
-    private void onCallback(int dev, int fid, int type, int rawBits, byte[] bytes) {
+    private boolean currentBinding(long identity) {
+        AutoserviceConnection connection = autoservice;
+        return connection == null || (connection.available() && connection.bindingIdentity() == identity);
+    }
+
+    private void onCallback(int dev, int fid, int type, int rawBits, byte[] bytes, long binding) {
         long wall = wallClock.getAsLong();
         long elapsed = nowElapsed();
-        captureKpi(dev, fid, type, rawBits, bytes, wall, elapsed);
+        captureKpi(dev, fid, type, rawBits, bytes, wall, elapsed, binding);
         synchronized (lock) {
-            if (closed) return;
+            if (closed || !currentBinding(binding)) return;
             callbacksReceived++;
             NativeKey key = new NativeKey(dev, fid);
             String quality = scalarUsable(key, type, rawBits) ? "callback" :
                 type == TelemetryCallbackBatch.TYPE_FLOAT && !Float.isFinite(Float.intBitsToFloat(rawBits))
                     ? "non_finite" : scalarTypeMatches(key, type) ? "invalid_sentinel" : "type_mismatch";
+            if ("callback".equals(quality) && platform.accepts(key) && autoservice != null) {
+                autoservice.noteData("callback");
+            }
             // Both independently stored streams need shared-key changes once periodic GET is gone.
             for (int stream = CollectorHelperProtocol.STREAM_MAIN;
                  stream <= CollectorHelperProtocol.STREAM_SECONDARY; stream++) {
@@ -1389,14 +1417,42 @@ final class HelperCallbackController implements AutoCloseable {
         }
     }
 
-    private void onListenerError(int code, String message) {
+    private void onListenerError(int code, String message, long binding) {
+        if (closed) return;
+        if (code == -1 && autoservice != null) {
+            autoservice.listenerDied(binding, message);
+            return;
+        }
+        if (!currentBinding(binding)) return;
+        listenerLost("BYDAuto listener error " + code + ": " + String.valueOf(message), false);
+    }
+
+    void attachAutoservice(AutoserviceConnection connection) {
+        autoservice = connection;
+        connection.setLossListener(() -> {
+            if (closed) return;
+            try {
+                registrationWorker.execute(() -> {
+                    if (closed || connection.episode() <= handledTransportLoss) return;
+                    handledTransportLoss = connection.episode();
+                    listenerLost(connection.failureDetail(), true);
+                });
+            } catch (java.util.concurrent.RejectedExecutionException error) {
+                if (!closed) {
+                    error.printStackTrace(System.err);
+                    host.noteError("autoservice recovery dispatch failed: " + describe(error));
+                }
+            }
+        });
+    }
+
+    private void listenerLost(String diagnostic, boolean transportLost) {
         if (closed) return;
         List<TelemetryCallbackBatch> displaced = new ArrayList<>();
         long wall = wallClock.getAsLong();
         long elapsed = nowElapsed();
         synchronized (lock) {
             callbackListenerGeneration = nextEpoch(callbackListenerGeneration);
-            String diagnostic = "BYDAuto listener error " + code + ": " + String.valueOf(message);
             sourceLossLocked(CollectorHelperProtocol.STREAM_MAIN, "native_listener_failure", diagnostic,
                 wall, elapsed, true, displaced);
             sourceLossLocked(CollectorHelperProtocol.STREAM_SECONDARY, "native_listener_failure", diagnostic,
@@ -1405,7 +1461,7 @@ final class HelperCallbackController implements AutoCloseable {
             markRegistrationUnavailable(CollectorHelperProtocol.STREAM_SECONDARY);
         }
         boolean kpiChanged = false;
-        String kpiDiagnostic = "BYDAuto listener error " + code + ": " + String.valueOf(message);
+        String kpiDiagnostic = diagnostic;
         synchronized (kpiLock) {
             boolean wasPowerOn = kpiPowerKnown && kpiPowerOn;
             for (CollectorHelperDaemon.Address row : kpiRows) {
@@ -1423,7 +1479,7 @@ final class HelperCallbackController implements AutoCloseable {
                 if (row.equals(kpiPowerRow)) {
                     state.seedAttempts = 0;
                     state.nextSeedReason = "source_recovery";
-                    state.nextDueElapsedMs = elapsed;
+                    state.nextDueElapsedMs = transportLost ? Long.MAX_VALUE : elapsed;
                 }
             }
             kpiPowerKnown = false;
@@ -1433,14 +1489,15 @@ final class HelperCallbackController implements AutoCloseable {
         }
         for (TelemetryCallbackBatch batch : displaced) submitBatch(batch);
         if (kpiChanged) scheduleKpiNotification();
-        try { streamWorkers[CollectorHelperProtocol.STREAM_MAIN].execute(() -> host.noteError(
-            "BYDAuto listener error " + code + ": " + String.valueOf(message))); }
-        catch (Throwable ignored) { }
-        noteKpiRegistration(CollectorHelperProtocol.KPI_LISTENER_FAILED,
-            "BYDAuto listener error " + code + ": " + String.valueOf(message));
+        try { streamWorkers[CollectorHelperProtocol.STREAM_MAIN].execute(() -> host.noteError(diagnostic)); }
+        catch (java.util.concurrent.RejectedExecutionException error) {
+            if (!closed) error.printStackTrace(System.err);
+        }
+        noteKpiRegistration(CollectorHelperProtocol.KPI_LISTENER_FAILED, diagnostic);
         restartListener = true;
-        retryReason = "listener_error_" + code;
-        scheduleRegistration(RETRY_MS[Math.min(retryIndex++, RETRY_MS.length - 1)], false);
+        retryReason = diagnostic;
+        if (transportLost) retryIndex = 0;
+        scheduleRegistration(transportLost ? 0L : RETRY_MS[Math.min(retryIndex++, RETRY_MS.length - 1)], transportLost);
     }
 
     private void scheduleFlushLocked(int stream, long delayMs) {
@@ -1547,7 +1604,7 @@ final class HelperCallbackController implements AutoCloseable {
     }
 
     void callbackForTest(int dev, int fid, int type, int rawBits, byte[] bytes) {
-        onCallback(dev, fid, type, rawBits, bytes);
+        onCallback(dev, fid, type, rawBits, bytes, -1L);
     }
 
     void flushForTest(int stream) {
@@ -1566,7 +1623,7 @@ final class HelperCallbackController implements AutoCloseable {
         }
     }
 
-    void listenerErrorForTest() { onListenerError(-1, "test"); }
+    void listenerErrorForTest() { onListenerError(-1, "test", -1L); }
 
     void maintenanceForTest() {
         maintenance(CollectorHelperProtocol.STREAM_MAIN);
@@ -1696,6 +1753,7 @@ final class HelperCallbackController implements AutoCloseable {
                 synchronized (registrationLock) { registrationFuture = null; }
                 try { reconcileRegistration(); }
                 catch (Throwable error) {
+                    error.printStackTrace(System.err);
                     retryReason = bound(describe(error), 512);
                     host.noteError("callback registration failed: " + describe(error));
                     updateKpiRegistrationStatus(error);
@@ -1706,6 +1764,9 @@ final class HelperCallbackController implements AutoCloseable {
     }
 
     private void reconcileRegistration() throws Throwable {
+        if (closed) return;
+        platform.restoreConnection();
+        if (closed) return;
         Set<NativeKey> target;
         synchronized (lock) {
             target = new LinkedHashSet<>();
@@ -1725,11 +1786,19 @@ final class HelperCallbackController implements AutoCloseable {
         } finally {
             refreshRegistrationState();
         }
+        if (autoservice != null && !autoservice.available()) {
+            throw new android.os.DeadObjectException(autoservice.failureDetail());
+        }
         if (platform.available() && platform.failedCount() > 0) {
             synchronized (lock) { retryReason = "native callback registration rejected one or more keys"; }
             scheduleRegistration(RETRY_MS[Math.min(retryIndex++, RETRY_MS.length - 1)], false);
         } else {
             synchronized (lock) { retryIndex = 0; retryReason = null; }
+            if (platform.available() && autoservice != null && autoservice.episode() > registeredTransportEpisode) {
+                registeredTransportEpisode = autoservice.episode();
+                host.noteContext("autoservice_subscriptions_restored", "episode=" + registeredTransportEpisode +
+                    " accepted=" + platform.acceptedCount() + " data_return_not_implied=true");
+            }
         }
         updateKpiRegistrationStatus(null);
     }
@@ -2154,14 +2223,15 @@ final class HelperCallbackController implements AutoCloseable {
     }
 
     interface Listener {
-        void changed(int dev, int fid, int type, int rawBits, byte[] bytes);
-        void error(int code, String message);
+        void changed(int dev, int fid, int type, int rawBits, byte[] bytes, long binding);
+        void error(int code, String message, long binding);
     }
 
     /** Reflection is isolated here so host tests can exercise registration without vendor classes. */
     static class Platform implements AutoCloseable {
         private final Object manager;
         private final HelperDualStreamRuntime.VendorReadScheduler vendor;
+        private final AutoserviceConnection connection;
         private final Method enable;
         private final Method disable;
         private final Method register;
@@ -2173,7 +2243,7 @@ final class HelperCallbackController implements AutoCloseable {
         private volatile Set<NativeKey> acceptedSnapshot = java.util.Collections.emptySet();
         private volatile Set<NativeKey> failedSnapshot = java.util.Collections.emptySet();
         private Listener sink;
-        private Object proxy;
+        private volatile Object proxy;
         private boolean registered;
         private boolean passFailed;
         private volatile int acceptedCount;
@@ -2181,7 +2251,13 @@ final class HelperCallbackController implements AutoCloseable {
         private volatile int targetCount;
 
         Platform(Object manager, HelperDualStreamRuntime.VendorReadScheduler vendor) throws Exception {
+            this(manager, vendor, null);
+        }
+
+        Platform(Object manager, HelperDualStreamRuntime.VendorReadScheduler vendor,
+                 AutoserviceConnection connection) throws Exception {
             this.manager = manager; this.vendor = vendor;
+            this.connection = connection;
             Class<?> managerType = Class.forName("android.hardware.BYDAutoManager");
             listenerType = Class.forName("android.hardware.BYDAutoManager$OnBYDAutoListener");
             enable = managerType.getMethod("enableDevice", int.class, int[].class);
@@ -2190,7 +2266,18 @@ final class HelperCallbackController implements AutoCloseable {
             unregister = managerType.getMethod("unregisterListener", listenerType);
         }
 
-        Platform() { manager = null; vendor = null; enable = disable = register = unregister = null; listenerType = null; }
+        Platform() { this(null, null); }
+
+        Platform(AutoserviceConnection connection, HelperDualStreamRuntime.VendorReadScheduler vendor) {
+            manager = null; this.vendor = vendor; this.connection = connection;
+            enable = disable = register = unregister = null; listenerType = null;
+        }
+
+        void restoreConnection() throws Throwable {
+            if (connection != null && !connection.available()) {
+                vendor.call(false, () -> { connection.connect(); return null; });
+            }
+        }
 
         void setListener(Listener sink) { this.sink = sink; }
 
@@ -2232,29 +2319,39 @@ final class HelperCallbackController implements AutoCloseable {
             refreshDiagnosticCounts();
             if (registered) {
                 try { unregister(); }
-                catch (Throwable ignored) { registered = false; proxy = null; }
+                catch (Throwable error) {
+                    error.printStackTrace(System.err);
+                    registered = false; proxy = null;
+                }
             }
             for (int dev : devices) {
-                try { callInt(disable, dev); } catch (Throwable ignored) { }
+                try { callInt(disable, dev); }
+                catch (Throwable error) {
+                    error.printStackTrace(System.err);
+                    if (connection != null && !connection.available()) throw error;
+                }
             }
         }
 
         private void register() throws Throwable {
+            long registeredBinding = connection == null ? -1L : connection.bindingIdentity();
             InvocationHandler handler = (instance, method, args) -> {
                 if (method.getDeclaringClass() == Object.class) {
                     if ("hashCode".equals(method.getName())) return System.identityHashCode(instance);
                     if ("equals".equals(method.getName())) return instance == args[0];
                     return "BYDCollectorCallbackListener";
                 }
-                if ("onError".equals(method.getName())) sink.error((Integer) args[0], (String) args[1]);
+                if (instance != proxy || (connection != null &&
+                    (!connection.available() || connection.bindingIdentity() != registeredBinding))) return null;
+                if ("onError".equals(method.getName())) sink.error((Integer) args[0], (String) args[1], registeredBinding);
                 else if ("onChanged".equals(method.getName())) {
                     Object value = args[2];
                     if (value instanceof Integer) sink.changed((Integer) args[0], (Integer) args[1],
-                        TelemetryCallbackBatch.TYPE_INT, (Integer) value, null);
+                        TelemetryCallbackBatch.TYPE_INT, (Integer) value, null, registeredBinding);
                     else if (value instanceof Float) sink.changed((Integer) args[0], (Integer) args[1],
-                        TelemetryCallbackBatch.TYPE_FLOAT, Float.floatToRawIntBits((Float) value), null);
+                        TelemetryCallbackBatch.TYPE_FLOAT, Float.floatToRawIntBits((Float) value), null, registeredBinding);
                     else if (value instanceof byte[]) sink.changed((Integer) args[0], (Integer) args[1],
-                        TelemetryCallbackBatch.TYPE_BYTES, 0, (byte[]) value);
+                        TelemetryCallbackBatch.TYPE_BYTES, 0, (byte[]) value, registeredBinding);
                 }
                 return null;
             };
@@ -2320,8 +2417,18 @@ final class HelperCallbackController implements AutoCloseable {
         }
 
         private <T> T call(HelperDualStreamRuntime.VendorCall<T> action) throws Throwable {
-            try { return vendor.call(false, action); }
-            catch (InvocationTargetException error) { throw error.getTargetException(); }
+            return vendor.call(false, () -> {
+                if (connection != null && !connection.available()) {
+                    throw new android.os.DeadObjectException(connection.failureDetail());
+                }
+                try { return action.run(); }
+                catch (Throwable failure) {
+                    Throwable error = failure instanceof InvocationTargetException
+                        ? ((InvocationTargetException) failure).getTargetException() : failure;
+                    if (connection != null) connection.nativeFailure(error);
+                    throw error;
+                }
+            });
         }
 
         int acceptedCount() { return acceptedCount; }
@@ -2345,11 +2452,16 @@ final class HelperCallbackController implements AutoCloseable {
 
         @Override public void close() throws Exception {
             try {
-                for (int dev : new ArrayList<>(accepted.keySet())) callInt(disable, dev);
+                if (connection == null || connection.available()) {
+                    for (int dev : new ArrayList<>(accepted.keySet())) callInt(disable, dev);
+                    if (registered) unregister();
+                }
                 accepted.clear();
                 failed.clear();
                 acceptedCount = failedCount = targetCount = 0;
-                if (registered) unregister();
+                registered = false;
+                proxy = null;
+                refreshDiagnosticCounts();
             } catch (Exception error) { throw error; }
             catch (Throwable error) { throw new Exception(error); }
         }

@@ -120,15 +120,9 @@ public final class CollectorHelperDaemon {
         final List<Address> secondaryRows = loadSecondaryRows(apkPath, secondaryCatalog.catalogVersion);
         final Set<Address> whitelist = loadWhitelist(mainRows, secondaryRows);
         Class<?> serviceManager = Class.forName("android.os.ServiceManager");
-        Method getService = serviceManager.getMethod("getService", String.class);
-        final IBinder autoservice = (IBinder) getService.invoke(null, "autoservice");
-        if (autoservice == null) {
-            System.err.println("ERR: autoservice not found");
-            helperDiagnostics.error("autoservice not found");
-            return 3;
-        }
-        String descriptor = autoservice.getInterfaceDescriptor();
-        final String autoserviceDescriptor = descriptor == null ? "" : descriptor;
+        final AutoserviceConnection autoservice = new AutoserviceConnection(helperDiagnostics);
+        resources.autoservice = autoservice;
+        autoservice.connect();
         final NativeArrayReader nativeReader = NativeArrayReader.create();
         final SecondarySpoolBinder secondarySpoolBinder = new SecondarySpoolBinder(secondaryCatalog.fieldCount);
         resources.secondarySpoolBinder = secondarySpoolBinder;
@@ -196,7 +190,7 @@ public final class CollectorHelperDaemon {
             helperGeneration,
             workerSpool,
             secondarySpoolBinder.spool(),
-            address -> scalarRead(autoservice, autoserviceDescriptor, address),
+            autoservice,
             nativeReader,
             callbackSpoolBinder,
             new HelperWakeLockController(
@@ -669,32 +663,6 @@ public final class CollectorHelperDaemon {
         // ActivityThread/Binder threads may outlive main; process death is the final
         // fallback that releases a lock whose explicit teardown persistently failed.
         return 0;
-    }
-
-    private static ReadValue scalarRead(
-            IBinder autoservice,
-            String descriptor,
-            Address address
-    ) {
-        Parcel data = Parcel.obtain();
-        Parcel reply = Parcel.obtain();
-        try {
-            data.writeInterfaceToken(descriptor);
-            data.writeInt(address.dev);
-            data.writeInt(address.fid);
-            if (!autoservice.transact(address.tx, data, reply, 0)) {
-                return ReadValue.error(CollectorHelperProtocol.STATUS_READ_ERROR, "autoservice transact returned false");
-            }
-            int available = reply.dataAvail();
-            int status = available >= 4 ? reply.readInt() : -999;
-            int raw = available >= 8 ? reply.readInt() : 0;
-            return new ReadValue(status, available >= 8 ? raw : null, available >= 8 ? null : "autoservice reply missing raw value");
-        } catch (Throwable error) {
-            return ReadValue.error(CollectorHelperProtocol.STATUS_READ_ERROR, describe(error));
-        } finally {
-            data.recycle();
-            reply.recycle();
-        }
     }
 
     private static void recordFailedAck(HelperDiagnostics diagnostics, String error) {
@@ -1252,6 +1220,9 @@ public final class CollectorHelperDaemon {
 
     interface ScalarReader {
         ReadValue read(Address address);
+        default boolean transportAvailable() { return true; }
+        default String transportError() { return null; }
+        default void nativeFailure(Throwable error) { }
     }
 
     interface NativeReader {
@@ -1387,22 +1358,41 @@ public final class CollectorHelperDaemon {
             String firstGroupError = null;
             for (Map.Entry<GroupKey, List<IndexedAddress>> entry : groups.entrySet()) {
                 List<IndexedAddress> group = entry.getValue();
+                if (!scalarReader.transportAvailable()) {
+                    for (IndexedAddress indexed : group) {
+                        values[indexed.index] = ReadValue.notAttempted(scalarReader.transportError());
+                    }
+                    if (firstGroupError == null) firstGroupError = scalarReader.transportError();
+                    continue;
+                }
                 boolean useFallback = !nativeReader.isAvailable();
                 if (!useFallback) {
                     try {
                         readNativeGroup(entry.getKey(), group, values, nativeReader);
                         nativeGroups++;
                     } catch (Throwable error) {
-                        useFallback = true;
+                        scalarReader.nativeFailure(error);
+                        useFallback = scalarReader.transportAvailable();
                         groupFailures++;
-                        if (firstGroupError == null) firstGroupError = describe(error);
+                        if (firstGroupError == null) {
+                            firstGroupError = describe(error);
+                            error.printStackTrace(System.err);
+                        }
+                        if (!useFallback) {
+                            for (IndexedAddress indexed : group) {
+                                values[indexed.index] = ReadValue.error(
+                                    CollectorHelperProtocol.STATUS_READ_ERROR, describe(error));
+                            }
+                        }
                     }
                 }
                 if (useFallback) {
                     fallbackGroups++;
-                    fallbackReads += group.size();
                     for (IndexedAddress indexed : group) {
-                        ReadValue value = scalarReader.read(indexed.address);
+                        ReadValue value = scalarReader.transportAvailable()
+                            ? scalarReader.read(indexed.address)
+                            : ReadValue.notAttempted(scalarReader.transportError());
+                        if (value.attempted) fallbackReads++;
                         values[indexed.index] = value;
                         if (firstGroupError == null && value.error != null) firstGroupError = value.error;
                     }
@@ -1532,6 +1522,7 @@ public final class CollectorHelperDaemon {
         final String error;
         final CallbackValueSource callbackSource;
         final HelperGetLineage getLineage;
+        final boolean attempted;
 
         ReadValue(int status, Integer raw, String error) {
             this(status, raw, error, null, null);
@@ -1542,6 +1533,11 @@ public final class CollectorHelperDaemon {
         }
 
         ReadValue(int status, Integer raw, String error, CallbackValueSource callbackSource, HelperGetLineage getLineage) {
+            this(status, raw, error, callbackSource, getLineage, true);
+        }
+
+        ReadValue(int status, Integer raw, String error, CallbackValueSource callbackSource,
+                  HelperGetLineage getLineage, boolean attempted) {
             this.status = status;
             this.raw = raw;
             this.error = error;
@@ -1550,6 +1546,7 @@ public final class CollectorHelperDaemon {
             }
             this.callbackSource = callbackSource;
             this.getLineage = getLineage;
+            this.attempted = attempted;
         }
 
         static ReadValue ok(int raw) {
@@ -1558,6 +1555,11 @@ public final class CollectorHelperDaemon {
 
         static ReadValue error(int status, String error) {
             return new ReadValue(status, null, error);
+        }
+
+        static ReadValue notAttempted(String reason) {
+            return new ReadValue(CollectorHelperProtocol.STATUS_READ_ERROR, null,
+                "not_attempted: " + reason, null, null, false);
         }
 
         static ReadValue cached(int raw, CallbackValueSource source) {
@@ -1887,6 +1889,7 @@ public final class CollectorHelperDaemon {
         private CallbackSpoolBinder callbackSpoolBinder;
         private HelperDualStreamRuntime runtime;
         private HelperTelegramLane telegramLane;
+        private AutoserviceConnection autoservice;
         private boolean closed;
 
         HelperResources(OwnerLock ownerLock, HelperDiagnostics diagnostics) {
@@ -1904,6 +1907,7 @@ public final class CollectorHelperDaemon {
 
         synchronized boolean closeForStop() {
             if (closed) return true;
+            if (autoservice != null) autoservice.close();
             if (telegramLane != null) {
                 telegramLane.stopAcceptingSubmissions();
                 if (!telegramLane.awaitHttpIdle(TELEGRAM_DRAIN_TIMEOUT_MS)) {
