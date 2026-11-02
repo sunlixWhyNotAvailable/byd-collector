@@ -14,6 +14,7 @@ internal class KpiCallbackDrainWorker(
     private val onSnapshot: (DirectKpiMailboxSnapshot) -> Unit,
     private val onListenerStatus: (Int) -> Unit,
     private val onTransportLoss: (String) -> Unit,
+    private val onConsumerFailure: (String) -> Unit,
     private val onConfirmedSourceLoss: (DirectKpiInvalidation) -> Unit = {},
     private val nowMs: () -> Long = { System.nanoTime() / 1_000_000L }
 ) {
@@ -81,6 +82,9 @@ internal class KpiCallbackDrainWorker(
         var retryAtMs: Long? = null
         var failures = 0
         var lastDrainedSequence = -1L
+        var pendingSnapshot: DirectKpiMailboxSnapshot? = null
+        var consumerRetryAtMs = 0L
+        var consumerFailures = 0
         try {
             while (true) {
                 val step = synchronized(lock) {
@@ -92,6 +96,9 @@ internal class KpiCallbackDrainWorker(
                             val observed = revision
                             while (!closed && !active && revision == observed) lock.wait()
                             continue
+                        }
+                        if (pendingSnapshot != null && nowMs() >= consumerRetryAtMs) {
+                            return@synchronized DrainStep.Deliver(pendingSnapshot!!)
                         }
                         val retryDeadline = retryAtMs
                         if (reconnectRequested || (retryDeadline != null && nowMs() >= retryDeadline) ||
@@ -116,7 +123,9 @@ internal class KpiCallbackDrainWorker(
                             continue
                         }
                         val observed = revision
-                        val waitMs = retryDeadline?.let { (it - nowMs()).coerceAtLeast(1L) } ?: 0L
+                        val nextDeadline = listOfNotNull(retryDeadline,
+                            consumerRetryAtMs.takeIf { pendingSnapshot != null }).minOrNull()
+                        val waitMs = nextDeadline?.let { (it - nowMs()).coerceAtLeast(1L) } ?: 0L
                         if (waitMs == 0L) {
                             while (!closed && active && revision == observed) lock.wait()
                         } else {
@@ -135,7 +144,7 @@ internal class KpiCallbackDrainWorker(
                     DrainStep.Close -> {
                         subscription?.let { runCatching { helper.unsubscribeKpi(it.subscriptionId) } }
                         subscription = null
-                        onListenerStatus(CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE)
+                        consume("close status") { onListenerStatus(CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE) }
                         return
                     }
                     is DrainStep.Deactivate -> {
@@ -145,70 +154,87 @@ internal class KpiCallbackDrainWorker(
                         retryAtMs = null
                         failures = 0
                         lastDrainedSequence = -1L
-                        onListenerStatus(CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE)
+                        pendingSnapshot = null
+                        consumerFailures = 0
+                        consume("inactive status") { onListenerStatus(CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE) }
                     }
                     is DrainStep.Subscribe -> {
+                        pendingSnapshot = null
                         step.previous?.let { runCatching { helper.unsubscribeKpi(it.subscriptionId) } }
                         synchronized(lock) { reconnectRequested = false }
-                        val result = runCatching { helper.subscribeKpi(::onInvalidated) }
-                            .getOrElse { error ->
-                                onTransportLoss(error.diagnosticDetail("KPI subscribe"))
-                                null
-                            }
+                        val read = runCatching { helper.subscribeKpi(::onInvalidated) }
+                        val result = read.getOrNull()
                         if (result?.ok == true) {
                             subscription = result
                             lastDrainedSequence = -1L
                             forceDrain = true // seed the mailbox even if its initial notify raced subscription.
-                            onSubscription(result)
-                            onListenerStatus(result.listenerStatus)
+                            consume("subscription") { onSubscription(result); onListenerStatus(result.listenerStatus) }
                             retryAtMs = if (result.listenerStatus == CollectorHelperProtocol.KPI_LISTENER_READY) null
                                 else nowMs() + retryDelay(++failures)
                         } else {
                             subscription = null
-                            onTransportLoss(result?.error ?: "KPI subscription failed")
-                            onListenerStatus(CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE)
+                            consume("subscription status") {
+                                onTransportLoss(read.exceptionOrNull()?.diagnosticDetail("KPI subscribe")
+                                    ?: result?.error ?: "KPI subscription failed")
+                                onListenerStatus(CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE)
+                            }
                             retryAtMs = nowMs() + retryDelay(++failures)
                         }
                     }
                     is DrainStep.Drain -> {
-                        val event = step.invalidation
-                        val snapshot = runCatching { helper.drainKpi(step.subscription.subscriptionId) }
-                            .getOrElse { error ->
-                                onTransportLoss(error.diagnosticDetail("KPI drain"))
-                                null
-                            }
+                        val read = runCatching { helper.drainKpi(step.subscription.subscriptionId) }
+                        val snapshot = read.getOrNull()
                         if (snapshot == null || !snapshot.ok ||
                             snapshot.subscriptionId != step.subscription.subscriptionId ||
                             snapshot.helperBootId != step.subscription.helperBootId ||
                             snapshot.helperGeneration != step.subscription.helperGeneration
                         ) {
-                            val reason = snapshot?.error ?: "KPI mailbox drain failed or helper generation changed"
+                            val reason = read.exceptionOrNull()?.diagnosticDetail("KPI drain")
+                                ?: snapshot?.error ?: "KPI mailbox drain failed or helper generation changed"
                             subscription = null // A drain failure invalidates the client's local subscription.
                             forceDrain = false
                             lastDrainedSequence = -1L
-                            onTransportLoss(reason)
-                            onListenerStatus(CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE)
+                            pendingSnapshot = null
+                            consume("transport status") {
+                                onTransportLoss(reason)
+                                onListenerStatus(CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE)
+                            }
                             retryAtMs = nowMs() + retryDelay(++failures)
                         } else {
-                            event?.sequence?.let { lastDrainedSequence = maxOf(lastDrainedSequence, it) }
-                            lastDrainedSequence = maxOf(lastDrainedSequence, snapshot.sequence)
                             failures = if (snapshot.listenerStatus == CollectorHelperProtocol.KPI_LISTENER_READY) 0 else failures
                             retryAtMs = if (snapshot.listenerStatus == CollectorHelperProtocol.KPI_LISTENER_READY) null
                                 else nowMs() + retryDelay(++failures)
                             val deliver = synchronized(lock) { active && !closed }
                             if (deliver) {
-                                onListenerStatus(snapshot.listenerStatus)
-                                onSnapshot(snapshot)
+                                pendingSnapshot = snapshot
                             }
+                        }
+                    }
+                    is DrainStep.Deliver -> {
+                        if (consume("snapshot sequence=${step.snapshot.sequence}") {
+                            onSnapshot(step.snapshot)
+                            onListenerStatus(step.snapshot.listenerStatus)
+                        }) {
+                            lastDrainedSequence = maxOf(lastDrainedSequence, step.snapshot.sequence)
+                            pendingSnapshot = null
+                            consumerFailures = 0
+                            consumerRetryAtMs = 0L
+                        } else {
+                            consumerRetryAtMs = nowMs() + retryDelay(++consumerFailures)
+                            // Stop retrying this retained snapshot; a newer invalidation can recover it.
+                            if (consumerFailures >= 5) pendingSnapshot = null
                         }
                     }
                     is DrainStep.SourceLoss -> {
                         subscription = null
                         forceDrain = false
                         lastDrainedSequence = -1L
-                        onListenerStatus(CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE)
+                        pendingSnapshot = null
                         retryAtMs = nowMs() + retryDelay(++failures)
-                        onConfirmedSourceLoss(step.invalidation)
+                        consume("source loss") {
+                            onListenerStatus(CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE)
+                            onConfirmedSourceLoss(step.invalidation)
+                        }
                     }
                 }
             }
@@ -216,8 +242,21 @@ internal class KpiCallbackDrainWorker(
             Thread.currentThread().interrupt()
         } finally {
             subscription?.let { runCatching { helper.unsubscribeKpi(it.subscriptionId) } }
-            onListenerStatus(CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE)
+            consume("final status") { onListenerStatus(CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE) }
         }
+    }
+
+    private fun consume(stage: String, action: () -> Unit): Boolean = try {
+        action()
+        true
+    } catch (error: Exception) {
+        if (error is InterruptedException) throw error
+        try { onConsumerFailure(error.diagnosticDetail("KPI consumer $stage")) }
+        catch (reportError: Exception) {
+            error.addSuppressed(reportError)
+            android.util.Log.e("KpiCallbackDrainWorker", "Consumer and diagnostic failure: $stage", error)
+        }
+        false
     }
 
     private fun matches(subscription: DirectKpiSubscriptionResult, value: DirectKpiInvalidation?): Boolean =
@@ -238,6 +277,7 @@ internal class KpiCallbackDrainWorker(
         data class Deactivate(val subscription: DirectKpiSubscriptionResult) : DrainStep()
         data class Subscribe(val previous: DirectKpiSubscriptionResult?) : DrainStep()
         data class Drain(val subscription: DirectKpiSubscriptionResult, val invalidation: DirectKpiInvalidation?) : DrainStep()
+        data class Deliver(val snapshot: DirectKpiMailboxSnapshot) : DrainStep()
         data class SourceLoss(val subscription: DirectKpiSubscriptionResult, val invalidation: DirectKpiInvalidation) : DrainStep()
     }
 }

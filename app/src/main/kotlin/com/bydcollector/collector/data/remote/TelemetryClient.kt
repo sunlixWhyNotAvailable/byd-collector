@@ -42,6 +42,9 @@ sealed class TelemetryReadResult {
         /** Actual attempted fields on an all-failed sparse GET; empty for transport failures. */
         val attemptedReadings: List<PollReading> = emptyList()
     ) : TelemetryReadResult() {
+        val fieldFailureOnly: Boolean
+            get() = category == "autoservice_snapshot_empty" && attemptedKeys.isNotEmpty()
+
         init {
             require(attemptedKeys.distinct().size == attemptedKeys.size) { "duplicate attempted telemetry key" }
             require(attemptedReadings.map { it.rawKey }.distinct().size == attemptedReadings.size) {

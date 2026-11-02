@@ -145,6 +145,8 @@ final class HelperCallbackController implements AutoCloseable {
     private long sourceRecoveryGetAttempts;
     private long secondaryExceptionGetAttempts;
     private long callbackListenerGeneration;
+    private Boolean lastConfirmedStreamPowerOn;
+    private long lastConfirmedStreamPowerElapsedMs = -1L;
     private HelperStreamRuntimeState.StreamView lastMainView;
     private HelperStreamRuntimeState.StreamView lastSecondaryView;
 
@@ -341,6 +343,7 @@ final class HelperCallbackController implements AutoCloseable {
         }
         boolean notify = false;
         boolean registrationChanged = false;
+        Boolean confirmedPower = null;
         synchronized (kpiLock) {
             if (closed) return;
             for (int index = 0; index < request.rows.size(); index++) {
@@ -373,6 +376,7 @@ final class HelperCallbackController implements AutoCloseable {
                         startedWallMs, startedElapsedMs, null, null);
                     notify = true;
                     if (row.equals(kpiPowerRow)) {
+                        confirmedPower = actual.raw > 0;
                         boolean wasOn = kpiPowerKnown && kpiPowerOn;
                         kpiPowerKnown = true;
                         kpiPowerOn = actual.raw > 0;
@@ -414,6 +418,7 @@ final class HelperCallbackController implements AutoCloseable {
                 }
             }
         }
+        if (confirmedPower != null) recoverExhaustedSeedsOnPower(confirmedPower, completedElapsedMs);
         if (notify) scheduleKpiNotification();
         if (registrationChanged) {
             scheduleRegistration(0L, true);
@@ -884,6 +889,7 @@ final class HelperCallbackController implements AutoCloseable {
         if (!kpiKeys.contains(key)) return;
         boolean captured = false;
         boolean registrationChanged = false;
+        Boolean confirmedPower = null;
         synchronized (kpiLock) {
             if (closed) return;
             List<CollectorHelperDaemon.Address> rows = kpiRowsByNative.get(key);
@@ -945,6 +951,7 @@ final class HelperCallbackController implements AutoCloseable {
                     null, -1L, -1L, null, null);
                 captured = true;
                 if (power) {
+                    confirmedPower = rawBits > 0;
                     boolean wasOn = kpiPowerKnown && kpiPowerOn;
                     kpiPowerKnown = true;
                     kpiPowerOn = rawBits > 0;
@@ -959,11 +966,39 @@ final class HelperCallbackController implements AutoCloseable {
                 }
             }
         }
+        if (confirmedPower != null) recoverExhaustedSeedsOnPower(confirmedPower, elapsed);
         if (captured) scheduleKpiNotification();
         if (registrationChanged) {
             scheduleRegistration(0L, true);
             updateKpiRegistrationStatus(null);
         }
+    }
+
+    private void recoverExhaustedSeedsOnPower(boolean powerOn, long elapsed) {
+        int scheduled = 0;
+        synchronized (lock) {
+            if (closed || elapsed < lastConfirmedStreamPowerElapsedMs) return;
+            boolean rising = Boolean.FALSE.equals(lastConfirmedStreamPowerOn) && powerOn;
+            lastConfirmedStreamPowerOn = powerOn;
+            lastConfirmedStreamPowerElapsedMs = elapsed;
+            if (!rising) return;
+            for (int stream : new int[] { CollectorHelperProtocol.STREAM_MAIN, CollectorHelperProtocol.STREAM_SECONDARY }) {
+                if (!capturePermitted[stream]) continue;
+                for (Map.Entry<CollectorHelperDaemon.Address, AcquisitionState> entry : acquisition(stream).entrySet()) {
+                    AcquisitionState state = entry.getValue();
+                    // Only exhausted seeds: live values and in-progress retry budgets retain their ordering.
+                    if (state.sourceAvailable || !state.registrationAccepted ||
+                        state.seedAttempts <= SEED_RETRY_DELAYS_MS.length || state.nextDueElapsedMs != Long.MAX_VALUE) continue;
+                    if (stream == CollectorHelperProtocol.STREAM_SECONDARY && SECONDARY_POLL_SOURCES.contains(entry.getKey())) continue;
+                    state.seedAttempts = 0;
+                    state.nextSeedReason = "source_recovery";
+                    state.nextDueElapsedMs = elapsed;
+                    scheduleAddress(stream, entry.getKey(), elapsed);
+                    scheduled++;
+                }
+            }
+        }
+        host.noteContext("power_on_seed_recovery", "unavailable_exhausted=" + scheduled + " elapsed_ms=" + elapsed);
     }
 
     private static int expectedNativeType(CollectorHelperDaemon.Address row) {

@@ -12,6 +12,20 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class DiagnosticShareSnapshotTest {
+    @Test fun repeatedTextKeepsPrivacyAndBundleLocalAliasesAfterCacheEviction() {
+        val first = DiagnosticShareSanitizer()
+        val input = "vin=L123456789012345X password=private-secret"
+        val redacted = first.sanitizeText(input)
+        repeat(300) { index -> first.sanitizeText("sequence=$index password=private-$index") }
+        assertEquals(redacted, first.sanitizeText(input))
+        assertFalse(redacted.contains("private-secret"))
+        assertFalse(redacted.contains("L123456789012345X"))
+        val second = DiagnosticShareSanitizer()
+        second.sanitizeText("vin=L999999999999999X")
+        assertTrue(second.sanitizeText(input).contains("[VIN-2]"))
+        assertTrue(first.sanitizeText(input).contains("[VIN-1]"))
+    }
+
     @Test
     fun usbStateSurvivesDiagnosticSanitizingAndZipWithoutChangingDedupe() {
         val root = Files.createTempDirectory("collector-usb-share").toFile()

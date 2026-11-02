@@ -42,8 +42,9 @@ final class CellularNetworkObserver implements AutoCloseable {
         if (closed || registered) return;
         try {
             Context context = KeepAliveDaemon.shellContext();
+            String opPackage = (String) Context.class.getMethod("getOpPackageName").invoke(context);
             if (Process.myUid() != 2000 || context.getApplicationInfo().uid != 2000
-                    || !"com.android.shell".equals(context.getOpPackageName()))
+                    || !"com.android.shell".equals(opPackage))
                 throw new SecurityException("Network observer requires shell attribution");
             manager = context.getSystemService(ConnectivityManager.class);
             if (manager == null) throw new IOException("ConnectivityManager unavailable");
@@ -72,7 +73,7 @@ final class CellularNetworkObserver implements AutoCloseable {
                         link.iface = name;
                         log.accept("network_link", "network=" + network + " interface=" + name
                                 + " wifi=" + link.wifi + " apn2=" + link.apn);
-                    } catch (Exception error) {
+                    } catch (Exception | LinkageError error) {
                         log.accept("network_error", KeepAliveDaemon.diagnosticDetail(error, "stage=network_link network=" + network));
                     }
                 }
@@ -87,10 +88,13 @@ final class CellularNetworkObserver implements AutoCloseable {
                 }
             };
             // No default-network, Internet, VPN or unrestricted-network requirement.
-            manager.registerNetworkCallback(new NetworkRequest.Builder().clearCapabilities().build(), callback, handler);
+            NetworkRequest.Builder request = new NetworkRequest.Builder();
+            // Present but hidden before API30; failure leaves the timed recovery path active.
+            NetworkRequest.Builder.class.getMethod("clearCapabilities").invoke(request);
+            manager.registerNetworkCallback(request.build(), callback, handler);
             registered = true;
-            log.accept("network_registered", "uid=" + Process.myUid() + " package=" + context.getOpPackageName());
-        } catch (Exception error) {
+            log.accept("network_registered", "uid=" + Process.myUid() + " package=" + opPackage);
+        } catch (Exception | LinkageError error) {
             log.accept("network_registration_error", KeepAliveDaemon.diagnosticDetail(error, "stage=register_network_callback"));
             if (!closed) handler.postDelayed(this::register, CellularApnSchedule.NORMAL_INTERVAL_MS);
         } finally {
@@ -112,7 +116,7 @@ final class CellularNetworkObserver implements AutoCloseable {
                 manager.unregisterNetworkCallback(callback);
                 log.accept("network_unregistered", "uid=" + Process.myUid());
             }
-        } catch (Exception error) {
+        } catch (Exception | LinkageError error) {
             log.accept("network_unregister_error", KeepAliveDaemon.diagnosticDetail(error, "stage=unregister_network_callback"));
         } finally {
             registered = false;

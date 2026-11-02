@@ -38,6 +38,8 @@ object CollectorAutoStart {
     const val MAX_RETRY_ATTEMPTS = 20
     private val keepAliveStopRetryAlarmLock = Any()
     private val archiveRetryAlarmLock = Any()
+    private val watchdogAlarmLock = Any()
+    private var watchdogDueElapsedMs = 0L
 
     fun scheduleArchiveRetry(context: Context, minimumDelayMs: Long = 0L) {
         if (BuildConfig.RUNTIME_CLIENT) return
@@ -137,6 +139,7 @@ object CollectorAutoStart {
     }
 
     fun handleBroadcast(context: Context, action: String, retryAttempt: Int = 0) {
+        if (action == ACTION_WATCHDOG_AUTO_START) synchronized(watchdogAlarmLock) { watchdogDueElapsedMs = 0L }
         val appContext = context.applicationContext
         val preflightSettings = CollectorSettings(appContext)
         if (preflightSettings.isUserShutdownRequested()) {
@@ -403,12 +406,14 @@ object CollectorAutoStart {
             return
         }
 
-        //periodically re-enters the same decision path because dilink can kill background work silently
-        appContext.getSystemService(AlarmManager::class.java).set(
-            AlarmManager.ELAPSED_REALTIME_WAKEUP,
-            SystemClock.elapsedRealtime() + WATCHDOG_DELAY_MS,
-            watchdogIntent(appContext)
-        )
+        synchronized(watchdogAlarmLock) {
+            val now = SystemClock.elapsedRealtime()
+            if (watchdogDueElapsedMs > now) return
+            val due = now + WATCHDOG_DELAY_MS
+            appContext.getSystemService(AlarmManager::class.java).set(
+                AlarmManager.ELAPSED_REALTIME_WAKEUP, due, watchdogIntent(appContext))
+            watchdogDueElapsedMs = due
+        }
         store.recordEvent(
             "watchdog_restart_scheduled",
             "Scheduled collector watchdog restart check",
@@ -493,11 +498,7 @@ object CollectorAutoStart {
                 "Collector already running; requested service reconcile",
                 "action=$action channels=${demand.recoveryActions().joinToString(",") { it.name }}"
             )
-            dispatchRuntimeRecovery(
-                appContext,
-                demand,
-                forceKeepAliveStatusCheck = action == ACTION_WATCHDOG_AUTO_START
-            )
+            CollectorServiceController.checkRuntime(appContext, action == ACTION_WATCHDOG_AUTO_START)
         } catch (error: RuntimeException) {
             store.recordEvent(
                 "auto_start_reconcile_failure",
@@ -573,7 +574,10 @@ object CollectorAutoStart {
     }
 
     private fun cancelWatchdog(context: Context) {
-        context.getSystemService(AlarmManager::class.java).cancel(watchdogIntent(context))
+        synchronized(watchdogAlarmLock) {
+            context.getSystemService(AlarmManager::class.java).cancel(watchdogIntent(context))
+            watchdogDueElapsedMs = 0L
+        }
     }
 
     private fun retryIntent(context: Context, retryAttempt: Int): PendingIntent {

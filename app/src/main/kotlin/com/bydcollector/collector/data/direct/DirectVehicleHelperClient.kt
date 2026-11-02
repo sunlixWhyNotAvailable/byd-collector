@@ -75,6 +75,11 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
             TelegramHelperProtocol.writeKey(data, key)
         }
 
+    fun recoverTelegram(key: TelegramHelperAttemptKey): TelegramHelperOutcome =
+        transactTelegram(CollectorHelperProtocol.TX_TELEGRAM_RECOVER, "recover") { data ->
+            TelegramHelperProtocol.writeKey(data, key)
+        }
+
     private fun readOwnerMode(stopOnly: Boolean): DirectHelperOwnerMode? = synchronized(lock) {
         val binder = ensureBinder() ?: return@synchronized null
         readOwnerMode(binder, stopOnly)

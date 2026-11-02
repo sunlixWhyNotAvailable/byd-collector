@@ -21,10 +21,10 @@ object MainPollStatusFormatter {
 
         val normalized = lastPollStatus.orEmpty().lowercase(Locale.US)
         return when {
+            queue != null -> queueStatus(queue, strings)!!
             normalized.contains("error") || normalized.contains("failed") -> {
                 MainPollDisplayStatus(strings.error.lowercase(Locale.getDefault()), StatusKind.ERROR)
             }
-            queue != null -> queueStatus(queue, strings)!!
             normalized.startsWith("ok") -> MainPollDisplayStatus(strings.collectionRunning, StatusKind.OK)
             else -> MainPollDisplayStatus(strings.waiting, StatusKind.WAITING)
         }

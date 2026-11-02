@@ -11,6 +11,13 @@ import com.bydcollector.collector.runtime.RuntimeEndpoint
 import android.os.Bundle
 
 object CollectorServiceController {
+    fun checkRuntime(context: Context, forceKeepAliveStatusCheck: Boolean = false) {
+        if (RuntimeEndpoint.forward(context, "checkRuntime", Bundle().apply { putBoolean("force", forceKeepAliveStatusCheck) })) return
+        val intent = CollectorService.checkRuntimeIntent(context, forceKeepAliveStatusCheck)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent)
+        else context.startService(intent)
+    }
+
     fun start(context: Context, forceKeepAliveStatusCheck: Boolean = false) {
         if (RuntimeEndpoint.forward(context, "start", Bundle().apply { putBoolean("force", forceKeepAliveStatusCheck) })) return
         check(CollectorSettings(context).rememberTaskRemoval()) { "Could not persist runtime intent" }

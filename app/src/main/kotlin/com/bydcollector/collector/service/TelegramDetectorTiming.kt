@@ -6,7 +6,8 @@ import org.json.JSONObject
 data class TelegramDetectorDeadline(
     val elapsedMs: Long,
     val observedAtMs: Long,
-    val sourceIdentity: String?
+    val sourceIdentity: String?,
+    val durationMs: Long? = null
 )
 
 data class TelegramDetectorTiming(
@@ -27,6 +28,7 @@ data class TelegramDetectorTiming(
                 put("elapsed", value.elapsedMs)
                 put("observed", value.observedAtMs)
                 put("source", value.sourceIdentity ?: JSONObject.NULL)
+                put("duration", value.durationMs ?: JSONObject.NULL)
             }) }
         })
         put("stop_at", pendingStopAtMs ?: JSONObject.NULL)
@@ -48,7 +50,8 @@ data class TelegramDetectorTiming(
                     val observed = value.getLong("observed")
                     require(elapsed >= 0L && observed >= 0L) { "Negative Telegram deadline" }
                     put(key, TelegramDetectorDeadline(elapsed, observed,
-                        if (value.isNull("source")) null else value.getString("source")))
+                        if (value.isNull("source")) null else value.getString("source"),
+                        if (value.isNull("duration")) null else value.getLong("duration").also { require(it >= 0L) }))
                 }
             }
             return TelegramDetectorTiming(

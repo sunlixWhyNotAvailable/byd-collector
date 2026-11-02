@@ -162,7 +162,8 @@ data class TelegramEventState(
     val lastTripEnergyCounterKwh: Double? = null,
     val lastPersistedAtMs: Long = 0L,
     val rawSourceInputs: Map<String, TelegramRawSourceCursor> = emptyMap(),
-    val detectorTiming: TelegramDetectorTiming = TelegramDetectorTiming()
+    val detectorTiming: TelegramDetectorTiming = TelegramDetectorTiming(),
+    val recoveryBaselines: Set<String> = emptySet()
 ) {
     fun hasDeferredStorageWork(): Boolean {
         return tripId != null ||
@@ -198,6 +199,7 @@ data class TelegramEventState(
     }
 
     fun toJson(): String = JSONObject().apply {
+        put("recoveryBaselines", org.json.JSONArray(recoveryBaselines.toList()))
         put("detectorTiming", detectorTiming.toJson())
         put("initialized", initialized)
         putNullable("charging", charging)
@@ -266,14 +268,47 @@ data class TelegramEventState(
 
     companion object {
         fun fromJson(value: String?): TelegramEventState {
-            return fromJsonOrNull(value) ?: TelegramEventState()
+            if (value == null) return TelegramEventState()
+            require(value.isNotBlank()) { "Blank Telegram detector state" }
+            return parseJson(JSONObject(value))
         }
 
         fun fromJsonOrNull(value: String?): TelegramEventState? {
-            if (value.isNullOrBlank()) return TelegramEventState()
-            return runCatching {
-                val json = JSONObject(value)
-                TelegramEventState(
+            return runCatching { fromJson(value) }.getOrNull()
+        }
+
+        /** Called only after the original bytes and exception have been retained by the store. */
+        fun recoverJson(value: String): TelegramEventState {
+            val json = try { JSONObject(value) } catch (_: org.json.JSONException) {
+                return TelegramEventState(initialized = true, recoveryBaselines = setOf("full", "low_12v"))
+            }
+            // A damaged timing section must not erase delivery/trip/charging identities.
+            val reportedPower = json.optJSONObject("detectorTiming")?.opt("reported_power") as? String
+            json.remove("detectorTiming")
+            json.remove("recoveryBaselines")
+            return parseJson(json).copy(
+                chargeGunCandidate = null, chargeGunCandidateCount = 0,
+                chargingActiveCandidate = null, chargingActiveCandidateCount = 0,
+                chargingActiveCandidateSource = null, chargingLowPowerSinceMs = null,
+                gearCandidate = null, gearCandidateCount = 0, fullCandidateCount = 0,
+                lowVoltageSinceMs = null,
+                detectorTiming = TelegramDetectorTiming(reportedPowerSessionId = reportedPower)
+            )
+        }
+
+        private fun parseJson(json: JSONObject): TelegramEventState {
+            require(json.isNull("detectorTiming") || json.get("detectorTiming") is JSONObject) {
+                "Invalid Telegram detector timing type"
+            }
+            val baselines = json.optJSONArray("recoveryBaselines")
+            val baselineKeys = buildSet {
+                if (baselines != null) for (index in 0 until baselines.length()) {
+                    val key = baselines.getString(index)
+                    require(key in setOf("full", "low_12v")) { "Unknown Telegram recovery baseline: $key" }
+                    add(key)
+                }
+            }
+            return TelegramEventState(
                     initialized = json.optBoolean("initialized", false),
                     //legacy semantic charging fields are accepted but intentionally discarded
                     charging = null,
@@ -351,9 +386,9 @@ data class TelegramEventState(
                         ?.takeIf { it.isFinite() && it >= 0.0 },
                     lastPersistedAtMs = json.optLong("lastPersistedAtMs"),
                     rawSourceInputs = TelegramOrderedInput.decodeCursors(json.optJSONArray("rawSourceInputs")),
-                    detectorTiming = TelegramDetectorTiming.fromJson(json.optJSONObject("detectorTiming"))
+                    detectorTiming = TelegramDetectorTiming.fromJson(json.optJSONObject("detectorTiming")),
+                    recoveryBaselines = baselineKeys
                 )
-            }.getOrNull()
         }
     }
 }
@@ -382,7 +417,16 @@ class TelegramEventEngine(
         bootStartSoc = validSoc(initialState.bootStartSoc) ?: validSoc(recoverableFirstTripSoc),
         bootEndSoc = validSoc(initialState.bootEndSoc)
             ?: validSoc(initialState.tripEndSoc)
-            ?: validSoc(recoverableFirstTripSoc)
+            ?: validSoc(recoverableFirstTripSoc),
+        detectorTiming = initialState.detectorTiming.let { timing ->
+            val gun = timing.pending["gun"]
+            // Old persisted disconnect candidates used 1s; extend from their original observation.
+            if (initialState.chargeGunCandidate == false && gun != null && gun.durationMs == null) {
+                timing.copy(pending = timing.pending + ("gun" to gun.copy(
+                    elapsedMs = Math.addExact(gun.elapsedMs, CABLE_DISCONNECT_CONFIRM_MS - CONFIRMATION_MS),
+                    durationMs = CABLE_DISCONNECT_CONFIRM_MS)))
+            } else timing
+        }
     )
         private set
 
@@ -400,6 +444,7 @@ class TelegramEventEngine(
             pendingPowerOffLocationTripId = previous.pendingPowerOffLocationTripId,
             pendingPowerOffLocationPowerSessionId = previous.pendingPowerOffLocationPowerSessionId,
             pendingPowerOffLocationSummaryDelivered = previous.pendingPowerOffLocationSummaryDelivered,
+            recoveryBaselines = previous.recoveryBaselines,
             detectorTiming = TelegramDetectorTiming(
                 reportedPowerSessionId = previous.detectorTiming.reportedPowerSessionId
                     ?: previous.pendingPowerOffLocationPowerSessionId)
@@ -598,7 +643,7 @@ class TelegramEventEngine(
     private fun deadline(key: String, delayMs: Long, observedAtMs: Long, sourceIdentity: String? = null): TelegramDetectorDeadline {
         state.detectorTiming.pending[key]?.let { return it }
         val timing = state.detectorTiming
-        val value = TelegramDetectorDeadline(timing.evaluatedElapsedMs + delayMs, observedAtMs, sourceIdentity)
+        val value = TelegramDetectorDeadline(timing.evaluatedElapsedMs + delayMs, observedAtMs, sourceIdentity, delayMs)
         state = state.copy(detectorTiming = timing.copy(pending = timing.pending + (key to value)))
         return value
     }
@@ -756,6 +801,14 @@ class TelegramEventEngine(
         val powerRawFresh = freshness?.hasAccepted("battery_charge_power_kw") ?: true
         val voltageFresh = freshness?.hasAccepted("aux_voltage_v") ?: true
         fun usable(key: String): Boolean = freshness == null || freshness.hasValid(key, state.detectorTiming.bootId)
+        if ("full" in state.recoveryBaselines && socFresh && soc != null && usable("soc")) {
+            state = state.copy(fullSent = soc >= FULL_SOC_THRESHOLD,
+                recoveryBaselines = state.recoveryBaselines - "full")
+        }
+        if ("low_12v" in state.recoveryBaselines && voltageFresh && auxVoltage != null && usable("aux_voltage_v")) {
+            state = state.copy(lowVoltageSent = auxVoltage < config.lowVoltageThreshold,
+                recoveryBaselines = state.recoveryBaselines - "low_12v")
+        }
         if (!usable("charge_gun_connected_raw") || rawGun == null) {
             cancelDeadline("gun")
             state = state.copy(chargeGunCandidate = null, chargeGunCandidateCount = 0)
@@ -1329,7 +1382,7 @@ class TelegramEventEngine(
             return
         }
         if (state.chargeGunCandidate != raw) cancelDeadline("gun")
-        val confirmation = deadline("gun", CONFIRMATION_MS, nowMs, sourceIdentity)
+        val confirmation = deadline("gun", if (raw) CONFIRMATION_MS else CABLE_DISCONNECT_CONFIRM_MS, nowMs, sourceIdentity)
         state = state.copy(chargeGunCandidate = raw, chargeGunCandidateCount = 1)
         if (!due(confirmation)) return
         cancelDeadline("gun")
@@ -1987,6 +2040,7 @@ class TelegramEventEngine(
     companion object {
         private const val PARK = "P"
         private const val CONFIRMATION_MS = 1_000L
+        private const val CABLE_DISCONNECT_CONFIRM_MS = 3_000L
         private const val FULL_SOC_THRESHOLD = 99.5
         private const val CHARGING_POWER_THRESHOLD_KW = 0.5
         private const val CHARGING_LOW_POWER_CONFIRM_MS = 60_000L

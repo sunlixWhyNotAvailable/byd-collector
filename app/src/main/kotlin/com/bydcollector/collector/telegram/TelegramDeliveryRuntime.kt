@@ -45,6 +45,10 @@ class TelegramDeliveryRuntime(
     val hasPendingResult: Boolean
         get() = synchronized(lock) { pendingResult != null }
 
+    internal fun isAttachedTo(token: Any): Boolean = synchronized(lock) {
+        attachedToken === token && !quiesced && !executor.isShutdown
+    }
+
     /** Outbox rows must not age out while HTTP or its local receipt is unresolved. */
     val protectedTelegramIds: Set<Long>
         get() = synchronized(lock) { activeAttempt?.entry?.id?.let(::setOf) ?: emptySet() }
@@ -311,7 +315,7 @@ class TelegramDeliveryRuntime(
 
     private fun queryHelper(attempt: TelegramDeliveryAttempt) = runHelperCall(attempt, submit = false)
 
-    private fun runHelperCall(attempt: TelegramDeliveryAttempt, submit: Boolean) {
+    private fun runHelperCall(attempt: TelegramDeliveryAttempt, submit: Boolean, recover: Boolean = false) {
         val persisted = checkNotNull(attempt.persisted) { "Telegram helper call has no persisted attempt" }
         val key = helperKey(persisted)
         val shouldRun = synchronized(lock) {
@@ -326,7 +330,8 @@ class TelegramDeliveryRuntime(
         try {
             httpExecutor.execute {
                 try {
-                    var outcome = if (submit) helper.submitTelegram(key, attempt.request) else helper.queryTelegram(key)
+                    var outcome = if (recover) helper.recoverTelegram(key)
+                        else if (submit) helper.submitTelegram(key, attempt.request) else helper.queryTelegram(key)
                     while (outcome.state == TelegramHelperState.RUNNING) {
                         Thread.sleep(HELPER_POLL_MS)
                         outcome = helper.queryTelegram(key)
@@ -375,6 +380,10 @@ class TelegramDeliveryRuntime(
                     deliveryReady(acknowledgeHelperAndApp(attempt, helperAlreadyAcked = true))
                 }
                 TelegramHelperState.ABSENT -> {
+                    if (attempt.persisted?.localSettled == true) {
+                        runHelperCall(attempt, submit = false, recover = true)
+                        return
+                    }
                     check(attempt.persisted?.localSettled != true) {
                         "Telegram helper lost the result of an APP-settled attempt"
                     }
@@ -410,10 +419,18 @@ class TelegramDeliveryRuntime(
                             )
                         }
                     }
-                    TelegramHelperAmbiguity.LEDGER_MISSING -> throw IllegalStateException(
-                        "Telegram helper ledger is missing for a noninitial APP attempt; " +
-                            "the request remains pending without retry or ACK. ${outcome.diagnostic.orEmpty()}"
-                    )
+                    TelegramHelperAmbiguity.LEDGER_MISSING, TelegramHelperAmbiguity.LEDGER_CORRUPT ->
+                        runHelperCall(attempt, submit = false, recover = true)
+                    TelegramHelperAmbiguity.LEDGER_RECOVERED -> {
+                        if (attempt.persisted?.localSettled == true) {
+                            deliveryReady(acknowledgeHelperAndApp(attempt, helperAlreadyAcked = false))
+                        } else {
+                            receiveResult(attempt, TelegramSendResult.Failure(
+                                kind = TelegramSendFailureKind.NETWORK_ERROR,
+                                exceptionClass = "TelegramHelperInterruptedAttempt",
+                                diagnostic = outcome.diagnostic), nowMs())
+                        }
+                    }
                 }
             }
         } catch (error: Exception) {

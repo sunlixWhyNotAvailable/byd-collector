@@ -47,7 +47,7 @@ class TelegramCoordinator internal constructor(
     private val onConnectionTestSettled: (TelegramSendResult) -> Unit = {},
     private val ecMeanKwhPer100Km: () -> Double? = { null }
 ) {
-    private var engine = createEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
+    private var engine = createEngine(loadDetectorState())
     @Volatile var detectorDeadlineAtMs: Long? = engine.nextDetectorDeadlineAtMs()
         private set
     private var enabledRuntimeStartedAtMs: Long? = null
@@ -448,8 +448,7 @@ class TelegramCoordinator internal constructor(
                 error, "created_at_ms=${entry.createdAtMs} occurred_at_ms=${entry.occurredAtMs ?: "unknown"}"
             )
             try {
-                telegramStore.telegramRuntimeState()
-                    ?.let { engine = createEngine(TelegramEventState.fromJson(it)) }
+                engine = createEngine(loadDetectorState())
             } catch (recoveryError: Exception) {
                 if (recoveryError is InterruptedException) Thread.currentThread().interrupt()
                 error.addSuppressed(recoveryError)
@@ -528,6 +527,16 @@ class TelegramCoordinator internal constructor(
 
     private fun createEngine(state: TelegramEventState) = TelegramEventEngine(state, ecMeanKwhPer100Km)
 
+    private fun loadDetectorState(): TelegramEventState = telegramStore.loadTelegramRuntimeState { error, evidence ->
+        val detail = "evidence=$evidence ${error.diagnosticDetail()}"
+        try {
+            eventStore.recordEvent("telegram_state_recovered", "Damaged Telegram detector state recovered", detail)
+        } catch (loggingError: Exception) {
+            error.addSuppressed(loggingError)
+            android.util.Log.e("TelegramCoordinator", "Cannot record detector-state recovery; evidence=$evidence", error)
+        }
+    }
+
     private fun nextWakeAt(eventDeadlineAtMs: Long?, queueDeadlineAtMs: Long?): Long? {
         return listOfNotNull(eventDeadlineAtMs, queueDeadlineAtMs).minOrNull()
     }
@@ -535,7 +544,7 @@ class TelegramCoordinator internal constructor(
     private fun handle(result: TelegramEventResult, completion: TripCompletionIntent? = null): Boolean {
         val messages = renderTelegramBatch(result.events, ::render)
         if (messages == null) {
-            engine = createEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
+            engine = createEngine(loadDetectorState())
             detectorDeadlineAtMs = engine.nextDetectorDeadlineAtMs()
             return false
         }
@@ -551,8 +560,13 @@ class TelegramCoordinator internal constructor(
             )
         } catch (error: Exception) {
             if (error is InterruptedException) throw error
-            engine = createEngine(TelegramEventState.fromJson(telegramStore.telegramRuntimeState()))
-            detectorDeadlineAtMs = engine.nextDetectorDeadlineAtMs()
+            try {
+                engine = createEngine(loadDetectorState())
+                detectorDeadlineAtMs = engine.nextDetectorDeadlineAtMs()
+            } catch (recoveryError: Exception) {
+                if (recoveryError is InterruptedException) Thread.currentThread().interrupt()
+                error.addSuppressed(recoveryError)
+            }
             throw error
         }
         detectorDeadlineAtMs = engine.nextDetectorDeadlineAtMs()

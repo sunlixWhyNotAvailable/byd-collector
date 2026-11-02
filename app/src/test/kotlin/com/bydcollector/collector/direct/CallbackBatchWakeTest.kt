@@ -55,6 +55,8 @@ class CallbackBatchWakeTest {
             dispatch(transport, code, stream, data, reply)
             assertEquals(P.STATUS_OK, reply.readInt()); assertNull(reply.readString())
             val ready = reply.readInt()
+            assertEquals("test-boot", reply.readString())
+            assertEquals("test-generation", reply.readString())
             assertEquals(0, reply.dataAvail())
             return ready == 1
         } finally { data.recycle(); reply.recycle() }

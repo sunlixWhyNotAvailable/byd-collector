@@ -7,6 +7,7 @@ import com.bydcollector.collector.data.callback.CallbackDelivery
 import com.bydcollector.collector.data.callback.CallbackImportResult
 import com.bydcollector.collector.data.direct.DirectFidRegistry
 import com.bydcollector.collector.data.input.BusinessInputCheckpointKeys
+import com.bydcollector.collector.data.input.BusinessContinuityState
 import com.bydcollector.collector.data.input.BusinessInputKind
 import com.bydcollector.collector.data.input.BusinessInputOrigin
 import com.bydcollector.collector.data.input.BusinessInputProjection
@@ -218,7 +219,11 @@ class BusinessInputStorageTest {
             assertEquals("ON", delta.readings.single { it.rawKey == "bodywork_power_level" }.descValue)
             assertEquals("4000", delta.sourceInputs.getValue("charging_charge_battery_volt").reading.rawValue)
             assertNull(delta.readings.single { it.rawKey == "charging_charge_current" }.rawValue)
-            assertEquals(3, delta.sourceInputs.size)
+            assertEquals(2, delta.sourceInputs.size)
+            assertEquals(BusinessContinuityState.LOST,
+                delta.continuityUpdates.getValue("charging_charge_current").state)
+            assertEquals("invalid_get_value",
+                delta.continuityUpdates.getValue("charging_charge_current").reason)
             val persistedUnrelatedValue = context.openOrCreateDatabase(databaseName, 0, null).use { db ->
                 db.rawQuery(
                     "SELECT \"${PollValueColumns.raw(unrelatedKey)}\" FROM poll_values WHERE poll_id = ?",
@@ -319,7 +324,7 @@ class BusinessInputStorageTest {
                     requestCount = 1,
                     errors = null,
                     rawResponseBody = null,
-                    readings = listOf(PollReading("charging_charge_current", "-200", "-20.0")),
+                    readings = listOf(PollReading("charging_charge_current", (-20f).toRawBits().toString(), "-20.0")),
                     source = sparseSource,
                     origin = PollOrigin.LIVE
                 ),
@@ -360,7 +365,7 @@ class BusinessInputStorageTest {
     fun sparseGetAttemptsInvalidateOnlyFailedKeysAndReceivedCountsIgnoreNullPlaceholders() {
         val context = RuntimeEnvironment.getApplication()
         val databaseName = "business_sparse_failure_${System.nanoTime()}.db"
-        val store = newStore(context, databaseName)
+        var store = newStore(context, databaseName)
         try {
             val sessionId = store.openSession()
             val catalog = store.getActiveCatalogParameters()
@@ -432,9 +437,12 @@ class BusinessInputStorageTest {
                 checkpoint, BusinessInputProjection.incoming(partialDelta), bootId
             )
             checkpoint = partialMerge.inputs
-            assertNull(checkpoint.getValue(batteryKey).reading.rawValue)
+            assertEquals("4000", checkpoint.getValue(batteryKey).reading.rawValue)
             assertEquals("150", checkpoint.getValue(currentKey).reading.rawValue)
-            assertTrue(store.completeBusinessInput(partialRef, partialMerge.updates))
+            assertTrue(store.completeBusinessInputs(listOf(partialRef), partialMerge.updates, partialDelta.continuityUpdates))
+            assertEquals(BusinessContinuityState.LOST, store.loadBusinessInputContinuityCheckpoint().getValue(batteryKey).state)
+            assertNull(BusinessInputProjection.freshInputs(checkpoint, bootId, 2_000L,
+                store.loadBusinessInputContinuityCheckpoint()).getValue(batteryKey).reading.rawValue)
 
             val persistedCounts = context.openOrCreateDatabase(databaseName, 0, null).use { db ->
                 db.rawQuery(
@@ -493,7 +501,8 @@ class BusinessInputStorageTest {
             assertEquals(failedBody, failedBatteryDelta.rawResponseBody)
             assertEquals(listOf(batteryKey), failedBatteryDelta.readings.map { it.rawKey })
             assertNull(failedBatteryDelta.readings.single().rawValue)
-            assertEquals(setOf(batteryKey), BusinessInputProjection.incoming(failedBatteryDelta).keys)
+            assertTrue(BusinessInputProjection.incoming(failedBatteryDelta).isEmpty())
+            assertEquals(setOf(batteryKey), failedBatteryDelta.continuityUpdates.keys)
             val failedValuesRows = context.openOrCreateDatabase(databaseName, 0, null).use { db ->
                 db.rawQuery("SELECT COUNT(*) FROM poll_values WHERE poll_id = ?", arrayOf(failedBatteryPoll.toString()))
                     .use { cursor -> assertTrue(cursor.moveToFirst()); cursor.getLong(0) }
@@ -503,10 +512,21 @@ class BusinessInputStorageTest {
                 checkpoint, BusinessInputProjection.incoming(failedBatteryDelta), bootId
             )
             checkpoint = failedMerge.inputs
-            assertNull(checkpoint.getValue(batteryKey).reading.rawValue)
+            assertEquals("4100", checkpoint.getValue(batteryKey).reading.rawValue)
             assertEquals("150", checkpoint.getValue(currentKey).reading.rawValue)
             assertEquals("1", checkpoint.getValue(powerKey).reading.rawValue)
-            assertTrue(store.completeBusinessInput(failedBatteryRef, failedMerge.updates))
+            assertTrue(store.completeBusinessInputs(listOf(failedBatteryRef), failedMerge.updates,
+                failedBatteryDelta.continuityUpdates))
+            store.close()
+            store = newStore(context, databaseName)
+            val continuity = store.loadBusinessInputContinuityCheckpoint()
+            assertEquals(BusinessContinuityState.LOST, continuity.getValue(batteryKey).state)
+            assertEquals("get_failed", continuity.getValue(batteryKey).reason)
+            assertTrue(assertNotNull(continuity.getValue(batteryKey).diagnostic).contains("controlled error payload"))
+            val visible = BusinessInputProjection.freshInputs(store.loadBusinessInputCheckpoint(), bootId, 4_000L, continuity)
+            assertNull(visible.getValue(batteryKey).reading.rawValue)
+            assertEquals("150", visible.getValue(currentKey).reading.rawValue)
+            assertEquals("1", visible.getValue(powerKey).reading.rawValue)
 
             val unrelatedKey = DirectFidRegistry.entries.first {
                 it.key !in BusinessInputCheckpointKeys.ALL && it.key !in TelegramOrderedInput.rawSourceKeys

@@ -27,6 +27,10 @@ internal class DiagnosticShareSanitizer {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, KeyClassification>?): Boolean =
             size > KEY_CACHE_LIMIT
     }
+    private val textCache = object : LinkedHashMap<String, String>(TEXT_CACHE_LIMIT, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean =
+            size > TEXT_CACHE_LIMIT
+    }
 
     fun sanitizeText(text: String): String {
         // Unlabelled numbers/IDs remain diagnostic data, not guessed identities.
@@ -34,6 +38,7 @@ internal class DiagnosticShareSanitizer {
             !text.contains("vin", ignoreCase = true) && !text.contains("imei", ignoreCase = true) &&
             !text.contains("imsi", ignoreCase = true) && !text.contains("iccid", ignoreCase = true) &&
             !text.contains("Location[", ignoreCase = true)) return text
+        if (text.length <= TEXT_CACHE_MAX_CHARS) textCache[text]?.let { return it }
         var sanitized = replaceCookieHeaders(text)
         sanitized = replaceAuthHeaders(sanitized)
         // Android Wi-Fi dumps allow an unquoted SSID containing spaces. Match
@@ -76,10 +81,12 @@ internal class DiagnosticShareSanitizer {
         sanitized = ANDROID_LOCATION_PATTERN.replace(sanitized) { match ->
             "${match.groups["prefix"]?.value.orEmpty()}$REDACTED_COORDINATE,$REDACTED_COORDINATE"
         }
-        return URL_PATTERN.replace(sanitized) { match ->
+        val result = URL_PATTERN.replace(sanitized) { match ->
             val url = match.value
             if (isRecognizedMapUrl(url)) sanitizeMapUrl(url) else url
         }
+        if (text.length <= TEXT_CACHE_MAX_CHARS && result.length <= TEXT_CACHE_MAX_CHARS) textCache[text] = result
+        return result
     }
 
     /** Parses exactly one JSON value; trailing non-whitespace is an error. */
@@ -211,6 +218,8 @@ internal class DiagnosticShareSanitizer {
         private const val REDACTED = "[redacted]"
         private const val REDACTED_COORDINATE = "[redacted-coordinate]"
         private const val KEY_CACHE_LIMIT = 256
+        private const val TEXT_CACHE_LIMIT = 256
+        private const val TEXT_CACHE_MAX_CHARS = 4096
         private val SENSITIVE_KEYS = setOf(
             "password", "passwd", "mqttpassword", "influxpassword",
             "bottoken", "telegrambottoken", "apikey", "accesstoken",

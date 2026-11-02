@@ -31,7 +31,8 @@ class HelperTelegramLane @JvmOverloads constructor(
         val key: TelegramHelperAttemptKey,
         val state: String,
         val result: TelegramSendResult? = null,
-        val confirmedAtMs: Long? = null
+        val confirmedAtMs: Long? = null,
+        val recoveryDiagnostic: String? = null
     )
 
     private data class Ledger(
@@ -94,6 +95,57 @@ class HelperTelegramLane @JvmOverloads constructor(
 
     fun telegramQuery(key: TelegramHelperAttemptKey): TelegramHelperOutcome = synchronized(lock) {
         queryLocked(key)
+    }
+
+    /** Reconciles the exact APP-owned attempt without starting HTTP or assuming delivery. */
+    fun telegramRecover(key: TelegramHelperAttemptKey): TelegramHelperOutcome = synchronized(lock) {
+        activeByOwner[key.ownerId]?.let {
+            requireSameKey(it, key)
+            return@synchronized TelegramHelperOutcome(TelegramHelperState.RUNNING)
+        }
+        var corruption: CorruptLedger? = null
+        val ledger = try { readLedger(key.ownerId) } catch (error: CorruptLedger) {
+            corruption = error
+            null
+        }
+        if (ledger != null) return@synchronized queryLocked(key)
+        val pending = pendingResults[key.ownerId]
+        pending?.let { requireSameKey(it.latest.key, key) }
+        workerFailures[key.ownerId]?.let { requireSameKey(it.key, key) }
+        val diagnostic = corruption?.let { TelegramHelperProtocol.exceptionDiagnostic(it, "telegram_ledger_recovery") }
+            ?: "Telegram helper ledger absent; exact attempt has no live HTTP owner"
+        preserveRecoveryEvidence(key, diagnostic)
+        // The lock excludes submit/completion; an old worker cannot later overwrite this checkpoint.
+        val recovered = pending ?: Ledger(key.ownerId, key.sequence - 1L,
+            StoredAttempt(key, RECOVERED, recoveryDiagnostic = diagnostic))
+        writeLedger(recovered)
+        pendingResults.remove(key.ownerId)
+        workerFailures.remove(key.ownerId)
+        lastPersistAttemptNs.remove(key.ownerId)
+        lock.notifyAll()
+        queryLocked(key)
+    }
+
+    private fun preserveRecoveryEvidence(key: TelegramHelperAttemptKey, diagnostic: String) {
+        val evidence = File(ledgerDirectory, "recovery-${key.attemptId}")
+        if (!evidence.isDirectory && !evidence.mkdirs()) throw IOException("cannot create Telegram recovery evidence: $evidence")
+        val base = fileFor(key.ownerId)
+        for (source in listOf(base, File(base.path + ".bak"))) {
+            if (source.exists()) {
+                val target = File(evidence, "${source.name}.${System.nanoTime()}")
+                if (!source.renameTo(target)) throw IOException("cannot preserve Telegram ledger evidence: $source")
+            }
+        }
+        val atomic = AtomicFile(File(evidence, "attempt.${System.nanoTime()}.json"))
+        val output = atomic.startWrite()
+        try {
+            output.write(JSONObject().put("key", TelegramHelperProtocol.keyToJson(key))
+                .put("diagnostic", diagnostic).toString().toByteArray(StandardCharsets.UTF_8))
+            atomic.finishWrite(output)
+        } catch (error: Throwable) {
+            try { atomic.failWrite(output) } catch (cleanup: Throwable) { error.addSuppressed(cleanup) }
+            throw error
+        }
     }
 
     fun telegramAck(key: TelegramHelperAttemptKey): TelegramHelperOutcome = synchronized(lock) {
@@ -175,17 +227,18 @@ class HelperTelegramLane @JvmOverloads constructor(
     }
 
     private fun queryLocked(key: TelegramHelperAttemptKey): TelegramHelperOutcome {
+        if (activeByOwner[key.ownerId] == key) return TelegramHelperOutcome(TelegramHelperState.RUNNING)
         persistPendingResult(key.ownerId)
-        val workerFailure = workerFailures[key.ownerId]
-        if (workerFailure?.key == key) {
-            throw workerFailure.asRemoteFailure()
-        }
-        val ledger = readLedger(key.ownerId) ?: return if (key.sequence == 1L) {
+        val ledger = try { readLedger(key.ownerId) } catch (error: CorruptLedger) {
+            return ambiguous(TelegramHelperAmbiguity.LEDGER_CORRUPT,
+                TelegramHelperProtocol.exceptionDiagnostic(error, "telegram_ledger_read"))
+        } ?: return if (key.sequence == 1L) {
             TelegramHelperOutcome(TelegramHelperState.ABSENT)
         } else {
             ambiguous(TelegramHelperAmbiguity.LEDGER_MISSING,
                 "Telegram helper ledger is absent for a noninitial sequence")
         }
+        workerFailures[key.ownerId]?.takeIf { it.key == key }?.let { throw it.asRemoteFailure() }
         val latest = ledger.latest
         if (key.sequence == latest.key.sequence) {
             requireSameKey(latest.key, key)
@@ -197,6 +250,8 @@ class HelperTelegramLane @JvmOverloads constructor(
                         "Telegram HTTP may have started before helper restart")
                 }
                 RESULT, ACKED -> outcome(latest)
+                RECOVERED -> ambiguous(TelegramHelperAmbiguity.LEDGER_RECOVERED,
+                    latest.recoveryDiagnostic ?: "Exact attempt recovered without a known HTTP result")
                 else -> error("invalid Telegram ledger state: ${latest.state}")
             }
         }
@@ -304,12 +359,12 @@ class HelperTelegramLane @JvmOverloads constructor(
             val key = TelegramHelperProtocol.keyFromJson(latest.getJSONObject("key"))
             require(key.ownerId == ownerId) { "Telegram attempt owner mismatch" }
             val state = latest.getString("state")
-            require(state in setOf(STARTED, RESULT, ACKED)) { "invalid Telegram helper ledger state" }
+            require(state in setOf(STARTED, RESULT, ACKED, RECOVERED)) { "invalid Telegram helper ledger state" }
             val result = if (latest.isNull("result")) null else resultFromJson(latest.getJSONObject("result"))
             val confirmedAtMs = if (latest.isNull("confirmed_at_ms")) null else latest.getLong("confirmed_at_ms")
             require(confirmedAtMs == null || confirmedAtMs >= 0L) { "negative Telegram result confirmation time" }
             when (state) {
-                STARTED -> require(result == null && confirmedAtMs == null && acknowledged == key.sequence - 1L) {
+                STARTED, RECOVERED -> require(result == null && confirmedAtMs == null && acknowledged == key.sequence - 1L) {
                     "invalid STARTED Telegram ledger state"
                 }
                 RESULT -> require(result != null && confirmedAtMs != null && acknowledged == key.sequence - 1L) {
@@ -319,8 +374,14 @@ class HelperTelegramLane @JvmOverloads constructor(
                     "invalid ACKED Telegram ledger state"
                 }
             }
-            return Ledger(ownerId, acknowledged, StoredAttempt(key, state, result, confirmedAtMs))
+            val recoveryDiagnostic = nullableString(latest, "recovery_diagnostic")?.also {
+                require(it.length <= TelegramHelperProtocol.MAX_DIAGNOSTIC_CHARS &&
+                    it.toByteArray(StandardCharsets.UTF_8).size <= TelegramHelperProtocol.MAX_DIAGNOSTIC_BYTES)
+            }
+            return Ledger(ownerId, acknowledged, StoredAttempt(key, state, result, confirmedAtMs, recoveryDiagnostic))
         } catch (error: Exception) {
+            if (error !is IOException || error is java.nio.charset.CharacterCodingException)
+                throw CorruptLedger("cannot decode Telegram helper ledger for owner $ownerId", error)
             throw IllegalStateException("cannot read Telegram helper ledger for owner $ownerId", error)
         }
     }
@@ -338,7 +399,8 @@ class HelperTelegramLane @JvmOverloads constructor(
                 .put("key", TelegramHelperProtocol.keyToJson(latest.key))
                 .put("state", latest.state)
                 .put("result", resultToJson(latest.result) ?: JSONObject.NULL)
-                .put("confirmed_at_ms", latest.confirmedAtMs ?: JSONObject.NULL))
+                .put("confirmed_at_ms", latest.confirmedAtMs ?: JSONObject.NULL)
+                .put("recovery_diagnostic", latest.recoveryDiagnostic ?: JSONObject.NULL))
             .toString()
             .toByteArray(StandardCharsets.UTF_8)
         require(payload.size <= MAX_LEDGER_BYTES) { "Telegram helper ledger exceeds size limit" }
@@ -415,7 +477,7 @@ class HelperTelegramLane @JvmOverloads constructor(
         while (true) {
             val count = input.read(buffer)
             if (count < 0) return output.toByteArray()
-            if (output.size() > MAX_LEDGER_BYTES - count) throw IOException("Telegram helper ledger exceeds size limit")
+            require(output.size() <= MAX_LEDGER_BYTES - count) { "Telegram helper ledger exceeds size limit" }
             output.write(buffer, 0, count)
         }
     }
@@ -426,6 +488,8 @@ class HelperTelegramLane @JvmOverloads constructor(
         .decode(ByteBuffer.wrap(bytes))
         .toString()
 
+    private class CorruptLedger(message: String, cause: Throwable) : IllegalStateException(message, cause)
+
     private companion object {
         const val DEFAULT_LEDGER_DIRECTORY = "/data/local/tmp/bydcollector_telegram_lane"
         const val LEDGER_VERSION = 1
@@ -435,5 +499,6 @@ class HelperTelegramLane @JvmOverloads constructor(
         const val STARTED = "STARTED"
         const val RESULT = "RESULT"
         const val ACKED = "ACKED"
+        const val RECOVERED = "RECOVERED"
     }
 }

@@ -341,6 +341,22 @@ class DashboardUiStateStore(
 
     internal fun mainPollSnapshot(): DashboardMainPollState? = synchronized(lock) { mainPollState }
 
+    fun publishCallbackCommit(main: Boolean, sessionId: Long?, completedAt: String) {
+        synchronized(lock) {
+            if (main) {
+                val previous = mainPollState
+                mainPollState = DashboardMainPollState(sessionId, completedAt, previous?.lastError,
+                    previous?.lastErrorAt, "ok at $completedAt", previous?.elapsedMs, previous?.requestCount)
+            } else {
+                val previous = debugPollState
+                debugPollState = DashboardDebugPollState(completedAt, previous?.lastErrorAt,
+                    previous?.lastError, previous?.errorCount ?: 0L, previous?.lastSessionId)
+            }
+            touchOwnerLocked()
+            updateTargetsLocked(setOf(if (main) AppTab.MAIN else AppTab.ALL_PARAMETERS), includeChrome = main)
+        }
+    }
+
     internal fun restoreMainPollState(state: DashboardMainPollState) {
         synchronized(lock) {
             if (mainPollState != null) return

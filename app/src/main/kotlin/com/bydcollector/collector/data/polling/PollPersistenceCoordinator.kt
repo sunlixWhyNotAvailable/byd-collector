@@ -21,6 +21,8 @@ data class PollCycleResult(
     val pollRowsPersisted: Long = 0L,
     val valueRowsPersisted: Long = 0L,
     val deferred: Boolean = false,
+    /** Raw GET failures are retained, but do not describe the independent callback pipeline. */
+    val fieldFailureOnly: Boolean = false,
     /** Remaining delay measured at helper batch-reply time; null keeps the existing poll interval. */
     val nextDueDelayMs: Long? = null
 )
@@ -215,6 +217,7 @@ class PollPersistenceCoordinator(
                         timestamp = timestamp,
                         errorMessage = result.message,
                         pollRowsPersisted = 1L,
+                        fieldFailureOnly = result.fieldFailureOnly,
                         nextDueDelayMs = result.nextDueDelayMs
                     )
                 }

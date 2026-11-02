@@ -30,7 +30,7 @@ data class TelegramHelperAttemptKey(
 
 enum class TelegramHelperState { ABSENT, RUNNING, RESULT, ACKED, AMBIGUOUS }
 
-enum class TelegramHelperAmbiguity { INTERRUPTED_ATTEMPT, LEDGER_MISSING }
+enum class TelegramHelperAmbiguity { INTERRUPTED_ATTEMPT, LEDGER_MISSING, LEDGER_CORRUPT, LEDGER_RECOVERED }
 
 data class TelegramHelperOutcome(
     val state: TelegramHelperState,
@@ -74,6 +74,7 @@ object TelegramHelperProtocol {
     const val TX_SUBMIT = 23
     const val TX_QUERY = 24
     const val TX_ACK = 25
+    const val TX_RECOVER = 26
     const val MAX_IPC_BYTES = 24 * 1024
     const val MAX_BOT_TOKEN_CHARS = 256
     const val MAX_CHAT_ID_CHARS = 256

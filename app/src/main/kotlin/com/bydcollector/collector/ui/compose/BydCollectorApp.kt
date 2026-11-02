@@ -2826,14 +2826,18 @@ private fun ExtraTab(
     session: UiSessionState,
     contentReady: Boolean,
 ) {
-    val optionsCardHeight = 312.dp
+    var leftBodyHeight by remember(language) { mutableStateOf(0) }
+    var rightBodyHeight by remember(language) { mutableStateOf(0) }
+    val optionsCardHeight = maxOf(312.dp,
+        with(LocalDensity.current) { maxOf(leftBodyHeight, rightBodyHeight).toDp() } + 70.dp)
     val shareStage by com.bydcollector.collector.diagnostics.DiagnosticLogRecorder.shareStage.collectAsStateWithLifecycle()
     val logsBusy = diagnosticsBusy || shareStage != null
     TabScrollColumn(AppTab.EXTRA, session, contentReady) {
         ScreenTitle(strings.extraTab, strings.extraSubtitle)
-        Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            SectionCard(strings.keepAlive, Modifier.weight(1f).heightIn(min = optionsCardHeight).fillMaxHeight()) {
-                Column(Modifier.fillMaxWidth()) {
+        // Measure natural bodies, including multiline text; intrinsics can undercount minLines.
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            SectionCard(strings.keepAlive, Modifier.weight(1f).heightIn(min = optionsCardHeight)) {
+                Column(Modifier.fillMaxWidth().onGloballyPositioned { leftBodyHeight = it.size.height }) {
                     SwitchRow(
                         strings.restoreConnectivity,
                         state?.keepWifiEnabled == true && state?.keepMobileDataEnabled == true,
@@ -2913,24 +2917,11 @@ private fun ExtraTab(
                             modifier = Modifier.weight(1f)
                         )
                     }
-                    Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        ActionButton(
-                            shareStage?.let { strings.shareLogStages[it.ordinal] } ?: strings.shareLogs,
-                            actions::onShareLogs,
-                            primary = true,
-                            enabled = !logsBusy && !actionUiState.isPending("jobSubmit:logShare"),
-                            modifier = Modifier.weight(1f)
-                        )
-                        ActionButton(
-                            strings.clearLogs,
-                            onRequestClearLogs,
-                            enabled = !logsBusy && !actionUiState.isPending("jobSubmit:logClear"),
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
                 }
             }
-            SectionCard(strings.appRuntime, Modifier.weight(1f).heightIn(min = optionsCardHeight).fillMaxHeight()) {
+            SectionCard(strings.appRuntime, Modifier.weight(1f).heightIn(min = optionsCardHeight)) {
+                Column(Modifier.fillMaxWidth().onGloballyPositioned { rightBodyHeight = it.size.height },
+                    verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 TailscaleRuntimeRow(
                     strings,
                     state?.tailscaleActivationEnabled == true,
@@ -2959,6 +2950,23 @@ private fun ExtraTab(
                     actions = actions,
                     pending = actionUiState.isPending("shutdown")
                 )
+                Box(Modifier.fillMaxWidth().height(1.dp).background(LocalBydPalette.current.border))
+                Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    ActionButton(
+                        shareStage?.let { strings.shareLogStages[it.ordinal] } ?: strings.shareLogs,
+                        actions::onShareLogs,
+                        primary = true,
+                        enabled = !logsBusy && !actionUiState.isPending("jobSubmit:logShare"),
+                        modifier = Modifier.weight(1f)
+                    )
+                    ActionButton(
+                        strings.clearLogs,
+                        onRequestClearLogs,
+                        enabled = !logsBusy && !actionUiState.isPending("jobSubmit:logClear"),
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                }
             }
         }
     }

@@ -52,6 +52,24 @@ internal class KpiLiveSourceBuffer(
 
     @Synchronized
     fun acceptMailbox(snapshot: DirectKpiMailboxSnapshot, nowElapsedMs: Long): KpiSourceUpdate {
+        val previousInputs = LinkedHashMap(inputs)
+        val previousRecords = HashMap(lastRecords)
+        val previousBoot = helperBootId
+        val previousGeneration = helperGeneration
+        val previousLost = generationLost
+        try {
+            return acceptMailboxLocked(snapshot, nowElapsedMs)
+        } catch (error: Exception) {
+            inputs.clear(); inputs.putAll(previousInputs)
+            lastRecords.clear(); lastRecords.putAll(previousRecords)
+            helperBootId = previousBoot
+            helperGeneration = previousGeneration
+            generationLost = previousLost
+            throw error
+        }
+    }
+
+    private fun acceptMailboxLocked(snapshot: DirectKpiMailboxSnapshot, nowElapsedMs: Long): KpiSourceUpdate {
         if (!snapshot.ok || snapshot.helperBootId.isNullOrBlank() || snapshot.helperGeneration.isNullOrBlank()) {
             return KpiSourceUpdate()
         }

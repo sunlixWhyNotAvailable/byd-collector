@@ -25,6 +25,9 @@ class KeepAliveSupervisor(
 ) {
     private val executor: ExecutorService = namedSingleThreadExecutor("byd-keepalive")
     private val reconcileState = KeepAliveReconcileState(ALIVE_TTL_MS)
+    private val requestLock = Any()
+    private var pendingRequest: Pair<KeepAliveConfig, Boolean>? = null
+    private var requestWorkerQueued = false
     private var installedApkIdentityUnavailableReason = "unknown"
     private var mirroredDiscoveryRequest: String? = null
     private val wifiPolicy = WifiPolicyRecovery(
@@ -33,8 +36,31 @@ class KeepAliveSupervisor(
     ) { category, message, detail -> recordEvent(category, message, detail) }
 
     fun reconcile(config: KeepAliveConfig, forceStatusCheck: Boolean = false) {
-        executor.execute {
-            runReconcileSerialized(config, forceStatusCheck)
+        synchronized(requestLock) {
+            pendingRequest = config to (forceStatusCheck || pendingRequest?.second == true)
+            if (requestWorkerQueued) return
+            requestWorkerQueued = true
+            try {
+                executor.execute {
+                    try {
+                        while (true) {
+                            val request = synchronized(requestLock) {
+                                val next = pendingRequest
+                                pendingRequest = null
+                                if (next == null) requestWorkerQueued = false
+                                next
+                            } ?: return@execute
+                            runReconcileSerialized(request.first, request.second)
+                        }
+                    } catch (error: Exception) {
+                        synchronized(requestLock) { requestWorkerQueued = false }
+                        recordFailure("keep_alive_reconcile_error", "Keep-alive reconciliation failed", error)
+                    }
+                }
+            } catch (error: RuntimeException) {
+                requestWorkerQueued = false
+                throw error
+            }
         }
     }
 

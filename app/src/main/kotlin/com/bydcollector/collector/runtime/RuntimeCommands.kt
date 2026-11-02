@@ -15,6 +15,7 @@ internal object RuntimeCommands {
             "stopDebug" -> Controller.stopDebug(context)
             "reconcileDebug" -> Controller.reconcileDebug(context)
             "reconcileKeepAlive" -> Controller.reconcileKeepAlive(context, args.getBoolean("force"))
+            "checkRuntime" -> Controller.checkRuntime(context, args.getBoolean("force"))
             "startMqttExport" -> Controller.startMqttExport(context)
             "stopMqttExport" -> Controller.stopMqttExport(context)
             "reconcileMqttExport" -> Controller.reconcileMqttExport(context)

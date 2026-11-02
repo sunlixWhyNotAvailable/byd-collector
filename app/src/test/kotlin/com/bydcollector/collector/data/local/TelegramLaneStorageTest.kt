@@ -4,6 +4,7 @@ import android.app.Application
 import android.os.Parcel
 import com.bydcollector.collector.direct.HelperTelegramLane
 import com.bydcollector.collector.telegram.TelegramHelperAttemptKey
+import com.bydcollector.collector.telegram.TelegramHelperAmbiguity
 import com.bydcollector.collector.telegram.TelegramHelperProtocol
 import com.bydcollector.collector.telegram.TelegramHelperRemoteFailure
 import com.bydcollector.collector.telegram.TelegramHelperState
@@ -30,6 +31,78 @@ import kotlin.test.assertTrue
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
 class TelegramLaneStorageTest {
+    @Test fun damagedTimingRetainsIndependentStateOutboxAndOriginalEvidenceAcrossReopen() {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "tg_state_recovery_${System.nanoTime()}.db"
+        fun openStore() = TelegramStore(context, TelegramDatabaseHelper(context, name))
+        val raw = """{"initialized":true,"tripId":"trip-kept","chargeGunConnected":true,
+            "fullSent":true,"detectorTiming":{"version":999,"reported_power":"power-kept"}}"""
+        try {
+            openStore().use { store ->
+                store.commitTelegramEvents(listOf(TelegramOutboxMessage("kept", "test", "payload")), raw)
+                var failure: Exception? = null
+                var evidenceName: String? = null
+                val recovered = store.loadTelegramRuntimeState { error, evidence ->
+                    failure = error
+                    evidenceName = evidence
+                }
+                assertIs<IllegalArgumentException>(failure)
+                assertEquals("trip-kept", recovered.tripId)
+                assertEquals(true, recovered.chargeGunConnected)
+                assertTrue(recovered.fullSent)
+                assertEquals("power-kept", recovered.detectorTiming.reportedPowerSessionId)
+                val evidence = File(File(store.databaseFile().parentFile, "telegram-state-recovery"), assertNotNull(evidenceName))
+                assertEquals(raw, org.json.JSONObject(evidence.readText()).getString("state"))
+            }
+            openStore().use { store ->
+                assertEquals("trip-kept", store.loadTelegramRuntimeState { _, _ -> error("Already recovered") }.tripId)
+                assertEquals(1L, store.diagnosticSnapshot().outboxTotal)
+            }
+        } finally { context.deleteDatabase(name) }
+    }
+
+    @Test fun missingAndCorruptLedgerRecoverWithoutSendingAndAllowTheNextAttempt() {
+        val directory = File(RuntimeEnvironment.getApplication().cacheDir, "tg_recovery_${System.nanoTime()}")
+        val request = TelegramSendMessage("invalid!token", "chat", "body")
+        var key = TelegramHelperAttemptKey(UUID.randomUUID(), UUID.randomUUID(), 2L,
+            TelegramHelperProtocol.requestDigest(request), TelegramHelperProtocol.destinationDigest(request), sha("event"))
+        var lane = HelperTelegramLane(directory)
+        try {
+            assertEquals(TelegramHelperAmbiguity.LEDGER_MISSING, lane.telegramQuery(key).ambiguity)
+            assertEquals(TelegramHelperAmbiguity.LEDGER_RECOVERED, lane.telegramRecover(key).ambiguity)
+            assertTrue(lane.closeAfterDrain())
+            lane = HelperTelegramLane(directory)
+            assertEquals(TelegramHelperAmbiguity.LEDGER_RECOVERED, lane.telegramQuery(key).ambiguity)
+            assertNull(lane.telegramQuery(key).result)
+            assertEquals(TelegramHelperState.ACKED, lane.telegramAck(key).state)
+
+            key = key.copy(attemptId = UUID.randomUUID(), sequence = 3L)
+            lane.telegramSubmit(key, request)
+            assertTrue(lane.awaitHttpIdle(5_000L))
+            assertEquals(TelegramSendFailureKind.CONFIGURATION,
+                assertIs<TelegramSendResult.Failure>(lane.telegramQuery(key).result).kind)
+            // Real corrupt bytes on disk, not an injected Binder/HTTP outcome.
+            File(directory, "${key.ownerId}.json").writeText("{broken-ledger")
+            assertEquals(TelegramHelperAmbiguity.LEDGER_CORRUPT, lane.telegramQuery(key).ambiguity)
+            val recovered = lane.telegramRecover(key)
+            assertEquals(TelegramHelperAmbiguity.LEDGER_RECOVERED, recovered.ambiguity)
+            assertTrue(assertNotNull(recovered.diagnostic).contains("JSONException"))
+            assertTrue(File(directory, "recovery-${key.attemptId}").listFiles()!!.any { it.readText() == "{broken-ledger" })
+            assertEquals(TelegramHelperState.ACKED, lane.telegramAck(key).state)
+            assertTrue(lane.closeAfterDrain())
+            lane = HelperTelegramLane(directory)
+            key = key.copy(attemptId = UUID.randomUUID(), sequence = 4L)
+            lane.telegramSubmit(key, request)
+            assertTrue(lane.awaitHttpIdle(5_000L))
+            assertEquals(TelegramSendFailureKind.CONFIGURATION,
+                assertIs<TelegramSendResult.Failure>(lane.telegramQuery(key).result).kind)
+        } finally {
+            lane.awaitHttpIdle(5_000L)
+            lane.closeAfterDrain()
+            directory.deleteRecursively()
+        }
+    }
+
     @Test fun overflowEvictsWholeDependencyGroupAndRepairsOldOrphans() {
         val context = RuntimeEnvironment.getApplication()
         val name = "tg_groups_${System.nanoTime()}.db"

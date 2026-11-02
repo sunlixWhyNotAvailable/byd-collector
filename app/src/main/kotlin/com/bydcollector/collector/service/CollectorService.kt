@@ -210,6 +210,10 @@ class CollectorService : Service() {
     private lateinit var callbackNormalizer: CallbackNormalizationWorker
     private lateinit var deferredEnergyWorker: CallbackNormalizationWorker
     private lateinit var businessWorker: CallbackNormalizationWorker
+    private val mainPollFailure = java.util.concurrent.atomic.AtomicReference<PollCycleResult?>(null)
+    private val lastMainCallbackCommitWallMs = AtomicLong(0L)
+    @Volatile private var mainNormalizationFault: String? = null
+    @Volatile private var mainBusinessFault: String? = null
     private val businessDrainLock = Any()
     private val pendingMainSourceLoss = java.util.concurrent.ConcurrentLinkedQueue<DirectCallbackSourceLoss>()
     private val observedCallbackLoss = arrayOfNulls<String>(2)
@@ -298,6 +302,8 @@ class CollectorService : Service() {
     private var lastNotificationText: String? = null
     private var accessSelfCheckScheduled = false
     private var mainStartRetryScheduled = false
+    private var runtimeHealthCheckQueued = false
+    private var runtimeHealthForceKeepAlive = false
     private var debugStartRetryScheduled = false
     private val debugStartRetryTask = Runnable {
         debugStartRetryScheduled = false
@@ -601,6 +607,7 @@ class CollectorService : Service() {
             threadName = "byd-callback-normalizer",
             drainPage = ::normalizeCallbackPage,
             onFault = { error ->
+                mainNormalizationFault = error.diagnosticDetail("Main callback normalization")
                 store.recordEvent("callback_normalization_error", "Main callback normalization failed", error.diagnosticDetail())
             }
         )
@@ -624,8 +631,11 @@ class CollectorService : Service() {
         )
         businessWorker = CallbackNormalizationWorker(
             threadName = "byd-business-inputs",
-            drainPage = { drainBusinessPage() },
-            onFault = { error -> store.recordEvent("business_input_error", "Business input remains pending", error.diagnosticDetail()) }
+            drainPage = { drainBusinessPage().also { mainBusinessFault = null } },
+            onFault = { error ->
+                mainBusinessFault = error.diagnosticDetail("Main business input")
+                store.recordEvent("business_input_error", "Business input remains pending", error.diagnosticDetail())
+            }
         )
         poller = createTelemetryPoller()
         maintenanceCoordinator = DbMaintenanceCoordinator(
@@ -764,6 +774,10 @@ class CollectorService : Service() {
             return START_STICKY
         }
         if (stickyRestart) reconcilePendingCutoverArchiveStorage(action)
+        if (action == ACTION_CHECK_RUNTIME) {
+            queueRuntimeHealthCheck(forceKeepAliveStatusCheck)
+            return START_STICKY
+        }
         if (stickyRestart) {
             reconcilePersistedRuntime(resetCollectionToAutoStartDemand = true)
         } else when (action) {
@@ -982,7 +996,7 @@ class CollectorService : Service() {
                         if (isOwnedPollerCurrent() && result !is com.bydcollector.collector.data.remote.TelemetryReadResult.ReplayPending) {
                             val failure = result as? com.bydcollector.collector.data.remote.TelemetryReadResult.Failure
                             telegramTelemetryHealth.observe(TelegramTelemetryHealth.Channel.READ, ticket,
-                                failure?.let { "${it.category}: ${it.message}" }, System.currentTimeMillis())
+                                failure?.takeUnless { it.fieldFailureOnly }?.let { "${it.category}: ${it.message}" }, System.currentTimeMillis())
                         }
                         return result
                     } catch (error: Exception) {
@@ -1036,6 +1050,8 @@ class CollectorService : Service() {
             },
             onRuntimeError = { error ->
                 if (ownsCurrentPollerSlot()) {
+                    mainPollFailure.set(PollCycleResult(null, false, "poller_runtime_error", 0L, 0,
+                        errorMessage = error.diagnosticDetail("Main poller")))
                     store.recordEvent("poller_runtime_error", "Main poller cycle failed", error.diagnosticDetail())
                 }
             },
@@ -1246,6 +1262,7 @@ class CollectorService : Service() {
             },
             importBatch = { batch, digest, delivery ->
                 val application = applicationContext as BydCollectorApplication
+                val previousFailure = mainPollFailure.get()
                 val gate = if (stream == CollectorHelperProtocol.STREAM_MAIN) application.databaseMaintenanceGate
                     else application.secondaryDatabaseMaintenanceGate
                 val imported = gate.withRead {
@@ -1255,6 +1272,22 @@ class CollectorService : Service() {
                     else debugStore.importCallbackBatch(batch, digest, delivery)
                 }
                 if (imported is com.bydcollector.collector.data.callback.CallbackImportResult.Committed && !imported.duplicate) {
+                    if (imported.eventCount > 0) {
+                        val main = stream == CollectorHelperProtocol.STREAM_MAIN
+                        if (main) lastMainCallbackCommitWallMs.set(System.currentTimeMillis())
+                        if (main && previousFailure?.category == "db_write_error")
+                            mainPollFailure.compareAndSet(previousFailure, null)
+                        dashboardUiStateStore.publishCallbackCommit(main, sessionId,
+                            checkNotNull(DisplayTimeFormatter.formatNullable(java.time.Instant.now().toString())))
+                        if (main) mainHandler.post {
+                            if (mainPollingRunning.get()) {
+                                publishStatusHeartbeat()
+                                if (mainCollectionQueueState()?.phase != com.bydcollector.collector.data.callback.CallbackQueuePhase.ERROR)
+                                    updateNotification(notificationText(true, isDebugPollerRunning(),
+                                        settings.keepAliveConfig().anyEnabled, settings.isTelegramEnabled()))
+                            }
+                        }
+                    }
                     if (stream == CollectorHelperProtocol.STREAM_MAIN) {
                         callbackNormalizer.signal()
                         businessWorker.signal()
@@ -1279,6 +1312,7 @@ class CollectorService : Service() {
         normalizationProgress = NormalizationProgress(result.processedCount, result.oldestPageReceivedWallMs,
             System.currentTimeMillis(), result.hasMore)
         if (result.summary.observedCount > 0) publishNormalizedWrite(result.summary, result.appliedObservations)
+        mainNormalizationFault = null
         result.hasMore
     }
 
@@ -1678,6 +1712,74 @@ class CollectorService : Service() {
         CollectorAutoStart.scheduleWatchdog(applicationContext, settings, store)
     }
 
+    private fun queueRuntimeHealthCheck(forceKeepAlive: Boolean) {
+        requireRuntimeOwner()
+        runtimeHealthForceKeepAlive = runtimeHealthForceKeepAlive || forceKeepAlive
+        if (runtimeHealthCheckQueued) return
+        runtimeHealthCheckQueued = true
+        mainHandler.post {
+            runtimeHealthCheckQueued = false
+            val force = runtimeHealthForceKeepAlive
+            runtimeHealthForceKeepAlive = false
+            if (!running.get() || serviceDestroyed.get() || settings.isUserShutdownRequested() ||
+                maintenanceBlocksRuntimeStart()) return@post
+            val demand = settings.runtimeDemand()
+            val repaired = mutableListOf<String>()
+            fun repair(channel: String, needed: Boolean, action: () -> Unit) {
+                if (!needed) return
+                try { action(); repaired += channel } catch (error: Exception) {
+                    try {
+                        store.recordEvent("runtime_health_repair_error", "Runtime recovery failed",
+                            error.diagnosticDetail("channel=$channel"))
+                    } catch (loggingError: Exception) {
+                        error.addSuppressed(loggingError)
+                        android.util.Log.e("CollectorService", "Runtime recovery failed: $channel", error)
+                    }
+                }
+            }
+            repair("kpi", kpiWorker?.isAlive != true) { startKpiWorker() }
+            if (demand.main && !mainStartInProgress.get() && !mainStartRetryScheduled) {
+                if (poller.isRunning()) {
+                    repair("main_business", !businessWorker.isRunning()) { check(businessWorker.start()) { "Main business worker still stopping" } }
+                    repair("main_normalizer", !callbackNormalizer.isRunning()) { check(callbackNormalizer.start()) { "Main normalizer still stopping" } }
+                    repair("main_callback", !mainCallbackIntake.isRunning()) { check(mainCallbackIntake.start()) { "Main callback worker still stopping" } }
+                } else repair("main", true) { startMainIfNeeded() }
+            }
+            if (demand.debug && !debugStartInProgress.get() && !debugStartRetryScheduled) {
+                if (isDebugPollerRunning()) {
+                    repair("secondary_callback", !secondaryCallbackIntake.isRunning()) { check(secondaryCallbackIntake.start()) { "Secondary callback worker still stopping" } }
+                } else repair("secondary", true) { startDebugIfNeeded(DEBUG_REASON_AUTOSTART) }
+            }
+            repair("mqtt", demand.mqtt && !mqttConnection.stopping && !mqttOfflineQueued.get() && !mqttRetryScheduled &&
+                (!mqttRuntimeActive.get() || mqttTerminalError || synchronized(mqttExecutorLock) { mqttExecutor.isShutdown })) {
+                startMqttExport(clearManualStop = false)
+            }
+            repair("influx", demand.influx && !influxConnection.stopping && !influxRetryScheduled &&
+                !influxRequestQueued.get() && influxWorkInFlight.get() == 0 &&
+                (!influxConnection.owned || !influxCoordinator.sessionFrozen || influxTerminalError)) {
+                startInfluxExport(clearManualStop = false)
+            }
+            repair("telegram", demand.telegram && !telegramStorageRecoveryInFlight.get() &&
+                (telegramCoordinator == null || !telegramDeliveryRuntime.isAttachedTo(this))) {
+                if (telegramCoordinator != null) telegramCoordinator = createTelegramCoordinator()
+                reconcileTelegramRuntime()
+            }
+            if (telegramDeliveryRuntime.hasPendingResult) telegramDeliveryRuntime.retryPendingResult()
+            // This supervisor checks its own daemon/config cache; one periodic health signal remains.
+            if (demand.keepAlive || settings.hasPendingWifiPolicy() || force) {
+                keepAliveSupervisor.reconcile(settings.keepAliveConfig(), forceStatusCheck = force)
+            }
+            if (repaired.isNotEmpty()) {
+                configureDesiredStreams()
+                reconcilePersistedHelperStateAsync()
+                publishDashboardRuntimeFlags()
+            }
+            store.recordEvent("runtime_health_checked", "Runtime recovery check completed",
+                "recovery_requested=${repaired.joinToString(",").ifEmpty { "none" }} force_keepalive=$force")
+            CollectorAutoStart.scheduleWatchdog(applicationContext, settings, store)
+        }
+    }
+
     private fun reconcileInfluxAutoStart() {
         if (!settings.runtimeDemand().influx) {
             if (influxWorkInFlight.get() == 0 && !settings.isInfluxEnabled() && !influxConnection.stopping) influxConnection.release()
@@ -1944,7 +2046,6 @@ class CollectorService : Service() {
         setMainRuntime(RuntimeActionStatus.STARTING)
         val ownerMode = DirectHelperOwnerMode.APP_GAP_SPOOL
         if (mainPollerOwnerMode != ownerMode) poller = createTelemetryPoller(ownerMode)
-        mqttRuntimeActive.set(false)
         startupExecutor.execute {
             try {
                 (applicationContext as BydCollectorApplication).withDatabaseRead {
@@ -2219,18 +2320,9 @@ class CollectorService : Service() {
                                 }.onSuccess { lastDebugReadModeKey = diagnostics.stateKey }
                             }
                         }
-                        if (summary.errorCount > 0 && summary.okCount == 0) {
-                            updateNotification("Polling error: debug helper returned errors")
-                        } else {
-                            updateNotification(
-                                notificationText(
-                                    settings.isPollingEnabled(),
-                                    true,
-                                    settings.keepAliveConfig().anyEnabled,
-                                    settings.isTelegramEnabled()
-                                )
-                            )
-                        }
+                        // Per-field failures are stored above; a committed sparse cycle is not a stopped stream.
+                        updateNotification(notificationText(settings.isPollingEnabled(), true,
+                            settings.keepAliveConfig().anyEnabled, settings.isTelegramEnabled()))
                     }
                 )
                     val started = runOnRuntimeOwnerBlocking {
@@ -3152,11 +3244,20 @@ class CollectorService : Service() {
                 adbAuthorized = access.adbAuthorized,
                 dbMaintenanceStatus = settings.dbMaintenanceStatus(),
                 archiveStorageJobStatus = settings.archiveStorageJobStatus(),
-                mainCallbackQueue = if (::mainCallbackIntake.isInitialized) mainCallbackIntake.snapshotQueueState() else null,
+                mainCallbackQueue = mainCollectionQueueState(),
                 secondaryCallbackQueue = if (::secondaryCallbackIntake.isInitialized)
                     secondaryCallbackIntake.snapshotQueueState() else null
             )
         )
+    }
+
+    private fun mainCollectionQueueState(): com.bydcollector.collector.data.callback.CallbackQueueState? {
+        if (!::mainCallbackIntake.isInitialized) return null
+        val fault = mainPollFailure.get()?.let { "${it.category}: ${it.errorMessage.orEmpty()}" }
+            ?: mainNormalizationFault ?: mainBusinessFault
+        return if (fault != null) com.bydcollector.collector.data.callback.CallbackQueueState(
+            com.bydcollector.collector.data.callback.CallbackQueuePhase.ERROR, fault)
+        else mainCallbackIntake.snapshotQueueState()
     }
 
     private fun reportKpiDiagnosticsIfDue() {
@@ -3398,6 +3499,12 @@ class CollectorService : Service() {
         val launcher = DirectTelemetryClient(applicationContext, helper = helper,
             expectedOwnerMode = DirectHelperOwnerMode.APP_GAP_SPOOL, ensureStreamReady = { true })
         val sourceBuffer = KpiLiveSourceBuffer()
+        var pendingSourceUpdate: KpiSourceUpdate? = null
+        fun applySourceUpdate(update: KpiSourceUpdate) {
+            pendingSourceUpdate = update
+            applyKpiSourceUpdate(update)
+            pendingSourceUpdate = null
+        }
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         val helperWasReady = AtomicBoolean(false)
         var callbackWorker: KpiCallbackDrainWorker? = null
@@ -3410,15 +3517,17 @@ class CollectorService : Service() {
                 onSubscription = { result ->
                     if (isKpiRuntimeCurrent(generation)) {
                         kpiFallbackReason = result.listenerError?.take(256) ?: "listener_${result.listenerStatus}"
-                        applyKpiSourceUpdate(sourceBuffer.acceptSubscription(
+                        pendingSourceUpdate = null
+                        applySourceUpdate(sourceBuffer.acceptSubscription(
                             result.helperBootId, result.helperGeneration, result.listenerStatus))
                     }
                 },
                 onSnapshot = { snapshot ->
                     if (isKpiRuntimeCurrent(generation)) {
-                        kpiMailboxSnapshots.incrementAndGet()
+                        pendingSourceUpdate?.let(::applySourceUpdate)
                         kpiFallbackReason = snapshot.listenerError?.take(256) ?: "listener_${snapshot.listenerStatus}"
-                        applyKpiSourceUpdate(sourceBuffer.acceptMailbox(snapshot, SystemClock.elapsedRealtime()))
+                        applySourceUpdate(sourceBuffer.acceptMailbox(snapshot, SystemClock.elapsedRealtime()))
+                        kpiMailboxSnapshots.incrementAndGet()
                     }
                 },
                 onListenerStatus = { status ->
@@ -3432,9 +3541,16 @@ class CollectorService : Service() {
                         signalKpiWorker()
                     }
                 },
+                onConsumerFailure = { reason ->
+                    if (isKpiRuntimeCurrent(generation)) {
+                        kpiFallbackReason = reason.take(256)
+                        queueKpiDiagnostic("kpi_consumer_error", reason)
+                    }
+                },
                 onConfirmedSourceLoss = { loss ->
                     if (isKpiRuntimeCurrent(generation)) {
-                        applyKpiSourceUpdate(sourceBuffer.confirmedHelperDeath(
+                        pendingSourceUpdate = null
+                        applySourceUpdate(sourceBuffer.confirmedHelperDeath(
                             loss.helperBootId, loss.helperGeneration, loss.reason ?: "helper_binder_died",
                             loss.diagnostic, requireNotNull(loss.observedWallMs),
                             requireNotNull(loss.observedElapsedMs)))
@@ -3993,15 +4109,23 @@ class CollectorService : Service() {
     private fun handlePollCycleResult(result: com.bydcollector.collector.data.polling.PollCycleResult) {
         if (result.pollRowsPersisted > 0L) scheduleDatabaseFootprintRefresh(force = false)
         // Busy transport is neither a fresh sample nor a collection failure.
-        if (result.deferred) return
+        if (result.deferred) {
+            // NoReadDue confirms a responsive getter, but says nothing about a failed DB write.
+            if (result.nextDueDelayMs != null) mainPollFailure.get()?.let { previous ->
+                if (previous.category != "db_write_error") mainPollFailure.compareAndSet(previous, null)
+            }
+            return
+        }
+        mainPollFailure.set(result.takeUnless { it.ok || it.fieldFailureOnly })
+        if (result.fieldFailureOnly) return // Original raw failure and quality already persisted by the poll coordinator.
         val completedAt = DisplayTimeFormatter.formatNullable(result.timestamp ?: java.time.Instant.now().toString())
         val errorSummary = if (result.ok) null else PollingErrorSummaries.summary(result.category, result.errorMessage)
         dashboardUiStateStore.publishMainPollState(
             DashboardMainPollState(
                 activeSessionId = sessionId,
                 lastSuccessAt = if (result.ok) completedAt else dashboardUiStateStore.mainPollSnapshot()?.lastSuccessAt,
-                lastError = errorSummary,
-                lastErrorAt = if (result.ok) null else completedAt,
+                lastError = errorSummary ?: dashboardUiStateStore.mainPollSnapshot()?.lastError,
+                lastErrorAt = if (result.ok) dashboardUiStateStore.mainPollSnapshot()?.lastErrorAt else completedAt,
                 lastPollStatus = if (result.ok) {
                     completedAt?.let { "ok at $it" } ?: "ok"
                 } else {
@@ -4696,8 +4820,8 @@ class CollectorService : Service() {
     }
 
     private fun publishStatusHeartbeat(
-        result: com.bydcollector.collector.data.polling.PollCycleResult,
-        force: Boolean
+        result: com.bydcollector.collector.data.polling.PollCycleResult? = null,
+        force: Boolean = false
     ) {
         if (settings.isUserShutdownRequested() || !settings.isMqttEnabled()) return
         val now = SystemClock.elapsedRealtime()
@@ -4710,20 +4834,27 @@ class CollectorService : Service() {
         }
     }
 
-    private fun statusHeartbeat(result: com.bydcollector.collector.data.polling.PollCycleResult): HaMqttStatus {
+    private fun statusHeartbeat(result: com.bydcollector.collector.data.polling.PollCycleResult?): HaMqttStatus {
         val health = store.healthSnapshot(
             running = poller.isRunning(),
             detail = HealthSnapshotDetail.SUMMARY,
             includeCounts = false
         )
+        val queue = mainCollectionQueueState()
+        val failed = queue?.phase == com.bydcollector.collector.data.callback.CallbackQueuePhase.ERROR ||
+            (queue == null && result?.ok == false && !result.fieldFailureOnly)
+        val callbackSuccess = lastMainCallbackCommitWallMs.get().takeIf { it > 0L }?.let(java.time.Instant::ofEpochMilli)
+        val lastSuccess = listOfNotNull(callbackSuccess, health.lastSuccessAt?.let {
+            runCatching { java.time.Instant.parse(it) }.getOrNull()
+        }).maxOrNull()?.toString() ?: health.lastSuccessAt
         return HaMqttStatus(
             availability = "online",
             polling = poller.isRunning(),
-            collectorStatus = if (result.ok) "polling" else "polling_error",
+            collectorStatus = if (failed) "polling_error" else "polling",
             adb = if (AdbAuthorizationManager.currentSnapshot().adbAuthorized) "authorized" else "not_authorized",
             helper = DirectBridgeManager.status(),
-            lastSuccessAt = health.lastSuccessAt,
-            lastError = if (result.ok) health.lastError else health.lastError ?: result.category,
+            lastSuccessAt = lastSuccess,
+            lastError = if (failed) queue?.reason ?: result?.errorMessage ?: health.lastError else health.lastError,
             categories = mqttCategoryStatus()
         )
     }
@@ -5996,6 +6127,7 @@ class CollectorService : Service() {
         val ACTION_STOP: String = "${BuildConfig.ACTION_PREFIX}.action.STOP"
         val ACTION_START_DEBUG: String = "${BuildConfig.ACTION_PREFIX}.action.START_DEBUG"
         val ACTION_RECONCILE_DEBUG: String = "${BuildConfig.ACTION_PREFIX}.action.RECONCILE_DEBUG"
+        val ACTION_CHECK_RUNTIME: String = "${BuildConfig.ACTION_PREFIX}.action.CHECK_RUNTIME"
         val ACTION_STOP_DEBUG: String = "${BuildConfig.ACTION_PREFIX}.action.STOP_DEBUG"
         val ACTION_RECONCILE_KEEP_ALIVE: String = "${BuildConfig.ACTION_PREFIX}.action.RECONCILE_KEEP_ALIVE"
         val ACTION_START_MQTT_EXPORT: String = "${BuildConfig.ACTION_PREFIX}.action.START_MQTT_EXPORT"
@@ -6182,6 +6314,11 @@ class CollectorService : Service() {
 
         fun startDebugIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {
             action = ACTION_START_DEBUG
+        }
+
+        fun checkRuntimeIntent(context: Context, force: Boolean): Intent = Intent(context, CollectorService::class.java).apply {
+            action = ACTION_CHECK_RUNTIME
+            putExtra(EXTRA_FORCE_KEEP_ALIVE_STATUS_CHECK, force)
         }
 
         fun reconcileDebugIntent(context: Context): Intent = Intent(context, CollectorService::class.java).apply {

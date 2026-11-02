@@ -872,6 +872,48 @@ class TelegramStore(
         emptyArray()
     ).use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
 
+    @Synchronized
+    fun loadTelegramRuntimeState(onRecovery: (Exception, String) -> Unit): TelegramEventState {
+        val db = helper.writableDatabase
+        var recovery: Pair<Exception, String>? = null
+        val state: TelegramEventState
+        db.beginTransaction()
+        try {
+            val raw = telegramRuntimeState()
+            state = try { TelegramEventState.fromJson(raw) } catch (error: Exception) {
+                try {
+                    val original = checkNotNull(raw)
+                    val directory = java.io.File(databaseFile().parentFile, "telegram-state-recovery")
+                    check(directory.isDirectory || directory.mkdirs()) { "Cannot retain Telegram detector-state evidence" }
+                    val evidence = java.io.File(directory,
+                        "${com.bydcollector.collector.diagnostics.diagnosticSha256(original)}.json")
+                    val atomic = android.util.AtomicFile(evidence)
+                    val output = atomic.startWrite()
+                    try {
+                        output.write(org.json.JSONObject().put("state", original)
+                            .put("error", error.stackTraceToString()).toString().toByteArray(Charsets.UTF_8))
+                        atomic.finishWrite(output)
+                    } catch (saveError: Exception) {
+                        try { atomic.failWrite(output) } catch (cleanup: Exception) { saveError.addSuppressed(cleanup) }
+                        throw saveError
+                    }
+                    val recovered = TelegramEventState.recoverJson(original)
+                    saveTelegramRuntimeState(db, recovered.toJson(), clockMs())
+                    recovery = error to evidence.name
+                    recovered
+                } catch (recoveryError: Exception) {
+                    error.addSuppressed(recoveryError)
+                    throw error
+                }
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        recovery?.let { onRecovery(it.first, it.second) }
+        return state
+    }
+
     /** Reads only bounded, redacted delivery metadata; payloads and errors never leave this store. */
     @Synchronized
     internal fun diagnosticSnapshot(limit: Int = 64): TelegramDiagnosticSnapshot {
@@ -987,15 +1029,14 @@ class TelegramStore(
     }
 
     private fun saveTelegramRuntimeState(db: SQLiteDatabase, stateJson: String, nowMs: Long) {
-        db.insertWithOnConflict(
+        db.replaceOrThrow(
             "telegram_runtime_state",
             null,
             ContentValues().apply {
                 put("id", 1)
                 put("state_json", stateJson)
                 put("updated_at_ms", nowMs)
-            },
-            SQLiteDatabase.CONFLICT_REPLACE
+            }
         )
     }
 

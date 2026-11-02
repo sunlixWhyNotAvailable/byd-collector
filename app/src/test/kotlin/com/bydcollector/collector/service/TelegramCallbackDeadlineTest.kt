@@ -41,6 +41,17 @@ class TelegramCallbackDeadlineTest {
     private fun tick(engine: TelegramEventEngine, elapsed: Long) =
         engine.onDetectorTimer(config, base + elapsed, "boot", elapsed, normalizer)
 
+    @Test fun unreadableStateBaselinesCurrentConditionsWithoutReplayingOldNotifications() {
+        assertFails { TelegramEventState.fromJson("{broken") }
+        val recovered = TelegramEventState.recoverJson("{broken")
+        val engine = TelegramEventEngine(TelegramEventState.fromJson(recovered.toJson()))
+        assertTrue(input(engine, 0, GUN to "2", SOC to "100", BMS to "1",
+            VOLTAGE to 11f.toRawBits().toString()).events.isEmpty())
+        assertTrue(tick(engine, 61_000L).events.isEmpty())
+        input(engine, 62_000L, GUN to "1")
+        assertTrue(tick(engine, 65_000L).events.any { it.type == TelegramEventType.CHARGE_GUN_DISCONNECTED })
+    }
+
     @Test fun singleCableAndChargingEdgesSurviveAppRestartAndConfirmWithoutMoreSamples() {
         val engine = TelegramEventEngine()
         input(engine, 0, GUN to "1")
@@ -67,6 +78,36 @@ class TelegramCallbackDeadlineTest {
         input(engine, 2000, GUN to "2")
         assertTrue(tick(engine, 2999).events.isEmpty())
         assertEquals(listOf(TelegramEventType.CHARGE_GUN_CONNECTED), tick(engine, 3000).events.map { it.type })
+    }
+
+    @Test fun briefDisconnectIsCancelledAndPersistentDisconnectSurvivesRestart() {
+        val engine = TelegramEventEngine()
+        input(engine, 0, GUN to "2")
+        input(engine, 100, GUN to "1")
+        assertTrue(tick(engine, 1100).events.isEmpty())
+        assertTrue(input(engine, 1101, GUN to "2").events.isEmpty())
+        assertTrue(tick(engine, 4101).events.isEmpty())
+        val candidate = input(engine, 5000, GUN to "1")
+        val restored = TelegramEventEngine(TelegramEventState.fromJson(candidate.state.toJson()))
+        assertTrue(tick(restored, 7999).events.isEmpty())
+        assertEquals(listOf(TelegramEventType.CHARGE_GUN_DISCONNECTED), tick(restored, 8000).events.map { it.type })
+        assertTrue(tick(restored, 9000).events.isEmpty())
+    }
+
+    @Test fun legacyDisconnectDeadlineIsExtendedOnceFromItsOriginalStart() {
+        val engine = TelegramEventEngine()
+        input(engine, 0, GUN to "2")
+        val candidate = input(engine, 100, GUN to "1")
+        val legacy = org.json.JSONObject(candidate.state.toJson())
+        legacy.getJSONObject("detectorTiming").getJSONObject("pending").getJSONObject("gun").apply {
+            remove("duration")
+            put("elapsed", 1100L)
+        }
+        val restored = TelegramEventEngine(TelegramEventState.fromJson(legacy.toString()))
+        assertTrue(tick(restored, 1100).events.isEmpty())
+        val reopened = TelegramEventEngine(TelegramEventState.fromJson(restored.state.toJson()))
+        assertTrue(tick(reopened, 3099).events.isEmpty())
+        assertEquals(listOf(TelegramEventType.CHARGE_GUN_DISCONNECTED), tick(reopened, 3100).events.map { it.type })
     }
 
     @Test fun lateSocSeedsProgressAndQuietLowVoltageHasARealDeadline() {
