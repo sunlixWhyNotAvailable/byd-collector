@@ -17,8 +17,11 @@ import android.provider.Settings
 import android.view.Display
 import com.bydcollector.collector.BydCollectorApplication
 import com.bydcollector.collector.service.CollectorSettings
+import com.bydcollector.collector.service.CollectorService
+import com.bydcollector.collector.service.CollectorServiceController
+import com.bydcollector.collector.util.diagnosticDetail
 
-/** Owns the existing check schedule without retaining an Activity or starting vehicle work. */
+/** Owns the existing check schedule; POWER comes from the independent live KPI channel. */
 internal class UpdateRuntime(private val app: BydCollectorApplication) {
     private val handler = Handler(Looper.getMainLooper())
     private val settings = CollectorSettings(app)
@@ -52,9 +55,13 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
     private var lastDisplayState: Int? = null
     var ownUiVisible = false
         private set
-    private val timer = Runnable { applyAction(UpdateAutoCheckRuntime.onTimerElapsed(enabled(), ownUiVisible)) }
+    private val timer = Runnable {
+        reconcileConditions("timer")
+        applyAction(UpdateAutoCheckRuntime.onTimerElapsed(enabled(), ownUiVisible))
+    }
     private val checkListener: () -> Unit = {
         handler.post {
+            reconcileConditions("check_result")
             val snapshot = app.updateChecks.snapshot()
             if (app.updateHints.activeResultId != null && app.updateHints.activeResultId != snapshot.availableResultId) {
                 cancelHintPresentation("stale_result")
@@ -74,19 +81,37 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
         if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.controlAsync("updateStart"); return }
         if (settings.isUserShutdownRequested()) return
         val firstEntry = !started
-        val wasSleeping = wakePolicy.sleeping
-        val newWake = wakePolicy.onEntry(SystemClock.elapsedRealtime(), isInteractive())
         if (firstEntry) {
             started = true
             observeWake()
             app.recordUpdateEvent("runtime_started", "source=$source auto_enabled=${enabled()}")
         }
-        when {
-            newWake -> restartAfterWake(source)
-            wakePolicy.sleeping -> if (firstEntry || !wasSleeping) pauseForSleep()
-            firstEntry -> applyAction(UpdateAutoCheckRuntime.onRuntimeStarted(enabled()))
+        val changed = reconcileConditions(source)
+        if (firstEntry && !changed) {
+            if (wakePolicy.ready) applyAction(UpdateAutoCheckRuntime.onRuntimeStarted(enabled()))
+            else pauseForConditions(source)
         }
+        if (firstEntry && source != "collector_service") ensurePowerSource()
         processCompletions()
+    }
+
+    /** Called on the runtime owner thread after KPI source identity/sequence validation. */
+    fun onVehiclePowerChanged(level: Int?, source: String) {
+        if (BuildConfig.RUNTIME_CLIENT || settings.isUserShutdownRequested()) return
+        val validLevel = level?.takeIf { it in 0..4 }
+        if (validLevel == wakePolicy.powerLevel) return
+        reconcileConditions(source, powerLevel = validLevel)
+    }
+
+    private fun ensurePowerSource() {
+        if (!started || settings.isUserShutdownRequested() ||
+            !settings.isUpdateAutoCheckEnabled() || CollectorService.isRunning()) return
+        try {
+            // This existing service owns KPI even when both SQLite collections are stopped.
+            CollectorServiceController.checkRuntime(app)
+        } catch (error: RuntimeException) {
+            app.recordUpdateEvent("power_source_start_failed", error.diagnosticDetail("Update POWER source"))
+        }
     }
 
     /** BootReceiver forwards real boot/wake signals even when recovery reuses a live service. */
@@ -99,13 +124,8 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
             start("wake:$action")
             return
         }
-        if (action != Intent.ACTION_SCREEN_ON && action != Intent.ACTION_USER_PRESENT && !isInteractive()) {
-            if (!wakePolicy.sleeping) pauseForSleep()
-            return
-        }
-        val newWake = wakePolicy.onWake(action, SystemClock.elapsedRealtime())
-        if (newWake) restartAfterWake(source)
-        recordWakeSignal(source, if (newWake) "restart_schedule" else "reconcile_presentation")
+        val changed = reconcileConditions(source)
+        recordWakeSignal(source, if (changed) "conditions_changed" else "conditions_unchanged")
         presentPendingHint()
     }
 
@@ -115,7 +135,7 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
                 if (intent.action == Intent.ACTION_SCREEN_OFF) {
-                    if (!wakePolicy.sleeping) pauseForSleep()
+                    reconcileConditions(Intent.ACTION_SCREEN_OFF, screenOn = false)
                     recordWakeSignal(Intent.ACTION_SCREEN_OFF, "sleep")
                 } else intent.action?.let { onSystemWake(it) }
             }
@@ -145,13 +165,8 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
                 val state = manager.getDisplay(displayId)?.state
                 if (state == lastDisplayState) return
                 lastDisplayState = state
-                if (isUpdateHintDisplayReady(isInteractive(), state)) {
-                    onSystemWake(Intent.ACTION_SCREEN_ON, "display")
-                } else {
-                    if (state == Display.STATE_OFF && !wakePolicy.sleeping) pauseForSleep()
-                    cancelHintPresentation("display_not_ready")
-                    recordWakeSignal("display", "defer_display_not_ready")
-                }
+                reconcileConditions("display", screenOn = isUpdateHintDisplayReady(isInteractive(), state))
+                presentPendingHint()
             }
         }
         try {
@@ -167,23 +182,40 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
         val displayState = app.getSystemService(DisplayManager::class.java)?.getDisplay(Display.DEFAULT_DISPLAY)?.state
         val resultId = app.updateChecks.snapshot().availableResultId
         app.recordUpdateEvent("wake_presentation", "source=$source elapsed_ms=${SystemClock.elapsedRealtime()} " +
-            "display=$displayState interactive=${isInteractive()} sleeping=${wakePolicy.sleeping} " +
+            "display=$displayState interactive=${isInteractive()} power=${wakePolicy.powerLevel} ready=${wakePolicy.ready} " +
             "shutdown=${settings.isUserShutdownRequested()} visible=$ownUiVisible installing=$installing " +
             "hint_enabled=${settings.isUpdateHintEnabled()} overlay=${canDrawUpdateHints()} " +
             "result_id=$resultId eligible=${resultId?.let(::canCreateHint) == true} " +
             "active_result=${app.updateHints.activeResultId} decision=$decision")
     }
 
-    private fun isInteractive(): Boolean = app.getSystemService(PowerManager::class.java)?.isInteractive != false
+    private fun isInteractive(): Boolean = app.getSystemService(PowerManager::class.java)?.isInteractive == true
 
-    private fun pauseForSleep() {
+    private fun reconcileConditions(
+        source: String,
+        powerLevel: Int? = wakePolicy.powerLevel,
+        screenOn: Boolean = mainDisplayForUpdateHintIfReady(app) != null
+    ): Boolean {
+        val stateChanged = powerLevel != wakePolicy.powerLevel || screenOn != wakePolicy.screenOn
+        val changed = wakePolicy.onState(powerLevel, screenOn)
+        if (started && changed) {
+            if (wakePolicy.ready) restartAfterWake(source) else pauseForConditions(source)
+        }
+        if (started && stateChanged) {
+            app.recordUpdateEvent("auto_check_conditions", "source=$source elapsed_ms=${SystemClock.elapsedRealtime()} " +
+                "power=${wakePolicy.powerLevel} screen_on=${wakePolicy.screenOn} ready=${wakePolicy.ready} " +
+                UpdateAutoCheckRuntime.diagnosticState())
+        }
+        return changed
+    }
+
+    private fun pauseForConditions(source: String) {
         if (!started) return
-        wakePolicy.onSleep()
         handler.removeCallbacks(timer)
         UpdateAutoCheckRuntime.onAutoCheckEnabledChanged(enabled = false)
         app.updateChecks.invalidateAutomatic()
-        cancelHintPresentation("screen_off")
-        app.recordUpdateEvent("auto_check_sleep")
+        cancelHintPresentation("car_or_screen_not_ready")
+        app.recordUpdateEvent("auto_check_paused", "source=$source power=${wakePolicy.powerLevel} screen_on=${wakePolicy.screenOn}")
     }
 
     private fun restartAfterWake(source: String) {
@@ -223,12 +255,13 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
     /** Reuses the cached result after permission/lifecycle changes; no HTTP check. */
     fun onPresentationAccessChanged() {
         if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.controlAsync("updateAccess"); return }
+        reconcileConditions("presentation_access")
         presentPendingHint()
     }
 
     fun onOfferPresented(resultId: Long) {
         if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.controlAsync("offer", Bundle().apply { putLong("result", resultId) }); return }
-        if (!ownUiVisible || !started || installing || wakePolicy.sleeping || settings.isUserShutdownRequested()) return
+        if (!ownUiVisible || !started || installing || !wakePolicy.screenOn || settings.isUserShutdownRequested()) return
         val snapshot = app.updateChecks.snapshot()
         if (presentation.markPresented(snapshot, resultId)) {
             app.recordUpdateEvent("offer_shown", "result_id=$resultId version=${(snapshot.uiState as UpdateUiState.Available).info.version}")
@@ -285,13 +318,18 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
 
     fun onAutoCheckEnabledChanged() {
         if (BuildConfig.RUNTIME_CLIENT) { RuntimeClient.control("updateAuto"); return }
+        reconcileConditions("auto_check_setting")
         handler.removeCallbacks(timer)
         if (!settings.isUpdateAutoCheckEnabled()) app.updateChecks.invalidateAutomatic()
-        if (started) applyAction(UpdateAutoCheckRuntime.onAutoCheckEnabledChanged(enabled()))
+        if (started) {
+            ensurePowerSource()
+            applyAction(UpdateAutoCheckRuntime.onAutoCheckEnabledChanged(enabled()))
+        }
     }
 
     fun request(manual: Boolean): Boolean {
         if (BuildConfig.RUNTIME_CLIENT) return RuntimeClient.control("updateRequest", Bundle().apply { putBoolean("manual", manual) }).getBoolean("accepted")
+        if (!manual) reconcileConditions("automatic_request")
         if (!started || installing || settings.isUserShutdownRequested() || (!manual && !enabled())) return false
         // A completed worker may be waiting for its posted listener. Consume it
         // before a user action/new timer can start another check in the same generation.
@@ -404,7 +442,7 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
         }
     }
 
-    private fun enabled() = started && !wakePolicy.sleeping && settings.isUpdateAutoCheckEnabled() && !settings.isUserShutdownRequested()
+    private fun enabled() = started && wakePolicy.ready && settings.isUpdateAutoCheckEnabled() && !settings.isUserShutdownRequested()
 
     private fun canCreateHint(resultId: Long): Boolean {
         val snapshot = app.updateChecks.snapshot()
@@ -429,7 +467,7 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
             ownUiVisible -> "own_ui_visible"
             !started -> "runtime_not_started"
             installing -> "installing"
-            wakePolicy.sleeping -> "sleeping"
+            !wakePolicy.ready -> "car_or_screen_not_ready"
             settings.isUserShutdownRequested() -> "shutdown"
             !settings.isUpdateHintEnabled() -> "disabled"
             !canDrawUpdateHints() -> "permission_missing"
@@ -446,7 +484,7 @@ internal class UpdateRuntime(private val app: BydCollectorApplication) {
     }
 
     private fun applyAction(action: UpdateAutoCheckAction) {
-        if (!started || installing || wakePolicy.sleeping) return
+        if (!started || installing || !wakePolicy.ready) return
         app.recordUpdateEvent("auto_check_gate", "action=$action visible=$ownUiVisible ${UpdateAutoCheckRuntime.diagnosticState()}")
         when (action) {
             UpdateAutoCheckAction.None -> Unit

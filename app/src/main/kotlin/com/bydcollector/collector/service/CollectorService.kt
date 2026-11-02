@@ -838,6 +838,7 @@ class CollectorService : Service() {
     override fun onDestroy() {
         requireRuntimeOwner()
         serviceDestroyed.set(true)
+        (applicationContext as BydCollectorApplication).updateRuntime.onVehiclePowerChanged(null, "collector_destroyed")
         mainStartGeneration.incrementAndGet()
         pendingStartCommands.clear()
         // Do not interrupt an in-progress SQLite transaction; its stale result is fenced below.
@@ -3342,7 +3343,7 @@ class CollectorService : Service() {
         return generation
     }
 
-    private fun applyKpiSourceUpdate(update: KpiSourceUpdate): Long {
+    private fun applyKpiSourceUpdate(update: KpiSourceUpdate, runtimeGeneration: Long): Long {
         val generation = if (update.helperGenerationChanged) invalidateKpiUiSources() else kpiUiGeneration.get()
         if (update.powerStateChanged) {
             val level = update.powerState?.level
@@ -3350,7 +3351,12 @@ class CollectorService : Service() {
             val changed = on != kpiPowerOn
             kpiPowerOn = on
             mainHandler.post {
-                if (generation != kpiUiGeneration.get() || !running.get()) return@post
+                if (generation != kpiUiGeneration.get() || !isKpiRuntimeCurrent(runtimeGeneration)) return@post
+                val power = update.powerState
+                (applicationContext as BydCollectorApplication).updateRuntime.onVehiclePowerChanged(level,
+                    "kpi boot=${power?.helperBootId} helper=${power?.helperGeneration} epoch=${power?.sourceEpoch} " +
+                        "sequence=${power?.sourceRecordSequence} kind=${power?.sourceKind} " +
+                        "reason=${power?.lossReason ?: update.sourceLosses.firstOrNull()?.reason ?: "source_update"}")
                 if (level == null && ::dashboardUiStateStore.isInitialized) dashboardUiStateStore.clearVehicleKpis()
                 if (level != null && settings.observeHaPower(level.toLong())) {
                     val demand = settings.runtimeDemand()
@@ -3488,6 +3494,7 @@ class CollectorService : Service() {
             kpiVisibilityListenerAttached = true
         }
         val generation = kpiRuntimeGeneration.incrementAndGet()
+        (applicationContext as BydCollectorApplication).updateRuntime.onVehiclePowerChanged(null, "kpi_started")
         val worker = Thread({ runKpiLoop(generation) }, "byd-kpi-reader").apply { isDaemon = true }
         kpiWorker = worker
         worker.start()
@@ -3502,7 +3509,7 @@ class CollectorService : Service() {
         var pendingSourceUpdate: KpiSourceUpdate? = null
         fun applySourceUpdate(update: KpiSourceUpdate) {
             pendingSourceUpdate = update
-            applyKpiSourceUpdate(update)
+            applyKpiSourceUpdate(update, generation)
             pendingSourceUpdate = null
         }
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -3616,6 +3623,12 @@ class CollectorService : Service() {
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         } finally {
+            val stoppedGeneration = if (kpiRuntimeGeneration.compareAndSet(generation, generation + 1L)) generation + 1L else null
+            mainHandler.post {
+                if (stoppedGeneration != null && isKpiRuntimeCurrent(stoppedGeneration)) {
+                    (applicationContext as BydCollectorApplication).updateRuntime.onVehiclePowerChanged(null, "kpi_stopped")
+                }
+            }
             kpiLiveMode = false
             kpiInteractive = false
             callbackWorker?.setActive(false)
