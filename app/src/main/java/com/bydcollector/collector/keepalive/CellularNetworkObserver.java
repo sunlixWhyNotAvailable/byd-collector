@@ -55,7 +55,8 @@ final class CellularNetworkObserver implements AutoCloseable {
 
                 @Override public void onCapabilitiesChanged(Network network, NetworkCapabilities capabilities) {
                     if (!closed) links.computeIfAbsent(network, key -> new Link()).wifi =
-                            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI);
+                            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                                    && !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN);
                 }
 
                 @Override public void onLinkPropertiesChanged(Network network, LinkProperties properties) {

@@ -39,22 +39,24 @@ internal class DiagnosticShareSanitizer {
             !text.contains("imsi", ignoreCase = true) && !text.contains("iccid", ignoreCase = true) &&
             !text.contains("Location[", ignoreCase = true)) return text
         if (text.length <= TEXT_CACHE_MAX_CHARS) textCache[text]?.let { return it }
-        var sanitized = replaceCookieHeaders(text)
-        sanitized = replaceAuthHeaders(sanitized)
+        // Gates contain necessary literals only; the regex still decides every match.
+        var sanitized = if (text.contains("cookie", ignoreCase = true)) replaceCookieHeaders(text) else text
+        if (sanitized.contains("authorization", ignoreCase = true)) sanitized = replaceAuthHeaders(sanitized)
         // Android Wi-Fi dumps allow an unquoted SSID containing spaces. Match
         // only named properties, ending at the next property or record boundary.
-        sanitized = WIFI_PROPERTY_PATTERN.replace(sanitized) { match ->
+        if (sanitized.contains("ssid", ignoreCase = true)) sanitized = WIFI_PROPERTY_PATTERN.replace(sanitized) { match ->
             match.groups["prefix"]!!.value + replaceMaskedToken(match.groups["value"]!!.value, REDACTED)
         }
-        sanitized = VIN_RESULT_PATTERN.replace(sanitized) { match ->
+        if (sanitized.contains("vin", ignoreCase = true)) sanitized = VIN_RESULT_PATTERN.replace(sanitized) { match ->
             match.groups["prefix"]!!.value + replaceMaskedToken(match.groups["value"]!!.value,
                 alias(IdentityKind.VIN, match.groups["value"]!!.value))
         }
-        sanitized = RADIO_ID_PATTERN.replace(sanitized) { match ->
+        if (sanitized.contains("imei", ignoreCase = true) || sanitized.contains("imsi", ignoreCase = true) ||
+            sanitized.contains("iccid", ignoreCase = true)) sanitized = RADIO_ID_PATTERN.replace(sanitized) { match ->
             match.groups["prefix"]!!.value + REDACTED
         }
-        sanitized = MAC_PATTERN.replace(sanitized, REDACTED)
-        sanitized = ASSIGNMENT_PATTERN.replace(sanitized) { match ->
+        if (':' in sanitized || '-' in sanitized) sanitized = MAC_PATTERN.replace(sanitized, REDACTED)
+        if (':' in sanitized || '=' in sanitized) sanitized = ASSIGNMENT_PATTERN.replace(sanitized) { match ->
             val key = match.groups["key"]?.value.orEmpty()
             val token = match.groups["value"]?.value.orEmpty()
             val prefix = match.groups["prefix"]?.value.orEmpty()
@@ -66,25 +68,25 @@ internal class DiagnosticShareSanitizer {
                 else -> prefix + replaceMaskedToken(token, alias(identity, token))
             }
         }
-        sanitized = URI_USERINFO_PATTERN.replace(sanitized) { match ->
+        if ('@' in sanitized && "://" in sanitized) sanitized = URI_USERINFO_PATTERN.replace(sanitized) { match ->
             "${match.groups["scheme"]?.value.orEmpty()}$REDACTED@"
         }
-        sanitized = TELEGRAM_HOST_BOT_PATTERN.replace(sanitized) { match ->
+        if (sanitized.contains("telegram.org/", ignoreCase = true)) sanitized = TELEGRAM_HOST_BOT_PATTERN.replace(sanitized) { match ->
             "${match.groups["prefix"]?.value.orEmpty()}$REDACTED"
         }
-        sanitized = TELEGRAM_BOT_PATH_PATTERN.replace(sanitized) { match ->
+        if (sanitized.contains("/bot", ignoreCase = true)) sanitized = TELEGRAM_BOT_PATH_PATTERN.replace(sanitized) { match ->
             "${match.groups["prefix"]?.value.orEmpty()}$REDACTED"
         }
-        sanitized = GEO_COORDINATE_PATTERN.replace(sanitized) { match ->
+        if (sanitized.contains("geo:", ignoreCase = true)) sanitized = GEO_COORDINATE_PATTERN.replace(sanitized) { match ->
             "${match.groups["prefix"]?.value.orEmpty()}$REDACTED_COORDINATE,$REDACTED_COORDINATE"
         }
-        sanitized = ANDROID_LOCATION_PATTERN.replace(sanitized) { match ->
+        if (sanitized.contains("Location[", ignoreCase = true)) sanitized = ANDROID_LOCATION_PATTERN.replace(sanitized) { match ->
             "${match.groups["prefix"]?.value.orEmpty()}$REDACTED_COORDINATE,$REDACTED_COORDINATE"
         }
-        val result = URL_PATTERN.replace(sanitized) { match ->
+        val result = if ("://" in sanitized) URL_PATTERN.replace(sanitized) { match ->
             val url = match.value
             if (isRecognizedMapUrl(url)) sanitizeMapUrl(url) else url
-        }
+        } else sanitized
         if (text.length <= TEXT_CACHE_MAX_CHARS && result.length <= TEXT_CACHE_MAX_CHARS) textCache[text] = result
         return result
     }

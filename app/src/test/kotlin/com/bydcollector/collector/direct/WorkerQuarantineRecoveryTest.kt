@@ -36,6 +36,35 @@ class WorkerQuarantineRecoveryTest {
     }
 
     @Test
+    fun emptyLegacyIndexRetainsHistoryAndSeesNewExternalReadyFiles() {
+        val root = Files.createTempDirectory("worker-empty-index").toFile()
+        val historyBytes = captured(24)
+        val history = File(root, filename(historyBytes) + ".bad.recovered").apply { writeBytes(historyBytes) }
+        val readyBytes = captured(28)
+        try {
+            TelemetryWorkerSpool.openForTest(root, TelemetryWorkerSpool.MAX_SPOOL_BYTES).use { spool ->
+                repeat(3) {
+                    assertFalse(spool.hasPending())
+                    assertTrue(spool.pending(10, validator).isEmpty())
+                }
+                File(root, filename(readyBytes)).writeBytes(readyBytes)
+                assertTrue(spool.hasPending())
+                val sample = spool.pending(10, validator).single()
+                assertEquals(28L, sample.identity.pollSequence)
+                assertEquals(TelemetryWorkerSpool.AckStatus.RELEASED,
+                    spool.acknowledge(sample.identity, sample.capturedWallMs).status)
+                assertFalse(spool.hasPending())
+                assertTrue(spool.pending(10, validator).isEmpty())
+            }
+            TelemetryWorkerSpool.openForTest(root, TelemetryWorkerSpool.MAX_SPOOL_BYTES).use { reopened ->
+                assertFalse(reopened.hasPending())
+                assertTrue(reopened.pending(10, validator).isEmpty())
+            }
+            assertContentEquals(historyBytes, history.readBytes())
+        } finally { root.deleteRecursively() }
+    }
+
+    @Test
     fun capturedQuarantineSurvivesReopenAndCommitsOnceBeforeAcknowledgement() {
         val root = Files.createTempDirectory("worker-recovery").toFile()
         val context = RuntimeEnvironment.getApplication()

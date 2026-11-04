@@ -12,6 +12,30 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class DiagnosticShareSnapshotTest {
+    @Test fun formatGatesPreserveMaskingAcrossMixedCaseAndUnquotedInputs() {
+        val cases = listOf(
+            "sEt-CoOkIe: secret=one; token=two" to "sEt-CoOkIe: [redacted]",
+            "pRoXy-AuThOrIzAtIoN: Bearer private-token" to "pRoXy-AuThOrIzAtIoN: [redacted]",
+            "mBsSiD: private network" to "mBsSiD: [redacted]",
+            "getVehicleVIN() -> L1234567890123456" to "getVehicleVIN() -> [VIN-1]",
+            "iMeI2 356789012345670" to "iMeI2 [redacted]",
+            "iMsI 255010123456789" to "iMsI [redacted]",
+            "IcCiD 8938000123456789012" to "IcCiD [redacted]",
+            "peer 01:23:45:67:89:AB 01-23-45-67-89-AC" to "peer [redacted] [redacted]",
+            "mqtt_password='private secret'" to "mqtt_password='[redacted]'",
+            "HtTpS://user:private@host/path" to "HtTpS://[redacted]@host/path",
+            "HTTPS://API.TELEGRAM.ORG/BOTprivate-token/send" to "HTTPS://API.TELEGRAM.ORG/BOT[redacted]/send",
+            "/BoT123456:private_token/send" to "/BoT[redacted]/send",
+            "GeO:50.123,30.456" to "GeO:[redacted-coordinate],[redacted-coordinate]",
+            "lOcAtIoN[gps 50.123,30.456 hAcc=5]" to "lOcAtIoN[gps [redacted-coordinate],[redacted-coordinate] hAcc=5]",
+            "HTTPS://MAPS.GOOGLE.COM/?q=50.123,30.456" to "HTTPS://MAPS.GOOGLE.COM/?q=[redacted-coordinate],[redacted-coordinate]",
+            "fid=876609592 count=17 elapsed_ms=42" to "fid=876609592 count=17 elapsed_ms=42"
+        )
+        cases.forEach { (input, expected) ->
+            assertEquals(expected, DiagnosticShareSanitizer().sanitizeText(input))
+        }
+    }
+
     @Test fun repeatedTextKeepsPrivacyAndBundleLocalAliasesAfterCacheEviction() {
         val first = DiagnosticShareSanitizer()
         val input = "vin=L123456789012345X password=private-secret"

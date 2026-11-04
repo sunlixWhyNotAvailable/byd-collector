@@ -1229,7 +1229,8 @@ class CollectorService : Service() {
         val now = System.currentTimeMillis()
         store.recordEvent("app_process_window", "APP CPU and poll-cycle summary",
             "process=app duration_scope=app_poll_cycle ${snapshot.toJson()} normalization_page_processed=${progress?.processed} " +
-                "normalization_page_oldest_age_ms=${progress?.oldestWallMs?.let { (now - it).coerceAtLeast(0L) }} " +
+                "normalization_completed_page_lag_ms=${progress?.let { page -> page.oldestWallMs?.let { (page.completedWallMs - it).coerceAtLeast(0L) } }} " +
+                "normalization_last_completion_age_ms=${progress?.let { (now - it.completedWallMs).coerceAtLeast(0L) }} " +
                 "normalization_last_completion_wall_ms=${progress?.completedWallMs} " +
                 "normalization_page_may_have_more=${progress?.hasMore} business_processed=${businessProcessed.get()} " +
                 "business_last_page_oldest_wall_ms=$businessOldestPageWallMs")

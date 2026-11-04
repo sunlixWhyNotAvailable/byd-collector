@@ -1,7 +1,11 @@
 package com.bydcollector.collector.keepalive;
 
+import android.content.ContentResolver;
+import android.database.ContentObserver;
 import android.os.FileObserver;
 import android.os.SystemClock;
+import android.provider.Settings;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
@@ -27,6 +31,12 @@ final class CellularApnRecovery implements AutoCloseable {
         }
     };
     private boolean stopping;
+    private boolean settingsDirty = true;
+    private volatile boolean settingsRetry = true;
+    private ContentResolver settingsResolver;
+    private final ContentObserver settingsObserver = new ContentObserver(null) {
+        @Override public void onChange(boolean selfChange) { invalidateSettings(); }
+    };
     private long epoch;
     private volatile long attempts;
     private final OwnedShellProcess child = new OwnedShellProcess();
@@ -34,6 +44,59 @@ final class CellularApnRecovery implements AutoCloseable {
     private String bootId = "unavailable";
 
     CellularApnRecovery(OemWakeDiscovery discovery) { this.discovery = discovery; }
+
+    // The existing heartbeat also covers OEM builds that reject ContentObserver registration.
+    void heartbeat() { if (settingsRetry) invalidateSettings(); }
+
+    private void invalidateSettings() {
+        synchronized (lock) {
+            if (stopping) return;
+            settingsDirty = true;
+            lock.notifyAll();
+        }
+    }
+
+    private void reconcileSettings() {
+        try {
+            ContentResolver resolver = KeepAliveDaemon.shellContext().getContentResolver();
+            if (settingsResolver == null) {
+                try {
+                    resolver.registerContentObserver(Settings.Global.getUriFor(KeepAliveProtocol.KEY_KEEP_MOBILE_DATA),
+                            false, settingsObserver);
+                    resolver.registerContentObserver(Settings.Global.getUriFor(KeepAliveProtocol.KEY_USER_SHUTDOWN),
+                            false, settingsObserver);
+                    settingsResolver = resolver;
+                    log("settings_observer_registered", "uid=" + android.os.Process.myUid());
+                } catch (Exception | LinkageError error) {
+                    try { resolver.unregisterContentObserver(settingsObserver); }
+                    catch (Exception | LinkageError cleanup) { error.addSuppressed(cleanup); }
+                    log("settings_observer_error", KeepAliveDaemon.diagnosticDetail(error, "stage=register_settings_observer"));
+                }
+            }
+            boolean enabled = readFlag(resolver, KeepAliveProtocol.KEY_KEEP_MOBILE_DATA);
+            boolean shutdown = readFlag(resolver, KeepAliveProtocol.KEY_USER_SHUTDOWN);
+            synchronized (lock) {
+                if (stopping || settingsDirty) return;
+                schedule.ownedBacklight(Files.exists(BacklightRecoveryState.PATH));
+                schedule.settingsChanged(enabled, shutdown);
+                settingsRetry = settingsResolver == null;
+                log("settings_reconciled", schedule.describe(SystemClock.elapsedRealtime()));
+            }
+        } catch (Exception | LinkageError error) {
+            synchronized (lock) {
+                schedule.settingsChanged(false, true);
+                settingsRetry = true;
+            }
+            log("settings_read_error", KeepAliveDaemon.diagnosticDetail(error, "stage=read_recovery_settings"));
+        }
+    }
+
+    private static boolean readFlag(ContentResolver resolver, String key) throws IOException {
+        String value = Settings.Global.getString(resolver, key);
+        if ("1".equals(value)) return true;
+        if ("0".equals(value)) return false;
+        throw new IOException("Unknown global flag " + key + "=" + value);
+    }
 
     void start() {
         try {
@@ -78,18 +141,22 @@ final class CellularApnRecovery implements AutoCloseable {
             while (true) {
                 long checkEpoch;
                 int trigger;
+                boolean reconcile;
                 synchronized (lock) {
-                    while (!stopping && schedule.dueAt() > SystemClock.elapsedRealtime()) {
+                    while (!stopping && !settingsDirty && schedule.dueAt() > SystemClock.elapsedRealtime()) {
                         if (schedule.dueAt() == Long.MAX_VALUE) lock.wait();
                         else lock.wait(Math.max(1L, schedule.dueAt() - SystemClock.elapsedRealtime()));
                     }
                     if (stopping) return;
-                    trigger = schedule.beginCheck(SystemClock.elapsedRealtime());
-                    if (trigger == 0) continue;
+                    reconcile = settingsDirty;
+                    settingsDirty = false;
+                    trigger = reconcile ? 0 : schedule.beginCheck(SystemClock.elapsedRealtime());
                     checkEpoch = epoch;
-                    log("check_started", "epoch=" + checkEpoch + " trigger=" + CellularApnSchedule.reason(trigger)
+                    if (trigger != 0) log("check_started", "epoch=" + checkEpoch + " trigger=" + CellularApnSchedule.reason(trigger)
                             + " " + schedule.describe(SystemClock.elapsedRealtime()));
                 }
+                if (reconcile) { reconcileSettings(); continue; }
+                if (trigger == 0) continue;
                 try { runCheck(checkEpoch); }
                 catch (InterruptedException error) { throw error; }
                 catch (Exception error) { log("check_error", KeepAliveDaemon.diagnosticDetail(error, "stage=check_process")); }
@@ -98,13 +165,21 @@ final class CellularApnRecovery implements AutoCloseable {
                 }
             }
         } catch (InterruptedException error) { Thread.currentThread().interrupt(); }
-        finally { log("monitor_stopped", "no_sleep_requested=true"); }
+        finally {
+            if (settingsResolver != null) {
+                try { settingsResolver.unregisterContentObserver(settingsObserver); }
+                catch (Exception | LinkageError error) {
+                    log("settings_observer_error", KeepAliveDaemon.diagnosticDetail(error, "stage=unregister_settings_observer"));
+                }
+            }
+            log("monitor_stopped", "no_sleep_requested=true");
+        }
     }
 
     private void runCheck(long checkEpoch) throws Exception {
         long token;
         synchronized (lock) {
-            if (stopping || epoch != checkEpoch) return;
+            if (stopping || settingsDirty || epoch != checkEpoch || !schedule.canCheck()) return;
             token = child.token();
         }
         WakeDiscoveryState.Selection selected = discovery.selection();

@@ -196,6 +196,14 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         }
     }
 
+    synchronized boolean hasPending() {
+        ensureOpen();
+        synchronized (rootState.lock) {
+            refreshRoot("pending_presence");
+            return rootState.readyRecordCount() > 0;
+        }
+    }
+
     // Validate in bounded passes before exposing any restored records, preserving replay ordering.
     synchronized boolean recoverQuarantined(SampleValidator validator) throws IOException {
         ensureOpen();
@@ -288,6 +296,11 @@ final class TelemetryWorkerSpool implements AutoCloseable {
         if (validator == null) throw new IllegalArgumentException("sample validator is required");
         if (limit < 1 || limit > CollectorHelperProtocol.MAX_PENDING_WORKER_SAMPLES) {
             throw new IllegalArgumentException("invalid pending sample limit: " + limit);
+        }
+        if (rootState.readyRecordCount() == 0) {
+            pendingRecords.clear();
+            pendingBootId = null;
+            return Collections.emptyList();
         }
         refreshPendingRecords();
         int reorderedPages = 0;

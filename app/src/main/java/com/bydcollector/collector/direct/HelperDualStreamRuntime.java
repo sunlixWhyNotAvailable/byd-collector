@@ -645,7 +645,7 @@ final class HelperDualStreamRuntime implements AutoCloseable {
 
     private boolean hasMainBacklog() {
         if (mainSpool == null) return false;
-        try { return !mainSpool.pending(1, sample -> { }).isEmpty(); }
+        try { return mainSpool.hasPending(); }
         catch (Throwable error) {
             noteError("main callback backlog check failed: " + android.util.Log.getStackTraceString(error));
             return true;

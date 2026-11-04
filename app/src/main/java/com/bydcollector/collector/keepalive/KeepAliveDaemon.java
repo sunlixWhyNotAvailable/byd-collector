@@ -137,6 +137,7 @@ public final class KeepAliveDaemon {
             while (true) {
                 try {
                     log("heartbeat_start");
+                    cellularRecovery.heartbeat();
                     runOnce(usbState);
                     log("heartbeat_end");
                 } catch (Throwable error) {

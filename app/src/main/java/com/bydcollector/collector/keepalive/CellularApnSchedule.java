@@ -9,7 +9,21 @@ final class CellularApnSchedule {
     private int power = -1;
     private long offStarted = -1, nextCheck;
     private int pending = STARTUP;
-    private boolean checking, stopped;
+    private boolean checking, stopped, enabled, shutdown, ownedBacklightPending;
+
+    void settingsChanged(boolean enabled, boolean shutdown) {
+        if (stopped || this.enabled == enabled && this.shutdown == shutdown) return;
+        this.enabled = enabled;
+        this.shutdown = shutdown;
+        pending = canCheck() ? STARTUP : 0;
+        nextCheck = canCheck() ? 0L : Long.MAX_VALUE;
+    }
+
+    void ownedBacklight(boolean pending) { ownedBacklightPending = pending; }
+
+    boolean canCheck() {
+        return !stopped && !shutdown && ((enabled && power <= 0) || (ownedBacklightPending && power != 0));
+    }
 
     boolean powerChanged(int value, long now) {
         if (stopped || power == value) return false;
@@ -32,13 +46,13 @@ final class CellularApnSchedule {
 
     boolean networkLost(int reason) {
         if (reason != APN_LOST && reason != WIFI_LOST) throw new IllegalArgumentException("Invalid loss reason");
-        if (stopped || power != 0) return false;
+        if (!canCheck() || power != 0) return false;
         pending |= reason;
         return true;
     }
 
     long dueAt() {
-        if (stopped || checking) return Long.MAX_VALUE;
+        if (!canCheck() || checking) return Long.MAX_VALUE;
         return pending != 0 ? 0L : nextCheck;
     }
 
@@ -52,8 +66,9 @@ final class CellularApnSchedule {
 
     void finishCheck(long now, boolean ownedBacklightPending) {
         checking = false;
+        this.ownedBacklightPending = ownedBacklightPending;
         if (stopped) return;
-        if (power > 0 && !ownedBacklightPending) nextCheck = Long.MAX_VALUE;
+        if (!canCheck()) { pending = 0; nextCheck = Long.MAX_VALUE; }
         else if (power != 0 || offStarted < 0) nextCheck = now + NORMAL_INTERVAL_MS;
         else {
             long age = Math.max(0L, now - offStarted);
@@ -68,7 +83,8 @@ final class CellularApnSchedule {
         long age = offStarted < 0 ? -1 : Math.max(0L, now - offStarted);
         return "power=" + power + " off_age_ms=" + age + " cadence_ms="
                 + (power == 0 && age >= 0 && age < FAST_WINDOW_MS ? FAST_INTERVAL_MS : NORMAL_INTERVAL_MS)
-                + " pending=" + pending + " checking=" + checking;
+                + " enabled=" + enabled + " shutdown=" + shutdown
+                + " owned_backlight=" + ownedBacklightPending + " pending=" + pending + " checking=" + checking;
     }
 
     static String reason(int mask) {

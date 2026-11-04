@@ -7,6 +7,7 @@ import static org.junit.Assert.*;
 public class CellularApnScheduleTest {
     @Test public void offCadenceIsAnchoredAndRepeatedOffDoesNotExtendIt() {
         CellularApnSchedule schedule = new CellularApnSchedule();
+        schedule.settingsChanged(true, false);
         assertTrue(schedule.powerChanged(0, 1_000));
         assertTrue(schedule.beginCheck(1_000) != 0);
         schedule.finishCheck(1_400, false);
@@ -25,6 +26,7 @@ public class CellularApnScheduleTest {
 
     @Test public void slowChecksSkipSlotsAndLossesCoalesceWithoutOverlap() {
         CellularApnSchedule schedule = new CellularApnSchedule();
+        schedule.settingsChanged(true, false);
         schedule.powerChanged(0, 0);
         schedule.beginCheck(0);
         assertTrue(schedule.networkLost(CellularApnSchedule.APN_LOST));
@@ -42,6 +44,7 @@ public class CellularApnScheduleTest {
 
     @Test public void onAndShutdownCancelLossWorkWhileAllowingOwnedBacklightCleanup() {
         CellularApnSchedule schedule = new CellularApnSchedule();
+        schedule.settingsChanged(true, false);
         schedule.beginCheck(0);
         schedule.observePower(0, 100); // First real check discovers already-OFF at startup.
         schedule.finishCheck(200, false);
@@ -66,5 +69,34 @@ public class CellularApnScheduleTest {
         assertFalse(schedule.powerChanged(1, 33_000));
         assertEquals(0, schedule.beginCheck(33_000));
         assertEquals(Long.MAX_VALUE, schedule.dueAt());
+    }
+
+    @Test public void disabledWorkStaysIdleAndReenableKeepsOriginalOffWindow() {
+        CellularApnSchedule schedule = new CellularApnSchedule();
+        schedule.powerChanged(0, 1_000);
+        assertEquals(Long.MAX_VALUE, schedule.dueAt());
+        assertFalse(schedule.networkLost(CellularApnSchedule.WIFI_LOST));
+        schedule.settingsChanged(true, false);
+        assertNotEquals(0, schedule.beginCheck(40_000));
+        schedule.settingsChanged(false, false); // Toggle while the bounded check is completing.
+        schedule.finishCheck(40_100, true);
+        assertEquals(Long.MAX_VALUE, schedule.dueAt());
+        assertFalse(schedule.networkLost(CellularApnSchedule.APN_LOST));
+        schedule.settingsChanged(true, false);
+        assertNotEquals(0, schedule.beginCheck(45_000));
+        schedule.finishCheck(45_100, true);
+        assertEquals(61_000, schedule.dueAt());
+        schedule.settingsChanged(true, false); // Duplicate notification must not reset the deadline.
+        assertEquals(61_000, schedule.dueAt());
+        schedule.settingsChanged(false, false);
+        schedule.powerChanged(1, 46_000);
+        assertEquals(CellularApnSchedule.POWER, schedule.beginCheck(46_000));
+        schedule.finishCheck(46_100, false);
+        assertEquals(Long.MAX_VALUE, schedule.dueAt());
+        schedule.ownedBacklight(true);
+        schedule.settingsChanged(true, true); // Explicit Shutdown also blocks restoration.
+        schedule.powerChanged(0, 47_000);
+        schedule.powerChanged(1, 48_000);
+        assertEquals(0, schedule.beginCheck(48_000));
     }
 }
