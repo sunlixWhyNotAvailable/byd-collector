@@ -124,6 +124,8 @@ data class ConnectivityRecoveryStrings(
     val failed: String,
 )
 
+data class HaTransportStrings(val sharedCategories: String, val tailscale: TailscaleStrings)
+
 data class UiStrings(
     val appSubtitle: String,
     val topBarSubtitle: String,
@@ -230,7 +232,7 @@ data class UiStrings(
     val climate: String,
     val safety: String,
     val driverAssist: String,
-    val sharedCategories: String,
+    val haTransport: HaTransportStrings,
     val primaryProfile: String,
     val alternativeProfile: String,
     val activeProfile: String,
@@ -381,6 +383,8 @@ data class UiStrings(
     val dbMaintenanceArchivePath: String
 ) {
     // Keep the constructor below DEX's invocation-register limit.
+    val sharedCategories: String get() = haTransport.sharedCategories
+    val tailscale: TailscaleStrings get() = haTransport.tailscale
     val restoreConnectivityDescription: String get() = connectivityRecovery.description
     val wakeDiscoveryPending: String get() = connectivityRecovery.pending
     val wakeDiscoveryFound: String get() = connectivityRecovery.found
@@ -751,7 +755,12 @@ private fun buildStrings(language: UiLanguage): UiStrings {
             climate = "Клімат",
             safety = "Безпека",
             driverAssist = "Асистенти",
-            sharedCategories = "Спільні категорії MQTT/InfluxDB",
+            haTransport = HaTransportStrings("Спільні категорії MQTT/InfluxDB", TailscaleStrings(
+                "Використовувати Tailscale Serve", "Підключення Tailscale", "Готуємо авторизацію…",
+                "Відкрийте посилання на планшеті або відскануйте QR-код телефоном і увійдіть у свій обліковий запис Tailscale.",
+                "Відкрити посилання", "Очікуємо дозволу адміністратора Tailscale…", "Перемикаємо підключення…",
+                "Не вдалося підключити Tailscale", "QR-код недоступний; скористайтеся посиланням."
+            )),
             host = "Хост",
             port = "Порт",
             username = "Користувач",
@@ -1046,7 +1055,12 @@ private fun buildStrings(language: UiLanguage): UiStrings {
             climate = "Climate",
             safety = "Safety",
             driverAssist = "Driver assist",
-            sharedCategories = "Shared MQTT/InfluxDB categories",
+            haTransport = HaTransportStrings("Shared MQTT/InfluxDB categories", TailscaleStrings(
+                "Use Tailscale Serve", "Connect Tailscale", "Preparing sign-in…",
+                "Open the link on this tablet or scan the QR code with your phone and sign in to your Tailscale account.",
+                "Open sign-in link", "Waiting for Tailscale administrator approval…", "Switching connection…",
+                "Could not connect Tailscale", "QR code unavailable; use the link instead."
+            )),
             host = "Host",
             port = "Port",
             username = "Username",

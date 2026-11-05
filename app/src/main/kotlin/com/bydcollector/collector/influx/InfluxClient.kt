@@ -1,5 +1,9 @@
 package com.bydcollector.collector.influx
 
+import com.bydcollector.collector.ha.tailscale.HaTailscaleRuntime
+import com.bydcollector.collector.ha.tailscale.TailscaleBridgeLease
+import com.bydcollector.collector.ha.tailscale.TailscaleTransportException
+import com.bydcollector.collector.util.diagnosticDetail
 import com.bydcollector.collector.util.readBoundedUtf8
 import com.bydcollector.collector.ha.HaEndpointProfile
 import java.io.IOException
@@ -12,6 +16,8 @@ import java.net.ProtocolException
 import java.net.SocketTimeoutException
 import java.net.URLEncoder
 import java.net.URL
+import java.net.Proxy
+import java.net.InetSocketAddress
 import java.nio.charset.StandardCharsets
 import java.util.Base64
 import java.util.UUID
@@ -83,18 +89,30 @@ class HttpInfluxClient(
         if (config.host.isBlank()) return InfluxActionResult.fail("influx_host_missing", "InfluxDB host is blank")
         return runCatching {
             var connection: HttpURLConnection? = null
+            var bridge: TailscaleBridgeLease? = null
+            var initiatingError: Throwable? = null
             try {
                 val openStarted = System.nanoTime()
                 try {
-                    connection = (URL(config.baseUrl + path).openConnection() as HttpURLConnection).apply {
+                    bridge = HaTailscaleRuntime.current()?.bridge(config.host, config.port)
+                    val url = URL(config.baseUrl + path)
+                    connection = (bridge?.let { url.openConnection(Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", it.port))) }
+                        ?: url.openConnection()) as HttpURLConnection
+                    connection.apply {
                         requestMethod = method
                         connectTimeout = CONNECT_TIMEOUT_MS
                         readTimeout = READ_TIMEOUT_MS
                         setRequestProperty("User-Agent", "BYDCollector")
+                        bridge?.let {
+                            setRequestProperty("Proxy-Authorization", "Bearer ${it.token}")
+                            // A redirected request would escape the exact destination capability.
+                            instanceFollowRedirects = false
+                        }
                         config.basicAuthHeader()?.let { setRequestProperty("Authorization", it) }
                         if (body != null) {
                             doOutput = true
                             setRequestProperty("Content-Type", "text/plain; charset=utf-8")
+                            if (bridge != null) setFixedLengthStreamingMode(body.toByteArray(StandardCharsets.UTF_8).size)
                         }
                     }
                     emitStage(context, config, "open_connection", elapsedMs(openStarted))
@@ -122,6 +140,9 @@ class HttpInfluxClient(
                     throw error
                 }
                 emitStage(context, config, "response", elapsedMs(responseStarted), httpStatus = code)
+                if (bridge != null) connection.getHeaderField("X-Collector-Bridge-Error")?.let {
+                    throw TailscaleTransportException("Tailscale HTTP bridge ($code): $it")
+                }
                 if (code in 200..299) {
                     InfluxActionResult.ok("http $code")
                 } else {
@@ -150,8 +171,20 @@ class HttpInfluxClient(
                         }
                     )
                 }
+            } catch (error: Throwable) {
+                initiatingError = error
+                throw error
             } finally {
-                connection?.disconnect()
+                var cleanupError: Throwable? = null
+                try { connection?.disconnect() } catch (error: Throwable) { cleanupError = error }
+                try { bridge?.close() } catch (error: Throwable) {
+                    if (cleanupError == null) cleanupError = error else cleanupError.addSuppressed(error)
+                }
+                cleanupError?.let { error ->
+                    if (initiatingError != null) initiatingError.addSuppressed(error)
+                    // Cleanup must never turn a confirmed write into a resend.
+                    emitStage(context, config, "transport_cleanup", 0L, error = error)
+                }
             }
         }.getOrElse { error ->
             emitStage(context, config, "request", 0L, error = error)
@@ -186,6 +219,7 @@ class HttpInfluxClient(
         error?.let {
             details["error_class"] = it::class.java.simpleName
             details["error_kind"] = classifyInfluxNetworkFailure(it).name.lowercase()
+            details["error_detail"] = sanitizeInfluxDiagnostic(it.diagnosticDetail(), config)
         }
         runCatching { diagnostics(InfluxDiagnosticEvent("influx_http_stage", details)) }
     }

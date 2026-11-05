@@ -11,8 +11,8 @@ android {
         applicationId = "com.bydcollector.collector.ui"
         minSdk = 26
         targetSdk = 29
-        versionCode = 328
-        versionName = "3.4.6"
+        versionCode = 329
+        versionName = "3.5.0"
         buildConfigField("String", "COLLECTOR_DISPLAY_NAME", "\"BYD Collector\"")
         buildConfigField("String", "COLLECTOR_DATABASE_NAME", "\"bydcollector_telemetry.db\"")
         buildConfigField("String", "UPDATE_RELEASES_API_URL", "\"https://api.github.com/repos/sunlixWhyNotAvailable/byd-collector/releases/latest\"")
@@ -47,6 +47,7 @@ android {
 }
 
 dependencies {
+    implementation("com.google.zxing:core:3.5.3")
     implementation("com.android.tools.smali:smali-dexlib2:3.0.9")
     implementation("org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5")
     implementation("androidx.core:core:1.13.1")

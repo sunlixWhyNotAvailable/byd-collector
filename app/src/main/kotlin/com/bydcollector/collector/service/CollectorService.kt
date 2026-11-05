@@ -1,5 +1,7 @@
 package com.bydcollector.collector.service
 
+import com.bydcollector.collector.ha.tailscale.HaTransportGate
+import com.bydcollector.collector.ha.tailscale.HaTailscaleRuntime
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -2466,6 +2468,7 @@ class CollectorService : Service() {
     }
 
     private fun stopRuntimeForUserShutdown() {
+        HaTailscaleRuntime.current()?.shutdown()
         (applicationContext as BydCollectorApplication).stopDashboardMetrics()
         com.bydcollector.collector.runtime.RuntimeJobsService.cancelForShutdown(this)
         closeEcMeanProvider()
@@ -4289,6 +4292,7 @@ class CollectorService : Service() {
     }
 
     private fun maybeActivateTailscaleAfterHaFailure(channel: String) {
+        if (HaTailscaleRuntime.current()?.enabled == true) return
         val endpoint = when (channel) {
             "mqtt" -> settings.mqttConfig().let { HaEndpoint(channel, it.host, it.port) }
             "influx" -> settings.influxConfig().let { HaEndpoint(channel, it.host, it.port) }
@@ -4311,7 +4315,7 @@ class CollectorService : Service() {
             tailscaleExecutor.execute {
                 try {
                     TailscaleActivator.runDelayedSequence(
-                        isEnabled = { settings.isTailscaleActivationEnabled() },
+                        isEnabled = { settings.isTailscaleActivationEnabled() && HaTailscaleRuntime.current()?.enabled != true },
                         sleeper = { Thread.sleep(it) },
                         launch = { TailscaleActivator.reactivate(applicationContext) },
                         restoreForeground = { target ->
@@ -4911,7 +4915,7 @@ class CollectorService : Service() {
                     "MQTT previous worker stop timed out; closing its client session"
                 )
             }
-            runCatching { mqttCoordinator.disconnectOffline() }
+            runCatching { HaTransportGate.operation { mqttCoordinator.disconnectOffline() } }
                 .onSuccess { result ->
                     completedOk = result.ok
                     if (!result.ok) {
@@ -4931,6 +4935,7 @@ class CollectorService : Service() {
                 }
         } finally {
             mqttOfflineQueued.set(false)
+            HaTailscaleRuntime.current()?.releaseIfIdle()
             mainHandler.post {
                 if (!settings.isMqttEnabled()) mqttConnection.release()
                 if (!settings.isMqttEnabled() && (mqttRuntimeStatus == RuntimeActionStatus.STOPPING || mqttTerminalError)) {
@@ -4961,14 +4966,17 @@ class CollectorService : Service() {
                 !settings.isUserShutdownRequested() && settings.isMqttEnabled() &&
                     !mqttConnection.stopping && !maintenanceBlocksRuntimeStart()
             },
-            action = {
+            action = { HaTransportGate.operation {
+                if (submitted != mqttWorkGeneration.get() || !settings.isMqttEnabled() || settings.isUserShutdownRequested()) {
+                    return@operation MqttActionResult.ok("MQTT work superseded during transport handover")
+                }
                 mqttCoordinator.runWithStorageRecovery(
                     errorCategory,
                     isCurrent = { submitted == mqttWorkGeneration.get() && !settings.isUserShutdownRequested() }
                 ) { action() }.also {
                     localStorageFailure.set(it.category == "mqtt_sqlite_busy" || it.category == "mqtt_storage_error")
                 }
-            },
+            } },
             onSuccess = { result, submittedGeneration ->
                 if (!result.ok && !result.retryable) terminal.set(result.category)
                 if (submittedGeneration == mqttWorkGeneration.get()) {
@@ -5086,8 +5094,14 @@ class CollectorService : Service() {
                     !maintenanceBlocksRuntimeStart() &&
                     (if (isStop) !settings.isInfluxEnabled() else settings.isInfluxEnabled() && !influxConnection.stopping)
             },
-            action = { action().also { result ->
-                localStorageFailure.set(result.category == "influx_sqlite_busy" || result.category == "influx_export_exception")
+            action = { HaTransportGate.operation {
+                if (submitted != influxWorkGeneration.get() || settings.isUserShutdownRequested() ||
+                    (!isStop && !settings.isInfluxEnabled())) {
+                    return@operation InfluxActionResult.ok("Influx work superseded during transport handover")
+                }
+                action().also { result ->
+                    localStorageFailure.set(result.category == "influx_sqlite_busy" || result.category == "influx_export_exception")
+                }
             } },
             onSuccess = { result, submittedGeneration ->
                 if (!isStop && !result.ok && !result.retryable) terminal.set(result.category)
@@ -5103,6 +5117,7 @@ class CollectorService : Service() {
             },
             onComplete = {
                 scheduleIntegrationDashboardRefresh()
+                HaTailscaleRuntime.current()?.releaseIfIdle()
                 afterComplete?.invoke()
             },
             onSettled = {

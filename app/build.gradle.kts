@@ -7,14 +7,15 @@ plugins {
 android {
     namespace = "com.bydcollector.collector"
     compileSdk = 35
+    ndkVersion = "30.0.15729638"
 
     defaultConfig {
         applicationId = "com.bydcollector.collector"
         testInstrumentationRunner = "com.bydcollector.collector.NativeSqliteInstrumentation"
         minSdk = 26
         targetSdk = 29
-        versionCode = 328
-        versionName = "3.4.6"
+        versionCode = 329
+        versionName = "3.5.0"
         manifestPlaceholders["collectorLabel"] = "BYD Collector"
         buildConfigField("String", "COLLECTOR_DISPLAY_NAME", "\"BYD Collector\"")
         buildConfigField("String", "COLLECTOR_DATABASE_NAME", "\"bydcollector_telemetry.db\"")
@@ -61,6 +62,22 @@ android {
     }
 }
 
+val tailscaleJniOutput = layout.buildDirectory.dir("generated/tailscaleJniLibs")
+android.sourceSets.getByName("main").jniLibs.srcDir(tailscaleJniOutput)
+android.sourceSets.getByName("main").assets.srcDir(layout.buildDirectory.dir("tailscale/notices"))
+val buildTailscaleNative by tasks.registering(Exec::class) {
+    inputs.dir("src/main/native/tailscale")
+    outputs.dir(tailscaleJniOutput)
+    outputs.dir(layout.buildDirectory.dir("tailscale/notices"))
+    commandLine("pwsh", "-NoProfile", "-File", file("src/main/native/tailscale/build.ps1").absolutePath,
+        "-GoExecutable", providers.gradleProperty("collectorGo").getOrElse("go.exe"),
+        "-AndroidNdk", android.sdkDirectory.resolve("ndk/${android.ndkVersion}").absolutePath,
+        "-BuildRoot", layout.buildDirectory.dir("tailscale").get().asFile.absolutePath,
+        "-OutputRoot", tailscaleJniOutput.get().asFile.absolutePath)
+    providers.gradleProperty("collectorGoModuleCache").orNull?.let { args("-ModuleCache", it) }
+}
+tasks.matching { it.name == "preBuild" }.configureEach { dependsOn(buildTailscaleNative) }
+
 val bundledUi = tasks.register<Copy>("bundleRuntimeUi") {
     dependsOn(":collector-ui:assemblePerformance")
     from(project(":collector-ui").layout.buildDirectory.file("outputs/apk/performance/collector-ui-performance.apk"))
@@ -71,6 +88,7 @@ android.sourceSets.getByName("main").assets.srcDir(layout.buildDirectory.dir("ge
 tasks.named("preBuild") { dependsOn(bundledUi) }
 
 dependencies {
+    implementation("com.google.zxing:core:3.5.3")
     implementation("com.android.tools.smali:smali-dexlib2:3.0.9")
     implementation("org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5")
     implementation("androidx.core:core:1.13.1")

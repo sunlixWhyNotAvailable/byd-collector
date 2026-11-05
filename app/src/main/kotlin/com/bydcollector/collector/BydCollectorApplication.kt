@@ -184,6 +184,7 @@ class BydCollectorApplication : Application() {
             com.bydcollector.collector.runtime.RuntimeClient.initialize(this)
             return
         }
+        com.bydcollector.collector.ha.tailscale.HaTailscaleRuntime.initialize(this)
         runCatching {
             ProcessExitDiagnostics.install(this, operationalEventJournal) {
                 if (maintenanceDiagnosticsDelegate.isInitialized()) maintenanceDiagnostics.cachedSnapshot().detail else "maintenance=inactive"

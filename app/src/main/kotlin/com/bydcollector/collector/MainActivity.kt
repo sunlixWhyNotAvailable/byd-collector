@@ -903,6 +903,32 @@ class MainActivity : ComponentActivity() {
                 work = { source.setHaSharedCategoriesEnabled(enabled) }, onSuccess = { refresh() })
         }
 
+        override fun onToggleHaTailscale(enabled: Boolean) {
+            submitUiOwnerAction("haTailscale", work = {
+                val args = Bundle().apply { putBoolean("enabled", enabled) }
+                if (!com.bydcollector.collector.runtime.RuntimeEndpoint.forward(applicationContext, "tailscaleEnable", args)) {
+                    com.bydcollector.collector.ha.tailscale.HaTailscaleRuntime.initialize(applicationContext).setEnabled(enabled)
+                }
+                tailscaleUiSnapshot()
+            }, onSuccess = { snapshot ->
+                actionUiState = actionUiState.copy(tailscale = snapshot)
+                refresh()
+            })
+        }
+
+        override fun onCancelHaTailscale(operation: Long) {
+            submitUiOwnerAction("haTailscaleCancel", work = {
+                val args = Bundle().apply { putLong("generation", operation) }
+                if (!com.bydcollector.collector.runtime.RuntimeEndpoint.forward(applicationContext, "tailscaleCancel", args)) {
+                    com.bydcollector.collector.ha.tailscale.HaTailscaleRuntime.initialize(applicationContext).cancel(operation)
+                }
+                tailscaleUiSnapshot()
+            }, onSuccess = { snapshot ->
+                actionUiState = actionUiState.copy(tailscale = snapshot)
+                refresh()
+            })
+        }
+
         override fun onStartMqtt() {
             refreshStoreBackedState()
             if (actionUiState.mqttTest || actionUiState.mqttCleanup || CollectorService.mqttConnection.owned) return
@@ -1527,6 +1553,7 @@ class MainActivity : ComponentActivity() {
         if (dashboardUiStateStore.currentChrome() == null) {
             dashboardUiStateStore.seed(stateProvider.loadInitial())
         }
+        actionUiState = actionUiState.copy(tailscale = tailscaleUiSnapshot())
         setContent {
             Box(Modifier.fillMaxSize()) {
                 val renderedOfferResultId = updateOfferResultId
@@ -2479,6 +2506,7 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 refreshInFlight = false
                 if (destroyed) return@runOnUiThread
+                actionUiState = actionUiState.copy(tailscale = tailscaleUiSnapshot())
                 runtimeJobs?.onSuccess { syncUpdateCheckUi(); syncReleaseNotesUi(); consumeRuntimeJobs(it) }
                 if (tabGeneration != null && tabResult != null) {
                     tabResult
@@ -2527,6 +2555,11 @@ class MainActivity : ComponentActivity() {
             Log.e(TAG, "Dashboard refresh failure could not be recorded", eventError)
         }
     }
+
+    private fun tailscaleUiSnapshot(): com.bydcollector.collector.ui.compose.TailscaleUiState =
+        com.bydcollector.collector.ui.compose.TailscaleUiState.from(
+            if (BuildConfig.RUNTIME_CLIENT) RuntimeClient.state.getBundle("tailscale")
+            else com.bydcollector.collector.ha.tailscale.HaTailscaleRuntime.current()?.snapshot())
 
     private fun reconcileActionUiState(state: DashboardState) {
         val archiveJob = state.archiveStorageJobStatus

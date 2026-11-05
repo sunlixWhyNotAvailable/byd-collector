@@ -104,6 +104,7 @@ internal object RuntimeClient {
 
     fun snapshotOwner(app: BydCollectorApplication): Bundle = Bundle().apply {
         check(!BuildConfig.RUNTIME_CLIENT)
+        putBundle("tailscale", com.bydcollector.collector.ha.tailscale.HaTailscaleRuntime.initialize(app).snapshot())
         putBoolean("running", CollectorService.isRunning())
         putBoolean("shutdown", CollectorService.isUserShutdownInProgress())
         putBoolean("main", CollectorService.isMainPollingRunning())

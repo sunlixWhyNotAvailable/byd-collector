@@ -1,5 +1,9 @@
 package com.bydcollector.collector.mqtt
 
+import com.bydcollector.collector.ha.tailscale.HaTailscaleRuntime
+import com.bydcollector.collector.ha.tailscale.TailscaleBridgeLease
+import com.bydcollector.collector.ha.tailscale.TailscaleSocketFactory
+import com.bydcollector.collector.util.diagnosticDetail
 import org.eclipse.paho.client.mqttv3.MqttClient
 import org.eclipse.paho.client.mqttv3.MqttConnectOptions
 import org.eclipse.paho.client.mqttv3.MqttException
@@ -33,6 +37,7 @@ class PahoMqttClientFacade(
 ) : MqttClientFacade {
     @Volatile private var client: PahoMqttClientHandle? = null
     private var clientIdentity: ClientIdentity? = null
+    private var bridgeLease: TailscaleBridgeLease? = null
 
     override val isConnected: Boolean
         get() = client?.isConnected == true
@@ -62,6 +67,7 @@ class PahoMqttClientFacade(
             )
         }
         return runMqttAction {
+            HaTailscaleRuntime.current()?.register(this)
             val will = when (purpose) {
                 MqttConnectionPurpose.RUNTIME -> willMessage ?: defaultWill(config)
                 MqttConnectionPurpose.TEST_NO_WILL -> willMessage
@@ -71,13 +77,22 @@ class PahoMqttClientFacade(
                 ?: replaceClient(config, identity)
             if (!mqttClient.isConnected) {
                 try {
-                    mqttClient.connect(connectOptions(config, will))
+                    releaseBridge()
+                    bridgeLease = HaTailscaleRuntime.current()?.bridge(config.host, config.port)
+                    mqttClient.connect(connectOptions(config, will).apply {
+                        bridgeLease?.let {
+                            // Paho resolves this address before Socket.connect; resolve the real host only in tsnet.
+                            serverURIs = arrayOf("tcp://127.0.0.1:${it.port}")
+                            socketFactory = TailscaleSocketFactory(config.host, config.port, it)
+                        }
+                    })
                 } catch (error: Exception) {
                     if (client === mqttClient) {
                         client = null
                         clientIdentity = null
                     }
                     closeBestEffort(mqttClient)
+                    try { releaseBridge() } catch (cleanup: Throwable) { error.addSuppressed(cleanup) }
                     throw error
                 }
             }
@@ -91,6 +106,7 @@ class PahoMqttClientFacade(
         client = null
         clientIdentity = null
         oldClient?.let { closeBestEffort(it) }
+        releaseBridge()
         return clientFactory(config.serverUri, config.clientId).also {
             it.setTimeToWait(MQTT_ACTION_TIMEOUT_MS)
             client = it
@@ -134,30 +150,38 @@ class PahoMqttClientFacade(
 
     @Synchronized
     override fun disconnect(gracefulMessage: HaMqttMessage?): MqttActionResult {
-        val mqttClient = client ?: return MqttActionResult.ok()
+        val mqttClient = client
         client = null
         clientIdentity = null
-        val publishError = if (mqttClient.isConnected && gracefulMessage != null) {
+        val publishError = if (mqttClient?.isConnected == true && gracefulMessage != null) {
             runCatching { mqttClient.publish(gracefulMessage.topic, mqttMessage(gracefulMessage)) }.exceptionOrNull()
         } else {
             null
         }
-        val disconnectError = if (mqttClient.isConnected) {
+        val disconnectError = if (mqttClient?.isConnected == true) {
             runCatching { mqttClient.disconnect() }.exceptionOrNull()
         } else {
             null
         }
-        val closeError = runCatching { mqttClient.close() }.exceptionOrNull()
-        val error = publishError ?: disconnectError ?: closeError
+        val closeError = runCatching { mqttClient?.close() }.exceptionOrNull()
+        val bridgeError = runCatching { releaseBridge() }.exceptionOrNull()
+        val failures = listOfNotNull(publishError, disconnectError, closeError, bridgeError)
+        val error = failures.firstOrNull()?.also { first -> failures.drop(1).forEach(first::addSuppressed) }
         return if (error == null) {
             MqttActionResult.ok()
         } else {
             MqttActionResult.fail(
                 "mqtt_error",
-                "${error::class.java.simpleName}: ${error.message ?: "no message"}",
+                error.diagnosticDetail(),
                 classifyFailure(error)
             )
         }
+    }
+
+    private fun releaseBridge() {
+        val lease = bridgeLease
+        bridgeLease = null
+        lease?.close()
     }
 
     private fun defaultWill(config: HaMqttConfig): HaMqttMessage {
@@ -196,7 +220,7 @@ class PahoMqttClientFacade(
         } catch (error: Exception) {
             MqttActionResult.fail(
                 "mqtt_error",
-                "${error::class.java.simpleName}: ${error.message ?: "no message"}",
+                error.diagnosticDetail(),
                 classifyFailure(error)
             )
         }

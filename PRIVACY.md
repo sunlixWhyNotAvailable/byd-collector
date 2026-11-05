@@ -34,7 +34,7 @@ MQTT is disabled until configured and enabled by the user. It sends selected nor
 
 Precise location is excluded unless the ordinary MQTT `location` category is enabled; that category is off by default.
 
-The current MQTT transport uses plain `tcp://` without TLS. MQTT credentials and payloads can therefore be visible to the local network or intermediaries. Use only a trusted network and broker until TLS support is implemented.
+The direct MQTT transport uses plain `tcp://` without TLS. MQTT credentials and payloads can therefore be visible to the local network or intermediaries; use a trusted network/broker or the optional Tailscale transport described below.
 
 ### InfluxDB
 
@@ -42,7 +42,13 @@ InfluxDB export is disabled until configured and enabled by the user. It sends s
 
 Precise location history is excluded unless the ordinary InfluxDB `location` category is enabled; that category is off by default.
 
-The current InfluxDB v1 transport uses plain `http://` without TLS. InfluxDB credentials and telemetry can therefore be visible to the local network or intermediaries. Use only a trusted network and endpoint until TLS support is implemented.
+The direct InfluxDB v1 transport uses plain `http://` without TLS. InfluxDB credentials and telemetry can therefore be visible to the local network or intermediaries; use a trusted network/endpoint or the optional Tailscale transport described below.
+
+### Optional Tailscale transport
+
+`Use Tailscale Serve` is off by default. When enabled, Collector runs an outgoing Tailscale node for MQTT/InfluxDB only. Tailscale coordination/relay infrastructure receives the connection and node/account metadata needed for this service. The tailnet connection encrypts integration traffic; the receiving server still receives its ordinary credentials and telemetry. An onward subnet-router-to-server connection is outside that encryption. Collector does not publish an incoming Serve/Funnel endpoint or change Android VPN routing.
+
+Node authorization is stored encrypted in the runtime application's private, backup-excluded directory, with its key protected by Android Keystore. Turning the switch off keeps authorization; clearing runtime app data or uninstalling removes the local copy, while removing the node from Tailscale is managed in your account. Login links and transport credentials are not added to diagnostics. The embedded client's automatic diagnostic log upload is disabled.
 
 ### Telegram
 

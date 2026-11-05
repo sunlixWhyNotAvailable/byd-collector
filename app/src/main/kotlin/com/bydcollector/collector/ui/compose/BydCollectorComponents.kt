@@ -458,20 +458,21 @@ fun SwitchControlRow(
         verticalAlignment = Alignment.CenterVertically
     ) {
         content()
-        BydSwitch(toggle.checked, null, enabled = toggle.enabled, interactionSource = interactionSource)
+        BydSwitch(toggle.checked, null, enabled = toggle.enabled, interactionSource = interactionSource, pending = toggle.pending)
     }
 }
 
 data class SwitchToggle(
     val checked: Boolean,
     val onChange: (Boolean) -> Unit,
-    val enabled: Boolean = true
+    val enabled: Boolean = true,
+    val pending: Boolean = false
 )
 
 private fun Modifier.switchTarget(toggle: SwitchToggle?, interactionSource: MutableInteractionSource): Modifier =
     if (toggle == null) this else toggleable(
         value = toggle.checked,
-        enabled = toggle.enabled,
+        enabled = toggle.enabled && !toggle.pending,
         role = Role.Switch,
         interactionSource = interactionSource,
         indication = null,
@@ -485,12 +486,14 @@ fun BydSwitch(
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
     binary: Boolean = false,
-    interactionSource: MutableInteractionSource = remember { MutableInteractionSource() }
+    interactionSource: MutableInteractionSource = remember { MutableInteractionSource() },
+    pending: Boolean = false
 ) {
     val p = LocalBydPalette.current
     val pressed by interactionSource.collectIsPressedAsState()
 
     val track = when {
+        pending -> p.accent.copy(alpha = 0.6f)
         !enabled -> p.disabled
         binary && pressed -> p.accent.copy(alpha = 0.82f)
         pressed -> p.activeSoft
@@ -500,6 +503,7 @@ fun BydSwitch(
     }
     val thumbSize by animateDpAsState(
         targetValue = when {
+            pending -> 22.dp
             binary -> 25.dp
             checked -> 25.dp
             else -> 19.dp
@@ -508,6 +512,7 @@ fun BydSwitch(
     )
     val thumbOffset by animateDpAsState(
         targetValue = when {
+            pending -> 14.dp
             binary && checked -> 25.dp
             checked -> 25.dp
             else -> 0.dp
@@ -520,7 +525,7 @@ fun BydSwitch(
             .clip(PillShape)
             .background(track)
             .border(1.dp, if (binary || checked) p.accent else p.border, PillShape)
-            .switchTarget(onCheckedChange?.let { SwitchToggle(checked, it, enabled) }, interactionSource)
+            .switchTarget(onCheckedChange?.let { SwitchToggle(checked, it, enabled, pending) }, interactionSource)
             .padding(3.dp),
         contentAlignment = Alignment.CenterStart
     ) {
@@ -529,7 +534,7 @@ fun BydSwitch(
                 .padding(start = thumbOffset)
                 .size(thumbSize)
                 .clip(PillShape)
-                .background(if (binary || checked) p.switchThumbOn else p.switchThumbOff)
+                .background(if (binary || checked || pending) p.switchThumbOn else p.switchThumbOff)
         )
     }
 }

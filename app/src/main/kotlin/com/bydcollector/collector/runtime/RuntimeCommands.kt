@@ -8,6 +8,10 @@ import com.bydcollector.collector.service.CollectorServiceController as Controll
 internal object RuntimeCommands {
     fun dispatch(context: Context, operation: String, args: Bundle) {
         when (operation) {
+            "tailscaleEnable" -> com.bydcollector.collector.ha.tailscale.HaTailscaleRuntime.initialize(context)
+                .setEnabled(args.getBoolean("enabled"))
+            "tailscaleCancel" -> com.bydcollector.collector.ha.tailscale.HaTailscaleRuntime.initialize(context)
+                .cancel(args.getLong("generation"))
             "start" -> Controller.start(context, args.getBoolean("force"))
             "stop" -> Controller.stop(context)
             "shutdown" -> Controller.shutdown(context)

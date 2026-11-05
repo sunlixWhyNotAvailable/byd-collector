@@ -152,7 +152,11 @@ Location export is **off by default** for each channel and is separate from loca
 
 MQTT sends current state, so updates can be missed while offline. InfluxDB saves export progress and resumes history after reconnection; a successful connection test does not mean all pending history has been sent.
 
-**Use a trusted network or VPN. Current MQTT and InfluxDB connections are not encrypted with TLS.** Protect the server and credentials; see [Privacy](PRIVACY.md).
+`Use Tailscale Serve` optionally connects both channels through Collector's own Tailscale node, without requiring an Android VPN. It starts off. Turn it on and follow the sign-in link or scan the QR code; authorize the node in the same tailnet as your broker/InfluxDB. Use their reachable tailnet host/address and service port. Existing exports keep their previous connection during sign-in, then switch after in-flight work finishes. Turning it off retains authorization for the next activation. If the selected Tailscale connection is unavailable, Collector retries through it instead of silently falling back to the ordinary network.
+
+Despite the switch's name, this is an outgoing connection: it does not publish a Serve/Funnel listener or expose HA to the public internet. HA's Tailscale add-on must allow access to the broker/InfluxDB ports; exposing only the HA web interface is insufficient. A separate Android VPN can remain enabled; its routing and exit-node settings remain under your control.
+
+**Direct MQTT/InfluxDB connections do not use TLS; use a trusted network or VPN.** The optional embedded Tailscale connection encrypts the tailnet leg; any onward subnet-router-to-server leg needs its own protection. See [Privacy](PRIVACY.md).
 
 <p align="center"><img src="docs/screenshots/en/home-assistant.png" alt="BYD Collector Home Assistant and InfluxDB settings" width="100%"></p>
 

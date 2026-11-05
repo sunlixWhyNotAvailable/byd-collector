@@ -1,5 +1,7 @@
 package com.bydcollector.collector.runtime
 
+import com.bydcollector.collector.ha.tailscale.HaTransportGate
+import com.bydcollector.collector.ha.tailscale.HaTailscaleRuntime
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -203,6 +205,15 @@ class RuntimeJobsService : Service() {
     }
 
     private fun execute(job: JSONObject): JSONObject {
+        if (job.getString("kind") !in setOf("mqttTest", "mqttCleanup", "influxTest")) return executeJob(job)
+        return try { HaTransportGate.operation {
+            check(!CollectorSettings(this).isUserShutdownRequested()) { "Shutdown requested" }
+            executeJob(job)
+        } }
+        finally { HaTailscaleRuntime.current()?.releaseIfIdle() }
+    }
+
+    private fun executeJob(job: JSONObject): JSONObject {
         val app = applicationContext as BydCollectorApplication
         val args = job.getJSONObject("args")
         return when (job.getString("kind")) {

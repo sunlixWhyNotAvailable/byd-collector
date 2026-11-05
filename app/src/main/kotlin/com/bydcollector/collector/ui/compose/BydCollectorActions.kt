@@ -46,6 +46,7 @@ data class InfluxDraft(
 )
 
 data class BydCollectorActionUiState(
+    val tailscale: TailscaleUiState = TailscaleUiState(),
     val adbGrant: Boolean = false,
     val mainArchivePreflight: Boolean = false,
     val archiveShare: Boolean = false,
@@ -277,6 +278,8 @@ interface BydCollectorActions {
     fun onToggleDebugAutoStart(enabled: Boolean)
 
     fun onToggleSharedCategories(enabled: Boolean)
+    fun onToggleHaTailscale(enabled: Boolean)
+    fun onCancelHaTailscale(operation: Long)
     fun onStartMqtt()
     fun onStopMqtt()
     fun onTestMqtt()

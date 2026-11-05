@@ -279,6 +279,7 @@ fun BydCollectorApp(
                         actions::onCleanupMqttIdentity, actions::onRefreshMqttCleanup,
                         onDismiss = { showMqttCleanup = false })
                 }
+                TailscaleAuthorization(actionUiState.tailscale, s, actions)
                 if (backgroundSetupPromptVisible) {
                     //blocks underlying controls while the dilink background-app instruction is visible
                     BackgroundAppsSetupPrompt(
@@ -1810,6 +1811,17 @@ private fun HaTab(
     TabScrollColumn(AppTab.HA, session, contentReady) {
         Row(Modifier.fillMaxWidth().height(36.dp), verticalAlignment = Alignment.CenterVertically) {
             ScreenTitle(strings.haTab, strings.haSubtitle, modifier = Modifier.weight(1f))
+            val tailnet = actionUiState.tailscale
+            // The first real snapshot mounts the switch at its actual value, without an OFF-to-ON jump.
+            if (tailnet.known) SwitchControlRow(
+                SwitchToggle(tailnet.enabled, actions::onToggleHaTailscale,
+                    enabled = !actionUiState.isPending("haTailscale"), pending = tailnet.pending || actionUiState.isPending("haTailscale")),
+                Modifier.height(36.dp)
+            ) {
+                Text(strings.tailscale.toggle, color = LocalBydPalette.current.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.width(10.dp))
+            } else Spacer(Modifier.width(280.dp))
+            Spacer(Modifier.width(18.dp))
             SwitchControlRow(
                 SwitchToggle(state?.haSharedCategoriesEnabled == true, actions::onToggleSharedCategories,
                     enabled = state?.influxEnabled != true && !actionUiState.isPending("sharedCategories")),
