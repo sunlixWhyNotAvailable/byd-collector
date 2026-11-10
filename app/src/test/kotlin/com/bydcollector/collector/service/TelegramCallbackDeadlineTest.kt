@@ -33,13 +33,53 @@ class TelegramCallbackDeadlineTest {
                     entry.dev, entry.fid, if (entry.tx == 7) 2 else 1, value.second.toInt(),
                     base + elapsed, elapsed, null, "callback")
                 PollReading(value.first, value.second,
-                    if (value.first in setOf(VOLTAGE, CURRENT)) Float.fromBits(value.second.toInt()).toString() else value.second,
+                    if (value.first in setOf(VOLTAGE, CURRENT, ENERGY)) Float.fromBits(value.second.toInt()).toString() else value.second,
                     callback)
             }, PollOrigin.REPLAY,
             "boot", config, base + 1_000_000L, normalizer, nowElapsedMs = 1_000_000L)
 
     private fun tick(engine: TelegramEventEngine, elapsed: Long) =
         engine.onDetectorTimer(config, base + elapsed, "boot", elapsed, normalizer)
+
+    @Test fun legacyEnergyPreservesKnownSubtotalWithoutCertifyingMissingStartOrReset() {
+        var engine = TelegramEventEngine()
+        input(engine, 0, GEAR to "1", ODOMETER to "1000")
+        input(engine, 100, GEAR to "4")
+        input(engine, 500, ENERGY to 10f.toRawBits().toString(), SOC to "72")
+        assertNull(engine.state.tripStartSoc)
+        assertNull(engine.state.bootStartSoc)
+        input(engine, 1_000, ENERGY to 11f.toRawBits().toString(), ODOMETER to "1010")
+        assertEquals(1.0, assertNotNull(engine.state.tripAccumulatedEnergyKwh), 1e-6, engine.state.toJson())
+        engine = TelegramEventEngine(TelegramEventState.fromJson(engine.state.toJson()))
+        input(engine, 2_000, GEAR to "1")
+        val first = tick(engine, 32_000).events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+        assertEquals("n/a", first.variables["trip_energy_kwh"])
+        assertEquals("n/a", first.variables["total_energy_kwh"])
+        assertEquals(1.0, engine.state.bootTotalEnergyKwh, 1e-6)
+        input(engine, 33_000, GEAR to "4")
+        input(engine, 34_000, ENERGY to 12f.toRawBits().toString(), ODOMETER to "1020")
+        input(engine, 35_000, GEAR to "1")
+        val second = tick(engine, 65_000).events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+        assertEquals("1", second.variables["trip_energy_kwh"])
+        assertEquals("n/a", second.variables["total_energy_kwh"])
+        input(engine, 66_000, GEAR to "4")
+        input(engine, 67_000, ENERGY to 1f.toRawBits().toString(), ODOMETER to "1030")
+        input(engine, 68_000, GEAR to "1")
+        assertEquals("n/a", tick(engine, 98_000).events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+            .variables["trip_energy_kwh"])
+    }
+
+    @Test fun delayedAcquisitionBeforeDepartureCanRecoverSocAndLegacyEnergyStart() {
+        val engine = TelegramEventEngine()
+        input(engine, 0, GEAR to "1", ODOMETER to "1000")
+        input(engine, 100, GEAR to "4")
+        input(engine, 50, ENERGY to 10f.toRawBits().toString(), SOC to "72")
+        assertEquals(72.0, engine.state.tripStartSoc)
+        input(engine, 1_000, ENERGY to 11f.toRawBits().toString(), ODOMETER to "1010")
+        input(engine, 2_000, GEAR to "1")
+        assertEquals("1", tick(engine, 32_000).events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+            .variables["total_energy_kwh"])
+    }
 
     @Test fun odometerDistanceUsesCachedStartWithoutGpsAndSurvivesStateReload() {
         var engine = TelegramEventEngine()
@@ -245,6 +285,27 @@ class TelegramCallbackDeadlineTest {
         assertTrue(tick(engine, 120000).events.isEmpty())
     }
 
+    @Test fun chargingSurvivesShortCablePulseAndStopsOnTheSharedDisconnectDeadline() {
+        var engine = TelegramEventEngine()
+        input(engine, 0, GUN to "1", SOC to "50")
+        input(engine, 100, GUN to "2", BMS to "1")
+        tick(engine, 1_100)
+        val session = assertNotNull(engine.state.chargingSessionId)
+        input(engine, 2_000, GUN to "1")
+        assertTrue(tick(engine, 3_100).events.isEmpty())
+        engine = TelegramEventEngine(TelegramEventState.fromJson(engine.state.toJson()))
+        assertTrue(input(engine, 4_900, GUN to "2").events.isEmpty())
+        assertEquals(session, engine.state.chargingSessionId)
+        assertTrue(tick(engine, 5_000).events.isEmpty())
+        input(engine, 6_000, GUN to "1")
+        assertTrue(tick(engine, 8_999).events.isEmpty())
+        val stopped = tick(engine, 9_000)
+        assertEquals(setOf(TelegramEventType.CHARGE_GUN_DISCONNECTED, TelegramEventType.CHARGING_STOPPED),
+            stopped.events.map { it.type }.toSet())
+        assertNull(engine.state.chargingSessionId)
+        assertTrue(tick(engine, 10_000).events.isEmpty())
+    }
+
     companion object {
         private const val GUN = "charging_1009_876609586_5"
         private const val BMS = "charging_1009_876609560_5"
@@ -253,5 +314,6 @@ class TelegramCallbackDeadlineTest {
         private const val ODOMETER = "statistic_1014_1246765072_5"
         private const val VOLTAGE = "ota_battery_voltage"
         private const val CURRENT = "charging_charge_current"
+        private const val ENERGY = "statistic_statistic_this_trip_total_elec_consumption"
     }
 }

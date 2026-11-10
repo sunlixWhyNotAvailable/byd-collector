@@ -122,6 +122,7 @@ internal object TripCompletionIntentCodec {
         put("quality", session.quality)
         put("telegram_eligible", session.telegramEligible)
         put("telegram_enqueued", session.telegramEnqueued)
+        putNullable("counter_coverage", session.counterCoverage?.toJson())
     }
 
     private fun decodeSession(json: JSONObject): TripSession = TripSession(
@@ -156,7 +157,8 @@ internal object TripCompletionIntentCodec {
         termination = json.stringOrNull("termination"),
         quality = json.getString("quality"),
         telegramEligible = json.getBoolean("telegram_eligible"),
-        telegramEnqueued = json.getBoolean("telegram_enqueued")
+        telegramEnqueued = json.getBoolean("telegram_enqueued"),
+        counterCoverage = json.optJSONObject("counter_coverage")?.let(TripCounterCoverage::fromJson)
     ).also(::requireFiniteSession)
 
     private fun requireFiniteSession(session: TripSession) {

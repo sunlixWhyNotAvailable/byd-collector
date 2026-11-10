@@ -40,6 +40,7 @@ internal data class TripBusinessInputReplay(
 )
 
 class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyRuntimeStorage {
+    private var calculatingBusinessPage = false
     @Synchronized
     internal fun pendingBusinessPage(): BusinessPage? = readableDb.rawQuery(
         "SELECT page_key, payload FROM business_page_handoff WHERE singleton=1", null
@@ -52,14 +53,19 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
     @Synchronized
     internal fun commitBusinessPage(calculate: () -> BusinessPage): BusinessPage {
         check(pendingBusinessPage() == null) { "Previous business page is not acknowledged" }
+        check(!calculatingBusinessPage) { "Nested Trips business page" }
         val db = writableDb
         db.beginTransaction()
         try {
+            calculatingBusinessPage = true
             val page = calculate()
             replaceBusinessPage(page)
             db.setTransactionSuccessful()
             return page
-        } finally { db.endTransaction() }
+        } finally {
+            calculatingBusinessPage = false
+            db.endTransaction()
+        }
     }
 
     @Synchronized
@@ -478,7 +484,7 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
 
     private fun upsertSession(db: SQLiteDatabase, session: TripSession, preserveDurableEnergy: Boolean) {
         if (session.state == TripSession.STATE_OPEN) materializeChunksIfNeeded(db, session.tripId)
-        val durableSnapshot = durableEnergySnapshot(db).takeIf { preserveDurableEnergy }
+        val durableSnapshot = if (preserveDurableEnergy && !calculatingBusinessPage) durableEnergySnapshot(db) else null
         val values = (durableSnapshot?.let { session.withEnergySnapshot(it) } ?: session).toContentValues()
         if (db.update("trip_sessions", values, "trip_id = ?", arrayOf(session.tripId)) == 0) {
             db.insertOrThrow("trip_sessions", null, values)
@@ -1247,7 +1253,7 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
         require(limit == null || limit > 0) { "Session query limit must be positive" }
         val limitClause = limit?.let { " LIMIT $it" }.orEmpty()
         return readableDb.rawQuery(
-            "SELECT trip_id, state, started_at, ended_at, start_elapsed_ms, end_elapsed_ms, start_boot_id, end_boot_id, start_segment_id, end_segment_id, movement_observed, start_soc, end_soc, start_odometer_km, last_odometer_km, start_trip_energy_kwh, last_trip_energy_kwh, duration_ms, distance_km, energy_kwh, average_consumption_kwh_per_100km, discharged_kwh, regenerated_kwh, net_kwh, energy_covered_ms, energy_uncovered_ms, energy_partial, energy_observed_at, termination, quality, telegram_eligible, telegram_enqueued FROM trip_sessions WHERE $where ORDER BY $orderBy$limitClause",
+            "SELECT trip_id, state, started_at, ended_at, start_elapsed_ms, end_elapsed_ms, start_boot_id, end_boot_id, start_segment_id, end_segment_id, movement_observed, start_soc, end_soc, start_odometer_km, last_odometer_km, start_trip_energy_kwh, last_trip_energy_kwh, duration_ms, distance_km, energy_kwh, average_consumption_kwh_per_100km, discharged_kwh, regenerated_kwh, net_kwh, energy_covered_ms, energy_uncovered_ms, energy_partial, energy_observed_at, termination, quality, telegram_eligible, telegram_enqueued, counter_coverage FROM trip_sessions WHERE $where ORDER BY $orderBy$limitClause",
             args
         ).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.toTripSession()) } }
     }
@@ -1264,6 +1270,7 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
         when (energyPartial) { null -> putNull("energy_partial"); else -> put("energy_partial", if (energyPartial) 1 else 0) }
         put("energy_observed_at", energyObservedAt); put("termination", termination); put("quality", quality)
         put("telegram_eligible", if (telegramEligible) 1 else 0); put("telegram_enqueued", if (telegramEnqueued) 1 else 0)
+        put("counter_coverage", counterCoverage?.toJson()?.toString())
     }
 
     private fun RoutePoint.toContentValues() = ContentValues().apply {
@@ -1307,7 +1314,8 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
         getStringOrNull(8), getStringOrNull(9), getInt(10) == 1, getDoubleOrNull(11), getDoubleOrNull(12), getDoubleOrNull(13), getDoubleOrNull(14),
         getDoubleOrNull(15), getDoubleOrNull(16), getLongOrNull(17), getDoubleOrNull(18), getDoubleOrNull(19), getDoubleOrNull(20),
         getDoubleOrNull(21), getDoubleOrNull(22), getDoubleOrNull(23), getLongOrNull(24), getLongOrNull(25), getBooleanOrNull(26),
-        getStringOrNull(27), getStringOrNull(28), getString(29), getInt(30) == 1, getInt(31) == 1
+        getStringOrNull(27), getStringOrNull(28), getString(29), getInt(30) == 1, getInt(31) == 1,
+        getStringOrNull(32)?.let { TripCounterCoverage.fromJson(org.json.JSONObject(it)) }
     )
 
     private fun Cursor.toTripCompletionIntent(): TripCompletionIntent {

@@ -10,6 +10,7 @@ import com.bydcollector.collector.data.trips.RoutePoint
 import com.bydcollector.collector.data.trips.TripId
 import com.bydcollector.collector.data.trips.TripMetrics
 import com.bydcollector.collector.data.trips.TripSession
+import com.bydcollector.collector.data.trips.TripCounterCoverage
 import com.bydcollector.collector.data.trips.TripStore
 import com.bydcollector.collector.data.trips.TripTime
 import com.bydcollector.collector.data.energy.EnergySnapshot
@@ -220,8 +221,8 @@ class TripRuntimeCoordinator(
                     eventSourceStamp = currentStamp
                 ).copy(
                     energy = energySnapshot?.takeIf {
-                        currentStamp != null && it.sourceBootId == currentStamp.bootId &&
-                            it.sourceElapsedMs == currentStamp.elapsedMs
+                        currentStamp != null && it.matchesBusinessInput(
+                            journalGeneration, inputId, currentStamp.bootId, currentStamp.elapsedMs)
                     }
                 )
                 val speedElapsedMs = snapshot.speedElapsedMs
@@ -455,20 +456,26 @@ class TripRuntimeCoordinator(
         }
         if (historyEnabled()) {
             if (session == null) {
-                val startEnergy = snapshot.tripEnergyKwh?.takeIf { it.isFinite() && it >= 0.0 }
+                val startEnergy = snapshot.tripEnergyKwh?.takeIf { it.isFinite() && it >= 0.0 &&
+                    snapshot.startEligible(snapshot.energySource, snapshot.eventBootId, snapshot.eventElapsedMs) }
+                val startSoc = snapshot.soc?.takeIf {
+                    snapshot.startEligible(snapshot.socSource, snapshot.eventBootId, snapshot.eventElapsedMs) }
+                val startOdometer = snapshot.odometerKm?.takeIf {
+                    snapshot.startEligible(snapshot.odometerSource, snapshot.eventBootId, snapshot.eventElapsedMs) }
                 session = TripSession(
                     tripId = snapshot.energy?.powerSessionId ?: TripId.forPowerSession(snapshot.eventBootId, snapshot.eventElapsedMs),
                     startedAt = snapshot.energy?.startedAt ?: timestamp,
                     startElapsedMs = snapshot.eventElapsedMs,
                     startBootId = snapshot.eventBootId,
                     startSegmentId = segmentId,
-                    startSoc = snapshot.soc,
+                    startSoc = startSoc,
                     endSoc = snapshot.soc,
-                    startOdometerKm = snapshot.odometerKm,
+                    startOdometerKm = startOdometer,
                     lastOdometerKm = snapshot.odometerKm,
                     startTripEnergyKwh = startEnergy,
                     lastTripEnergyKwh = startEnergy,
-                    energyKwh = startEnergy?.let { 0.0 }
+                    energyKwh = startEnergy?.let { 0.0 },
+                    counterCoverage = TripCounterCoverage(startSoc != null, startOdometer != null, startEnergy != null)
                 ).let { trip -> snapshot.energy?.let(trip::withEnergySnapshot) ?: trip }.also(tripStore::upsertSession)
                 nextRouteSequence = 0L
                 recordEvent("power_trip_started", "Vehicle power session started", "trip_id=${session?.tripId}")
@@ -480,33 +487,44 @@ class TripRuntimeCoordinator(
 
     private fun updateOpenSession(timestamp: String, snapshot: TelemetrySnapshot) {
         val current = session ?: return
-        val startSoc = current.startSoc ?: snapshot.soc
-        val startOdometer = current.startOdometerKm ?: snapshot.odometerKm
+        val coverage = current.counterCoverage ?: TripCounterCoverage(energyContinuous = false,
+            knownDistanceKm = current.distanceKm ?: 0.0, knownEnergyKwh = current.energyKwh ?: 0.0)
+        val startSoc = current.startSoc.takeIf { coverage.socStartKnown } ?: snapshot.soc?.takeIf {
+            snapshot.startEligible(snapshot.socSource, current.startBootId, current.startElapsedMs) }
+        val startOdometer = current.startOdometerKm.takeIf { coverage.odometerStartKnown } ?: snapshot.odometerKm?.takeIf {
+            snapshot.startEligible(snapshot.odometerSource, current.startBootId, current.startElapsedMs) }
         val currentEnergy = snapshot.tripEnergyKwh?.takeIf { it.isFinite() && it >= 0.0 }
-        val startEnergy = current.startTripEnergyKwh ?: currentEnergy
+        val startEnergy = current.startTripEnergyKwh.takeIf { coverage.energyStartKnown } ?: currentEnergy?.takeIf {
+            snapshot.startEligible(snapshot.energySource, current.startBootId, current.startElapsedMs) }
         val odometerReset = decreased(snapshot.odometerKm, current.lastOdometerKm)
-        val lastOdometer = if (odometerReset) current.lastOdometerKm else snapshot.odometerKm ?: current.lastOdometerKm
-        val legacyResetWithoutTotal = current.energyKwh == null && "trip_energy_reset" in current.quality
-        val accumulatedEnergy = if (legacyResetWithoutTotal) {
-            0.0
-        } else {
-            current.energyKwh ?: TripMetrics.delta(startEnergy, current.lastTripEnergyKwh ?: currentEnergy)
-        }
+        val lastOdometer = snapshot.odometerKm ?: current.lastOdometerKm
+        val accumulatedEnergy = if (!coverage.energyStartKnown && startEnergy != null)
+            TripMetrics.delta(startEnergy, current.lastTripEnergyKwh) ?: coverage.knownEnergyKwh
+        else coverage.knownEnergyKwh
         val energyUpdate = TripMetrics.advanceEnergyCounter(
             accumulatedKwh = accumulatedEnergy,
-            lastCounterKwh = currentEnergy.takeIf { legacyResetWithoutTotal }
-                ?: current.lastTripEnergyKwh
-                ?: currentEnergy,
+            lastCounterKwh = current.lastTripEnergyKwh ?: startEnergy,
             currentCounterKwh = currentEnergy
         )
+        val energyContinuous = coverage.energyContinuous && !energyUpdate.resetObserved &&
+            (snapshot.energySource == null || currentEnergy != null && snapshot.energySource.bootId == current.startBootId)
+        val nextCoverage = TripCounterCoverage(startSoc != null, startOdometer != null, startEnergy != null,
+            energyContinuous, coverage.knownDistanceKm +
+                (TripMetrics.delta(current.lastOdometerKm, snapshot.odometerKm) ?: 0.0),
+            energyUpdate.accumulatedKwh ?: coverage.knownEnergyKwh)
         val quality = listOfNotNull(
-            current.quality.takeUnless { it == TripSession.QUALITY_OK },
+            current.quality.split(',').filterNot { it == TripSession.QUALITY_OK || it.endsWith("_start_missing") ||
+                it == "trip_energy_incomplete" }.joinToString(",").takeIf { it.isNotBlank() },
             "odometer_reset".takeIf { odometerReset },
-            "trip_energy_reset".takeIf { energyUpdate.resetObserved }
+            "trip_energy_reset".takeIf { energyUpdate.resetObserved },
+            "soc_start_missing".takeIf { startSoc == null },
+            "odometer_start_missing".takeIf { startOdometer == null },
+            "trip_energy_start_missing".takeIf { startEnergy == null },
+            "trip_energy_incomplete".takeIf { !energyContinuous }
         ).flatMap { it.split(',') }.distinct().joinToString(",").ifBlank { TripSession.QUALITY_OK }
         val distance = TripMetrics.delta(startOdometer, lastOdometer)
             .takeUnless { "odometer_reset" in quality }
-        val energy = energyUpdate.accumulatedKwh
+        val energy = nextCoverage.knownEnergyKwh.takeIf { startEnergy != null && energyContinuous }
         val duration = TripTime.durationMs(current.startedAt, timestamp)
         session = current.copy(
             movementObserved = current.movementObserved || (snapshot.speedKmh ?: 0.0) > MOVEMENT_THRESHOLD_KMH,
@@ -520,7 +538,8 @@ class TripRuntimeCoordinator(
             distanceKm = distance,
             energyKwh = energy,
             averageConsumptionKwhPer100Km = TripMetrics.averageConsumptionKwhPer100Km(energy, distance),
-            quality = quality
+            quality = quality,
+            counterCoverage = nextCoverage
         ).let { trip -> snapshot.energy?.let(trip::withEnergySnapshot) ?: trip }.also(tripStore::upsertSession)
     }
 
@@ -727,6 +746,10 @@ class TripRuntimeCoordinator(
             tripEnergyKwh = values.number("trip_energy_kwh"),
             speedKmh = values.number("speed_kmh"),
             batteryPowerKw = values.number("battery_power_kw"),
+            sourceStamped = sourceStamped,
+            socSource = sourceStamp("soc"),
+            odometerSource = sourceStamp("odometer_km"),
+            energySource = sourceStamp("trip_energy_kwh"),
             receivedElapsedMs = receivedElapsedMs,
             eventElapsedMs = eventSourceStamp?.elapsedMs ?: receivedElapsedMs,
             eventBootId = eventSourceStamp?.bootId ?: bootId,
@@ -766,6 +789,10 @@ class TripRuntimeCoordinator(
         val tripEnergyKwh: Double?,
         val speedKmh: Double?,
         val batteryPowerKw: Double?,
+        val sourceStamped: Boolean,
+        val socSource: NormalizedSourceStamp?,
+        val odometerSource: NormalizedSourceStamp?,
+        val energySource: NormalizedSourceStamp?,
         val receivedElapsedMs: Long,
         val eventElapsedMs: Long,
         val eventBootId: String,
@@ -774,7 +801,12 @@ class TripRuntimeCoordinator(
         val batteryPowerElapsedMs: Long?,
         val batteryPowerBootId: String?,
         val energy: EnergySnapshot? = null
-    )
+    ) {
+        fun startEligible(source: NormalizedSourceStamp?, boot: String?, elapsed: Long?): Boolean =
+            boot != null && elapsed != null && if (source == null) !sourceStamped &&
+                eventBootId == boot && eventElapsedMs <= elapsed
+            else source.bootId == boot && source.elapsedMs <= elapsed
+    }
 
     companion object {
         private const val THREAD_NAME = "byd-trips"

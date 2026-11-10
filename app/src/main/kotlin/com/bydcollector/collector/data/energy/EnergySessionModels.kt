@@ -83,6 +83,18 @@ enum class EnergyRecoveryState {
     WAITING_FOR_ON
 }
 
+/** The actual covered integration interval, sufficient to evaluate an earlier boundary without future energy. */
+data class EnergyCoveredInterval(
+    val startedElapsedMs: Long,
+    val startPowerKw: Double,
+    val endPowerKw: Double,
+    val totalsBefore: EnergyTotals
+) {
+    init {
+        require(startedElapsedMs >= 0 && startPowerKw.isFinite() && endPowerKw.isFinite())
+    }
+}
+
 data class EnergySnapshot(
     val snapshotId: String,
     val sourceIdentity: String,
@@ -100,7 +112,10 @@ data class EnergySnapshot(
     val energyUncoveredMs: Long,
     val energyPartial: Boolean,
     val integrationQuality: EnergyIntegrationQuality,
-    val reason: String
+    val reason: String,
+    val acquiredBootId: String? = null,
+    val acquiredElapsedMs: Long? = null,
+    val coveredInterval: EnergyCoveredInterval? = null
 ) {
     init {
         require(snapshotId.isNotBlank())
@@ -117,6 +132,10 @@ data class EnergySnapshot(
         require(!active || (powerSessionId != null && startedAt != null))
         require(reason.isNotBlank() && reason.length <= 128)
         require(sourceElapsedMs >= 0L)
+        require((acquiredBootId == null) == (acquiredElapsedMs == null))
+        require(acquiredBootId == null || acquiredBootId.isNotBlank())
+        require(acquiredElapsedMs == null || acquiredElapsedMs >= 0L)
+        coveredInterval?.let { require(sourceElapsedMs - it.startedElapsedMs in 1..BatteryEnergyIntegrator.MAX_INTERVAL_MS) }
         require(energyCoveredMs >= 0L)
         require(energyUncoveredMs >= 0L)
         require(listOfNotNull(dischargedKwh, regeneratedKwh, netKwh).all(Double::isFinite))
@@ -128,6 +147,35 @@ data class EnergySnapshot(
             require(kotlin.math.abs((dischargedKwh - regeneratedKwh) - netKwh!!) <= NET_EPSILON)
             require(energyCoveredMs > 0L)
         }
+    }
+
+    /** Old checkpoints recover acquisition identity from the exact retained journal reference. */
+    fun matchesBusinessInput(generation: String, inputId: Long, bootId: String, elapsedMs: Long): Boolean =
+        sourceIdentity == EnergyReceipt.businessIdentity(generation, inputId) &&
+            sourceBootId == bootId && sourceElapsedMs >= elapsedMs &&
+            (acquiredBootId == null || acquiredBootId == bootId && acquiredElapsedMs == elapsedMs)
+
+    fun atBoundary(bootId: String, elapsedMs: Long): EnergySnapshot? {
+        if (bootId != sourceBootId) return null
+        if (elapsedMs == sourceElapsedMs) return this
+        val interval = coveredInterval ?: return null
+        if (elapsedMs !in interval.startedElapsedMs until sourceElapsedMs) return null
+        val duration = elapsedMs - interval.startedElapsedMs
+        val fraction = duration.toDouble() / (sourceElapsedMs - interval.startedElapsedMs)
+        val power = interval.startPowerKw + (interval.endPowerKw - interval.startPowerKw) * fraction
+        val totals = BatteryEnergyIntegrator.integrateCoveredInterval(interval.totalsBefore,
+            interval.startPowerKw, power, duration)
+        val identity = "boundary:" + java.util.UUID.nameUUIDFromBytes(
+            "$powerSessionId:$bootId:$elapsedMs".toByteArray(Charsets.UTF_8))
+        return copy(snapshotId = "energy:$identity", sourceIdentity = identity,
+            sourceElapsedMs = elapsedMs, active = true,
+            observedAt = java.time.Instant.parse(observedAt).minusMillis(sourceElapsedMs - elapsedMs).toString(),
+            dischargedKwh = totals.dischargedKwh.takeIf { totals.coveredMs > 0 },
+            regeneratedKwh = totals.regeneratedKwh.takeIf { totals.coveredMs > 0 },
+            netKwh = totals.netKwh.takeIf { totals.coveredMs > 0 }, energyCoveredMs = totals.coveredMs,
+            energyUncoveredMs = totals.uncoveredMs, energyPartial = totals.partial,
+            acquiredBootId = bootId, acquiredElapsedMs = elapsedMs, coveredInterval = null,
+            reason = "covered_boundary")
     }
 
     companion object {

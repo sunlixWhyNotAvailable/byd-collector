@@ -1,6 +1,7 @@
 package com.bydcollector.collector.data.trips
 
 import android.app.Application
+import com.bydcollector.collector.data.energy.*
 import com.bydcollector.collector.data.local.PollReading
 import com.bydcollector.collector.data.normalized.NormalizedSourceKind
 import com.bydcollector.collector.data.normalized.NormalizedSourceStamp
@@ -182,6 +183,53 @@ class TripBusinessInputCursorTest {
         }
     }
 
+    @Test
+    fun delayedPowerBoundariesKeepTheComputedEnergySessionAndCompletionAfterReopen() {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "delayed_power_${System.nanoTime()}.db"
+        var expectedSession: String? = null
+        var expectedFinal: EnergySnapshot? = null
+        try {
+            TripStore(TripDatabaseHelper(context, name)).use { store ->
+                val energy = EnergySessionCoordinator(store)
+                val runtime = TripRuntimeCoordinator(context, store, { true }, { false }, {}, { true }, {},
+                    { _, _, _ -> }, bootIdProvider = { "business-test-boot" })
+                try {
+                    listOf(false, true, false).forEachIndexed { index, on ->
+                        val id = index + 1L
+                        val acquired = 1_000L + index * 1_000L
+                        val evaluated = acquired + 500L
+                        val timestamp = java.time.Instant.ofEpochMilli(1_793_000_000_000L + acquired).toString()
+                        val result = energy.process(EnergyReceipt(EnergyReceipt.businessIdentity("late", id), timestamp,
+                            EnergyInput("business-test-boot", acquired, 400.0, 10.0, on, true, false),
+                            businessGeneration = "late", businessInputId = id,
+                            evaluationBootId = "business-test-boot", evaluationElapsedMs = evaluated))
+                        result.pendingProjection?.let { assertTrue(energy.confirmProjected(it.snapshot.snapshotId)) }
+                        val snapshot = assertNotNull(result.snapshot)
+                        assertTrue(snapshot.matchesBusinessInput("late", id, "business-test-boot", acquired))
+                        assertFalse(snapshot.matchesBusinessInput("late", id + 1, "business-test-boot", acquired))
+                        val trip = runtime.onBusinessInput("late", id, "source-$id", timestamp,
+                            listOf(PollReading("bodywork_power_level", if (on) "2" else "0", if (on) "2" else "0")),
+                            emptyList(), false, snapshot, stamp("source-$id", acquired, timestamp)).get(5, TimeUnit.SECONDS)
+                        if (on) {
+                            expectedSession = assertNotNull(snapshot.powerSessionId)
+                            assertEquals(expectedSession, trip.powerSessionId)
+                        }
+                        if (index == 2) expectedFinal = snapshot
+                    }
+                } finally { runtime.close() }
+            }
+            TripStore(TripDatabaseHelper(context, name)).use { store ->
+                val completion = store.allPendingCompletions().last()
+                assertEquals(expectedSession, completion.session?.tripId)
+                assertEquals(expectedFinal, completion.energySnapshot)
+                assertEquals(3_000L, completion.session?.endElapsedMs)
+                assertEquals(3_500L, completion.energySnapshot?.sourceElapsedMs)
+                assertEquals(3_000L, completion.energySnapshot?.acquiredElapsedMs)
+            }
+        } finally { context.deleteDatabase(name) }
+    }
+
     private fun stamp(identity: String, elapsedMs: Long, timestamp: String) = NormalizedSourceStamp(
         kind = NormalizedSourceKind.POLL,
         identity = identity,
@@ -191,4 +239,77 @@ class TripBusinessInputCursorTest {
         wallMs = java.time.Instant.parse(timestamp).toEpochMilli(),
         elapsedMs = elapsedMs
     )
+
+    @Test fun missingTripBaselinesRemainUnknownAndCoverageSurvivesCompletionReopen() {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "trip_coverage_${System.nanoTime()}.db"
+        val odo = "statistic_1014_1246765072_5"
+        val soc = "statistic_1014_1145045040_5"
+        val counter = "statistic_statistic_this_trip_total_elec_consumption"
+        try {
+            TripStore(TripDatabaseHelper(context, name)).use { store ->
+                val runtime = TripRuntimeCoordinator(context, store, { true }, { false }, {}, { true }, {},
+                    { _, _, _ -> }, bootIdProvider = { "business-test-boot" })
+                val normalizer = com.bydcollector.collector.data.normalized.VehicleStateNormalizer()
+                val inputs = linkedMapOf<String, com.bydcollector.collector.data.normalized.NormalizedSourceInput>()
+                var id = 0L
+                fun feed(ms: Long, vararg fields: Pair<String, String>): com.bydcollector.collector.service.TripBusinessResult {
+                    id++
+                    val at = java.time.Instant.ofEpochMilli(1_793_000_000_000L + ms).toString()
+                    val source = stamp("coverage:$id", ms, at)
+                    val readings = fields.map { (key, value) -> PollReading(key, value,
+                        if (key == counter) Float.fromBits(value.toInt()).toString() else value) }
+                    readings.forEach { inputs[it.rawKey] = com.bydcollector.collector.data.normalized.NormalizedSourceInput(it, source, id) }
+                    return runtime.onBusinessInput("coverage", id, source.identity, at, readings,
+                        normalizer.normalizeSparse(inputs, inputs.keys), false, eventSourceStamp = source).get(5, TimeUnit.SECONDS)
+                }
+                try {
+                    val tripId = assertNotNull(feed(100, "bodywork_power_level" to "2").powerSessionId)
+                    feed(500, odo to "1000", soc to "72", counter to 10f.toRawBits().toString())
+                    feed(1_000, odo to "1010", counter to 11f.toRawBits().toString())
+                    val trip = assertNotNull(store.session(tripId))
+                    assertNull(trip.startSoc)
+                    assertNull(trip.startOdometerKm)
+                    assertNull(trip.distanceKm)
+                    assertNull(trip.energyKwh)
+                    assertEquals(1.0, assertNotNull(trip.counterCoverage).knownEnergyKwh, 1e-6)
+                    feed(2_000, "bodywork_power_level" to "0")
+                } finally { runtime.close() }
+            }
+            TripStore(TripDatabaseHelper(context, name)).use { store ->
+                val completion = store.allPendingCompletions().single()
+                val trip = assertNotNull(completion.session)
+                assertEquals(trip.counterCoverage, store.session(trip.tripId)?.counterCoverage)
+                assertEquals(1.0, assertNotNull(trip.counterCoverage).knownDistanceKm, 1e-6)
+                assertNull(trip.startSoc)
+                assertNull(trip.energyKwh)
+            }
+        } finally { context.deleteDatabase(name) }
+    }
+
+    @Test fun versionEightSessionsMigrateWithoutInventingCoverage() {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "trips_v8_${System.nanoTime()}.db"
+        try {
+            context.openOrCreateDatabase(name, 0, null).use { db ->
+                db.execSQL(requireNotNull(javaClass.getResourceAsStream("/trip-sessions-v8.sql"))
+                    .bufferedReader().use { it.readText() })
+                db.execSQL("INSERT INTO trip_sessions (trip_id, state, started_at, start_soc, distance_km) " +
+                    "VALUES ('legacy', 'closed', '2026-11-10T10:00:00Z', 72, 1.2)")
+                db.version = 8
+            }
+            TripStore(TripDatabaseHelper(context, name)).use { store ->
+                assertEquals(9, store.schemaVersion())
+                val legacy = assertNotNull(store.session("legacy"))
+                assertEquals(72.0, legacy.startSoc)
+                assertEquals(1.2, legacy.distanceKm)
+                assertNull(legacy.counterCoverage)
+                store.upsertSession(legacy.copy(tripId = "new", counterCoverage = TripCounterCoverage()))
+            }
+            TripStore(TripDatabaseHelper(context, name)).use { store ->
+                assertNull(store.session("legacy")?.counterCoverage)
+                assertEquals(TripCounterCoverage(), store.session("new")?.counterCoverage)
+            }
+        } finally { context.deleteDatabase(name) }
+    }
 }

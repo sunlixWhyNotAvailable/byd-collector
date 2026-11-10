@@ -6,6 +6,10 @@ import com.bydcollector.collector.data.energy.EnergyReceipt
 import com.bydcollector.collector.data.energy.EnergySessionCoordinator
 import com.bydcollector.collector.data.energy.EnergySessionSeed
 import com.bydcollector.collector.data.energy.EnergyStateCodec
+import com.bydcollector.collector.data.energy.BufferedEnergyStorage
+import com.bydcollector.collector.data.energy.EnergySnapshot
+import com.bydcollector.collector.data.input.BusinessPage
+import com.bydcollector.collector.data.input.BusinessPageEntry
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -20,6 +24,60 @@ import kotlin.test.assertTrue
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
 class TripEnergyRuntimeMirrorTest {
+    @Test
+    fun pageClosingAnExistingSessionAndStartingAnotherKeepsBothFinalIntegrals() {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "multi_session_energy_${System.nanoTime()}.db"
+        var finalA: EnergySnapshot? = null
+        var finalB: EnergySnapshot? = null
+        fun receipt(id: Long, on: Boolean) = EnergyReceipt(EnergyReceipt.businessIdentity("multi", id),
+            java.time.Instant.ofEpochMilli(1_793_000_000_000L + id * 1_000).toString(),
+            EnergyInput("boot", id * 1_000, 400.0, 100.0, on, true, false),
+            businessGeneration = "multi", businessInputId = id)
+        try {
+            TripStore(TripDatabaseHelper(context, name)).use { store ->
+                val direct = EnergySessionCoordinator(store)
+                val startA = assertNotNull(direct.process(receipt(1, true)).snapshot)
+                assertTrue(direct.confirmProjected(startA.snapshotId))
+                val a = TripSession(tripId = startA.powerSessionId!!, startedAt = startA.startedAt!!).withEnergySnapshot(startA)
+                store.upsertSession(a)
+                val priorA = assertNotNull(direct.process(receipt(2, true)).snapshot)
+                assertTrue(direct.confirmProjected(priorA.snapshotId))
+                store.commitBusinessPage {
+                    val buffered = BufferedEnergyStorage(store.readEnergyRuntimeRow())
+                    val energy = EnergySessionCoordinator(buffered)
+                    val entries = listOf(3L to false, 4L to true, 5L to true).map { (id, on) ->
+                        val snapshot = assertNotNull(energy.process(receipt(id, on)).snapshot)
+                        assertTrue(energy.confirmProjected(snapshot.snapshotId))
+                        if (id == 3L) {
+                            finalA = snapshot
+                            val closed = a.withEnergySnapshot(snapshot).copy(state = TripSession.STATE_CLOSED,
+                                endedAt = snapshot.observedAt)
+                            store.closeSessionWithCompletion(closed, null)
+                            assertEquals(snapshot.dischargedKwh, store.session(a.tripId)?.dischargedKwh)
+                        } else {
+                            finalB = snapshot
+                            store.upsertSession(TripSession(tripId = snapshot.powerSessionId!!,
+                                startedAt = snapshot.startedAt!!).withEnergySnapshot(snapshot))
+                        }
+                        BusinessPageEntry(id, "source-$id", snapshot, true, null)
+                    }
+                    buffered.commitTo(store)
+                    BusinessPage("multi", "boot", entries)
+                }
+            }
+            TripStore(TripDatabaseHelper(context, name)).use { store ->
+                val a = assertNotNull(finalA)
+                val b = assertNotNull(finalB)
+                assertEquals(80.0 / 3600, a.dischargedKwh!!, 1e-9)
+                assertEquals(a.dischargedKwh, store.session(a.powerSessionId!!)?.dischargedKwh)
+                assertEquals(a.energyCoveredMs, store.session(a.powerSessionId!!)?.energyCoveredMs)
+                assertEquals(b.dischargedKwh, store.session(b.powerSessionId!!)?.dischargedKwh)
+                assertEquals(b, EnergyStateCodec.decodeState(store.readEnergyRuntimeRow()!!.stateJson).currentSnapshot)
+            }
+        } finally { context.deleteDatabase(name) }
+    }
+
     @Test
     fun offCursorCheckpointKeepsRuntimeProgressWithoutRewritingFinalTripEnergy() {
         val context = RuntimeEnvironment.getApplication()

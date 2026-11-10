@@ -176,9 +176,9 @@ class TelegramCoordinator internal constructor(
     }
 
     /** The caller consumes this timer in the same durable order as telemetry. */
-    fun evaluateDetectors(timestampMs: Long, bootId: String, elapsedMs: Long): Long? {
+    fun evaluateDetectors(timestampMs: Long, bootId: String, elapsedMs: Long, energySnapshot: EnergySnapshot? = null): Long? {
         activateEnabledRuntime() ?: return null
-        val result = engine.onDetectorTimer(eventConfig(), timestampMs, bootId, elapsedMs, normalizer)
+        val result = engine.onDetectorTimer(eventConfig(), timestampMs, bootId, elapsedMs, normalizer, energySnapshot)
         check(handle(result)) { "Telegram detector timer rendering failed; input remains pending" }
         if (result.events.isNotEmpty()) eventStore.recordEvent(
             "telegram_detector_deadline", "Telegram stable-state deadline completed",
@@ -836,19 +836,21 @@ internal fun recoverCompletionState(state: TelegramEventState, intent: TripCompl
         tripStartedAtMs = tripStartedAtMs,
         tripDistance = com.bydcollector.collector.service.TelegramTripDistance.legacy(
             trip.startOdometerKm, trip.lastOdometerKm, tripStartedAtMs, tripEndedAtMs),
-        tripStartSoc = trip.startSoc,
-        tripStartEnergyKwh = trip.startTripEnergyKwh,
+        tripStartSoc = trip.startSoc.takeIf { trip.counterCoverage?.socStartKnown == true },
+        tripStartEnergyKwh = trip.startTripEnergyKwh.takeIf { trip.counterCoverage?.energyStartKnown == true },
         tripParkedSinceMs = null,
         tripEndedAtMs = tripEndedAtMs,
         tripEndSoc = trip.endSoc,
         tripEndEnergyKwh = trip.lastTripEnergyKwh,
-        tripAccumulatedEnergyKwh = trip.energyKwh,
+        tripAccumulatedEnergyKwh = trip.counterCoverage?.knownEnergyKwh ?: trip.energyKwh,
+        tripEnergyContinuous = trip.counterCoverage?.energyContinuous == true,
         lastTripEnergyCounterKwh = trip.lastTripEnergyKwh,
-        bootStartSoc = trip.startSoc,
+        bootStartSoc = trip.startSoc.takeIf { trip.counterCoverage?.socStartKnown == true },
         bootEndSoc = trip.endSoc,
         bootTotalDistanceKm = 0.0,
         bootTotalDistanceComplete = true,
         bootTotalEnergyKwh = 0.0,
+        bootTotalEnergyComplete = true,
         bootTotalDurationMs = 0L,
         bootTotalStartedAtMs = tripStartedAtMs,
         bootTotalEndedAtMs = tripEndedAtMs

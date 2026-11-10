@@ -300,6 +300,14 @@ object BatteryEnergyIntegrator {
             current != null && current.isFinite() && (voltage * current / 1_000.0).isFinite()
     }
 
+    fun integrateCoveredInterval(totals: EnergyTotals, startKw: Double, endKw: Double, intervalMs: Long): EnergyTotals {
+        require(startKw.isFinite() && endKw.isFinite() && intervalMs in 0..MAX_INTERVAL_MS)
+        val energy = splitTrapezoid(startKw, endKw, intervalMs)
+        return totals.copy(dischargedKwh = totals.dischargedKwh + energy.dischargedKwh,
+            regeneratedKwh = totals.regeneratedKwh + energy.regeneratedKwh,
+            coveredMs = addDuration(totals.coveredMs, intervalMs))
+    }
+
     private fun splitTrapezoid(startKw: Double, endKw: Double, intervalMs: Long): EnergySlice {
         val duration = intervalMs.toDouble()
         if (startKw >= 0.0 && endKw >= 0.0) {

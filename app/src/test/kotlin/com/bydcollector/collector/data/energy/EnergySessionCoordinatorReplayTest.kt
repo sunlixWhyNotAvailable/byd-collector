@@ -3,6 +3,13 @@ package com.bydcollector.collector.data.energy
 import android.app.Application
 import com.bydcollector.collector.data.trips.TripDatabaseHelper
 import com.bydcollector.collector.data.trips.TripStore
+import com.bydcollector.collector.data.input.*
+import com.bydcollector.collector.data.local.PollReading
+import com.bydcollector.collector.data.normalized.*
+import com.bydcollector.collector.data.polling.PollSampleSource
+import com.bydcollector.collector.data.polling.PollOrigin
+import com.bydcollector.collector.service.*
+import com.bydcollector.collector.telegram.TelegramEventType
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -17,6 +24,96 @@ import kotlin.test.assertTrue
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
 class EnergySessionCoordinatorReplayTest {
+    @Test
+    fun sparseGearAndTimersUseCalculatedBoundariesAcrossTwoLegsAndReload() {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "sparse_leg_energy.db"
+        val base = 1_793_000_000_000L
+        val normalizer = VehicleStateNormalizer()
+        val config = TelegramEventConfig(TelegramEventType.entries.toSet(), 5, 12.0, 60_000, 5_000)
+        val gear = "gearbox_1011_555745336_5"
+        val odo = "statistic_1014_1246765072_5"
+        var engine = TelegramEventEngine()
+        var inputs = emptyMap<String, NormalizedSourceInput>()
+        var id = 0L
+        try {
+            TripStore(TripDatabaseHelper(context, name)).use { store ->
+                val energy = EnergySessionCoordinator(store)
+                fun feed(ms: Long, vararg values: Pair<String, String>): TelegramEventResult {
+                    id++
+                    val source = PollSampleSource("raw-$id", "boot", ms, "test", id)
+                    val at = java.time.Instant.ofEpochMilli(base + ms).toString()
+                    val stamp = NormalizedSourceStamp(NormalizedSourceKind.POLL, source.identity, "boot", "test", id, base + ms, ms)
+                    val readings = values.map { (key, raw) -> PollReading(key, raw,
+                        if (key == "charging_charge_current") Float.fromBits(raw.toInt()).toString() else raw) }
+                    val merge = BusinessInputReducer.merge(inputs, readings.associate { it.rawKey to NormalizedSourceInput(it, stamp, null) }, "boot")
+                    inputs = merge.inputs
+                    val fresh = BusinessInputProjection.freshInputs(inputs, "boot", ms)
+                    val kind = if (values.isEmpty()) BusinessInputKind.TIMER else BusinessInputKind.GET
+                    val result = if (BusinessInputProjection.needsEnergyCheckpoint(kind, false, merge.updates.keys, energy.runtimeStatus().active)) {
+                        energy.process(EnergyTelemetryProjection.receipt(source.copy(identity = EnergyReceipt.businessIdentity("sparse", id)),
+                            at, fresh.values.map { it.reading }, BusinessInputProjection.observations(normalizer, fresh))
+                            .copy(businessGeneration = "sparse", businessInputId = id))
+                    } else null
+                    result?.pendingProjection?.let { assertTrue(energy.confirmProjected(it.snapshot.snapshotId)) }
+                    return if (kind == BusinessInputKind.TIMER)
+                        engine.onDetectorTimer(config, base + ms, "boot", ms, normalizer, result?.snapshot)
+                    else engine.onSourcePoll(id, at, source, readings, PollOrigin.REPLAY, "boot", config,
+                        base + ms, normalizer, result?.snapshot, ms)
+                }
+                feed(0, "bodywork_power_level" to "0", "charging_1009_876609586_5" to "1",
+                    "charging_charge_battery_volt" to "400", "charging_charge_current" to 100f.toRawBits().toString(),
+                    gear to "1", odo to "1000", "statistic_1014_1145045040_5" to "80")
+                feed(100, "bodywork_power_level" to "2")
+                feed(200, gear to "4")
+                assertEquals(200L, assertNotNull(engine.state.tripStartEnergyPoint).sourceElapsedMs)
+                feed(1_000); feed(2_000)
+                feed(2_100, gear to "1", odo to "1004")
+                val parked = assertNotNull(engine.state.tripEndEnergyPoint)
+                assertEquals(2_100L, parked.sourceElapsedMs)
+                engine = TelegramEventEngine(TelegramEventState.fromJson(engine.state.toJson()))
+                for (ms in 3_000L..7_000L step 1_000) feed(ms)
+                assertEquals(parked, engine.state.tripEndEnergyPoint)
+                val first = feed(7_100).events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+                assertEquals("0.02", first.variables["trip_discharged_kwh"])
+                assertEquals("0.08", first.variables["total_discharged_kwh"])
+                feed(7_200, gear to "4")
+                feed(8_200)
+                feed(9_200, gear to "1", odo to "1014")
+                for (ms in 10_200L..13_200L step 1_000) feed(ms)
+                // Delivery is late, but the report must use energy at its 14_200 deadline.
+                val second = feed(14_700).events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+                assertEquals("0.02", second.variables["trip_discharged_kwh"])
+                assertEquals("0.16", second.variables["total_discharged_kwh"])
+                assertTrue(feed(15_200).events.none { it.type == TelegramEventType.TRIP_SUMMARY })
+            }
+        } finally { context.deleteDatabase(name) }
+    }
+
+    @Test
+    fun coveredBoundaryReconstructionUsesThePersistedIntegralWithoutExtrapolation() {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "energy_boundary.db"
+        try {
+            TripStore(TripDatabaseHelper(context, name)).use { store ->
+                val energy = EnergySessionCoordinator(store)
+                confirm(energy, energy.process(receipt("boundary", 1, 0, 0, false)))
+                confirm(energy, energy.process(receipt("boundary", 2, 100, 100, true)))
+                val result = energy.process(receipt("boundary", 3, 1_100, 1_100, true))
+                confirm(energy, result)
+            }
+            TripStore(TripDatabaseHelper(context, name)).use { store ->
+                val snapshot = assertNotNull(EnergySessionCoordinator(store).currentSnapshot())
+                val boundary = assertNotNull(snapshot.atBoundary("energy-replay-boot", 600))
+                assertEquals(500L, boundary.energyCoveredMs)
+                assertEquals(40.0 * 0.5 / 3_600.0, assertNotNull(boundary.dischargedKwh), 1e-12)
+                assertNull(snapshot.atBoundary("energy-replay-boot", 99))
+                assertNull(snapshot.atBoundary("energy-replay-boot", 1_101))
+                assertNull(snapshot.atBoundary("another-boot", 600))
+            }
+        } finally { context.deleteDatabase(name) }
+    }
+
     @Test
     fun checkpointCacheFollowsPersistedChanges() {
         val context = RuntimeEnvironment.getApplication()

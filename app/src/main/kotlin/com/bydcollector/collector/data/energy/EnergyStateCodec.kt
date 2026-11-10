@@ -108,6 +108,12 @@ object EnergyStateCodec {
         put("observed_at", snapshot.observedAt)
         put("source_boot_id", snapshot.sourceBootId)
         put("source_elapsed_ms", snapshot.sourceElapsedMs)
+        putNullable("acquired_boot_id", snapshot.acquiredBootId)
+        putNullable("acquired_elapsed_ms", snapshot.acquiredElapsedMs)
+        putNullable("covered_interval", snapshot.coveredInterval?.let { interval ->
+            JSONObject().put("started", interval.startedElapsedMs).put("start_kw", interval.startPowerKw)
+                .put("end_kw", interval.endPowerKw).put("totals", encodeTotals(interval.totalsBefore))
+        })
         put("active", snapshot.active)
         putNullable("discharged_kwh", snapshot.dischargedKwh)
         putNullable("regenerated_kwh", snapshot.regeneratedKwh)
@@ -135,7 +141,13 @@ object EnergyStateCodec {
         energyUncoveredMs = json.getLong("energy_uncovered_ms"),
         energyPartial = json.getBoolean("energy_partial"),
         integrationQuality = enumValueOf(json.getString("integration_quality")),
-        reason = json.getString("reason")
+        reason = json.getString("reason"),
+        acquiredBootId = json.stringOrNull("acquired_boot_id"),
+        acquiredElapsedMs = json.longOrNull("acquired_elapsed_ms"),
+        coveredInterval = json.objectOrNull("covered_interval")?.let {
+            EnergyCoveredInterval(it.getLong("started"), it.finiteDouble("start_kw"), it.finiteDouble("end_kw"),
+                decodeTotals(it.getJSONObject("totals")))
+        }
     )
 
     private fun JSONObject.putNullable(key: String, value: Any?) {

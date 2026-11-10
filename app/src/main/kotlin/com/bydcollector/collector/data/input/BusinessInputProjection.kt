@@ -21,6 +21,11 @@ object BusinessInputProjection {
         "charging_1009_876609586_5", "charging_1009_89128973_5",
         "charging_charging_vtov_discharge_status", "charging_1009_876609560_5"
     )
+    val energyBoundaryKeys = NormalizedFieldCatalog.gearAutoMode.sourceKeys.toSet()
+
+    fun needsEnergyCheckpoint(kind: BusinessInputKind, changedEnergy: Boolean, updatedKeys: Set<String>, active: Boolean) =
+        active || kind == BusinessInputKind.TIMER || changedEnergy ||
+            updatedKeys.any { it in energyKeys || it in energyBoundaryKeys }
     private val freshnessByKey = NormalizedFieldCatalog.fields
         .flatMap { field -> field.sourceKeys.map { it to field.category.staleAfterMs } }
         .groupBy({ it.first }, { it.second }).mapValues { (_, ages) -> ages.min() }

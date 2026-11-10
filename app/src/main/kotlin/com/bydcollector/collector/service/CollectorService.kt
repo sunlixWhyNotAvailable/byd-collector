@@ -1474,8 +1474,7 @@ class CollectorService : Service() {
             }
             val observations = BusinessInputProjection.observations(vehicleStateNormalizer, fresh)
             val readings = fresh.values.map { it.reading }
-            val energyDue = ref.kind == BusinessInputKind.TIMER || changedEnergy ||
-                merged.updates.keys.any { it in BusinessInputProjection.energyKeys }
+            val energyDue = BusinessInputProjection.needsEnergyCheckpoint(ref.kind, changedEnergy, merged.updates.keys, evaluation.active)
             val energyResult = if (energyDue) synchronized(energyCoordinator) {
                 if (application.withDatabaseRead { selectedStore.hasDeferredEnergy() }) {
                     deferredEnergyWorker.signal()
@@ -1554,7 +1553,7 @@ class CollectorService : Service() {
                                 "Telegram owner changed before timer ${ref.id}"
                             }
                             finished.complete(coordinator.evaluateDetectors(checkNotNull(ref.acquiredWallMs),
-                                source.bootId, source.capturedElapsedMs))
+                                source.bootId, source.capturedElapsedMs, snapshot))
                         } catch (error: Throwable) { finished.completeExceptionally(error) }
                     }
                     postTelegramTickSchedule(awaitBusinessResult(finished), telegramGeneration)
@@ -1624,7 +1623,7 @@ class CollectorService : Service() {
                         val source = BusinessInputProjection.source(ref)
                         if (ref.kind == BusinessInputKind.TIMER) {
                             if (coordinator.detectorDeadlineAtMs?.let { it <= checkNotNull(ref.acquiredWallMs) } == true)
-                                coordinator.evaluateDetectors(checkNotNull(ref.acquiredWallMs), source.bootId, source.capturedElapsedMs)
+                                coordinator.evaluateDetectors(checkNotNull(ref.acquiredWallMs), source.bootId, source.capturedElapsedMs, entry.energy)
                         } else {
                             entry.trip?.let { completeThrough(it.priorCompletionWatermark) }
                             coordinator.onSourcePoll(ref.pollId ?: 0L, BusinessInputProjection.timestamp(ref), source,
@@ -1698,7 +1697,8 @@ class CollectorService : Service() {
                 before[key]?.reading?.let { it.rawValue to it.descValue } != fresh[key]?.reading?.let { it.rawValue to it.descValue } }
             val readings = fresh.values.map { it.reading }
             val observations = BusinessInputProjection.observations(vehicleStateNormalizer, fresh)
-            val energyDue = ref.kind == BusinessInputKind.TIMER || changedEnergy || merged.updates.keys.any { it in BusinessInputProjection.energyKeys }
+            val projectEnergy = BusinessInputProjection.needsEnergyCheckpoint(ref.kind, changedEnergy, merged.updates.keys, false)
+            val energyDue = projectEnergy || evaluation.active
             val result = if (energyDue) energy.process(EnergyTelemetryProjection.receipt(
                 source.copy(identity = "business:$generation:${ref.id}"), timestamp, readings, observations
             ).copy(businessGeneration = generation, businessInputId = ref.id, evaluationBootId = source.bootId,
@@ -1718,7 +1718,7 @@ class CollectorService : Service() {
                 check(future.isDone) { "Trips page calculation must stay on its owner thread" }
                 awaitBusinessResult(future)
             } else null
-            BusinessPageEntry(ref.id, ref.sourceIdentity, snapshot, project != null, trip)
+            BusinessPageEntry(ref.id, ref.sourceIdentity, snapshot, project != null && projectEnergy, trip)
         }
         buffered.commitTo(trips)
         return BusinessPage(generation, mergeBoot, entries)

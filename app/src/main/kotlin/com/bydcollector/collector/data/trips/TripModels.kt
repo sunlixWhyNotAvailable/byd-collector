@@ -42,12 +42,39 @@ data class TripSession(
     val termination: String? = null,
     val quality: String = QUALITY_OK,
     val telegramEligible: Boolean = false,
-    val telegramEnqueued: Boolean = false
+    val telegramEnqueued: Boolean = false,
+    val counterCoverage: TripCounterCoverage? = null
 ) : java.io.Serializable {
     companion object {
         const val STATE_OPEN = "open"
         const val STATE_CLOSED = "closed"
         const val QUALITY_OK = "ok"
+    }
+}
+
+/** Missing legacy metadata never certifies a complete start boundary. */
+data class TripCounterCoverage(
+    val socStartKnown: Boolean = false,
+    val odometerStartKnown: Boolean = false,
+    val energyStartKnown: Boolean = false,
+    val energyContinuous: Boolean = true,
+    val knownDistanceKm: Double = 0.0,
+    val knownEnergyKwh: Double = 0.0
+) : java.io.Serializable {
+    init {
+        require(knownDistanceKm.isFinite() && knownDistanceKm >= 0.0)
+        require(knownEnergyKwh.isFinite() && knownEnergyKwh >= 0.0)
+    }
+    fun toJson() = org.json.JSONObject().apply {
+        put("soc_start", socStartKnown); put("odometer_start", odometerStartKnown)
+        put("energy_start", energyStartKnown); put("energy_continuous", energyContinuous)
+        put("known_distance_km", knownDistanceKm); put("known_energy_kwh", knownEnergyKwh)
+    }
+    companion object {
+        fun fromJson(json: org.json.JSONObject) = TripCounterCoverage(
+            json.getBoolean("soc_start"), json.getBoolean("odometer_start"),
+            json.getBoolean("energy_start"), json.getBoolean("energy_continuous"),
+            json.getDouble("known_distance_km"), json.getDouble("known_energy_kwh"))
     }
 }
 

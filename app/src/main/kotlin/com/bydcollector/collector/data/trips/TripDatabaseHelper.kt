@@ -65,7 +65,8 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
                 termination TEXT,
                 quality TEXT NOT NULL DEFAULT 'ok',
                 telegram_eligible INTEGER NOT NULL DEFAULT 0 CHECK (telegram_eligible IN (0, 1)),
-                telegram_enqueued INTEGER NOT NULL DEFAULT 0 CHECK (telegram_enqueued IN (0, 1))
+                telegram_enqueued INTEGER NOT NULL DEFAULT 0 CHECK (telegram_enqueued IN (0, 1)),
+                counter_coverage TEXT
             )
             """.trimIndent()
         )
@@ -128,6 +129,7 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
         }
         if (oldVersion < 6) createTripCompletions(db)
         if (oldVersion < 7) createBusinessInputCursor(db)
+        if (oldVersion < 9) db.execSQL("ALTER TABLE trip_sessions ADD COLUMN counter_coverage TEXT")
         onCreate(db)
     }
 
@@ -244,6 +246,6 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
 
     companion object {
         const val DATABASE_NAME = "bydcollector_trips.db"
-        const val DATABASE_VERSION = 8
+        const val DATABASE_VERSION = 9
     }
 }

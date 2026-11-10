@@ -37,7 +37,7 @@ internal data class BusinessPage(
         }
     }
 
-    fun encode(): String = JSONObject().put("version", 1).put("generation", generation)
+    fun encode(): String = JSONObject().put("version", 2).put("generation", generation)
         .put("mergeBoot", mergeBootId).put("entries", JSONArray().apply {
             entries.forEach { entry -> put(JSONObject().put("id", entry.inputId).put("source", entry.sourceIdentity)
                 .put("energy", entry.energy?.let { EnergyStateCodec.encodeProjection(EnergyPendingProjection(it)) })
@@ -59,7 +59,7 @@ internal data class BusinessPage(
     companion object {
         fun decode(encoded: String): BusinessPage {
             val json = JSONObject(encoded)
-            require(json.getInt("version") == 1) { "Unsupported business page version" }
+            require(json.getInt("version") in 1..2) { "Unsupported business page version" }
             val values = json.getJSONArray("entries")
             require(values.length() in 1..64)
             val locations = json.getJSONArray("location")

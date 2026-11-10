@@ -212,7 +212,19 @@ class EnergySessionCoordinator(
             energyUncoveredMs = totals.uncoveredMs,
             energyPartial = totals.partial,
             integrationQuality = integration.quality,
-            reason = reason
+            reason = reason,
+            acquiredBootId = receipt.input.bootId,
+            acquiredElapsedMs = receipt.input.elapsedMs,
+            coveredInterval = state.anchor?.takeIf {
+                it.bootId == evaluation.bootId && state.powerSessionId == sessionId &&
+                    integration.quality == EnergyIntegrationQuality.COVERED &&
+                    evaluation.elapsedMs > it.elapsedMs
+            }?.let { EnergyCoveredInterval(it.elapsedMs, it.powerKw,
+                requireNotNull(evaluationInput.voltage) * requireNotNull(evaluationInput.current) / 1_000.0,
+                state.totals) } ?: state.currentSnapshot?.takeIf {
+                it.powerSessionId == sessionId && it.sourceBootId == evaluation.bootId &&
+                    it.sourceElapsedMs == evaluation.elapsedMs && totals == state.totals && !receipt.lateRelevantSource
+            }?.coveredInterval
         )
         val nextState = state.copy(
             powerState = nextPower,
@@ -341,6 +353,7 @@ class EnergySessionCoordinator(
         snapshot.copy(
             energyPartial = true,
             integrationQuality = EnergyIntegrationQuality.PARTIAL,
+            coveredInterval = null,
             reason = EnergyRuntimeState.REASON_RECOVERED_PENDING
         )
     )

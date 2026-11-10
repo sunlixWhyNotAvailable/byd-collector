@@ -91,6 +91,7 @@ object BusinessInputCheckpointKeys {
         "statistic_1014_1145045040_5",
         "statistic_1014_1246765072_5",
         "statistic_statistic_this_trip_total_elec_consumption",
+        "gearbox_1011_555745336_5",
         "speed_1013_-1807745016_7"
     )
 }
