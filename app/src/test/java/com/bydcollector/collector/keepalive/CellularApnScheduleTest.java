@@ -5,6 +5,30 @@ import static org.junit.Assert.*;
 
 /** Real production scheduling with elapsed-time inputs; no platform outcomes are substituted. */
 public class CellularApnScheduleTest {
+    @Test public void unknownSettingsPauseOffWorkWithoutInventingShutdown() {
+        CellularApnSchedule schedule = new CellularApnSchedule();
+        schedule.settingsChanged(true, false);
+        schedule.powerChanged(0, 1_000);
+        schedule.settingsUnavailable();
+        assertEquals(Long.MAX_VALUE, schedule.dueAt());
+        assertFalse(schedule.networkLost(CellularApnSchedule.APN_LOST));
+        schedule.ownedBacklight(true);
+        schedule.powerChanged(1, 2_000);
+        assertEquals(CellularApnSchedule.POWER, schedule.beginCheck(2_000));
+        schedule.finishCheck(2_100, false);
+        assertEquals(Long.MAX_VALUE, schedule.dueAt());
+        schedule.powerChanged(0, 3_000);
+        schedule.settingsChanged(true, false);
+        assertEquals(CellularApnSchedule.STARTUP, schedule.beginCheck(3_000));
+        schedule.finishCheck(3_100, false);
+        assertEquals(8_000, schedule.dueAt());
+        schedule.settingsChanged(true, true);
+        schedule.settingsUnavailable();
+        schedule.ownedBacklight(true);
+        schedule.powerChanged(1, 4_000);
+        assertEquals(Long.MAX_VALUE, schedule.dueAt());
+    }
+
     @Test public void offCadenceIsAnchoredAndRepeatedOffDoesNotExtendIt() {
         CellularApnSchedule schedule = new CellularApnSchedule();
         schedule.settingsChanged(true, false);

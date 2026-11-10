@@ -9,10 +9,11 @@ final class CellularApnSchedule {
     private int power = -1;
     private long offStarted = -1, nextCheck;
     private int pending = STARTUP;
-    private boolean checking, stopped, enabled, shutdown, ownedBacklightPending;
+    private boolean checking, stopped, enabled, shutdown, ownedBacklightPending, settingsKnown;
 
     void settingsChanged(boolean enabled, boolean shutdown) {
-        if (stopped || this.enabled == enabled && this.shutdown == shutdown) return;
+        if (stopped || settingsKnown && this.enabled == enabled && this.shutdown == shutdown) return;
+        settingsKnown = true;
         this.enabled = enabled;
         this.shutdown = shutdown;
         pending = canCheck() ? STARTUP : 0;
@@ -21,8 +22,14 @@ final class CellularApnSchedule {
 
     void ownedBacklight(boolean pending) { ownedBacklightPending = pending; }
 
+    void settingsUnavailable() {
+        settingsKnown = false;
+        pending = 0;
+        nextCheck = canCheck() ? 0L : Long.MAX_VALUE;
+    }
+
     boolean canCheck() {
-        return !stopped && !shutdown && ((enabled && power <= 0) || (ownedBacklightPending && power != 0));
+        return !stopped && !shutdown && ((settingsKnown && enabled && power <= 0) || (ownedBacklightPending && power != 0));
     }
 
     boolean powerChanged(int value, long now) {
@@ -83,7 +90,7 @@ final class CellularApnSchedule {
         long age = offStarted < 0 ? -1 : Math.max(0L, now - offStarted);
         return "power=" + power + " off_age_ms=" + age + " cadence_ms="
                 + (power == 0 && age >= 0 && age < FAST_WINDOW_MS ? FAST_INTERVAL_MS : NORMAL_INTERVAL_MS)
-                + " enabled=" + enabled + " shutdown=" + shutdown
+                + " enabled=" + enabled + " shutdown=" + shutdown + " settings_known=" + settingsKnown
                 + " owned_backlight=" + ownedBacklightPending + " pending=" + pending + " checking=" + checking;
     }
 

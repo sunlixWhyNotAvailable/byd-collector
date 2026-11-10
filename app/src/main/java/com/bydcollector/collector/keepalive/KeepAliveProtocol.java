@@ -14,6 +14,7 @@ public final class KeepAliveProtocol {
     public static final String KEY_KEEP_USB = "bydcollector_keep_usb";
     public static final String KEY_RECOVER_COLLECTOR_SERVICE = "bydcollector_recover_collector_service";
     public static final String KEY_USER_SHUTDOWN = "bydcollector_user_shutdown";
+    public static final String SETTINGS_CHANGED_NAME = "bydcollector_keepalive_settings_changed";
     public static final long LOOP_INTERVAL_MS = 30_000L;
 
     private KeepAliveProtocol() {

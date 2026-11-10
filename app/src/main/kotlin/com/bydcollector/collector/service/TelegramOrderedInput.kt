@@ -78,7 +78,7 @@ data class TelegramRawSourceCursor(
             )
         }.getOrNull()
 
-        private fun stampFromJson(json: JSONObject): NormalizedSourceStamp? = runCatching {
+        internal fun stampFromJson(json: JSONObject): NormalizedSourceStamp? = runCatching {
             val kind = NormalizedSourceKind.entries.first { it.storageValue == json.optString("kind") }
             val identity = json.optString("identity").takeIf(String::isNotBlank) ?: return null
             val boot = json.optString("boot").takeIf(String::isNotBlank) ?: return null
@@ -428,7 +428,7 @@ private fun JSONObject.optStringOrNull(key: String): String? =
 private fun JSONObject.optLongOrNull(key: String): Long? =
     if (!has(key) || isNull(key)) null else optLong(key)
 
-private fun NormalizedSourceStamp.toJson() = JSONObject().apply {
+internal fun NormalizedSourceStamp.toJson() = JSONObject().apply {
     put("kind", kind.storageValue)
     put("identity", identity)
     put("boot", bootId)

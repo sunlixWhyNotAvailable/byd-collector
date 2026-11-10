@@ -41,6 +41,97 @@ class TelegramCallbackDeadlineTest {
     private fun tick(engine: TelegramEventEngine, elapsed: Long) =
         engine.onDetectorTimer(config, base + elapsed, "boot", elapsed, normalizer)
 
+    @Test fun odometerDistanceUsesCachedStartWithoutGpsAndSurvivesStateReload() {
+        var engine = TelegramEventEngine()
+        input(engine, 0, GEAR to "1", ODOMETER to "1000", SOC to "72")
+        input(engine, 100, GEAR to "4")
+        engine = TelegramEventEngine(TelegramEventState.fromJson(engine.state.toJson()))
+        input(engine, 1_000, GEAR to "1")
+        // Exactly at the report deadline: this real input must update distance before rendering.
+        val result = input(engine, 31_000, ODOMETER to "1008")
+        val report = result.events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+        assertEquals("0.8", report.variables["trip_distance_km"])
+        assertEquals("0.8", report.variables["total_distance_km"])
+        assertTrue(tick(engine, 32_000).events.none { it.type == TelegramEventType.TRIP_SUMMARY })
+    }
+
+    @Test fun lateStartKeepsKnownDistanceButDoesNotTurnIncompleteTotalIntoZero() {
+        var engine = TelegramEventEngine()
+        input(engine, 0, GEAR to "1", SOC to "72")
+        input(engine, 100, GEAR to "4")
+        input(engine, 500, ODOMETER to "1000")
+        input(engine, 1_000, ODOMETER to "1008", SOC to "70")
+        engine = TelegramEventEngine(TelegramEventState.fromJson(engine.state.toJson()))
+        assertEquals(0.8, engine.state.tripDistance.knownKm!!, 0.00001)
+        assertNull(engine.state.tripDistance.completeKm)
+        input(engine, 2_000, GEAR to "1")
+        val first = tick(engine, 32_000).events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+        assertEquals("n/a", first.variables["total_distance_km"])
+        assertEquals("n/a", first.variables["total_net_kwh_per_100km"])
+        assertEquals(0.8, engine.state.bootTotalDistanceKm, 0.00001)
+        input(engine, 33_000, GEAR to "4")
+        input(engine, 34_000, ODOMETER to "1018")
+        input(engine, 35_000, GEAR to "1")
+        val second = tick(engine, 65_000).events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+        assertEquals("1", second.variables["trip_distance_km"])
+        assertEquals("n/a", second.variables["total_distance_km"])
+        assertEquals(1.8, engine.state.bootTotalDistanceKm, 0.00001)
+        val legacy = org.json.JSONObject(engine.state.toJson()).apply {
+            remove("tripDistance"); remove("bootTotalDistanceComplete")
+        }
+        val restored = TelegramEventState.fromJson(legacy.toString())
+        assertFalse(restored.bootTotalDistanceComplete)
+        assertEquals(engine.state.bootTotalDistanceKm, restored.bootTotalDistanceKm)
+    }
+
+    @Test fun delayedPreDepartureEvidenceRecoversStartButCounterResetRemainsInvalid() {
+        val engine = TelegramEventEngine()
+        input(engine, 0, GEAR to "1", SOC to "72")
+        input(engine, 100, GEAR to "4")
+        // Delivery is late, but the source captured this value before departure.
+        input(engine, 50, ODOMETER to "1000")
+        input(engine, 1_000, ODOMETER to "1008")
+        assertEquals(0.8, engine.state.tripDistance.completeKm!!, 0.00001)
+        input(engine, 2_000, ODOMETER to "10", SOC to "70")
+        input(engine, 3_000, ODOMETER to "1010")
+        assertEquals("odometer_reset", engine.state.tripDistance.error)
+        val report = engine.onPowerOffConfirmed(config, TelegramPowerOffSnapshot(soc = 70.0), nowMs = base + 4_000).events
+            .single { it.type == TelegramEventType.TRIP_SUMMARY }
+        assertEquals("n/a", report.variables["trip_distance_km"])
+        assertEquals("n/a", report.variables["total_distance_km"])
+    }
+
+    @Test fun validUnchangedOdometerStaysZeroAtPowerOff() {
+        val engine = TelegramEventEngine()
+        input(engine, 0, GEAR to "1", ODOMETER to "1000", SOC to "72")
+        input(engine, 100, GEAR to "4")
+        input(engine, 1_000, SOC to "70")
+        val report = engine.onPowerOffConfirmed(config, TelegramPowerOffSnapshot(soc = 70.0), nowMs = base + 2_000).events
+            .single { it.type == TelegramEventType.TRIP_SUMMARY }
+        assertEquals("0", report.variables["total_distance_km"])
+    }
+
+    @Test fun completionWithNewerOdometerUpdatesTheFinalDistance() {
+        val engine = TelegramEventEngine()
+        input(engine, 0, GEAR to "1", ODOMETER to "1000", SOC to "72")
+        input(engine, 100, GEAR to "4")
+        val report = engine.onPowerOffConfirmed(config,
+            TelegramPowerOffSnapshot(odometerKm = 100.8, soc = 72.0), nowMs = base + 2_000).events
+            .single { it.type == TelegramEventType.TRIP_SUMMARY }
+        assertEquals("0.8", report.variables["total_distance_km"])
+    }
+
+    @Test fun completionDoesNotRevalidateAnOdometerAfterAnInvalidSourceValue() {
+        val engine = TelegramEventEngine()
+        input(engine, 0, GEAR to "1", ODOMETER to "1000", SOC to "72")
+        input(engine, 100, GEAR to "4")
+        input(engine, 1_000, ODOMETER to "-10011", SOC to "70")
+        val report = engine.onPowerOffConfirmed(config,
+            TelegramPowerOffSnapshot(odometerKm = 100.0, soc = 70.0), nowMs = base + 2_000).events
+            .single { it.type == TelegramEventType.TRIP_SUMMARY }
+        assertEquals("n/a", report.variables["total_distance_km"])
+    }
+
     @Test fun unreadableStateBaselinesCurrentConditionsWithoutReplayingOldNotifications() {
         assertFails { TelegramEventState.fromJson("{broken") }
         val recovered = TelegramEventState.recoverJson("{broken")
@@ -159,6 +250,7 @@ class TelegramCallbackDeadlineTest {
         private const val BMS = "charging_1009_876609560_5"
         private const val SOC = "statistic_1014_1145045040_5"
         private const val GEAR = "gearbox_1011_555745336_5"
+        private const val ODOMETER = "statistic_1014_1246765072_5"
         private const val VOLTAGE = "ota_battery_voltage"
         private const val CURRENT = "charging_charge_current"
     }

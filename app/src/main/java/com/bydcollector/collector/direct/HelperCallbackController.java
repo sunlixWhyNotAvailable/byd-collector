@@ -37,6 +37,8 @@ final class HelperCallbackController implements AutoCloseable {
     static final long SECONDARY_EXCEPTION_POLL_MS = 500L;
     private static final Set<CollectorHelperDaemon.Address> KPI_FIELD_SOURCES = kpiSources(NormalizedFieldCatalog.INSTANCE.getKpiSourceKeys());
     private static final CollectorHelperDaemon.Address KPI_POWER_SOURCE = registryAddress("bodywork_power_level");
+    private static final CollectorHelperDaemon.Address TRIP_GEAR_SOURCE = registryAddress("gearbox_1011_555745336_5");
+    private static final CollectorHelperDaemon.Address TRIP_ODOMETER_SOURCE = registryAddress("statistic_1014_1246765072_5");
     private static final Set<CollectorHelperDaemon.Address> KPI_SOURCES = allKpiSources(KPI_FIELD_SOURCES, KPI_POWER_SOURCE);
     static boolean isKpiSource(CollectorHelperDaemon.Address address) { return KPI_SOURCES.contains(address); }
     static final int MAX_ADDITION = 128;
@@ -148,6 +150,8 @@ final class HelperCallbackController implements AutoCloseable {
     private long sourceRecoveryGetAttempts;
     private long secondaryExceptionGetAttempts;
     private long callbackListenerGeneration;
+    private int tripBoundaryGear = -1, tripBoundaryPower = -1;
+    private long tripGearElapsed = -1L, tripPowerElapsed = -1L, tripBoundaryGetAttempts;
     private Boolean lastConfirmedStreamPowerOn;
     private long lastConfirmedStreamPowerElapsedMs = -1L;
     private HelperStreamRuntimeState.StreamView lastMainView;
@@ -605,6 +609,10 @@ final class HelperCallbackController implements AutoCloseable {
                 else if ("source_recovery".equals(reason)) sourceRecoveryGetAttempts = saturatedIncrement(sourceRecoveryGetAttempts);
                 else if ("secondary_poll_exception".equals(reason)) {
                     secondaryExceptionGetAttempts = saturatedIncrement(secondaryExceptionGetAttempts);
+                } else if ("trip_boundary_seed".equals(reason)) {
+                    tripBoundaryGetAttempts = saturatedIncrement(tripBoundaryGetAttempts);
+                    host.noteContext("trip_boundary_get", "attempts=" + tripBoundaryGetAttempts
+                        + " status=" + actual.status + " elapsed_ms=" + readCompletedElapsedMs);
                 }
                 long watermarkStart = callbackWatermarkBefore.getOrDefault(row, -1L);
                 long watermarkEnd = callbackWatermarks(stream).getOrDefault(row, -1L);
@@ -649,6 +657,8 @@ final class HelperCallbackController implements AutoCloseable {
                     state.seedAttempts = 0;
                     scheduleAfterAvailable(stream, row, state, readCompletedElapsedMs);
                     state.nextSeedReason = seedReason(state);
+                    if (stream == CollectorHelperProtocol.STREAM_MAIN)
+                        observeTripBoundary(row, actual.raw, readCompletedElapsedMs);
                 } else if (state.sourceAvailable && !registrationAccepted && sourceEpochCurrent && listenerCurrent) {
                     enqueueLostAddressLocked(stream, row, "native_registration_lost",
                         "GET value retained, but no accepted native callback registration exists",
@@ -679,6 +689,12 @@ final class HelperCallbackController implements AutoCloseable {
                     state.nextSeedReason = seedReason(state);
                     scheduleSeedRetry(stream, row, state, readCompletedElapsedMs);
                 } else {
+                    scheduleAddress(stream, row, Long.MAX_VALUE);
+                }
+                // A boundary permits one extra attempt, never a new retry/polling cycle.
+                if ("trip_boundary_seed".equals(reason) && !supersededByCallback &&
+                    sourceEpochCurrent && listenerCurrent && !state.sourceAvailable) {
+                    state.nextDueElapsedMs = Long.MAX_VALUE;
                     scheduleAddress(stream, row, Long.MAX_VALUE);
                 }
                 nextDue = Math.min(nextDue, state.nextDueElapsedMs);
@@ -714,6 +730,9 @@ final class HelperCallbackController implements AutoCloseable {
                 } else if (canceled) {
                     state.nextDueElapsedMs = now;
                     scheduleAddress(stream, row, now);
+                } else if ("trip_boundary_seed".equals(state.nextSeedReason)) {
+                    state.nextDueElapsedMs = Long.MAX_VALUE;
+                    scheduleAddress(stream, row, Long.MAX_VALUE);
                 } else if (periodicException || state.sourceAvailable) {
                     scheduleAfterAvailable(stream, row, state, now);
                 } else {
@@ -1325,6 +1344,10 @@ final class HelperCallbackController implements AutoCloseable {
             }
         }
         sourceEpoch[stream] = nextEpoch(sourceEpoch[stream]);
+        if (stream == CollectorHelperProtocol.STREAM_MAIN) {
+            tripBoundaryGear = tripBoundaryPower = -1;
+            tripGearElapsed = tripPowerElapsed = -1L;
+        }
         queues[stream] = new TelemetryCallbackQueue(stream, bootId, generation, sourceEpoch[stream]);
         sources(stream).clear();
         callbackWatermarks(stream).clear();
@@ -1686,10 +1709,37 @@ final class HelperCallbackController implements AutoCloseable {
                         state.seededOnce = true;
                         state.nextSeedReason = seedReason(state);
                         scheduleAfterAvailable(batch.stream, row, state, nowElapsed());
+                        if (batch.stream == CollectorHelperProtocol.STREAM_MAIN)
+                            observeTripBoundary(row, event.rawBits, event.receivedElapsedMs);
                     }
                 }
             }
         }
+    }
+
+    private void observeTripBoundary(CollectorHelperDaemon.Address row, int raw, long elapsed) {
+        boolean boundary = false;
+        if (row.equals(TRIP_GEAR_SOURCE) && raw >= 1 && raw <= 4 && elapsed >= tripGearElapsed) {
+            boundary = tripBoundaryGear != raw &&
+                ((raw != 1 && (tripBoundaryGear == -1 || tripBoundaryGear == 1)) ||
+                    (raw == 1 && tripBoundaryGear > 1));
+            tripBoundaryGear = raw;
+            tripGearElapsed = elapsed;
+        } else if (row.equals(KPI_POWER_SOURCE) && raw >= 0 && raw <= 4 && elapsed >= tripPowerElapsed) {
+            boundary = raw == 0 && tripBoundaryPower != 0 && tripBoundaryGear > 1;
+            tripBoundaryPower = raw;
+            tripPowerElapsed = elapsed;
+        }
+        if (!boundary || !capturePermitted[CollectorHelperProtocol.STREAM_MAIN]) return;
+        AcquisitionState odometer = mainAcquisition.get(TRIP_ODOMETER_SOURCE);
+        // A queued/in-flight initial or recovery seed already owns the missing value.
+        if (odometer == null || odometer.sourceAvailable || !odometer.registrationAccepted ||
+            odometer.nextDueElapsedMs != Long.MAX_VALUE) return;
+        odometer.nextSeedReason = "trip_boundary_seed";
+        odometer.nextDueElapsedMs = nowElapsed();
+        scheduleAddress(CollectorHelperProtocol.STREAM_MAIN, TRIP_ODOMETER_SOURCE, odometer.nextDueElapsedMs);
+        host.noteContext("trip_boundary_seed", "gear=" + tripBoundaryGear + " power=" + tripBoundaryPower
+            + " source_elapsed_ms=" + elapsed + " polling=false");
     }
 
     private void applyBoundary(TelemetryCallbackBatch.SourceBoundary boundary, int stream) {

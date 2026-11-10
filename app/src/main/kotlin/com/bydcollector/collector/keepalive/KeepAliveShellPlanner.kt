@@ -17,8 +17,17 @@ object KeepAliveShellPlanner {
             "settings put global bydcollector_keep_bluetooth ${flag(config.keepBluetooth)}",
             "settings put global bydcollector_keep_usb ${flag(config.keepUsb)}",
             "settings put global bydcollector_recover_collector_service ${flag(config.recoverCollectorService)}",
-            "settings put global bydcollector_user_shutdown ${flag(userShutdown)}"
+            "settings put global bydcollector_user_shutdown ${flag(userShutdown)}",
+            settingsChangedCommand()
         )
+    }
+
+    private fun settingsChangedCommand(): String {
+        val path = "/data/local/tmp/${KeepAliveProtocol.SETTINGS_CHANGED_NAME}"
+        // Notify only after every mirrored flag was written; the marker carries no authority.
+        return "umask 077; marker_tmp=\$(mktemp $path.XXXXXX) && " +
+            "printf '%s' '1' > \"\$marker_tmp\" && mv -f \"\$marker_tmp\" $path; " +
+            "marker_result=\$?; [ -z \"\$marker_tmp\" ] || rm -f \"\$marker_tmp\"; exit \$marker_result"
     }
 
     fun daemonStatusCommand(): String = "pidof bydcollector_keepalive"
