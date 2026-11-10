@@ -6,6 +6,8 @@ import android.database.sqlite.SQLiteDatabase
 import com.bydcollector.collector.service.TelegramEventState
 import java.io.Closeable
 import java.util.UUID
+import org.json.JSONArray
+import org.json.JSONObject
 
 /** Durable Telegram outbox/state facade. The database lives outside Main archives. */
 class TelegramStore(
@@ -24,13 +26,21 @@ class TelegramStore(
         nowMs: Long = clockMs(),
         completionSequence: Long? = null,
         completionIdentity: String? = null,
-        protectedTelegramIds: Set<Long> = emptySet()
+        protectedTelegramIds: Set<Long> = emptySet(),
+        businessPageKey: String? = null,
+        pageCompletions: List<Pair<Long, String>> = emptyList()
     ): List<TelegramEnqueueResult> {
         require((completionSequence == null) == (completionIdentity == null))
-        if (messages.isEmpty() && stateJson == null && completionSequence == null) return emptyList()
+        require(pageCompletions.isEmpty() || businessPageKey != null)
+        require(pageCompletions.zipWithNext().all { (a, b) -> a.first < b.first })
+        if (messages.isEmpty() && stateJson == null && completionSequence == null && businessPageKey == null) return emptyList()
         val db = helper.writableDatabase
         db.beginTransaction()
         try {
+            if (businessPageKey != null && hasBusinessPageReceipt(businessPageKey)) {
+                db.setTransactionSuccessful()
+                return emptyList()
+            }
             if (completionSequence != null && hasTripCompletionReceipt(db, completionSequence, completionIdentity!!)) {
                 db.setTransactionSuccessful()
                 return emptyList()
@@ -43,13 +53,26 @@ class TelegramStore(
                 results[results.lastIndex] = results.last().copy(overflowCount = removed, orphanCount = repaired.second)
             }
             stateJson?.let { saveTelegramRuntimeState(db, it, nowMs) }
-            if (completionSequence != null) {
+            val lastCompletion = pageCompletions.lastOrNull() ?: completionSequence?.let { it to completionIdentity!! }
+            if (lastCompletion != null) {
                 db.delete("telegram_trip_completion_receipt", "id = 1", emptyArray())
                 db.insertOrThrow("telegram_trip_completion_receipt", null, ContentValues().apply {
                     put("id", 1)
-                    put("sequence", completionSequence)
-                    put("identity", completionIdentity)
+                    put("sequence", lastCompletion.first)
+                    put("identity", lastCompletion.second)
                 })
+            }
+            businessPageKey?.let { key ->
+                require(key.isNotBlank())
+                check(db.insertWithOnConflict("telegram_business_page_receipt", null, ContentValues().apply {
+                    put("singleton", 1); put("page_key", key)
+                    put("completions_json", JSONArray().apply {
+                        pageCompletions.forEach { (sequence, identity) ->
+                            require(sequence > 0 && identity.isNotBlank())
+                            put(JSONObject().put("sequence", sequence).put("identity", identity))
+                        }
+                    }.toString())
+                }, SQLiteDatabase.CONFLICT_REPLACE) != -1L) { "Telegram business page receipt failed" }
             }
             db.setTransactionSuccessful()
             return results
@@ -61,8 +84,24 @@ class TelegramStore(
     fun hasTripCompletionReceipt(sequence: Long, identity: String): Boolean =
         hasTripCompletionReceipt(helper.readableDatabase, sequence, identity)
 
+    internal fun hasBusinessPageReceipt(key: String): Boolean = helper.readableDatabase.rawQuery(
+        "SELECT page_key FROM telegram_business_page_receipt WHERE singleton=1", null
+    ).use { it.moveToFirst() && it.getString(0) == key }
+
     private fun hasTripCompletionReceipt(db: SQLiteDatabase, sequence: Long, identity: String): Boolean {
         require(sequence > 0L && identity.isNotBlank())
+        db.rawQuery("SELECT completions_json FROM telegram_business_page_receipt WHERE singleton=1", null).use { cursor ->
+            if (cursor.moveToFirst()) {
+                val entries = JSONArray(cursor.getString(0))
+                for (index in 0 until entries.length()) {
+                    val entry = entries.getJSONObject(index)
+                    if (entry.getLong("sequence") == sequence) {
+                        check(entry.getString("identity") == identity) { "Trip completion identity changed" }
+                        return true
+                    }
+                }
+            }
+        }
         return db.rawQuery("SELECT sequence, identity FROM telegram_trip_completion_receipt WHERE id = 1", emptyArray()).use {
             if (!it.moveToFirst()) return@use false
             check(it.getLong(0) <= sequence) { "Trip completion handoff is out of order" }

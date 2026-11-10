@@ -105,6 +105,7 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
         createHistoricalEnergyBackfill(db)
         createTripCompletions(db)
         createBusinessInputCursor(db)
+        db.execSQL("CREATE TABLE IF NOT EXISTS business_page_handoff (singleton INTEGER PRIMARY KEY CHECK(singleton=1), page_key TEXT NOT NULL, payload TEXT NOT NULL)")
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -243,6 +244,6 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
 
     companion object {
         const val DATABASE_NAME = "bydcollector_trips.db"
-        const val DATABASE_VERSION = 7
+        const val DATABASE_VERSION = 8
     }
 }

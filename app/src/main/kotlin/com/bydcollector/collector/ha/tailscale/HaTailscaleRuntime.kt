@@ -30,6 +30,7 @@ internal class HaTailscaleRuntime private constructor(private val context: Conte
     private var native: TailscaleNativeSession? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private val mqttClients = Collections.newSetFromMap(WeakHashMap<MqttClientFacade, Boolean>())
+    private val readyListeners = java.util.concurrent.CopyOnWriteArraySet<(String) -> Unit>()
     @Volatile var enabled = preferences.getBoolean("enabled", false)
         private set
     @Volatile private var pending = false
@@ -76,7 +77,11 @@ internal class HaTailscaleRuntime private constructor(private val context: Conte
 
     private fun onNativeState(state: TailscaleNativeStatus) {
         if (synchronized(nativeLock) { native?.id } != state.id) return
-        if (state.state == "transport_error") { record("transport_error", state.error); return }
+        if (state.state == "transport_error") {
+            record("transport_error", "runtime_id=${state.id} request_id=${state.requestId ?: "none"} " +
+                "profile=${state.profile ?: "unknown"} ${state.error.orEmpty()}")
+            return
+        }
         if (!pending && !enabled) return
         detail = state.error
         if (state.state == "ready") {
@@ -95,6 +100,7 @@ internal class HaTailscaleRuntime private constructor(private val context: Conte
             // Login URLs are only delivered to the requesting UI, never to diagnostics.
             loginUrl = state.loginUrl?.takeIf { pending && it.startsWith("https://") }
             if (previous != phase || state.error != null) record("native_state", "state=$phase" + state.error?.let { " error=$it" }.orEmpty())
+            if (previous != "ready" && phase == "ready") notifyReady(state.id)
         }
     }
 
@@ -117,6 +123,7 @@ internal class HaTailscaleRuntime private constructor(private val context: Conte
         }
         if (operation != generation.get()) return
         record("transport_selected", "transport=${if(value) "tailscale" else "android"} operation=$operation")
+        if (value) synchronized(nativeLock) { native?.id }?.let(::notifyReady)
         if (!value) closeNativeReported("disable") else releaseIfIdle()
     }
 
@@ -153,12 +160,24 @@ internal class HaTailscaleRuntime private constructor(private val context: Conte
         }
     }
 
-    fun bridge(host: String, port: Int): TailscaleBridgeLease? {
+    fun bridge(host: String, port: Int, requestId: String? = null, profile: String? = null): TailscaleBridgeLease? {
         if (!enabled) return null
-        return synchronized(nativeLock) { ensureNative().lease(host, port) }
+        return synchronized(nativeLock) { ensureNative().lease(host, port, requestId, profile) }
     }
 
     fun register(client: MqttClientFacade) { synchronized(mqttClients) { mqttClients.add(client) } }
+
+    fun isReady(id: String? = null): Boolean = enabled && !pending && phase == "ready" &&
+        synchronized(nativeLock) { native?.let { id == null || id == it.id } == true }
+
+    fun addReadyListener(listener: (String) -> Unit) { readyListeners.add(listener) }
+    fun removeReadyListener(listener: (String) -> Unit) { readyListeners.remove(listener) }
+    private fun notifyReady(id: String) {
+        readyListeners.forEach { listener ->
+            try { listener(id) }
+            catch (error: Throwable) { record("ready_notification_failed", error.diagnosticDetail()) }
+        }
+    }
 
     fun releaseIfIdle() {
         worker.execute {

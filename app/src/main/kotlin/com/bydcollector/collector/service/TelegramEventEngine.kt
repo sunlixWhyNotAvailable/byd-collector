@@ -568,6 +568,12 @@ class TelegramEventEngine(
         if (source.bootId == currentBootId || state.detectorTiming.bootId != currentBootId) {
             advanceDetectorClock(source.bootId, source.capturedElapsedMs, pollStamp.wallMs)
         }
+        if (energySnapshot == null && readings.none { it.rawKey in TelegramOrderedInput.rawSourceKeys } &&
+            continuityUpdates.keys.none { it in TelegramOrderedInput.rawSourceKeys } &&
+            state.detectorTiming.pending.values.none { it.elapsedMs <= state.detectorTiming.evaluatedElapsedMs }) {
+            // Speed-only input still advances ordered time, but has no Telegram values to normalize.
+            return TelegramEventResult(state, priorEvents, state != original || priorEvents.isNotEmpty(), nextDetectorDeadlineAtMs())
+        }
         val ordered = TelegramOrderedInput.merge(
             previous = state.rawSourceInputs,
             readings = readings,

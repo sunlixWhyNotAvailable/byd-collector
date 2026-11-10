@@ -36,6 +36,11 @@ import com.bydcollector.collector.data.callback.CallbackBatchDrainCoordinator
 import com.bydcollector.collector.data.callback.CallbackIntakeWorker
 import com.bydcollector.collector.data.callback.CallbackNormalizationWorker
 import com.bydcollector.collector.data.input.BusinessInputKind
+import com.bydcollector.collector.data.input.BusinessInputRef
+import com.bydcollector.collector.data.input.BusinessInputDelta
+import com.bydcollector.collector.data.input.BusinessPage
+import com.bydcollector.collector.data.input.BusinessPageEntry
+import com.bydcollector.collector.data.energy.BufferedEnergyStorage
 import com.bydcollector.collector.data.input.BusinessInputOrigin
 import com.bydcollector.collector.data.input.BusinessInputCheckpointKeys
 import com.bydcollector.collector.data.input.BusinessInputContinuity
@@ -266,6 +271,21 @@ class CollectorService : Service() {
     private val influxWorkInFlight = AtomicInteger(0)
     @Volatile private var influxRetryScheduled = false
     private var influxRetryAtElapsedMs: Long? = null
+    private val influxTransportReadyListener: (String) -> Unit = { id ->
+        synchronized(influxExecutorLock) {
+            if (!influxExecutor.isShutdown) {
+                try { influxExecutor.execute {
+                    if (!serviceDestroyed.get() && settings.isInfluxEnabled() &&
+                        !settings.isUserShutdownRequested() && HaTailscaleRuntime.current()?.isReady(id) == true) {
+                        // Queued behind the active write so a ready event cannot outrun its persisted failure.
+                        postInfluxRetrySchedule(influxWorkGeneration.get(), influxRequestRevision)
+                    }
+                } } catch (error: RejectedExecutionException) {
+                    recordInfluxGate("transport_ready_rejected", mapOf("error" to error.diagnosticDetail()))
+                }
+            }
+        }
+    }
     @Volatile private var influxWorkQueuedAtElapsedMs: Long? = null
     private val influxRuntimeDiagnostics = InfluxRuntimeDiagnosticsProcess.instance
     private val influxDiagnosticRuntimeId = java.util.UUID.randomUUID().toString()
@@ -617,6 +637,7 @@ class CollectorService : Service() {
         secondaryCallbackIntake = createCallbackIntake(CollectorHelperProtocol.STREAM_SECONDARY)
         mqttCoordinator = createMqttCoordinator(processMqttClientFacade)
         influxCoordinator = createInfluxCoordinator()
+        HaTailscaleRuntime.current()?.addReadyListener(influxTransportReadyListener)
         telegramCoordinator = createTelegramCoordinator()
         normalizedStateChangedCallback = { changedCategories -> publishChangedCategoriesAsync(changedCategories) }
         tripRuntime = createTripRuntimeCoordinator()
@@ -840,6 +861,7 @@ class CollectorService : Service() {
     override fun onDestroy() {
         requireRuntimeOwner()
         serviceDestroyed.set(true)
+        HaTailscaleRuntime.current()?.removeReadyListener(influxTransportReadyListener)
         (applicationContext as BydCollectorApplication).updateRuntime.onVehiclePowerChanged(null, "collector_destroyed")
         mainStartGeneration.incrementAndGet()
         pendingStartCommands.clear()
@@ -1371,12 +1393,26 @@ class CollectorService : Service() {
             pendingMainSourceLoss.remove(loss)
         }
         val generation = application.withDatabaseRead { selectedStore.businessInputGeneration() }
+        val trips = BydCollectorApplication.trips(applicationContext)
+        val pendingPage = trips.pendingBusinessPage()
+        if (pendingPage != null) {
+            check(pendingPage.generation == generation) { "Unfinished business page belongs to another Main generation" }
+            if (application.withDatabaseRead { selectedStore.completedBusinessInputId() } >= pendingPage.entries.last().inputId) {
+                check(checkNotNull(telegramCoordinator).hasBusinessPageReceipt(pendingPage.key)) {
+                    "Main business page committed without Telegram receipt"
+                }
+                acknowledgeBusinessPage(pendingPage)
+                return@synchronized true
+            }
+        }
         if (businessGeneration != generation) {
             businessInputs = application.withDatabaseRead { selectedStore.loadBusinessInputCheckpoint() }
             businessContinuity = application.withDatabaseRead { selectedStore.loadBusinessInputContinuityCheckpoint() }
             businessGeneration = generation
         }
         val refs = application.withDatabaseRead { selectedStore.pendingBusinessInputs() }
+            .let { if (pendingPage == null) it else it.take(pendingPage.entries.size) }
+        pendingPage?.requireReferences(refs)
         if (refs.isEmpty()) {
             val active = synchronized(energyCoordinator) { energyCoordinator.runtimeStatus().active }
             val telegramDue = settings.isTelegramEnabled() &&
@@ -1396,6 +1432,14 @@ class CollectorService : Service() {
             scheduleBusinessTimer(!maintenanceDrain && active && mainPollingRunning.get())
             return@synchronized false
         }
+        val completed = application.withDatabaseRead { selectedStore.completedBusinessInputId() }
+        val oldTripCursor = trips.businessInputCursor()
+        val oldEnergyCursor = synchronized(energyCoordinator) { energyCoordinator.runtimeStatus() }
+        val legacyPartial = pendingPage == null && (
+            oldTripCursor?.let { it.journalGeneration == generation && it.inputId > completed } == true ||
+            oldEnergyCursor.lastBusinessGeneration == generation && (oldEnergyCursor.lastBusinessInputId ?: 0L) > completed)
+        if (!legacyPartial) return@synchronized drainAtomicBusinessPage(selectedStore, generation, refs, pendingPage, maintenanceDrain)
+        // Finish an interrupted pre-batching upgrade page with its existing per-input receipts.
         var inputs = businessInputs
         var continuity = businessContinuity
         val finalUpdates = linkedMapOf<String, NormalizedSourceInput>()
@@ -1531,6 +1575,165 @@ class CollectorService : Service() {
         true
     }
 
+    private fun drainAtomicBusinessPage(selectedStore: TelemetryStore, generation: String,
+        refs: List<BusinessInputRef>, pending: BusinessPage?, maintenanceDrain: Boolean): Boolean {
+        val application = applicationContext as BydCollectorApplication
+        val trips = BydCollectorApplication.trips(applicationContext)
+        val deltas = application.withDatabaseRead { refs.map(selectedStore::loadBusinessInputDelta) }
+        val mergeBoot = pending?.mergeBootId ?: LivePollSource.liveBootId
+        val coordinator = checkNotNull(telegramCoordinator) { "Telegram owner is not initialized" }
+        val telegramGeneration = telegramWorkGeneration.get()
+        val finished = CompletableFuture<BusinessPage>()
+        synchronized(telegramExecutorLock) { telegramExecutor }.execute {
+            try {
+                checkBusinessOwner()
+                check(telegramCoordinator === coordinator && telegramWorkGeneration.get() == telegramGeneration) {
+                    "Telegram owner changed before business page"
+                }
+                // Holding the Telegram owner prevents its tick from seeing a future energy/Trips frontier.
+                val page = pending ?: awaitBusinessResult(tripRuntime.prepareBusinessPage(
+                    stopFinalGps = deltas.any { delta -> delta.readings.any {
+                        it.rawKey == "bodywork_power_level" && it.descValue?.trim()?.toIntOrNull() == 0
+                    } },
+                    allowWhilePaused = maintenanceDrain,
+                    beforeTransaction = {
+                        synchronized(energyCoordinator) {
+                            if (application.withDatabaseRead { selectedStore.hasDeferredEnergy() }) {
+                                deferredEnergyWorker.signal()
+                                error("Legacy energy receipts must drain before a business page")
+                            }
+                            prepareEnergyProjection()
+                        }
+                    },
+                    calculate = { calculateBusinessPage(generation, mergeBoot, deltas, maintenanceDrain) }
+                ))
+                page.requireReferences(refs)
+                val completions = trips.allPendingCompletions()
+                val accepted = mutableSetOf<Long>()
+                fun completeThrough(watermark: Long) {
+                    if (!settings.isTelegramEnabled()) return
+                    completions.filter { it.sequence <= watermark && accepted.add(it.sequence) }.forEach { intent ->
+                        coordinator.acceptTripCompletion(intent, intent.lastLocation?.let(::telegramLocationSnapshot))
+                            ?.let(coordinator::deliverPreparedPowerOff)
+                    }
+                }
+                val deadline = coordinator.processBusinessPage(page.key) {
+                    deltas.zip(page.entries).forEach { (delta, entry) ->
+                        checkBusinessOwner()
+                        val ref = delta.ref
+                        val source = BusinessInputProjection.source(ref)
+                        if (ref.kind == BusinessInputKind.TIMER) {
+                            if (coordinator.detectorDeadlineAtMs?.let { it <= checkNotNull(ref.acquiredWallMs) } == true)
+                                coordinator.evaluateDetectors(checkNotNull(ref.acquiredWallMs), source.bootId, source.capturedElapsedMs)
+                        } else {
+                            entry.trip?.let { completeThrough(it.priorCompletionWatermark) }
+                            coordinator.onSourcePoll(ref.pollId ?: 0L, BusinessInputProjection.timestamp(ref), source,
+                                delta.readings, if (ref.origin == BusinessInputOrigin.REPLAY) PollOrigin.REPLAY else PollOrigin.LIVE,
+                                mergeBoot, entry.energy, continuityUpdates = delta.continuityUpdates, requireCommit = true) { leg ->
+                                entry.trip?.powerSessionId?.let { coordinator.bindTripDiagnosticParent(leg, it) }
+                            }
+                            entry.trip?.let { completeThrough(it.completionWatermark) }
+                        }
+                    }
+                }
+                postTelegramTickSchedule(deadline, telegramGeneration)
+                finished.complete(page)
+            } catch (error: Throwable) { finished.completeExceptionally(error) }
+        }
+        val page = awaitBusinessResult(finished)
+        var inputs = businessInputs
+        var continuity = businessContinuity
+        val updates = linkedMapOf<String, NormalizedSourceInput>()
+        val continuityUpdates = linkedMapOf<String, BusinessInputContinuity>()
+        deltas.forEach { delta ->
+            val merged = BusinessInputReducer.merge(inputs, BusinessInputProjection.incoming(delta), mergeBoot)
+            val mergedContinuity = BusinessInputReducer.mergeContinuity(continuity, delta.continuityUpdates, mergeBoot, merged.inputs)
+            inputs = merged.inputs
+            continuity = mergedContinuity.continuity
+            updates.putAll(merged.updates)
+            continuityUpdates.putAll(mergedContinuity.updates)
+        }
+        val observations = page.entries.filter { it.projectEnergy }.flatMap {
+            EnergyTelemetryProjection.observations(checkNotNull(it.energy))
+        } + page.locationObservations
+        val summary = application.withDatabaseRead {
+            check(store === selectedStore) { "Main store replaced before business page commit" }
+            selectedStore.completeBusinessPage(generation, refs, updates, continuityUpdates, observations)
+        }
+        businessInputs = inputs
+        businessContinuity = continuity
+        acknowledgeBusinessPage(page)
+        publishNormalizedWrite(summary, observations)
+        businessProcessed.addAndGet(refs.size.toLong())
+        businessOldestPageWallMs = refs.first().acquiredWallMs
+        if (page.entries.any { it.trip?.closedPowerSession == true }) application.historicalEnergyCandidatesChanged(historicalEnergyGeneration)
+        if (page.entries.any { it.trip?.confirmedPowerOn == true }) requestTelegramRecovery(RECOVERY_VEHICLE_ON)
+        return true
+    }
+
+    private fun calculateBusinessPage(generation: String, mergeBoot: String,
+        deltas: List<BusinessInputDelta>, maintenanceDrain: Boolean): BusinessPage {
+        val trips = BydCollectorApplication.trips(applicationContext)
+        val buffered = BufferedEnergyStorage(trips.readEnergyRuntimeRow())
+        val energy = EnergySessionCoordinator(buffered) {
+            trips.loadOpenSession()?.let { EnergySessionSeed(it.tripId, it.startedAt) }
+        }
+        var evaluation = energy.runtimeStatus()
+        var inputs = businessInputs
+        var continuity = businessContinuity
+        val entries = deltas.map { delta ->
+            checkBusinessOwner()
+            val ref = delta.ref
+            val source = BusinessInputProjection.source(ref)
+            val timestamp = BusinessInputProjection.timestamp(ref)
+            val elapsed = if (evaluation.lastEvaluationBootId == source.bootId)
+                maxOf(source.capturedElapsedMs, evaluation.lastEvaluationElapsedMs ?: source.capturedElapsedMs) else source.capturedElapsedMs
+            val before = BusinessInputProjection.freshInputs(inputs, source.bootId, elapsed, continuity)
+            val merged = BusinessInputReducer.merge(inputs, BusinessInputProjection.incoming(delta), mergeBoot)
+            val mergedContinuity = BusinessInputReducer.mergeContinuity(continuity, delta.continuityUpdates, mergeBoot, merged.inputs)
+            inputs = merged.inputs
+            continuity = mergedContinuity.continuity
+            val fresh = BusinessInputProjection.freshInputs(inputs, source.bootId, elapsed, continuity)
+            val changedEnergy = (before.keys + fresh.keys).any { key -> key in BusinessInputProjection.energyKeys &&
+                before[key]?.reading?.let { it.rawValue to it.descValue } != fresh[key]?.reading?.let { it.rawValue to it.descValue } }
+            val readings = fresh.values.map { it.reading }
+            val observations = BusinessInputProjection.observations(vehicleStateNormalizer, fresh)
+            val energyDue = ref.kind == BusinessInputKind.TIMER || changedEnergy || merged.updates.keys.any { it in BusinessInputProjection.energyKeys }
+            val result = if (energyDue) energy.process(EnergyTelemetryProjection.receipt(
+                source.copy(identity = "business:$generation:${ref.id}"), timestamp, readings, observations
+            ).copy(businessGeneration = generation, businessInputId = ref.id, evaluationBootId = source.bootId,
+                evaluationElapsedMs = elapsed, lateRelevantSource = changedEnergy && elapsed > source.capturedElapsedMs)) else null
+            val snapshot = result?.takeUnless { it.stale }?.snapshot
+            val project = result?.takeUnless { it.stale }?.pendingProjection
+            if (project != null) check(energy.confirmProjected(project.snapshot.snapshotId)) { "Buffered energy receipt changed" }
+            if (energyDue) evaluation = energy.runtimeStatus()
+            val trip = if (ref.kind != BusinessInputKind.TIMER && (merged.updates.isNotEmpty() ||
+                mergedContinuity.updates.keys.any { it in BusinessInputCheckpointKeys.ALL })) {
+                val future = tripRuntime.onBusinessInput(generation, ref.id, source.identity, timestamp, readings, observations,
+                    !maintenanceDrain && ref.origin == BusinessInputOrigin.LIVE, snapshot,
+                    NormalizedSourceStamp(if (ref.kind == BusinessInputKind.CALLBACK || ref.kind == BusinessInputKind.CONTINUITY)
+                        NormalizedSourceKind.CALLBACK else NormalizedSourceKind.POLL, source.identity, source.bootId,
+                        source.generatorId, source.sequence, checkNotNull(ref.acquiredWallMs), source.capturedElapsedMs),
+                    allowWhilePaused = maintenanceDrain)
+                check(future.isDone) { "Trips page calculation must stay on its owner thread" }
+                awaitBusinessResult(future)
+            } else null
+            BusinessPageEntry(ref.id, ref.sourceIdentity, snapshot, project != null, trip)
+        }
+        buffered.commitTo(trips)
+        return BusinessPage(generation, mergeBoot, entries)
+    }
+
+    private fun acknowledgeBusinessPage(page: BusinessPage) {
+        val trips = BydCollectorApplication.trips(applicationContext)
+        val telegram = checkNotNull((applicationContext as BydCollectorApplication).telegramStoreOrNull())
+        val watermark = page.entries.mapNotNull { it.trip?.completionWatermark }.maxOrNull() ?: 0L
+        trips.pendingCompletions(watermark).forEach { intent ->
+            if (telegram.hasTripCompletionReceipt(intent.sequence, intent.identity)) trips.acknowledgeCompletion(intent.sequence, intent.identity)
+        }
+        trips.acknowledgeBusinessPage(page.key)
+    }
+
     private fun checkBusinessOwner() {
         if (!running.get() || settings.isUserShutdownRequested() || Thread.currentThread().isInterrupted)
             throw InterruptedException("Business input owner stopped")
@@ -1567,7 +1770,12 @@ class CollectorService : Service() {
     }
 
     private fun drainDeferredEnergy(): Boolean {
+        return synchronized(businessDrainLock) { drainDeferredEnergyLocked() }
+    }
+
+    private fun drainDeferredEnergyLocked(): Boolean {
         if (!running.get()) return false
+        if (BydCollectorApplication.trips(applicationContext).pendingBusinessPage() != null) return false
         var waitingForRetry = false
         val hasMore = synchronized(energyCoordinator) {
             val pending = (applicationContext as BydCollectorApplication).withDatabaseRead {
@@ -1630,6 +1838,7 @@ class CollectorService : Service() {
     private fun drainTripCompletions(coordinator: TelegramCoordinator, watermark: Long): Long? {
         if (!settings.isTelegramEnabled()) return null
         val trips = BydCollectorApplication.trips(applicationContext)
+        if (trips.pendingBusinessPage() != null) return null
         var deadline: Long? = null
         com.bydcollector.collector.telegram.handoffTripCompletions(
             frontier = watermark,

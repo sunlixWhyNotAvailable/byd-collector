@@ -30,7 +30,8 @@ data class InfluxActionResult(
     val category: String,
     val message: String,
     val httpStatus: Int? = null,
-    val failureKind: InfluxFailureKind? = null
+    val failureKind: InfluxFailureKind? = null,
+    val transportWaitGeneration: String? = null
 ) {
     val retryable: Boolean get() = !ok && failureKind != InfluxFailureKind.AUTHENTICATION &&
         failureKind != InfluxFailureKind.PROTOCOL && failureKind != InfluxFailureKind.DATA &&
@@ -43,8 +44,9 @@ data class InfluxActionResult(
             category: String,
             message: String,
             httpStatus: Int? = null,
-            failureKind: InfluxFailureKind? = null
-        ) = InfluxActionResult(false, category, message, httpStatus, failureKind)
+            failureKind: InfluxFailureKind? = null,
+            transportWaitGeneration: String? = null
+        ) = InfluxActionResult(false, category, message, httpStatus, failureKind, transportWaitGeneration)
     }
 }
 
@@ -74,7 +76,8 @@ data class InfluxExportStateSnapshot(
     val lastSuccessAt: String?,
     val lastErrorAt: String?,
     val lastError: String?,
-    val exportedRowsTotal: Long
+    val exportedRowsTotal: Long,
+    val transportWaitGeneration: String? = null
 )
 
 data class InfluxPendingSummary(
@@ -105,7 +108,8 @@ interface InfluxExportStore {
         lastSuccessAt: String?,
         lastErrorAt: String?,
         lastError: String?,
-        exportedRowsDelta: Long
+        exportedRowsDelta: Long,
+        transportWaitGeneration: String? = null
     )
     fun recordInfluxEvent(
         eventType: String,

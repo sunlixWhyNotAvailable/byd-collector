@@ -33,15 +33,30 @@ type request struct {
 	Host      string `json:"host"`
 	Port      int    `json:"port"`
 	Token     string `json:"token"`
+	RequestID string `json:"requestId"`
+	Profile   string `json:"profile"`
+	Purpose   string `json:"purpose"`
 }
 
 type result struct {
-	ID       string `json:"id,omitempty"`
-	State    string `json:"state"`
-	LoginURL string `json:"loginUrl,omitempty"`
-	Port     int    `json:"port,omitempty"`
-	Token    string `json:"token,omitempty"`
-	Error    string `json:"error,omitempty"`
+	ID        string `json:"id,omitempty"`
+	State     string `json:"state"`
+	LoginURL  string `json:"loginUrl,omitempty"`
+	Port      int    `json:"port,omitempty"`
+	Token     string `json:"token,omitempty"`
+	Error     string `json:"error,omitempty"`
+	Code      string `json:"code,omitempty"`
+	RequestID string `json:"requestId,omitempty"`
+	Profile   string `json:"profile,omitempty"`
+}
+
+type bridgeCapability struct {
+	target    string
+	requestID string
+	profile   string
+	influx    bool
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 type runtimeState struct {
@@ -54,7 +69,7 @@ type runtimeState struct {
 	proxy        *http.Server
 	port         int
 	transport    *http.Transport
-	capabilities map[string]string
+	capabilities map[string]*bridgeCapability
 	connections  map[net.Conn]struct{}
 }
 
@@ -63,6 +78,7 @@ var current *runtimeState
 var deliverEvent = func(string) {}
 var urlPattern = regexp.MustCompile(`(?i)\b(?:https?|wss?)://[^\s<>"']+`)
 var credentialPattern = regexp.MustCompile(`\btskey-[A-Za-z0-9_-]+\b`)
+var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,80}$`)
 
 func main() {}
 func init() { log.SetOutput(io.Discard) }
@@ -129,7 +145,7 @@ func command(operation, raw string) (output string) {
 		}
 		envknob.SetNoLogsNoSupport()
 		ctx, cancel := context.WithCancel(context.Background())
-		r := &runtimeState{id: input.ID, ctx: ctx, cancel: cancel, capabilities: map[string]string{}, connections: map[net.Conn]struct{}{}, snapshot: result{ID: input.ID, State: "starting"}}
+		r := &runtimeState{id: input.ID, ctx: ctx, cancel: cancel, capabilities: map[string]*bridgeCapability{}, connections: map[net.Conn]struct{}{}, snapshot: result{ID: input.ID, State: "starting"}}
 		r.server = &tsnet.Server{Dir: input.Directory, Hostname: input.Name, Store: store, Logf: func(string, ...any) {}, UserLogf: func(string, ...any) {}}
 		if err := r.server.Start(); err != nil {
 			cancel()
@@ -169,9 +185,19 @@ func command(operation, raw string) (output string) {
 		if input.Host == "" || strings.ContainsAny(input.Host, "\r\n\x00/\\ \t") || input.Port < 1 || input.Port > 65535 {
 			return failed(errors.New("invalid destination"))
 		}
+		if input.Purpose != "mqtt" && input.Purpose != "influx" {
+			return failed(errors.New("invalid bridge purpose"))
+		}
+		if input.Purpose == "influx" && (!requestIDPattern.MatchString(input.RequestID) ||
+			(input.Profile != "primary" && input.Profile != "alternative" && input.Profile != "unknown")) {
+			return failed(errors.New("invalid bridge correlation"))
+		}
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		if r.snapshot.State != "ready" {
+			if r.snapshot.State == "starting" {
+				return marshalResult(result{ID: r.id, State: "error", Code: "tailnet_starting", Error: "lease: tailnet is starting"})
+			}
 			return failed(fmt.Errorf("tailnet is %s", r.snapshot.State))
 		}
 		tokenBytes := make([]byte, 32)
@@ -179,23 +205,27 @@ func command(operation, raw string) (output string) {
 			return failed(err)
 		}
 		token := base64.RawURLEncoding.EncodeToString(tokenBytes)
-		r.capabilities[token] = net.JoinHostPort(strings.Trim(input.Host, "[]"), strconv.Itoa(input.Port))
+		ctx, cancel := context.WithCancel(r.ctx)
+		r.capabilities[token] = &bridgeCapability{target: net.JoinHostPort(strings.Trim(input.Host, "[]"), strconv.Itoa(input.Port)),
+			requestID: input.RequestID, profile: input.Profile, influx: input.Purpose == "influx", ctx: ctx, cancel: cancel}
 		return marshalResult(result{ID: r.id, State: "ready", Port: r.port, Token: token})
 	case "release":
-		r.mu.Lock()
-		delete(r.capabilities, input.Token)
-		r.mu.Unlock()
+		r.releaseCapability(input.Token)
 		return marshalResult(r.status())
 	case "close":
 		current = nil
 		r.cancel()
 		err := r.proxy.Close()
 		r.mu.Lock()
+		connections := make([]net.Conn, 0, len(r.connections))
 		for conn := range r.connections {
+			connections = append(connections, conn)
+		}
+		r.capabilities = map[string]*bridgeCapability{}
+		r.mu.Unlock()
+		for _, conn := range connections {
 			err = errors.Join(err, conn.Close())
 		}
-		r.capabilities = map[string]string{}
-		r.mu.Unlock()
 		r.transport.CloseIdleConnections()
 		err = errors.Join(err, r.server.Close())
 		if err != nil {
@@ -204,6 +234,16 @@ func command(operation, raw string) (output string) {
 		return marshalResult(result{ID: r.id, State: "stopped"})
 	default:
 		return failed(errors.New("unknown native operation"))
+	}
+}
+
+func (r *runtimeState) releaseCapability(token string) {
+	r.mu.Lock()
+	capability := r.capabilities[token]
+	delete(r.capabilities, token)
+	r.mu.Unlock()
+	if capability != nil {
+		capability.cancel()
 	}
 }
 

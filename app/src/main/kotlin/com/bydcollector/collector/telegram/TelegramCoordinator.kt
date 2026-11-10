@@ -5,6 +5,7 @@ import com.bydcollector.collector.data.local.TelegramDeliveryReceipt
 import com.bydcollector.collector.data.local.TelegramStore
 import com.bydcollector.collector.data.local.TelegramOutboxEntry
 import com.bydcollector.collector.data.local.TelegramOutboxMessage
+import com.bydcollector.collector.data.local.TelegramEnqueueResult
 import com.bydcollector.collector.diagnostics.diagnosticSha256
 import com.bydcollector.collector.data.local.PollReading
 import com.bydcollector.collector.data.input.BusinessInputContinuity
@@ -52,6 +53,47 @@ class TelegramCoordinator internal constructor(
         private set
     private var enabledRuntimeStartedAtMs: Long? = null
     private var startupRecoveryPending = true
+    private class BusinessBatch {
+        val messages = mutableListOf<TelegramOutboxMessage>()
+        val events = mutableListOf<TelegramDetectedEvent>()
+        val completions = linkedMapOf<Long, String>()
+        val deliveries = mutableListOf<TelegramPowerOffPreparation>()
+    }
+    private var businessBatch: BusinessBatch? = null
+
+    internal fun hasBusinessPageReceipt(key: String): Boolean = telegramStore.hasBusinessPageReceipt(key)
+
+    /** Runs on the Telegram owner; no network work or cross-owner waits occur in the commit. */
+    internal fun processBusinessPage(key: String, process: () -> Unit): Long? {
+        check(businessBatch == null) { "Nested Telegram business page" }
+        if (telegramStore.hasBusinessPageReceipt(key)) return nextWakeAt(futureDetectorDeadline(), pendingQueueDeadline())
+        val batch = BusinessBatch()
+        val previousStartup = startupRecoveryPending
+        businessBatch = batch
+        try {
+            process()
+            val at = nowMs()
+            val outcomes = telegramStore.commitTelegramEvents(
+                batch.messages, engine.state.toJson(), at,
+                protectedTelegramIds = protectedTelegramIds(), businessPageKey = key,
+                pageCompletions = batch.completions.map { it.key to it.value }
+            )
+            businessBatch = null
+            detectorDeadlineAtMs = engine.nextDetectorDeadlineAtMs()
+            recordQueued(batch.messages, batch.events, outcomes, at)
+        } catch (error: Throwable) {
+            businessBatch = null
+            startupRecoveryPending = previousStartup
+            try {
+                engine = createEngine(loadDetectorState())
+                detectorDeadlineAtMs = engine.nextDetectorDeadlineAtMs()
+            } catch (recovery: Throwable) { error.addSuppressed(recovery) }
+            throw error
+        }
+        var deadline = nextWakeAt(futureDetectorDeadline(), pendingQueueDeadline())
+        batch.deliveries.forEach { deadline = nextWakeAt(deadline, deliverPreparedPowerOff(it)) }
+        return deadline
+    }
     private var lastTelemetryHealthDiagnostic: String? = null
     private val locationKindsByDedupeKey = LinkedHashMap<String, String>(16, 0.75f, true)
     private val locationKindCacheLock = Any()
@@ -151,7 +193,7 @@ class TelegramCoordinator internal constructor(
     internal fun bindTripDiagnosticParent(legId: String, powerSessionId: String) {
         runCatching {
             engine.bindTripPowerSession(legId, powerSessionId) { state ->
-                telegramStore.saveTelegramRuntimeState(state.toJson(), nowMs())
+                if (businessBatch == null) telegramStore.saveTelegramRuntimeState(state.toJson(), nowMs())
             }
         }.onFailure { error ->
             runCatching {
@@ -195,6 +237,10 @@ class TelegramCoordinator internal constructor(
         intent: TripCompletionIntent,
         location: TelegramLocationSnapshot?
     ): TelegramPowerOffPreparation? {
+        businessBatch?.completions?.get(intent.sequence)?.let { identity ->
+            check(identity == intent.identity) { "Trip completion identity changed in business page" }
+            return null
+        }
         if (telegramStore.hasTripCompletionReceipt(intent.sequence, intent.identity)) return null
         check(settings.isTelegramEnabled()) { "Telegram completion is waiting for the enabled runtime" }
         return preparePowerOffConfirmed(
@@ -252,6 +298,10 @@ class TelegramCoordinator internal constructor(
 
     /** Performs network work only after the Trips close succeeds. */
     internal fun deliverPreparedPowerOff(preparation: TelegramPowerOffPreparation): Long? {
+        businessBatch?.let {
+            it.deliveries += preparation
+            return preparation.eventDeadlineAtMs
+        }
         var deadline = preparation.eventDeadlineAtMs
         preparation.priorityKeys.forEach { key ->
             deadline = nextWakeAt(deadline, flushPending(key, force = true))
@@ -422,6 +472,7 @@ class TelegramCoordinator internal constructor(
         delivery.acknowledgePersistedAttempt(attempt)
 
     private fun pendingQueueDeadline(): Long? {
+        if (businessBatch != null) return null
         return delivery.pendingDeadline()
     }
 
@@ -549,6 +600,13 @@ class TelegramCoordinator internal constructor(
             return false
         }
         val committedAt = nowMs()
+        businessBatch?.let { batch ->
+            batch.messages += messages
+            batch.events += result.events
+            completion?.let { batch.completions[it.sequence] = it.identity }
+            detectorDeadlineAtMs = engine.nextDetectorDeadlineAtMs()
+            return true
+        }
         val outcomes = try {
             telegramStore.commitTelegramEvents(
                 messages = messages,
@@ -570,7 +628,13 @@ class TelegramCoordinator internal constructor(
             throw error
         }
         detectorDeadlineAtMs = engine.nextDetectorDeadlineAtMs()
-        val eventsByDedupeKey = result.events.associateBy { it.dedupeKey }
+        recordQueued(messages, result.events, outcomes, committedAt)
+        return true
+    }
+
+    private fun recordQueued(messages: List<TelegramOutboxMessage>, events: List<TelegramDetectedEvent>,
+        outcomes: List<TelegramEnqueueResult>, committedAt: Long) {
+        val eventsByDedupeKey = events.associateBy { it.dedupeKey }
         messages.zip(outcomes).forEach { (message, queued) ->
             if (queued.inserted) {
                 val locationKind = telegramLocationKind(eventsByDedupeKey[message.dedupeKey], message.dedupeKey)
@@ -599,7 +663,6 @@ class TelegramCoordinator internal constructor(
                 )
             }
         }
-        return true
     }
 
     private fun recordSourceDecisions(result: TelegramEventResult, origin: PollOrigin) {

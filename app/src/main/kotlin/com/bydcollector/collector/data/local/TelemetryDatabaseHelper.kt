@@ -42,7 +42,7 @@ class TelemetryDatabaseHelper(
         executeSqlAsset(db, if (compactV2) COMPACT_SCHEMA_ASSET else LEGACY_SCHEMA_ASSET)
         CallbackRawSchema.create(db)
         createPollGetLineage(db)
-        if (oldVersion < DATABASE_VERSION) BusinessInputSchema.migrateToV17(db)
+        if (oldVersion < 17) BusinessInputSchema.migrateToV17(db)
         BusinessInputSchema.create(db)
         createCollectorEvents(db)
         createDeferredEnergyReceipts(db)
@@ -53,7 +53,8 @@ class TelemetryDatabaseHelper(
         ensureColumns(db, "normalized_source_inputs", mapOf("source_epoch" to "INTEGER"))
         ensureColumns(db, "poll_callback_sources", mapOf("source_epoch" to "INTEGER"))
         ensureNormalizedQualityDetails(db)
-        if (oldVersion < DATABASE_VERSION) BusinessInputSchema.seedExistingSourceCheckpoint(db)
+        ensureColumns(db, "influx_export_state", mapOf("transport_wait_generation" to "TEXT"))
+        if (oldVersion < 17) BusinessInputSchema.seedExistingSourceCheckpoint(db)
     }
 
     override fun onDowngrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -507,7 +508,7 @@ class TelemetryDatabaseHelper(
 
     companion object {
         val DATABASE_NAME: String = BuildConfig.COLLECTOR_DATABASE_NAME
-        const val DATABASE_VERSION = 17
+        const val DATABASE_VERSION = 18
         const val LEGACY_SCHEMA_ASSET = "schema.sql"
         const val COMPACT_SCHEMA_ASSET = "schema_v2.sql"
         const val LEGACY_STORAGE_FORMAT = 1

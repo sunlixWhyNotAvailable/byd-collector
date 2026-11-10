@@ -74,7 +74,8 @@ class NormalizedStateStore(
 
     internal fun applyObservationsInTransaction(
         db: SQLiteDatabase,
-        observations: List<NormalizedObservation>
+        observations: List<NormalizedObservation>,
+        keepNewerLocationCurrent: Boolean = false
     ): NormalizedWriteSummary {
         check(db.inTransaction()) { "normalized callback writes require an active transaction" }
         if (observations.isEmpty()) return NormalizedWriteSummary(0, 0, 0)
@@ -92,6 +93,17 @@ class NormalizedStateStore(
                     observations.forEach { observation ->
                         val next = observation.toStoredState()
                         val previous = currentByKey[next.fieldKey]
+                        // GPS callbacks can commit while the durable business page awaits Telegram.
+                        if (keepNewerLocationCurrent && observation.field.category == NormalizedCategory.LOCATION &&
+                            previous != null && parseIso(next.observedAt)?.let { at ->
+                                parseIso(previous.observedAt)?.isAfter(at)
+                            } == true) {
+                            insertHistory(db, historyStatement, next.copy(changedAt = next.observedAt))
+                            changedCount += 1
+                            historyInsertedCount += 1
+                            changedCategories += next.category
+                            return@forEach
+                        }
                         if (previous == null) currentInsertedCount += 1
                         //dedupes unchanged semantic values so history represents changes instead of every poll tick
                         val decision = NormalizedStateReducer.decide(previous, next)

@@ -13,6 +13,7 @@ import com.bydcollector.collector.data.trips.TripSession
 import com.bydcollector.collector.data.trips.TripStore
 import com.bydcollector.collector.data.trips.TripTime
 import com.bydcollector.collector.data.energy.EnergySnapshot
+import com.bydcollector.collector.data.input.BusinessPage
 import com.bydcollector.collector.data.trips.withEnergySnapshot
 import com.bydcollector.collector.data.trips.closedAtPowerOff
 import com.bydcollector.collector.data.trips.TripCompletionIntent
@@ -64,6 +65,8 @@ class TripRuntimeCoordinator(
     private val segmentId = "$bootId:${System.currentTimeMillis()}"
     @Volatile private var ownerThread: Thread? = null
     private var initialized = false
+    private var pageLocations: MutableList<NormalizedObservation>? = null
+    private var pageGpsRequested = false
     private var session: TripSession? = null
     private var nextRouteSequence = 0L
     private var gpsStarted = false
@@ -244,7 +247,7 @@ class TripRuntimeCoordinator(
                     }
                 }
                 val finalGpsStopped = willTransition && decodedPower == 0
-                if (finalGpsStopped) stopGps(markFinal = true)
+                if (finalGpsStopped && pageLocations == null) stopGps(markFinal = true)
 
                 val committed = tripStore.consumeBusinessInput(journalGeneration, inputId, sourceIdentity) { _ ->
                     val mutation = applyBusinessInput(
@@ -287,7 +290,7 @@ class TripRuntimeCoordinator(
                 latestBatteryPowerAtMs = priorBatteryPowerAtMs
                 latestBatteryPowerBootId = priorBatteryPowerBootId
                 try {
-                    restoreRuntimeFromDurableState()
+                    if (pageLocations == null) restoreRuntimeFromDurableState()
                 } catch (restoreError: Throwable) {
                     error.addSuppressed(restoreError)
                 }
@@ -306,6 +309,44 @@ class TripRuntimeCoordinator(
                 future.completeExceptionally(error)
             }
         }
+        return future
+    }
+
+    /** The calculation and its handoff share the Trips transaction and owner. */
+    internal fun prepareBusinessPage(
+        stopFinalGps: Boolean,
+        allowWhilePaused: Boolean,
+        beforeTransaction: () -> Unit,
+        calculate: () -> BusinessPage
+    ): CompletableFuture<BusinessPage> {
+        val future = CompletableFuture<BusinessPage>()
+        try {
+            executor.execute {
+                ownerThread = Thread.currentThread()
+                val priorPower = Triple(latestBatteryPowerKw, latestBatteryPowerAtMs, latestBatteryPowerBootId)
+                try {
+                    check(running.get() && (allowWhilePaused || !paused.get())) { "Trips page owner stopped" }
+                    ensureInitialized()
+                    if (stopFinalGps) stopGps(markFinal = true)
+                    beforeTransaction()
+                    val locations = mutableListOf<NormalizedObservation>()
+                    pageLocations = locations
+                    pageGpsRequested = false
+                    val page = tripStore.commitBusinessPage { calculate().copy(locationObservations = locations.toList()) }
+                    pageLocations = null
+                    if (powerTracker.current() == VehiclePowerState.OFF || !locationCaptureEnabled()) stopGps()
+                    else if (pageGpsRequested && !allowWhilePaused) ensureGpsRunning()
+                    future.complete(page)
+                } catch (error: Throwable) {
+                    pageLocations = null
+                    latestBatteryPowerKw = priorPower.first
+                    latestBatteryPowerAtMs = priorPower.second
+                    latestBatteryPowerBootId = priorPower.third
+                    try { restoreRuntimeFromDurableState() } catch (restore: Throwable) { error.addSuppressed(restore) }
+                    future.completeExceptionally(error)
+                }
+            }
+        } catch (error: Throwable) { future.completeExceptionally(error) }
         return future
     }
 
@@ -532,6 +573,7 @@ class TripRuntimeCoordinator(
     }
 
     private fun ensureGpsRunning() {
+        if (pageLocations != null) { pageGpsRequested = true; return }
         if (gpsStarted || !locationCaptureEnabled()) return
         val nowMs = elapsedRealtimeMs()
         if (!gpsStartRetry.canAttempt(nowMs)) return
@@ -551,6 +593,7 @@ class TripRuntimeCoordinator(
     }
 
     private fun stopGps(markFinal: Boolean = false) {
+        if (pageLocations != null) { pageGpsRequested = false; return }
         locationSource.stop(markFinal)
         gpsStarted = false
         gpsStartRetry.reset()
@@ -560,7 +603,7 @@ class TripRuntimeCoordinator(
         if (!running.get()) return
         lastLocation = sample
         trustAnchor = sample
-        persistLocation(LocationNormalizer.observations(sample, sample.receiveWallTimeMs))
+        persistOrBufferLocation(LocationNormalizer.observations(sample, sample.receiveWallTimeMs))
         val current = session ?: return
         lastLocationTripId = current.tripId
         val sampleElapsedMs = sample.receiveElapsedRealtimeNanos / 1_000_000L
@@ -599,7 +642,7 @@ class TripRuntimeCoordinator(
     }
 
     private fun handleGap(reason: String, observedAt: String) {
-        persistLocation(LocationNormalizer.gap(observedAt, reason))
+        persistOrBufferLocation(LocationNormalizer.gap(observedAt, reason))
         val current = session ?: return
         tripStore.upsertRoutePoint(
             TripMetrics.gapPoint(current.tripId, nextRouteSequence++, observedAt, bootId, segmentId, reason)
@@ -610,6 +653,11 @@ class TripRuntimeCoordinator(
         tripStore.queryRoutePoints(tripId).lastOrNull { it.kind == RoutePoint.KIND_VALID }?.let { last ->
             if (!last.isFinal) tripStore.upsertRoutePoint(last.copy(isFinal = true))
         }
+    }
+
+    private fun persistOrBufferLocation(observations: List<NormalizedObservation>) {
+        val pending = pageLocations
+        if (pending == null) persistLocation(observations) else pending.addAll(observations)
     }
 
     private fun ensureInitialized() {

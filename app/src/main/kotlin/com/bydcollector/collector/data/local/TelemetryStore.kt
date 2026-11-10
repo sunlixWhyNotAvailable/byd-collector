@@ -559,6 +559,30 @@ class TelemetryStore(
         acceptedContinuityUpdates: Map<String, BusinessInputContinuity> = emptyMap()
     ): Boolean = businessInputStore.completeBusinessInputs(refs, acceptedCheckpointUpdates, acceptedContinuityUpdates)
 
+    internal fun completedBusinessInputId(): Long = helper.readableDatabase.rawQuery(
+        "SELECT completed_input_id FROM business_input_meta WHERE singleton=1", null
+    ).use { check(it.moveToFirst()) { "Business journal metadata is missing" }; it.getLong(0) }
+
+    internal fun completeBusinessPage(
+        generation: String,
+        refs: List<BusinessInputRef>,
+        updates: Map<String, NormalizedSourceInput>,
+        continuity: Map<String, BusinessInputContinuity>,
+        observations: List<NormalizedObservation>
+    ): NormalizedWriteSummary {
+        ensureNormalizedCatalogImported()
+        val db = helper.writableDatabase
+        db.beginTransaction()
+        try {
+            check(businessInputStore.businessInputGeneration(db) == generation) { "Main generation changed before page commit" }
+            val applied = businessInputStore.completeBusinessInputs(refs, updates, continuity)
+            val summary = if (applied) normalizedStore.applyObservationsInTransaction(db, observations, keepNewerLocationCurrent = true)
+                else NormalizedWriteSummary(0, 0, 0)
+            db.setTransactionSuccessful()
+            return summary
+        } finally { db.endTransaction() }
+    }
+
     fun businessInputEventHistory(afterId: Long = 0L, limit: Int = 512): List<BusinessInputRef> =
         businessInputStore.businessInputEventHistory(afterId, limit)
 
@@ -1688,7 +1712,7 @@ class TelemetryStore(
         helper.readableDatabase.rawQuery(
             """
             SELECT status, mode, pending_rows, oldest_pending_at, next_retry_at,
-                   last_success_at, last_error_at, last_error, exported_rows_total
+                   last_success_at, last_error_at, last_error, exported_rows_total, transport_wait_generation
             FROM influx_export_state
             WHERE id = 1
             """.trimIndent(),
@@ -1716,7 +1740,8 @@ class TelemetryStore(
                 lastSuccessAt = cursor.getNullableString(5),
                 lastErrorAt = cursor.getNullableString(6),
                 lastError = cursor.getNullableString(7),
-                exportedRowsTotal = cursor.getLong(8)
+                exportedRowsTotal = cursor.getLong(8),
+                transportWaitGeneration = cursor.getNullableString(9)
             )
         }
     }
@@ -1730,7 +1755,8 @@ class TelemetryStore(
         lastSuccessAt: String?,
         lastErrorAt: String?,
         lastError: String?,
-        exportedRowsDelta: Long
+        exportedRowsDelta: Long,
+        transportWaitGeneration: String?
     ) {
         val currentTotal = influxExportState().exportedRowsTotal
         val now = clock.nowIso()
@@ -1744,6 +1770,7 @@ class TelemetryStore(
             if (lastErrorAt == null) putNull("last_error_at") else put("last_error_at", lastErrorAt)
             if (lastError == null) putNull("last_error") else put("last_error", lastError.truncateForStorage(MAX_ERROR_TEXT_LENGTH))
             put("exported_rows_total", currentTotal + exportedRowsDelta)
+            put("transport_wait_generation", transportWaitGeneration)
             put("updated_at", now)
         }
         val updated = helper.writableDatabase.update("influx_export_state", values, "id = 1", emptyArray())

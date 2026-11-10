@@ -94,14 +94,15 @@ class HttpInfluxClient(
             try {
                 val openStarted = System.nanoTime()
                 try {
-                    bridge = HaTailscaleRuntime.current()?.bridge(config.host, config.port)
+                    bridge = HaTailscaleRuntime.current()?.bridge(config.host, config.port,
+                        context.requestId, context.profile?.name?.lowercase() ?: "unknown")
                     val url = URL(config.baseUrl + path)
                     connection = (bridge?.let { url.openConnection(Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", it.port))) }
                         ?: url.openConnection()) as HttpURLConnection
                     connection.apply {
                         requestMethod = method
                         connectTimeout = CONNECT_TIMEOUT_MS
-                        readTimeout = READ_TIMEOUT_MS
+                        readTimeout = if (bridge != null) TAILNET_READ_TIMEOUT_MS else READ_TIMEOUT_MS
                         setRequestProperty("User-Agent", "BYDCollector")
                         bridge?.let {
                             setRequestProperty("Proxy-Authorization", "Bearer ${it.token}")
@@ -192,7 +193,8 @@ class HttpInfluxClient(
             InfluxActionResult.fail(
                 "influx_network_error",
                 "${error::class.java.simpleName}: $detail",
-                failureKind = classifyNetworkFailure(error)
+                failureKind = classifyNetworkFailure(error),
+                transportWaitGeneration = (error as? TailscaleTransportException)?.startingGeneration
             )
         }
     }
@@ -243,6 +245,7 @@ class HttpInfluxClient(
     private companion object {
         const val CONNECT_TIMEOUT_MS = 5_000
         const val READ_TIMEOUT_MS = 10_000
+        const val TAILNET_READ_TIMEOUT_MS = 20_000
     }
 }
 

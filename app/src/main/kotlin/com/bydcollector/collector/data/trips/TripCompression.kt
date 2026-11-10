@@ -80,6 +80,7 @@ internal class TripCompression(
                 snapshotStore.allPendingCompletions()
             )
             candidateStore.replaceBusinessInputCursor(snapshotStore.businessInputCursor())
+            candidateStore.replaceBusinessPage(snapshotStore.pendingBusinessPage())
             onPhase(TripCompressionPhase.CANDIDATE_BUILT)
             onStep(2)
             check(sameSessions(snapshotStore, candidateStore)) { "Trip sessions changed during compression" }
@@ -88,6 +89,7 @@ internal class TripCompression(
             check(sameHistoricalEnergyBackfill(snapshotStore, candidateStore)) { "Historical energy progress changed during compression" }
             check(sameTripCompletions(snapshotStore, candidateStore)) { "Trip completion intents changed during compression" }
             check(sameBusinessInputCursor(snapshotStore, candidateStore)) { "Business input cursor changed during compression" }
+            check(snapshotStore.pendingBusinessPage() == candidateStore.pendingBusinessPage()) { "Business page changed during compression" }
             sessions.forEach { session ->
                 checkInterrupted()
                 check(sameRoute(snapshotStore, candidateStore, session.tripId)) { "Route equality verification failed" }
@@ -126,6 +128,7 @@ internal class TripCompression(
                     if (store.businessInputCursorChanged()) {
                         candidateStore.replaceBusinessInputCursor(store.businessInputCursor())
                     }
+                    candidateStore.replaceBusinessPage(store.pendingBusinessPage())
                     check(sameSessions(store, candidateStore)) { "Concurrent trip state was not preserved" }
                     check(sameEnergyRuntime(store, candidateStore)) { "Concurrent energy runtime state was not preserved" }
                     check(sameHistoricalEnergyBackfill(store, candidateStore)) { "Concurrent historical energy progress was not preserved" }
@@ -138,6 +141,7 @@ internal class TripCompression(
                     val expectedCompletionWatermark = candidateStore.completionWatermark()
                     val expectedCompletions = candidateStore.allPendingCompletions()
                     val expectedBusinessInputCursor = candidateStore.businessInputCursor()
+                    val expectedBusinessPage = candidateStore.pendingBusinessPage()
                     candidateStore.checkpointTruncate()
                     candidateStore.closeDatabase()
                     store.checkpointTruncate()
@@ -155,7 +159,8 @@ internal class TripCompression(
                             expectedEnergyQuarantine,
                             expectedCompletionWatermark,
                             expectedCompletions,
-                            expectedBusinessInputCursor
+                            expectedBusinessInputCursor,
+                            expectedBusinessPage
                         )
                         TripCompressionResult(before, after)
                     }
@@ -186,7 +191,8 @@ internal class TripCompression(
         expectedEnergyQuarantine: List<EnergyQuarantineRecord>,
         expectedCompletionWatermark: Long,
         expectedCompletions: List<TripCompletionIntent>,
-        expectedBusinessInputCursor: TripBusinessInputCursor?
+        expectedBusinessInputCursor: TripBusinessInputCursor?,
+        expectedBusinessPage: com.bydcollector.collector.data.input.BusinessPage?
     ) {
         store.closeForReplacement()
         try {
@@ -209,7 +215,8 @@ internal class TripCompression(
                     store.energyQuarantineRecords() == expectedEnergyQuarantine &&
                     store.completionWatermark() == expectedCompletionWatermark &&
                     store.allPendingCompletions() == expectedCompletions &&
-                    store.businessInputCursor() == expectedBusinessInputCursor
+                    store.businessInputCursor() == expectedBusinessInputCursor &&
+                    store.pendingBusinessPage() == expectedBusinessPage
             ) {
                 "Compressed Trips reopen verification failed"
             }

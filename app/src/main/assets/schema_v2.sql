@@ -331,6 +331,7 @@ CREATE TABLE IF NOT EXISTS influx_export_cursor (
 
 CREATE TABLE IF NOT EXISTS influx_export_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
+    transport_wait_generation TEXT,
     status TEXT NOT NULL DEFAULT 'stopped',
     mode TEXT,
     pending_rows INTEGER NOT NULL DEFAULT 0,

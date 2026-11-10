@@ -968,8 +968,6 @@ object DiagnosticLogRecorder {
             lines += "trip_ended_at=${diagnosticSafeText(session.endedAt, 64).ifBlank { "none" }}"
             lines += "trip_termination=${diagnosticSafeText(session.termination, 64).ifBlank { "none" }}"
             lines += "trip_quality=${diagnosticSafeText(session.quality, 128)}"
-            lines += "trip_telegram_eligible=${session.telegramEligible}"
-            lines += "trip_telegram_enqueued=${session.telegramEnqueued}"
         }
         route?.let { evidence ->
             lines += "route_storage=${evidence.storage}"

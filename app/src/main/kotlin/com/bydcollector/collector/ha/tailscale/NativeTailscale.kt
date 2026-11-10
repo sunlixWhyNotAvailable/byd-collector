@@ -14,14 +14,17 @@ import java.util.Base64
 import java.util.UUID
 import java.net.NetworkInterface
 
-internal data class TailscaleNativeStatus(val id: String, val state: String, val loginUrl: String?, val error: String?) {
+internal data class TailscaleNativeStatus(val id: String, val state: String, val loginUrl: String?, val error: String?,
+    val requestId: String? = null, val profile: String? = null) {
     companion object {
         fun parse(value: JSONObject) = TailscaleNativeStatus(value.optString("id"), value.getString("state"),
-            value.optString("loginUrl").takeIf(String::isNotBlank), value.optString("error").takeIf(String::isNotBlank))
+            value.optString("loginUrl").takeIf(String::isNotBlank), value.optString("error").takeIf(String::isNotBlank),
+            value.optString("requestId").takeIf(String::isNotBlank), value.optString("profile").takeIf(String::isNotBlank))
     }
 }
 
-internal class TailscaleTransportException(message: String, cause: Throwable? = null) : IOException(message, cause)
+internal class TailscaleTransportException(message: String, cause: Throwable? = null,
+    val startingGeneration: String? = null) : IOException(message, cause)
 
 internal object NativeTailscale {
     @Volatile var listener: ((TailscaleNativeStatus) -> Unit)? = null
@@ -79,8 +82,9 @@ internal class TailscaleNativeSession(private val context: Context, val id: Stri
     }
     fun status() = TailscaleNativeStatus.parse(request("status"))
     fun networkChanged() { request("network") }
-    fun lease(host: String, port: Int): TailscaleBridgeLease {
-        val response = request("lease", JSONObject().put("host", host).put("port", port))
+    fun lease(host: String, port: Int, requestId: String?, profile: String?): TailscaleBridgeLease {
+        val response = request("lease", JSONObject().put("host", host).put("port", port)
+            .put("requestId", requestId).put("profile", profile).put("purpose", if (requestId != null) "influx" else "mqtt"))
         if (response.optString("state") != "ready") throw TailscaleTransportException("Tailscale is ${response.optString("state")}")
         return TailscaleBridgeLease(response.getInt("port"), response.getString("token")) { token ->
             request("release", JSONObject().put("token", token))
@@ -88,7 +92,8 @@ internal class TailscaleNativeSession(private val context: Context, val id: Stri
     }
     private fun request(operation: String, arguments: JSONObject = JSONObject()): JSONObject {
         val result = JSONObject(NativeTailscale.call(operation, arguments.put("id", id).toString()))
-        if (result.optString("state") == "error") throw TailscaleTransportException(result.getString("error"))
+        if (result.optString("state") == "error") throw TailscaleTransportException(result.getString("error"),
+            startingGeneration = id.takeIf { result.optString("code") == "tailnet_starting" })
         return result
     }
     override fun close() { request("close") }

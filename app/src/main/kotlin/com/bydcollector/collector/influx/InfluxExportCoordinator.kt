@@ -5,6 +5,7 @@ import android.database.sqlite.SQLiteTableLockedException
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import com.bydcollector.collector.ha.HaEndpointProfile
+import com.bydcollector.collector.ha.tailscale.HaTailscaleRuntime
 import com.bydcollector.collector.util.diagnosticDetail
 import java.time.OffsetDateTime
 import java.util.Locale
@@ -142,6 +143,7 @@ class InfluxExportCoordinator(
             lastSuccessAt = state.lastSuccessAt,
             lastErrorAt = state.lastErrorAt.takeIf { preservesFailure },
             lastError = state.lastError.takeIf { preservesFailure },
+            transportWaitGeneration = state.transportWaitGeneration.takeIf { preservesFailure },
             exportedRowsDelta = 0
         )
         return InfluxActionResult.ok("resumed")
@@ -158,7 +160,10 @@ class InfluxExportCoordinator(
         }
         // The completed cycle already persisted its deadline; scheduling must not rescan history.
         // A locked database may not have accepted the retry status; keep the live run's deadline.
-        val nextRetryAt = sqliteRetryAt ?: store.influxExportState().nextRetryAt ?: return null
+        val sqliteDeadline = sqliteRetryAt
+        val state = if (sqliteDeadline == null) store.influxExportState() else null
+        if (state != null && transportRetryReady(state)) return 0L
+        val nextRetryAt = sqliteDeadline ?: state?.nextRetryAt ?: return null
         return runCatching {
             val now = OffsetDateTime.parse(clock.nowIso()).toInstant().toEpochMilli()
             (OffsetDateTime.parse(nextRetryAt).toInstant().toEpochMilli() - now).coerceAtLeast(0L)
@@ -268,7 +273,7 @@ class InfluxExportCoordinator(
             return InfluxActionResult.ok("no fields enabled")
         }
         //honors the short success pacing and the longer persisted failure backoff
-        if (!force && !state.nextRetryAt.isNullOrBlank() && !retryDue(state.nextRetryAt, clock.nowIso())) {
+        if (!force && !transportRetryReady(state) && !state.nextRetryAt.isNullOrBlank() && !retryDue(state.nextRetryAt, clock.nowIso())) {
             diagnosticGate("backoff", mapOf("retry_deadline" to state.nextRetryAt))
             // Keep the last calculated snapshot/error, rather than rewriting it as a fresh count.
             return InfluxActionResult.ok("influx next attempt pending")
@@ -363,7 +368,8 @@ class InfluxExportCoordinator(
                         "transient_failure_floor"
                     }
                 }
-                recordFailure(if (failure.retryable) STATUS_BACKOFF else "error", failure.message, pendingAfterFailure)
+                recordFailure(if (failure.retryable) STATUS_BACKOFF else "error", failure.message, pendingAfterFailure,
+                    failure.transportWaitGeneration)
                 return failure
             }
 
@@ -902,7 +908,8 @@ class InfluxExportCoordinator(
     private fun recordFailure(
         status: String,
         error: String,
-        pendingSummary: InfluxPendingSummary = InfluxPendingSummary(rows = 0, oldestObservedAt = null)
+        pendingSummary: InfluxPendingSummary = InfluxPendingSummary(rows = 0, oldestObservedAt = null),
+        transportWaitGeneration: String? = null
     ) {
         val now = clock.nowIso()
         val state = store.influxExportState()
@@ -915,6 +922,7 @@ class InfluxExportCoordinator(
             lastSuccessAt = state.lastSuccessAt,
             lastErrorAt = now,
             lastError = error,
+            transportWaitGeneration = transportWaitGeneration,
             exportedRowsDelta = 0
         )
         store.recordInfluxEvent(
@@ -933,6 +941,10 @@ class InfluxExportCoordinator(
     private fun plusSeconds(iso: String, seconds: Long): String {
         return runCatching { OffsetDateTime.parse(iso).plusSeconds(seconds).toString() }.getOrDefault(iso)
     }
+
+    private fun transportRetryReady(state: InfluxExportStateSnapshot): Boolean =
+        state.status == STATUS_BACKOFF && state.transportWaitGeneration != null &&
+            HaTailscaleRuntime.current()?.isReady() == true
 
     private fun retryDue(nextRetryAt: String, nowIso: String): Boolean {
         return runCatching {

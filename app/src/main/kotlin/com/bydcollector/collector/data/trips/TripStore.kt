@@ -7,6 +7,7 @@ import com.bydcollector.collector.data.energy.EnergyRuntimeRow
 import com.bydcollector.collector.data.energy.EnergyRuntimeStorage
 import com.bydcollector.collector.data.energy.EnergySnapshot
 import com.bydcollector.collector.data.energy.EnergyStateCodec
+import com.bydcollector.collector.data.input.BusinessPage
 import java.time.Instant
 import com.bydcollector.collector.BuildConfig
 import com.bydcollector.collector.runtime.RuntimeReads
@@ -39,6 +40,44 @@ internal data class TripBusinessInputReplay(
 )
 
 class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyRuntimeStorage {
+    @Synchronized
+    internal fun pendingBusinessPage(): BusinessPage? = readableDb.rawQuery(
+        "SELECT page_key, payload FROM business_page_handoff WHERE singleton=1", null
+    ).use { cursor ->
+        if (!cursor.moveToFirst()) null else BusinessPage.decode(cursor.getString(1)).also {
+            check(it.key == cursor.getString(0)) { "Business page identity mismatch" }
+        }
+    }
+
+    @Synchronized
+    internal fun commitBusinessPage(calculate: () -> BusinessPage): BusinessPage {
+        check(pendingBusinessPage() == null) { "Previous business page is not acknowledged" }
+        val db = writableDb
+        db.beginTransaction()
+        try {
+            val page = calculate()
+            replaceBusinessPage(page)
+            db.setTransactionSuccessful()
+            return page
+        } finally { db.endTransaction() }
+    }
+
+    @Synchronized
+    internal fun replaceBusinessPage(page: BusinessPage?) {
+        val db = writableDb
+        if (page == null) db.delete("business_page_handoff", "singleton=1", null)
+        else check(db.insertWithOnConflict("business_page_handoff", null, ContentValues().apply {
+            put("singleton", 1); put("page_key", page.key); put("payload", page.encode())
+        }, SQLiteDatabase.CONFLICT_REPLACE) != -1L) { "Business page handoff write failed" }
+    }
+
+    @Synchronized
+    internal fun acknowledgeBusinessPage(key: String) {
+        check(writableDb.delete("business_page_handoff", "singleton=1 AND page_key=?", arrayOf(key)) == 1) {
+            "Business page acknowledgment identity changed"
+        }
+    }
+
     /** Serializes all TripStore access; Step 8 leases this monitor for cutover. */
     private val changedTripSequences = linkedMapOf<String, Long?>()
     private var changeTracking = false
