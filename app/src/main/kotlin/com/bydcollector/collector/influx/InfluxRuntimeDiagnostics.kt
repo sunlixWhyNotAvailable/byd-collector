@@ -52,6 +52,9 @@ class InfluxRuntimeDiagnosticsState(
     private var requestBodyBytesTotal = 0L
     private var summaryRoute: String? = null
     private var summaryRuntimeId: String? = null
+    private class PhaseSummary(var count: Long = 0L, var totalMs: Long = 0L, var maxMs: Long = 0L)
+    private val databasePhases = linkedMapOf<String, PhaseSummary>()
+    private val retryTimers = linkedMapOf<String, Long>()
     private var problemStartedElapsedMs: Long? = null
     private var lastDurableGateKey: String? = null
     @Volatile private var journal: OperationalEventJournal? = null
@@ -150,7 +153,7 @@ class InfluxRuntimeDiagnosticsState(
             }
 
             val enriched = normalize(enrich(normalized, requestContext, now, freshState))
-            if (shouldPersistLocked(enriched)) persisted += enriched
+            if (!aggregateRoutineLocked(enriched, now) && shouldPersistLocked(enriched)) persisted += enriched
 
             if (freshState && details.containsKey("actual_route") && previousRoute != actualRoute) {
                 val routeChanged = normalize(
@@ -337,6 +340,28 @@ class InfluxRuntimeDiagnosticsState(
         if (summaryStartedElapsedMs == null) summaryStartedElapsedMs = now
     }
 
+    private fun aggregateRoutineLocked(event: InfluxDiagnosticEvent, now: Long): Boolean {
+        if (isFailure(event)) return false
+        when (event.type) {
+            "influx_db_phase" -> {
+                val phase = event.details["phase"]?.takeIf { it in DATABASE_PHASES } ?: return false
+                if (event.details["result"] != "ok") return false
+                val duration = event.details["duration_ms"]?.toLongOrNull()?.takeIf { it >= 0L } ?: return false
+                databasePhases.getOrPut(phase) { PhaseSummary() }.apply {
+                    count++
+                    totalMs += duration
+                    maxMs = maxOf(maxMs, duration)
+                }
+            }
+            "influx_retry_scheduled", "influx_retry_fired" -> {
+                retryTimers[event.type] = (retryTimers[event.type] ?: 0L) + 1L
+            }
+            else -> return false
+        }
+        beginSummaryWindow(now)
+        return true
+    }
+
     private fun takeElapsedSummaryLocked(now: Long): InfluxDiagnosticEvent? {
         val started = summaryStartedElapsedMs ?: return null
         if ((now - started).coerceAtLeast(0L) < SUMMARY_INTERVAL_MS) return null
@@ -345,7 +370,7 @@ class InfluxRuntimeDiagnosticsState(
 
     private fun takeSummaryLocked(reason: String, now: Long): InfluxDiagnosticEvent? {
         val started = summaryStartedElapsedMs ?: return null
-        if (successfulHttpRequests == 0L && confirmedRows == 0L) return null
+        if (successfulHttpRequests == 0L && confirmedRows == 0L && databasePhases.isEmpty() && retryTimers.isEmpty()) return null
         val event = normalize(
             InfluxDiagnosticEvent(
                 "influx_success_summary",
@@ -354,6 +379,12 @@ class InfluxRuntimeDiagnosticsState(
                     put("window_ms", (now - started).coerceAtLeast(0L).toString())
                     put("successful_http_requests", successfulHttpRequests.toString())
                     put("confirmed_rows", confirmedRows.toString())
+                    databasePhases.forEach { (phase, stats) ->
+                        put("db_${phase}_count", stats.count.toString())
+                        put("db_${phase}_total_ms", stats.totalMs.toString())
+                        put("db_${phase}_max_ms", stats.maxMs.toString())
+                    }
+                    retryTimers.forEach { (type, count) -> put("${type}_count", count.toString()) }
                     put("request_duration_total_ms", requestDurationTotalMs.toString())
                     put("request_body_bytes_total", requestBodyBytesTotal.toString())
                     put("request_duration_average_ms", if (successfulHttpRequests == 0L) "0" else (requestDurationTotalMs / successfulHttpRequests).toString())
@@ -378,6 +409,8 @@ class InfluxRuntimeDiagnosticsState(
         requestBodyBytesTotal = 0L
         summaryRoute = null
         summaryRuntimeId = null
+        databasePhases.clear()
+        retryTimers.clear()
         return event
     }
 
@@ -489,6 +522,7 @@ class InfluxRuntimeDiagnosticsState(
         const val SUMMARY_INTERVAL_MS = 60_000L
         const val MAX_REQUEST_CONTEXTS = 4
         const val MAX_DETAIL_VALUE_CHARS = 512
+        val DATABASE_PHASES = setOf("select_batch", "queue_summary", "pending_head")
         val ROUTINE_GATE_REASONS = setOf(
             "no_work", "no_categories", "singleflight_occupied", "stale_generation"
         )

@@ -19,11 +19,14 @@ internal fun normalizedSourceMatchesSeed(
     stamp: NormalizedSourceStamp,
     seedKind: String?,
     seedIdentity: String?,
-    seedRecordSequence: Long?
+    seedRecordSequence: Long?,
+    owner: NormalizedSourceStamp? = null
 ): Boolean {
     if (seedIdentity == null || seedRecordSequence == null || stamp.sequence != seedRecordSequence || stamp.sourceEpoch == null) {
         return false
     }
+    if (owner != null && (stamp.bootId != owner.bootId || stamp.generatorId == null ||
+            stamp.generatorId != owner.generatorId || stamp.sourceEpoch != owner.sourceEpoch)) return false
     return when (seedKind) {
         "callback" -> stamp.kind == NormalizedSourceKind.CALLBACK && stamp.identity == seedIdentity
         "get" -> stamp.kind == NormalizedSourceKind.POLL &&

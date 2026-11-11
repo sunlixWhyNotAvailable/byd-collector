@@ -3,6 +3,7 @@ package com.bydcollector.collector.service
 import com.bydcollector.collector.data.local.PollReading
 import com.bydcollector.collector.data.input.BusinessContinuityState
 import com.bydcollector.collector.data.input.BusinessInputContinuity
+import com.bydcollector.collector.data.input.BusinessInputReducer
 import com.bydcollector.collector.data.direct.DirectFidRegistry
 import com.bydcollector.collector.data.direct.DirectValueDecoders
 import com.bydcollector.collector.data.normalized.NormalizedFieldCatalog
@@ -99,7 +100,8 @@ data class TelegramSourceOrderStats(
     val conflictingEqual: Int = 0,
     val invalid: Int = 0,
     val sourceRefs: Set<String> = emptySet(),
-    val keyRefs: Set<String> = emptySet()
+    val keyRefs: Set<String> = emptySet(),
+    val rejectionReasons: Map<String, Int> = emptyMap()
 ) {
     val rejected: Int get() = repeated + older + incomparable + conflictingEqual + invalid
 }
@@ -191,13 +193,19 @@ internal object TelegramOrderedInput {
         var invalid = 0
         val sourceRefs = linkedSetOf<String>()
         val keyRefs = linkedSetOf<String>()
+        val rejectionReasons = linkedMapOf<String, Int>()
+        fun rejected(reason: String) {
+            invalid += 1
+            rejectionReasons[reason] = (rejectionReasons[reason] ?: 0) + 1
+        }
 
         readings.asSequence()
             .filter { it.rawKey in rawSourceKeys }
             .forEach { reading ->
                 val incoming = normalizedSourceInputForPollReading(reading, pollStamp, pollId)
                 if (incoming == null) {
-                    invalid += 1
+                    rejected(if (reading.getLineage?.supersededByCallback == true)
+                        "get_superseded_by_callback" else "source_conversion_rejected")
                     keyRefs += diagnosticSha256(reading.rawKey)
                     sourceRefs += diagnosticSha256(reading.callbackSource?.let {
                         "callback:${it.bootId}:${it.helperGeneration}:${it.stream}:${it.epoch}:${it.eventSequence}"
@@ -209,23 +217,31 @@ internal object TelegramOrderedInput {
                 val entry = DirectFidRegistry.entries.firstOrNull { it.key == key }
                 val bits = incoming.reading.rawInt
                 val validValue = entry != null && bits != null && DirectValueDecoders.decode(entry, bits) != null
+                val barrier = previousCursor?.continuityBarrier
                 val approvedSeed = continuityUpdates[key]?.let { update ->
                     update.state == BusinessContinuityState.AVAILABLE && update.seedValid &&
-                        normalizedSourceMatchesSeed(incoming.stamp, update.seedKind, update.seedIdentity, update.seedRecordSequence)
+                        (barrier == null || NormalizedSourceOrdering.compare(update.stamp, barrier, currentBootId)
+                            in setOf(NormalizedSourceOrder.NEWER, NormalizedSourceOrder.EQUAL)) &&
+                        normalizedSourceMatchesSeed(incoming.stamp, update.seedKind, update.seedIdentity,
+                            update.seedRecordSequence, update.stamp)
                 } == true
                 val matchingStoredSeed = previousCursor?.let {
-                    normalizedSourceMatchesSeed(incoming.stamp, "get", it.continuitySeedIdentity, it.continuitySeedRecordSequence) ||
-                        normalizedSourceMatchesSeed(incoming.stamp, "callback", it.continuitySeedIdentity, it.continuitySeedRecordSequence)
+                    barrier != null && (normalizedSourceMatchesSeed(incoming.stamp, "get", it.continuitySeedIdentity,
+                        it.continuitySeedRecordSequence, barrier) || normalizedSourceMatchesSeed(incoming.stamp,
+                        "callback", it.continuitySeedIdentity, it.continuitySeedRecordSequence, barrier))
                 } == true
-                val barrier = previousCursor?.continuityBarrier
                 val qualifiedAfterBreak = barrier != null && incoming.stamp.bootId == barrier.bootId &&
                     incoming.stamp.sourceEpoch != null &&
                     NormalizedSourceOrdering.compare(incoming.stamp, barrier, currentBootId) == NormalizedSourceOrder.NEWER
                 val canUsePendingSeed = previousCursor?.valid != true && barrier != null &&
-                    (approvedSeed || matchingStoredSeed) && previousCursor.stamp.identity == barrier.identity
+                    (approvedSeed || matchingStoredSeed) &&
+                    // A retained pre-loss value is not the loss event. Only a newer value/loss blocks its seed.
+                    (previousCursor.stamp.identity == barrier.identity ||
+                        NormalizedSourceOrdering.compare(incoming.stamp, previousCursor.stamp, currentBootId)
+                            in setOf(NormalizedSourceOrder.NEWER, NormalizedSourceOrder.EQUAL))
                 if (!validValue) {
                     if (previousCursor?.valid == false && barrier != null && !qualifiedAfterBreak && !canUsePendingSeed) {
-                        invalid += 1
+                        rejected("invalid_value_behind_continuity")
                         sourceRefs += diagnosticSha256(incoming.stamp.identity)
                         keyRefs += diagnosticSha256(key)
                         return@forEach
@@ -249,7 +265,7 @@ internal object TelegramOrderedInput {
                     } else {
                         incomparable += 1
                     }
-                    invalid += 1
+                    rejected("raw_value_invalid")
                     sourceRefs += diagnosticSha256(incoming.stamp.identity)
                     keyRefs += diagnosticSha256(key)
                     return@forEach
@@ -264,7 +280,7 @@ internal object TelegramOrderedInput {
                 }
                 if (!previousCursor.valid && barrier != null) {
                     if (!qualifiedAfterBreak && !canUsePendingSeed) {
-                        invalid += 1
+                        rejected("valid_value_behind_continuity")
                         sourceRefs += diagnosticSha256(incoming.stamp.identity)
                         keyRefs += diagnosticSha256(key)
                         return@forEach
@@ -312,6 +328,12 @@ internal object TelegramOrderedInput {
 
         continuityUpdates.filterKeys { it in rawSourceKeys }.forEach { (key, update) ->
             val cursor = cursors[key]
+            if (BusinessInputReducer.isAppObservedSourceLoss(update) &&
+                !BusinessInputReducer.appObservedSourceLossTargetsCurrentSource(update, null, cursor?.toInput(key))) return@forEach
+            cursor?.continuityBarrier?.let { barrier ->
+                if (NormalizedSourceOrdering.compare(update.stamp, barrier, currentBootId)
+                    !in setOf(NormalizedSourceOrder.NEWER, NormalizedSourceOrder.EQUAL)) return@forEach
+            }
             if (update.state == BusinessContinuityState.LOST || !update.seedValid) {
                 if (cursor == null) {
                     cursors[key] = TelegramRawSourceCursor(null, null, update.stamp, valid = false,
@@ -332,8 +354,10 @@ internal object TelegramOrderedInput {
                 return@forEach
             }
             val isSeed = cursor != null && normalizedSourceMatchesSeed(
-                cursor.stamp, update.seedKind, update.seedIdentity, update.seedRecordSequence
-            )
+                cursor.stamp, update.seedKind, update.seedIdentity, update.seedRecordSequence, update.stamp
+            ) && cursor.rawValue?.toIntOrNull()?.let { raw ->
+                DirectFidRegistry.entries.firstOrNull { it.key == key }?.let { DirectValueDecoders.decode(it, raw) }
+            } != null
             if (isSeed) {
                 cursors[key] = cursor!!.copy(valid = true, continuityBarrier = null,
                     continuitySeedIdentity = null, continuitySeedRecordSequence = null)
@@ -372,7 +396,8 @@ internal object TelegramOrderedInput {
                 conflictingEqual = conflicting,
                 invalid = invalid,
                 sourceRefs = sourceRefs,
-                keyRefs = keyRefs
+                keyRefs = keyRefs,
+                rejectionReasons = rejectionReasons
             ),
             currentBootId = currentBootId
         )

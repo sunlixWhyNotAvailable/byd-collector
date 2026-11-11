@@ -53,6 +53,37 @@ class TelegramCoordinator internal constructor(
         private set
     private var enabledRuntimeStartedAtMs: Long? = null
     private var startupRecoveryPending = true
+    private var historyRepairAttempted = false
+
+    /** Called on the owner at a completed Main frontier, before the next business page. */
+    internal fun recoverInitialHistory(history: (String, Long) -> Sequence<com.bydcollector.collector.data.input.BusinessInputDelta>) {
+        if (historyRepairAttempted || engine.state.initialSeedRecoveryVersion >= 1) return
+        historyRepairAttempted = true
+        check(businessBatch == null)
+        try {
+            val energy = currentEnergySnapshot()
+            val activeGroup = energy?.active == true && energy.powerSessionId == engine.state.powerEnergyPoint?.powerSessionId
+            val timing = engine.state.detectorTiming
+            val result = com.bydcollector.collector.service.TelegramHistoryRepair.recover(
+                engine.state, eventConfig(), normalizer, activeGroup,
+                timing.bootId?.let { history(it, timing.evaluatedElapsedMs) } ?: emptySequence())
+            // State and the revision marker are one durable value; delivery rows are untouched.
+            telegramStore.saveTelegramRuntimeState(result.state.toJson(), nowMs())
+            engine = createEngine(result.state)
+            eventStore.recordEvent("telegram_initial_history_recovered", "Telegram initial history examined",
+                "reason=${result.reason} inputs=${result.inputs} restored_keys=${result.restoredKeys} " +
+                    "distance_complete=${result.state.bootTotalDistanceComplete} start_soc_known=${result.state.bootStartSoc != null}")
+        } catch (error: Exception) {
+            if (error is InterruptedException) throw error
+            try {
+                eventStore.recordEvent("telegram_initial_history_recovery_failed", "Telegram history recovery failed",
+                    error.diagnosticDetail())
+            } catch (logging: Exception) {
+                error.addSuppressed(logging)
+                android.util.Log.e("TelegramCoordinator", "Cannot record history recovery failure", error)
+            }
+        }
+    }
     private class BusinessBatch {
         val messages = mutableListOf<TelegramOutboxMessage>()
         val events = mutableListOf<TelegramDetectedEvent>()
@@ -674,6 +705,10 @@ class TelegramCoordinator internal constructor(
                 "incomparable" to stats.incomparable, "conflicting_equal" to stats.conflictingEqual,
                 "invalid" to stats.invalid
             )) sourceCounts[reason] = (sourceCounts[reason] ?: 0L) + count
+            stats.rejectionReasons.forEach { (reason, count) ->
+                val key = "rejected_$reason"
+                sourceCounts[key] = (sourceCounts[key] ?: 0L) + count
+            }
             // Bounded examples only; counts retain all rejects until the existing tick flushes them.
             stats.sourceRefs.take((8 - rejectedSourceRefs.size).coerceAtLeast(0)).forEach(rejectedSourceRefs::add)
             stats.keyRefs.take((16 - rejectedKeyRefs.size).coerceAtLeast(0)).forEach(rejectedKeyRefs::add)

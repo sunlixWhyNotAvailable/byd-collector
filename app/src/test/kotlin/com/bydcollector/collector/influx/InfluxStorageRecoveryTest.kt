@@ -168,7 +168,9 @@ class InfluxStorageRecoveryTest {
         val config = InfluxConfig(true, "127.0.0.1", 8086, "test", null, null, "state", setOf("battery"))
         store.ensureInfluxCursors(influxEffectiveFields(config))
         helper.writableDatabase.rawQuery("PRAGMA busy_timeout=1", emptyArray()).use { it.moveToFirst() }
-        val coordinator = InfluxExportCoordinator(store, HttpInfluxClient(), { config }, clock)
+        val durable = mutableListOf<InfluxDiagnosticEvent>()
+        val diagnostics = InfluxRuntimeDiagnosticsState(journalSink = { durable += it })
+        val coordinator = InfluxExportCoordinator(store, HttpInfluxClient(), { config }, clock, diagnostics::record)
         // A second native SQLite connection really owns the write lock. No HTTP server or substituted result.
         SQLiteDatabase.openDatabase(helper.writableDatabase.path, null, SQLiteDatabase.OPEN_READWRITE).use { blocker ->
             blocker.beginTransaction()
@@ -194,6 +196,12 @@ class InfluxStorageRecoveryTest {
         assertNull(coordinator.retryDelayMs())
         assertTrue(coordinator.stopExport().ok)
         assertEquals("stopped", store.influxExportState().status)
+        diagnostics.flushSummary("storage_check")
+        assertTrue(durable.any { it.type == "influx_retry_pending" || it.type == "influx_export_error" })
+        assertTrue(durable.none { it.type == "influx_db_phase" && it.details["result"] == "ok" })
+        assertTrue(durable.filter { it.type == "influx_success_summary" }.any {
+            (it.details["db_queue_summary_count"]?.toLongOrNull() ?: 0L) > 0L
+        })
         store.close()
     }
 

@@ -469,8 +469,17 @@ class InfluxExportCoordinator(
 
     private inline fun <T> timedDatabasePhase(phase: String, action: () -> T): T {
         val started = System.nanoTime()
-        return try { action() } finally {
-            diagnostic("influx_db_phase", mapOf("phase" to phase, "duration_ms" to elapsedDiagnosticMs(started).toString()))
+        var failure: Throwable? = null
+        return try { action() } catch (error: Throwable) {
+            failure = error
+            throw error
+        } finally {
+            diagnostic("influx_db_phase", buildMap {
+                put("phase", phase)
+                put("duration_ms", elapsedDiagnosticMs(started).toString())
+                put("result", if (failure == null) "ok" else "error")
+                failure?.let { put("error_class", it.javaClass.name) }
+            })
         }
     }
 

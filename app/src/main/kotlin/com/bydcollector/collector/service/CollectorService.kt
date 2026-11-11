@@ -1592,6 +1592,26 @@ class CollectorService : Service() {
                 check(telegramCoordinator === coordinator && telegramWorkGeneration.get() == telegramGeneration) {
                     "Telegram owner changed before business page"
                 }
+                if (pending == null) coordinator.recoverInitialHistory { boot, throughElapsed ->
+                    val frontier = application.withDatabaseRead { selectedStore.completedBusinessInputId() }
+                    sequence {
+                        var after = 0L
+                        while (after < frontier) {
+                            checkBusinessOwner()
+                            val history = application.withDatabaseRead {
+                                check(store === selectedStore && selectedStore.businessInputGeneration() == generation) {
+                                    "Main store changed during Telegram history recovery"
+                                }
+                                selectedStore.historicalBusinessInputPage(boot, 0L, throughElapsed, after, 512)
+                                    .inputs.filter { it.id <= frontier }
+                                    .map(selectedStore::loadBusinessInputDelta)
+                            }
+                            if (history.isEmpty()) break
+                            history.forEach { yield(it) }
+                            after = history.last().ref.id
+                        }
+                    }
+                }
                 // Holding the Telegram owner prevents its tick from seeing a future energy/Trips frontier.
                 val page = pending ?: awaitBusinessResult(tripRuntime.prepareBusinessPage(
                     stopFinalGps = deltas.any { delta -> delta.readings.any {

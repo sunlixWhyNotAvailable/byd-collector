@@ -168,7 +168,8 @@ data class TelegramEventState(
     val lastPersistedAtMs: Long = 0L,
     val rawSourceInputs: Map<String, TelegramRawSourceCursor> = emptyMap(),
     val detectorTiming: TelegramDetectorTiming = TelegramDetectorTiming(),
-    val recoveryBaselines: Set<String> = emptySet()
+    val recoveryBaselines: Set<String> = emptySet(),
+    val initialSeedRecoveryVersion: Int = 1
 ) {
     val tripStartOdometerKm: Double? get() = tripDistance.start?.km
     val tripEndOdometerKm: Double? get() = tripDistance.end?.km
@@ -277,6 +278,7 @@ data class TelegramEventState(
         putNullable("lastTripEnergyCounterKwh", lastTripEnergyCounterKwh)
         put("lastPersistedAtMs", lastPersistedAtMs)
         put("rawSourceInputs", TelegramOrderedInput.encodeCursors(rawSourceInputs))
+        put("initialSeedRecoveryVersion", initialSeedRecoveryVersion)
     }.toString()
 
     companion object {
@@ -412,7 +414,8 @@ data class TelegramEventState(
                     lastPersistedAtMs = json.optLong("lastPersistedAtMs"),
                     rawSourceInputs = TelegramOrderedInput.decodeCursors(json.optJSONArray("rawSourceInputs")),
                     detectorTiming = TelegramDetectorTiming.fromJson(json.optJSONObject("detectorTiming")),
-                    recoveryBaselines = baselineKeys
+                    recoveryBaselines = baselineKeys,
+                    initialSeedRecoveryVersion = json.optInt("initialSeedRecoveryVersion", 0)
                 )
         }
     }
@@ -472,6 +475,7 @@ class TelegramEventEngine(
             pendingPowerOffLocationPowerSessionId = previous.pendingPowerOffLocationPowerSessionId,
             pendingPowerOffLocationSummaryDelivered = previous.pendingPowerOffLocationSummaryDelivered,
             recoveryBaselines = previous.recoveryBaselines,
+            initialSeedRecoveryVersion = previous.initialSeedRecoveryVersion,
             detectorTiming = TelegramDetectorTiming(
                 reportedPowerSessionId = previous.detectorTiming.reportedPowerSessionId
                     ?: previous.pendingPowerOffLocationPowerSessionId)

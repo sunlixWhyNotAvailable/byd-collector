@@ -23,6 +23,22 @@ import kotlin.test.*
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
 class CompositeTelemetryNormalizationTest {
+    @Test fun signedMinusOneSurvivesDecodingAndPowerNormalizationWhileSentinelsRemainInvalid() {
+        val keys = listOf("charging_charge_current", "engine_1012_1141899288_7", "engine_1012_1169162280_7")
+        keys.forEach { key ->
+            val entry = com.bydcollector.collector.data.direct.DirectFidRegistry.entries.first { it.key == key }
+            fun decode(value: Float) = com.bydcollector.collector.data.direct.DirectValueDecoders.decode(entry, value.toRawBits())
+            assertEquals("-1", decode(-1f), key)
+            assertNull(decode(65535f), key)
+            assertNull(decode(Float.NaN), key)
+            assertNull(decode(Float.POSITIVE_INFINITY), key)
+        }
+        val values = mapOf(voltage to input(voltage, 558.0, 100), current to input(current, -1.0, 101))
+        val power = normalizer.normalizeSparse(values, setOf(current)).single { it.field.fieldKey == "battery_power_kw" }
+        assertEquals(NormalizedQuality.OK, power.quality)
+        assertEquals(-0.558, power.value.number!!, 1e-6)
+    }
+
     private val fields = listOf(NormalizedFieldCatalog.batteryPower,
         NormalizedFieldCatalog.batteryChargePower, NormalizedFieldCatalog.batteryDischargePower,
         NormalizedFieldCatalog.chargingTimeRemaining)
