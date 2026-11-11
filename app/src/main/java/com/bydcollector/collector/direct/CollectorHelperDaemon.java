@@ -270,7 +270,7 @@ public final class CollectorHelperDaemon {
                         result = new HelperStreamRuntimeState.ControlResult(
                             CollectorHelperProtocol.STATUS_INVALID_REQUEST,
                             snapshot.controllerToken, snapshot.mainEpoch, snapshot.secondaryEpoch,
-                            0L, describe(error));
+                            0L, com.bydcollector.collector.util.OperationalEventDispatcherKt.diagnosticDetail(error, "stream_control"));
                     }
                     if (reply != null) writeControlReply(reply, result);
                     return true;
@@ -803,7 +803,13 @@ public final class CollectorHelperDaemon {
         reply.writeLong(result.mainEpoch);
         reply.writeLong(result.secondaryEpoch);
         reply.writeLong(result.leaseExpiresElapsedMs);
-        reply.writeString(boundError(result.error));
+        String error = result.error;
+        int limit = CollectorHelperProtocol.STREAM_CONTROL_MAX_ERROR_CHARS;
+        if (error != null && error.length() > limit) {
+            String marker = "\n[TRUNCATED; limit=" + limit + " chars]";
+            error = error.substring(0, limit - marker.length()) + marker;
+        }
+        reply.writeString(error);
     }
 
     private static void writeSecondaryBatchReply(Parcel reply, String catalogVersion, BatchResult result) {

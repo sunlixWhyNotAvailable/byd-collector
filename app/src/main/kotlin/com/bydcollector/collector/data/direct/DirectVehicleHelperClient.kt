@@ -608,10 +608,11 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
     fun streamControl(
         action: Int, nonce: String, controllerToken: Long, stream: Int, epoch: Long, value: Int
     ): DirectStreamControlResult = synchronized(lock) {
-        val binder = ensureBinder() ?: return@synchronized DirectStreamControlResult(STATUS_NO_BINDER, error = "helper binder unavailable")
         val data = Parcel.obtain()
         val reply = Parcel.obtain()
         try {
+            val binder = ensureBinder(throwOnError = true)
+                ?: return@synchronized DirectStreamControlResult(STATUS_NO_BINDER, error = "helper binder unavailable")
             require(nonce.isNotEmpty() && nonce.length <= 64) { "invalid controller nonce" }
             data.writeInterfaceToken(CollectorHelperProtocol.DESCRIPTOR)
             data.writeInt(action)
@@ -624,17 +625,17 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
                 cached = null
                 return@synchronized DirectStreamControlResult(STATUS_TRANSACT_FALSE, error = "stream control transact returned false")
             }
-            require(reply.dataSize() <= 4096) { "oversize stream control reply" }
+            require(reply.dataSize() <= CollectorHelperProtocol.STREAM_CONTROL_MAX_REPLY_BYTES) { "oversize stream control reply" }
             val result = DirectStreamControlResult(reply.readInt(), reply.readLong(), reply.readLong(), reply.readLong(), reply.readLong(), reply.readString())
             require(reply.dataAvail() == 0 && result.controllerToken >= 0 && result.mainEpoch >= 0 && result.secondaryEpoch >= 0 &&
-                result.leaseExpiresElapsedMs >= 0 && (result.error?.length ?: 0) <= 512
+                result.leaseExpiresElapsedMs >= 0 && (result.error?.length ?: 0) <= CollectorHelperProtocol.STREAM_CONTROL_MAX_ERROR_CHARS
             ) { "invalid stream control reply" }
             result
         } catch (error: DeadObjectException) {
             cached = null
-            DirectStreamControlResult(STATUS_DEAD_OBJECT, error = error.message ?: "dead binder")
+            DirectStreamControlResult(STATUS_DEAD_OBJECT, error = error.diagnosticDetail("stream control action=$action stream=$stream"), cause = error)
         } catch (error: Exception) {
-            DirectStreamControlResult(STATUS_CLIENT_ERROR, error = "${error::class.java.simpleName}: ${error.message ?: "no message"}")
+            DirectStreamControlResult(STATUS_CLIENT_ERROR, error = error.diagnosticDetail("stream control action=$action stream=$stream"), cause = error)
         } finally {
             data.recycle()
             reply.recycle()
@@ -1330,21 +1331,22 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
         else -> "rejected"
     }
 
-    private fun ensureBinder(): IBinder? {
+    private fun ensureBinder(throwOnError: Boolean = false): IBinder? {
         //reuses the service-manager lookup until android tells us the binder died
         cached?.let {
             if (it.isBinderAlive) return it
             reportCallbackSourceLoss(it, "helper_binder_died", "IBinder.isBinderAlive returned false")
         }
-        return resolveBinder()?.also { cached = it }
+        return resolveBinder(throwOnError)?.also { cached = it }
     }
 
-    private fun resolveBinder(): IBinder? {
+    private fun resolveBinder(throwOnError: Boolean = false): IBinder? {
         return try {
             val serviceManager = Class.forName("android.os.ServiceManager")
             serviceManager.getMethod("getService", String::class.java)
                 .invoke(null, CollectorHelperProtocol.SERVICE_NAME) as? IBinder
         } catch (error: Exception) {
+            if (throwOnError) throw error
             Log.w(TAG, "getService failed: ${error.message}")
             null
         }

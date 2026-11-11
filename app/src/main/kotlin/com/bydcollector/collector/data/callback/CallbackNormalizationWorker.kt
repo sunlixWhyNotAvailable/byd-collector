@@ -1,5 +1,7 @@
 package com.bydcollector.collector.data.callback
 
+import android.database.sqlite.SQLiteConstraintException
+import android.database.sqlite.SQLiteException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Serializes receipt-driven callback normalization; wakeups coalesce, committed raw rows do not. */
@@ -8,12 +10,14 @@ class CallbackNormalizationWorker(
     private val drainPage: () -> Boolean,
     private val onFault: (Throwable) -> Unit = {},
     private val sleepMs: (Long) -> Unit = { Thread.sleep(it) },
-    private val monotonicNanos: () -> Long = System::nanoTime
+    private val monotonicNanos: () -> Long = System::nanoTime,
+    private val requiresRepair: (Throwable) -> Boolean = { false }
 ) {
     private val lock = Object()
     private val running = AtomicBoolean(false)
     @Volatile private var worker: Thread? = null
     private var signaled = false
+    private var waitingForRepair = false
     private var lastFaultReportNanos: Long? = null
     private var lastFaultSignature: String? = null
 
@@ -24,7 +28,7 @@ class CallbackNormalizationWorker(
     fun signal() {
         synchronized(lock) {
             signaled = true
-            lock.notifyAll()
+            if (!waitingForRepair) lock.notifyAll()
         }
     }
 
@@ -32,6 +36,9 @@ class CallbackNormalizationWorker(
         if (worker?.isAlive == true || !running.compareAndSet(false, true)) return@synchronized false
         // A fresh worker always scans durable receipts, including after process or service restart.
         signaled = true
+        waitingForRepair = false
+        lastFaultReportNanos = null
+        lastFaultSignature = null
         val next = Thread(::runLoop, threadName).apply { isDaemon = true }
         worker = next
         next.start()
@@ -91,6 +98,14 @@ class CallbackNormalizationWorker(
                             throw InterruptedException("callback normalization stopped")
                         }
                         reportFault(error)
+                        if (requiresRepair(error)) {
+                            // New receipts cannot repair a schema/constraint; keep them pending until reopen/restart.
+                            synchronized(lock) {
+                                waitingForRepair = true
+                                while (running.get()) lock.wait()
+                            }
+                            break
+                        }
                         sleepMs(RETRY_DELAY_MS[backoffIndex])
                         backoffIndex = (backoffIndex + 1).coerceAtMost(RETRY_DELAY_MS.lastIndex)
                     }
@@ -132,6 +147,13 @@ class CallbackNormalizationWorker(
     }
 
     companion object {
+        fun isPersistentSqliteFault(error: Throwable): Boolean = generateSequence(error) { it.cause }
+            .take(MAX_CAUSE_DEPTH).any { cause ->
+                cause is SQLiteConstraintException || cause is SQLiteException &&
+                    listOf("no such table:", "no such column:", "has no column named")
+                        .any { cause.message.orEmpty().contains(it, ignoreCase = true) }
+            }
+
         private val RETRY_DELAY_MS = longArrayOf(100L, 250L, 500L, 1_000L)
         private const val SUMMARY_INTERVAL_NANOS = 30_000_000_000L
         private const val MAX_CAUSE_DEPTH = 8

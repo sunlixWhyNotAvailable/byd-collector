@@ -6,12 +6,14 @@ import com.bydcollector.collector.data.direct.DirectAutoserviceReader
 import com.bydcollector.collector.data.direct.DirectAutoserviceSnapshot
 import com.bydcollector.collector.data.direct.DirectHelperOwnerMode
 import com.bydcollector.collector.data.direct.DirectStreamController
+import com.bydcollector.collector.data.direct.DirectStreamControlException
 import com.bydcollector.collector.data.direct.DirectVehicleHelper
 import com.bydcollector.collector.data.direct.DirectVehicleHelperClient
 import com.bydcollector.collector.direct.CollectorHelperProtocol
 import com.bydcollector.collector.data.local.Clock
 import com.bydcollector.collector.data.local.SystemClockAdapter
 import com.bydcollector.collector.service.CollectorSettings
+import com.bydcollector.collector.util.diagnosticDetail
 import java.io.File
 
 class DirectTelemetryClient(
@@ -74,8 +76,14 @@ class DirectTelemetryClient(
                 return failure("helper_unavailable", "Direct helper did not answer Binder ping", startedAt)
             }
         }
-        if (!ensureStreamReady()) {
-            return failure("helper_stream_control_failed", "Direct helper stream claim/reconcile failed", startedAt)
+        try {
+            check(ensureStreamReady()) { "Stream readiness returned false without a diagnostic outcome" }
+        } catch (error: DirectStreamControlException) {
+            if (error.cancelled) throw InterruptedException(error.message).apply { initCause(error) }
+            val detail = error.diagnosticDetail("Main helper readiness")
+            return failure("helper_stream_control_failed", detail, startedAt, rawBody = detail).copy(
+                failureKey = "stream_control:${error.stage}:${error.stream}:${error.reason}:${error.reply?.status}:${error.reply?.error}"
+            )
         }
         return null
     }

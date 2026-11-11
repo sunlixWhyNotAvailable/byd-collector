@@ -40,7 +40,9 @@ sealed class TelemetryReadResult {
         /** Remaining delay measured when the helper formed its batch reply. */
         val nextDueDelayMs: Long? = null,
         /** Actual attempted fields on an all-failed sparse GET; empty for transport failures. */
-        val attemptedReadings: List<PollReading> = emptyList()
+        val attemptedReadings: List<PollReading> = emptyList(),
+        /** Stable fault identity when full diagnostics contain changing request/ownership metadata. */
+        val failureKey: String? = null
     ) : TelemetryReadResult() {
         val fieldFailureOnly: Boolean
             get() = category == "autoservice_snapshot_empty" && attemptedKeys.isNotEmpty()

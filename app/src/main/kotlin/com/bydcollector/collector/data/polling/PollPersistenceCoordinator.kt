@@ -156,7 +156,7 @@ class PollPersistenceCoordinator(
                 }
 
                 is TelemetryReadResult.Failure -> {
-                    val failureKey = "${result.category}:${result.message}"
+                    val failureKey = result.failureKey ?: "${result.category}:${result.message}"
                     val nowMs = clock.elapsedRealtimeMs()
                     val timestamp = clock.nowIso()
                     val attemptedKeys = result.attemptedKeys.ifEmpty { result.attemptedReadings.map { it.rawKey } }

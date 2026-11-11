@@ -21,6 +21,8 @@ public final class CollectorHelperProtocol {
     public static final int TX_SECONDARY_ACK = 8;
     public static final int TX_SECONDARY_QUARANTINE = 9;
     public static final int TX_STREAM_CONTROL = 10;
+    public static final int STREAM_CONTROL_MAX_ERROR_CHARS = 16_384;
+    public static final int STREAM_CONTROL_MAX_REPLY_BYTES = 36_864;
     public static final int TX_SECONDARY_READ_BATCH = 11;
     public static final int TX_SECONDARY_STATUS = 12;
     public static final int TX_CALLBACK_PENDING_PAGE = 13;

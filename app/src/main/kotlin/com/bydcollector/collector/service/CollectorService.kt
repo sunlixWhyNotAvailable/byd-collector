@@ -655,9 +655,13 @@ class CollectorService : Service() {
         businessWorker = CallbackNormalizationWorker(
             threadName = "byd-business-inputs",
             drainPage = { drainBusinessPage().also { mainBusinessFault = null } },
+            requiresRepair = CallbackNormalizationWorker::isPersistentSqliteFault,
             onFault = { error ->
                 mainBusinessFault = error.diagnosticDetail("Main business input")
-                store.recordEvent("business_input_error", "Business input remains pending", error.diagnosticDetail())
+                val pending = if (CallbackNormalizationWorker.isPersistentSqliteFault(error))
+                    "Business input remains pending; schema/constraint repair and worker restart required"
+                    else "Business input remains pending"
+                store.recordEvent("business_input_error", pending, error.diagnosticDetail())
             }
         )
         poller = createTelemetryPoller()
@@ -1000,9 +1004,8 @@ class CollectorService : Service() {
             helper = helper,
             expectedOwnerMode = ownerMode,
             ensureStreamReady = {
-                DirectStreamController.setConsumerReady(
+                DirectStreamController.ensureConsumerReady(
                     CollectorHelperProtocol.STREAM_MAIN,
-                    true,
                     mainConsumerOwner
                 ) {
                     isOwnedPollerCurrent() && !Thread.currentThread().isInterrupted &&
@@ -2147,11 +2150,10 @@ class CollectorService : Service() {
                     while (helperReconcileRequested.getAndSet(false)) {
                         if (settings.isUserShutdownRequested()) return@execute
                         val helper = DirectVehicleHelperClient()
-                        if (helper.isAlive() && !DirectStreamController.ensureReady()) {
-                            store.recordEvent("direct_stream_reconcile_failed",
-                                "Persisted direct stream state could not be reconciled")
-                        }
+                        if (helper.isAlive()) DirectStreamController.ensureReady()
                     }
+                } catch (error: InterruptedException) {
+                    store.recordEvent("direct_stream_reconcile_cancelled", "Direct stream reconciliation cancelled", error.diagnosticDetail())
                 } catch (error: Exception) {
                     store.recordEvent("direct_stream_reconcile_failed",
                         "Persisted direct stream state could not be reconciled", error.diagnosticDetail())
@@ -2393,14 +2395,7 @@ class CollectorService : Service() {
                             "actual=${parameters.size}"
                     }
                     configureDesiredStreams()
-                    if (!DirectStreamController.ensureReady(CollectorHelperProtocol.STREAM_SECONDARY)) {
-                        val detail = "Secondary stream claim/reconcile failed"
-                        if (debugStartStillCurrent(startGeneration)) {
-                            setDebugRuntime(DebugRuntimeStatus.ERROR, detail, generation = startGeneration)
-                            store.recordEvent("debug_polling_start_error", "Debug direct helper unavailable", detail)
-                        }
-                        return@execute
-                    }
+                    DirectStreamController.ensureReady(CollectorHelperProtocol.STREAM_SECONDARY)
                     if (!debugStartStillCurrent(startGeneration)) return@execute
                     val batchSize = parameters.size
                     var lastDebugReadModeKey: String? = null
@@ -2574,8 +2569,10 @@ class CollectorService : Service() {
                             "reason=$reason batch_size=$batchSize parameters=${parameters.size}"
                         )
                     }
+                } catch (error: InterruptedException) {
+                    store.recordEvent("debug_polling_start_cancelled", "Secondary startup cancelled", error.diagnosticDetail())
                 } catch (error: RuntimeException) {
-                    val detail = "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                    val detail = error.diagnosticDetail("Secondary startup")
                     if (debugStartStillCurrent(startGeneration)) {
                         setDebugRuntime(DebugRuntimeStatus.ERROR, detail, generation = startGeneration)
                         store.recordEvent(

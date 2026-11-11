@@ -105,45 +105,7 @@ object BusinessInputSchema {
             ) WITHOUT ROWID
             """.trimIndent()
         )
-        val allowedKeys = BusinessInputCheckpointKeys.ALL.sorted().joinToString(", ") { "'$it'" }
-        db.execSQL(
-            """
-            CREATE TABLE IF NOT EXISTS business_input_source_checkpoints (
-                source_key TEXT PRIMARY KEY CHECK(source_key IN ($allowedKeys)),
-                raw_value TEXT,
-                desc_value TEXT,
-                source_kind TEXT NOT NULL CHECK(source_kind IN ('poll', 'callback')),
-                source_identity TEXT NOT NULL,
-                source_boot_id TEXT NOT NULL,
-                source_generator_id TEXT,
-                source_sequence INTEGER,
-                source_epoch INTEGER,
-                source_wall_ms INTEGER NOT NULL,
-                source_elapsed_ms INTEGER NOT NULL,
-                source_poll_id INTEGER,
-                updated_at_ms INTEGER NOT NULL
-            ) WITHOUT ROWID
-            """.trimIndent()
-        )
-        db.execSQL(
-            """
-            CREATE TABLE IF NOT EXISTS business_input_source_seed (
-                source_key TEXT PRIMARY KEY CHECK(source_key IN ($allowedKeys)),
-                raw_value TEXT,
-                desc_value TEXT,
-                source_kind TEXT NOT NULL CHECK(source_kind IN ('poll', 'callback')),
-                source_identity TEXT NOT NULL,
-                source_boot_id TEXT NOT NULL,
-                source_generator_id TEXT,
-                source_sequence INTEGER,
-                source_epoch INTEGER,
-                source_wall_ms INTEGER NOT NULL,
-                source_elapsed_ms INTEGER NOT NULL,
-                source_poll_id INTEGER,
-                updated_at_ms INTEGER NOT NULL
-            ) WITHOUT ROWID
-            """.trimIndent()
-        )
+        CHECKPOINT_TABLES.forEach { createCheckpointTable(db, it) }
         db.execSQL(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_business_input_raw_ref " +
                 "ON business_input_journal(input_kind, raw_ref_id) " +
@@ -157,6 +119,43 @@ object BusinessInputSchema {
         ensureColumn(db, "business_input_source_checkpoints", "source_epoch", "INTEGER")
         ensureColumn(db, "business_input_source_seed", "source_epoch", "INTEGER")
     }
+
+    /** The persisted CHECK contains the key list from the APK that created the table. */
+    fun migrateToV19(db: SQLiteDatabase) {
+        check(db.inTransaction()) { "Checkpoint migration requires the database upgrade transaction" }
+        val columns = "source_key, raw_value, desc_value, source_kind, source_identity, source_boot_id, " +
+            "source_generator_id, source_sequence, source_epoch, source_wall_ms, source_elapsed_ms, source_poll_id, updated_at_ms"
+        CHECKPOINT_TABLES.forEach { table ->
+            val replacement = "${table}_v19"
+            createCheckpointTable(db, replacement)
+            db.execSQL("INSERT INTO $replacement($columns) SELECT $columns FROM $table")
+            db.execSQL("DROP TABLE $table")
+            db.execSQL("ALTER TABLE $replacement RENAME TO $table")
+        }
+    }
+
+    private fun createCheckpointTable(db: SQLiteDatabase, table: String) {
+        val allowedKeys = BusinessInputCheckpointKeys.ALL.sorted().joinToString(", ") { "'$it'" }
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS $table (
+                source_key TEXT PRIMARY KEY CHECK(source_key IN ($allowedKeys)),
+                raw_value TEXT,
+                desc_value TEXT,
+                source_kind TEXT NOT NULL CHECK(source_kind IN ('poll', 'callback')),
+                source_identity TEXT NOT NULL,
+                source_boot_id TEXT NOT NULL,
+                source_generator_id TEXT,
+                source_sequence INTEGER,
+                source_epoch INTEGER,
+                source_wall_ms INTEGER NOT NULL,
+                source_elapsed_ms INTEGER NOT NULL,
+                source_poll_id INTEGER,
+                updated_at_ms INTEGER NOT NULL
+            ) WITHOUT ROWID
+        """.trimIndent())
+    }
+
+    private val CHECKPOINT_TABLES = listOf("business_input_source_checkpoints", "business_input_source_seed")
 
     /** Seeds only the small Energy/Trips source frontier once, during the additive upgrade. */
     fun seedExistingSourceCheckpoint(db: SQLiteDatabase) {

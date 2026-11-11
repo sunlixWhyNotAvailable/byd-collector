@@ -25,7 +25,71 @@ import kotlin.test.*
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
 class BusinessPageRecoveryTest {
-    @Test fun orderedPageReopensAcrossAllDatabases() {
+    @Test fun businessConstraintParksUntilStorageReopenedWithoutDroppingInputs() {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "business_fault_${System.nanoTime()}.db"
+        fun open() = TelemetryStore(context, TelemetryDatabaseHelper(context, name),
+            operationalEventJournal = OperationalEventJournal(context))
+        var store = open()
+        val fault = java.util.concurrent.CountDownLatch(1)
+        val retried = java.util.concurrent.CountDownLatch(1)
+        val completed = java.util.concurrent.CountDownLatch(1)
+        val attempts = java.util.concurrent.atomic.AtomicInteger()
+        val worker = com.bydcollector.collector.data.callback.CallbackNormalizationWorker(
+            "business-real-sqlite-check",
+            drainPage = {
+                if (attempts.incrementAndGet() > 1) retried.countDown()
+                val ref = store.nextPendingBusinessInput()
+                if (ref != null) store.completeBusinessInput(ref,
+                    BusinessInputProjection.incoming(store.loadBusinessInputDelta(ref)))
+                val more = store.nextPendingBusinessInput() != null
+                if (!more) completed.countDown()
+                more
+            },
+            onFault = { fault.countDown() },
+            requiresRepair = com.bydcollector.collector.data.callback.CallbackNormalizationWorker::isPersistentSqliteFault
+        )
+        try {
+            store.insertPoll(store.openSession(), PersistedPollInput(
+                timestamp = "2026-11-11T07:00:00Z", ok = true, elapsedMs = 1, requestCount = 1,
+                errors = null, rawResponseBody = null,
+                readings = listOf(PollReading("gearbox_1011_555745336_5", "4", "4")),
+                source = com.bydcollector.collector.data.polling.PollSampleSource("gear", "boot", 1_000, "timer", 1),
+                origin = PollOrigin.REPLAY), store.getActiveCatalogParameters())
+            context.openOrCreateDatabase(name, 0, null).use { db ->
+                db.execSQL("DROP TABLE business_input_source_checkpoints")
+                db.execSQL(checkNotNull(javaClass.classLoader?.getResourceAsStream("business-checkpoint-v18.sql"))
+                    .bufferedReader().use { it.readText() })
+                db.version = 18
+            }
+            val generation = store.businessInputGeneration()
+            val first = assertNotNull(store.nextPendingBusinessInput())
+            assertTrue(worker.start())
+            assertTrue(fault.await(5, TimeUnit.SECONDS))
+            assertTrue(worker.isRunning())
+            store.enqueueEvaluation(BusinessInputTimerSource("later", "boot", "timer", 2,
+                1_800_000_002_000, 2_000), null)
+            repeat(100) { worker.signal() }
+            assertFalse(retried.await(1_300, TimeUnit.MILLISECONDS), "Unrepaired CHECK must not retry")
+            assertEquals(first, store.nextPendingBusinessInput())
+            assertEquals(2, store.pendingBusinessInputs().size)
+            assertTrue(worker.stopAndJoin(2_000))
+            store.close()
+            store = open()
+            assertEquals(generation, store.businessInputGeneration())
+            assertTrue(worker.start())
+            assertTrue(completed.await(5, TimeUnit.SECONDS))
+            assertTrue(worker.stopAndJoin(2_000))
+            assertNull(store.nextPendingBusinessInput())
+            assertEquals("4", store.loadBusinessInputCheckpoint().getValue("gearbox_1011_555745336_5").reading.rawValue)
+        } finally {
+            worker.stopAndJoin(2_000)
+            store.close()
+            context.deleteDatabase(name)
+        }
+    }
+
+    @Test fun main18UpgradePreservesAndCompletesPageAlreadyCommittedByTripsAndTelegram() {
         val context = RuntimeEnvironment.getApplication()
         val prefix = "page"
         val names = listOf("${prefix}_main.db", "${prefix}_trips.db", "${prefix}_telegram.db")
@@ -35,12 +99,29 @@ class BusinessPageRecoveryTest {
         fun telegram() = TelegramStore(context, TelegramDatabaseHelper(context, names[2]))
         try {
             val refs = main().use { store ->
-                repeat(5) { index -> store.enqueueEvaluation(BusinessInputTimerSource(
+                val session = store.openSession()
+                store.insertPoll(session, PersistedPollInput(
+                    timestamp = Instant.ofEpochMilli(1_799_999_999_000L).toString(), ok = true,
+                    elapsedMs = 1, requestCount = 1, errors = null, rawResponseBody = null,
+                    readings = listOf(PollReading("bodywork_power_level", "0", "0")),
+                    source = com.bydcollector.collector.data.polling.PollSampleSource("before-page", "boot", 0, "timer", 0),
+                    origin = PollOrigin.REPLAY), store.getActiveCatalogParameters())
+                val previous = assertNotNull(store.nextPendingBusinessInput())
+                store.completeBusinessInput(previous, BusinessInputProjection.incoming(store.loadBusinessInputDelta(previous)))
+                store.insertPoll(session, PersistedPollInput(
+                    timestamp = Instant.ofEpochMilli(1_800_000_000_000L).toString(), ok = true,
+                    elapsedMs = 1, requestCount = 1, errors = null, rawResponseBody = null,
+                    readings = listOf(PollReading("gearbox_1011_555745336_5", "4", "4")),
+                    source = com.bydcollector.collector.data.polling.PollSampleSource("gear-page", "boot", 1_000, "timer", 1),
+                    origin = PollOrigin.REPLAY), store.getActiveCatalogParameters())
+                (1..4).forEach { index -> store.enqueueEvaluation(BusinessInputTimerSource(
                     "timer-$index", "boot", "timer", index.toLong(), 1_800_000_000_000L + index * 10_000L,
                     1_000L + index * 10_000L), null) }
                 store.pendingBusinessInputs()
             }
             val generation = main().use { it.businessInputGeneration() }
+            val checkpoint = main().use { it.loadBusinessInputCheckpoint() }
+            val updates = main().use { BusinessInputProjection.incoming(it.loadBusinessInputDelta(refs.first())) }
             val page = trips().use { store ->
                 val runtime = TripRuntimeCoordinator(context, store, { true }, { false }, {}, { true }, {}, { _, _, _ -> },
                     bootIdProvider = { "boot" })
@@ -114,6 +195,35 @@ class BusinessPageRecoveryTest {
                 completions.forEach { assertTrue(store.hasTripCompletionReceipt(it.sequence, it.identity)) }
                 assertEquals(2L, store.diagnosticSnapshot().outboxTotal, store.loadTelegramRuntimeState { _, _ -> }.toJson())
             }
+            // Reopen the historical Main18 schema while Trips/Telegram already have their durable page receipts.
+            context.openOrCreateDatabase(names[0], 0, null).use { db ->
+                db.execSQL("INSERT INTO business_input_source_seed SELECT * FROM business_input_source_checkpoints")
+                val ddl = checkNotNull(javaClass.classLoader?.getResourceAsStream("business-checkpoint-v18.sql"))
+                    .bufferedReader().use { it.readText() }
+                listOf("business_input_source_checkpoints", "business_input_source_seed").forEach { table ->
+                    db.execSQL("ALTER TABLE $table RENAME TO ${table}_fixture")
+                    db.execSQL(ddl.replace("business_input_source_checkpoints", table))
+                    db.execSQL("INSERT INTO $table SELECT * FROM ${table}_fixture")
+                    db.execSQL("DROP TABLE ${table}_fixture")
+                    assertFailsWith<android.database.sqlite.SQLiteConstraintException> {
+                        db.execSQL("INSERT INTO $table SELECT 'gearbox_1011_555745336_5', raw_value, desc_value, " +
+                            "source_kind, source_identity, source_boot_id, source_generator_id, source_sequence, source_epoch, " +
+                            "source_wall_ms, source_elapsed_ms, source_poll_id, updated_at_ms FROM $table")
+                    }
+                }
+                db.version = 18
+            }
+            main().use { store ->
+                assertEquals(generation, store.businessInputGeneration())
+                assertEquals(refs, store.pendingBusinessInputs())
+                assertEquals(checkpoint, store.loadBusinessInputCheckpoint())
+                assertEquals(checkpoint, store.loadBusinessInputInitialCheckpoint())
+            }
+            trips().use { assertEquals(page, it.pendingBusinessPage()) }
+            telegram().use { store ->
+                assertTrue(store.hasBusinessPageReceipt(page.key))
+                assertEquals(2L, store.diagnosticSnapshot().outboxTotal)
+            }
             val olderLocation = com.bydcollector.collector.location.LocationNormalizer.gap("2026-11-10T10:00:00Z", "page-gap")
             val newerLocation = com.bydcollector.collector.location.LocationNormalizer.gap("2026-11-10T10:00:01Z", "provider-gap")
             val observations = page.entries.filter { it.projectEnergy }.flatMap { EnergyTelemetryProjection.observations(it.energy!!) } + olderLocation
@@ -121,7 +231,7 @@ class BusinessPageRecoveryTest {
                 store.applyNormalizedObservations(newerLocation)
                 assertFailsWith<IllegalStateException> { store.completeBusinessPage("other-generation", refs, emptyMap(), emptyMap(), observations) }
                 assertEquals(refs, store.pendingBusinessInputs())
-                store.completeBusinessPage(generation, refs, emptyMap(), emptyMap(), observations)
+                store.completeBusinessPage(generation, refs, updates, emptyMap(), observations)
             }
             assertTrue(first.observedCount > 0)
             TelemetryDatabaseHelper(context, names[0]).use { helper ->
@@ -137,7 +247,15 @@ class BusinessPageRecoveryTest {
                 assertTrue(current.all { it.observedAt == "2026-11-10T10:00:01Z" })
                 assertEquals(refs.last().id, store.completedBusinessInputId())
                 assertNull(store.nextPendingBusinessInput())
-                assertEquals(0, store.completeBusinessPage(generation, refs, emptyMap(), emptyMap(), observations).observedCount)
+                assertEquals("4", store.loadBusinessInputCheckpoint().getValue("gearbox_1011_555745336_5").reading.rawValue)
+                assertEquals(0, store.completeBusinessPage(generation, refs, updates, emptyMap(), observations).observedCount)
+                TelemetryDatabaseHelper(context, names[0]).use { helper ->
+                    assertEquals(19, helper.readableDatabase.version)
+                    helper.readableDatabase.rawQuery("SELECT COUNT(*) FROM business_input_receipts", null).use {
+                        assertTrue(it.moveToFirst()); assertEquals(refs.size + 1, it.getInt(0))
+                    }
+                    helper.readableDatabase.rawQuery("PRAGMA foreign_key_check", null).use { assertFalse(it.moveToFirst()) }
+                }
             }
             trips().use { store ->
                 assertEquals(page, store.pendingBusinessPage())
