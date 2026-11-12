@@ -4,7 +4,6 @@ param(
     [Parameter(Mandatory)][string]$BuildRoot,
     [Parameter(Mandatory)][string]$OutputRoot,
     [string]$ModuleCache,
-    [string[]]$Abis = @('arm64-v8a','armeabi-v7a','x86_64','x86'),
     [switch]$HostTest
 )
 $ErrorActionPreference='Stop'
@@ -74,23 +73,13 @@ try {
         }
     }
     [IO.File]::WriteAllText((Join-Path $notices 'tailscale-dependency-notices.txt'),$licenseText.ToString(),[Text.UTF8Encoding]::new($false))
-    $targets=@{
-        'arm64-v8a'=@('arm64','aarch64-linux-android26-clang.cmd','')
-        'armeabi-v7a'=@('arm','armv7a-linux-androideabi26-clang.cmd','7')
-        'x86_64'=@('amd64','x86_64-linux-android26-clang.cmd','')
-        'x86'=@('386','i686-linux-android26-clang.cmd','')
-    }
     $env:CGO_ENABLED='1'
     $env:GOOS='android'
-    foreach($abi in $Abis){
-        if(!$targets.ContainsKey($abi)){throw "Unsupported ABI: $abi"}
-        $target=$targets[$abi]
-        $env:GOARCH=$target[0]
-        $env:CC=Join-Path $AndroidNdk "toolchains/llvm/prebuilt/windows-x86_64/bin/$($target[1])"
-        $env:GOARM=$target[2]
-        $out=Join-Path $OutputRoot $abi
-        New-Item -ItemType Directory -Force -Path $out | Out-Null
-        & $go build -p 2 "-modfile=$mod" -tags=ts_omit_logtail -trimpath -buildmode=c-shared '-ldflags=-s -w -buildid=' -o (Join-Path $out 'libcollector_tailscale.so') .
-        if($LASTEXITCODE){throw "Native build failed for $abi"}
-    }
+    $env:GOARCH='arm64'
+    $env:CC=Join-Path $AndroidNdk 'toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android26-clang.cmd'
+    $env:GOARM=''
+    $out=Join-Path $OutputRoot 'arm64-v8a'
+    New-Item -ItemType Directory -Force -Path $out | Out-Null
+    & $go build -p 2 "-modfile=$mod" -tags=ts_omit_logtail -trimpath -buildmode=c-shared '-ldflags=-s -w -buildid=' -o (Join-Path $out 'libcollector_tailscale.so') .
+    if($LASTEXITCODE){throw 'Native build failed for arm64-v8a'}
 } finally { Pop-Location }

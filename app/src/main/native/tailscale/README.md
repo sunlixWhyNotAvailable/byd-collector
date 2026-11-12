@@ -1,7 +1,9 @@
 # Outgoing HA Tailscale transport
 
 Pinned: Tailscale v1.96.4, Go 1.26.10, Android NDK 30.0.15729638-beta2.
-Gradle builds the JNI library for arm64-v8a, armeabi-v7a, x86_64 and x86.
+ARM64 (`arm64-v8a`) is the only supported APK architecture. The native script
+builds only ARM64; both APP and embedded UI apply the same ABI packaging filter,
+including dependency libraries and any previously cached native outputs.
 Install the pinned Go/NDK, then run the normal Performance build with optional
 `-PcollectorGo=<absolute go.exe>` and `-PcollectorGoModuleCache=<module cache>`.
 PowerShell 7 is required. Generated source, caches, JNI and dependency notices
