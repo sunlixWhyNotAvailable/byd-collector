@@ -120,13 +120,13 @@ object BusinessInputSchema {
         ensureColumn(db, "business_input_source_seed", "source_epoch", "INTEGER")
     }
 
-    /** The persisted CHECK contains the key list from the APK that created the table. */
-    fun migrateToV19(db: SQLiteDatabase) {
+    /** Key validation belongs to the current application, not the APK that created the table. */
+    fun migrateToV20(db: SQLiteDatabase) {
         check(db.inTransaction()) { "Checkpoint migration requires the database upgrade transaction" }
         val columns = "source_key, raw_value, desc_value, source_kind, source_identity, source_boot_id, " +
             "source_generator_id, source_sequence, source_epoch, source_wall_ms, source_elapsed_ms, source_poll_id, updated_at_ms"
         CHECKPOINT_TABLES.forEach { table ->
-            val replacement = "${table}_v19"
+            val replacement = "${table}_v20"
             createCheckpointTable(db, replacement)
             db.execSQL("INSERT INTO $replacement($columns) SELECT $columns FROM $table")
             db.execSQL("DROP TABLE $table")
@@ -135,10 +135,9 @@ object BusinessInputSchema {
     }
 
     private fun createCheckpointTable(db: SQLiteDatabase, table: String) {
-        val allowedKeys = BusinessInputCheckpointKeys.ALL.sorted().joinToString(", ") { "'$it'" }
         db.execSQL("""
             CREATE TABLE IF NOT EXISTS $table (
-                source_key TEXT PRIMARY KEY CHECK(source_key IN ($allowedKeys)),
+                source_key TEXT PRIMARY KEY,
                 raw_value TEXT,
                 desc_value TEXT,
                 source_kind TEXT NOT NULL CHECK(source_kind IN ('poll', 'callback')),

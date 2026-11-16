@@ -15,6 +15,7 @@ internal class KpiCallbackDrainWorker(
     private val onListenerStatus: (Int) -> Unit,
     private val onTransportLoss: (String) -> Unit,
     private val onConsumerFailure: (String) -> Unit,
+    private val onCleanupDiagnostic: (String, String) -> Unit,
     private val onConfirmedSourceLoss: (DirectKpiInvalidation) -> Unit = {},
     private val nowMs: () -> Long = { System.nanoTime() / 1_000_000L }
 ) {
@@ -142,13 +143,13 @@ internal class KpiCallbackDrainWorker(
 
                 when (step) {
                     DrainStep.Close -> {
-                        subscription?.let { runCatching { helper.unsubscribeKpi(it.subscriptionId) } }
+                        subscription?.let { unsubscribeReported(it, "close") }
                         subscription = null
                         consume("close status") { onListenerStatus(CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE) }
                         return
                     }
                     is DrainStep.Deactivate -> {
-                        runCatching { helper.unsubscribeKpi(step.subscription.subscriptionId) }
+                        unsubscribeReported(step.subscription, "deactivate")
                         subscription = null
                         forceDrain = false
                         retryAtMs = null
@@ -160,7 +161,7 @@ internal class KpiCallbackDrainWorker(
                     }
                     is DrainStep.Subscribe -> {
                         pendingSnapshot = null
-                        step.previous?.let { runCatching { helper.unsubscribeKpi(it.subscriptionId) } }
+                        step.previous?.let { unsubscribeReported(it, "replace") }
                         synchronized(lock) { reconnectRequested = false }
                         val read = runCatching { helper.subscribeKpi(::onInvalidated) }
                         val result = read.getOrNull()
@@ -241,8 +242,35 @@ internal class KpiCallbackDrainWorker(
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         } finally {
-            subscription?.let { runCatching { helper.unsubscribeKpi(it.subscriptionId) } }
+            subscription?.let { unsubscribeReported(it, "finally") }
             consume("final status") { onListenerStatus(CollectorHelperProtocol.KPI_LISTENER_UNAVAILABLE) }
+        }
+    }
+
+    private fun unsubscribeReported(subscription: DirectKpiSubscriptionResult, stage: String) {
+        val context = "KPI unsubscribe stage=$stage subscription_id=${subscription.subscriptionId} " +
+            "helper_boot_id=${subscription.helperBootId} helper_generation=${subscription.helperGeneration}"
+        val result = try {
+            helper.unsubscribeKpi(subscription.subscriptionId)
+        } catch (error: Throwable) {
+            if (error is InterruptedException) Thread.currentThread().interrupt()
+            reportCleanup("kpi_unsubscribe_error", error.diagnosticDetail(context), error)
+            return
+        }
+        if (!result.ok) {
+            val event = if (result.status == CollectorHelperProtocol.STATUS_INVALID_KPI_SUBSCRIPTION)
+                "kpi_unsubscribe_stale" else "kpi_unsubscribe_error"
+            reportCleanup(event, "$context status=${result.status} error=${result.error ?: "no details"}")
+        }
+    }
+
+    private fun reportCleanup(event: String, detail: String, original: Throwable? = null) {
+        try {
+            onCleanupDiagnostic(event, detail)
+        } catch (reportError: Throwable) {
+            if (reportError is InterruptedException) Thread.currentThread().interrupt()
+            if (original != null && original !== reportError) original.addSuppressed(reportError)
+            android.util.Log.e("KpiCallbackDrainWorker", "Cleanup diagnostic failed: $detail", original ?: reportError)
         }
     }
 

@@ -11,8 +11,8 @@ android {
         applicationId = "com.bydcollector.collector.ui"
         minSdk = 26
         targetSdk = 29
-        versionCode = 336
-        versionName = "3.5.5"
+        versionCode = 337
+        versionName = "3.5.6"
         ndk { abiFilters += "arm64-v8a" }
         buildConfigField("String", "COLLECTOR_DISPLAY_NAME", "\"BYD Collector\"")
         buildConfigField("String", "COLLECTOR_DATABASE_NAME", "\"bydcollector_telemetry.db\"")

@@ -92,7 +92,7 @@ internal class HaTailscaleRuntime private constructor(private val context: Conte
             }
         }
         if (pending && state.state == "error") {
-            failActivation(activation, TailscaleTransportException(state.error ?: "Native authorization failed")); return
+            failActivation(activation, TailscaleTransportException(state.error ?: "Native error without details")); return
         }
         if (pending || enabled) {
             val previous = phase

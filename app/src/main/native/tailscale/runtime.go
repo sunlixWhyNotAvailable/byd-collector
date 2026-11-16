@@ -135,6 +135,10 @@ func command(operation, raw string) (output string) {
 		if err != nil {
 			return failed(err)
 		}
+		// APP may have just created the private root alongside its wrapped key.
+		if err := syncStateDirectory(filepath.Dir(input.Directory)); err != nil {
+			return failed(fmt.Errorf("persist native state root: %w", err))
+		}
 		// Android has no HOME or writable /tmp; even disabled loggers resolve this directory.
 		logs := filepath.Join(input.Directory, "logs")
 		if err := os.MkdirAll(logs, 0700); err != nil {

@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"crypto/rand"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"tailscale.com/ipn"
 )
 
 func TestEncryptedStateReopensAndRejectsTampering(t *testing.T) {
-	dir := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "state")
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
 		t.Fatal(err)
@@ -38,6 +39,22 @@ func TestEncryptedStateReopensAndRejectsTampering(t *testing.T) {
 	actual, err := reopened.ReadState(id)
 	if err != nil || !bytes.Equal(actual, input) {
 		t.Fatalf("state not recovered: %v", err)
+	}
+	replacement := []byte("updated private node state input")
+	if err = reopened.WriteState(id, replacement); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err = newEncryptedStore(dir, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err = reopened.ReadState(id)
+	if err != nil || !bytes.Equal(actual, replacement) {
+		t.Fatalf("replacement not recovered: %v", err)
+	}
+	onDisk, err = os.ReadFile(store.path(id))
+	if err != nil {
+		t.Fatal(err)
 	}
 	onDisk[len(onDisk)-1] ^= 1
 	if err = os.WriteFile(store.path(id), onDisk, 0600); err != nil {
@@ -77,10 +94,18 @@ func TestEncryptedStateRejectsWrongKeyAndDeletes(t *testing.T) {
 	if _, err = wrong.ReadState(id); err == nil {
 		t.Fatal("wrong key accepted")
 	}
+	key[0] ^= 1
 	if err = store.WriteState(id, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.ReadState(id); err != ipn.ErrStateNotExist {
+	if err = store.WriteState(id, nil); err != nil {
+		t.Fatalf("repeated deletion failed: %v", err)
+	}
+	reopened, err := newEncryptedStore(dir, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = reopened.ReadState(id); err != ipn.ErrStateNotExist {
 		t.Fatalf("deletion not persisted: %v", err)
 	}
 }

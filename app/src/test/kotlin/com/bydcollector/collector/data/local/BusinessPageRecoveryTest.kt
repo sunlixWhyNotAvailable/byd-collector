@@ -89,7 +89,11 @@ class BusinessPageRecoveryTest {
         }
     }
 
-    @Test fun main18UpgradePreservesAndCompletesPageAlreadyCommittedByTripsAndTelegram() {
+    @Test fun checkpointUpgradesPreserveAndCompletePageAlreadyCommittedByTripsAndTelegram() {
+        listOf(18, 19).forEach(::upgradePreservesAndCompletesPage)
+    }
+
+    private fun upgradePreservesAndCompletesPage(oldVersion: Int) {
         val context = RuntimeEnvironment.getApplication()
         val prefix = "page"
         val names = listOf("${prefix}_main.db", "${prefix}_trips.db", "${prefix}_telegram.db")
@@ -195,10 +199,10 @@ class BusinessPageRecoveryTest {
                 completions.forEach { assertTrue(store.hasTripCompletionReceipt(it.sequence, it.identity)) }
                 assertEquals(2L, store.diagnosticSnapshot().outboxTotal, store.loadTelegramRuntimeState { _, _ -> }.toJson())
             }
-            // Reopen the historical Main18 schema while Trips/Telegram already have their durable page receipts.
+            // Reopen the historical schema while Trips/Telegram already have their durable page receipts.
             context.openOrCreateDatabase(names[0], 0, null).use { db ->
                 db.execSQL("INSERT INTO business_input_source_seed SELECT * FROM business_input_source_checkpoints")
-                val ddl = checkNotNull(javaClass.classLoader?.getResourceAsStream("business-checkpoint-v18.sql"))
+                val ddl = checkNotNull(javaClass.classLoader?.getResourceAsStream("business-checkpoint-v$oldVersion.sql"))
                     .bufferedReader().use { it.readText() }
                 listOf("business_input_source_checkpoints", "business_input_source_seed").forEach { table ->
                     db.execSQL("ALTER TABLE $table RENAME TO ${table}_fixture")
@@ -206,18 +210,24 @@ class BusinessPageRecoveryTest {
                     db.execSQL("INSERT INTO $table SELECT * FROM ${table}_fixture")
                     db.execSQL("DROP TABLE ${table}_fixture")
                     assertFailsWith<android.database.sqlite.SQLiteConstraintException> {
-                        db.execSQL("INSERT INTO $table SELECT 'gearbox_1011_555745336_5', raw_value, desc_value, " +
+                        val rejectedKey = if (oldVersion == 18) "gearbox_1011_555745336_5" else "future_checkpoint_key"
+                        db.execSQL("INSERT INTO $table SELECT '$rejectedKey', raw_value, desc_value, " +
                             "source_kind, source_identity, source_boot_id, source_generator_id, source_sequence, source_epoch, " +
                             "source_wall_ms, source_elapsed_ms, source_poll_id, updated_at_ms FROM $table")
                     }
                 }
-                db.version = 18
+                db.version = oldVersion
             }
             main().use { store ->
                 assertEquals(generation, store.businessInputGeneration())
                 assertEquals(refs, store.pendingBusinessInputs())
                 assertEquals(checkpoint, store.loadBusinessInputCheckpoint())
                 assertEquals(checkpoint, store.loadBusinessInputInitialCheckpoint())
+                val unknown = updates.values.first().let { it.copy(reading = it.reading.copy(rawKey = "future_checkpoint_key")) }
+                assertFailsWith<IllegalArgumentException> {
+                    store.completeBusinessInput(refs.first(), mapOf("future_checkpoint_key" to unknown))
+                }
+                assertEquals(refs, store.pendingBusinessInputs())
             }
             trips().use { assertEquals(page, it.pendingBusinessPage()) }
             telegram().use { store ->
@@ -250,7 +260,8 @@ class BusinessPageRecoveryTest {
                 assertEquals("4", store.loadBusinessInputCheckpoint().getValue("gearbox_1011_555745336_5").reading.rawValue)
                 assertEquals(0, store.completeBusinessPage(generation, refs, updates, emptyMap(), observations).observedCount)
                 TelemetryDatabaseHelper(context, names[0]).use { helper ->
-                    assertEquals(19, helper.readableDatabase.version)
+                    assertEquals(20, helper.readableDatabase.version)
+                    assertCheckpointKeyConstraints(helper.writableDatabase)
                     helper.readableDatabase.rawQuery("SELECT COUNT(*) FROM business_input_receipts", null).use {
                         assertTrue(it.moveToFirst()); assertEquals(refs.size + 1, it.getInt(0))
                     }
@@ -264,6 +275,32 @@ class BusinessPageRecoveryTest {
             }
             trips().use { assertNull(it.pendingBusinessPage()); assertTrue(it.allPendingCompletions().isEmpty()) }
         } finally { names.forEach(context::deleteDatabase) }
+    }
+
+    @Test fun freshCheckpointTablesKeepIntegrityWithoutFreezingTheKeyCatalog() {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "checkpoint_integrity_${System.nanoTime()}.db"
+        try {
+            TelemetryDatabaseHelper(context, name).use { assertCheckpointKeyConstraints(it.writableDatabase) }
+        } finally { context.deleteDatabase(name) }
+    }
+
+    private fun assertCheckpointKeyConstraints(db: android.database.sqlite.SQLiteDatabase) {
+        db.beginTransaction()
+        try {
+            listOf("business_input_source_checkpoints", "business_input_source_seed").forEach { table ->
+                fun insert(key: String?, kind: String = "poll", identity: String? = "integrity-input") = db.execSQL(
+                    "INSERT INTO $table(source_key, source_kind, source_identity, source_boot_id, " +
+                        "source_wall_ms, source_elapsed_ms, updated_at_ms) VALUES (?, ?, ?, 'boot', 1, 1, 1)",
+                    arrayOf(key, kind, identity)
+                )
+                insert("future_checkpoint_key")
+                assertFailsWith<android.database.sqlite.SQLiteConstraintException> { insert("future_checkpoint_key") }
+                assertFailsWith<android.database.sqlite.SQLiteConstraintException> { insert(null) }
+                assertFailsWith<android.database.sqlite.SQLiteConstraintException> { insert("bad_kind", kind = "invalid") }
+                assertFailsWith<android.database.sqlite.SQLiteConstraintException> { insert("no_identity", identity = null) }
+            }
+        } finally { db.endTransaction() }
     }
 
     @Test fun failedPageRollsBackTripsAndEnergy() {

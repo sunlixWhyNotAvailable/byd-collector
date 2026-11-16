@@ -35,9 +35,27 @@ func newEncryptedStore(dir string, key []byte) (*encryptedStore, error) {
 		return nil, err
 	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create encrypted state directory: %w", err)
+	}
+	// Also retries a directory creation whose previous parent sync failed.
+	if err := syncStateDirectory(filepath.Dir(dir)); err != nil {
+		return nil, fmt.Errorf("persist encrypted state directory: %w", err)
 	}
 	return &encryptedStore{dir: dir, aead: aead}, nil
+}
+
+func syncStateDirectory(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open state directory for sync: %w", err)
+	}
+	if err = f.Sync(); err != nil {
+		err = fmt.Errorf("sync state directory: %w", err)
+	}
+	if closeErr := f.Close(); closeErr != nil {
+		err = errors.Join(err, fmt.Errorf("close state directory: %w", closeErr))
+	}
+	return err
 }
 
 func (s *encryptedStore) path(id ipn.StateKey) string {
@@ -79,10 +97,13 @@ func (s *encryptedStore) WriteState(id ipn.StateKey, plain []byte) (err error) {
 	path := s.path(id)
 	if plain == nil {
 		err := os.Remove(path)
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove encrypted state: %w", err)
 		}
-		return err
+		if err := syncStateDirectory(s.dir); err != nil {
+			return fmt.Errorf("persist encrypted state deletion: %w", err)
+		}
+		return nil
 	}
 	nonce := make([]byte, s.aead.NonceSize())
 	if _, err = rand.Read(nonce); err != nil {
@@ -91,7 +112,7 @@ func (s *encryptedStore) WriteState(id ipn.StateKey, plain []byte) (err error) {
 	sealed := s.aead.Seal(nonce, nonce, plain, []byte(id))
 	f, err := os.CreateTemp(s.dir, ".state-*")
 	if err != nil {
-		return err
+		return fmt.Errorf("create encrypted temp: %w", err)
 	}
 	tmp := f.Name()
 	defer func() {
@@ -99,15 +120,22 @@ func (s *encryptedStore) WriteState(id ipn.StateKey, plain []byte) (err error) {
 			err = errors.Join(err, fmt.Errorf("remove encrypted temp: %w", removeErr))
 		}
 	}()
-	if _, err = f.Write(sealed); err == nil {
-		err = f.Sync()
+	if _, err = f.Write(sealed); err != nil {
+		err = fmt.Errorf("write encrypted temp: %w", err)
+	} else if err = f.Sync(); err != nil {
+		err = fmt.Errorf("sync encrypted temp: %w", err)
 	}
-	err = errors.Join(err, f.Close())
+	if closeErr := f.Close(); closeErr != nil {
+		err = errors.Join(err, fmt.Errorf("close encrypted temp: %w", closeErr))
+	}
 	if err != nil {
 		return err
 	}
 	if err = os.Rename(tmp, path); err != nil {
-		return err
+		return fmt.Errorf("rename encrypted state: %w", err)
+	}
+	if err = syncStateDirectory(s.dir); err != nil {
+		return fmt.Errorf("persist encrypted state rename: %w", err)
 	}
 	return nil
 }

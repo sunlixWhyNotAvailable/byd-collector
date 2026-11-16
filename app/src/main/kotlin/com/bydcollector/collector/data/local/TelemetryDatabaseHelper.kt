@@ -47,7 +47,7 @@ class TelemetryDatabaseHelper(
         createCollectorEvents(db)
         createDeferredEnergyReceipts(db)
         if (!compactV2) ensureLegacySchemaCompatibility(db)
-        if (oldVersion < 19) BusinessInputSchema.migrateToV19(db)
+        if (oldVersion < 20) BusinessInputSchema.migrateToV20(db)
         //The compact schema asset is CREATE IF NOT EXISTS, so it cannot add this
         //column to an existing compact database. Keep the additive migration shared.
         ensureColumns(db, "mqtt_outbox", mapOf("destination_key" to "TEXT"))
@@ -509,7 +509,7 @@ class TelemetryDatabaseHelper(
 
     companion object {
         val DATABASE_NAME: String = BuildConfig.COLLECTOR_DATABASE_NAME
-        const val DATABASE_VERSION = 19
+        const val DATABASE_VERSION = 20
         const val LEGACY_SCHEMA_ASSET = "schema.sql"
         const val COMPACT_SCHEMA_ASSET = "schema_v2.sql"
         const val LEGACY_STORAGE_FORMAT = 1

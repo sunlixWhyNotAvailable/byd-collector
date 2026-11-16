@@ -3784,6 +3784,10 @@ class CollectorService : Service() {
                         queueKpiDiagnostic("kpi_consumer_error", reason)
                     }
                 },
+                onCleanupDiagnostic = { event, detail ->
+                    // Cleanup outlives the KPI generation and must not be coalesced away.
+                    store.recordEvent(event, "KPI subscription cleanup", detail)
+                },
                 onConfirmedSourceLoss = { loss ->
                     if (isKpiRuntimeCurrent(generation)) {
                         pendingSourceUpdate = null
@@ -5124,7 +5128,7 @@ class CollectorService : Service() {
             store.recordEvent(
                 "mqtt_offline_publish_error",
                 "MQTT offline publish rejected",
-                "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                error.diagnosticDetail("MQTT offline dispatch")
             )
             if (!settings.isMqttEnabled() && mqttRuntimeStatus == RuntimeActionStatus.STOPPING) {
                 setMqttRuntime(RuntimeActionStatus.ERROR)
@@ -5156,7 +5160,7 @@ class CollectorService : Service() {
                     store.recordEvent(
                         "mqtt_offline_publish_error",
                         "MQTT offline publish failed",
-                        "${error::class.java.simpleName}: ${error.message ?: "no message"}"
+                        error.diagnosticDetail("MQTT offline disconnect")
                     )
                 }
         } finally {
