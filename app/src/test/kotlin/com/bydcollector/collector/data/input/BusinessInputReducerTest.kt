@@ -11,6 +11,57 @@ import kotlin.test.assertTrue
 import kotlin.test.assertNull
 
 class BusinessInputReducerTest {
+    @Test fun globalFailureInvalidatesObservedOptionalSourcesWithoutInventingAbsentOnes() {
+        val optional = "charging_1009_89128973_5"
+        val all = mapOf("charging_charge_battery_volt" to "400", "charging_charge_current" to "50",
+            "bodywork_power_level" to "2", "charging_1009_876609586_5" to "1", optional to "0")
+        fun value(key: String, raw: String) = input("boot", 20, 2).let {
+            it.copy(reading = PollReading(key, raw, raw), stamp = it.stamp.copy(sourceEpoch = 1, elapsedMs = 20_000))
+        }
+        val required = (all - optional).mapValues { (key, raw) -> value(key, raw) }
+        fun available(input: NormalizedSourceInput) = BusinessInputContinuity(BusinessContinuityState.AVAILABLE,
+            input.stamp, "callback", input.stamp.identity, input.stamp.sequence, true, "callback_value")
+        val states = required.mapValues { available(it.value) }.toMutableMap()
+        val ref = BusinessInputRef(1, BusinessInputKind.GET, null, emptyList(), "failed", "boot", "generation",
+            10, null, 1_790_000_000_000, 15_000, null, null, BusinessInputOrigin.REPLAY, false, "failed", "io", "failed GET")
+        val failure = BusinessInputDelta(ref)
+        assertTrue(BusinessInputProjection.incoming(failure).isEmpty())
+        states[optional] = available(value(optional, "0")).copy(state = BusinessContinuityState.LOST,
+            stamp = input("boot", 10, 2).stamp.copy(elapsedMs = 15_000), seedValid = false, reason = "helper_lost")
+        val timer = BusinessInputDelta(ref.copy(kind = BusinessInputKind.TIMER, id = 30, ok = true,
+            acquiredElapsedMs = 60_000))
+        val normalizer = com.bydcollector.collector.data.normalized.VehicleStateNormalizer()
+        fun proof(inputs: Map<String, NormalizedSourceInput>) =
+            com.bydcollector.collector.data.energy.EnergyTelemetryProjection.intervalContinuity(inputs, states, timer, normalizer)
+        assertEquals(20_000L, proof(required)?.previousValidSinceMs)
+
+        val knownOptional = value(optional, "0").let { it.copy(stamp = it.stamp.copy(elapsedMs = 10_000, sequence = 1)) }
+        val failed = BusinessInputReducer.merge(mapOf(optional to knownOptional),
+            BusinessInputProjection.incoming(failure, mapOf(optional to knownOptional)), "boot").inputs
+        assertNull(failed.getValue(optional).reading.rawValue)
+        assertNull(proof(required + failed)?.previousValidSinceMs)
+        val recovered = value(optional, "0")
+        states[optional] = available(recovered)
+        assertEquals(20_000L, proof(required + (optional to recovered))?.previousValidSinceMs)
+        assertNull(proof(required + (optional to recovered.copy(reading = PollReading(optional, "-1", "-1"))))?.previousValidSinceMs)
+    }
+
+    @Test fun qualifiedContinuityCarriesItsActualBoundaryAndRejectsLossFutureAndOtherOwner() {
+        val acquired = input("boot", 1, 2).let { it.copy(stamp = it.stamp.copy(sourceEpoch = 1L)) }
+        val available = BusinessInputContinuity(BusinessContinuityState.AVAILABLE,
+            acquired.stamp.copy(identity = "available", sequence = 2L, elapsedMs = 10_001L),
+            "callback", acquired.stamp.identity, 1L, true, "registered")
+        val inputs = mapOf(KEY to acquired)
+        val states = mapOf(KEY to available)
+        assertEquals(mapOf(KEY to 10_001L), BusinessInputProjection.continuousSources(inputs, states, "boot", 600_000L))
+        assertEquals(acquired, BusinessInputProjection.freshInputs(inputs, "boot", 600_000L, states)[KEY])
+        assertTrue(BusinessInputProjection.continuousSources(inputs, states, "boot", 10_000L).isEmpty())
+        val lost = available.copy(state = BusinessContinuityState.LOST, seedValid = false)
+        assertNull(BusinessInputProjection.freshInputs(inputs, "boot", 600_000L, mapOf(KEY to lost))[KEY]?.reading?.rawValue)
+        val otherOwner = available.copy(stamp = available.stamp.copy(generatorId = "other"))
+        assertTrue(BusinessInputProjection.continuousSources(inputs, mapOf(KEY to otherOwner), "boot", 600_000L).isEmpty())
+    }
+
     @Test fun sameMillisecondTransitionsAndEqualValuesKeepTheirSourceOrder() {
         val on = input("boot", 10, 2)
         val off = input("boot", 11, 0)

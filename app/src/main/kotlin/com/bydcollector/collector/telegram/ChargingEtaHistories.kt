@@ -6,7 +6,7 @@ internal data class WeightedPowerMedian(val powerKw: Double, val coveredMs: Long
 
 /** Bounded source-time buffer for the exact trailing-window benchmark rule. */
 internal class ChargingPowerWindow {
-    private data class Sample(val elapsedMs: Long, val powerKw: Double?)
+    private data class Sample(val elapsedMs: Long, val powerKw: Double?, val continuous: Boolean)
 
     private var session: ChargingEtaSessionId? = null
     private val samples = ArrayList<Sample>(MAX_SAMPLES)
@@ -17,12 +17,12 @@ internal class ChargingPowerWindow {
     }
 
     /** Null, zero, negative, and non-finite samples are retained as gap markers. */
-    fun add(session: ChargingEtaSessionId, sourceElapsedMs: Long, powerKw: Double?): Boolean {
+    fun add(session: ChargingEtaSessionId, sourceElapsedMs: Long, powerKw: Double?, continuous: Boolean = false): Boolean {
         if (this.session != session || sourceElapsedMs < 0L) return false
         val last = samples.lastOrNull()
         if (last != null && sourceElapsedMs <= last.elapsedMs) return false
         val validPower = powerKw?.takeIf { it.isFinite() && it > 0.0 }
-        samples += Sample(sourceElapsedMs, validPower)
+        samples += Sample(sourceElapsedMs, validPower, continuous)
 
         val cutoff = sourceElapsedMs - RETAIN_MS
         while (samples.size > 1 && (samples.size > MAX_SAMPLES || samples[1].elapsedMs < cutoff)) {
@@ -38,23 +38,32 @@ internal class ChargingPowerWindow {
     ): WeightedPowerMedian? {
         if (this.session != session || asOfElapsedMs < 0L || actualNowElapsedMs < asOfElapsedMs) return null
         val actualCurrent = samples.lastOrNull { it.elapsedMs <= actualNowElapsedMs } ?: return null
-        if (actualNowElapsedMs - actualCurrent.elapsedMs > MAX_PAIR_MS) return null
+        if (actualCurrent.powerKw == null || !actualCurrent.continuous && actualNowElapsedMs - actualCurrent.elapsedMs > MAX_PAIR_MS) return null
         val endIndex = samples.indexOfLast { it.elapsedMs <= asOfElapsedMs }
-        if (endIndex < 1) return null
-        val windowEnd = samples[endIndex].elapsedMs
+        if (endIndex < 0) return null
+        val windowEnd = if (samples[endIndex].continuous) asOfElapsedMs else samples[endIndex].elapsedMs
         // Keep the event-time endpoint fresh without extending it to the later processing time.
         if (asOfElapsedMs - windowEnd > MAX_PAIR_MS) return null
         val windowStart = windowEnd - WINDOW_MS
         val weighted = ArrayList<Pair<Double, Long>>()
         var covered = 0L
-        for (index in 0 until endIndex) {
+        for (index in 0..endIndex) {
             val first = samples[index]
-            val second = samples[index + 1]
+            val firstPower = first.powerKw ?: continue
+            if (first.continuous) {
+                val until = minOf(samples.getOrNull(index + 1)?.elapsedMs ?: windowEnd, windowEnd)
+                val weightMs = until - max(first.elapsedMs, windowStart)
+                if (weightMs > 0L) {
+                    weighted += firstPower to weightMs
+                    covered += weightMs
+                }
+                continue
+            }
+            val second = samples.getOrNull(index + 1)?.takeIf { it.elapsedMs <= windowEnd } ?: continue
             val pairMs = second.elapsedMs - first.elapsedMs
             if (pairMs <= 0L || pairMs > MAX_PAIR_MS) continue
             val weightMs = second.elapsedMs - max(first.elapsedMs, windowStart)
             if (weightMs <= 0L) continue
-            val firstPower = first.powerKw ?: continue
             val secondPower = second.powerKw ?: continue
             weighted += ((firstPower + secondPower) / 2.0) to weightMs
             covered += weightMs
@@ -93,7 +102,8 @@ internal class OemEtaStabilizer {
         val minuteSourceElapsedMs: Long,
         val cycleSourceElapsedMs: Long,
         val sourceWallMs: Long,
-        val seconds: Double?
+        val seconds: Double?,
+        val continuous: Boolean
     )
 
     private var session: ChargingEtaSessionId? = null
@@ -115,7 +125,8 @@ internal class OemEtaStabilizer {
         cycleSourceElapsedMs: Long,
         sourceWallMs: Long,
         hours: Int,
-        minutes: Int
+        minutes: Int,
+        continuous: Boolean = false
     ): Boolean {
         if (this.session != session || evaluatedElapsedMs < 0L || minuteSourceElapsedMs < 0L ||
             cycleSourceElapsedMs < 0L || sourceWallMs <= 0L
@@ -130,12 +141,15 @@ internal class OemEtaStabilizer {
         } else {
             null
         }
+        if (continuous && last?.continuous == true && last.minuteSourceElapsedMs == minuteSourceElapsedMs &&
+            last.seconds == totalMinutes?.times(60L)?.toDouble()) return false
         observations += Observation(
             evaluatedElapsedMs = evaluatedElapsedMs,
             minuteSourceElapsedMs = minuteSourceElapsedMs,
             cycleSourceElapsedMs = cycleSourceElapsedMs,
             sourceWallMs = sourceWallMs,
-            seconds = totalMinutes?.times(60L)?.toDouble()
+            seconds = totalMinutes?.times(60L)?.toDouble(),
+            continuous = continuous
         )
         val cutoff = evaluatedElapsedMs - HISTORY_MS
         while (observations.size > 1 && (observations.size > MAX_OBSERVATIONS || observations[1].evaluatedElapsedMs < cutoff)) {
@@ -151,9 +165,31 @@ internal class OemEtaStabilizer {
     ): StableOemEta? {
         if (this.session != session || asOfElapsedMs < OEM_STABILITY_MS || actualNowElapsedMs < asOfElapsedMs) return null
         val actualCurrent = observations.lastOrNull { it.evaluatedElapsedMs <= actualNowElapsedMs } ?: return null
-        if (actualNowElapsedMs - actualCurrent.minuteSourceElapsedMs > MAX_SOURCE_AGE_MS ||
-            actualNowElapsedMs - actualCurrent.cycleSourceElapsedMs > MAX_SOURCE_AGE_MS
+        if (actualCurrent.seconds == null || !actualCurrent.continuous &&
+            (actualNowElapsedMs - actualCurrent.minuteSourceElapsedMs > MAX_SOURCE_AGE_MS ||
+            actualNowElapsedMs - actualCurrent.cycleSourceElapsedMs > MAX_SOURCE_AGE_MS)
         ) return null
+        val endIndex = observations.indexOfLast { it.evaluatedElapsedMs <= asOfElapsedMs }
+        if (endIndex < 0) return null
+        if (observations[endIndex].continuous) {
+            val start = asOfElapsedMs - OEM_STABILITY_MS
+            val startIndex = observations.indexOfLast { it.evaluatedElapsedMs <= start }
+            if (startIndex < 0) return null
+            var earliestFinish = Double.POSITIVE_INFINITY
+            var latestFinish = Double.NEGATIVE_INFINITY
+            for (index in startIndex..endIndex) {
+                val sample = observations[index]
+                val seconds = sample.seconds ?: return null
+                if (!sample.continuous) return null
+                val from = max(start, sample.evaluatedElapsedMs)
+                val until = minOf(asOfElapsedMs, observations.getOrNull(index + 1)?.evaluatedElapsedMs ?: asOfElapsedMs)
+                earliestFinish = minOf(earliestFinish, from / 1_000.0 + seconds)
+                latestFinish = maxOf(latestFinish, until / 1_000.0 + seconds)
+            }
+            if (latestFinish - earliestFinish > MAX_FINISH_SPREAD_SECONDS) return null
+            val current = observations[endIndex]
+            return StableOemEta(requireNotNull(current.seconds), current.sourceWallMs, current.minuteSourceElapsedMs)
+        }
         val finishes = ArrayList<Double>(GRID_SAMPLES)
         var lastValue: Observation? = null
         var gridTime = asOfElapsedMs - OEM_STABILITY_MS

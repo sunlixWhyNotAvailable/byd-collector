@@ -141,6 +141,12 @@ internal data class TelegramOrderedPollInput(
         return keys.isNotEmpty() && keys.all { cursors[it]?.valid == true && inputs[it]?.stamp?.bootId == bootId }
     }
 
+    /** Validity includes the persisted loss barriers handled by merge; age alone is not a loss. */
+    fun hasContinuousSource(fieldKey: String): Boolean = hasCurrentBoot(fieldKey) &&
+        sourceKeys(fieldKey).all { key -> inputs[key]?.stamp?.let {
+            it.sourceEpoch != null && it.generatorId != null
+        } == true }
+
     fun sourceStamp(fieldKey: String, freshOnly: Boolean = true): NormalizedSourceStamp? {
         val keys = sourceKeys(fieldKey).filter { cursors[it]?.valid == true && (!freshOnly || it in freshSourceKeys) }
         if (keys.isEmpty()) return null

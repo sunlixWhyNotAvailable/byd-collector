@@ -56,7 +56,7 @@ class AndroidGpsLocationSource(
     private val segmentIdProvider: () -> String = { "gps" },
     private val wallClockMs: () -> Long = { System.currentTimeMillis() },
     private val looper: Looper = Looper.getMainLooper(),
-    private val vehicleSpeedReferenceKmh: () -> Double? = { null }
+    private val vehicleSpeedReferenceKmh: (Long) -> Double? = { null }
 ) {
     private val appContext = context.applicationContext
     private val locationManager = appContext.getSystemService(LocationManager::class.java)
@@ -124,7 +124,7 @@ class AndroidGpsLocationSource(
     }
 
     private fun emit(sample: GpsLocationSample, isFinal: Boolean = false) {
-        val decision = trustGate.offer(sample, vehicleSpeedReferenceKmh())
+        val decision = trustGate.offer(sample, vehicleSpeedReferenceKmh(sample.elapsedRealtimeNanos / 1_000_000L))
         if (decision.callbackGap) {
             val receivedAt = runCatching { Instant.ofEpochMilli(sample.receiveWallTimeMs).toString() }.getOrElse { sample.observedAt }
             sink.onGap("gps_callback_gap", receivedAt)

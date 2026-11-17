@@ -13,10 +13,48 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import com.bydcollector.collector.direct.CollectorHelperProtocol as P
+import com.bydcollector.collector.data.callback.CallbackQueueStatusTracker
+import com.bydcollector.collector.data.callback.CallbackQueuePhase
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
 class CallbackBatchWakeTest {
+    @Test
+    fun actualEmptySpoolWaitStaysHealthyAndDeliveryEndsTheIdleWindow() = withTransport { transport ->
+        var elapsed = 0L
+        val tracker = CallbackQueueStatusTracker(monotonicMs = { elapsed }, wallTimeMs = { 10_000L + elapsed })
+        tracker.start()
+        assertNull(transport.spool(1).oldest())
+        tracker.confirmedEmpty()
+        val wakes = LinkedBlockingQueue<Unit>()
+        val ready = listener { tracker.idleWaitEnded(); wakes.add(Unit) }
+        assertFalse(waitAction(transport, P.TX_CALLBACK_AWAIT, 1, ready))
+        tracker.idleWaitStarted(30_000L)
+        elapsed = 29_000L
+        assertEquals(CallbackQueuePhase.HEALTHY, tracker.snapshot().phase)
+        elapsed = 35_001L
+        assertEquals(CallbackQueuePhase.WAITING, tracker.snapshot().phase)
+        assertEquals(CallbackSpool.AppendResult.SUCCESS, transport.deliver(batch(1, 1), false))
+        assertNotNull(wakes.poll(2, TimeUnit.SECONDS))
+        tracker.downloadStarted()
+        val descriptor = assertNotNull(transport.spool(1).oldest())
+        tracker.pendingBatchObserved(10_001L)
+        elapsed += 6_000L
+        assertEquals(CallbackQueuePhase.WAITING, tracker.snapshot().phase)
+        assertEquals(CallbackSpool.AckResult.RELEASED, transport.spool(1).acknowledge(descriptor))
+        tracker.pendingBatchCompleted()
+        assertNull(transport.spool(1).oldest())
+        tracker.confirmedEmpty()
+        assertFalse(waitAction(transport, P.TX_CALLBACK_AWAIT, 1, ready))
+        tracker.idleWaitStarted(30_000L)
+        elapsed += 2_000L
+        assertEquals(CallbackQueuePhase.HEALTHY, tracker.snapshot().phase)
+        waitAction(transport, P.TX_CALLBACK_CANCEL_WAIT, 1, ready)
+        tracker.idleWaitEnded()
+        tracker.stop()
+        assertEquals(CallbackQueuePhase.UNKNOWN, tracker.snapshot().phase)
+    }
+
     @Test
     fun armRechecksDiskBacklogAndOldCancellationCannotCancelAnotherStreamOrNewWaiter() = withTransport { transport ->
         val wakes = LinkedBlockingQueue<String>()

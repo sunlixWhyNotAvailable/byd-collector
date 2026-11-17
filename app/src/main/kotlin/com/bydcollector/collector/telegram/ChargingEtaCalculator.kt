@@ -45,7 +45,8 @@ data class ChargingEtaInput(
     val chargeType: ChargingType,
     val selection: ChargingEtaSelection,
     val chargingActive: Boolean,
-    val paused: Boolean
+    val paused: Boolean,
+    val remainingEnergyContinuous: Boolean = false
 )
 
 data class ChargingEtaResult(
@@ -90,10 +91,19 @@ class ChargingEtaCalculator internal constructor(
     fun addPowerSample(
         session: ChargingEtaSessionId,
         sourceElapsedMs: Long,
-        powerKw: Double?
+        powerKw: Double?,
+        continuous: Boolean = false
     ): Boolean {
         if (currentSession != session) return false
-        return powerWindow.add(session, sourceElapsedMs, powerKw)
+        return powerWindow.add(session, sourceElapsedMs, powerKw, continuous)
+    }
+
+    fun invalidatePower(session: ChargingEtaSessionId) {
+        if (currentSession == session) powerWindow.reset(session)
+    }
+
+    fun invalidateOem(session: ChargingEtaSessionId) {
+        if (currentSession == session) oemStabilizer.reset(session)
     }
 
     /**
@@ -110,7 +120,8 @@ class ChargingEtaCalculator internal constructor(
         cycleSourceElapsedMs: Long,
         sourceWallMs: Long,
         hours: Int,
-        minutes: Int
+        minutes: Int,
+        continuous: Boolean = false
     ): Boolean {
         if (currentSession != session) return false
         return oemStabilizer.observe(
@@ -120,7 +131,8 @@ class ChargingEtaCalculator internal constructor(
             cycleSourceElapsedMs = cycleSourceElapsedMs,
             sourceWallMs = sourceWallMs,
             hours = hours,
-            minutes = minutes
+            minutes = minutes,
+            continuous = continuous
         )
     }
 
@@ -219,7 +231,7 @@ class ChargingEtaCalculator internal constructor(
                 } else if (energySourceElapsedMs == null || energySourceElapsedMs < 0L ||
                     energySourceElapsedMs > input.measuredAtElapsedMs ||
                     energySourceElapsedMs > input.nowElapsedMs ||
-                    input.nowElapsedMs - energySourceElapsedMs > MAX_STATE_AGE_MS
+                    !input.remainingEnergyContinuous && input.nowElapsedMs - energySourceElapsedMs > MAX_STATE_AGE_MS
                 ) {
                     OwnCalculation(null, ChargingEtaUnavailableReason.INVALID_REMAINING_ENERGY)
                 } else {

@@ -88,10 +88,12 @@ data class EnergyCoveredInterval(
     val startedElapsedMs: Long,
     val startPowerKw: Double,
     val endPowerKw: Double,
-    val totalsBefore: EnergyTotals
+    val totalsBefore: EnergyTotals,
+    val held: Boolean = false
 ) {
     init {
         require(startedElapsedMs >= 0 && startPowerKw.isFinite() && endPowerKw.isFinite())
+        require(!held || startPowerKw == endPowerKw)
     }
 }
 
@@ -135,7 +137,10 @@ data class EnergySnapshot(
         require((acquiredBootId == null) == (acquiredElapsedMs == null))
         require(acquiredBootId == null || acquiredBootId.isNotBlank())
         require(acquiredElapsedMs == null || acquiredElapsedMs >= 0L)
-        coveredInterval?.let { require(sourceElapsedMs - it.startedElapsedMs in 1..BatteryEnergyIntegrator.MAX_INTERVAL_MS) }
+        coveredInterval?.let {
+            val duration = sourceElapsedMs - it.startedElapsedMs
+            require(duration > 0L && (it.held || duration <= BatteryEnergyIntegrator.MAX_INTERVAL_MS))
+        }
         require(energyCoveredMs >= 0L)
         require(energyUncoveredMs >= 0L)
         require(listOfNotNull(dischargedKwh, regeneratedKwh, netKwh).all(Double::isFinite))
@@ -164,7 +169,7 @@ data class EnergySnapshot(
         val fraction = duration.toDouble() / (sourceElapsedMs - interval.startedElapsedMs)
         val power = interval.startPowerKw + (interval.endPowerKw - interval.startPowerKw) * fraction
         val totals = BatteryEnergyIntegrator.integrateCoveredInterval(interval.totalsBefore,
-            interval.startPowerKw, power, duration)
+            interval.startPowerKw, power, duration, interval.held)
         val identity = "boundary:" + java.util.UUID.nameUUIDFromBytes(
             "$powerSessionId:$bootId:$elapsedMs".toByteArray(Charsets.UTF_8))
         return copy(snapshotId = "energy:$identity", sourceIdentity = identity,

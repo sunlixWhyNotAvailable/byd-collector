@@ -2,6 +2,29 @@ package com.bydcollector.collector.data.trips
 
 import com.bydcollector.collector.location.GpsLocationSample
 
+/** Only the short history needed by delayed GPS fixes; loss markers close held power. */
+internal data class RoutePowerHistory(private val samples: List<Sample> = emptyList()) {
+    data class Sample(val bootId: String, val elapsedMs: Long, val powerKw: Double?, val continuous: Boolean)
+
+    fun observe(bootId: String, elapsedMs: Long, powerKw: Double?, continuous: Boolean): RoutePowerHistory {
+        if (bootId.isBlank() || elapsedMs < 0L) return this
+        val sample = Sample(bootId, elapsedMs, powerKw?.takeIf(Double::isFinite), continuous)
+        val current = samples.takeIf { it.lastOrNull()?.bootId == bootId }.orEmpty()
+        val last = current.lastOrNull()
+        if (last != null && elapsedMs < last.elapsedMs) return this
+        if (sample == last) return this
+        val retained = if (last?.elapsedMs == elapsedMs) current.dropLast(1) else current
+        // GPS rejects fixes over five seconds old; retain the interval crossing that boundary.
+        val first = retained.indexOfLast { it.elapsedMs <= elapsedMs - 5_000L }.coerceAtLeast(0)
+        return RoutePowerHistory((retained.drop(first).takeLast(4_095) + sample))
+    }
+
+    fun powerAt(bootId: String?, elapsedMs: Long): Double? {
+        val sample = samples.lastOrNull { it.bootId == bootId && it.elapsedMs <= elapsedMs } ?: return null
+        return sample.powerKw.takeIf { sample.continuous || elapsedMs - sample.elapsedMs <= 2_000L }
+    }
+}
+
 data class EnergyCounterUpdate(
     val accumulatedKwh: Double?,
     val lastCounterKwh: Double?,

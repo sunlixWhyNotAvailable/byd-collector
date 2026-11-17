@@ -23,6 +23,53 @@ import kotlin.test.assertTrue
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
 class TripBusinessInputCursorTest {
+    @Test fun gpsSpeedUsesOnlyCommittedBusinessInputsAndPages() {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "trip_speed_commit_${System.nanoTime()}.db"
+        val key = "speed_1013_-1807745016_7"
+        val normalizer = com.bydcollector.collector.data.normalized.VehicleStateNormalizer()
+        try {
+            TripStore(TripDatabaseHelper(context, name)).use { store ->
+                val runtime = TripRuntimeCoordinator(context, store, { true }, { false }, {}, { true }, {},
+                    { _, _, _ -> }, bootIdProvider = { "business-test-boot" })
+                fun feed(id: Long, speed: Float?): com.bydcollector.collector.service.TripBusinessResult {
+                    val ms = id * 10_000
+                    val at = java.time.Instant.ofEpochMilli(1_800_000_000_000L + ms).toString()
+                    val source = stamp("speed:$id", ms, at)
+                    val inputs = speed?.let { mapOf(key to com.bydcollector.collector.data.normalized.NormalizedSourceInput(
+                        PollReading(key, it.toRawBits().toString(), it.toString()), source, null)) }.orEmpty()
+                    return runtime.onBusinessInput("speed", id, source.identity, at, emptyList(),
+                        normalizer.normalizeSparse(inputs, inputs.keys), true, eventSourceStamp = source,
+                        continuousSources = inputs.keys.associateWith { ms }).get(5, TimeUnit.SECONDS)
+                }
+                try {
+                    feed(1, 40f)
+                    assertEquals(40.0, runtime.vehicleSpeedAt(15_000))
+                    listOf(0f, null).forEachIndexed { index, speed ->
+                        val id = index + 2L
+                        val at = id * 10_000 + 3_000
+                        val prior = runtime.vehicleSpeedAt(at)
+                        fun page() = runtime.prepareBusinessPage(false, false, {}) {
+                            val result = feed(id, speed)
+                            assertEquals(prior, runtime.vehicleSpeedAt(at), "GPS cannot read a pending page")
+                            com.bydcollector.collector.data.input.BusinessPage("speed", "business-test-boot", listOf(
+                                com.bydcollector.collector.data.input.BusinessPageEntry(id, "speed:$id", null, false, result)))
+                        }.get(5, TimeUnit.SECONDS)
+                        context.openOrCreateDatabase(name, 0, null).use { db -> db.execSQL(
+                            "CREATE TRIGGER reject_page BEFORE INSERT ON business_page_handoff BEGIN SELECT RAISE(ABORT, 'page rejected'); END") }
+                        val error = assertFailsWith<java.util.concurrent.ExecutionException> { page() }
+                        assertTrue(generateSequence(error as Throwable?) { it.cause }.any { it.message?.contains("page rejected") == true })
+                        assertEquals(prior, runtime.vehicleSpeedAt(at), "Failed commit cannot change GPS speed")
+                        context.openOrCreateDatabase(name, 0, null).use { it.execSQL("DROP TRIGGER reject_page") }
+                        val committed = page()
+                        assertEquals(speed?.toDouble(), runtime.vehicleSpeedAt(at))
+                        store.acknowledgeBusinessPage(committed.key)
+                    }
+                } finally { runtime.close() }
+            }
+        } finally { context.deleteDatabase(name) }
+    }
+
     @Test
     fun cursorAndTripWritesCommitTogetherAndReplaysAreBounded() {
         val context = RuntimeEnvironment.getApplication()

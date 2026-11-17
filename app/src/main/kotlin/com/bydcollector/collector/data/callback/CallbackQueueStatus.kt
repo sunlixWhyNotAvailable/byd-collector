@@ -28,6 +28,8 @@ class CallbackQueueStatusTracker(
     private var waitingReason: String? = null
     private var errorReason: String? = null
     private var hadKnownActivity = false
+    private var idleWaitUntilMs: Long? = null
+    private var lastWaitExitAtMs: Long? = null
 
     init {
         require(pendingAgeThresholdMs > 0)
@@ -50,6 +52,7 @@ class CallbackQueueStatusTracker(
     @Synchronized
     fun downloadStarted() {
         if (!workerActive) return
+        idleWaitUntilMs = null
         advanceStableCaughtUp(monotonicMs())
         downloadStartedAtMs = monotonicMs()
         hadKnownActivity = true
@@ -59,6 +62,7 @@ class CallbackQueueStatusTracker(
     @Synchronized
     fun pendingBatchObserved(oldestEventWallMs: Long?) {
         if (!workerActive) return
+        idleWaitUntilMs = null
         val now = monotonicMs()
         advanceStableCaughtUp(now)
         val headAge = oldestEventWallMs?.let { (wallTimeMs() - it).coerceAtLeast(0L) }
@@ -136,6 +140,7 @@ class CallbackQueueStatusTracker(
     @Synchronized
     fun waiting(reason: String?) {
         if (!workerActive) return
+        idleWaitUntilMs = null
         downloadStartedAtMs = null
         healthyEstablished = false
         caughtUpAtMs = null
@@ -149,6 +154,7 @@ class CallbackQueueStatusTracker(
     @Synchronized
     fun failed(reason: String?) {
         if (!workerActive) return
+        idleWaitUntilMs = null
         downloadStartedAtMs = null
         healthyEstablished = false
         caughtUpAtMs = null
@@ -177,10 +183,30 @@ class CallbackQueueStatusTracker(
         return stateAt(wallTimeMs(), now)
     }
 
+    /** Called only after the helper accepted the bounded ready subscription. */
+    @Synchronized
+    fun idleWaitStarted(timeoutMs: Long) {
+        require(timeoutMs > 0L)
+        if (workerActive && lastConfirmedEmptyAtMs != null && !pendingBatchObserved &&
+            downloadStartedAtMs == null && waitingReason == null && errorReason == null) {
+            idleWaitUntilMs = monotonicMs() + timeoutMs
+        }
+    }
+
+    @Synchronized
+    fun idleWaitEnded() {
+        if (idleWaitUntilMs != null) lastWaitExitAtMs = monotonicMs()
+        idleWaitUntilMs = null
+    }
+
     private fun stateAt(nowWallMs: Long, nowMonoMs: Long): CallbackQueueState {
         if (!workerActive) return CallbackQueueState(CallbackQueuePhase.UNKNOWN)
         errorReason?.let { return CallbackQueueState(CallbackQueuePhase.ERROR, it) }
         waitingReason?.let { return CallbackQueueState(CallbackQueuePhase.WAITING, it) }
+        idleWaitUntilMs?.let { deadline ->
+            if (nowMonoMs - deadline > pendingAgeThresholdMs) return CallbackQueueState(
+                CallbackQueuePhase.WAITING, "callback ready wait has not completed after its deadline")
+        }
 
         downloadStartedAtMs?.let { startedAt ->
             val age = (nowMonoMs - startedAt).coerceAtLeast(0L)
@@ -247,7 +273,8 @@ class CallbackQueueStatusTracker(
         }
 
         if (healthyEstablished) {
-            val lastSignalAt = listOfNotNull(lastProgressAtMs, lastConfirmedEmptyAtMs).maxOrNull()
+            if (idleWaitUntilMs != null) return CallbackQueueState(CallbackQueuePhase.HEALTHY)
+            val lastSignalAt = listOfNotNull(lastProgressAtMs, lastConfirmedEmptyAtMs, lastWaitExitAtMs).maxOrNull()
             val staleFor = lastSignalAt?.let { (nowMonoMs - it).coerceAtLeast(0L) }
             if (staleFor != null && staleFor > progressFreshnessMs) {
                 healthyEstablished = false
@@ -313,6 +340,8 @@ class CallbackQueueStatusTracker(
     }
 
     private fun clear() {
+        idleWaitUntilMs = null
+        lastWaitExitAtMs = null
         downloadStartedAtMs = null
         pendingBatchObserved = false
         pendingHeadWallMs = null

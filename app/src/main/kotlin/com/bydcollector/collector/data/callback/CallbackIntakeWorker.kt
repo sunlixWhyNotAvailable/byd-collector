@@ -59,7 +59,11 @@ class CallbackIntakeWorker(
     fun isStopping(): Boolean = !running.get() && worker?.isAlive == true
 
     /** Cached queue state; this never contacts the helper or reads SQLite. */
-    fun snapshotQueueState(): CallbackQueueState = queueStatusTracker.snapshot()
+    fun snapshotQueueState(): CallbackQueueState {
+        if (!running.get() || worker?.isAlive != true) return CallbackQueueState(CallbackQueuePhase.UNKNOWN)
+        if (!ready()) return CallbackQueueState(CallbackQueuePhase.WAITING, "callback stream is not claimed")
+        return queueStatusTracker.snapshot()
+    }
 
     fun start(): Boolean = synchronized(lock) {
         if (worker?.isAlive == true || !running.compareAndSet(false, true)) return@synchronized false
@@ -301,19 +305,27 @@ class CallbackIntakeWorker(
     private fun waitForBatch() {
         var signaled = false
         val subscription = armBatchReady {
-            synchronized(dataReady) { signaled = true; dataReady.notifyAll() }
+            synchronized(dataReady) {
+                signaled = true
+                queueStatusTracker.idleWaitEnded()
+                dataReady.notifyAll()
+            }
         }
         try {
             // A lost advisory wake or changed lease cannot strand retained data indefinitely.
             val deadline = System.nanoTime() + SUMMARY_INTERVAL_NANOS
             synchronized(dataReady) {
+                if (running.get() && !signaled) queueStatusTracker.idleWaitStarted(SUMMARY_INTERVAL_NANOS / 1_000_000L)
                 while (running.get() && !signaled) {
                     val remaining = deadline - System.nanoTime()
                     if (remaining <= 0L) break
                     java.util.concurrent.TimeUnit.NANOSECONDS.timedWait(dataReady, remaining)
                 }
             }
-        } finally { subscription.close() }
+        } finally {
+            queueStatusTracker.idleWaitEnded()
+            subscription.close()
+        }
     }
 
     private fun faultResult(error: Throwable) = CallbackDrainResult(

@@ -168,12 +168,15 @@ class EnergySessionCoordinator(
             if (!knownBoundary) forcedReason = EnergyRuntimeState.REASON_STARTED_MID_POWER_SESSION
         }
 
+        val previousEvaluation = state.lastEvaluationElapsedMs.takeIf {
+            state.active && state.powerSessionId == sessionId && state.lastEvaluationBootId == evaluation.bootId
+        }
         val integration = if (active && receipt.lateRelevantSource) {
             BatteryEnergyIntegrator.reanchorAfterLateSource(anchor, totals, evaluationInput)
         } else if (active && nextPower == EnergyPowerState.OFF) {
-            BatteryEnergyIntegrator.finishSession(anchor, totals, evaluationInput)
+            BatteryEnergyIntegrator.finishSession(anchor, totals, evaluationInput, previousEvaluation)
         } else if (active) {
-            BatteryEnergyIntegrator.integrate(anchor, totals, evaluationInput)
+            BatteryEnergyIntegrator.integrate(anchor, totals, evaluationInput, previousEvaluation)
         } else {
             EnergyIntegrationResult(
                 totals = totals,
@@ -217,11 +220,12 @@ class EnergySessionCoordinator(
             acquiredElapsedMs = receipt.input.elapsedMs,
             coveredInterval = state.anchor?.takeIf {
                 it.bootId == evaluation.bootId && state.powerSessionId == sessionId &&
-                    integration.quality == EnergyIntegrationQuality.COVERED &&
+                    (integration.quality == EnergyIntegrationQuality.COVERED || integration.heldInterval) &&
                     evaluation.elapsedMs > it.elapsedMs
             }?.let { EnergyCoveredInterval(it.elapsedMs, it.powerKw,
-                requireNotNull(evaluationInput.voltage) * requireNotNull(evaluationInput.current) / 1_000.0,
-                state.totals) } ?: state.currentSnapshot?.takeIf {
+                if (integration.heldInterval) it.powerKw else
+                    requireNotNull(evaluationInput.voltage) * requireNotNull(evaluationInput.current) / 1_000.0,
+                state.totals, integration.heldInterval) } ?: state.currentSnapshot?.takeIf {
                 it.powerSessionId == sessionId && it.sourceBootId == evaluation.bootId &&
                     it.sourceElapsedMs == evaluation.elapsedMs && totals == state.totals && !receipt.lateRelevantSource
             }?.coveredInterval

@@ -30,10 +30,6 @@ object BusinessInputProjection {
         .flatMap { field -> field.sourceKeys.map { it to field.category.staleAfterMs } }
         .groupBy({ it.first }, { it.second }).mapValues { (_, ages) -> ages.min() }
 
-    val energyHistoryLookbackMs: Long
-        get() = energyKeys.maxOfOrNull { freshnessByKey[it] ?: NormalizedCategory.BODY.staleAfterMs }
-            ?: NormalizedCategory.BODY.staleAfterMs
-
     fun source(ref: BusinessInputRef): PollSampleSource = PollSampleSource(
         ref.sourceIdentity,
         checkNotNull(ref.bootId) { "Business input ${ref.id} has no acquisition boot ID" },
@@ -45,7 +41,7 @@ object BusinessInputProjection {
         checkNotNull(ref.acquiredWallMs) { "Business input ${ref.id} has no acquisition wall time" }
     ).toString()
 
-    fun incoming(delta: BusinessInputDelta): Map<String, NormalizedSourceInput> {
+    fun incoming(delta: BusinessInputDelta, previous: Map<String, NormalizedSourceInput> = emptyMap()): Map<String, NormalizedSourceInput> {
         // A failed sparse GET invalidates only its recorded attempted fields. Only a
         // transport failure without any attempted keys is truly unscoped.
         if (delta.ref.kind != BusinessInputKind.GET || delta.ref.ok || delta.ref.readingKeys.isNotEmpty()) {
@@ -56,8 +52,8 @@ object BusinessInputProjection {
         val stamp = NormalizedSourceStamp(NormalizedSourceKind.POLL, source.identity,
             source.bootId, source.generatorId, source.sequence, checkNotNull(delta.ref.acquiredWallMs),
             source.capturedElapsedMs)
-        // An overall failed GET has no values; retain its failure frontier instead of stale successes.
-        return BusinessInputCheckpointKeys.ALL.associateWith { key ->
+        // Invalidate held values, without inventing participation for never-observed optional sources.
+        return previous.keys.associateWith { key ->
             NormalizedSourceInput(PollReading(key, null, null), stamp, delta.ref.pollId)
         }
     }
@@ -70,15 +66,29 @@ object BusinessInputProjection {
         val ttl = freshnessByKey[key] ?: NormalizedCategory.BODY.staleAfterMs
         val sourceState = continuity[key]
         val afterContinuityFrontier = sourceState != null && sourceAfter(input.stamp, sourceState.stamp, bootId)
-        val explicitValid = sourceState?.state == BusinessContinuityState.AVAILABLE && sourceState.seedValid &&
-            sourceState.stamp.bootId == bootId && input.stamp.bootId == bootId &&
-            (normalizedSourceMatchesSeed(input.stamp, sourceState.seedKind, sourceState.seedIdentity, sourceState.seedRecordSequence) ||
-                afterContinuityFrontier) ||
-            sourceState?.state == BusinessContinuityState.LOST && afterContinuityFrontier
+        val explicitValid = continuousSince(input, sourceState, bootId, evaluatedElapsedMs) != null
         val explicitlyLost = sourceState?.state == BusinessContinuityState.LOST && sourceState.stamp.bootId == bootId &&
             !afterContinuityFrontier
         if (input.stamp.bootId == bootId && !explicitlyLost && (explicitValid || sourceState == null && age in 0..ttl)) input
         else input.copy(reading = PollReading(key, null, null))
+    }
+
+    /** Source-time start of the currently proven value, never a refreshed acquisition clock. */
+    fun continuousSources(inputs: Map<String, NormalizedSourceInput>, continuity: Map<String, BusinessInputContinuity>,
+        bootId: String, evaluatedElapsedMs: Long): Map<String, Long> = inputs.mapNotNull { (key, input) ->
+        continuousSince(input, continuity[key], bootId, evaluatedElapsedMs)?.let { key to it }
+    }.toMap()
+
+    private fun continuousSince(input: NormalizedSourceInput, state: BusinessInputContinuity?,
+        bootId: String, evaluatedElapsedMs: Long): Long? {
+        if (state == null || state.stamp.bootId != bootId || input.stamp.bootId != bootId ||
+            input.stamp.elapsedMs > evaluatedElapsedMs || state.stamp.elapsedMs > evaluatedElapsedMs ||
+            input.reading.rawValue == null && input.reading.descValue == null) return null
+        val after = sourceAfter(input.stamp, state.stamp, bootId)
+        val valid = state.state == BusinessContinuityState.AVAILABLE && state.seedValid &&
+            (normalizedSourceMatchesSeed(input.stamp, state.seedKind, state.seedIdentity, state.seedRecordSequence, state.stamp) || after) ||
+            state.state == BusinessContinuityState.LOST && after
+        return if (valid) maxOf(input.stamp.elapsedMs, state.stamp.elapsedMs) else null
     }
 
     private fun sourceAfter(input: NormalizedSourceStamp, boundary: NormalizedSourceStamp, bootId: String): Boolean {

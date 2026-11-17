@@ -10,6 +10,34 @@ import kotlin.test.assertTrue
 
 class ChargingEtaCalculatorTest {
     @Test
+    fun qualifiedIntervalsSurviveSilenceButNotInvalidationAndOemRemainsIndependent() {
+        val session = ChargingEtaSessionId("callback-boot", "held-charge")
+        val calculator = ChargingEtaCalculator().apply { beginSession(session) }
+        calculator.addPowerSample(session, 0L, 20.0, continuous = true)
+        calculator.observeOem(session, 0L, 0L, 0L, WALL_BASE, 2, 0, continuous = true)
+        val request = input(session, 180_000L, WALL_BASE + 180_000L, 50.0, 40.0,
+            ChargingType.AC, energySourceElapsed = 0L).copy(remainingEnergyContinuous = true)
+        val estimated = calculator.estimate(request)
+        assertEquals(ChargingEtaSource.CALCULATED_AC, estimated.source)
+        assertEquals(7_200.0, estimated.seconds!!, 1e-9)
+        calculator.addPowerSample(session, 181_000L, null, continuous = true)
+        val fallback = calculator.estimate(request.copy(nowElapsedMs = 181_000L, measuredAtElapsedMs = 181_000L))
+        assertEquals(ChargingEtaSource.OEM, fallback.source)
+        assertEquals(7_200.0, fallback.seconds!!, 1e-9)
+        assertEquals(WALL_BASE, fallback.sourceObservedAtWallMs)
+        calculator.observeOem(session, 182_000L, 182_000L, 182_000L, WALL_BASE + 182_000L,
+            0, 255, continuous = true)
+        assertFalse(calculator.estimate(request.copy(nowElapsedMs = 182_000L,
+            measuredAtElapsedMs = 182_000L)).available)
+
+        val window = ChargingPowerWindow().apply { reset(session) }
+        window.add(session, 0L, 10.0, continuous = true)
+        window.add(session, 40_000L, 100.0, continuous = true)
+        window.add(session, 61_000L, 200.0, continuous = true)
+        assertEquals(10.0, window.weightedMedianKw(session, 60_000L, 61_000L)!!.powerKw, 1e-9)
+    }
+
+    @Test
     fun acUsesSourceTimeMedianAndAnchorsRoundedFinishToMeasurementEvent() {
         val session = ChargingEtaSessionId("boot-a", "ac-1")
         val calculator = ChargingEtaCalculator()

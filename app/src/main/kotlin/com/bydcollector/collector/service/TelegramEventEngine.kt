@@ -1017,6 +1017,13 @@ class TelegramEventEngine(
             events = events,
             sourceIdentity = evidenceSourceIdentity
         ) else false
+        chargingEtaSession?.takeIf { freshness != null && it.bootId == etaCycleBootId }?.let { session ->
+            if (!freshness!!.hasCurrentBoot("battery_charge_power_kw") || batteryChargePower == null) {
+                chargingEtaCalculator.invalidatePower(session)
+                chargingEtaLastPowerElapsedMs = null
+            }
+            if (!freshness.hasCurrentBoot("charging_time_remaining")) chargingEtaCalculator.invalidateOem(session)
+        }
         val chargingEtaStateDiagnosticDetail = if (freshness != null && origin == PollOrigin.LIVE &&
             etaCycleBootId == etaCurrentBootId && etaCurrentBootId != null &&
             etaCycleElapsedMs != null && etaNowElapsedMs != null
@@ -2264,11 +2271,12 @@ class TelegramEventEngine(
         if (input.hasCurrentBoot("battery_charge_power_kw")) {
             input.latestAcceptedStamp("battery_charge_power_kw")?.let { stamp ->
                 val previousPowerElapsedMs = chargingEtaLastPowerElapsedMs
-                if (previousPowerElapsedMs != null && stamp.elapsedMs - previousPowerElapsedMs > MAX_ETA_POWER_SAMPLE_GAP_MS) {
-                    resetChargingEtaHistory(session, chargeType)
+                val continuous = input.hasContinuousSource("battery_charge_power_kw")
+                if (!continuous && previousPowerElapsedMs != null && stamp.elapsedMs - previousPowerElapsedMs > MAX_ETA_POWER_SAMPLE_GAP_MS) {
+                    chargingEtaCalculator.invalidatePower(session)
                     transitionReason = transitionReason ?: "gap"
                 }
-                if (chargingEtaCalculator.addPowerSample(session, stamp.elapsedMs, batteryChargePower)) {
+                if (chargingEtaCalculator.addPowerSample(session, stamp.elapsedMs, batteryChargePower, continuous)) {
                     chargingEtaLastPowerElapsedMs = stamp.elapsedMs
                 }
             }
@@ -2291,7 +2299,8 @@ class TelegramEventEngine(
                     cycleSourceElapsedMs = cycleElapsedMs,
                     sourceWallMs = minuteStamp.wallMs,
                     hours = parts?.getOrNull(0)?.toIntOrNull() ?: -1,
-                    minutes = parts?.getOrNull(1)?.toIntOrNull() ?: -1
+                    minutes = parts?.getOrNull(1)?.toIntOrNull() ?: -1,
+                    continuous = input.hasContinuousSource("charging_time_remaining")
                 )
             }
         }
@@ -2337,7 +2346,9 @@ class TelegramEventEngine(
                     chargeType = chargeType,
                     selection = selection,
                     chargingActive = active,
-                    paused = paused
+                    paused = paused,
+                    remainingEnergyContinuous = input.hasContinuousSource("battery_remaining_energy_kwh") &&
+                        energyStamp?.sourceEpoch != null && energyStamp.generatorId == currentEnergyStamp?.generatorId
                 )
             )
         } else {

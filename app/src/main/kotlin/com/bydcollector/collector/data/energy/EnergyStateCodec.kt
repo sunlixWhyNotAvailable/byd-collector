@@ -113,6 +113,7 @@ object EnergyStateCodec {
         putNullable("covered_interval", snapshot.coveredInterval?.let { interval ->
             JSONObject().put("started", interval.startedElapsedMs).put("start_kw", interval.startPowerKw)
                 .put("end_kw", interval.endPowerKw).put("totals", encodeTotals(interval.totalsBefore))
+                .put("held", interval.held)
         })
         put("active", snapshot.active)
         putNullable("discharged_kwh", snapshot.dischargedKwh)
@@ -146,7 +147,7 @@ object EnergyStateCodec {
         acquiredElapsedMs = json.longOrNull("acquired_elapsed_ms"),
         coveredInterval = json.objectOrNull("covered_interval")?.let {
             EnergyCoveredInterval(it.getLong("started"), it.finiteDouble("start_kw"), it.finiteDouble("end_kw"),
-                decodeTotals(it.getJSONObject("totals")))
+                decodeTotals(it.getJSONObject("totals")), if (it.has("held")) it.getBoolean("held") else false)
         }
     )
 

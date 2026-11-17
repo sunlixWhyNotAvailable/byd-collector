@@ -271,35 +271,49 @@ class GpsTrustGate(
     }
 }
 
-/** Keeps the highest valid normalized vehicle speed observed in the recent elapsed-time window. */
+/** Highest speed whose value interval overlaps the short GPS/CAN alignment window. */
 internal class VehicleSpeedReference(
     private val nowElapsedMs: () -> Long = SystemClock::elapsedRealtime,
     private val windowMs: Long = 2_000L
 ) {
-    private data class Reading(val elapsedMs: Long, val speedKmh: Double)
+    private data class Reading(val elapsedMs: Long, val speedKmh: Double, val continuous: Boolean)
 
     private val readings = ArrayDeque<Reading>()
 
     @Synchronized
-    fun observe(speedKmh: Double?, elapsedMs: Long = nowElapsedMs()) {
-        if (speedKmh == null || !speedKmh.isFinite() || speedKmh < 0.0 || elapsedMs < 0L) return
-        prune(elapsedMs)
-        readings.addLast(Reading(elapsedMs, speedKmh))
+    fun observe(speedKmh: Double?, elapsedMs: Long = nowElapsedMs(), continuous: Boolean = false) {
+        if (elapsedMs < 0L || readings.peekLast()?.elapsedMs?.let { elapsedMs < it } == true) return
+        if (speedKmh == null || !speedKmh.isFinite() || speedKmh < 0.0) {
+            readings.clear()
+            return
+        }
+        val next = Reading(elapsedMs, speedKmh, continuous)
+        if (readings.peekLast() == next) return
+        if (readings.peekLast()?.elapsedMs == elapsedMs) readings.removeLast()
+        readings.addLast(next)
+        // Include the oldest admissible GPS fix and its preceding CAN maximum window.
+        while (readings.size > 1 && (readings.size > 4_096 ||
+            readings.elementAt(1).elapsedMs < elapsedMs - 5_000L - windowMs)) readings.removeFirst()
     }
+
+    @Synchronized
+    fun clear() = readings.clear()
 
     @Synchronized
     fun current(elapsedMs: Long = nowElapsedMs()): Double? {
         if (elapsedMs < 0L) return null
-        prune(elapsedMs)
-        return readings.maxOfOrNull { it.speedKmh }
-    }
-
-    private fun prune(nowMs: Long) {
+        var maximum: Double? = null
+        val iterator = readings.iterator()
+        var value = if (iterator.hasNext()) iterator.next() else return null
         while (true) {
-            val first = readings.peekFirst() ?: return
-            if (nowMs >= first.elapsedMs && nowMs - first.elapsedMs > windowMs) readings.removeFirst()
-            else return
+            val next = if (iterator.hasNext()) iterator.next() else null
+            val end = if (value.continuous) next?.elapsedMs ?: elapsedMs else value.elapsedMs
+            if (value.elapsedMs <= elapsedMs && end >= elapsedMs - windowMs) {
+                maximum = maxOf(maximum ?: value.speedKmh, value.speedKmh)
+            }
+            value = next ?: break
         }
+        return maximum
     }
 }
 

@@ -6,6 +6,27 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class BatteryEnergyIntegratorTest {
+    @Test fun callbackIntervalsCloseBeforeChangesAndNeverBridgeAnUnprovenGap() {
+        val start = BatteryEnergyIntegrator.integrate(null, EnergyTotals(), input(current = 50.0))
+        val changed = BatteryEnergyIntegrator.integrate(start.anchor, start.totals,
+            input(elapsedMs = 60_000, current = -25.0).copy(continuity = EnergyIntervalContinuity(0)))
+        assertClose(1.0 / 3.0, changed.totals.dischargedKwh)
+        assertEquals(0.0, changed.totals.regeneratedKwh)
+        val lost = BatteryEnergyIntegrator.integrate(changed.anchor, changed.totals,
+            input(elapsedMs = 120_000, voltage = null).copy(continuity = EnergyIntervalContinuity(60_000)))
+        assertClose(1.0 / 6.0, lost.totals.regeneratedKwh)
+        assertTrue(lost.totals.partial)
+        assertEquals(null, lost.anchor)
+        val recovered = BatteryEnergyIntegrator.integrate(null, lost.totals,
+            input(elapsedMs = 150_000).copy(continuity = EnergyIntervalContinuity(null)), 120_000)
+        assertEquals(30_000L, recovered.totals.uncoveredMs)
+        val unknown = BatteryEnergyIntegrator.finishSession(recovered.anchor, recovered.totals,
+            input(elapsedMs = 151_000, powerOn = false).copy(continuity = EnergyIntervalContinuity(null)), 150_000)
+        assertEquals(31_000L, unknown.totals.uncoveredMs)
+        assertEquals(recovered.totals.dischargedKwh, unknown.totals.dischargedKwh)
+        assertEquals(120_000L, unknown.totals.coveredMs)
+    }
+
 
     @Test
     fun exactZeroCrossingSplitsGrossEnergyAndAllowsNegativeNet() {

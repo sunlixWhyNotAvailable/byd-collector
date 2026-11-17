@@ -1,6 +1,7 @@
 package com.bydcollector.collector.service
 
 import com.bydcollector.collector.data.local.PollReading
+import com.bydcollector.collector.data.direct.DirectGetLineage
 import com.bydcollector.collector.data.normalized.VehicleStateNormalizer
 import com.bydcollector.collector.data.polling.PollOrigin
 import com.bydcollector.collector.data.polling.PollSampleSource
@@ -22,6 +23,23 @@ import kotlin.test.assertTrue
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29])
 class TelegramChargingEtaRuntimeTest {
+    @Test
+    fun sparseQualifiedSourcesKeepEtaAndReportedInvalidVoltageRemovesIt() {
+        val engine = TelegramEventEngine()
+        val config = config()
+        for (sequence in 0L..2L) poll(engine, config, sequence, 50.0, qualified = true)
+        val progress = poll(engine, config, 42L, 55.0, qualified = true,
+            onlyKeys = setOf("statistic_1014_1145045040_5"))
+            .events.single { it.type == TelegramEventType.CHARGING_PROGRESS }
+        assertEquals("50m", progress.variables["charge_time_to_full"])
+        poll(engine, config, 43L, 55.0, qualified = true,
+            onlyKeys = setOf("charging_charge_battery_volt"), invalidVoltage = true)
+        val lost = poll(engine, config, 44L, 60.0, qualified = true,
+            onlyKeys = setOf("statistic_1014_1145045040_5"))
+            .events.single { it.type == TelegramEventType.CHARGING_PROGRESS }
+        assertEquals("—", lost.variables["charge_time_to_full"])
+    }
+
     @Test
     fun progressUsesFreshAcWindowAndTypeChangeResetsOnlyEtaHistory() {
         val engine = TelegramEventEngine()
@@ -191,7 +209,10 @@ class TelegramChargingEtaRuntimeTest {
         gunType: Int = 2,
         bmsState: Int = 1,
         currentAmps: Double = -50.0,
-        nowOffsetMs: Long = 0L
+        nowOffsetMs: Long = 0L,
+        qualified: Boolean = false,
+        onlyKeys: Set<String>? = null,
+        invalidVoltage: Boolean = false
     ): TelegramEventResult {
         val elapsedMs = sequence * SAMPLE_INTERVAL_MS
         val source = PollSampleSource(
@@ -204,14 +225,19 @@ class TelegramChargingEtaRuntimeTest {
         val readings = listOf(
             PollReading("statistic_1014_1145045040_5", soc.toInt().toString()),
             floatReading("power_battery_remain_electricity", 20.0),
-            PollReading("charging_charge_battery_volt", "400"),
+            PollReading("charging_charge_battery_volt", if (invalidVoltage) null else "400"),
             floatReading("charging_charge_current", currentAmps),
             PollReading("charging_1009_876609586_5", gunType.toString(), gunType.toString()),
             PollReading("charging_1009_876609592_5", chargeType.toString(), chargeType.toString()),
             PollReading("charging_1009_876609560_5", bmsState.toString(), bmsState.toString()),
             PollReading("charging_1009_1146095640_5", "0", "0"),
             PollReading("charging_1009_1146095648_5", "0", "0")
-        )
+        ).filter { onlyKeys == null || it.rawKey in onlyKeys }.map { reading ->
+            if (!qualified) reading else reading.copy(getLineage = DirectGetLineage(
+                BOOT_ID, "eta-helper", 1, 1L, "eta-read:$sequence:${reading.rawKey}", sequence,
+                WALL_BASE + elapsedMs, elapsedMs, WALL_BASE + elapsedMs, elapsedMs, -1L, -1L, false
+            ))
+        }
         val wallMs = WALL_BASE + elapsedMs
         return engine.onSourcePoll(
             pollId = sequence,

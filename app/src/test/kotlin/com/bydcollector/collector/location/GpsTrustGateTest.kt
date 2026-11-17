@@ -20,6 +20,25 @@ import kotlin.test.*
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29])
 class GpsTrustGateTest {
+    @Test fun heldCanSpeedKeepsGpsProtectionAndLossClearsItsAlignmentWindow() {
+        val reference = VehicleSpeedReference(nowElapsedMs = { 60_000L })
+        reference.observe(0.0, 0L, continuous = true)
+        assertEquals(0.0, reference.current())
+        val fast = sample(60_000L, 50.0, false).copy(speedMps = 200.0 / 3.6)
+        assertEquals("vehicle_speed_mismatch", GpsTrustGate().offer(fast, reference.current()).reason)
+        reference.observe(100.0, 61_000L, continuous = true)
+        assertEquals(0.0, reference.current(60_000L))
+        reference.observe(0.0, 62_000L, continuous = true)
+        assertEquals(100.0, reference.current(64_000L))
+        assertEquals(0.0, reference.current(64_001L))
+        reference.observe(null, 65_000L)
+        assertNull(reference.current(65_000L))
+        assertTrue(GpsTrustGate().offer(fast, reference.current()).trusted)
+        val legacy = VehicleSpeedReference(nowElapsedMs = { 2_001L })
+        legacy.observe(0.0, 0L)
+        assertNull(legacy.current())
+    }
+
     @Test fun rejectedGpsCannotReplacePersistedTripAnchorOrLeakIntoNextTrip() {
         val context = RuntimeEnvironment.getApplication()
         val dbName = "gps-trip-recovery.db"

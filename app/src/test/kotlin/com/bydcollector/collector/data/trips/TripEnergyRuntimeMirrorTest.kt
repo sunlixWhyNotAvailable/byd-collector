@@ -25,6 +25,26 @@ import kotlin.test.assertTrue
 @Config(sdk = [29], application = Application::class)
 class TripEnergyRuntimeMirrorTest {
     @Test
+    fun routePowerUsesTheIntervalAtTheFixAndStopsAtActualLoss() {
+        var history = RoutePowerHistory().observe("boot", 0L, 20.0, true)
+        assertEquals(20.0, history.powerAt("boot", 60_000L))
+        history = history.observe("boot", 61_000L, -10.0, true)
+        val sample = com.bydcollector.collector.location.GpsLocationSample(
+            "2026-11-17T08:00:00Z", 1_800_000_000_000L, 60_000_000_000L,
+            "boot", "segment", 50.0, 30.0, 5.0, 10.0, null, null,
+            receiveElapsedRealtimeNanos = 62_000_000_000L)
+        val point = TripMetrics.routePoint("trip", 1L, sample,
+            history.powerAt(sample.bootId, sample.elapsedRealtimeNanos / 1_000_000L))
+        assertEquals(20.0 * 100.0 / 36.0, point.instantaneousConsumptionKwhPer100Km!!, 1e-9)
+        history = history.observe("boot", 62_000L, null, false)
+        assertEquals(-10.0, history.powerAt("boot", 61_500L))
+        assertNull(history.powerAt("boot", 62_000L))
+        assertNull(history.powerAt("other-boot", 61_500L))
+        assertNull(TripMetrics.instantaneousConsumptionKwhPer100Km(20.0, 0.0))
+        assertNull(RoutePowerHistory().observe("boot", 0L, 20.0, false).powerAt("boot", 2_001L))
+    }
+
+    @Test
     fun pageClosingAnExistingSessionAndStartingAnotherKeepsBothFinalIntegrals() {
         val context = RuntimeEnvironment.getApplication()
         val name = "multi_session_energy_${System.nanoTime()}.db"

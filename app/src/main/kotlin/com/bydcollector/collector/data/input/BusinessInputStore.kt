@@ -551,8 +551,10 @@ class BusinessInputStore(
         }
         require(afterId >= 0L) { "business input history cursor must be non-negative" }
         require(limit in 1..MAX_HISTORY_PAGE) { "business input history limit must be 1..$MAX_HISTORY_PAGE" }
+        // Whole-prefix replay walks the INTEGER PRIMARY KEY once, instead of sorting the entire time range per page.
+        val access = if (fromElapsedMs == 0L) "NOT INDEXED" else ""
         return database().rawQuery(
-            "SELECT ${REF_COLUMNS.joinToString(", ")} FROM $JOURNAL j " +
+            "SELECT ${REF_COLUMNS.joinToString(", ")} FROM $JOURNAL j $access " +
                 "WHERE j.source_boot_id = ? AND j.acquired_elapsed_ms >= ? AND j.acquired_elapsed_ms <= ? " +
                 "AND j.id > ? ORDER BY j.id LIMIT ?",
             arrayOf(bootId, fromElapsedMs.toString(), throughElapsedMs.toString(), afterId.toString(), limit.toString())

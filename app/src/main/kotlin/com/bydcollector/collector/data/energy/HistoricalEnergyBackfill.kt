@@ -224,7 +224,7 @@ internal class HistoricalBusinessEnergyAccumulator(
         val tripEnd = requireNotNull(endedElapsedMs)
         if (sourceElapsed > tripEnd) return
 
-        val incoming = BusinessInputProjection.incoming(delta)
+        val incoming = BusinessInputProjection.incoming(delta, inputs)
         val previousEvaluation = previousEvaluationElapsedMs
         val merged = BusinessInputReducer.merge(inputs, incoming, tripBootId)
         val mergedContinuity = BusinessInputReducer.mergeContinuity(continuity, delta.continuityUpdates, tripBootId, merged.inputs)
@@ -257,7 +257,8 @@ internal class HistoricalBusinessEnergyAccumulator(
         }
         val sourceIdentity = EnergyReceipt.businessIdentity(businessGeneration, ref.id)
         val receipt = EnergyTelemetryProjection.receipt(
-            source.copy(identity = sourceIdentity), observedAt, readings, observations
+            source.copy(identity = sourceIdentity), observedAt, readings, observations,
+            EnergyTelemetryProjection.intervalContinuity(previousInputs, previousContinuity, delta, normalizer)
         ).copy(
             businessGeneration = businessGeneration,
             businessInputId = ref.id,
@@ -288,7 +289,7 @@ internal class HistoricalBusinessEnergyAccumulator(
             val integration = if (receipt.lateRelevantSource) {
                 BatteryEnergyIntegrator.reanchorAfterLateSource(anchor, totals, evaluationInput)
             } else {
-                BatteryEnergyIntegrator.finishSession(anchor, totals, evaluationInput)
+                BatteryEnergyIntegrator.finishSession(anchor, totals, evaluationInput, previousEvaluationElapsedMs)
             }
             totals = integration.totals
             anchor = integration.anchor
@@ -301,7 +302,7 @@ internal class HistoricalBusinessEnergyAccumulator(
             val integration = if (receipt.lateRelevantSource) {
                 BatteryEnergyIntegrator.reanchorAfterLateSource(anchor, totals, evaluationInput)
             } else {
-                BatteryEnergyIntegrator.integrate(anchor, totals, evaluationInput)
+                BatteryEnergyIntegrator.integrate(anchor, totals, evaluationInput, previousEvaluationElapsedMs)
             }
             totals = integration.totals
             anchor = integration.anchor

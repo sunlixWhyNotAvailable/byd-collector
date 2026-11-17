@@ -22,6 +22,7 @@ import com.bydcollector.collector.data.energy.HistoricalBusinessEnergyAccumulato
 import com.bydcollector.collector.data.energy.HistoricalEnergyResult
 import com.bydcollector.collector.data.energy.HistoricalBackfillFinalizationGate
 import com.bydcollector.collector.data.input.BusinessInputProjection
+import com.bydcollector.collector.data.input.BusinessInputKind
 import com.bydcollector.collector.data.local.HistoricalBusinessInputSource
 import java.util.concurrent.locks.ReentrantLock
 import com.bydcollector.collector.diagnostics.OperationalEventJournal
@@ -494,15 +495,13 @@ class BydCollectorApplication : Application() {
             return historicalEnergyRetry("active_main_replaced")
         }
         val accumulator = HistoricalBusinessEnergyAccumulator(candidate, source.businessGeneration, seedRead.seed)
-        val lookback = BusinessInputProjection.energyHistoryLookbackMs
-        val fromElapsed = if (tripStart < lookback) 0L else tripStart - lookback
         var afterInputId = 0L
         while (true) {
             if (!historicalEnergyCanContinue(generation)) return false
             val page = tryDatabaseRead {
                 StoreReadResult(
                     telemetryStore?.historicalBusinessInputPage(
-                        tripBoot, fromElapsed, tripEnd, afterInputId, HISTORICAL_BUSINESS_PAGE_SIZE
+                        tripBoot, 0L, tripEnd, afterInputId, HISTORICAL_BUSINESS_PAGE_SIZE
                     )
                 )
             }?.value ?: return historicalEnergyRetry("main_maintenance_busy")
@@ -512,6 +511,8 @@ class BydCollectorApplication : Application() {
             if (page.inputs.isEmpty()) break
             for (ref in page.inputs) {
                 if (!historicalEnergyCanContinue(generation)) return false
+                // Callback/boundary keys live in the payload, not necessarily in readingKeys.
+                if (checkNotNull(ref.acquiredElapsedMs) < tripStart && ref.kind == BusinessInputKind.TIMER) continue
                 val delta = tryDatabaseRead {
                     StoreReadResult(telemetryStore?.loadBusinessInputDelta(ref))
                 }?.value ?: return historicalEnergyRetry("main_maintenance_busy")

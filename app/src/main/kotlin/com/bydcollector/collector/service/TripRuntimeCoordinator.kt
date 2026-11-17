@@ -9,6 +9,8 @@ import com.bydcollector.collector.data.normalized.NormalizedSourceStamp
 import com.bydcollector.collector.data.trips.RoutePoint
 import com.bydcollector.collector.data.trips.TripId
 import com.bydcollector.collector.data.trips.TripMetrics
+import com.bydcollector.collector.data.trips.RoutePowerHistory
+import com.bydcollector.collector.data.normalized.NormalizedFieldCatalog
 import com.bydcollector.collector.data.trips.TripSession
 import com.bydcollector.collector.data.trips.TripCounterCoverage
 import com.bydcollector.collector.data.trips.TripStore
@@ -67,6 +69,7 @@ class TripRuntimeCoordinator(
     @Volatile private var ownerThread: Thread? = null
     private var initialized = false
     private var pageLocations: MutableList<NormalizedObservation>? = null
+    private var pageSpeedUpdates: MutableList<() -> Unit>? = null
     private var pageGpsRequested = false
     private var session: TripSession? = null
     private var nextRouteSequence = 0L
@@ -75,9 +78,7 @@ class TripRuntimeCoordinator(
     private var lastLocation: GpsLocationSample? = null
     private var trustAnchor: GpsLocationSample? = null
     private var lastLocationTripId: String? = null
-    private var latestBatteryPowerKw: Double? = null
-    private var latestBatteryPowerAtMs = Long.MIN_VALUE
-    private var latestBatteryPowerBootId: String? = null
+    private var routePower = RoutePowerHistory()
     private val vehicleSpeedReference = VehicleSpeedReference(nowElapsedMs = elapsedRealtimeMs)
     private val locationSource = AndroidGpsLocationSource(
         context = context,
@@ -104,8 +105,10 @@ class TripRuntimeCoordinator(
         },
         bootIdProvider = { bootId },
         segmentIdProvider = { segmentId },
-        vehicleSpeedReferenceKmh = vehicleSpeedReference::current
+        vehicleSpeedReferenceKmh = ::vehicleSpeedAt
     )
+
+    internal fun vehicleSpeedAt(elapsedMs: Long): Double? = vehicleSpeedReference.current(elapsedMs)
 
     fun onSuccessfulPoll(
         timestamp: String,
@@ -130,9 +133,7 @@ class TripRuntimeCoordinator(
                 // Capture the frontier here, not when Telegram eventually runs: a later
                 // OFF must never be applied before this earlier queued ON/poll input.
                 beforeBoundary(tripStore.completionWatermark())
-                latestBatteryPowerKw = snapshot.batteryPowerKw
-                latestBatteryPowerAtMs = snapshot.receivedElapsedMs
-                latestBatteryPowerBootId = bootId
+                routePower = routePower.observe(bootId, snapshot.receivedElapsedMs, snapshot.batteryPowerKw, false)
 
                 val decodedPower = readings.firstOrNull { it.rawKey == POWER_FIELD_KEY }
                     ?.descValue
@@ -177,7 +178,8 @@ class TripRuntimeCoordinator(
         liveTelemetry: Boolean,
         energySnapshot: EnergySnapshot? = null,
         eventSourceStamp: NormalizedSourceStamp? = null,
-        allowWhilePaused: Boolean = false
+        allowWhilePaused: Boolean = false,
+        continuousSources: Map<String, Long> = emptyMap()
     ): CompletableFuture<TripBusinessResult> {
         val future = CompletableFuture<TripBusinessResult>()
         if (!running.get()) {
@@ -189,9 +191,7 @@ class TripRuntimeCoordinator(
             return future
         }
         val work: () -> Unit = task@ {
-            val priorBatteryPowerKw = latestBatteryPowerKw
-            val priorBatteryPowerAtMs = latestBatteryPowerAtMs
-            val priorBatteryPowerBootId = latestBatteryPowerBootId
+            val priorRoutePower = routePower
             try {
                 check(running.get()) { "Trips runtime is closed" }
                 check(allowWhilePaused || !paused.get()) { "Trips runtime is paused" }
@@ -226,14 +226,22 @@ class TripRuntimeCoordinator(
                     }
                 )
                 val speedElapsedMs = snapshot.speedElapsedMs
-                if (liveTelemetry && speedElapsedMs != null && snapshot.speedBootId == bootId) {
-                    vehicleSpeedReference.observe(snapshot.speedKmh, speedElapsedMs)
+                val updateSpeed: (() -> Unit)? = if (currentStamp?.bootId == bootId && snapshot.speedKmh == null) {
+                    { vehicleSpeedReference.clear() }
+                } else if (liveTelemetry && speedElapsedMs != null && snapshot.speedBootId == bootId) {
+                    val speedSources = NormalizedFieldCatalog.fields.first { it.fieldKey == "speed_kmh" }
+                        .sourceKeys.mapNotNull(continuousSources::get)
+                    val heldSpeed = speedSources.isNotEmpty()
+                    val at = if (heldSpeed) speedSources.max() else speedElapsedMs
+                    ({ vehicleSpeedReference.observe(snapshot.speedKmh, at, heldSpeed) })
+                } else null
+                if (currentStamp?.bootId == bootId) {
+                    val powerSources = NormalizedFieldCatalog.batteryPower.sourceKeys.mapNotNull(continuousSources::get)
+                    val heldPower = powerSources.size == NormalizedFieldCatalog.batteryPower.sourceKeys.size && snapshot.batteryPowerKw != null
+                    val powerAt = if (heldPower) powerSources.max() else if (snapshot.batteryPowerKw == null) eventElapsedMs
+                        else snapshot.batteryPowerElapsedMs ?: eventElapsedMs
+                    routePower = routePower.observe(bootId, powerAt, snapshot.batteryPowerKw, heldPower)
                 }
-                latestBatteryPowerKw = snapshot.batteryPowerKw
-                latestBatteryPowerAtMs = snapshot.batteryPowerElapsedMs
-                    ?.takeIf { snapshot.batteryPowerBootId == bootId }
-                    ?: Long.MIN_VALUE
-                latestBatteryPowerBootId = snapshot.batteryPowerBootId
 
                 val decodedPower = readings.firstOrNull { it.rawKey == POWER_FIELD_KEY }
                     ?.descValue?.trim()?.toIntOrNull()
@@ -260,6 +268,8 @@ class TripRuntimeCoordinator(
                     TripBusinessInputMutation(mutation, mutation.powerSessionId)
                 }
                 if (committed.applied) {
+                    // GPS callbacks run on another thread and must never see a rolled-back page.
+                    if (updateSpeed != null) pageSpeedUpdates?.add(updateSpeed) ?: updateSpeed()
                     val mutation = checkNotNull(committed.value)
                     if (!allowWhilePaused && powerTracker.current() == VehiclePowerState.ON) {
                         if (!locationCaptureEnabled()) stopGps()
@@ -287,9 +297,7 @@ class TripRuntimeCoordinator(
                     )
                 }
             } catch (error: Throwable) {
-                latestBatteryPowerKw = priorBatteryPowerKw
-                latestBatteryPowerAtMs = priorBatteryPowerAtMs
-                latestBatteryPowerBootId = priorBatteryPowerBootId
+                routePower = priorRoutePower
                 try {
                     if (pageLocations == null) restoreRuntimeFromDurableState()
                 } catch (restoreError: Throwable) {
@@ -324,7 +332,7 @@ class TripRuntimeCoordinator(
         try {
             executor.execute {
                 ownerThread = Thread.currentThread()
-                val priorPower = Triple(latestBatteryPowerKw, latestBatteryPowerAtMs, latestBatteryPowerBootId)
+                val priorPower = routePower
                 try {
                     check(running.get() && (allowWhilePaused || !paused.get())) { "Trips page owner stopped" }
                     ensureInitialized()
@@ -332,17 +340,19 @@ class TripRuntimeCoordinator(
                     beforeTransaction()
                     val locations = mutableListOf<NormalizedObservation>()
                     pageLocations = locations
+                    pageSpeedUpdates = mutableListOf()
                     pageGpsRequested = false
                     val page = tripStore.commitBusinessPage { calculate().copy(locationObservations = locations.toList()) }
+                    synchronized(vehicleSpeedReference) { pageSpeedUpdates?.forEach { it() } }
+                    pageSpeedUpdates = null
                     pageLocations = null
                     if (powerTracker.current() == VehiclePowerState.OFF || !locationCaptureEnabled()) stopGps()
                     else if (pageGpsRequested && !allowWhilePaused) ensureGpsRunning()
                     future.complete(page)
                 } catch (error: Throwable) {
                     pageLocations = null
-                    latestBatteryPowerKw = priorPower.first
-                    latestBatteryPowerAtMs = priorPower.second
-                    latestBatteryPowerBootId = priorPower.third
+                    pageSpeedUpdates = null
+                    routePower = priorPower
                     try { restoreRuntimeFromDurableState() } catch (restore: Throwable) { error.addSuppressed(restore) }
                     future.completeExceptionally(error)
                 }
@@ -369,6 +379,7 @@ class TripRuntimeCoordinator(
         runCatching {
             executor.execute {
                 ownerThread = Thread.currentThread()
+                vehicleSpeedReference.clear()
                 stopGps()
                 if (session != null) handleGap(reason, Instant.now().toString())
                 tripStore.checkpoint()
@@ -381,6 +392,7 @@ class TripRuntimeCoordinator(
         paused.set(true)
         val future = executor.submit {
             ownerThread = Thread.currentThread()
+            vehicleSpeedReference.clear()
             stopGps()
             if (session != null) handleGap(reason, Instant.now().toString())
             tripStore.checkpoint()
@@ -392,6 +404,7 @@ class TripRuntimeCoordinator(
         if (!running.get()) return
         val future = executor.submit {
             ownerThread = Thread.currentThread()
+            vehicleSpeedReference.clear()
             stopGps()
             if (session != null && !paused.get()) handleGap("service_destroyed", Instant.now().toString())
             tripStore.checkpoint()
@@ -625,13 +638,8 @@ class TripRuntimeCoordinator(
         persistOrBufferLocation(LocationNormalizer.observations(sample, sample.receiveWallTimeMs))
         val current = session ?: return
         lastLocationTripId = current.tripId
-        val sampleElapsedMs = sample.receiveElapsedRealtimeNanos / 1_000_000L
-        val powerAgeMs = if (sample.bootId == latestBatteryPowerBootId && sample.bootId == bootId) {
-            sampleElapsedMs - latestBatteryPowerAtMs
-        } else Long.MIN_VALUE
-        val power = latestBatteryPowerKw.takeIf {
-            powerAgeMs in 0L..TELEMETRY_FRESH_MS
-        }
+        val power = if (sample.bootId == bootId) routePower.powerAt(sample.bootId,
+            sample.elapsedRealtimeNanos / 1_000_000L) else null
         val point = TripMetrics.routePoint(
             tripId = current.tripId,
             sequence = nextRouteSequence++,
@@ -812,7 +820,6 @@ class TripRuntimeCoordinator(
         private const val THREAD_NAME = "byd-trips"
         private const val POWER_FIELD_KEY = "bodywork_power_level"
         private const val MOVEMENT_THRESHOLD_KMH = 0.5
-        private const val TELEMETRY_FRESH_MS = 2_000L
         private const val COUNTER_EPSILON = 1e-6
 
         private fun readBootId(): String = runCatching {

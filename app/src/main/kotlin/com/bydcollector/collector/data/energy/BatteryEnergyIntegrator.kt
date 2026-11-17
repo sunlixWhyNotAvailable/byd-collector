@@ -24,6 +24,9 @@ data class EnergyTotals(
     }
 }
 
+/** Null proof means an observed callback interval whose continuity is not established. */
+data class EnergyIntervalContinuity(val previousValidSinceMs: Long?)
+
 data class EnergyInput(
     val bootId: String,
     val elapsedMs: Long,
@@ -31,7 +34,8 @@ data class EnergyInput(
     val current: Double?,
     val powerOn: Boolean?,
     val gunDisconnected: Boolean?,
-    val externalCharging: Boolean?
+    val externalCharging: Boolean?,
+    val continuity: EnergyIntervalContinuity? = null
 )
 
 enum class EnergyIntegrationQuality {
@@ -54,14 +58,16 @@ enum class EnergyIntegrationReason {
     NON_MONOTONIC_TIME,
     GAP_EXCEEDED,
     ZERO_INTERVAL,
-    LATE_SOURCE_REANCHORED
+    LATE_SOURCE_REANCHORED,
+    SOURCE_CONTINUITY_UNKNOWN
 }
 
 data class EnergyIntegrationResult(
     val totals: EnergyTotals,
     val anchor: EnergyAnchor?,
     val quality: EnergyIntegrationQuality,
-    val reason: EnergyIntegrationReason
+    val reason: EnergyIntegrationReason,
+    val heldInterval: Boolean = false
 )
 
 object BatteryEnergyIntegrator {
@@ -71,10 +77,14 @@ object BatteryEnergyIntegrator {
     fun integrate(
         previousAnchor: EnergyAnchor?,
         totals: EnergyTotals,
-        input: EnergyInput
+        input: EnergyInput,
+        previousEvaluationElapsedMs: Long? = null
     ): EnergyIntegrationResult {
         if (input.bootId.isBlank() || input.elapsedMs < 0L) {
             return partial(previousAnchor, totals, input, EnergyIntegrationReason.INVALID_SAMPLE)
+        }
+        if (input.continuity != null) {
+            return integrateCallback(previousAnchor, totals, input, previousEvaluationElapsedMs)
         }
         if (input.powerOn == false) {
             return excluded(totals, EnergyIntegrationReason.POWER_OFF)
@@ -173,6 +183,34 @@ object BatteryEnergyIntegrator {
         )
     }
 
+    private fun integrateCallback(previous: EnergyAnchor?, totals: EnergyTotals, input: EnergyInput,
+        previousEvaluationElapsedMs: Long?): EnergyIntegrationResult {
+        val since = input.continuity?.previousValidSinceMs
+        val duration = previous?.takeIf { it.bootId == input.bootId }?.let { input.elapsedMs - it.elapsedMs }
+        val covered = previous != null && duration != null && duration > 0L &&
+            previous.elapsedMs >= 0L && previous.powerKw.isFinite() && since != null &&
+            since >= 0L && since <= previous.elapsedMs
+        val missing = if (duration != null && duration > 0L && !covered) duration else
+            if (previous == null && totals.partial && previousEvaluationElapsedMs != null)
+                (input.elapsedMs - previousEvaluationElapsedMs).coerceAtLeast(0L) else 0L
+        val boundaryInvalid = previous != null && (previous.bootId != input.bootId || duration == null || duration < 0L)
+        val advanced = if (covered) integrateCoveredInterval(totals, previous!!.powerKw, previous.powerKw,
+            requireNotNull(duration), held = true) else totals.copy(
+            uncoveredMs = addDuration(totals.uncoveredMs, missing),
+            partial = totals.partial || missing > 0L || boundaryInvalid)
+        // The new value governs only the next interval, even when this event is a loss or OFF.
+        val next = integrate(null, advanced, input.copy(continuity = null))
+        return when {
+            covered -> next.copy(quality = if (next.quality == EnergyIntegrationQuality.PARTIAL) next.quality
+                else EnergyIntegrationQuality.COVERED,
+                reason = if (next.quality == EnergyIntegrationQuality.ANCHOR_ONLY) EnergyIntegrationReason.INTEGRATED else next.reason,
+                heldInterval = true)
+            missing > 0L || boundaryInvalid -> next.copy(quality = EnergyIntegrationQuality.PARTIAL,
+                reason = if (next.quality == EnergyIntegrationQuality.ANCHOR_ONLY) EnergyIntegrationReason.SOURCE_CONTINUITY_UNKNOWN else next.reason)
+            else -> next
+        }
+    }
+
     fun reanchorAfterLateSource(
         previousAnchor: EnergyAnchor?,
         totals: EnergyTotals,
@@ -205,8 +243,12 @@ object BatteryEnergyIntegrator {
     fun finishSession(
         previousAnchor: EnergyAnchor?,
         totals: EnergyTotals,
-        input: EnergyInput
+        input: EnergyInput,
+        previousEvaluationElapsedMs: Long? = null
     ): EnergyIntegrationResult {
+        if (input.continuity != null && input.powerOn == false) {
+            return integrate(previousAnchor, totals, input, previousEvaluationElapsedMs)
+        }
         require(input.powerOn == false) { "Energy session can finish only on confirmed power off" }
         val intervalMs = previousAnchor
             ?.takeIf { it.bootId == input.bootId }
@@ -300,8 +342,10 @@ object BatteryEnergyIntegrator {
             current != null && current.isFinite() && (voltage * current / 1_000.0).isFinite()
     }
 
-    fun integrateCoveredInterval(totals: EnergyTotals, startKw: Double, endKw: Double, intervalMs: Long): EnergyTotals {
-        require(startKw.isFinite() && endKw.isFinite() && intervalMs in 0..MAX_INTERVAL_MS)
+    fun integrateCoveredInterval(totals: EnergyTotals, startKw: Double, endKw: Double, intervalMs: Long,
+        held: Boolean = false): EnergyTotals {
+        require(startKw.isFinite() && endKw.isFinite() && intervalMs >= 0L &&
+            (if (held) startKw == endKw else intervalMs <= MAX_INTERVAL_MS))
         val energy = splitTrapezoid(startKw, endKw, intervalMs)
         return totals.copy(dischargedKwh = totals.dischargedKwh + energy.dischargedKwh,
             regeneratedKwh = totals.regeneratedKwh + energy.regeneratedKwh,

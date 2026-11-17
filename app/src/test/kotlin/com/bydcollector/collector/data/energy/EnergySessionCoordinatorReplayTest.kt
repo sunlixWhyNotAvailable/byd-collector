@@ -24,6 +24,71 @@ import kotlin.test.assertTrue
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
 class EnergySessionCoordinatorReplayTest {
+    @Test fun qualifiedIntervalsMatchLiveTimersAndSparseReplayAcrossSqliteReopen() {
+        val context = RuntimeEnvironment.getApplication()
+        val base = 1_793_000_000_000L
+        fun run(timers: Boolean): EnergySnapshot {
+            val name = "held_energy_$timers.db"
+            var store = TripStore(TripDatabaseHelper(context, name))
+            var engine = EnergySessionCoordinator(store)
+            var inputs = emptyMap<String, NormalizedSourceInput>()
+            var continuity = emptyMap<String, BusinessInputContinuity>()
+            val normalizer = VehicleStateNormalizer()
+            var id = 0L
+            fun feed(ms: Long, vararg values: Pair<String, String>): EnergySnapshot {
+                id++
+                val stamp = normalizedCallbackSourceStamp("boot", "helper", 1, 1, id, base + ms, ms, 1)
+                val updates = values.associate { (key, value) -> key to NormalizedSourceInput(PollReading(key, value, value), stamp, null) }
+                val states = updates.mapValues { BusinessInputContinuity(BusinessContinuityState.AVAILABLE,
+                    stamp, "callback", stamp.identity, id, true, "callback_value") }
+                val ref = BusinessInputRef(id, if (values.isEmpty()) BusinessInputKind.TIMER else BusinessInputKind.CALLBACK,
+                    null, updates.keys.toList(), stamp.identity, "boot", "helper", id, 1, base + ms, ms,
+                    null, null, BusinessInputOrigin.REPLAY, true, "ok", null, null)
+                val delta = BusinessInputDelta(ref, sourceInputs = updates, continuityUpdates = states)
+                val proof = EnergyTelemetryProjection.intervalContinuity(inputs, continuity, delta, normalizer)
+                val merged = BusinessInputReducer.merge(inputs, updates, "boot")
+                continuity = BusinessInputReducer.mergeContinuity(continuity, states, "boot", merged.inputs).continuity
+                inputs = merged.inputs
+                val fresh = BusinessInputProjection.freshInputs(inputs, "boot", ms, continuity)
+                val receipt = EnergyTelemetryProjection.receipt(PollSampleSource(EnergyReceipt.businessIdentity(name, id),
+                    "boot", ms, "helper", id), java.time.Instant.ofEpochMilli(base + ms).toString(),
+                    fresh.values.map { it.reading }, BusinessInputProjection.observations(normalizer, fresh), proof)
+                    .copy(businessGeneration = name, businessInputId = id)
+                val result = engine.process(receipt)
+                confirm(engine, result)
+                if (!timers && ms == 61_000L) {
+                    store.close()
+                    store = TripStore(TripDatabaseHelper(context, name))
+                    engine = EnergySessionCoordinator(store)
+                    val repeated = engine.process(receipt)
+                    assertTrue(repeated.duplicate)
+                    assertEquals(result.snapshot, repeated.snapshot)
+                    confirm(engine, repeated)
+                    val boundary = assertNotNull(engine.currentSnapshot()?.atBoundary("boot", 31_000L))
+                    assertEquals(1.0 / 6.0, assertNotNull(boundary.dischargedKwh), 1e-10)
+                }
+                return assertNotNull(result.snapshot)
+            }
+            try {
+                feed(0, "bodywork_power_level" to "0", "charging_1009_876609586_5" to "1",
+                    "charging_charge_battery_volt" to "400", "charging_charge_current" to "50")
+                feed(1_000, "bodywork_power_level" to "2")
+                if (timers) for (ms in 2_000L..60_000L step 1_000L) feed(ms)
+                feed(61_000, "charging_charge_current" to "-25")
+                if (timers) for (ms in 62_000L..120_000L step 1_000L) feed(ms)
+                return feed(121_000, "bodywork_power_level" to "0")
+            } finally { store.close(); context.deleteDatabase(name) }
+        }
+        val live = run(true)
+        val replay = run(false)
+        assertEquals(1.0 / 3.0, assertNotNull(replay.dischargedKwh), 1e-10)
+        assertEquals(1.0 / 6.0, assertNotNull(replay.regeneratedKwh), 1e-10)
+        assertEquals(assertNotNull(live.netKwh), assertNotNull(replay.netKwh), 1e-10)
+        assertEquals(120_000L, replay.energyCoveredMs)
+        assertEquals(0L, replay.energyUncoveredMs)
+        assertFalse(replay.energyPartial)
+    }
+
     @Test
     fun sparseGearAndTimersUseCalculatedBoundariesAcrossTwoLegsAndReload() {
         val context = RuntimeEnvironment.getApplication()

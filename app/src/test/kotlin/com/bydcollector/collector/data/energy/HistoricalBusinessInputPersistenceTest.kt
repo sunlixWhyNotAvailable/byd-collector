@@ -16,6 +16,10 @@ import com.bydcollector.collector.data.trips.TripDatabaseHelper
 import com.bydcollector.collector.data.trips.TripSession
 import com.bydcollector.collector.data.trips.TripStore
 import com.bydcollector.collector.diagnostics.OperationalEventJournal
+import com.bydcollector.collector.data.callback.CallbackDelivery
+import com.bydcollector.collector.data.callback.CallbackImportResult
+import com.bydcollector.collector.data.direct.DirectFidRegistry
+import com.bydcollector.collector.direct.TelemetryCallbackBatch
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -30,6 +34,61 @@ import kotlin.test.assertTrue
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
 class HistoricalBusinessInputPersistenceTest {
+    @Test fun retainedCallbackPrefixSurvivesReopenButLossMustRecoverBeforeTrip() {
+        val context = RuntimeEnvironment.getApplication()
+        for (scenario in listOf("steady", "lost", "recovered")) {
+            val name = "historical_prefix_$scenario.db"
+            var helper = TelemetryDatabaseHelper(context, name)
+            var store = newTelemetryStore(context, helper)
+            var sequence = 0L
+            fun imported(batch: TelemetryCallbackBatch) {
+                assertIs<CallbackImportResult.Committed>(store.importCallbackBatch(
+                    batch, TelemetryCallbackBatch.digest(batch.encode()), CallbackDelivery.REPLAY))
+            }
+            fun value(key: String, raw: Int, ms: Long) {
+                val entry = DirectFidRegistry.entries.single { it.key == key }
+                sequence++
+                imported(TelemetryCallbackBatch("prefix-boot", "helper", 1, 1, sequence, 1,
+                    listOf(TelemetryCallbackBatch.Event(sequence, entry.dev, entry.fid,
+                        if (entry.tx == DirectFidRegistry.TX_GET_FLOAT) TelemetryCallbackBatch.TYPE_FLOAT else TelemetryCallbackBatch.TYPE_INT,
+                        raw, null, wallAtElapsed(ms), ms, null, "callback")), emptyList()))
+            }
+            try {
+                store.openSession()
+                value(POWER_KEY, 0, 1_000)
+                value(GUN_KEY, 1, 1_000)
+                value(VOLTAGE_KEY, 400, 1_000)
+                value(CURRENT_KEY, 50f.toRawBits(), 1_000)
+                if (scenario != "steady") {
+                    val entry = DirectFidRegistry.entries.single { it.key == VOLTAGE_KEY }
+                    sequence++
+                    imported(TelemetryCallbackBatch("prefix-boot", "helper", 1, 1, sequence, 1,
+                        emptyList(), listOf(TelemetryCallbackBatch.SourceBoundary(sequence,
+                            TelemetryCallbackBatch.SourceBoundary.SCOPE_ADDRESS, TelemetryCallbackBatch.SourceBoundary.STATE_LOST,
+                            entry.dev, entry.fid, entry.tx, wallAtElapsed(541_000), 541_000,
+                            "source_disconnected", "controlled source boundary", null, null, null))))
+                }
+                if (scenario == "recovered") value(VOLTAGE_KEY, 400, 550_000)
+                value(POWER_KEY, 1, 601_000)
+                value(POWER_KEY, 0, 661_000)
+                value(VOLTAGE_KEY, 999, 662_000)
+                store.close()
+                helper = TelemetryDatabaseHelper(context, name)
+                store = newTelemetryStore(context, helper)
+                val history = BusinessInputStore(database = { helper.writableDatabase })
+                val trip = closedTrip("prefix-$scenario", "prefix-boot", 601_000, 661_000)
+                val result = reconstruct(history, trip, store.businessInputGeneration(), store.loadBusinessInputInitialCheckpoint())
+                if (scenario == "lost") assertIs<HistoricalEnergyResult.Rejected>(result) else {
+                    val snapshot = assertIs<HistoricalEnergyResult.Complete>(result).snapshot
+                    assertEquals(1.0 / 3.0, snapshot.dischargedKwh!!, 1e-10)
+                    assertEquals(60_000L, snapshot.energyCoveredMs)
+                    assertEquals(0L, snapshot.energyUncoveredMs)
+                    assertFalse(snapshot.energyPartial)
+                }
+            } finally { store.close(); context.deleteDatabase(name) }
+        }
+    }
+
     @Test
     fun persistedEventHistory() {
         val context = RuntimeEnvironment.getApplication()
@@ -376,7 +435,7 @@ class HistoricalBusinessInputPersistenceTest {
         val refs = historyPages(
             store,
             requireNotNull(trip.startBootId),
-            requireNotNull(trip.startElapsedMs),
+            0L,
             requireNotNull(trip.endElapsedMs),
             pageSize = 64
         )

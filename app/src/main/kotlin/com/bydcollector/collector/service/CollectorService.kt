@@ -1455,7 +1455,7 @@ class CollectorService : Service() {
             val timestamp = BusinessInputProjection.timestamp(ref)
             val previousInputs = inputs
             val previousContinuity = continuity
-            val merged = BusinessInputReducer.merge(inputs, BusinessInputProjection.incoming(delta), LivePollSource.liveBootId)
+            val merged = BusinessInputReducer.merge(inputs, BusinessInputProjection.incoming(delta, inputs), LivePollSource.liveBootId)
             val mergedContinuity = BusinessInputReducer.mergeContinuity(
                 continuity, delta.continuityUpdates, LivePollSource.liveBootId, merged.inputs
             )
@@ -1485,7 +1485,8 @@ class CollectorService : Service() {
                 }
                 prepareEnergyProjection()
                 val receipt = EnergyTelemetryProjection.receipt(
-                    source.copy(identity = "business:$generation:${ref.id}"), timestamp, readings, observations
+                    source.copy(identity = "business:$generation:${ref.id}"), timestamp, readings, observations,
+                    EnergyTelemetryProjection.intervalContinuity(previousInputs, previousContinuity, delta, vehicleStateNormalizer)
                 ).copy(businessGeneration = generation, businessInputId = ref.id,
                     evaluationBootId = source.bootId, evaluationElapsedMs = evaluatedElapsed,
                     lateRelevantSource = changedEnergy && evaluatedElapsed > source.capturedElapsedMs)
@@ -1505,7 +1506,8 @@ class CollectorService : Service() {
                             if (ref.kind == BusinessInputKind.CALLBACK || ref.kind == BusinessInputKind.CONTINUITY)
                                 NormalizedSourceKind.CALLBACK else NormalizedSourceKind.POLL, source.identity,
                             source.bootId, source.generatorId, source.sequence, checkNotNull(ref.acquiredWallMs), source.capturedElapsedMs),
-                        allowWhilePaused = maintenanceDrain
+                        allowWhilePaused = maintenanceDrain,
+                        continuousSources = BusinessInputProjection.continuousSources(inputs, continuity, source.bootId, evaluatedElapsed)
                     ))
                 } else null
                 if (trip?.closedPowerSession == true) {
@@ -1668,7 +1670,7 @@ class CollectorService : Service() {
         val updates = linkedMapOf<String, NormalizedSourceInput>()
         val continuityUpdates = linkedMapOf<String, BusinessInputContinuity>()
         deltas.forEach { delta ->
-            val merged = BusinessInputReducer.merge(inputs, BusinessInputProjection.incoming(delta), mergeBoot)
+            val merged = BusinessInputReducer.merge(inputs, BusinessInputProjection.incoming(delta, inputs), mergeBoot)
             val mergedContinuity = BusinessInputReducer.mergeContinuity(continuity, delta.continuityUpdates, mergeBoot, merged.inputs)
             inputs = merged.inputs
             continuity = mergedContinuity.continuity
@@ -1711,7 +1713,8 @@ class CollectorService : Service() {
             val elapsed = if (evaluation.lastEvaluationBootId == source.bootId)
                 maxOf(source.capturedElapsedMs, evaluation.lastEvaluationElapsedMs ?: source.capturedElapsedMs) else source.capturedElapsedMs
             val before = BusinessInputProjection.freshInputs(inputs, source.bootId, elapsed, continuity)
-            val merged = BusinessInputReducer.merge(inputs, BusinessInputProjection.incoming(delta), mergeBoot)
+            val intervalContinuity = EnergyTelemetryProjection.intervalContinuity(inputs, continuity, delta, vehicleStateNormalizer)
+            val merged = BusinessInputReducer.merge(inputs, BusinessInputProjection.incoming(delta, inputs), mergeBoot)
             val mergedContinuity = BusinessInputReducer.mergeContinuity(continuity, delta.continuityUpdates, mergeBoot, merged.inputs)
             inputs = merged.inputs
             continuity = mergedContinuity.continuity
@@ -1723,7 +1726,7 @@ class CollectorService : Service() {
             val projectEnergy = BusinessInputProjection.needsEnergyCheckpoint(ref.kind, changedEnergy, merged.updates.keys, false)
             val energyDue = projectEnergy || evaluation.active
             val result = if (energyDue) energy.process(EnergyTelemetryProjection.receipt(
-                source.copy(identity = "business:$generation:${ref.id}"), timestamp, readings, observations
+                source.copy(identity = "business:$generation:${ref.id}"), timestamp, readings, observations, intervalContinuity
             ).copy(businessGeneration = generation, businessInputId = ref.id, evaluationBootId = source.bootId,
                 evaluationElapsedMs = elapsed, lateRelevantSource = changedEnergy && elapsed > source.capturedElapsedMs)) else null
             val snapshot = result?.takeUnless { it.stale }?.snapshot
@@ -1737,7 +1740,8 @@ class CollectorService : Service() {
                     NormalizedSourceStamp(if (ref.kind == BusinessInputKind.CALLBACK || ref.kind == BusinessInputKind.CONTINUITY)
                         NormalizedSourceKind.CALLBACK else NormalizedSourceKind.POLL, source.identity, source.bootId,
                         source.generatorId, source.sequence, checkNotNull(ref.acquiredWallMs), source.capturedElapsedMs),
-                    allowWhilePaused = maintenanceDrain)
+                    allowWhilePaused = maintenanceDrain,
+                    continuousSources = BusinessInputProjection.continuousSources(inputs, continuity, source.bootId, elapsed))
                 check(future.isDone) { "Trips page calculation must stay on its owner thread" }
                 awaitBusinessResult(future)
             } else null
