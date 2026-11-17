@@ -142,12 +142,13 @@ class RuntimeJobsService : Service() {
                         val diagnostic = error.diagnosticDetail(
                             "stage=${if (updateJob) failureStage.name else "runtime_job"} job_id=${job.getString("id")}"
                         )
-                        recordDiagnostic(job, "failed", diagnostic)
+                        val recordedDiagnostic = recordDiagnostic(job, "failed", diagnostic)
                         val storedError = conciseRuntimeJobError(error)
                         change(this, job.getString("id")) {
                             if (it.getString("status") == "running") {
                                 it.put("status", "error")
                                     .put("error", storedError)
+                                if (isAdbDiagnostic(it)) it.put("diagnostic", recordedDiagnostic)
                                 if (updateJob) it.put("errorStage", failureStage.name)
                             }
                         }
@@ -172,7 +173,7 @@ class RuntimeJobsService : Service() {
         if (lanes.isEmpty() && !DiagnosticLogRecorder.isRecording()) stopSelf(lastStartId)
     }
 
-    private fun recordDiagnostic(job: JSONObject, outcome: String, detail: String) {
+    private fun recordDiagnostic(job: JSONObject, outcome: String, detail: String): String {
         val safeDetail = runCatching { DiagnosticShareSanitizer().sanitizeText(detail) }
             .getOrElse { "[original diagnostic withheld; sanitization failed]" }
         val marker = "\n[TRUNCATED; limit=32768 chars]"
@@ -192,6 +193,7 @@ class RuntimeJobsService : Service() {
                 )
             }
         }
+        return boundedDetail
     }
 
     private fun throwIfUpdateCancelled(id: String) {
@@ -269,7 +271,12 @@ class RuntimeJobsService : Service() {
                 check(recordingPrefs(this).edit().putBoolean("recording", false).commit())
                 JSONObject().put("path", DiagnosticLogRecorder.stop()?.absolutePath)
             }
-            "logShare" -> JSONObject().put("uri", grant(DiagnosticLogRecorder.prepareShareBundle(this)))
+            "logShare" -> {
+                val file = DiagnosticLogRecorder.prepareShareBundle(this)
+                val uri = if (isAdbDiagnostic(job)) FileProvider.getUriForFile(this, "$packageName.fileprovider", file).toString()
+                    else grant(file)
+                JSONObject().put("uri", uri)
+            }
             "logClear" -> DiagnosticLogRecorder.clearCompleted(this).let {
                 JSONObject().put("removed", it.removed).put("warnings", JSONArray(it.warnings))
             }
@@ -430,7 +437,9 @@ class RuntimeJobsService : Service() {
                         return active.getString("id")
                     }
             }
-            all.firstOrNull { it.getString("kind") == kind && it.getString("status") in setOf("queued", "running", "cancelling") }
+            all.firstOrNull { it.getString("kind") == kind &&
+                (kind !in setOf("logShare", "logClear") || isAdbDiagnostic(it) == (args.optString("origin") == "adb")) &&
+                it.getString("status") in setOf("queued", "running", "cancelling") }
                 ?.let { return it.getString("id") }
             check(all.count { it.getString("status") in setOf("queued", "running", "cancelling") } < 16) { "Background task queue is full" }
             val id = UUID.randomUUID().toString()
@@ -480,13 +489,23 @@ class RuntimeJobsService : Service() {
             }
             return synchronized(LOCK) {
                 JSONArray(load(context).filterNot {
-                    it.optBoolean("presented") || (it.optString("kind") == "updateDownload" && it.optBoolean("targetInstalled"))
+                    isAdbDiagnostic(it) || it.optBoolean("presented") ||
+                        (it.optString("kind") == "updateDownload" && it.optBoolean("targetInstalled"))
                 }.map { item ->
                     JSONObject(item.toString()).apply {
                         if (optString("kind") != "updateDownload") optJSONObject("args")?.remove("notes")
                     }
                 }).toString()
             }
+        }
+
+        private fun isAdbDiagnostic(job: JSONObject): Boolean =
+            job.optString("kind") in setOf("logShare", "logClear") && job.optJSONObject("args")?.optString("origin") == "adb"
+
+        internal fun adbDiagnosticJob(context: Context, id: String): JSONObject = synchronized(LOCK) {
+            val job = load(context).firstOrNull { it.optString("id") == id && isAdbDiagnostic(it) }
+                ?: throw IllegalArgumentException("Diagnostic operation not found: $id")
+            JSONObject(job.toString())
         }
 
         internal fun updateInfo(job: JSONObject): UpdateInfo = job.getJSONObject("args").let { args ->

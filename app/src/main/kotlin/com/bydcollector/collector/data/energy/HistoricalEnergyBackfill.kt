@@ -1,12 +1,10 @@
 package com.bydcollector.collector.data.energy
 
 import com.bydcollector.collector.data.local.HistoricalEnergyPoll
-import com.bydcollector.collector.data.local.PollReading
 import com.bydcollector.collector.data.input.BusinessInputDelta
 import com.bydcollector.collector.data.input.BusinessInputKind
 import com.bydcollector.collector.data.input.BusinessInputProjection
 import com.bydcollector.collector.data.input.BusinessInputReducer
-import com.bydcollector.collector.data.normalized.NormalizedQuality
 import com.bydcollector.collector.data.normalized.NormalizedSourceInput
 import com.bydcollector.collector.data.normalized.VehicleStateNormalizer
 import com.bydcollector.collector.data.polling.PollSampleSource
@@ -81,9 +79,6 @@ internal class HistoricalEnergyAccumulator(
         if (!poll.ok) return reject("failed_poll")
 
         val observations = normalizer.normalize(poll.pollId, poll.timestamp, poll.readings)
-        if (invalidPresentOptionalVeto(poll.readings, observations.associateBy { it.field.fieldKey })) {
-            return reject("invalid_charge_veto")
-        }
         val sourceLabel = "historical-main-session:${poll.sessionId}:epoch-ms-not-uptime"
         val receipt = EnergyTelemetryProjection.receipt(
             PollSampleSource(sourceLabel, sourceLabel, instant.toEpochMilli()),
@@ -152,22 +147,7 @@ internal class HistoricalEnergyAccumulator(
         failure = reason
     }
 
-    private fun invalidPresentOptionalVeto(
-        readings: List<PollReading>,
-        observations: Map<String, com.bydcollector.collector.data.normalized.NormalizedObservation>
-    ): Boolean = OPTIONAL_VETO_FIELDS.any { (rawKey, fieldKey) ->
-        readings.firstOrNull { it.rawKey == rawKey }
-            ?.let { it.rawValue != null || it.descValue != null } == true &&
-            observations[fieldKey]?.quality != NormalizedQuality.OK
-    }
-
     companion object {
-        private val OPTIONAL_VETO_FIELDS = mapOf(
-            "charging_1009_89128973_5" to "charger_connected_raw",
-            "charging_charging_vtov_discharge_status" to "v2l_discharge_active_raw",
-            "charging_1009_876609560_5" to "charging_battery_device_state"
-        )
-
         internal fun overlaps(candidate: TripSession, other: TripSession): Boolean {
             if (candidate.tripId == other.tripId) return false
             val candidateStart = parse(candidate.startedAt) ?: return true
@@ -252,13 +232,10 @@ internal class HistoricalBusinessEnergyAccumulator(
         }
         val observations = BusinessInputProjection.observations(normalizer, fresh)
         val readings = fresh.values.map { it.reading }
-        if (invalidPresentOptionalVeto(readings, observations.associateBy { it.field.fieldKey })) {
-            return reject("invalid_charge_veto")
-        }
         val sourceIdentity = EnergyReceipt.businessIdentity(businessGeneration, ref.id)
         val receipt = EnergyTelemetryProjection.receipt(
             source.copy(identity = sourceIdentity), observedAt, readings, observations,
-            EnergyTelemetryProjection.intervalContinuity(previousInputs, previousContinuity, delta, normalizer)
+            EnergyTelemetryProjection.intervalContinuity(previousInputs, previousContinuity, delta)
         ).copy(
             businessGeneration = businessGeneration,
             businessInputId = ref.id,
@@ -345,22 +322,8 @@ internal class HistoricalBusinessEnergyAccumulator(
         failure = reason
     }
 
-    private fun invalidPresentOptionalVeto(
-        readings: List<PollReading>,
-        observations: Map<String, com.bydcollector.collector.data.normalized.NormalizedObservation>
-    ): Boolean = OPTIONAL_VETO_FIELDS.any { (rawKey, fieldKey) ->
-        readings.firstOrNull { it.rawKey == rawKey }
-            ?.let { it.rawValue != null || it.descValue != null } == true &&
-            observations[fieldKey]?.quality != NormalizedQuality.OK
-    }
-
     companion object {
         private const val POWER_KEY = "bodywork_power_level"
-        private val OPTIONAL_VETO_FIELDS = mapOf(
-            "charging_1009_89128973_5" to "charger_connected_raw",
-            "charging_charging_vtov_discharge_status" to "v2l_discharge_active_raw",
-            "charging_1009_876609560_5" to "charging_battery_device_state"
-        )
 
         private fun parse(value: String): Instant? = runCatching { Instant.parse(value) }.getOrNull()
     }

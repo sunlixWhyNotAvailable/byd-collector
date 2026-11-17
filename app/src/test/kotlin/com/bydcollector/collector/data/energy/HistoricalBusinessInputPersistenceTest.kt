@@ -4,6 +4,9 @@ import android.app.Application
 import com.bydcollector.collector.data.input.BusinessInputKind
 import com.bydcollector.collector.data.input.BusinessInputStore
 import com.bydcollector.collector.data.input.BusinessInputTimerSource
+import com.bydcollector.collector.data.input.BusinessInputProjection
+import com.bydcollector.collector.data.input.BusinessInputReducer
+import com.bydcollector.collector.data.input.BusinessInputContinuity
 import com.bydcollector.collector.data.local.PersistedPollInput
 import com.bydcollector.collector.data.local.PollReading
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
@@ -36,7 +39,7 @@ import kotlin.test.assertTrue
 class HistoricalBusinessInputPersistenceTest {
     @Test fun retainedCallbackPrefixSurvivesReopenButLossMustRecoverBeforeTrip() {
         val context = RuntimeEnvironment.getApplication()
-        for (scenario in listOf("steady", "lost", "recovered")) {
+        for (scenario in listOf("steady", "lost", "recovered", "charging", "gun", "invalid_current")) {
             val name = "historical_prefix_$scenario.db"
             var helper = TelemetryDatabaseHelper(context, name)
             var store = newTelemetryStore(context, helper)
@@ -59,7 +62,11 @@ class HistoricalBusinessInputPersistenceTest {
                 value(GUN_KEY, 1, 1_000)
                 value(VOLTAGE_KEY, 400, 1_000)
                 value(CURRENT_KEY, 50f.toRawBits(), 1_000)
-                if (scenario != "steady") {
+                // These optional OEM sources have no usable value; they must not erase valid battery measurements.
+                value("charging_1009_89128973_5", 65535, 1_000)
+                value("charging_charging_vtov_discharge_status", 65535, 1_000)
+                value("charging_1009_876609560_5", 65535, 1_000)
+                if (scenario in setOf("lost", "recovered")) {
                     val entry = DirectFidRegistry.entries.single { it.key == VOLTAGE_KEY }
                     sequence++
                     imported(TelemetryCallbackBatch("prefix-boot", "helper", 1, 1, sequence, 1,
@@ -69,6 +76,9 @@ class HistoricalBusinessInputPersistenceTest {
                             "source_disconnected", "controlled source boundary", null, null, null))))
                 }
                 if (scenario == "recovered") value(VOLTAGE_KEY, 400, 550_000)
+                if (scenario == "charging") value("charging_1009_89128973_5", 1, 550_000)
+                if (scenario == "gun") value(GUN_KEY, 2, 550_000)
+                if (scenario == "invalid_current") value(CURRENT_KEY, 65535f.toRawBits(), 550_000)
                 value(POWER_KEY, 1, 601_000)
                 value(POWER_KEY, 0, 661_000)
                 value(VOLTAGE_KEY, 999, 662_000)
@@ -78,15 +88,43 @@ class HistoricalBusinessInputPersistenceTest {
                 val history = BusinessInputStore(database = { helper.writableDatabase })
                 val trip = closedTrip("prefix-$scenario", "prefix-boot", 601_000, 661_000)
                 val result = reconstruct(history, trip, store.businessInputGeneration(), store.loadBusinessInputInitialCheckpoint())
-                if (scenario == "lost") assertIs<HistoricalEnergyResult.Rejected>(result) else {
+                val live = replayLiveEnergy(history, "prefix-boot", 661_000)
+                if (scenario !in setOf("steady", "recovered")) {
+                    assertIs<HistoricalEnergyResult.Rejected>(result)
+                    assertEquals(null, live.dischargedKwh, scenario)
+                } else {
                     val snapshot = assertIs<HistoricalEnergyResult.Complete>(result).snapshot
                     assertEquals(1.0 / 3.0, snapshot.dischargedKwh!!, 1e-10)
                     assertEquals(60_000L, snapshot.energyCoveredMs)
                     assertEquals(0L, snapshot.energyUncoveredMs)
                     assertFalse(snapshot.energyPartial)
+                    assertEquals(snapshot.dischargedKwh, live.dischargedKwh)
+                    assertEquals(snapshot.energyCoveredMs, live.energyCoveredMs)
                 }
             } finally { store.close(); context.deleteDatabase(name) }
         }
+    }
+
+    private fun replayLiveEnergy(history: BusinessInputStore, bootId: String, endMs: Long): EnergySnapshot {
+        val engine = EnergySessionCoordinator(BufferedEnergyStorage(null))
+        val normalizer = com.bydcollector.collector.data.normalized.VehicleStateNormalizer()
+        var inputs = emptyMap<String, NormalizedSourceInput>()
+        var continuity = emptyMap<String, BusinessInputContinuity>()
+        historyPages(history, bootId, 0, endMs, 64).forEach { ref ->
+            val delta = history.loadBusinessInputDelta(ref)
+            val proof = EnergyTelemetryProjection.intervalContinuity(inputs, continuity, delta)
+            inputs = BusinessInputReducer.merge(inputs, BusinessInputProjection.incoming(delta, inputs), bootId).inputs
+            continuity = BusinessInputReducer.mergeContinuity(continuity, delta.continuityUpdates, bootId, inputs).continuity
+            val fresh = BusinessInputProjection.freshInputs(inputs, bootId, requireNotNull(ref.acquiredElapsedMs), continuity)
+            val receipt = EnergyTelemetryProjection.receipt(BusinessInputProjection.source(ref),
+                BusinessInputProjection.timestamp(ref), fresh.values.map { it.reading },
+                BusinessInputProjection.observations(normalizer, fresh), proof)
+                .copy(sourceIdentity = EnergyReceipt.businessIdentity("persisted-probe", ref.id),
+                    businessGeneration = "persisted-probe", businessInputId = ref.id)
+            val result = engine.process(receipt)
+            result.pendingProjection?.let { assertTrue(engine.confirmProjected(it.snapshot.snapshotId)) }
+        }
+        return requireNotNull(engine.currentSnapshot())
     }
 
     @Test

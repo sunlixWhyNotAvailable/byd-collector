@@ -30,20 +30,21 @@ class BusinessInputReducerTest {
             stamp = input("boot", 10, 2).stamp.copy(elapsedMs = 15_000), seedValid = false, reason = "helper_lost")
         val timer = BusinessInputDelta(ref.copy(kind = BusinessInputKind.TIMER, id = 30, ok = true,
             acquiredElapsedMs = 60_000))
-        val normalizer = com.bydcollector.collector.data.normalized.VehicleStateNormalizer()
         fun proof(inputs: Map<String, NormalizedSourceInput>) =
-            com.bydcollector.collector.data.energy.EnergyTelemetryProjection.intervalContinuity(inputs, states, timer, normalizer)
+            com.bydcollector.collector.data.energy.EnergyTelemetryProjection.intervalContinuity(inputs, states, timer)
         assertEquals(20_000L, proof(required)?.previousValidSinceMs)
 
         val knownOptional = value(optional, "0").let { it.copy(stamp = it.stamp.copy(elapsedMs = 10_000, sequence = 1)) }
         val failed = BusinessInputReducer.merge(mapOf(optional to knownOptional),
             BusinessInputProjection.incoming(failure, mapOf(optional to knownOptional)), "boot").inputs
         assertNull(failed.getValue(optional).reading.rawValue)
-        assertNull(proof(required + failed)?.previousValidSinceMs)
+        assertEquals(20_000L, proof(required + failed)?.previousValidSinceMs)
         val recovered = value(optional, "0")
         states[optional] = available(recovered)
         assertEquals(20_000L, proof(required + (optional to recovered))?.previousValidSinceMs)
-        assertNull(proof(required + (optional to recovered.copy(reading = PollReading(optional, "-1", "-1"))))?.previousValidSinceMs)
+        assertEquals(20_000L, proof(required + (optional to recovered.copy(reading = PollReading(optional, "-1", "-1"))))?.previousValidSinceMs)
+        val voltage = "charging_charge_battery_volt"
+        assertNull(proof(required + (voltage to required.getValue(voltage).copy(reading = PollReading(voltage, null, null))))?.previousValidSinceMs)
     }
 
     @Test fun qualifiedContinuityCarriesItsActualBoundaryAndRejectsLossFutureAndOtherOwner() {

@@ -9,14 +9,13 @@ import com.bydcollector.collector.data.normalized.NormalizedValueType
 import com.bydcollector.collector.data.polling.PollSampleSource
 import com.bydcollector.collector.data.input.*
 import com.bydcollector.collector.data.normalized.NormalizedSourceInput
-import com.bydcollector.collector.data.normalized.VehicleStateNormalizer
 
 object EnergyTelemetryProjection {
     /** Proof concerns the state before this journal event, not two valid endpoints. */
     fun intervalContinuity(previous: Map<String, NormalizedSourceInput>,
-        continuity: Map<String, BusinessInputContinuity>, delta: BusinessInputDelta,
-        normalizer: VehicleStateNormalizer): EnergyIntervalContinuity? {
-        val keys = REQUIRED_KEYS + OPTIONAL_VETO_FIELDS.keys.filter { it in previous }
+        continuity: Map<String, BusinessInputContinuity>, delta: BusinessInputDelta): EnergyIntervalContinuity? {
+        // Optional charging evidence can veto a sample; its absence cannot invalidate the required sources.
+        val keys = REQUIRED_KEYS
         if (keys.none { it in continuity || delta.sourceInputs[it]?.stamp?.sourceEpoch != null ||
                 it in delta.continuityUpdates }) return null
         val unproven = EnergyIntervalContinuity(null)
@@ -24,9 +23,6 @@ object EnergyTelemetryProjection {
         val elapsed = delta.ref.acquiredElapsedMs ?: return unproven
         val proven = BusinessInputProjection.continuousSources(previous, continuity, boot, elapsed)
         if (keys.any { it !in proven }) return unproven
-        val veto = normalizer.normalizeSparse(previous, OPTIONAL_VETO_FIELDS.keys.intersect(previous.keys))
-            .associateBy { it.field.fieldKey }
-        if (OPTIONAL_VETO_FIELDS.any { (raw, field) -> raw in previous && veto[field]?.quality != NormalizedQuality.OK }) return unproven
         for (key in keys) {
             val old = previous.getValue(key).stamp
             val next = delta.sourceInputs[key]?.stamp ?: delta.continuityUpdates[key]?.stamp ?: continue
@@ -41,9 +37,6 @@ object EnergyTelemetryProjection {
 
     private val REQUIRED_KEYS = setOf("charging_charge_battery_volt", "charging_charge_current",
         "bodywork_power_level", "charging_1009_876609586_5")
-    private val OPTIONAL_VETO_FIELDS = mapOf("charging_1009_89128973_5" to "charger_connected_raw",
-        "charging_charging_vtov_discharge_status" to "v2l_discharge_active_raw",
-        "charging_1009_876609560_5" to "charging_battery_device_state")
     private val EXACT_LOSS_REASONS = setOf("explicit_stop", "capture_ineligible", "consumer_rejected")
 
     fun receipt(source: PollSampleSource, observedAt: String, readings: List<PollReading>,

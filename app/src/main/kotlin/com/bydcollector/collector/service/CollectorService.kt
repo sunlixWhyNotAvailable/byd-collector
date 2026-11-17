@@ -1486,7 +1486,7 @@ class CollectorService : Service() {
                 prepareEnergyProjection()
                 val receipt = EnergyTelemetryProjection.receipt(
                     source.copy(identity = "business:$generation:${ref.id}"), timestamp, readings, observations,
-                    EnergyTelemetryProjection.intervalContinuity(previousInputs, previousContinuity, delta, vehicleStateNormalizer)
+                    EnergyTelemetryProjection.intervalContinuity(previousInputs, previousContinuity, delta)
                 ).copy(businessGeneration = generation, businessInputId = ref.id,
                     evaluationBootId = source.bootId, evaluationElapsedMs = evaluatedElapsed,
                     lateRelevantSource = changedEnergy && evaluatedElapsed > source.capturedElapsedMs)
@@ -1715,7 +1715,7 @@ class CollectorService : Service() {
             val elapsed = if (evaluation.lastEvaluationBootId == source.bootId)
                 maxOf(source.capturedElapsedMs, evaluation.lastEvaluationElapsedMs ?: source.capturedElapsedMs) else source.capturedElapsedMs
             val before = BusinessInputProjection.freshInputs(inputs, source.bootId, elapsed, continuity)
-            val intervalContinuity = EnergyTelemetryProjection.intervalContinuity(inputs, continuity, delta, vehicleStateNormalizer)
+            val intervalContinuity = EnergyTelemetryProjection.intervalContinuity(inputs, continuity, delta)
             val merged = BusinessInputReducer.merge(inputs, BusinessInputProjection.incoming(delta, inputs), mergeBoot)
             val mergedContinuity = BusinessInputReducer.mergeContinuity(continuity, delta.continuityUpdates, mergeBoot, merged.inputs)
             inputs = merged.inputs

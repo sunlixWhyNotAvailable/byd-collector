@@ -84,7 +84,7 @@ class EnergySessionCoordinatorReplayTest {
                     null, updates.keys.toList(), stamp.identity, "boot", "helper", id, 1, base + ms, ms,
                     null, null, BusinessInputOrigin.REPLAY, true, "ok", null, null)
                 val delta = BusinessInputDelta(ref, sourceInputs = updates, continuityUpdates = states)
-                val proof = EnergyTelemetryProjection.intervalContinuity(inputs, continuity, delta, normalizer)
+                val proof = EnergyTelemetryProjection.intervalContinuity(inputs, continuity, delta)
                 val merged = BusinessInputReducer.merge(inputs, updates, "boot")
                 continuity = BusinessInputReducer.mergeContinuity(continuity, states, "boot", merged.inputs).continuity
                 inputs = merged.inputs

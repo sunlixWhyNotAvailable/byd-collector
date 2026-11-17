@@ -301,11 +301,53 @@ The diagnostic ZIP includes available app/system logs and troubleshooting summar
 
 `Clear logs` removes diagnostic history and completed captures after confirmation. It does **not** delete telemetry databases, database archives, trips, or pending Telegram messages, and does not stop active system-log recording.
 
+With an authorized laptop, you can also [collect and clear logs through the ADB API](#adb-diagnostics-api) without interacting with the tablet UI.
+
 **Review files before sharing.** Recognized sensitive values are masked in diagnostic copies, but full-system logs are not guaranteed anonymous and can contain data from other apps. Database archives may contain location and vehicle identifiers. Share only what is needed; never publish tokens or passwords.
 
 Telemetry and logs are not automatically sent to the developer. External integrations are destinations you choose. Read the full [privacy policy](PRIVACY.md).
 
 For other feedback, [suggest an improvement](https://github.com/sunlixWhyNotAvailable/byd-collector/issues/new?template=suggestion.yml) or use the [issue chooser](https://github.com/sunlixWhyNotAvailable/byd-collector/issues/new/choose).
+
+## ADB diagnostics API
+
+An authorized ADB connection can collect a diagnostic ZIP and separately clear logs without opening Collector's UI. Access is limited to Android shell/root. These are the same archive and cleanup operations as the app buttons: telemetry databases, trips, database archives and pending Telegram messages are not deleted, and active logcat recording continues. No HTTP server is started.
+
+### 1. Collect logs
+
+```powershell
+adb shell content call --uri content://com.bydcollector.collector.diagnostics --method collect
+```
+
+Copy the returned `id` and replace `JOB_ID` in the following commands.
+
+### 2. Check the operation
+
+```powershell
+adb shell content call --uri content://com.bydcollector.collector.diagnostics --method status --arg JOB_ID
+```
+
+Wait for `status=complete`. The other states are `queued`, `running` and `error`. Errors retain details in `diagnostic` and the operational journal; an error does not mean an empty archive. Repeating a pending request returns its existing ID. Closing the UI does not cancel a job; process interruptions use the existing background-job recovery.
+
+### 3. Download the ZIP
+
+After collection completes, save the archive to the current laptop directory:
+
+```powershell
+cmd /d /c "adb exec-out content read --uri content://com.bydcollector.collector.diagnostics/archive/JOB_ID > collector-logs.zip"
+```
+
+The `cmd /d /c` wrapper preserves binary output also in PowerShell versions before 7.4. Download promptly: the archive has the same temporary retention as Share logs. Verify that `collector-logs.zip` opens before clearing any logs.
+
+### 4. Clear logs separately
+
+This is an explicit cleanup request with no on-screen confirmation:
+
+```powershell
+adb shell content call --uri content://com.bydcollector.collector.diagnostics --method clear
+```
+
+Check the returned cleanup ID with `status`. Its `result` contains `removed` and `warnings`; warnings indicate partial cleanup. Collector's explicit Shutdown is respected: open the app normally before requesting jobs after Shutdown.
 
 ## Support the project
 

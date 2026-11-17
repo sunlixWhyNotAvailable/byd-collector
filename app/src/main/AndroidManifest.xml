@@ -45,6 +45,12 @@
             android:exported="true"
             android:permission="com.bydcollector.collector.permission.RUNTIME" />
 
+        <provider
+            android:name="com.bydcollector.collector.diagnostics.AdbDiagnosticsProvider"
+            android:authorities="com.bydcollector.collector.diagnostics"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
+
         <service android:name="com.bydcollector.collector.runtime.RuntimeJobsService"
             android:exported="false" android:stopWithTask="false"
             android:foregroundServiceType="dataSync" />
