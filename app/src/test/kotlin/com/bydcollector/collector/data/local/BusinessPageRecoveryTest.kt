@@ -25,6 +25,68 @@ import kotlin.test.*
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
 class BusinessPageRecoveryTest {
+    @Test fun expiredFinalCountersRemainUnknownInStoredStationaryCompletion() {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "missing_endpoint.db"
+        try {
+            TripStore(TripDatabaseHelper(context, name)).use { store ->
+                val runtime = TripRuntimeCoordinator(context, store, { true }, { false }, {}, { true }, {}, { _, _, _ -> },
+                    bootIdProvider = { "boot" })
+                val energy = EnergySessionCoordinator(BufferedEnergyStorage(null))
+                val odo = "statistic_1014_1246765072_5"
+                val soc = "statistic_1014_1145045040_5"
+                val seed = NormalizedSourceStamp(NormalizedSourceKind.POLL, "seed", "boot", "probe", 1, 100001, 1)
+                val counters = mapOf(odo to NormalizedSourceInput(PollReading(odo, "1000", "1000"), seed, 1),
+                    soc to NormalizedSourceInput(PollReading(soc, "75", "75"), seed, 1))
+                try {
+                    listOf(1L, 60001L).forEachIndexed { index, time ->
+                        val on = index == 0
+                        val at = Instant.ofEpochMilli(100000 + time).toString()
+                        val id = index + 1L
+                        val result = energy.process(EnergyReceipt(EnergyReceipt.businessIdentity("endpoints", id), at,
+                            EnergyInput("boot", time, 400.0, 100.0, on, true, false, EnergyIntervalContinuity(0)),
+                            businessGeneration = "endpoints", businessInputId = id))
+                        result.pendingProjection?.let { assertTrue(energy.confirmProjected(it.snapshot.snapshotId)) }
+                        val observations = BusinessInputProjection.observations(VehicleStateNormalizer(),
+                            BusinessInputProjection.freshInputs(counters, "boot", time))
+                        runtime.onBusinessInput("endpoints", id, "sample:$id", at,
+                            listOf(PollReading("bodywork_power_level", if (on) "2" else "0", if (on) "2" else "0")),
+                            observations, false, result.snapshot, seed.copy(identity = "sample:$id", sequence = id,
+                                wallMs = 100000 + time, elapsedMs = time)).get(1, TimeUnit.SECONDS)
+                    }
+                } finally { runtime.close() }
+            }
+            TripStore(TripDatabaseHelper(context, name)).use { reopened ->
+                val completion = reopened.allPendingCompletions().single()
+                val closed = assertNotNull(completion.session)
+                assertEquals(100.0, closed.lastOdometerKm)
+                assertNull(closed.distanceKm)
+                assertNull(closed.endSoc)
+                assertNull(completion.odometerKm)
+                assertEquals(false, closed.counterCoverage?.odometerEndKnown)
+                assertEquals(false, closed.counterCoverage?.socEndKnown)
+                assertTrue("odometer_end_missing" in closed.quality)
+                val config = TelegramEventConfig(setOf(com.bydcollector.collector.telegram.TelegramEventType.TRIP_SUMMARY),
+                    5, 12.0, 60000, 5000)
+                val report = TelegramEventEngine().onPowerOffConfirmed(config,
+                    TelegramPowerOffSnapshot(energySnapshot = completion.energySnapshot, session = closed,
+                        completionIdentity = completion.identity), nowMs = 160001).events.single()
+                assertEquals("n/a", report.variables["total_distance_km"])
+                assertEquals("n/a", report.variables["total_soc_end"])
+                val legacyCoverage = assertNotNull(closed.counterCoverage).toJson().apply {
+                    remove("odometer_end"); remove("soc_end")
+                }
+                val legacy = closed.copy(distanceKm = 0.0, endSoc = 75.0, quality = TripSession.QUALITY_OK,
+                    counterCoverage = TripCounterCoverage.fromJson(legacyCoverage))
+                val oldReport = TelegramEventEngine().onPowerOffConfirmed(config,
+                    TelegramPowerOffSnapshot(100.0, 75.0, energySnapshot = completion.energySnapshot,
+                        session = legacy, completionIdentity = completion.identity), nowMs = 160001).events.single()
+                assertEquals("n/a", oldReport.variables["total_distance_km"])
+                assertEquals("n/a", oldReport.variables["total_soc_end"])
+            }
+        } finally { context.deleteDatabase(name) }
+    }
+
     @Test fun businessConstraintParksUntilStorageReopenedWithoutDroppingInputs() {
         val context = RuntimeEnvironment.getApplication()
         val name = "business_fault_${System.nanoTime()}.db"
@@ -138,7 +200,7 @@ class BusinessPageRecoveryTest {
                             val elapsed = checkNotNull(ref.acquiredElapsedMs)
                             val at = Instant.ofEpochMilli(checkNotNull(ref.acquiredWallMs)).toString()
                             val result = energy.process(EnergyReceipt(EnergyReceipt.businessIdentity(generation, ref.id), at,
-                                EnergyInput("boot", elapsed, 400.0, 100.0, on, true, false),
+                                EnergyInput("boot", elapsed, 400.0, 100.0, on, true, false, EnergyIntervalContinuity(0)),
                                 businessGeneration = generation, businessInputId = ref.id,
                                 evaluationBootId = "boot", evaluationElapsedMs = elapsed))
                             val projection = result.pendingProjection
@@ -149,9 +211,12 @@ class BusinessPageRecoveryTest {
                             val odometerKey = com.bydcollector.collector.data.normalized.NormalizedFieldCatalog.odometerKm.sourceKeys.single()
                             val counterKey = com.bydcollector.collector.data.normalized.NormalizedFieldCatalog.tripEnergy.sourceKeys.single()
                             val motion = BusinessInputProjection.observations(VehicleStateNormalizer(), mapOf(
-                                speedKey to NormalizedSourceInput(PollReading(speedKey, "1092616192", "10.0"), stamp, null),
-                                odometerKey to NormalizedSourceInput(PollReading(odometerKey, (100000 + index * 2).toString(),
-                                    (100000 + index * 2).toString()), stamp, null),
+                                "statistic_1014_1145045040_5" to NormalizedSourceInput(
+                                    PollReading("statistic_1014_1145045040_5", "75", "75"), stamp, null),
+                                speedKey to NormalizedSourceInput(PollReading(speedKey,
+                                    (if (index < 3) 10f else 0f).toRawBits().toString(), if (index < 3) "10.0" else "0.0"), stamp, null),
+                                odometerKey to NormalizedSourceInput(PollReading(odometerKey, (100000 + minOf(index, 3) * 2).toString(),
+                                    (100000 + minOf(index, 3) * 2).toString()), stamp, null),
                                 counterKey to NormalizedSourceInput(PollReading(counterKey,
                                     java.lang.Float.floatToRawIntBits(index * 0.2f).toString(), (index * 0.2).toString()), stamp, null)))
                             val trip = runtime.onBusinessInput(generation, ref.id, ref.sourceIdentity, at,
@@ -167,10 +232,12 @@ class BusinessPageRecoveryTest {
             val completions = trips().use { store ->
                 assertEquals(page, store.pendingBusinessPage())
                 assertEquals(2, store.allPendingCompletions().size)
-                store.allPendingCompletions().forEach {
-                    assertTrue(it.session?.movementObserved == true, "Missing movement: ${it.session}")
-                    assertTrue((it.session?.distanceKm ?: 0.0) > 0.1, "Missing distance: ${it.session}")
-                }
+                val closed = store.allPendingCompletions().map { requireNotNull(it.session) }
+                assertTrue(closed.first().movementObserved)
+                assertTrue(requireNotNull(closed.first().distanceKm) > 0.1)
+                assertFalse(closed.last().movementObserved)
+                assertEquals(0.0, closed.last().distanceKm)
+                assertEquals(true, closed.last().counterCoverage?.odometerEndKnown)
                 assertFalse(EnergySessionCoordinator(store).runtimeStatus().active)
                 store.allPendingCompletions()
             }
@@ -181,16 +248,27 @@ class BusinessPageRecoveryTest {
                 settings.setTelegramEventEnabled(com.bydcollector.collector.telegram.TelegramEventType.TRIP_SUMMARY.key, true)
                 val coordinator = TelegramCoordinator(eventStore, store, settings, VehicleStateNormalizer(),
                     dispatchSend = { error("Local page must not dispatch HTTP") })
-                coordinator.processBusinessPage(page.key) {
+                val applyPage = {
                     refs.zip(page.entries).forEachIndexed { index, (ref, entry) ->
                         val on = index != 2 && index != 4
                         coordinator.onSourcePoll(0, BusinessInputProjection.timestamp(ref), BusinessInputProjection.source(ref),
                             listOf(PollReading("bodywork_power_level", if (on) "2" else "0", if (on) "2" else "0")),
-                            PollOrigin.REPLAY, "boot", entry.energy, requireCommit = true)
+                            PollOrigin.REPLAY, "boot", entry.energy, requireCommit = true,
+                            startedPowerSessionId = entry.trip?.takeIf { it.confirmedPowerOn }?.powerSessionId)
                         completions.filter { it.sequence == entry.trip?.completionWatermark && entry.trip.closedPowerSession }
                             .forEach { coordinator.acceptTripCompletion(it, null) }
                     }
                 }
+                context.openOrCreateDatabase(names[2], 0, null).use { db ->
+                    db.execSQL("CREATE TRIGGER reject_final BEFORE INSERT ON telegram_business_page_receipt " +
+                        "BEGIN SELECT RAISE(ABORT, 'final receipt write rejected'); END")
+                }
+                assertFailsWith<android.database.sqlite.SQLiteException> { coordinator.processBusinessPage(page.key, applyPage) }
+                assertFalse(store.hasBusinessPageReceipt(page.key))
+                assertEquals(0L, store.diagnosticSnapshot().outboxTotal)
+                completions.forEach { assertFalse(store.hasTripCompletionReceipt(it.sequence, it.identity)) }
+                context.openOrCreateDatabase(names[2], 0, null).use { it.execSQL("DROP TRIGGER reject_final") }
+                coordinator.processBusinessPage(page.key, applyPage)
                 coordinator.processBusinessPage(page.key) { error("Committed page must not execute twice") }
             }
             }
@@ -198,6 +276,9 @@ class BusinessPageRecoveryTest {
                 assertTrue(store.hasBusinessPageReceipt(page.key))
                 completions.forEach { assertTrue(store.hasTripCompletionReceipt(it.sequence, it.identity)) }
                 assertEquals(2L, store.diagnosticSnapshot().outboxTotal, store.loadTelegramRuntimeState { _, _ -> }.toJson())
+                val parked = assertNotNull(store.telegramMessageByDedupeKey("${completions.last().identity}:final_summary"))
+                assertTrue(parked.payload.contains("0 км") || parked.payload.contains("0 km"))
+                assertFalse(parked.payload.contains("n/a"), parked.payload)
             }
             // Reopen the historical schema while Trips/Telegram already have their durable page receipts.
             context.openOrCreateDatabase(names[0], 0, null).use { db ->

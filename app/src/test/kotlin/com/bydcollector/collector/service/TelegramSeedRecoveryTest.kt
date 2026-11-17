@@ -9,6 +9,7 @@ import com.bydcollector.collector.data.local.TelegramDatabaseHelper
 import com.bydcollector.collector.data.local.TelegramStore
 import com.bydcollector.collector.data.local.TelegramOutboxMessage
 import com.bydcollector.collector.data.input.*
+import com.bydcollector.collector.data.energy.*
 import com.bydcollector.collector.data.normalized.VehicleStateNormalizer
 import com.bydcollector.collector.data.polling.PollOrigin
 import com.bydcollector.collector.telegram.TelegramEventType
@@ -103,7 +104,8 @@ class TelegramSeedRecoveryTest {
                         getLineage = get)
                 })
         }
-        val history = listOf(delta(0, gear to "1", soc to "72", odo to "1000"),
+        val history = listOf(delta(0, gear to "1", soc to "72", odo to "1000", "bodywork_power_level" to "0"),
+            delta(50, "bodywork_power_level" to "2"),
             delta(100, gear to "4", energy to 10f.toRawBits().toString()),
             delta(500, soc to "71", odo to "1010", energy to 11f.toRawBits().toString()),
             delta(1000, gear to "1", odo to "1020"), delta(31000))
@@ -124,12 +126,45 @@ class TelegramSeedRecoveryTest {
         val original = TelegramEventState.fromJson(JSONObject(broken.state.toJson()).apply {
             remove("initialSeedRecoveryVersion")
         }.toString())
-        val repaired = TelegramHistoryRepair.recover(original, config, normalizer, true, history.asSequence())
+        val integrator = EnergySessionCoordinator(BufferedEnergyStorage(null))
+        var active: EnergySnapshot? = null
+        history.forEach { d ->
+            val power = d.readings.firstOrNull { it.rawKey == "bodywork_power_level" }?.descValue?.toInt()?.let { it > 0 }
+            val result = integrator.process(EnergyReceipt(d.ref.sourceIdentity, BusinessInputProjection.timestamp(d.ref),
+                EnergyInput("boot", d.ref.acquiredElapsedMs!!, 400.0, 10.0, power, true, false,
+                    EnergyIntervalContinuity(0))))
+            result.pendingProjection?.let { assertTrue(integrator.confirmProjected(it.snapshot.snapshotId)) }
+            active = result.snapshot
+        }
+        val repaired = TelegramHistoryRepair.recover(original, config, normalizer, true, history.asSequence(), active)
         assertEquals("matching_active_group", repaired.reason)
         assertTrue(repaired.state.bootTotalDistanceComplete)
         assertEquals(2.0, repaired.state.bootTotalDistanceKm, 1e-6)
         assertEquals(72.0, repaired.state.bootStartSoc)
+        val powerSession = assertNotNull(repaired.state.powerSession)
+        assertEquals(100050L, powerSession.startedAtMs)
+        assertEquals(50L, powerSession.boundary?.elapsedMs)
+        assertEquals(72.0, powerSession.startSoc)
+        assertEquals(2.0, powerSession.distance.completeKm)
+        val empty = TelegramHistoryRepair.recover(TelegramEventState(), config, normalizer, false,
+            history.asSequence(), active)
+        assertEquals(powerSession, empty.state.powerSession)
         assertEquals(original.pendingPowerOffLocationTripId, repaired.state.pendingPowerOffLocationTripId)
+        val withoutOn = TelegramHistoryRepair.recover(original, config, normalizer, true,
+            history.filterNot { it.ref.acquiredElapsedMs == 50L }.asSequence(), active)
+        assertNull(withoutOn.state.powerSession)
+        val restarted = TelegramEventEngine(original)
+        val last = history[4]
+        restarted.onSourcePoll(last.ref.pollId!!, BusinessInputProjection.timestamp(last.ref),
+            BusinessInputProjection.source(last.ref), last.readings, PollOrigin.REPLAY, "boot", config,
+            last.ref.acquiredWallMs!!, normalizer, active, last.ref.acquiredElapsedMs!!,
+            startedPowerSessionId = active!!.powerSessionId)
+        val unproven = assertNotNull(restarted.state.powerSession)
+        assertEquals(100050L, unproven.startedAtMs)
+        assertNull(unproven.boundary)
+        assertNull(unproven.distance.completeKm)
+        assertNull(unproven.startSoc)
+        assertEquals(unproven, TelegramEventState.fromJson(restarted.state.toJson()).powerSession)
         val closed = TelegramHistoryRepair.recover(original, config, normalizer, false, history.asSequence())
         assertFalse(closed.state.bootTotalDistanceComplete)
         val absent = TelegramHistoryRepair.recover(original, config, normalizer, true, emptySequence())

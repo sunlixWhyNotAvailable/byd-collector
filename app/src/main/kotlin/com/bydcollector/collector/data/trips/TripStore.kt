@@ -853,15 +853,11 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
     val databaseFile get() = helper.databaseFile
 
     @Synchronized
-    fun queryHierarchy(includeZeroMotion: Boolean = false): List<TripDayGroup> {
+    fun queryHierarchy(): List<TripDayGroup> {
         if (BuildConfig.RUNTIME_CLIENT) {
-            require(!includeZeroMotion) { "UI hierarchy excludes zero-motion sessions" }
             return RuntimeReads.read(RuntimeClient.context, "tripHierarchy")
         }
-        val rows = querySummaries(
-            if (includeZeroMotion) "WHERE state = 'closed'" else "WHERE state = 'closed' AND movement_observed = 1",
-            emptyArray()
-        )
+        val rows = querySummaries("WHERE state = 'closed'", emptyArray())
         return rows.groupBy { summary ->
             val date = TripTime.localDate(summary.startedAt)
             date?.let { Triple(it.year, it.monthValue, it.dayOfMonth) } ?: Triple(0, 0, 0)

@@ -24,6 +24,38 @@ import kotlin.test.assertTrue
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
 class EnergySessionCoordinatorReplayTest {
+    @Test fun stationaryFirstReportRequiresMeasuredEnergyOrSocThreshold() {
+        val base = 1_793_000_000_000L
+        val config = TelegramEventConfig(setOf(TelegramEventType.TRIP_SUMMARY), 5, 12.0, 60_000, 5_000)
+        fun run(duration: Long, endSoc: Double): List<TelegramDetectedEvent> {
+            val energy = EnergySessionCoordinator(BufferedEnergyStorage(null))
+            val telegram = TelegramEventEngine()
+            val normalizer = VehicleStateNormalizer()
+            val seed = listOf(PollReading("gearbox_1011_555745336_5", "1", "1"),
+                PollReading("statistic_1014_1246765072_5", "1000", "1000"),
+                PollReading("statistic_1014_1145045040_5", "75", "75"))
+            fun feed(id: Long, ms: Long, on: Boolean): EnergySnapshot {
+                val at = java.time.Instant.ofEpochMilli(base + ms).toString()
+                val result = energy.process(EnergyReceipt("threshold:$id", at,
+                    EnergyInput("boot", ms, 400.0, 100.0, on, true, false, EnergyIntervalContinuity(0))))
+                confirm(energy, result)
+                telegram.onSourcePoll(id, at, PollSampleSource("threshold:$id", "boot", ms, "test", id),
+                    if (id == 1L) seed else emptyList(), PollOrigin.REPLAY, "boot", config, base + ms, normalizer,
+                    result.snapshot, ms, startedPowerSessionId = result.snapshot?.powerSessionId
+                        .takeIf { result.transition == EnergySessionTransition.STARTED })
+                return requireNotNull(result.snapshot)
+            }
+            feed(1, 0, false)
+            feed(2, 1, true)
+            val final = feed(3, duration + 1, false)
+            return telegram.onPowerOffConfirmed(config,
+                TelegramPowerOffSnapshot(100.0, endSoc, energySnapshot = final), nowMs = base + duration + 1).events
+        }
+        assertTrue(run(9_000, 75.0).isEmpty(), "exactly 0.1kWh does not exceed the energy threshold")
+        assertEquals(1, run(10_000, 75.0).size)
+        assertEquals(1, run(1_000, 74.0).size, "one percent SOC independently admits the first report")
+    }
+
     @Test fun qualifiedIntervalsMatchLiveTimersAndSparseReplayAcrossSqliteReopen() {
         val context = RuntimeEnvironment.getApplication()
         val base = 1_793_000_000_000L
@@ -31,6 +63,8 @@ class EnergySessionCoordinatorReplayTest {
             val name = "held_energy_$timers.db"
             var store = TripStore(TripDatabaseHelper(context, name))
             var engine = EnergySessionCoordinator(store)
+            var telegram = TelegramEventEngine()
+            val config = TelegramEventConfig(setOf(TelegramEventType.TRIP_SUMMARY), 5, 12.0, 60_000, 5_000)
             var inputs = emptyMap<String, NormalizedSourceInput>()
             var continuity = emptyMap<String, BusinessInputContinuity>()
             val normalizer = VehicleStateNormalizer()
@@ -38,7 +72,12 @@ class EnergySessionCoordinatorReplayTest {
             fun feed(ms: Long, vararg values: Pair<String, String>): EnergySnapshot {
                 id++
                 val stamp = normalizedCallbackSourceStamp("boot", "helper", 1, 1, id, base + ms, ms, 1)
-                val updates = values.associate { (key, value) -> key to NormalizedSourceInput(PollReading(key, value, value), stamp, null) }
+                val updates = values.associate { (key, value) ->
+                    val entry = com.bydcollector.collector.data.direct.DirectFidRegistry.entries.first { it.key == key }
+                    val callback = com.bydcollector.collector.direct.CallbackValueSource("boot", "helper", 1, 1, 1,
+                        id, entry.dev, entry.fid, if (entry.tx == 7) 2 else 1, value.toInt(), base + ms, ms, null, "callback")
+                    key to NormalizedSourceInput(PollReading(key, value, value, callback), stamp, null)
+                }
                 val states = updates.mapValues { BusinessInputContinuity(BusinessContinuityState.AVAILABLE,
                     stamp, "callback", stamp.identity, id, true, "callback_value") }
                 val ref = BusinessInputRef(id, if (values.isEmpty()) BusinessInputKind.TIMER else BusinessInputKind.CALLBACK,
@@ -56,10 +95,33 @@ class EnergySessionCoordinatorReplayTest {
                     .copy(businessGeneration = name, businessInputId = id)
                 val result = engine.process(receipt)
                 confirm(engine, result)
+                telegram.onSourcePoll(id, receipt.observedAt, PollSampleSource(stamp.identity, "boot", ms, "helper", id),
+                    updates.values.map { it.reading }, PollOrigin.REPLAY, "boot", config, base + ms, normalizer,
+                    result.snapshot, ms, states,
+                    startedPowerSessionId = result.snapshot?.powerSessionId.takeIf { result.transition == EnergySessionTransition.STARTED })
+                if (result.transition == EnergySessionTransition.STOPPED) {
+                    val completed = telegram.onPowerOffConfirmed(config,
+                        TelegramPowerOffSnapshot(100.0, 75.0, energySnapshot = result.snapshot), nowMs = base + ms)
+                    val report = completed.events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+                    assertTrue(report.omitCurrent)
+                    assertEquals("0", report.variables["total_distance_km"])
+                    assertEquals("0.33", report.variables["total_discharged_kwh"])
+                    assertEquals("0.17", report.variables["total_regenerated_kwh"])
+                    assertEquals("0.17", report.variables["total_net_kwh"])
+                    assertEquals("-", report.variables["total_net_kwh_per_100km"])
+                    assertEquals("0:02", report.variables["total_duration"])
+                    com.bydcollector.collector.telegram.TelegramTemplateLanguage.entries.forEach { language ->
+                        val text = requireNotNull(com.bydcollector.collector.telegram.renderTelegramPayload(report, null, language).text)
+                        assertFalse(text.contains("n/a"), text)
+                        assertTrue(text.contains("- кВт·год/100 км") || text.contains("- kWh/100 km"), text)
+                    }
+                    assertTrue(telegram.onPowerOffConfirmed(config, nowMs = base + ms + 1).events.isEmpty())
+                }
                 if (!timers && ms == 61_000L) {
                     store.close()
                     store = TripStore(TripDatabaseHelper(context, name))
                     engine = EnergySessionCoordinator(store)
+                    telegram = TelegramEventEngine(TelegramEventState.fromJson(telegram.state.toJson()))
                     val repeated = engine.process(receipt)
                     assertTrue(repeated.duplicate)
                     assertEquals(result.snapshot, repeated.snapshot)
@@ -71,7 +133,9 @@ class EnergySessionCoordinatorReplayTest {
             }
             try {
                 feed(0, "bodywork_power_level" to "0", "charging_1009_876609586_5" to "1",
-                    "charging_charge_battery_volt" to "400", "charging_charge_current" to "50")
+                    "charging_charge_battery_volt" to "400", "charging_charge_current" to "50",
+                    "gearbox_1011_555745336_5" to "1", "statistic_1014_1246765072_5" to "1000",
+                    "statistic_1014_1145045040_5" to "75")
                 feed(1_000, "bodywork_power_level" to "2")
                 if (timers) for (ms in 2_000L..60_000L step 1_000L) feed(ms)
                 feed(61_000, "charging_charge_current" to "-25")
@@ -124,7 +188,8 @@ class EnergySessionCoordinatorReplayTest {
                     return if (kind == BusinessInputKind.TIMER)
                         engine.onDetectorTimer(config, base + ms, "boot", ms, normalizer, result?.snapshot)
                     else engine.onSourcePoll(id, at, source, readings, PollOrigin.REPLAY, "boot", config,
-                        base + ms, normalizer, result?.snapshot, ms)
+                        base + ms, normalizer, result?.snapshot, ms,
+                        startedPowerSessionId = result?.snapshot?.powerSessionId.takeIf { result?.transition == EnergySessionTransition.STARTED })
                 }
                 feed(0, "bodywork_power_level" to "0", "charging_1009_876609586_5" to "1",
                     "charging_charge_battery_volt" to "400", "charging_charge_current" to 100f.toRawBits().toString(),
@@ -141,16 +206,40 @@ class EnergySessionCoordinatorReplayTest {
                 assertEquals(parked, engine.state.tripEndEnergyPoint)
                 val first = feed(7_100).events.single { it.type == TelegramEventType.TRIP_SUMMARY }
                 assertEquals("0.02", first.variables["trip_discharged_kwh"])
-                assertEquals("0.08", first.variables["total_discharged_kwh"])
+                assertEquals("0.02", first.variables["total_discharged_kwh"])
+                assertFalse(first.omitCurrent, "parking before departure belongs only to the total")
                 feed(7_200, gear to "4")
                 feed(8_200)
                 feed(9_200, gear to "1", odo to "1014")
                 for (ms in 10_200L..13_200L step 1_000) feed(ms)
-                // Delivery is late, but the report must use energy at its 14_200 deadline.
+                // Delivery is late; both blocks still end at P (9_200), not at the report deadline.
                 val second = feed(14_700).events.single { it.type == TelegramEventType.TRIP_SUMMARY }
                 assertEquals("0.02", second.variables["trip_discharged_kwh"])
-                assertEquals("0.16", second.variables["total_discharged_kwh"])
+                assertEquals("0.1", second.variables["total_discharged_kwh"])
                 assertTrue(feed(15_200).events.none { it.type == TelegramEventType.TRIP_SUMMARY })
+                feed(16_200, "bodywork_power_level" to "0")
+                val beforeOff = engine.state.toJson()
+                val final = engine.onPowerOffConfirmed(config,
+                    TelegramPowerOffSnapshot(101.4, 80.0, energySnapshot = energy.currentSnapshot()), nowMs = base + 16_200)
+                    .events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+                assertTrue(final.omitCurrent)
+                assertEquals("1.4", final.variables["total_distance_km"])
+                assertEquals("0.18", final.variables["total_discharged_kwh"])
+                assertEquals(base + 16_200, final.occurredAtMs)
+                val fix = TelegramLocationSnapshot(1.0, 1.0, java.time.Instant.ofEpochMilli(base + 9_200).toString(),
+                    7, "", "https://maps.google.com/?q=1,1", "")
+                listOf(false, true).forEach { send ->
+                    val restored = TelegramEventEngine(TelegramEventState.fromJson(beforeOff))
+                    val report = restored.onPowerOffConfirmed(config.copy(sendLocation = send,
+                        navigatorMask = com.bydcollector.collector.telegram.TelegramNavigatorMask.GOOGLE),
+                        TelegramPowerOffSnapshot(101.4, 80.0, energySnapshot = energy.currentSnapshot()),
+                        location = fix, nowMs = base + 16_200).events.single()
+                    assertEquals(final.dedupeKey, report.dedupeKey)
+                    val text = requireNotNull(com.bydcollector.collector.telegram.renderTelegramPayload(report, null,
+                        com.bydcollector.collector.telegram.TelegramTemplateLanguage.UK).text)
+                    assertEquals(send, text.contains("\n\nGoogle:"))
+                    assertFalse(report.locationOnly)
+                }
             }
         } finally { context.deleteDatabase(name) }
     }

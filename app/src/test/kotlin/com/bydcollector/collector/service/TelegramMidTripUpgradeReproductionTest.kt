@@ -295,8 +295,10 @@ class TelegramMidTripUpgradeReproductionTest {
             )
             val powerOff = afterSecondRestart.onPowerOffConfirmed(config, location = location, nowMs = 10_000L)
             val locationEvent = powerOff.events.single { it.type == TelegramEventType.TRIP_SUMMARY }
-            assertTrue(locationEvent.locationOnly)
-            assertEquals(secondSummary.dedupeKey, locationEvent.waitsForSummaryKey)
+            assertFalse(locationEvent.locationOnly)
+            assertTrue(locationEvent.omitCurrent)
+            assertNull(locationEvent.waitsForSummaryKey)
+            assertTrue(requireNotNull(locationEvent.textSuffix).contains("maps"))
             assertFalse(powerOff.state.tripSummaryCreatedInPowerSession)
             val locationPayload = assertNotNull(renderTelegramPayload(locationEvent, null, config.language).text)
             assertTrue(store.commitTelegramEvents(
@@ -504,7 +506,11 @@ class TelegramMidTripUpgradeReproductionTest {
                 location = null,
                 nowMs = 9_500L
             )
-            assertTrue(powerOffTelegram.events.isEmpty(), "the long-P summary already finished without GPS")
+            val finalSummary = powerOffTelegram.events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+            assertTrue(finalSummary.omitCurrent)
+            assertMetric(finalSummary, "total_soc_end", 68.0)
+            assertMetric(finalSummary, "total_distance_km", 6.0)
+            assertNull(finalSummary.textSuffix, "missing GPS does not block the updated final summary")
             telegramStore.saveTelegramRuntimeState(powerOffTelegram.state.toJson(), nowMs = 9_500L)
             assertTrue(telegramStore.verifyRuntimeState())
         } finally {
@@ -544,7 +550,7 @@ class TelegramMidTripUpgradeReproductionTest {
             .events.single { it.type == TelegramEventType.TRIP_SUMMARY }
         assertTrue(parkedSummary.omitCurrent)
         assertMetric(parkedSummary, "soc_end", 70.0)
-        assertMetric(parkedSummary, "total_soc_end", 69.0)
+        assertMetric(parkedSummary, "total_soc_end", 70.0)
         val parkedText = assertNotNull(
             renderTelegramPayload(parkedSummary, null, TelegramTemplateLanguage.UK).text
         )
@@ -643,7 +649,7 @@ class TelegramMidTripUpgradeReproductionTest {
         val firstEmittedSummary = engine.onSuccessfulPoll(
             tripTelemetry(gear = "P", soc = 70.0, odometer = 104.0, tripEnergy = 2.5), enabledConfig, 12_000L
         ).events.single { it.type == TelegramEventType.TRIP_SUMMARY }
-        assertTrue(firstEmittedSummary.omitCurrent)
+        assertFalse(firstEmittedSummary.omitCurrent, "first emitted does not mean the current and total blocks are equal")
         assertMetric(firstEmittedSummary, "trip_distance_km", 2.0)
         assertMetric(firstEmittedSummary, "total_distance_km", 4.0)
     }

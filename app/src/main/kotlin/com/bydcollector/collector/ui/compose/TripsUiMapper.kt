@@ -268,7 +268,7 @@ object TripsUiMapper {
 
     private fun Double?.validNumber(): Double? = this?.takeIf(Double::isFinite)
 
-    private fun Double?.validDistance(): Double? = validNumber()?.takeIf { it > 0.0 }
+    private fun Double?.validDistance(): Double? = validNumber()?.takeIf { it >= 0.0 }
 
     private inline fun List<TripSummaryUi>.sumOrNull(value: (TripSummaryUi) -> Double?): Double? {
         val values = mapNotNull(value)

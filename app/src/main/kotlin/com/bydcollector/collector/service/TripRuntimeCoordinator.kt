@@ -524,25 +524,28 @@ class TripRuntimeCoordinator(
         val nextCoverage = TripCounterCoverage(startSoc != null, startOdometer != null, startEnergy != null,
             energyContinuous, coverage.knownDistanceKm +
                 (TripMetrics.delta(current.lastOdometerKm, snapshot.odometerKm) ?: 0.0),
-            energyUpdate.accumulatedKwh ?: coverage.knownEnergyKwh)
+            energyUpdate.accumulatedKwh ?: coverage.knownEnergyKwh,
+            odometerEndKnown = snapshot.odometerKm != null, socEndKnown = snapshot.soc != null)
         val quality = listOfNotNull(
             current.quality.split(',').filterNot { it == TripSession.QUALITY_OK || it.endsWith("_start_missing") ||
-                it == "trip_energy_incomplete" }.joinToString(",").takeIf { it.isNotBlank() },
+                it == "trip_energy_incomplete" || it == "odometer_end_missing" || it == "soc_end_missing" }.joinToString(",").takeIf { it.isNotBlank() },
             "odometer_reset".takeIf { odometerReset },
             "trip_energy_reset".takeIf { energyUpdate.resetObserved },
             "soc_start_missing".takeIf { startSoc == null },
             "odometer_start_missing".takeIf { startOdometer == null },
+            "odometer_end_missing".takeIf { snapshot.odometerKm == null },
+            "soc_end_missing".takeIf { snapshot.soc == null },
             "trip_energy_start_missing".takeIf { startEnergy == null },
             "trip_energy_incomplete".takeIf { !energyContinuous }
         ).flatMap { it.split(',') }.distinct().joinToString(",").ifBlank { TripSession.QUALITY_OK }
-        val distance = TripMetrics.delta(startOdometer, lastOdometer)
+        val distance = TripMetrics.delta(startOdometer, snapshot.odometerKm)
             .takeUnless { "odometer_reset" in quality }
         val energy = nextCoverage.knownEnergyKwh.takeIf { startEnergy != null && energyContinuous }
         val duration = TripTime.durationMs(current.startedAt, timestamp)
         session = current.copy(
             movementObserved = current.movementObserved || (snapshot.speedKmh ?: 0.0) > MOVEMENT_THRESHOLD_KMH,
             startSoc = startSoc,
-            endSoc = snapshot.soc ?: current.endSoc,
+            endSoc = snapshot.soc,
             startOdometerKm = startOdometer,
             lastOdometerKm = lastOdometer,
             startTripEnergyKwh = startEnergy,
@@ -589,9 +592,9 @@ class TripRuntimeCoordinator(
             session = closed,
             lastLocation = trustedLocation?.let { TripCompletionLocation(it.latitude, it.longitude, it.observedAt) },
             energySnapshot = snapshot.energy,
-            odometerKm = snapshot.odometerKm ?: closed?.lastOdometerKm,
-            soc = snapshot.soc ?: closed?.endSoc,
-            tripEnergyKwh = snapshot.tripEnergyKwh ?: closed?.lastTripEnergyKwh
+            odometerKm = snapshot.odometerKm,
+            soc = snapshot.soc,
+            tripEnergyKwh = snapshot.tripEnergyKwh
         ) else null
         val durableCompletion = tripStore.closeSessionWithCompletion(closed, completion)
         // Only the atomic local commit above controls whether this boundary succeeded.

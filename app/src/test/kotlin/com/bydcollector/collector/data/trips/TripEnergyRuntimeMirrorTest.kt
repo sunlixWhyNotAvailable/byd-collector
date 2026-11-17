@@ -24,6 +24,39 @@ import kotlin.test.assertTrue
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
 class TripEnergyRuntimeMirrorTest {
+    @Test fun hierarchyKeepsStationaryHistoryAndIncludesItsEnergyInGroupedConsumption() {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "stationary_history.db"
+        val stationary = TripSession("parked", TripSession.STATE_CLOSED, "2026-11-17T10:00:00Z",
+            endedAt = "2026-11-17T11:00:00Z", distanceKm = 0.0, durationMs = 3_600_000,
+            startSoc = 75.0, endSoc = 75.0, dischargedKwh = 1.0, regeneratedKwh = 0.0,
+            netKwh = 1.0, energyPartial = false)
+        try {
+            TripStore(TripDatabaseHelper(context, name)).use { it.upsertSession(stationary) }
+            TripStore(TripDatabaseHelper(context, name)).use { store ->
+                val before = store.queryHierarchy()
+                assertEquals(listOf("parked"), before.flatMap { it.trips }.map { it.tripId })
+                val pure = com.bydcollector.collector.ui.compose.TripsUiMapper.years(before,
+                    com.bydcollector.collector.ui.compose.UiLanguage.UK).single()
+                assertEquals(1.0, pure.netKwh)
+                assertNull(pure.averageConsumptionKwhPer100Km)
+                store.upsertSession(stationary.copy(tripId = "drive", movementObserved = true,
+                    distanceKm = 10.0, dischargedKwh = 2.0, netKwh = 2.0))
+                store.upsertSession(stationary.copy(tripId = "unfinished", state = TripSession.STATE_OPEN, endedAt = null))
+                val groups = store.queryHierarchy()
+                assertEquals(setOf("parked", "drive"), groups.flatMap { it.trips }.map { it.tripId }.toSet())
+                listOf(com.bydcollector.collector.ui.compose.UiLanguage.UK,
+                    com.bydcollector.collector.ui.compose.UiLanguage.EN).forEach { language ->
+                    val year = com.bydcollector.collector.ui.compose.TripsUiMapper.years(groups, language).single()
+                    assertEquals(3.0, year.netKwh)
+                    assertEquals(30.0, year.averageConsumptionKwhPer100Km)
+                    assertEquals(30.0, year.months.single().days.single().averageConsumptionKwhPer100Km)
+                    assertEquals(0.0, year.months.single().days.single().trips.single { it.id == "parked" }.distanceKm)
+                }
+            }
+        } finally { context.deleteDatabase(name) }
+    }
+
     @Test
     fun routePowerUsesTheIntervalAtTheFixAndStopsAtActualLoss() {
         var history = RoutePowerHistory().observe("boot", 0L, 20.0, true)

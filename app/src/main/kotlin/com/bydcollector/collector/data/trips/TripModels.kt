@@ -59,7 +59,9 @@ data class TripCounterCoverage(
     val energyStartKnown: Boolean = false,
     val energyContinuous: Boolean = true,
     val knownDistanceKm: Double = 0.0,
-    val knownEnergyKwh: Double = 0.0
+    val knownEnergyKwh: Double = 0.0,
+    val odometerEndKnown: Boolean? = null,
+    val socEndKnown: Boolean? = null
 ) : java.io.Serializable {
     init {
         require(knownDistanceKm.isFinite() && knownDistanceKm >= 0.0)
@@ -69,12 +71,16 @@ data class TripCounterCoverage(
         put("soc_start", socStartKnown); put("odometer_start", odometerStartKnown)
         put("energy_start", energyStartKnown); put("energy_continuous", energyContinuous)
         put("known_distance_km", knownDistanceKm); put("known_energy_kwh", knownEnergyKwh)
+        odometerEndKnown?.let { put("odometer_end", it) }
+        socEndKnown?.let { put("soc_end", it) }
     }
     companion object {
         fun fromJson(json: org.json.JSONObject) = TripCounterCoverage(
             json.getBoolean("soc_start"), json.getBoolean("odometer_start"),
             json.getBoolean("energy_start"), json.getBoolean("energy_continuous"),
-            json.getDouble("known_distance_km"), json.getDouble("known_energy_kwh"))
+            json.getDouble("known_distance_km"), json.getDouble("known_energy_kwh"),
+            if (json.has("odometer_end")) json.getBoolean("odometer_end") else null,
+            if (json.has("soc_end")) json.getBoolean("soc_end") else null)
     }
 }
 

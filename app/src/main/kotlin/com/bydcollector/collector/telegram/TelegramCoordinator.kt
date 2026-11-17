@@ -57,16 +57,20 @@ class TelegramCoordinator internal constructor(
 
     /** Called on the owner at a completed Main frontier, before the next business page. */
     internal fun recoverInitialHistory(history: (String, Long) -> Sequence<com.bydcollector.collector.data.input.BusinessInputDelta>) {
-        if (historyRepairAttempted || engine.state.initialSeedRecoveryVersion >= 1) return
+        if (historyRepairAttempted) return
+        val energy = currentEnergySnapshot()
+        if (engine.state.initialSeedRecoveryVersion >= 2 &&
+            (energy?.active != true || engine.state.powerSession?.boundary != null)) return
         historyRepairAttempted = true
         check(businessBatch == null)
         try {
-            val energy = currentEnergySnapshot()
             val activeGroup = energy?.active == true && energy.powerSessionId == engine.state.powerEnergyPoint?.powerSessionId
             val timing = engine.state.detectorTiming
+            val boot = timing.bootId ?: energy?.takeIf { it.active }?.sourceBootId
+            val through = if (timing.bootId == boot) timing.evaluatedElapsedMs else energy?.sourceElapsedMs ?: 0L
             val result = com.bydcollector.collector.service.TelegramHistoryRepair.recover(
                 engine.state, eventConfig(), normalizer, activeGroup,
-                timing.bootId?.let { history(it, timing.evaluatedElapsedMs) } ?: emptySequence())
+                boot?.let { history(it, through) } ?: emptySequence(), energy)
             // State and the revision marker are one durable value; delivery rows are untouched.
             telegramStore.saveTelegramRuntimeState(result.state.toJson(), nowMs())
             engine = createEngine(result.state)
@@ -152,6 +156,7 @@ class TelegramCoordinator internal constructor(
         energySnapshot: EnergySnapshot? = null,
         continuityUpdates: Map<String, BusinessInputContinuity> = emptyMap(),
         requireCommit: Boolean = false,
+        startedPowerSessionId: String? = null,
         onDiagnosticLegStarted: ((String) -> Unit)? = null
     ): Long? {
         activateEnabledRuntime() ?: return null
@@ -164,6 +169,7 @@ class TelegramCoordinator internal constructor(
             pollId, timestamp, source, readings, origin, currentBootId,
             eventConfig(), eventNowMs, normalizer, energySnapshot,
             continuityUpdates = continuityUpdates,
+            startedPowerSessionId = startedPowerSessionId,
             nowElapsedMs = android.os.SystemClock.elapsedRealtime()
         )
         val committed = handle(result)
@@ -275,7 +281,7 @@ class TelegramCoordinator internal constructor(
         if (telegramStore.hasTripCompletionReceipt(intent.sequence, intent.identity)) return null
         check(settings.isTelegramEnabled()) { "Telegram completion is waiting for the enabled runtime" }
         return preparePowerOffConfirmed(
-            snapshot = TelegramPowerOffSnapshot(intent.odometerKm, intent.soc, intent.tripEnergyKwh, intent.energySnapshot),
+            snapshot = TelegramPowerOffSnapshot(intent.odometerKm, intent.soc, intent.tripEnergyKwh, intent.energySnapshot, intent.session, intent.identity),
             location = location,
             occurredAtMs = checkNotNull(TripTime.instant(intent.observedAt)).toEpochMilli(),
             completion = intent
@@ -291,9 +297,6 @@ class TelegramCoordinator internal constructor(
     ): TelegramPowerOffPreparation? {
         activateEnabledRuntime() ?: return null
         val recovered = recoverStartupLocally(snapshot.energySnapshot, occurredAtMs)
-        // No Telegram samples may have been processed while its SQLite was unavailable.
-        // Preserve the known complete power session instead of inventing moving-leg splits.
-        if (completion != null) engine = createEngine(recoverCompletionState(engine.state, completion))
         val pendingSummaryKey = engine.state.pendingPowerOffLocationTripId
             ?.takeIf { !engine.state.pendingPowerOffLocationSummaryDelivered }
             ?.let { "$it:summary" }
@@ -855,41 +858,6 @@ class TelegramCoordinator internal constructor(
     private fun failureDetail(result: TelegramSendResult.Failure): String {
         return telegramFailureDetail(result)
     }
-}
-
-/** A fallback only when the sender has no surviving leg/parked obligation. */
-internal fun recoverCompletionState(state: TelegramEventState, intent: TripCompletionIntent): TelegramEventState {
-    if (state.tripId != null || state.pendingPowerOffLocationTripId != null) return state
-    val trip = intent.session?.takeIf { it.movementObserved } ?: return state
-    // With no new observed leg, OFF must not rebuild an already reported power session.
-    if (state.detectorTiming.reportedPowerSessionId == trip.tripId) return state
-    val tripStartedAtMs = TripTime.instant(trip.startedAt)?.toEpochMilli()
-    val tripEndedAtMs = trip.endedAt?.let { TripTime.instant(it)?.toEpochMilli() }
-    return state.copy(
-        tripId = "${intent.identity}:recovered",
-        tripPowerSessionId = trip.tripId,
-        tripStartedAtMs = tripStartedAtMs,
-        tripDistance = com.bydcollector.collector.service.TelegramTripDistance.legacy(
-            trip.startOdometerKm, trip.lastOdometerKm, tripStartedAtMs, tripEndedAtMs),
-        tripStartSoc = trip.startSoc.takeIf { trip.counterCoverage?.socStartKnown == true },
-        tripStartEnergyKwh = trip.startTripEnergyKwh.takeIf { trip.counterCoverage?.energyStartKnown == true },
-        tripParkedSinceMs = null,
-        tripEndedAtMs = tripEndedAtMs,
-        tripEndSoc = trip.endSoc,
-        tripEndEnergyKwh = trip.lastTripEnergyKwh,
-        tripAccumulatedEnergyKwh = trip.counterCoverage?.knownEnergyKwh ?: trip.energyKwh,
-        tripEnergyContinuous = trip.counterCoverage?.energyContinuous == true,
-        lastTripEnergyCounterKwh = trip.lastTripEnergyKwh,
-        bootStartSoc = trip.startSoc.takeIf { trip.counterCoverage?.socStartKnown == true },
-        bootEndSoc = trip.endSoc,
-        bootTotalDistanceKm = 0.0,
-        bootTotalDistanceComplete = true,
-        bootTotalEnergyKwh = 0.0,
-        bootTotalEnergyComplete = true,
-        bootTotalDurationMs = 0L,
-        bootTotalStartedAtMs = tripStartedAtMs,
-        bootTotalEndedAtMs = tripEndedAtMs
-    )
 }
 
 /** Joins one poll's results without waiting or changing either owner's execution order. */

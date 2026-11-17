@@ -23,7 +23,9 @@ class TelegramCallbackDeadlineTest {
     private val normalizer = VehicleStateNormalizer()
     private val base = 1_797_000_000_000L
 
-    private fun input(engine: TelegramEventEngine, elapsed: Long, vararg values: Pair<String, String>) =
+    private fun input(engine: TelegramEventEngine, elapsed: Long, vararg values: Pair<String, String>,
+        startedPowerSessionId: String? = null,
+        energySnapshot: com.bydcollector.collector.data.energy.EnergySnapshot? = null) =
         engine.onSourcePoll(elapsed, Instant.ofEpochMilli(base + elapsed).toString(),
             PollSampleSource("sample:$elapsed", "boot", elapsed, "source", elapsed),
             values.mapIndexed { index, value ->
@@ -36,7 +38,31 @@ class TelegramCallbackDeadlineTest {
                     if (value.first in setOf(VOLTAGE, CURRENT, ENERGY)) Float.fromBits(value.second.toInt()).toString() else value.second,
                     callback)
             }, PollOrigin.REPLAY,
-            "boot", config, base + 1_000_000L, normalizer, nowElapsedMs = 1_000_000L)
+            "boot", config, base + 1_000_000L, normalizer, nowElapsedMs = 1_000_000L,
+            startedPowerSessionId = startedPowerSessionId, energySnapshot = energySnapshot)
+
+    @Test fun powerSessionKeepsTheOnBoundaryAcrossParkingDrivingAndReload() {
+        var engine = TelegramEventEngine()
+        input(engine, 0, GEAR to "1", ODOMETER to "1000", SOC to "75", startedPowerSessionId = "on:1")
+        assertNull(engine.state.tripId)
+        assertEquals(0.0, engine.state.powerSession!!.distance.completeKm)
+        input(engine, 60_000, SOC to "74")
+        input(engine, 120_000, GEAR to "4")
+        assertEquals(74.0, engine.state.tripStartSoc)
+        input(engine, 180_000, ODOMETER to "1010", SOC to "73")
+        engine = TelegramEventEngine(TelegramEventState.fromJson(engine.state.toJson()))
+        input(engine, 240_000, GEAR to "1")
+        assertEquals(base, engine.state.powerSession!!.startedAtMs)
+        assertEquals(75.0, engine.state.powerSession!!.startSoc)
+        assertEquals(1.0, engine.state.powerSession!!.distance.completeKm)
+        input(engine, 245_000, SOC to "72")
+        assertEquals(73.0, engine.state.tripEndPowerSession!!.endSoc)
+        assertEquals(72.0, engine.state.powerSession!!.endSoc)
+        input(engine, 246_000, ODOMETER to "-1")
+        assertNull(engine.state.powerSession!!.distance.completeKm)
+        input(engine, 247_000, ODOMETER to "10")
+        assertNull(engine.state.powerSession!!.distance.completeKm)
+    }
 
     private fun tick(engine: TelegramEventEngine, elapsed: Long) =
         engine.onDetectorTimer(config, base + elapsed, "boot", elapsed, normalizer)

@@ -1530,7 +1530,8 @@ class CollectorService : Service() {
                                     var deadline = coordinator.onSourcePoll(ref.pollId ?: 0L, timestamp, source,
                                         delta.readings, if (ref.origin == BusinessInputOrigin.REPLAY) PollOrigin.REPLAY else PollOrigin.LIVE,
                                         LivePollSource.liveBootId, snapshot,
-                                        continuityUpdates = delta.continuityUpdates, requireCommit = true) { legId ->
+                                        continuityUpdates = delta.continuityUpdates, requireCommit = true,
+                                        startedPowerSessionId = trip?.takeIf { it.confirmedPowerOn }?.powerSessionId) { legId ->
                                         trip?.powerSessionId?.let { coordinator.bindTripDiagnosticParent(legId, it) }
                                     }
                                     trip?.let { result ->
@@ -1653,7 +1654,8 @@ class CollectorService : Service() {
                             entry.trip?.let { completeThrough(it.priorCompletionWatermark) }
                             coordinator.onSourcePoll(ref.pollId ?: 0L, BusinessInputProjection.timestamp(ref), source,
                                 delta.readings, if (ref.origin == BusinessInputOrigin.REPLAY) PollOrigin.REPLAY else PollOrigin.LIVE,
-                                mergeBoot, entry.energy, continuityUpdates = delta.continuityUpdates, requireCommit = true) { leg ->
+                                mergeBoot, entry.energy, continuityUpdates = delta.continuityUpdates, requireCommit = true,
+                                startedPowerSessionId = entry.trip?.takeIf { it.confirmedPowerOn }?.powerSessionId) { leg ->
                                 entry.trip?.powerSessionId?.let { coordinator.bindTripDiagnosticParent(leg, it) }
                             }
                             entry.trip?.let { completeThrough(it.completionWatermark) }
