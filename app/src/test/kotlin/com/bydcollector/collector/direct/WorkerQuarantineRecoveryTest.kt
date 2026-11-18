@@ -36,18 +36,15 @@ class WorkerQuarantineRecoveryTest {
     }
 
     @Test
-    fun emptyLegacyIndexRetainsHistoryAndSeesNewExternalReadyFiles() {
-        val root = Files.createTempDirectory("worker-empty-index").toFile()
+    fun firstOpenReplaysExistingReadyFileAndPreservesRecoveredHistory() {
+        val root = Files.createTempDirectory("worker-first-open").toFile()
         val historyBytes = captured(24)
-        val history = File(root, filename(historyBytes) + ".bad.recovered").apply { writeBytes(historyBytes) }
+        val history = File(root, filename(historyBytes) + ".bad.recovered")
         val readyBytes = captured(28)
         try {
+            history.writeBytes(historyBytes)
+            File(root, filename(readyBytes)).writeBytes(readyBytes)
             TelemetryWorkerSpool.openForTest(root, TelemetryWorkerSpool.MAX_SPOOL_BYTES).use { spool ->
-                repeat(3) {
-                    assertFalse(spool.hasPending())
-                    assertTrue(spool.pending(10, validator).isEmpty())
-                }
-                File(root, filename(readyBytes)).writeBytes(readyBytes)
                 assertTrue(spool.hasPending())
                 val sample = spool.pending(10, validator).single()
                 assertEquals(28L, sample.identity.pollSequence)
@@ -119,7 +116,9 @@ class WorkerQuarantineRecoveryTest {
             val current = TelemetryWorkerSpool.Sample(old.identity, old.catalogVersion, old.capturedWallMs,
                 old.capturedElapsedMs, old.pollElapsedMs, old.batchStatus, old.batchMode, old.nativeAvailable,
                 old.groupFailureCount, old.error, old.values)
+            assertFalse(spool.hasPending())
             assertEquals(TelemetryWorkerSpool.AppendResult.SUCCESS, spool.append(current))
+            assertTrue(spool.hasPending())
             val v4 = spool.pending(10, validator).single()
             assertEquals(4, v4.recordVersion)
             val transported = TelemetryWorkerSample(v4.identity, v4.catalogVersion, v4.capturedWallMs,
