@@ -315,6 +315,8 @@ An authorized ADB connection can collect a diagnostic ZIP and separately clear l
 
 ### 1. Collect logs
 
+The ZIP includes the last 10 closed trips, newest first, with start and end times, discharged, regenerated and net battery energy, covered and uncovered time, and quality flags. Missing readings appear as `null`. These rows contain no coordinates.
+
 ```powershell
 adb shell content call --uri content://com.bydcollector.collector.diagnostics --method collect
 ```

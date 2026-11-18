@@ -278,6 +278,15 @@ class InfluxExportCoordinator(
             // Keep the last calculated snapshot/error, rather than rewriting it as a fresh count.
             return InfluxActionResult.ok("influx next attempt pending")
         }
+        val waitingFor = state.transportWaitGeneration
+        if (state.status == STATUS_BACKOFF && waitingFor != null &&
+            HaTailscaleRuntime.current()?.nativeState(waitingFor) == "starting") {
+            // Recheck only the shared node at the fallback deadline. A ready event bypasses it.
+            store.updateInfluxExportState(state.status, state.mode, state.pendingRows, state.oldestPendingAt,
+                plusSeconds(clock.nowIso(), FAILURE_RETRY_INTERVAL_SECONDS), state.lastSuccessAt,
+                state.lastErrorAt, state.lastError, 0, waitingFor)
+            return InfluxActionResult.ok("influx transport start pending")
+        }
         store.ensureInfluxCursors(fieldKeys)
         // Queue statistics are not delivery authority; every batch still reads the durable cursors.
         val pendingBefore = pendingSummary(fieldKeys)
@@ -358,7 +367,7 @@ class InfluxExportCoordinator(
             val pendingAfter = pendingAfterBatch(fieldKeys)
             batch.failure?.let { failure ->
                 val pendingAfterFailure = pendingAfter
-                if (isTransientFailure(failure)) {
+                if (failure.transportWaitGeneration == null && isTransientFailure(failure)) {
                     val previousLimit = currentBatchSize ?: batchLimit
                     val nextLimit = influxBatchSizeAfterTransientFailure(pendingAfterFailure, currentBatchSize)
                     currentBatchSize = nextLimit
@@ -744,7 +753,7 @@ class InfluxExportCoordinator(
     }
 
     private fun isFallbackEligible(result: InfluxActionResult): Boolean {
-        if (result.ok) return false
+        if (result.ok || result.transportWaitGeneration != null) return false
         if (result.failureKind == InfluxFailureKind.AUTHENTICATION ||
             result.failureKind == InfluxFailureKind.DATA ||
             result.failureKind == InfluxFailureKind.PROTOCOL

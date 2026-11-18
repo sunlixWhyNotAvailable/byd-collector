@@ -142,6 +142,7 @@ internal class HaTailscaleRuntime private constructor(private val context: Conte
         check(!CollectorSettings(context).isUserShutdownRequested()) { "Collector was shut down" }
         val session = TailscaleNativeSession(context)
         native = session
+        phase = "starting"
         try {
             session.start()
             worker.execute {
@@ -167,8 +168,17 @@ internal class HaTailscaleRuntime private constructor(private val context: Conte
 
     fun register(client: MqttClientFacade) { synchronized(mqttClients) { mqttClients.add(client) } }
 
-    fun isReady(id: String? = null): Boolean = enabled && !pending && phase == "ready" &&
-        synchronized(nativeLock) { native?.let { id == null || id == it.id } == true }
+    fun isReady(id: String? = null): Boolean = !pending && phase == "ready" && nativeState(id) == "ready"
+
+    fun nativeState(id: String?): String? = synchronized(nativeLock) {
+        val session = native?.takeIf { enabled && (id == null || it.id == id) } ?: return null
+        try {
+            session.status().state
+        } catch (error: Exception) {
+            record("status_check_failed", error.diagnosticDetail())
+            null // Let the normal write at the retry deadline report the transport failure.
+        }
+    }
 
     fun addReadyListener(listener: (String) -> Unit) { readyListeners.add(listener) }
     fun removeReadyListener(listener: (String) -> Unit) { readyListeners.remove(listener) }

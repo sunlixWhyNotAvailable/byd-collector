@@ -1,6 +1,7 @@
 package com.bydcollector.collector.diagnostics
 
 import android.content.Context
+import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
@@ -10,6 +11,8 @@ import com.bydcollector.collector.adb.AdbLocalClient
 import com.bydcollector.collector.data.local.TelemetryDatabaseHelper
 import com.bydcollector.collector.data.local.TelegramDiagnosticRow
 import com.bydcollector.collector.data.local.TelegramDiagnosticSnapshot
+import com.bydcollector.collector.data.trips.TripCompression
+import com.bydcollector.collector.data.trips.TripDatabaseHelper
 import com.bydcollector.collector.data.trips.TripRouteDiagnosticEvidence
 import com.bydcollector.collector.data.trips.TripSession
 import com.bydcollector.collector.maintenance.ArchiveStorageItemState
@@ -859,6 +862,37 @@ object DiagnosticLogRecorder {
         false
     }
 
+    internal fun recentClosedTripEvidence(file: File): List<String> {
+        if (TripCompression.needsRecoveryForRead(file)) return listOf("recent_closed_status=compression_recovery_pending")
+        if (!file.exists()) return listOf("recent_closed_status=missing")
+        return SQLiteDatabase.openDatabase(file.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { db ->
+            db.rawQuery("""
+                SELECT started_at, ended_at, discharged_kwh, regenerated_kwh, net_kwh,
+                       energy_covered_ms, energy_uncovered_ms, energy_partial, quality
+                FROM trip_sessions WHERE state = ?
+                ORDER BY julianday(COALESCE(ended_at, started_at)) DESC, trip_id DESC LIMIT 10
+            """.trimIndent(), arrayOf(TripSession.STATE_CLOSED)).use { cursor ->
+                buildList {
+                    add("recent_closed_status=ok")
+                    add("recent_closed_count=${cursor.count}")
+                    val names = cursor.columnNames
+                    while (cursor.moveToNext()) {
+                        val row = JSONObject()
+                        names.forEachIndexed { i, name ->
+                            row.put(name, when (cursor.getType(i)) {
+                                Cursor.FIELD_TYPE_NULL -> JSONObject.NULL
+                                Cursor.FIELD_TYPE_INTEGER -> if (name == "energy_partial") cursor.getInt(i) != 0 else cursor.getLong(i)
+                                Cursor.FIELD_TYPE_FLOAT -> cursor.getDouble(i)
+                                else -> cursor.getString(i)
+                            })
+                        }
+                        add("recent_closed_trip=$row")
+                    }
+                }
+            }
+        }
+    }
+
     private fun writeTripsTelegramEvidence(context: Context, runDir: File): String {
         return runCatching {
             (context.applicationContext as BydCollectorApplication).tryDatabaseRead {
@@ -869,7 +903,7 @@ object DiagnosticLogRecorder {
 
     private fun writeTripsEvidenceUnavailable(runDir: File, reason: String): String {
         File(runDir, TRIPS_TELEGRAM_EVIDENCE_NAME).writeText(
-            "schema_version=1\ntrips_status=$reason\ntelegram_status=$reason\ntruncated=0\n",
+            "schema_version=1\ntrips_status=$reason\nrecent_closed_status=$reason\ntelegram_status=$reason\ntruncated=0\n",
             Charsets.UTF_8
         )
         return "partial $reason"
@@ -884,6 +918,16 @@ object DiagnosticLogRecorder {
         )
         val app = context.applicationContext as BydCollectorApplication
         var telegram: TelegramDiagnosticSnapshot? = null
+        if (app.tripsFileOperationLock.tryLock()) {
+            try {
+                lines += recentClosedTripEvidence(context.getDatabasePath(TripDatabaseHelper.DATABASE_NAME))
+            } catch (error: Exception) {
+                lines += "recent_closed_status=error"
+                lines += "recent_closed_error=${error.diagnosticDetail("read closed trip energy")}"
+            } finally {
+                app.tripsFileOperationLock.unlock()
+            }
+        } else lines += "recent_closed_status=maintenance_busy"
         var telegramStatus = "not_initialized"
         var telegramError: Throwable? = null
         runCatching {

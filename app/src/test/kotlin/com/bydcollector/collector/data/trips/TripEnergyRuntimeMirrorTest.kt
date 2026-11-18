@@ -10,6 +10,12 @@ import com.bydcollector.collector.data.energy.BufferedEnergyStorage
 import com.bydcollector.collector.data.energy.EnergySnapshot
 import com.bydcollector.collector.data.input.BusinessPage
 import com.bydcollector.collector.data.input.BusinessPageEntry
+import com.bydcollector.collector.diagnostics.DiagnosticLogRecorder
+import com.bydcollector.collector.diagnostics.DiagnosticZipWriter
+import com.bydcollector.collector.diagnostics.sanitizeDiagnosticSnapshot
+import java.io.File
+import java.util.zip.ZipFile
+import org.json.JSONObject
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -24,6 +30,54 @@ import kotlin.test.assertTrue
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
 class TripEnergyRuntimeMirrorTest {
+    @Test fun diagnosticZipKeepsLatestTenClosedSessionsAndDistinguishesUnknownFromZero() {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "recent_closed_energy.db"
+        val snapshot = File(context.cacheDir, "snapshot_closed_energy").apply { mkdirs() }
+        val zip = File(context.cacheDir, "closed_energy.zip")
+        try {
+            TripStore(TripDatabaseHelper(context, name)).use { store ->
+                for (hour in 0..11) {
+                    val start = java.time.Instant.parse("2026-11-18T00:00:00Z").plusSeconds(hour * 3600L)
+                    val trip = TripSession("private-id-$hour", TripSession.STATE_CLOSED, start.toString(),
+                        endedAt = start.plusSeconds(600).toString())
+                    store.upsertSession(if (hour == 11) trip.copy(dischargedKwh = 0.0, regeneratedKwh = 0.25,
+                        netKwh = -0.25, energyCoveredMs = 550_000, energyUncoveredMs = 50_000,
+                        energyPartial = true, quality = "trip_energy_reset,trip_energy_incomplete") else trip)
+                }
+                store.upsertSession(TripSession("private-open", startedAt = "2026-11-18T12:00:00Z"))
+                val file = File(snapshot, "trips_telegram_evidence.txt")
+                file.writeText(DiagnosticLogRecorder.recentClosedTripEvidence(store.databaseFile).joinToString("\n"))
+            }
+            sanitizeDiagnosticSnapshot(snapshot)
+            DiagnosticZipWriter.writeLatestZip(zip, snapshot)
+            val rows = ZipFile(zip).use { archive ->
+                val text = archive.getInputStream(archive.getEntry("trips_telegram_evidence.txt")).bufferedReader().use { it.readText() }
+                assertFalse(text.contains("private-"))
+                text.lineSequence().filter { it.startsWith("recent_closed_trip=") }.map { JSONObject(it.substringAfter('=')) }.toList()
+            }
+            val starts = (11 downTo 2).map { java.time.Instant.parse("2026-11-18T00:00:00Z").plusSeconds(it * 3600L).toString() }
+            assertEquals(starts, rows.map { it.getString("started_at") })
+            val first = rows.first()
+            assertEquals(0.0, first.getDouble("discharged_kwh"))
+            assertEquals(0.25, first.getDouble("regenerated_kwh"))
+            assertEquals(-0.25, first.getDouble("net_kwh"))
+            assertEquals(550_000L, first.getLong("energy_covered_ms"))
+            assertEquals(50_000L, first.getLong("energy_uncovered_ms"))
+            assertTrue(first.getBoolean("energy_partial"))
+            assertEquals("trip_energy_reset,trip_energy_incomplete", first.getString("quality"))
+            assertTrue(rows[1].has("net_kwh") && rows[1].isNull("net_kwh"))
+            val active = context.getDatabasePath(name)
+            val journal = File(active.path + ".compression-journal")
+            try {
+                journal.writeText("PREPARED")
+                assertEquals(listOf("recent_closed_status=compression_recovery_pending"),
+                    DiagnosticLogRecorder.recentClosedTripEvidence(active))
+                assertEquals("PREPARED", journal.readText())
+            } finally { journal.delete() }
+        } finally { context.deleteDatabase(name); snapshot.deleteRecursively(); zip.delete() }
+    }
+
     @Test fun hierarchyKeepsStationaryHistoryAndIncludesItsEnergyInGroupedConsumption() {
         val context = RuntimeEnvironment.getApplication()
         val name = "stationary_history.db"

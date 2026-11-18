@@ -247,6 +247,12 @@ internal class TripCompression(
         private const val COMMITTED = "COMMITTED"
         private const val SPACE_RESERVE = 16L * 1024L * 1024L
 
+        internal fun needsRecoveryForRead(active: File): Boolean {
+            val files = Files(active)
+            if (!files.journal.exists()) return files.backup.exists()
+            return !active.isFile || readPhase(files) != COMMITTED
+        }
+
         /** Must run before SQLiteOpenHelper is allowed to create/open the canonical Trips file. */
         fun recoverBeforeOpen(context: Context, databaseName: String = TripDatabaseHelper.DATABASE_NAME): Boolean {
             require(databaseName == File(databaseName).name) { "Invalid Trips database name" }
