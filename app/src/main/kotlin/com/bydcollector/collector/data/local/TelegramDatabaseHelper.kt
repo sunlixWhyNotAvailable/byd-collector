@@ -86,6 +86,12 @@ class TelegramDatabaseHelper(
             )
             """.trimIndent()
         )
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS telegram_trip_report_evidence (
+                report_ref TEXT PRIMARY KEY, session_ref TEXT NOT NULL, formed_at_ms INTEGER NOT NULL,
+                evidence TEXT NOT NULL
+            ) WITHOUT ROWID
+        """.trimIndent())
         db.execSQL(TelegramDatabaseSql.CREATE_DELIVERY_RECEIPT_TABLE)
         db.execSQL("CREATE TABLE IF NOT EXISTS telegram_business_page_receipt (singleton INTEGER PRIMARY KEY CHECK(singleton=1), page_key TEXT NOT NULL, completions_json TEXT NOT NULL)")
         db.execSQL(TelegramDatabaseSql.CREATE_DELIVERY_RECEIPT_INDEX)
@@ -120,7 +126,7 @@ class TelegramDatabaseHelper(
 
     companion object {
         const val DATABASE_NAME = "bydcollector_telegram.db"
-        const val DATABASE_VERSION = 7
+        const val DATABASE_VERSION = 8
         const val MAX_PENDING = 1_000L
         const val RETENTION_MS = 30L * 24L * 60L * 60L * 1_000L
         const val LEGACY_UNCLAIMED_BOT_SCOPE = "__legacy_unclaimed__"

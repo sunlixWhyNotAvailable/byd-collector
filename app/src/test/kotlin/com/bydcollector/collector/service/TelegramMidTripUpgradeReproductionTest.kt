@@ -649,7 +649,7 @@ class TelegramMidTripUpgradeReproductionTest {
         val firstEmittedSummary = engine.onSuccessfulPoll(
             tripTelemetry(gear = "P", soc = 70.0, odometer = 104.0, tripEnergy = 2.5), enabledConfig, 12_000L
         ).events.single { it.type == TelegramEventType.TRIP_SUMMARY }
-        assertFalse(firstEmittedSummary.omitCurrent, "first emitted does not mean the current and total blocks are equal")
+        assertTrue(firstEmittedSummary.omitCurrent, "a disabled report does not consume the first report")
         assertMetric(firstEmittedSummary, "trip_distance_km", 2.0)
         assertMetric(firstEmittedSummary, "total_distance_km", 4.0)
     }

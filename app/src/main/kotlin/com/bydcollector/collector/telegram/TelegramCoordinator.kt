@@ -46,7 +46,8 @@ class TelegramCoordinator internal constructor(
     private val protectedTelegramIds: () -> Set<Long> = { emptySet() },
     private val deliveryLaneAvailable: () -> Boolean = { true },
     private val onConnectionTestSettled: (TelegramSendResult) -> Unit = {},
-    private val ecMeanKwhPer100Km: () -> Double? = { null }
+    private val ecMeanKwhPer100Km: () -> Double? = { null },
+    private val retainedEnergyAtBoundary: (String, String, Long, Long) -> EnergySnapshot? = { _, _, _, _ -> null }
 ) {
     private var engine = createEngine(loadDetectorState())
     @Volatile var detectorDeadlineAtMs: Long? = engine.nextDetectorDeadlineAtMs()
@@ -111,7 +112,8 @@ class TelegramCoordinator internal constructor(
             val outcomes = telegramStore.commitTelegramEvents(
                 batch.messages, engine.state.toJson(), at,
                 protectedTelegramIds = protectedTelegramIds(), businessPageKey = key,
-                pageCompletions = batch.completions.map { it.key to it.value }
+                pageCompletions = batch.completions.map { it.key to it.value },
+                tripReportEvidence = batch.events.tripReportEvidence()
             )
             businessBatch = null
             detectorDeadlineAtMs = engine.nextDetectorDeadlineAtMs()
@@ -610,7 +612,7 @@ class TelegramCoordinator internal constructor(
         return enabledRuntimeStartedAtMs ?: nowMs().also { enabledRuntimeStartedAtMs = it }
     }
 
-    private fun createEngine(state: TelegramEventState) = TelegramEventEngine(state, ecMeanKwhPer100Km)
+    private fun createEngine(state: TelegramEventState) = TelegramEventEngine(state, ecMeanKwhPer100Km, retainedEnergyAtBoundary)
 
     private fun loadDetectorState(): TelegramEventState = telegramStore.loadTelegramRuntimeState { error, evidence ->
         val detail = "evidence=$evidence ${error.diagnosticDetail()}"
@@ -648,7 +650,8 @@ class TelegramCoordinator internal constructor(
                 nowMs = committedAt,
                 completionSequence = completion?.sequence,
                 completionIdentity = completion?.identity,
-                protectedTelegramIds = protectedTelegramIds()
+                protectedTelegramIds = protectedTelegramIds(),
+                tripReportEvidence = result.events.tripReportEvidence()
             )
         } catch (error: Exception) {
             if (error is InterruptedException) throw error
@@ -665,6 +668,9 @@ class TelegramCoordinator internal constructor(
         recordQueued(messages, result.events, outcomes, committedAt)
         return true
     }
+
+    private fun List<TelegramDetectedEvent>.tripReportEvidence() =
+        mapNotNull { event -> event.tripEnergyEvidence?.let { event.dedupeKey to it } }.toMap()
 
     private fun recordQueued(messages: List<TelegramOutboxMessage>, events: List<TelegramDetectedEvent>,
         outcomes: List<TelegramEnqueueResult>, committedAt: Long) {

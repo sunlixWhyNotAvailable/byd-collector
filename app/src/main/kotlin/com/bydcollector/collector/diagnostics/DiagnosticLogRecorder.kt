@@ -862,12 +862,12 @@ object DiagnosticLogRecorder {
         false
     }
 
-    internal fun recentClosedTripEvidence(file: File): List<String> {
+    internal fun recentClosedTripEvidence(file: File, sessionRefs: MutableSet<String>? = null): List<String> {
         if (TripCompression.needsRecoveryForRead(file)) return listOf("recent_closed_status=compression_recovery_pending")
         if (!file.exists()) return listOf("recent_closed_status=missing")
         return SQLiteDatabase.openDatabase(file.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { db ->
             db.rawQuery("""
-                SELECT started_at, ended_at, discharged_kwh, regenerated_kwh, net_kwh,
+                SELECT trip_id, started_at, ended_at, discharged_kwh, regenerated_kwh, net_kwh,
                        energy_covered_ms, energy_uncovered_ms, energy_partial, quality
                 FROM trip_sessions WHERE state = ?
                 ORDER BY julianday(COALESCE(ended_at, started_at)) DESC, trip_id DESC LIMIT 10
@@ -879,6 +879,10 @@ object DiagnosticLogRecorder {
                     while (cursor.moveToNext()) {
                         val row = JSONObject()
                         names.forEachIndexed { i, name ->
+                            if (name == "trip_id") {
+                                sessionRefs?.add(diagnosticSha256(cursor.getString(i)))
+                                return@forEachIndexed
+                            }
                             row.put(name, when (cursor.getType(i)) {
                                 Cursor.FIELD_TYPE_NULL -> JSONObject.NULL
                                 Cursor.FIELD_TYPE_INTEGER -> if (name == "energy_partial") cursor.getInt(i) != 0 else cursor.getLong(i)
@@ -903,7 +907,7 @@ object DiagnosticLogRecorder {
 
     private fun writeTripsEvidenceUnavailable(runDir: File, reason: String): String {
         File(runDir, TRIPS_TELEGRAM_EVIDENCE_NAME).writeText(
-            "schema_version=1\ntrips_status=$reason\nrecent_closed_status=$reason\ntelegram_status=$reason\ntruncated=0\n",
+            "schema_version=2\ntrips_status=$reason\nrecent_closed_status=$reason\ntelegram_status=$reason\ntruncated=0\n",
             Charsets.UTF_8
         )
         return "partial $reason"
@@ -912,15 +916,16 @@ object DiagnosticLogRecorder {
     private fun writeTripsTelegramEvidenceUnderReadGate(context: Context, runDir: File): String {
         val output = File(runDir, TRIPS_TELEGRAM_EVIDENCE_NAME)
         val lines = mutableListOf<String>(
-            "schema_version=1",
+            "schema_version=2",
             "captured_at=${timestampIso()}",
             "redaction=trip_telegram_metadata_only"
         )
         val app = context.applicationContext as BydCollectorApplication
         var telegram: TelegramDiagnosticSnapshot? = null
+        val closedSessionRefs = mutableSetOf<String>()
         if (app.tripsFileOperationLock.tryLock()) {
             try {
-                lines += recentClosedTripEvidence(context.getDatabasePath(TripDatabaseHelper.DATABASE_NAME))
+                lines += recentClosedTripEvidence(context.getDatabasePath(TripDatabaseHelper.DATABASE_NAME), closedSessionRefs)
             } catch (error: Exception) {
                 lines += "recent_closed_status=error"
                 lines += "recent_closed_error=${error.diagnosticDetail("read closed trip energy")}"
@@ -935,6 +940,9 @@ object DiagnosticLogRecorder {
             if (store == null) {
                 telegramStatus = if (app.telegramStorageError() == null) "not_initialized" else "error"
             } else {
+                lines += runCatching { store.tripReportDiagnosticLines(closedSessionRefs) }.getOrElse {
+                    listOf("trip_report_status=error", "trip_report_error=${it.diagnosticDetail("read trip report evidence")}")
+                }
                 telegram = store.diagnosticSnapshot(TELEGRAM_EVIDENCE_ROW_LIMIT)
                 telegramStatus = telegram?.status ?: "error"
             }
@@ -1066,7 +1074,7 @@ object DiagnosticLogRecorder {
         }.getOrElse { error ->
             runCatching {
                 output.writeText(
-                    "schema_version=1\nstatus=error\nerror=${error::class.java.simpleName}\n",
+                    "schema_version=2\nstatus=error\nerror=${error::class.java.simpleName}\n",
                     Charsets.UTF_8
                 )
             }

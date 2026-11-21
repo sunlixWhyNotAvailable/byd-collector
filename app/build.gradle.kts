@@ -14,8 +14,8 @@ android {
         testInstrumentationRunner = "com.bydcollector.collector.NativeSqliteInstrumentation"
         minSdk = 26
         targetSdk = 29
-        versionCode = 338
-        versionName = "3.5.7"
+        versionCode = 339
+        versionName = "3.5.8"
         ndk { abiFilters += "arm64-v8a" }
         manifestPlaceholders["collectorLabel"] = "BYD Collector"
         buildConfigField("String", "COLLECTOR_DISPLAY_NAME", "\"BYD Collector\"")

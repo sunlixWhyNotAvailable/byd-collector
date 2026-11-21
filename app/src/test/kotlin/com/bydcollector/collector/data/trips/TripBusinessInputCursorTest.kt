@@ -346,7 +346,7 @@ class TripBusinessInputCursorTest {
                 db.version = 8
             }
             TripStore(TripDatabaseHelper(context, name)).use { store ->
-                assertEquals(9, store.schemaVersion())
+                assertEquals(TripDatabaseHelper.DATABASE_VERSION, store.schemaVersion())
                 val legacy = assertNotNull(store.session("legacy"))
                 assertEquals(72.0, legacy.startSoc)
                 assertEquals(1.2, legacy.distanceKm)

@@ -3,7 +3,9 @@ package com.bydcollector.collector.data.local
 import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
+import com.bydcollector.collector.diagnostics.diagnosticSha256
 import com.bydcollector.collector.service.TelegramEventState
+import com.bydcollector.collector.service.pendingTripEnergyEvidence
 import java.io.Closeable
 import java.util.UUID
 import org.json.JSONArray
@@ -28,7 +30,8 @@ class TelegramStore(
         completionIdentity: String? = null,
         protectedTelegramIds: Set<Long> = emptySet(),
         businessPageKey: String? = null,
-        pageCompletions: List<Pair<Long, String>> = emptyList()
+        pageCompletions: List<Pair<Long, String>> = emptyList(),
+        tripReportEvidence: Map<String, JSONObject> = emptyMap()
     ): List<TelegramEnqueueResult> {
         require((completionSequence == null) == (completionIdentity == null))
         require(pageCompletions.isEmpty() || businessPageKey != null)
@@ -46,6 +49,9 @@ class TelegramStore(
                 return emptyList()
             }
             val results = messages.map { enqueueTelegramMessage(db, it, nowMs) }.toMutableList()
+            messages.zip(results).forEach { (message, result) ->
+                if (result.inserted) tripReportEvidence[message.dedupeKey]?.let { saveTripReportEvidence(db, it, nowMs) }
+            }
             val protectedIds = protectedTelegramIds + readActiveTelegramDeliveryAttempt(db)?.outboxId?.let(::setOf).orEmpty()
             if (results.isNotEmpty()) {
                 val repaired = repairTelegramDependencies(db, protectedIds)
@@ -78,6 +84,54 @@ class TelegramStore(
             return results
         } finally {
             db.endTransaction()
+        }
+    }
+
+    private fun saveTripReportEvidence(db: SQLiteDatabase, evidence: JSONObject, nowMs: Long) {
+        val report = evidence.getString("report_ref")
+        val session = if (evidence.isNull("session_ref")) report else evidence.getString("session_ref")
+        db.insertWithOnConflict("telegram_trip_report_evidence", null, ContentValues().apply {
+            put("report_ref", report)
+            put("session_ref", session)
+            put("formed_at_ms", nowMs)
+            put("evidence", JSONObject(evidence.toString()).put("committed_at_ms", nowMs).toString())
+        }, SQLiteDatabase.CONFLICT_REPLACE).also { check(it != -1L) { "Trip report evidence write failed" } }
+        db.execSQL("""
+            DELETE FROM telegram_trip_report_evidence WHERE session_ref = ? AND report_ref NOT IN (
+                SELECT report_ref FROM telegram_trip_report_evidence WHERE session_ref = ?
+                ORDER BY formed_at_ms DESC, report_ref DESC LIMIT 32
+            )
+        """.trimIndent(), arrayOf(session, session))
+        db.execSQL("""
+            DELETE FROM telegram_trip_report_evidence WHERE session_ref NOT IN (
+                SELECT session_ref FROM telegram_trip_report_evidence GROUP BY session_ref
+                ORDER BY MAX(formed_at_ms) DESC, session_ref DESC LIMIT 12
+            )
+        """.trimIndent())
+    }
+
+    @Synchronized
+    internal fun tripReportDiagnosticLines(closedSessionRefs: Set<String>): List<String> {
+        val state = TelegramEventState.fromJsonOrNull(telegramRuntimeState())
+        val pending = state?.let(::pendingTripEnergyEvidence)
+        val activeSessionRef = state?.powerSession?.id?.let(::diagnosticSha256)
+        val wanted = closedSessionRefs + listOfNotNull(activeSessionRef, pending?.optString("session_ref"))
+        return buildList {
+            pending?.let { add("trip_report_pending=$it") }
+            if (wanted.isEmpty()) {
+                add("trip_report_status=no_sessions")
+                return@buildList
+            }
+            val placeholders = wanted.joinToString(",") { "?" }
+            helper.readableDatabase.rawQuery(
+                """SELECT evidence FROM telegram_trip_report_evidence WHERE session_ref IN ($placeholders)
+                    ORDER BY formed_at_ms DESC, report_ref DESC LIMIT 41""".trimIndent(),
+                wanted.toTypedArray()
+            ).use { rows ->
+                add("trip_report_status=${if (rows.count == 0) "not_recorded" else "ok"}")
+                add("trip_report_rows_truncated=${rows.count > 40}")
+                while (rows.moveToNext() && rows.position < 40) add("trip_report=${rows.getString(0)}")
+            }
         }
     }
 

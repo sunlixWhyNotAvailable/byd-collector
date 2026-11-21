@@ -3,6 +3,7 @@ package com.bydcollector.collector.data.trips
 import android.content.ContentValues
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
+import com.bydcollector.collector.data.energy.EnergyReceipt
 import com.bydcollector.collector.data.energy.EnergyRuntimeRow
 import com.bydcollector.collector.data.energy.EnergyRuntimeStorage
 import com.bydcollector.collector.data.energy.EnergySnapshot
@@ -59,6 +60,14 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
         try {
             calculatingBusinessPage = true
             val page = calculate()
+            val energyPoints = page.entries.mapNotNull { entry ->
+                entry.energy?.takeIf { it.sourceIdentity == EnergyReceipt.businessIdentity(page.generation, entry.inputId) }
+            }
+            if (energyPoints.isNotEmpty()) TripEnergyBoundaries.append(db, energyPoints.asSequence())
+            if (energyPoints.any { !it.active && it.powerSessionId != null } ||
+                page.entries.any { it.trip?.closedPowerSession == true || it.trip?.confirmedPowerOn == true }) {
+                boundaryPruneNeeded = true
+            }
             replaceBusinessPage(page)
             db.setTransactionSuccessful()
             return page
@@ -79,9 +88,37 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
 
     @Synchronized
     internal fun acknowledgeBusinessPage(key: String) {
-        check(writableDb.delete("business_page_handoff", "singleton=1 AND page_key=?", arrayOf(key)) == 1) {
-            "Business page acknowledgment identity changed"
+        val db = writableDb
+        db.beginTransaction()
+        try {
+            check(db.delete("business_page_handoff", "singleton=1 AND page_key=?", arrayOf(key)) == 1) {
+                "Business page acknowledgment identity changed"
+            }
+            if (boundaryPruneNeeded) pruneEnergyBoundaries(db)
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
         }
+    }
+
+    @Synchronized
+    internal fun energyAtBoundary(session: String, boot: String, elapsed: Long, through: Long): EnergySnapshot? =
+        TripEnergyBoundaries.find(readableDb, session, boot, elapsed, through)
+
+    @Synchronized
+    internal fun syncEnergyBoundariesFrom(source: TripStore, checkReserve: () -> Unit) =
+        TripEnergyBoundaries.sync(source.readableDb, writableDb, checkReserve)
+
+    @Synchronized
+    internal fun energyBoundarySignature(): Pair<Long, Long> = TripEnergyBoundaries.signature(readableDb)
+
+    private var boundaryPruneNeeded = true
+
+    private fun pruneEnergyBoundaries(db: SQLiteDatabase) {
+        if (db.rawQuery("SELECT 1 FROM trip_completion_outbox LIMIT 1", null).use { it.moveToFirst() }) return
+        val state = readEnergyRuntimeRow()?.let { EnergyStateCodec.decodeState(it.stateJson) }
+        TripEnergyBoundaries.prune(db, state?.takeIf { it.active }?.powerSessionId)
+        boundaryPruneNeeded = false
     }
 
     /** Serializes all TripStore access; Step 8 leases this monitor for cutover. */
@@ -598,7 +635,10 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
             "sequence = ? AND identity = ?",
             arrayOf(sequence.toString(), identity)
         ) == 1
-        if (deleted) markTripCompletionsChanged()
+        if (deleted) {
+            markTripCompletionsChanged()
+            if (pendingBusinessPage() == null) pruneEnergyBoundaries(writableDb)
+        }
         return deleted
     }
 
@@ -717,6 +757,12 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
             if (db.update("energy_runtime_state", values, "singleton_id = 1", null) == 0) {
                 values.put("singleton_id", 1)
                 db.insertOrThrow("energy_runtime_state", null, values)
+            }
+            if (!calculatingBusinessPage && snapshot != null && pendingProjectionJson != null) {
+                TripEnergyBoundaries.append(db, sequenceOf(snapshot))
+            }
+            if (!calculatingBusinessPage && snapshot?.active != true && pendingProjectionJson != null) {
+                boundaryPruneNeeded = true
             }
             snapshot?.powerSessionId?.let { tripId ->
                 if (db.update(

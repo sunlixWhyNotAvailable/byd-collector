@@ -167,7 +167,8 @@ class EnergySessionCoordinatorReplayTest {
         var id = 0L
         try {
             TripStore(TripDatabaseHelper(context, name)).use { store ->
-                val energy = EnergySessionCoordinator(store)
+                var energy = EnergySessionCoordinator(store)
+                engine = TelegramEventEngine(retainedEnergyAtBoundary = store::energyAtBoundary)
                 fun feed(ms: Long, vararg values: Pair<String, String>): TelegramEventResult {
                     id++
                     val source = PollSampleSource("raw-$id", "boot", ms, "test", id)
@@ -201,21 +202,59 @@ class EnergySessionCoordinatorReplayTest {
                 feed(2_100, gear to "1", odo to "1004")
                 val parked = assertNotNull(engine.state.tripEndEnergyPoint)
                 assertEquals(2_100L, parked.sourceElapsedMs)
-                engine = TelegramEventEngine(TelegramEventState.fromJson(engine.state.toJson()))
+                engine = TelegramEventEngine(TelegramEventState.fromJson(engine.state.toJson()),
+                    retainedEnergyAtBoundary = store::energyAtBoundary)
                 for (ms in 3_000L..7_000L step 1_000) feed(ms)
                 assertEquals(parked, engine.state.tripEndEnergyPoint)
                 val first = feed(7_100).events.single { it.type == TelegramEventType.TRIP_SUMMARY }
                 assertEquals("0.02", first.variables["trip_discharged_kwh"])
                 assertEquals("0.02", first.variables["total_discharged_kwh"])
-                assertFalse(first.omitCurrent, "parking before departure belongs only to the total")
+                assertTrue(first.omitCurrent, "the first report shows only the power-session total including preheating")
+                feed(7_500); feed(8_200)
                 feed(7_200, gear to "4")
-                feed(8_200)
+                assertEquals(7_200L, assertNotNull(engine.state.tripStartEnergyPoint).sourceElapsedMs)
+                feed(9_000); feed(9_400); feed(9_900)
+                store.close()
+                energy = EnergySessionCoordinator(store)
+                engine = TelegramEventEngine(TelegramEventState.fromJson(engine.state.toJson()),
+                    retainedEnergyAtBoundary = store::energyAtBoundary)
                 feed(9_200, gear to "1", odo to "1014")
+                assertEquals(9_200L, assertNotNull(engine.state.tripEndEnergyPoint).sourceElapsedMs)
                 for (ms in 10_200L..13_200L step 1_000) feed(ms)
                 // Delivery is late; both blocks still end at P (9_200), not at the report deadline.
-                val second = feed(14_700).events.single { it.type == TelegramEventType.TRIP_SUMMARY }
+                val second = feed(15_000).events.single { it.type == TelegramEventType.TRIP_SUMMARY }
                 assertEquals("0.02", second.variables["trip_discharged_kwh"])
                 assertEquals("0.1", second.variables["total_discharged_kwh"])
+                assertFalse(second.omitCurrent)
+                val evidence = assertNotNull(second.tripEnergyEvidence)
+                assertEquals(7_200L, evidence.getJSONObject("start_checkpoint").getLong("source_elapsed_ms"))
+                assertEquals(9_200L, evidence.getJSONObject("end_checkpoint").getLong("source_elapsed_ms"))
+                assertTrue(evidence.isNull("na_reason"))
+                assertFalse(evidence.toString().contains("\"source_boot_id\""))
+                val telegramName = "sparse_leg_report.db"
+                val telegramHelper = com.bydcollector.collector.data.local.TelegramDatabaseHelper(context, telegramName)
+                try {
+                    com.bydcollector.collector.data.local.TelegramStore(context, telegramHelper).use { telegram ->
+                        val rendered = assertNotNull(com.bydcollector.collector.telegram.renderTelegramPayload(second,
+                            null, com.bydcollector.collector.telegram.TelegramTemplateLanguage.UK).text)
+                        val message = com.bydcollector.collector.data.local.TelegramOutboxMessage(second.dedupeKey,
+                            second.type.key, rendered)
+                        telegram.commitTelegramEvents(listOf(message), engine.state.toJson(),
+                            tripReportEvidence = mapOf(second.dedupeKey to evidence))
+                        // The diagnostic row is independent of the delivery row.
+                        assertEquals(1, telegramHelper.writableDatabase.delete("telegram_outbox", "dedupe_key=?",
+                            arrayOf(second.dedupeKey)))
+                    }
+                    com.bydcollector.collector.data.local.TelegramStore(context, telegramHelper).use { telegram ->
+                        assertEquals(0L, telegram.diagnosticSnapshot().outboxTotal)
+                        val line = telegram.tripReportDiagnosticLines(setOf(evidence.getString("session_ref")))
+                            .single { it.startsWith("trip_report=") }.substringAfter('=')
+                        val persisted = org.json.JSONObject(line)
+                        assertEquals("current_and_total", persisted.getString("blocks"))
+                        assertEquals(9_200L, persisted.getJSONObject("end_checkpoint").getLong("source_elapsed_ms"))
+                        assertFalse(line.contains("Поточна статистика"))
+                    }
+                } finally { context.deleteDatabase(telegramName) }
                 assertTrue(feed(15_200).events.none { it.type == TelegramEventType.TRIP_SUMMARY })
                 feed(16_200, "bodywork_power_level" to "0")
                 val beforeOff = engine.state.toJson()

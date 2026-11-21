@@ -14,7 +14,9 @@ data class TelegramEnergyPoint(
     val regeneratedKwh: Double?,
     val energyCoveredMs: Long,
     val energyUncoveredMs: Long,
-    val energyPartial: Boolean
+    val energyPartial: Boolean,
+    val integrationReason: String? = null,
+    val qualifiedAnchor: Boolean = false
 ) {
     init {
         require(powerSessionId.isNotBlank())
@@ -43,9 +45,11 @@ data class TelegramEnergyPoint(
         put("energy_covered_ms", energyCoveredMs)
         put("energy_uncovered_ms", energyUncoveredMs)
         put("energy_partial", energyPartial)
+        put("integration_reason", integrationReason ?: JSONObject.NULL)
+        put("qualified_anchor", qualifiedAnchor)
     }
 
-    private fun knownZero(): Double? = 0.0.takeIf { energyCoveredMs == 0L && !energyPartial }
+    private fun knownZero(): Double? = 0.0.takeIf { energyCoveredMs == 0L && (!energyPartial || qualifiedAnchor) }
 
     companion object {
         fun fromSnapshot(snapshot: EnergySnapshot?): TelegramEnergyPoint? {
@@ -62,7 +66,10 @@ data class TelegramEnergyPoint(
                     regeneratedKwh = snapshot.regeneratedKwh,
                     energyCoveredMs = snapshot.energyCoveredMs,
                     energyUncoveredMs = snapshot.energyUncoveredMs,
-                    energyPartial = snapshot.energyPartial
+                    energyPartial = snapshot.energyPartial,
+                    integrationReason = snapshot.reason,
+                    qualifiedAnchor = snapshot.reason == "covered_boundary" ||
+                        snapshot.integrationQuality == com.bydcollector.collector.data.energy.EnergyIntegrationQuality.ANCHOR_ONLY
                 )
             }.getOrNull()
         }
@@ -80,7 +87,9 @@ data class TelegramEnergyPoint(
                     regeneratedKwh = json.finiteDoubleOrNull("regenerated_kwh"),
                     energyCoveredMs = json.getLong("energy_covered_ms"),
                     energyUncoveredMs = json.getLong("energy_uncovered_ms"),
-                    energyPartial = json.getBoolean("energy_partial")
+                    energyPartial = json.getBoolean("energy_partial"),
+                    integrationReason = json.optString("integration_reason").takeIf(String::isNotBlank),
+                    qualifiedAnchor = json.optBoolean("qualified_anchor")
                 )
             }.getOrNull()
         }

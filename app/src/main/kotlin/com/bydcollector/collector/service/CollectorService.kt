@@ -6314,7 +6314,10 @@ class CollectorService : Service() {
                     com.bydcollector.collector.data.energy.EnergyStateCodec.decodeState(row.stateJson).currentSnapshot
                 }
             },
-            ecMeanKwhPer100Km = { ecCurrentMeanProvider.snapshot().meanKwhPer100Km }
+            ecMeanKwhPer100Km = { ecCurrentMeanProvider.snapshot().meanKwhPer100Km },
+            retainedEnergyAtBoundary = { session, boot, elapsed, through ->
+                BydCollectorApplication.trips(application).energyAtBoundary(session, boot, elapsed, through)
+            }
             )
         }
         telegramDeliveryRuntime.attach(

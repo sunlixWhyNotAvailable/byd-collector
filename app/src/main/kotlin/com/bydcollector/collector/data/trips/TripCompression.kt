@@ -81,6 +81,7 @@ internal class TripCompression(
             )
             candidateStore.replaceBusinessInputCursor(snapshotStore.businessInputCursor())
             candidateStore.replaceBusinessPage(snapshotStore.pendingBusinessPage())
+            candidateStore.syncEnergyBoundariesFrom(snapshotStore, ::checkReserve)
             onPhase(TripCompressionPhase.CANDIDATE_BUILT)
             onStep(2)
             check(sameSessions(snapshotStore, candidateStore)) { "Trip sessions changed during compression" }
@@ -129,6 +130,7 @@ internal class TripCompression(
                         candidateStore.replaceBusinessInputCursor(store.businessInputCursor())
                     }
                     candidateStore.replaceBusinessPage(store.pendingBusinessPage())
+                    candidateStore.syncEnergyBoundariesFrom(store, ::checkReserve)
                     check(sameSessions(store, candidateStore)) { "Concurrent trip state was not preserved" }
                     check(sameEnergyRuntime(store, candidateStore)) { "Concurrent energy runtime state was not preserved" }
                     check(sameHistoricalEnergyBackfill(store, candidateStore)) { "Concurrent historical energy progress was not preserved" }
@@ -142,6 +144,7 @@ internal class TripCompression(
                     val expectedCompletions = candidateStore.allPendingCompletions()
                     val expectedBusinessInputCursor = candidateStore.businessInputCursor()
                     val expectedBusinessPage = candidateStore.pendingBusinessPage()
+                    val expectedBoundaries = candidateStore.energyBoundarySignature()
                     candidateStore.checkpointTruncate()
                     candidateStore.closeDatabase()
                     store.checkpointTruncate()
@@ -160,7 +163,8 @@ internal class TripCompression(
                             expectedCompletionWatermark,
                             expectedCompletions,
                             expectedBusinessInputCursor,
-                            expectedBusinessPage
+                            expectedBusinessPage,
+                            expectedBoundaries
                         )
                         TripCompressionResult(before, after)
                     }
@@ -192,7 +196,8 @@ internal class TripCompression(
         expectedCompletionWatermark: Long,
         expectedCompletions: List<TripCompletionIntent>,
         expectedBusinessInputCursor: TripBusinessInputCursor?,
-        expectedBusinessPage: com.bydcollector.collector.data.input.BusinessPage?
+        expectedBusinessPage: com.bydcollector.collector.data.input.BusinessPage?,
+        expectedBoundaries: Pair<Long, Long>
     ) {
         store.closeForReplacement()
         try {
@@ -216,7 +221,8 @@ internal class TripCompression(
                     store.completionWatermark() == expectedCompletionWatermark &&
                     store.allPendingCompletions() == expectedCompletions &&
                     store.businessInputCursor() == expectedBusinessInputCursor &&
-                    store.pendingBusinessPage() == expectedBusinessPage
+                    store.pendingBusinessPage() == expectedBusinessPage &&
+                    store.energyBoundarySignature() == expectedBoundaries
             ) {
                 "Compressed Trips reopen verification failed"
             }

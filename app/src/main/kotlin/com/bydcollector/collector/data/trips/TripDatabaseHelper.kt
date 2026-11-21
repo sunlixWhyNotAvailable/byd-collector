@@ -102,6 +102,7 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_route_points_trip_order ON route_points(trip_id, sequence)")
         createRouteChunks(db)
         createEnergyRuntimeState(db)
+        TripEnergyBoundaries.create(db)
         createEnergyQuarantine(db)
         createHistoricalEnergyBackfill(db)
         createTripCompletions(db)
@@ -246,6 +247,6 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
 
     companion object {
         const val DATABASE_NAME = "bydcollector_trips.db"
-        const val DATABASE_VERSION = 9
+        const val DATABASE_VERSION = 10
     }
 }

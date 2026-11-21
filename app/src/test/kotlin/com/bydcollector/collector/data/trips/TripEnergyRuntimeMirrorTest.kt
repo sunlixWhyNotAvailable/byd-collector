@@ -181,6 +181,22 @@ class TripEnergyRuntimeMirrorTest {
                 assertEquals(a.energyCoveredMs, store.session(a.powerSessionId!!)?.energyCoveredMs)
                 assertEquals(b.dischargedKwh, store.session(b.powerSessionId!!)?.dischargedKwh)
                 assertEquals(b, EnergyStateCodec.decodeState(store.readEnergyRuntimeRow()!!.stateJson).currentSnapshot)
+                val aId = requireNotNull(a.powerSessionId)
+                val bId = requireNotNull(b.powerSessionId)
+                val retained = assertNotNull(store.energyAtBoundary(aId, "boot", 2_500L, 3_000L))
+                assertEquals(60.0 / 3600, assertNotNull(retained.dischargedKwh), 1e-9)
+                assertNull(store.energyAtBoundary(bId, "boot", 2_500L, 3_000L))
+                val candidateName = "energy-copy.db"
+                try {
+                    TripStore(TripDatabaseHelper(context, candidateName)).use { candidate ->
+                        candidate.syncEnergyBoundariesFrom(store) {}
+                        assertEquals(retained, candidate.energyAtBoundary(aId, "boot", 2_500L, 3_000L))
+                        store.acknowledgeBusinessPage(assertNotNull(store.pendingBusinessPage()).key)
+                        candidate.syncEnergyBoundariesFrom(store) {}
+                        assertNull(candidate.energyAtBoundary(aId, "boot", 2_500L, 3_000L))
+                        assertNotNull(candidate.energyAtBoundary(bId, "boot", 4_500L, 5_000L))
+                    }
+                } finally { context.deleteDatabase(candidateName) }
             }
         } finally { context.deleteDatabase(name) }
     }
