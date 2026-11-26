@@ -37,7 +37,9 @@ data class TelegramHelperOutcome(
     val result: TelegramSendResult? = null,
     val confirmedAtMs: Long? = null,
     val ambiguity: TelegramHelperAmbiguity? = null,
-    val diagnostic: String? = null
+    val diagnostic: String? = null,
+    val actualKey: TelegramHelperAttemptKey? = null,
+    val ownerRetired: Boolean = false
 ) {
     init {
         require(confirmedAtMs == null || confirmedAtMs >= 0L) { "negative Telegram confirmation time" }
@@ -77,11 +79,24 @@ class TelegramHelperRemoteFailure(
             }
 }
 
+internal fun reconciledTelegramResult(expected: TelegramHelperAttemptKey, outcome: TelegramHelperOutcome,
+    nowMs: Long): Pair<TelegramSendResult, Long> {
+    require(outcome.ownerRetired) { "Telegram result requires a retired HTTP owner" }
+    val actual = outcome.actualKey
+    val matches = actual != null && actual.requestDigest == expected.requestDigest &&
+        actual.destinationDigest == expected.destinationDigest && actual.dedupeRef == expected.dedupeRef
+    if (matches && outcome.result != null) return outcome.result to checkNotNull(outcome.confirmedAtMs)
+    return TelegramSendResult.Failure(TelegramSendFailureKind.NETWORK_ERROR,
+        exceptionClass = "TelegramHelperInterruptedAttempt",
+        diagnostic = outcome.diagnostic ?: "Old Telegram owner retired without a matching confirmed HTTP result") to nowMs
+}
+
 object TelegramHelperProtocol {
     const val TX_SUBMIT = 23
     const val TX_QUERY = 24
     const val TX_ACK = 25
     const val TX_RECOVER = 26
+    const val TX_RECONCILE = 27
     const val MAX_IPC_BYTES = 24 * 1024
     const val MAX_BOT_TOKEN_CHARS = 256
     const val MAX_CHAT_ID_CHARS = 256
@@ -140,6 +155,9 @@ object TelegramHelperProtocol {
         writeResult(parcel, outcome.result)
         writeNullableLong(parcel, outcome.confirmedAtMs)
         writeBoundedString(parcel, outcome.diagnostic, MAX_DIAGNOSTIC_CHARS, MAX_DIAGNOSTIC_BYTES)
+        parcel.writeInt(if (outcome.actualKey == null) 0 else 1)
+        outcome.actualKey?.let { writeKey(parcel, it) }
+        parcel.writeInt(if (outcome.ownerRetired) 1 else 0)
     }
 
     fun readOutcome(parcel: Parcel): TelegramHelperOutcome {
@@ -153,12 +171,70 @@ object TelegramHelperProtocol {
         val result = readResult(parcel)
         val confirmedAtMs = readNullableLong(parcel)
         val diagnostic = readBoundedString(parcel, MAX_DIAGNOSTIC_CHARS, MAX_DIAGNOSTIC_BYTES)
+        val actualKey = when (parcel.readInt()) {
+            0 -> null
+            1 -> readKey(parcel)
+            else -> error("Invalid Telegram reconciliation key marker")
+        }
+        val ownerRetired = when (parcel.readInt()) {
+            0 -> false
+            1 -> true
+            else -> error("Invalid Telegram owner retirement marker")
+        }
         require(parcel.dataAvail() == 0) { "unexpected Telegram helper reply data" }
         return TelegramHelperOutcome(
             TelegramHelperState.values()[stateIndex], result, confirmedAtMs,
-            ambiguityIndex.takeIf { it >= 0 }?.let { TelegramHelperAmbiguity.values()[it] }, diagnostic
+            ambiguityIndex.takeIf { it >= 0 }?.let { TelegramHelperAmbiguity.values()[it] }, diagnostic,
+            actualKey, ownerRetired
         )
     }
+
+    fun encodeRecovery(outcome: TelegramHelperOutcome): String = org.json.JSONObject()
+        .put("state", outcome.state.name).put("result", resultToJson(outcome.result))
+        .put("confirmed_at_ms", outcome.confirmedAtMs).put("ambiguity", outcome.ambiguity?.name)
+        .put("diagnostic", outcome.diagnostic).put("actual_key", outcome.actualKey?.let(::keyToJson))
+        .put("owner_retired", outcome.ownerRetired).toString()
+
+    fun decodeRecovery(value: String): TelegramHelperOutcome {
+        val json = org.json.JSONObject(value)
+        return TelegramHelperOutcome(TelegramHelperState.valueOf(json.getString("state")),
+            json.optJSONObject("result")?.let(::resultFromJson), nullableLong(json, "confirmed_at_ms"),
+            nullableString(json, "ambiguity")?.let(TelegramHelperAmbiguity::valueOf),
+            nullableString(json, "diagnostic"), json.optJSONObject("actual_key")?.let(::keyFromJson),
+            json.getBoolean("owner_retired"))
+    }
+
+    fun resultToJson(result: TelegramSendResult?): org.json.JSONObject? = when (result) {
+        null -> null
+        is TelegramSendResult.Success -> org.json.JSONObject().put("type", "success")
+            .put("message_id", result.messageId ?: org.json.JSONObject.NULL)
+        is TelegramSendResult.Failure -> org.json.JSONObject().put("type", "failure")
+            .put("kind", result.kind.name).put("http_status", result.httpStatus ?: org.json.JSONObject.NULL)
+            .put("telegram_error_code", result.telegramErrorCode ?: org.json.JSONObject.NULL)
+            .put("retry_after_seconds", result.retryAfterSeconds ?: org.json.JSONObject.NULL)
+            .put("exception_class", result.exceptionClass ?: org.json.JSONObject.NULL)
+            .put("diagnostic", result.diagnostic ?: org.json.JSONObject.NULL)
+    }
+
+    fun resultFromJson(json: org.json.JSONObject): TelegramSendResult = when (json.getString("type")) {
+        "success" -> TelegramSendResult.Success(nullableLong(json, "message_id")?.also { require(it > 0L) })
+        "failure" -> TelegramSendResult.Failure(
+            TelegramSendFailureKind.valueOf(json.getString("kind")),
+            nullableLong(json, "http_status")?.toInt()?.also { require(it in 100..599) },
+            nullableLong(json, "telegram_error_code")?.toInt()?.also { require(it > 0) },
+            nullableLong(json, "retry_after_seconds")?.also { require(it >= 0L) },
+            nullableString(json, "exception_class")?.also { require(it.length <= 512) },
+            nullableString(json, "diagnostic")?.also {
+                require(it.length <= MAX_DIAGNOSTIC_CHARS && it.toByteArray(StandardCharsets.UTF_8).size <= MAX_DIAGNOSTIC_BYTES)
+            })
+        else -> error("Invalid Telegram helper result type")
+    }
+
+    private fun nullableLong(json: org.json.JSONObject, name: String): Long? =
+        if (json.isNull(name)) null else json.getLong(name)
+
+    private fun nullableString(json: org.json.JSONObject, name: String): String? =
+        if (json.isNull(name)) null else json.getString(name)
 
     fun writeSuccessReply(parcel: Parcel, outcome: TelegramHelperOutcome) {
         parcel.writeNoException()

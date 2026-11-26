@@ -12,6 +12,10 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
     null,
     DATABASE_VERSION
 ) {
+    init {
+        com.bydcollector.collector.data.local.DurableSqlite.configure(this)
+    }
+
     override fun getWritableDatabase(): SQLiteDatabase {
         check(!com.bydcollector.collector.BuildConfig.RUNTIME_CLIENT) { "UI cannot own Trips SQLite" }
         return super.getWritableDatabase()
@@ -27,7 +31,7 @@ class TripDatabaseHelper(context: Context, databaseName: String = DATABASE_NAME)
     val databaseFile: File get() = databasePath
     override fun onConfigure(db: SQLiteDatabase) {
         db.setForeignKeyConstraintsEnabled(true)
-        db.enableWriteAheadLogging()
+        com.bydcollector.collector.data.local.DurableSqlite.configureConnection(db)
     }
 
     override fun onCreate(db: SQLiteDatabase) {

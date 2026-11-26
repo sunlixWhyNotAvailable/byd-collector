@@ -36,7 +36,31 @@ internal object TelegramDatabaseSql {
             "dedupe_ref TEXT NOT NULL, " +
             "bot_scope TEXT NOT NULL, " +
             "started_at_ms INTEGER NOT NULL, " +
-            "local_settled INTEGER NOT NULL DEFAULT 0 CHECK (local_settled IN (0, 1)))"
+            "local_settled INTEGER NOT NULL DEFAULT 0 CHECK (local_settled IN (0, 1)), " +
+            "reconciled_outcome TEXT)"
+
+    const val CREATE_CONFLICT_RECOVERY_TABLE =
+        "CREATE TABLE IF NOT EXISTS telegram_conflicting_delivery (" +
+            "dedupe_key TEXT PRIMARY KEY NOT NULL, attempt_id TEXT NOT NULL, owner_id TEXT NOT NULL, " +
+            "sequence INTEGER NOT NULL, event_type TEXT NOT NULL, payload TEXT, key_json TEXT NOT NULL, " +
+            "diagnostic TEXT NOT NULL, archived_at_ms INTEGER NOT NULL, recovered_at_ms INTEGER, " +
+            "resolution TEXT NOT NULL DEFAULT 'pending', last_error TEXT, reconciled_outcome TEXT)"
+
+    const val CREATE_BUSINESS_RECOVERY_TABLE =
+        "CREATE TABLE IF NOT EXISTS telegram_unconfirmed_business_recovery (" +
+            "page_key TEXT PRIMARY KEY, page_payload TEXT NOT NULL, completions_json TEXT NOT NULL, " +
+            "before_state_json TEXT, sources_json TEXT, messages_json TEXT, " +
+            "status TEXT NOT NULL DEFAULT 'pending', next_attempt_at_ms INTEGER NOT NULL DEFAULT 0, " +
+            "updated_at_ms INTEGER NOT NULL DEFAULT 0, last_error TEXT)"
+
+    const val CREATE_PAGE_RECEIPTS_TABLE =
+        "CREATE TABLE IF NOT EXISTS telegram_page_receipts (page_key TEXT PRIMARY KEY NOT NULL, " +
+            "before_state_json TEXT, sources_json TEXT, messages_json TEXT NOT NULL, " +
+            "completions_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL)"
+
+    const val CREATE_COMPLETION_RECEIPTS_TABLE =
+        "CREATE TABLE IF NOT EXISTS telegram_completion_receipts (sequence INTEGER PRIMARY KEY, " +
+            "identity TEXT NOT NULL UNIQUE, created_at_ms INTEGER NOT NULL)"
 
     const val RECEIPT_BY_KEY =
         "SELECT dedupe_key, event_type, confirmed_at_ms, telegram_message_id " +

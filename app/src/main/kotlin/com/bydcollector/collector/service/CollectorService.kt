@@ -132,7 +132,7 @@ import com.bydcollector.collector.mqtt.MqttPublishCoordinator
 import com.bydcollector.collector.mqtt.PahoMqttClientFacade
 import com.bydcollector.collector.system.CollectorAutoStart
 import com.bydcollector.collector.telegram.TelegramCoordinator
-import com.bydcollector.collector.telegram.TelegramDeliveryConflictQuarantined
+import com.bydcollector.collector.telegram.TelegramDeliveryConflictReconciled
 import com.bydcollector.collector.telegram.TelegramSendResult
 import java.time.Instant
 import com.bydcollector.collector.ui.DashboardDebugPollState
@@ -1505,6 +1505,7 @@ class CollectorService : Service() {
                         continuousSources = BusinessInputProjection.continuousSources(inputs, continuity, source.bootId, evaluatedElapsed)
                     ))
                 } else null
+                trips.ensureCommitted()
                 if (trip?.closedPowerSession == true) {
                     application.historicalEnergyCandidatesChanged(historicalEnergyGeneration)
                 }
@@ -1628,6 +1629,7 @@ class CollectorService : Service() {
                     calculate = { calculateBusinessPage(generation, mergeBoot, deltas, maintenanceDrain) }
                 ))
                 page.requireReferences(refs)
+                trips.ensureCommitted()
                 val completions = trips.allPendingCompletions()
                 val accepted = mutableSetOf<Long>()
                 fun completeThrough(watermark: Long) {
@@ -1637,7 +1639,7 @@ class CollectorService : Service() {
                             ?.let(coordinator::deliverPreparedPowerOff)
                     }
                 }
-                val deadline = coordinator.processBusinessPage(page.key) {
+                val deadline = coordinator.processBusinessPage(page.key, BusinessPage.sourceEvidence(deltas)) {
                     deltas.zip(page.entries).forEach { (delta, entry) ->
                         checkBusinessOwner()
                         val ref = delta.ref
@@ -1757,6 +1759,7 @@ class CollectorService : Service() {
         // Main and Trips already committed. Preserve the handoff first, without
         // fabricating a detector receipt or resending any uncertain report.
         telegram.archiveUnconfirmedBusinessPage(page, uncertain)
+        telegram.ensureDeliveryDurable()
         trips.acknowledgeBusinessPage(page.key, uncertain)
         store.recordEvent(
             "business_page_recovery",
@@ -1774,6 +1777,7 @@ class CollectorService : Service() {
             if (telegram.hasTripCompletionReceipt(intent.sequence, intent.identity)) trips.acknowledgeCompletion(intent.sequence, intent.identity)
         }
         trips.acknowledgeBusinessPage(page.key)
+        checkNotNull(telegramCoordinator).releaseBusinessPageReceipt(page.key)
     }
 
     private fun checkBusinessOwner() {
@@ -1881,34 +1885,20 @@ class CollectorService : Service() {
         if (!settings.isTelegramEnabled()) return null
         val trips = BydCollectorApplication.trips(applicationContext)
         if (trips.pendingBusinessPage() != null) return null
+        trips.ensureCommitted()
         var deadline: Long? = null
         com.bydcollector.collector.telegram.handoffTripCompletions(
             frontier = watermark,
             pending = { trips.pendingCompletions(watermark) },
             accept = { intent -> coordinator.acceptTripCompletion(intent, intent.lastLocation?.let(::telegramLocationSnapshot)) },
-            acknowledge = { intent -> trips.acknowledgeCompletion(intent.sequence, intent.identity) },
+            acknowledge = { intent ->
+                trips.acknowledgeCompletion(intent.sequence, intent.identity).also { trips.ensureCommitted() }
+            },
             afterAck = { preparation ->
                 if (preparation != null) deadline = coordinator.deliverPreparedPowerOff(preparation)
             }
         )
         return deadline
-    }
-
-    private fun telegramLocationSnapshot(sample: com.bydcollector.collector.data.trips.TripCompletionLocation): TelegramLocationSnapshot {
-        val latitude = sample.latitude
-        val longitude = sample.longitude
-        val capturedAtMs = Instant.parse(sample.capturedAt).toEpochMilli()
-        val ageSeconds = ((System.currentTimeMillis() - capturedAtMs).coerceAtLeast(0L) / 1_000L)
-        return TelegramLocationSnapshot(
-            latitude = latitude,
-            longitude = longitude,
-            capturedAt = sample.capturedAt,
-            ageSeconds = ageSeconds,
-            osmUrl = "https://www.openstreetmap.org/?mlat=$latitude&mlon=$longitude#map=17/$latitude/$longitude",
-            googleUrl = "https://www.google.com/maps/search/?api=1&query=$latitude,$longitude",
-            appleUrl = "https://maps.apple.com/?ll=$latitude,$longitude",
-            wazeUrl = "https://www.waze.com/ul?ll=$latitude%2C$longitude&navigate=yes"
-        )
     }
 
     private fun reconcileDebugRuntime() {
@@ -5637,15 +5627,15 @@ class CollectorService : Service() {
     }
 
     private fun handleTelegramExecutionFailure(error: Throwable) {
-        val quarantined = error is TelegramDeliveryConflictQuarantined
+        val reconciled = error is TelegramDeliveryConflictReconciled
         runCatching {
             store.recordEvent(
-                if (quarantined) "telegram_delivery_conflict_quarantined" else "telegram_delivery_runtime_error",
-                if (quarantined) "Conflicting Telegram report preserved without retry" else "Telegram delivery result remains pending",
+                if (reconciled) "telegram_delivery_conflict_reconciled" else "telegram_delivery_runtime_error",
+                if (reconciled) "Conflicting Telegram attempt reconciled" else "Telegram delivery result remains pending",
                 error.diagnosticDetail()
             )
         }.onFailure(error::addSuppressed)
-        if (quarantined) return // the owner already schedules the next eligible report
+        if (reconciled) return // the owner is applying the reconciled result
         if (error !is SQLiteException) {
             if (telegramDeliveryRuntime.hasPendingResult) mainHandler.post { scheduleTelegramTick() }
             else if (telegramDeliveryRuntime.hasInFlightDelivery) mainHandler.post { scheduleTelegramTick() }
@@ -6352,7 +6342,7 @@ class CollectorService : Service() {
             restoreAttempt = coordinator::restoreDeliveryAttempt,
             preparedAttemptAction = coordinator::preparedAttemptAction,
             discardPreparedAttempt = coordinator::discardPreparedAttempt,
-            quarantineConflictingAttempt = coordinator::quarantineConflictingAttempt,
+            reconcileConflictingAttempt = coordinator::reconcileConflictingAttempt,
             acknowledgeAttempt = coordinator::acknowledgePersistedAttempt
         )
         telegramDeliveryRuntime.resume()

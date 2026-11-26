@@ -73,6 +73,7 @@ class HelperTelegramLane @JvmOverloads constructor(
         return synchronized(lock) {
             val previous = queryLocked(key)
             if (previous.state != TelegramHelperState.ABSENT) return previous
+            check(!retiredFile(key.ownerId).exists()) { "Telegram owner is retired after reconciliation" }
             check(!stopping && !closed) { "Telegram helper is stopping" }
             check(activeByOwner.isEmpty() && pendingResults.isEmpty()) { "Telegram helper already has an unsettled attempt" }
             val ledger = readLedger(key.ownerId)
@@ -94,8 +95,63 @@ class HelperTelegramLane @JvmOverloads constructor(
     }
 
     fun telegramQuery(key: TelegramHelperAttemptKey): TelegramHelperOutcome = synchronized(lock) {
-        queryLocked(key)
+        if (retiredFile(key.ownerId).exists()) telegramReconcile(key) else queryLocked(key)
     }
+
+    /** Resolves the actual owner under the HTTP lock before allowing a new owner. */
+    fun telegramReconcile(key: TelegramHelperAttemptKey): TelegramHelperOutcome = synchronized(lock) {
+        activeByOwner[key.ownerId]?.let { active ->
+            return@synchronized TelegramHelperOutcome(TelegramHelperState.RUNNING, actualKey = active)
+        }
+        val retired = AtomicFile(retiredFile(key.ownerId))
+        if (retired.baseFile.exists()) {
+            return@synchronized retired.openRead().use {
+                TelegramHelperProtocol.decodeRecovery(String(readBounded(it), StandardCharsets.UTF_8))
+            }.also {
+                check(it.ownerRetired && it.actualKey?.ownerId?.let { owner -> owner == key.ownerId } != false) {
+                    "Retired Telegram owner evidence differs from the requested owner"
+                }
+            }
+        }
+        val pending = pendingResults[key.ownerId]
+        var diagnostic: String? = workerFailures[key.ownerId]?.diagnostic
+        val ledger = pending ?: try { readLedger(key.ownerId) } catch (error: CorruptLedger) {
+            diagnostic = TelegramHelperProtocol.exceptionDiagnostic(error, "telegram_reconcile")
+            try { preserveRecoveryEvidence(key, checkNotNull(diagnostic)) }
+            catch (storage: Throwable) { error.addSuppressed(storage); throw error }
+            null
+        }
+        val actual = ledger?.latest
+        val result = if (actual?.state == RESULT) actual.result else null
+        val outcome = if (result != null) {
+            val completed = checkNotNull(actual)
+            TelegramHelperOutcome(TelegramHelperState.RESULT, result, completed.confirmedAtMs,
+                actualKey = completed.key, ownerRetired = true)
+        } else {
+            TelegramHelperOutcome(TelegramHelperState.AMBIGUOUS,
+                ambiguity = TelegramHelperAmbiguity.LEDGER_RECOVERED,
+                diagnostic = diagnostic ?: "Telegram owner retired with no known HTTP result",
+                actualKey = actual?.key, ownerRetired = true)
+        }
+        check(ledgerDirectory.isDirectory || ledgerDirectory.mkdirs()) { "Cannot create Telegram ledger directory" }
+        val payload = TelegramHelperProtocol.encodeRecovery(outcome).toByteArray(StandardCharsets.UTF_8)
+        require(payload.size <= MAX_LEDGER_BYTES) { "Retired Telegram evidence exceeds its size limit" }
+        val output = retired.startWrite()
+        try {
+            output.write(payload)
+            retired.finishWrite(output)
+        } catch (error: Throwable) {
+            try { retired.failWrite(output) } catch (cleanup: Throwable) { error.addSuppressed(cleanup) }
+            throw error
+        }
+        pendingResults.remove(key.ownerId)
+        workerFailures.remove(key.ownerId)
+        lastPersistAttemptNs.remove(key.ownerId)
+        lock.notifyAll()
+        outcome
+    }
+
+    private fun retiredFile(owner: UUID) = File(ledgerDirectory, "retired-$owner.json")
 
     /** Reconciles the exact APP-owned attempt without starting HTTP or assuming delivery. */
     fun telegramRecover(key: TelegramHelperAttemptKey): TelegramHelperOutcome = synchronized(lock) {
@@ -360,7 +416,7 @@ class HelperTelegramLane @JvmOverloads constructor(
             require(key.ownerId == ownerId) { "Telegram attempt owner mismatch" }
             val state = latest.getString("state")
             require(state in setOf(STARTED, RESULT, ACKED, RECOVERED)) { "invalid Telegram helper ledger state" }
-            val result = if (latest.isNull("result")) null else resultFromJson(latest.getJSONObject("result"))
+            val result = if (latest.isNull("result")) null else TelegramHelperProtocol.resultFromJson(latest.getJSONObject("result"))
             val confirmedAtMs = if (latest.isNull("confirmed_at_ms")) null else latest.getLong("confirmed_at_ms")
             require(confirmedAtMs == null || confirmedAtMs >= 0L) { "negative Telegram result confirmation time" }
             when (state) {
@@ -398,7 +454,7 @@ class HelperTelegramLane @JvmOverloads constructor(
             .put("latest", JSONObject()
                 .put("key", TelegramHelperProtocol.keyToJson(latest.key))
                 .put("state", latest.state)
-                .put("result", resultToJson(latest.result) ?: JSONObject.NULL)
+                .put("result", TelegramHelperProtocol.resultToJson(latest.result) ?: JSONObject.NULL)
                 .put("confirmed_at_ms", latest.confirmedAtMs ?: JSONObject.NULL)
                 .put("recovery_diagnostic", latest.recoveryDiagnostic ?: JSONObject.NULL))
             .toString()
@@ -420,51 +476,6 @@ class HelperTelegramLane @JvmOverloads constructor(
             }
             throw IOException("cannot durably write Telegram helper ledger for owner ${ledger.ownerId}", error)
         }
-    }
-
-    private fun resultToJson(result: TelegramSendResult?): JSONObject? = when (result) {
-        null -> null
-        is TelegramSendResult.Success -> JSONObject()
-            .put("type", "success")
-            .put("message_id", result.messageId ?: JSONObject.NULL)
-        is TelegramSendResult.Failure -> JSONObject()
-            .put("type", "failure")
-            .put("kind", result.kind.name)
-            .put("http_status", result.httpStatus ?: JSONObject.NULL)
-            .put("telegram_error_code", result.telegramErrorCode ?: JSONObject.NULL)
-            .put("retry_after_seconds", result.retryAfterSeconds ?: JSONObject.NULL)
-            .put("exception_class", result.exceptionClass ?: JSONObject.NULL)
-            .put("diagnostic", result.diagnostic ?: JSONObject.NULL)
-    }
-
-    private fun resultFromJson(json: JSONObject): TelegramSendResult = when (json.getString("type")) {
-        "success" -> TelegramSendResult.Success(nullableLong(json, "message_id")?.also {
-            require(it > 0L) { "invalid Telegram message id in helper ledger" }
-        })
-        "failure" -> TelegramSendResult.Failure(
-            kind = TelegramSendFailureKind.valueOf(json.getString("kind")),
-            httpStatus = nullableLong(json, "http_status")?.toInt()?.also {
-                require(it in 100..599) { "invalid HTTP status in Telegram helper ledger" }
-            },
-            telegramErrorCode = nullableLong(json, "telegram_error_code")?.toInt()?.also {
-                require(it > 0) { "invalid Telegram error code in helper ledger" }
-            },
-            retryAfterSeconds = nullableLong(json, "retry_after_seconds")?.also {
-                require(it >= 0L) { "invalid Telegram retry delay in helper ledger" }
-            },
-            exceptionClass = nullableString(json, "exception_class")?.also {
-                require(it.length <= 512) { "oversize exception class in Telegram helper ledger" }
-            },
-            diagnostic = nullableString(json, "diagnostic")?.also {
-                require(it.length <= TelegramHelperProtocol.MAX_DIAGNOSTIC_CHARS) {
-                    "oversize Telegram diagnostic in helper ledger"
-                }
-                require(it.toByteArray(StandardCharsets.UTF_8).size <= TelegramHelperProtocol.MAX_DIAGNOSTIC_BYTES) {
-                    "oversize UTF-8 Telegram diagnostic in helper ledger"
-                }
-            }
-        )
-        else -> error("invalid Telegram helper result type")
     }
 
     private fun nullableLong(json: JSONObject, name: String): Long? = if (json.isNull(name)) null else json.getLong(name)

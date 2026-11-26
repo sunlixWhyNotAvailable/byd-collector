@@ -14,6 +14,7 @@ import com.bydcollector.collector.data.polling.PollOrigin
 import com.bydcollector.collector.data.polling.PollSampleSource
 import com.bydcollector.collector.data.energy.EnergySnapshot
 import com.bydcollector.collector.data.trips.TripCompletionIntent
+import com.bydcollector.collector.data.trips.TripCompletionIntentCodec
 import com.bydcollector.collector.data.trips.TripTime
 import com.bydcollector.collector.service.CollectorSettings
 import com.bydcollector.collector.service.TelegramDetectedEvent
@@ -28,6 +29,7 @@ import com.bydcollector.collector.util.diagnosticDetail
 import java.util.LinkedHashMap
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
+import org.json.JSONArray
 
 internal data class TelegramPowerOffPreparation(
     val priorityKeys: List<String>,
@@ -100,11 +102,14 @@ class TelegramCoordinator internal constructor(
     internal fun hasBusinessPageReceipt(key: String): Boolean = telegramStore.hasBusinessPageReceipt(key)
 
     /** Runs on the Telegram owner; no network work or cross-owner waits occur in the commit. */
-    internal fun processBusinessPage(key: String, process: () -> Unit): Long? {
+    internal fun processBusinessPage(key: String, process: () -> Unit): Long? = processBusinessPage(key, null, process)
+
+    internal fun processBusinessPage(key: String, pageSources: String?, process: () -> Unit): Long? {
         check(businessBatch == null) { "Nested Telegram business page" }
         if (telegramStore.hasBusinessPageReceipt(key)) return nextWakeAt(futureDetectorDeadline(), pendingQueueDeadline())
         val batch = BusinessBatch()
         val previousStartup = startupRecoveryPending
+        val beforeState = engine.state.toJson()
         businessBatch = batch
         try {
             process()
@@ -113,8 +118,10 @@ class TelegramCoordinator internal constructor(
                 batch.messages, engine.state.toJson(), at,
                 protectedTelegramIds = protectedTelegramIds(), businessPageKey = key,
                 pageCompletions = batch.completions.map { it.key to it.value },
-                tripReportEvidence = batch.events.tripReportEvidence()
+                tripReportEvidence = batch.events.tripReportEvidence(),
+                beforePageState = beforeState, pageSources = pageSources
             )
+            telegramStore.ensureDeliveryDurable()
             businessBatch = null
             detectorDeadlineAtMs = engine.nextDetectorDeadlineAtMs()
             recordQueued(batch.messages, batch.events, outcomes, at)
@@ -131,6 +138,8 @@ class TelegramCoordinator internal constructor(
         batch.deliveries.forEach { deadline = nextWakeAt(deadline, deliverPreparedPowerOff(it)) }
         return deadline
     }
+
+    internal fun releaseBusinessPageReceipt(key: String) = telegramStore.releaseBusinessPageReceipt(key)
     private var lastTelemetryHealthDiagnostic: String? = null
     private val locationKindsByDedupeKey = LinkedHashMap<String, String>(16, 0.75f, true)
     private val locationKindCacheLock = Any()
@@ -250,6 +259,7 @@ class TelegramCoordinator internal constructor(
         health: TelegramTelemetryHealthSnapshot
     ): Long? {
         activateEnabledRuntime() ?: return null
+        recoverOneBusinessPage()
         val startupDeadline = ensureStartupRecovery()
         val tickAtMs = nowMs()
         flushSourceDiagnostics(tickAtMs)
@@ -268,7 +278,8 @@ class TelegramCoordinator internal constructor(
             eventStore.recordEvent("telegram_telemetry_health", "Telemetry availability evidence", detail)
             lastTelemetryHealthDiagnostic = detail
         }
-        return nextWakeAt(futureDetectorDeadline(), nextWakeAt(startupDeadline, flushPending()))
+        return nextWakeAt(futureDetectorDeadline(), nextWakeAt(startupDeadline,
+            nextWakeAt(flushPending(), telegramStore.businessRecoveryDeadline())))
     }
 
     /** Accepts a durable Trips completion. The receipt and batch commit together. */
@@ -501,8 +512,9 @@ class TelegramCoordinator internal constructor(
         if (settings.isUserShutdownRequested()) TelegramPreparedAttemptAction.WAIT
         else delivery.preparedAttemptAction(attempt)
 
-    internal fun quarantineConflictingAttempt(attempt: TelegramDeliveryAttempt, diagnostic: String): Long? =
-        delivery.quarantineConflictingAttempt(attempt, diagnostic)
+    internal fun reconcileConflictingAttempt(attempt: TelegramDeliveryAttempt, outcome: TelegramHelperOutcome,
+        diagnostic: String): com.bydcollector.collector.data.local.TelegramPersistedDeliveryAttempt =
+        delivery.reconcileConflictingAttempt(attempt, outcome, diagnostic)
 
     internal fun discardPreparedAttempt(attempt: TelegramDeliveryAttempt): Long? =
         delivery.discardPreparedAttempt(attempt)
@@ -512,7 +524,54 @@ class TelegramCoordinator internal constructor(
 
     private fun pendingQueueDeadline(): Long? {
         if (businessBatch != null) return null
-        return delivery.pendingDeadline()
+        return nextWakeAt(delivery.pendingDeadline(), telegramStore.businessRecoveryDeadline())
+    }
+
+    internal fun recoverOneBusinessPage() {
+        if (!settings.isTelegramEnabled()) return
+        val at = nowMs()
+        val job = telegramStore.nextBusinessRecovery(at) ?: return
+        try {
+            val original = JSONArray(job.completionsJson)
+            val completed = mutableListOf<TripCompletionIntent>()
+            val events = mutableListOf<TelegramDetectedEvent>()
+            val problems = mutableListOf<String>()
+            for (index in 0 until original.length()) {
+                try {
+                    val intent = TripCompletionIntentCodec.decode(original.getJSONObject(index).toString())
+                    if (job.messagesJson == null && !telegramStore.hasTripCompletionReceipt(intent.sequence, intent.identity)) {
+                        events += recoverClosedTripEvents(intent, eventConfig())
+                    }
+                    completed += intent
+                } catch (error: Exception) {
+                    if (error is android.database.sqlite.SQLiteException || error is InterruptedException) throw error
+                    problems += error.diagnosticDetail("Archived completion $index")
+                }
+            }
+            if (job.messagesJson == null && original.length() == 0) {
+                problems += "Legacy business page has no saved detector inputs/results or closed completion"
+            }
+            val messages = job.messagesJson?.let(::decodeTelegramMessages)
+                ?: checkNotNull(renderTelegramBatch(events, ::render)) { "Recovered Telegram reports could not be rendered" }
+            val outcomes = telegramStore.completeBusinessRecovery(job.pageKey, messages,
+                completed.sortedBy { it.sequence }, events.tripReportEvidence(), at, protectedTelegramIds(),
+                problems.takeIf { it.isNotEmpty() }?.joinToString("\n"))
+            telegramStore.ensureDeliveryDurable()
+            recordQueued(messages, events, outcomes, at)
+            eventStore.recordEvent("telegram_business_recovery", "Archived Telegram work examined",
+                "page_ref=${diagnosticSha256(job.pageKey)} restored=${messages.size} unresolved=${problems.size}")
+        } catch (error: Exception) {
+            if (error is InterruptedException) throw error
+            try { telegramStore.failBusinessRecovery(job.pageKey, error, false, at) }
+            catch (persist: Exception) { error.addSuppressed(persist); throw error }
+            try {
+                eventStore.recordEvent("telegram_business_recovery_error", "Archived Telegram work remains pending",
+                    error.diagnosticDetail())
+            } catch (logging: Exception) {
+                error.addSuppressed(logging)
+                throw error
+            }
+        }
     }
 
     private fun commitDelivery(
@@ -655,7 +714,7 @@ class TelegramCoordinator internal constructor(
                 completionIdentity = completion?.identity,
                 protectedTelegramIds = protectedTelegramIds(),
                 tripReportEvidence = result.events.tripReportEvidence()
-            )
+            ).also { telegramStore.ensureDeliveryDurable() }
         } catch (error: Exception) {
             if (error is InterruptedException) throw error
             try {

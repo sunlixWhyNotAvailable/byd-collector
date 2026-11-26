@@ -41,6 +41,13 @@ internal data class TripBusinessInputReplay(
 )
 
 class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyRuntimeStorage {
+    @Synchronized
+    internal fun durabilityDiagnosticLines() =
+        com.bydcollector.collector.data.local.DurableSqlite.diagnosticLines(readableDb, "trips")
+
+    @Synchronized
+    internal fun ensureCommitted() = com.bydcollector.collector.data.local.DurableSqlite.barrier(writableDb)
+
     private var calculatingBusinessPage = false
     @Synchronized
     internal fun pendingBusinessPage(): BusinessPage? = readableDb.rawQuery(
@@ -104,6 +111,7 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
             db.endTransaction()
         }
         if (archivedCompletions.isNotEmpty()) markTripCompletionsChanged()
+        ensureCommitted()
     }
 
     @Synchronized

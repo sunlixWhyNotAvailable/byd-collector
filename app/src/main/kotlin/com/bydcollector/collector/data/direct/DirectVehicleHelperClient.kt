@@ -70,6 +70,11 @@ class DirectVehicleHelperClient : DirectVehicleHelper {
             TelegramHelperProtocol.writeKey(data, key)
         }
 
+    fun reconcileTelegram(key: TelegramHelperAttemptKey): TelegramHelperOutcome =
+        transactTelegram(CollectorHelperProtocol.TX_TELEGRAM_RECONCILE, "reconcile") { data ->
+            TelegramHelperProtocol.writeKey(data, key)
+        }
+
     fun acknowledgeTelegram(key: TelegramHelperAttemptKey): TelegramHelperOutcome =
         transactTelegram(CollectorHelperProtocol.TX_TELEGRAM_ACK, "acknowledge") { data ->
             TelegramHelperProtocol.writeKey(data, key)

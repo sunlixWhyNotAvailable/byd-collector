@@ -25,6 +25,114 @@ import kotlin.test.*
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
 class BusinessPageRecoveryTest {
+    @Test fun archivedRecoveryCannotEvictAnAlreadyFullOutbox() {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "recovery-capacity.db"
+        val page = BusinessPage("capacity-generation", "boot", listOf(BusinessPageEntry(1, "input", null, false, null)))
+        try {
+            TelegramStore(context, TelegramDatabaseHelper(context, name)).use { store ->
+                store.archiveUnconfirmedBusinessPage(page, emptyList())
+                store.commitTelegramEvents((1..TelegramDatabaseHelper.MAX_PENDING.toInt()).map {
+                    TelegramOutboxMessage("queued-$it", "capacity-input", "original $it")
+                }, null)
+                assertFailsWith<IllegalStateException> {
+                    store.completeBusinessRecovery(page.key,
+                        listOf(TelegramOutboxMessage("recovered", "capacity-input", "archived message")),
+                        emptyList(), emptyMap(), System.currentTimeMillis(), emptySet())
+                }
+            }
+            TelegramStore(context, TelegramDatabaseHelper(context, name)).use { store ->
+                assertEquals(TelegramDatabaseHelper.MAX_PENDING, store.diagnosticSnapshot().outboxTotal)
+                assertEquals("original 1", store.telegramMessageByDedupeKey("queued-1")?.payload)
+                assertEquals(page.encode(), assertNotNull(store.nextBusinessRecovery(Long.MAX_VALUE)).pagePayload)
+                assertNull(store.telegramMessageByDedupeKey("recovered"))
+            }
+        } finally { context.deleteDatabase(name) }
+    }
+
+    @Test fun telegramV8RecoveryArchiveSurvivesAdditiveUpgrade() {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "telegram-v8-recovery.db"
+        val intent = TripCompletionIntent(17, "historical-completion", "2026-11-25T10:00:00Z")
+        val payload = org.json.JSONArray().put(org.json.JSONObject(TripCompletionIntentCodec.encode(intent))).toString()
+        try {
+            context.openOrCreateDatabase(name, 0, null).use { db ->
+                // Actual v8 table definitions; no terminal delivery result is manufactured.
+                db.execSQL("CREATE TABLE telegram_unconfirmed_business_recovery " +
+                    "(page_key TEXT PRIMARY KEY, page_payload TEXT NOT NULL, completions_json TEXT NOT NULL)")
+                db.execSQL("CREATE TABLE telegram_conflicting_delivery (dedupe_key TEXT PRIMARY KEY NOT NULL, " +
+                    "attempt_id TEXT NOT NULL, owner_id TEXT NOT NULL, sequence INTEGER NOT NULL, event_type TEXT NOT NULL, " +
+                    "payload TEXT, key_json TEXT NOT NULL, diagnostic TEXT NOT NULL, archived_at_ms INTEGER NOT NULL)")
+                db.execSQL("CREATE TABLE telegram_delivery_attempt (id INTEGER PRIMARY KEY CHECK (id=1), " +
+                    "owner_id TEXT NOT NULL, attempt_id TEXT NOT NULL UNIQUE, sequence INTEGER NOT NULL CHECK(sequence>0), " +
+                    "outbox_id INTEGER NOT NULL, dedupe_key TEXT NOT NULL, event_type TEXT NOT NULL, request_digest TEXT NOT NULL, " +
+                    "destination_digest TEXT NOT NULL, dedupe_ref TEXT NOT NULL, bot_scope TEXT NOT NULL, started_at_ms INTEGER NOT NULL, " +
+                    "local_settled INTEGER NOT NULL DEFAULT 0 CHECK(local_settled IN (0,1)))")
+                db.execSQL("CREATE TABLE telegram_trip_completion_receipt (id INTEGER PRIMARY KEY CHECK(id=1), " +
+                    "sequence INTEGER NOT NULL, identity TEXT NOT NULL)")
+                db.execSQL("INSERT INTO telegram_unconfirmed_business_recovery VALUES(?, ?, ?)",
+                    arrayOf("old-page", "original-page-data", payload))
+                db.execSQL("INSERT INTO telegram_trip_completion_receipt VALUES(1, ?, ?)", arrayOf(intent.sequence, intent.identity))
+                db.version = 8
+            }
+            repeat(2) {
+                TelegramStore(context, TelegramDatabaseHelper(context, name)).use { store ->
+                    val recovered = assertNotNull(store.nextBusinessRecovery(Long.MAX_VALUE))
+                    assertEquals("original-page-data", recovered.pagePayload)
+                    assertEquals(payload, recovered.completionsJson)
+                    assertNull(recovered.beforeStateJson)
+                    assertTrue(store.hasTripCompletionReceipt(intent.sequence, intent.identity))
+                    assertNull(store.activeTelegramDeliveryAttempt())
+                    store.ensureDeliveryDurable()
+                    val parseError = assertFailsWith<org.json.JSONException> {
+                        org.json.JSONObject("{\"payload\":\"private archived report\", broken")
+                    }
+                    store.failBusinessRecovery(recovered.pageKey, parseError, false, System.currentTimeMillis())
+                    val diagnostic = store.recoveryDiagnosticLines().joinToString("\n")
+                    assertContains(diagnostic, "telegram_sqlite_synchronous=2")
+                    assertContains(diagnostic, "\"before_state_saved\":false")
+                    assertFalse(diagnostic.contains("original-page-data"))
+                    assertFalse(diagnostic.contains(intent.identity))
+                    assertFalse(diagnostic.contains("private archived report"))
+                    assertContains(diagnostic, "org.json.JSONException")
+                }
+            }
+        } finally { context.deleteDatabase(name) }
+    }
+
+    @Test
+    @Config(sdk = [26, 29])
+    fun handoffDatabasesKeepFullSyncAcrossReopen() {
+        val context = RuntimeEnvironment.getApplication()
+        val telegramName = "durable-telegram.db"
+        val tripsName = "durable-trips.db"
+        try {
+            repeat(2) {
+                val telegram = TelegramDatabaseHelper(context, telegramName)
+                try {
+                    val db = telegram.writableDatabase
+                    db.rawQuery("PRAGMA synchronous", null).use { cursor ->
+                        assertTrue(cursor.moveToFirst())
+                        assertEquals(2, cursor.getInt(0))
+                    }
+                    DurableSqlite.barrier(db)
+                } finally { telegram.close() }
+                val trips = TripDatabaseHelper(context, tripsName)
+                try {
+                    val db = trips.writableDatabase
+                    db.rawQuery("PRAGMA synchronous", null).use { cursor ->
+                        assertTrue(cursor.moveToFirst())
+                        assertEquals(2, cursor.getInt(0))
+                    }
+                    DurableSqlite.barrier(db)
+                } finally { trips.close() }
+            }
+        } finally {
+            context.deleteDatabase(telegramName)
+            context.deleteDatabase(tripsName)
+        }
+    }
+
     @Test fun completedPageWithoutTelegramReceiptIsArchivedBeforeConsumingExactTripsHandoff() {
         val context = RuntimeEnvironment.getApplication()
         val tripsName = "unconfirmed-page-trips.db"
@@ -289,6 +397,39 @@ class BusinessPageRecoveryTest {
                 store.allPendingCompletions()
             }
             main().use { assertEquals(refs, it.pendingBusinessInputs()) }
+            val recoveredName = "page_recovered_$oldVersion.db"
+            try {
+                val settings = CollectorSettings(context)
+                settings.setTelegramEnabled(true)
+                settings.setTelegramEventEnabled(com.bydcollector.collector.telegram.TelegramEventType.TRIP_SUMMARY.key, true)
+                val dispatched = mutableListOf<Any>()
+                val liveState = TelegramStore(context, TelegramDatabaseHelper(context, recoveredName)).use { recovered ->
+                    main().use { eventStore ->
+                        val coordinator = TelegramCoordinator(eventStore, recovered, settings, VehicleStateNormalizer(),
+                            dispatchSend = { dispatched += it })
+                        coordinator.onSourcePoll(1, "2027-01-16T08:00:00Z",
+                            com.bydcollector.collector.data.polling.PollSampleSource("new-session", "new-boot", 100),
+                            listOf(PollReading("bodywork_power_level", "2", "2")), PollOrigin.LIVE, "new-boot")
+                        recovered.archiveUnconfirmedBusinessPage(page, completions)
+                        assertNotNull(recovered.telegramRuntimeState())
+                    }
+                }
+                TelegramStore(context, TelegramDatabaseHelper(context, recoveredName)).use { recovered ->
+                    main().use { eventStore ->
+                        val coordinator = TelegramCoordinator(eventStore, recovered, settings, VehicleStateNormalizer(),
+                            dispatchSend = { dispatched += it })
+                        coordinator.recoverOneBusinessPage()
+                        val count = recovered.diagnosticSnapshot().outboxTotal
+                        assertTrue(count > 0)
+                        assertEquals(liveState, recovered.telegramRuntimeState())
+                        completions.forEach { assertTrue(recovered.hasTripCompletionReceipt(it.sequence, it.identity)) }
+                        coordinator.recoverOneBusinessPage()
+                        assertEquals(count, recovered.diagnosticSnapshot().outboxTotal)
+                        assertNull(recovered.businessRecoveryDeadline())
+                        assertTrue(dispatched.isEmpty())
+                    }
+                }
+            } finally { context.deleteDatabase(recoveredName) }
             telegram().use { store -> main().use { eventStore ->
                 val settings = CollectorSettings(context)
                 settings.setTelegramEnabled(true)

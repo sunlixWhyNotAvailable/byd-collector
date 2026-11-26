@@ -17,6 +17,8 @@ data class TelegramOutboxEntry(
 
 /** Narrow durable delivery contract shared by the independent Telegram sender. */
 public interface TelegramDeliveryStore {
+    fun ensureDeliveryDurable()
+
     fun oldestDueTelegramMessage(nowMs: Long, eventType: String? = null): TelegramOutboxEntry?
 
     fun nextTelegramAttemptAtMs(eventType: String? = null): Long?
@@ -39,6 +41,14 @@ public interface TelegramDeliveryStore {
     fun expediteNetworkRetries(nowMs: Long, excludeIds: Set<Long> = emptySet()): Int
 
     fun activeTelegramDeliveryAttempt(): TelegramPersistedDeliveryAttempt?
+
+    fun restoreConflictingTelegramAttempt(): TelegramPersistedDeliveryAttempt?
+
+    fun reconcileTelegramDeliveryAttempt(
+        attempt: TelegramPersistedDeliveryAttempt,
+        outcome: com.bydcollector.collector.telegram.TelegramHelperOutcome,
+        diagnostic: String
+    ): TelegramPersistedDeliveryAttempt
 
     fun prepareTelegramDeliveryAttempt(
         entry: TelegramOutboxEntry,
@@ -84,7 +94,8 @@ data class TelegramPersistedDeliveryAttempt(
     val dedupeRef: String,
     val botScope: String,
     val startedAtMs: Long,
-    val localSettled: Boolean
+    val localSettled: Boolean,
+    val reconciledOutcome: com.bydcollector.collector.telegram.TelegramHelperOutcome? = null
 )
 
 data class TelegramEnqueueResult(
@@ -92,6 +103,15 @@ data class TelegramEnqueueResult(
     val expiredCount: Int,
     val overflowCount: Int,
     val orphanCount: Int = 0
+)
+
+internal data class TelegramBusinessRecovery(
+    val pageKey: String,
+    val pagePayload: String,
+    val completionsJson: String,
+    val beforeStateJson: String?,
+    val sourcesJson: String?,
+    val messagesJson: String?
 )
 
 data class TelegramOutboxMessage(

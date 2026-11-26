@@ -907,7 +907,7 @@ object DiagnosticLogRecorder {
 
     private fun writeTripsEvidenceUnavailable(runDir: File, reason: String): String {
         File(runDir, TRIPS_TELEGRAM_EVIDENCE_NAME).writeText(
-            "schema_version=2\ntrips_status=$reason\nrecent_closed_status=$reason\ntelegram_status=$reason\ntruncated=0\n",
+            "schema_version=3\ntrips_status=$reason\nrecent_closed_status=$reason\ntelegram_status=$reason\ntruncated=0\n",
             Charsets.UTF_8
         )
         return "partial $reason"
@@ -916,7 +916,7 @@ object DiagnosticLogRecorder {
     private fun writeTripsTelegramEvidenceUnderReadGate(context: Context, runDir: File): String {
         val output = File(runDir, TRIPS_TELEGRAM_EVIDENCE_NAME)
         val lines = mutableListOf<String>(
-            "schema_version=2",
+            "schema_version=3",
             "captured_at=${timestampIso()}",
             "redaction=trip_telegram_metadata_only"
         )
@@ -942,6 +942,9 @@ object DiagnosticLogRecorder {
             } else {
                 lines += runCatching { store.tripReportDiagnosticLines(closedSessionRefs) }.getOrElse {
                     listOf("trip_report_status=error", "trip_report_error=${it.diagnosticDetail("read trip report evidence")}")
+                }
+                lines += runCatching { store.recoveryDiagnosticLines() }.getOrElse {
+                    listOf("telegram_recovery_status=error", "telegram_recovery_error=${it.diagnosticDetail("read recovery evidence")}")
                 }
                 telegram = store.diagnosticSnapshot(TELEGRAM_EVIDENCE_ROW_LIMIT)
                 telegramStatus = telegram?.status ?: "error"
@@ -977,6 +980,7 @@ object DiagnosticLogRecorder {
                     if (pendingTripId != null) tripCorrelation = "unavailable"
                 } else try {
                     trips.withLease {
+                        lines += trips.durabilityDiagnosticLines()
                         val selection = selectDiagnosticTrip(
                             pendingTripId = pendingTripId,
                             pendingPowerSessionId = pendingPowerSessionId,
@@ -1074,7 +1078,7 @@ object DiagnosticLogRecorder {
         }.getOrElse { error ->
             runCatching {
                 output.writeText(
-                    "schema_version=2\nstatus=error\nerror=${error::class.java.simpleName}\n",
+                    "schema_version=3\nstatus=error\nerror=${error::class.java.simpleName}\n",
                     Charsets.UTF_8
                 )
             }

@@ -5,6 +5,7 @@ import com.bydcollector.collector.data.energy.EnergySnapshot
 import com.bydcollector.collector.data.energy.EnergyStateCodec
 import com.bydcollector.collector.data.normalized.*
 import com.bydcollector.collector.service.TripBusinessResult
+import com.bydcollector.collector.service.toJson
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -57,6 +58,50 @@ internal data class BusinessPage(
         }).toString()
 
     companion object {
+        fun sourceEvidence(deltas: List<BusinessInputDelta>): String = JSONArray().apply {
+            deltas.forEach { delta ->
+                val ref = delta.ref
+                put(JSONObject().put("id", ref.id).put("identity", ref.sourceIdentity)
+                    .put("boot", ref.bootId).put("kind", ref.kind.storageValue).put("origin", ref.origin.storageValue)
+                    .put("generation", ref.generation).put("sequence", ref.sequence).put("epoch", ref.epoch)
+                    .put("wall_ms", ref.acquiredWallMs).put("elapsed_ms", ref.acquiredElapsedMs)
+                    .put("poll", ref.pollId).put("ok", ref.ok).put("quality", ref.quality)
+                    .put("error_category", ref.errorCategory).put("error", ref.errorMessage)
+                    .put("readings", JSONArray().apply {
+                        delta.readings.forEach { reading ->
+                            put(JSONObject().put("key", reading.rawKey).put("raw", reading.rawValue ?: JSONObject.NULL)
+                                .put("desc", reading.descValue ?: JSONObject.NULL).apply {
+                                    reading.callbackSource?.let { callback ->
+                                        val bytes = java.io.ByteArrayOutputStream()
+                                        java.io.DataOutputStream(bytes).use {
+                                            com.bydcollector.collector.direct.CallbackValueSource.writeNullable(it, callback, true)
+                                        }
+                                        put("callback_source_v4", java.util.Base64.getEncoder().encodeToString(bytes.toByteArray()))
+                                    }
+                                    reading.getLineage?.let { lineage ->
+                                        put("get", JSONObject().put("boot", lineage.helperBootId)
+                                            .put("generation", lineage.helperGeneration).put("stream", lineage.stream)
+                                            .put("epoch", lineage.sourceEpoch).put("identity", lineage.readIdentity)
+                                            .put("sequence", lineage.recordSequence).put("start_wall", lineage.startedWallMs)
+                                            .put("start_elapsed", lineage.startedElapsedMs).put("end_wall", lineage.completedWallMs)
+                                            .put("end_elapsed", lineage.completedElapsedMs)
+                                            .put("watermark_start", lineage.callbackWatermarkStart)
+                                            .put("watermark_end", lineage.callbackWatermarkEnd)
+                                            .put("superseded", lineage.supersededByCallback))
+                                    }
+                                })
+                        }
+                    }).put("continuity", JSONObject().apply {
+                        delta.continuityUpdates.forEach { (key, value) ->
+                            put(key, JSONObject().put("state", value.state.storageValue).put("stamp", value.stamp.toJson())
+                                .put("seed_kind", value.seedKind).put("seed_identity", value.seedIdentity)
+                                .put("seed_sequence", value.seedRecordSequence).put("seed_valid", value.seedValid)
+                                .put("reason", value.reason).put("diagnostic", value.diagnostic))
+                        }
+                    }))
+            }
+        }.toString()
+
         fun decode(encoded: String): BusinessPage {
             val json = JSONObject(encoded)
             require(json.getInt("version") in 1..2) { "Unsupported business page version" }

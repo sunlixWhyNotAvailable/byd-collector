@@ -25,6 +25,8 @@ class TelegramStore(
 
     fun databaseFile() = helper.databaseFile()
 
+    override fun ensureDeliveryDurable() = DurableSqlite.barrier(helper.writableDatabase)
+
     fun commitTelegramEvents(
         messages: List<TelegramOutboxMessage>,
         stateJson: String?,
@@ -34,7 +36,9 @@ class TelegramStore(
         protectedTelegramIds: Set<Long> = emptySet(),
         businessPageKey: String? = null,
         pageCompletions: List<Pair<Long, String>> = emptyList(),
-        tripReportEvidence: Map<String, JSONObject> = emptyMap()
+        tripReportEvidence: Map<String, JSONObject> = emptyMap(),
+        beforePageState: String? = null,
+        pageSources: String? = null
     ): List<TelegramEnqueueResult> {
         require((completionSequence == null) == (completionIdentity == null))
         require(pageCompletions.isEmpty() || businessPageKey != null)
@@ -62,14 +66,25 @@ class TelegramStore(
                 results[results.lastIndex] = results.last().copy(overflowCount = removed, orphanCount = repaired.second)
             }
             stateJson?.let { saveTelegramRuntimeState(db, it, nowMs) }
-            val lastCompletion = pageCompletions.lastOrNull() ?: completionSequence?.let { it to completionIdentity!! }
+            val completions = pageCompletions.ifEmpty { completionSequence?.let { listOf(it to completionIdentity!!) }.orEmpty() }
+            completions.forEach { (sequence, identity) ->
+                db.insertWithOnConflict("telegram_completion_receipts", null, ContentValues().apply {
+                    put("sequence", sequence); put("identity", identity); put("created_at_ms", nowMs)
+                }, SQLiteDatabase.CONFLICT_IGNORE)
+                check(hasTripCompletionReceipt(db, sequence, identity)) { "Telegram completion receipt identity changed" }
+            }
+            val lastCompletion = completions.lastOrNull()
             if (lastCompletion != null) {
+                val previous = db.rawQuery("SELECT sequence FROM telegram_trip_completion_receipt WHERE id=1", null)
+                    .use { if (it.moveToFirst()) it.getLong(0) else 0L }
+                if (lastCompletion.first >= previous) {
                 db.delete("telegram_trip_completion_receipt", "id = 1", emptyArray())
                 db.insertOrThrow("telegram_trip_completion_receipt", null, ContentValues().apply {
                     put("id", 1)
                     put("sequence", lastCompletion.first)
                     put("identity", lastCompletion.second)
                 })
+                }
             }
             businessPageKey?.let { key ->
                 require(key.isNotBlank())
@@ -82,6 +97,15 @@ class TelegramStore(
                         }
                     }.toString())
                 }, SQLiteDatabase.CONFLICT_REPLACE) != -1L) { "Telegram business page receipt failed" }
+                db.insertOrThrow("telegram_page_receipts", null, ContentValues().apply {
+                    put("page_key", key); put("before_state_json", beforePageState); put("sources_json", pageSources)
+                    put("messages_json", com.bydcollector.collector.telegram.encodeTelegramMessages(messages)); put("created_at_ms", nowMs)
+                    put("completions_json", JSONArray().apply {
+                        completions.forEach { (sequence, identity) ->
+                            put(JSONObject().put("sequence", sequence).put("identity", identity))
+                        }
+                    }.toString())
+                })
             }
             db.setTransactionSuccessful()
             return results
@@ -141,20 +165,97 @@ class TelegramStore(
     fun hasTripCompletionReceipt(sequence: Long, identity: String): Boolean =
         hasTripCompletionReceipt(helper.readableDatabase, sequence, identity)
 
+    /** Bounded metadata only: never export archived payloads, source values or detector state. */
+    @Synchronized
+    internal fun recoveryDiagnosticLines(): List<String> {
+        val db = helper.readableDatabase
+        val sanitizer = com.bydcollector.collector.diagnostics.DiagnosticShareSanitizer()
+        fun safeError(value: String): String {
+            // JSON exceptions can echo the entire private input, including message
+            // text. Keep the type/frames here; the exact error stays in SQLite.
+            val withoutJsonInput = Regex("(org\\.json\\.JSONException:)[\\s\\S]*?(?=\\n\\s+at |\\n(?:Caused by:|\\s*Suppressed:)|$)")
+                .replace(value) { it.groupValues[1] + " [JSON input details redacted; original retained privately]" }
+            val redacted = sanitizer.sanitizeText(withoutJsonInput)
+            return if (redacted.length <= 4_096) redacted else redacted.take(4_096) + " [TRUNCATED]"
+        }
+        return buildList {
+            addAll(DurableSqlite.diagnosticLines(db, "telegram"))
+            listOf("telegram_page_receipts", "telegram_completion_receipts").forEach { table ->
+                db.rawQuery("SELECT COUNT(*) FROM $table", null).use { check(it.moveToFirst()); add("${table}_count=${it.getLong(0)}") }
+            }
+            listOf("telegram_conflicting_delivery" to "resolution", "telegram_unconfirmed_business_recovery" to "status")
+                .forEach { (table, status) ->
+                    db.rawQuery("SELECT $status, COUNT(*) FROM $table GROUP BY $status", null).use {
+                        while (it.moveToNext()) add("${table}_count=" + JSONObject().put("state", it.getString(0)).put("count", it.getLong(1)))
+                    }
+                }
+            db.rawQuery("SELECT dedupe_key, attempt_id, owner_id, sequence, event_type, diagnostic, archived_at_ms, " +
+                "recovered_at_ms, resolution, last_error, reconciled_outcome FROM telegram_conflicting_delivery " +
+                "ORDER BY archived_at_ms DESC, dedupe_key LIMIT 21", null).use { cursor ->
+                add("telegram_conflict_rows_truncated=${cursor.count > 20}")
+                while (cursor.moveToNext() && cursor.position < 20) {
+                    val row = JSONObject().put("dedupe_ref", diagnosticSha256(cursor.getString(0)))
+                        .put("attempt_ref", diagnosticSha256(cursor.getString(1))).put("owner_ref", diagnosticSha256(cursor.getString(2)))
+                        .put("sequence", cursor.getLong(3)).put("event", cursor.getString(4))
+                        .put("original_error", safeError(cursor.getString(5))).put("archived_at_ms", cursor.getLong(6))
+                        .put("recovered_at_ms", if (cursor.isNull(7)) JSONObject.NULL else cursor.getLong(7))
+                        .put("resolution", cursor.getString(8))
+                        .put("last_error", if (cursor.isNull(9)) JSONObject.NULL else safeError(cursor.getString(9)))
+                    if (!cursor.isNull(10)) {
+                        val outcome = com.bydcollector.collector.telegram.TelegramHelperProtocol.decodeRecovery(cursor.getString(10))
+                        row.put("actual_attempt_ref", outcome.actualKey?.attemptId?.toString()?.let(::diagnosticSha256) ?: JSONObject.NULL)
+                            .put("actual_sequence", outcome.actualKey?.sequence ?: JSONObject.NULL)
+                            .put("reconciled_state", outcome.state.name).put("owner_retired", outcome.ownerRetired)
+                            .put("result_confirmed_at_ms", outcome.confirmedAtMs ?: JSONObject.NULL)
+                    }
+                    add("telegram_conflict=$row")
+                }
+            }
+            db.rawQuery("SELECT page_key, status, next_attempt_at_ms, updated_at_ms, last_error, " +
+                "before_state_json IS NOT NULL, sources_json IS NOT NULL, messages_json IS NOT NULL, " +
+                "length(page_payload), length(completions_json) FROM telegram_unconfirmed_business_recovery " +
+                "ORDER BY updated_at_ms DESC, page_key LIMIT 21", null).use { cursor ->
+                add("telegram_business_recovery_rows_truncated=${cursor.count > 20}")
+                while (cursor.moveToNext() && cursor.position < 20) {
+                    add("telegram_business_recovery=" + JSONObject().put("page_ref", diagnosticSha256(cursor.getString(0)))
+                        .put("status", cursor.getString(1)).put("next_attempt_at_ms", cursor.getLong(2)).put("updated_at_ms", cursor.getLong(3))
+                        .put("last_error", if (cursor.isNull(4)) JSONObject.NULL else safeError(cursor.getString(4)))
+                        .put("before_state_saved", cursor.getInt(5) != 0).put("sources_saved", cursor.getInt(6) != 0)
+                        .put("messages_saved", cursor.getInt(7) != 0).put("page_chars", cursor.getLong(8)).put("completions_chars", cursor.getLong(9)))
+                }
+            }
+            activeTelegramDeliveryAttempt()?.let { attempt ->
+                val outcome = attempt.reconciledOutcome
+                add("telegram_active_attempt=" + JSONObject().put("owner_ref", diagnosticSha256(attempt.ownerId))
+                    .put("attempt_ref", diagnosticSha256(attempt.attemptId)).put("sequence", attempt.sequence)
+                    .put("dedupe_ref", diagnosticSha256(attempt.dedupeKey)).put("local_settled", attempt.localSettled)
+                    .put("started_at_ms", attempt.startedAtMs).put("owner_retired", outcome?.ownerRetired ?: false)
+                    .put("reconciled_state", outcome?.state?.name ?: JSONObject.NULL)
+                    .put("actual_attempt_ref", outcome?.actualKey?.attemptId?.toString()?.let(::diagnosticSha256) ?: JSONObject.NULL)
+                    .put("actual_sequence", outcome?.actualKey?.sequence ?: JSONObject.NULL)
+                    .put("result_confirmed_at_ms", outcome?.confirmedAtMs ?: JSONObject.NULL))
+            }
+        }
+    }
+
     internal fun archiveUnconfirmedBusinessPage(page: BusinessPage, completions: List<TripCompletionIntent>) {
         val db = helper.writableDatabase
         db.beginTransactionNonExclusive()
         try {
-            db.execSQL("CREATE TABLE IF NOT EXISTS telegram_unconfirmed_business_recovery " +
-                "(page_key TEXT PRIMARY KEY, page_payload TEXT NOT NULL, completions_json TEXT NOT NULL)")
             val payload = page.encode()
             val intents = JSONArray().apply {
                 completions.forEach { put(JSONObject(TripCompletionIntentCodec.encode(it))) }
             }.toString()
+            val evidence = db.rawQuery("SELECT before_state_json, sources_json, messages_json " +
+                "FROM telegram_page_receipts WHERE page_key=?", arrayOf(page.key)).use { cursor ->
+                if (!cursor.moveToFirst()) null else arrayOf(cursor.getString(0), cursor.getString(1), cursor.getString(2))
+            }
             db.insertWithOnConflict("telegram_unconfirmed_business_recovery", null, ContentValues().apply {
                 put("page_key", page.key)
                 put("page_payload", payload)
                 put("completions_json", intents)
+                put("before_state_json", evidence?.get(0)); put("sources_json", evidence?.get(1))
+                put("messages_json", evidence?.get(2)); put("updated_at_ms", clockMs())
             }, SQLiteDatabase.CONFLICT_IGNORE)
             db.rawQuery("SELECT page_payload, completions_json FROM telegram_unconfirmed_business_recovery WHERE page_key=?",
                 arrayOf(page.key)).use {
@@ -169,11 +270,74 @@ class TelegramStore(
     }
 
     internal fun hasBusinessPageReceipt(key: String): Boolean = helper.readableDatabase.rawQuery(
-        "SELECT page_key FROM telegram_business_page_receipt WHERE singleton=1", null
-    ).use { it.moveToFirst() && it.getString(0) == key }
+        "SELECT 1 FROM telegram_page_receipts WHERE page_key=? UNION ALL " +
+            "SELECT 1 FROM telegram_business_page_receipt WHERE singleton=1 AND page_key=? LIMIT 1", arrayOf(key, key)
+    ).use { it.moveToFirst() }
+
+    internal fun releaseBusinessPageReceipt(key: String) {
+        helper.writableDatabase.delete("telegram_page_receipts", "page_key=?", arrayOf(key))
+        ensureDeliveryDurable()
+    }
+
+    internal fun businessRecoveryDeadline(): Long? = helper.readableDatabase.rawQuery(
+        "SELECT MIN(next_attempt_at_ms) FROM telegram_unconfirmed_business_recovery WHERE status='pending'", null
+    ).use { if (it.moveToFirst() && !it.isNull(0)) it.getLong(0) else null }
+
+    internal fun nextBusinessRecovery(nowMs: Long): TelegramBusinessRecovery? = helper.readableDatabase.rawQuery(
+        "SELECT page_key, page_payload, completions_json, before_state_json, sources_json, messages_json " +
+            "FROM telegram_unconfirmed_business_recovery WHERE status='pending' AND next_attempt_at_ms<=? " +
+            "ORDER BY updated_at_ms, page_key LIMIT 1", arrayOf(nowMs.toString())
+    ).use { if (!it.moveToFirst()) null else TelegramBusinessRecovery(it.getString(0), it.getString(1),
+        it.getString(2), it.getString(3), it.getString(4), it.getString(5)) }
+
+    internal fun failBusinessRecovery(key: String, error: Throwable, sourceUnavailable: Boolean, nowMs: Long) {
+        check(helper.writableDatabase.update("telegram_unconfirmed_business_recovery", ContentValues().apply {
+            put("status", if (sourceUnavailable) "source_unavailable" else "pending")
+            put("last_error", error.stackTraceToString()); put("updated_at_ms", nowMs)
+            put("next_attempt_at_ms", nowMs + 30_000L)
+        }, "page_key=?", arrayOf(key)) == 1)
+        ensureDeliveryDurable()
+    }
+
+    internal fun completeBusinessRecovery(key: String, messages: List<TelegramOutboxMessage>,
+        completions: List<TripCompletionIntent>, evidence: Map<String, JSONObject>, nowMs: Long,
+        protectedIds: Set<Long>, unresolvedDiagnostic: String? = null): List<TelegramEnqueueResult> {
+        val db = helper.writableDatabase
+        db.beginTransaction()
+        try {
+            val status = db.rawQuery("SELECT status FROM telegram_unconfirmed_business_recovery WHERE page_key=?",
+                arrayOf(key)).use { check(it.moveToFirst()); it.getString(0) }
+            if (status == "resolved") { db.setTransactionSuccessful(); return emptyList() }
+            val queued = db.rawQuery("SELECT COUNT(*) FROM telegram_outbox", null)
+                .use { check(it.moveToFirst()); it.getLong(0) }
+            val additional = messages.distinctBy { it.dedupeKey }.count {
+                telegramMessageByDedupeKey(it.dedupeKey) == null && telegramDeliveryReceipt(db, it.dedupeKey) == null
+            }
+            check(queued + additional <= TelegramDatabaseHelper.MAX_PENDING) {
+                "Archived Telegram work retained until outbox has capacity: queued=$queued additional=$additional"
+            }
+            val receipt = "recovery:$key"
+            val results = commitTelegramEvents(messages, null, nowMs, protectedTelegramIds = protectedIds,
+                businessPageKey = receipt, pageCompletions = completions.map { it.sequence to it.identity },
+                tripReportEvidence = evidence)
+            check(db.update("telegram_unconfirmed_business_recovery", ContentValues().apply {
+                put("status", if (unresolvedDiagnostic == null) "resolved" else "source_unavailable")
+                put("updated_at_ms", nowMs); put("last_error", unresolvedDiagnostic)
+            }, "page_key=?", arrayOf(key)) == 1)
+            db.delete("telegram_page_receipts", "page_key=?", arrayOf(receipt))
+            db.setTransactionSuccessful()
+            return results
+        } finally { db.endTransaction() }
+    }
 
     private fun hasTripCompletionReceipt(db: SQLiteDatabase, sequence: Long, identity: String): Boolean {
         require(sequence > 0L && identity.isNotBlank())
+        db.rawQuery("SELECT identity FROM telegram_completion_receipts WHERE sequence=?", arrayOf(sequence.toString())).use {
+            if (it.moveToFirst()) {
+                check(it.getString(0) == identity) { "Trip completion identity changed" }
+                return true
+            }
+        }
         db.rawQuery("SELECT completions_json FROM telegram_business_page_receipt WHERE singleton=1", null).use { cursor ->
             if (cursor.moveToFirst()) {
                 val entries = JSONArray(cursor.getString(0))
@@ -188,7 +352,6 @@ class TelegramStore(
         }
         return db.rawQuery("SELECT sequence, identity FROM telegram_trip_completion_receipt WHERE id = 1", emptyArray()).use {
             if (!it.moveToFirst()) return@use false
-            check(it.getLong(0) <= sequence) { "Trip completion handoff is out of order" }
             if (it.getLong(0) != sequence) return@use false
             check(it.getString(1) == identity) { "Trip completion identity changed" }
             true
@@ -203,7 +366,7 @@ class TelegramStore(
         require(message.dedupeKey.isNotBlank()) { "Telegram dedupe key must not be blank" }
         require(message.eventType.isNotBlank()) { "Telegram event type must not be blank" }
         require(message.payload.isNotBlank()) { "Telegram payload must not be blank" }
-        db.rawQuery("SELECT event_type FROM telegram_conflicting_delivery WHERE dedupe_key=?",
+        db.rawQuery("SELECT event_type FROM telegram_conflicting_delivery WHERE dedupe_key=? AND recovered_at_ms IS NULL",
             arrayOf(message.dedupeKey)).use {
             if (it.moveToFirst()) {
                 check(it.getString(0) == message.eventType) { "Quarantined Telegram dedupe key changed event type" }
@@ -491,6 +654,16 @@ class TelegramStore(
             val attempt = readActiveTelegramDeliveryAttempt(db) ?: return false
             check(attempt.attemptId == attemptId) { "Telegram delivery ACK does not match the active attempt" }
             check(attempt.localSettled) { "Telegram delivery cannot be ACKed before local settlement" }
+            if (attempt.reconciledOutcome != null) {
+                db.update("telegram_delivery_owner", ContentValues().apply {
+                    put("owner_id", UUID.randomUUID().toString())
+                    put("last_sequence", 0L)
+                }, "id=1 AND owner_id=?", arrayOf(attempt.ownerId))
+            }
+            db.update("telegram_conflicting_delivery", ContentValues().apply {
+                put("recovered_at_ms", clockMs())
+                put("resolution", "settled")
+            }, "dedupe_key=? AND attempt_id=?", arrayOf(attempt.dedupeKey, attempt.attemptId))
             check(db.delete(
                 "telegram_delivery_attempt",
                 "id = 1 AND attempt_id = ? AND local_settled = 1",
@@ -579,6 +752,107 @@ class TelegramStore(
         }
     }
 
+    override fun reconcileTelegramDeliveryAttempt(
+        attempt: TelegramPersistedDeliveryAttempt,
+        outcome: com.bydcollector.collector.telegram.TelegramHelperOutcome,
+        diagnostic: String
+    ): TelegramPersistedDeliveryAttempt {
+        require(outcome.ownerRetired && outcome.state != com.bydcollector.collector.telegram.TelegramHelperState.RUNNING)
+        require(outcome.actualKey?.ownerId?.toString()?.let { it == attempt.ownerId } != false)
+        val db = helper.writableDatabase
+        db.beginTransactionNonExclusive()
+        try {
+            val current = checkNotNull(readActiveTelegramDeliveryAttempt(db))
+            check(current.copy(reconciledOutcome = null) == attempt.copy(reconciledOutcome = null)) {
+                "Telegram reconciliation no longer matches the active attempt"
+            }
+            current.reconciledOutcome?.let { db.setTransactionSuccessful(); return current }
+            val entry = telegramMessageByDedupeKey(attempt.dedupeKey)
+            db.insertWithOnConflict("telegram_conflicting_delivery", null, ContentValues().apply {
+                put("dedupe_key", attempt.dedupeKey); put("attempt_id", attempt.attemptId)
+                put("owner_id", attempt.ownerId); put("sequence", attempt.sequence)
+                put("event_type", attempt.eventType); put("payload", entry?.payload)
+                put("key_json", JSONObject().put("outbox_id", attempt.outboxId)
+                    .put("request_digest", attempt.requestDigest).put("destination_digest", attempt.destinationDigest)
+                    .put("dedupe_ref", attempt.dedupeRef).put("bot_scope", attempt.botScope)
+                    .put("started_at_ms", attempt.startedAtMs).put("local_settled", attempt.localSettled).toString())
+                put("diagnostic", diagnostic); put("archived_at_ms", clockMs())
+            }, SQLiteDatabase.CONFLICT_IGNORE)
+            val encoded = com.bydcollector.collector.telegram.TelegramHelperProtocol.encodeRecovery(outcome)
+            check(db.update("telegram_delivery_attempt", ContentValues().apply {
+                put("reconciled_outcome", encoded)
+            }, "id=1 AND attempt_id=?", arrayOf(attempt.attemptId)) == 1)
+            db.update("telegram_conflicting_delivery", ContentValues().apply {
+                put("resolution", "reconciled"); put("reconciled_outcome", encoded); putNull("last_error")
+            }, "dedupe_key=?", arrayOf(attempt.dedupeKey))
+            db.setTransactionSuccessful()
+            return current.copy(reconciledOutcome = outcome)
+        } finally { db.endTransaction() }
+    }
+
+    override fun restoreConflictingTelegramAttempt(): TelegramPersistedDeliveryAttempt? {
+        val db = helper.writableDatabase
+        db.beginTransactionNonExclusive()
+        try {
+            readActiveTelegramDeliveryAttempt(db)?.let { db.setTransactionSuccessful(); return it }
+            val row = db.rawQuery("SELECT dedupe_key, attempt_id, owner_id, sequence, event_type, payload, key_json " +
+                "FROM telegram_conflicting_delivery WHERE recovered_at_ms IS NULL AND resolution='pending' " +
+                "ORDER BY archived_at_ms, dedupe_key LIMIT 1", null).use { cursor ->
+                if (!cursor.moveToFirst()) null else JSONObject().apply {
+                    put("dedupe", cursor.getString(0)); put("attempt", cursor.getString(1))
+                    put("owner", cursor.getString(2)); put("sequence", cursor.getLong(3))
+                    put("event", cursor.getString(4)); put("payload", cursor.getString(5))
+                    put("key", cursor.getString(6))
+                }
+            } ?: run { db.setTransactionSuccessful(); return null }
+            val dedupe = row.getString("dedupe")
+            if (telegramDeliveryReceipt(db, dedupe) != null) {
+                db.update("telegram_conflicting_delivery", ContentValues().apply {
+                    put("recovered_at_ms", clockMs()); put("resolution", "confirmed_receipt")
+                }, "dedupe_key=?", arrayOf(dedupe))
+                db.setTransactionSuccessful()
+                return null
+            }
+            val restored = try {
+                val key = JSONObject(row.getString("key"))
+                var entry = telegramMessageByDedupeKey(dedupe)
+                if (entry == null) {
+                    check(!row.isNull("payload")) { "Original Telegram recovery payload is unavailable" }
+                    db.insertOrThrow("telegram_outbox", null, ContentValues().apply {
+                        put("dedupe_key", dedupe); put("event_type", row.getString("event"))
+                        put("payload", row.getString("payload")); put("created_at_ms", key.getLong("started_at_ms"))
+                        put("next_attempt_at_ms", clockMs()); put("blocked", 1)
+                    })
+                    entry = checkNotNull(telegramMessageByDedupeKey(dedupe))
+                }
+                check(entry.eventType == row.getString("event")) { "Telegram recovery event identity changed" }
+                TelegramPersistedDeliveryAttempt(row.getString("owner"), row.getString("attempt"),
+                    row.getLong("sequence"), entry.id, dedupe, entry.eventType,
+                    key.getString("request_digest"), key.getString("destination_digest"), key.getString("dedupe_ref"),
+                    key.getString("bot_scope"), key.getLong("started_at_ms"), false)
+            } catch (error: Exception) {
+                if (error is android.database.sqlite.SQLiteException || error is InterruptedException) throw error
+                db.update("telegram_conflicting_delivery", ContentValues().apply {
+                    put("resolution", "source_unavailable"); put("last_error", error.stackTraceToString())
+                }, "dedupe_key=?", arrayOf(dedupe))
+                db.setTransactionSuccessful()
+                return null
+            }
+            db.insertOrThrow("telegram_delivery_attempt", null, ContentValues().apply {
+                put("id", 1); put("owner_id", restored.ownerId); put("attempt_id", restored.attemptId)
+                put("sequence", restored.sequence); put("outbox_id", restored.outboxId)
+                put("dedupe_key", restored.dedupeKey); put("event_type", restored.eventType)
+                put("request_digest", restored.requestDigest); put("destination_digest", restored.destinationDigest)
+                put("dedupe_ref", restored.dedupeRef); put("bot_scope", restored.botScope)
+                put("started_at_ms", restored.startedAtMs); put("local_settled", 0)
+            })
+            db.update("telegram_conflicting_delivery", ContentValues().apply { put("resolution", "recovering") },
+                "dedupe_key=?", arrayOf(dedupe))
+            db.setTransactionSuccessful()
+            return restored
+        } finally { db.endTransaction() }
+    }
+
     private fun ensureTelegramDeliveryOwner(db: SQLiteDatabase): String {
         db.rawQuery("SELECT owner_id FROM telegram_delivery_owner WHERE id = 1", emptyArray()).use { cursor ->
             if (cursor.moveToFirst()) return cursor.getString(0)
@@ -595,7 +869,7 @@ class TelegramStore(
     private fun readActiveTelegramDeliveryAttempt(db: SQLiteDatabase): TelegramPersistedDeliveryAttempt? =
         db.rawQuery(
             "SELECT owner_id, attempt_id, sequence, outbox_id, dedupe_key, event_type, " +
-                "request_digest, destination_digest, dedupe_ref, bot_scope, started_at_ms, local_settled " +
+                "request_digest, destination_digest, dedupe_ref, bot_scope, started_at_ms, local_settled, reconciled_outcome " +
                 "FROM telegram_delivery_attempt WHERE id = 1",
             emptyArray()
         ).use { cursor ->
@@ -612,7 +886,9 @@ class TelegramStore(
                 dedupeRef = cursor.getString(8),
                 botScope = cursor.getString(9),
                 startedAtMs = cursor.getLong(10),
-                localSettled = cursor.getInt(11) != 0
+                localSettled = cursor.getInt(11) != 0,
+                reconciledOutcome = if (cursor.isNull(12)) null else
+                    com.bydcollector.collector.telegram.TelegramHelperProtocol.decodeRecovery(cursor.getString(12))
             )
         }
 
@@ -898,6 +1174,7 @@ class TelegramStore(
                 next_attempt_at_ms = MAX(next_attempt_at_ms, ?)
             WHERE blocked = 1 AND NOT EXISTS (
                 SELECT 1 FROM telegram_conflicting_delivery q WHERE q.dedupe_key = telegram_outbox.dedupe_key
+                    AND q.recovered_at_ms IS NULL
             )
             """.trimIndent(),
             arrayOf(nowMs)

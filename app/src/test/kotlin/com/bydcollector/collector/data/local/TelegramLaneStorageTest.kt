@@ -11,6 +11,9 @@ import com.bydcollector.collector.telegram.TelegramHelperState
 import com.bydcollector.collector.telegram.TelegramSendFailureKind
 import com.bydcollector.collector.telegram.TelegramSendMessage
 import com.bydcollector.collector.telegram.TelegramSendResult
+import com.bydcollector.collector.telegram.reconciledTelegramResult
+import com.bydcollector.collector.telegram.TelegramRetryPolicy
+import com.bydcollector.collector.telegram.telegramFailureCode
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -31,7 +34,7 @@ import kotlin.test.assertTrue
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
 class TelegramLaneStorageTest {
-    @Test fun sameSequenceConflictQuarantinesOnlyThatReportAndStartsNewOwnerWithoutSending() {
+    @Test fun sameSequenceConflictRecoversTheArchivedAttemptAcrossReopenWithoutSending() {
         val context = RuntimeEnvironment.getApplication()
         val name = "tg_conflict_" + System.nanoTime() + ".db"
         val directory = File(context.cacheDir, name + ".ledger")
@@ -84,11 +87,52 @@ class TelegramLaneStorageTest {
                 assertEquals(42L, assertNotNull(store.telegramDeliveryReceipt("completed-earlier")).telegramMessageId)
                 assertFalse(store.commitTelegramEvents(listOf(message), null, at).single().inserted)
                 assertEquals(next.dedupeKey, store.oldestDueTelegramMessage(at)?.dedupeKey)
+                // Legacy archives can outlive their old outbox row. A genuine SQLite
+                // write failure must leave that recovery pending, rather than reject its source.
+                context.openOrCreateDatabase(name, 0, null).use { db ->
+                    db.delete("telegram_outbox", "dedupe_key=?", arrayOf(message.dedupeKey))
+                    db.execSQL("CREATE TRIGGER reject_restore BEFORE INSERT ON telegram_outbox " +
+                        "BEGIN SELECT RAISE(ABORT, 'restoration write blocked'); END")
+                    assertFailsWith<android.database.sqlite.SQLiteException> { store.restoreConflictingTelegramAttempt() }
+                    db.rawQuery("SELECT resolution FROM telegram_conflicting_delivery WHERE dedupe_key=?",
+                        arrayOf(message.dedupeKey)).use { assertTrue(it.moveToFirst()); assertEquals("pending", it.getString(0)) }
+                    db.execSQL("DROP TRIGGER reject_restore")
+                }
+                val restored = assertNotNull(store.restoreConflictingTelegramAttempt())
+                assertEquals(attempt.copy(outboxId = restored.outboxId), restored)
+                val outcome = lane.telegramReconcile(key(restored))
+                assertTrue(outcome.ownerRetired)
+                assertEquals(persistedKey, outcome.actualKey)
+                val wire = Parcel.obtain()
+                try {
+                    TelegramHelperProtocol.writeSuccessReply(wire, outcome)
+                    wire.setDataPosition(0)
+                    assertEquals(outcome, TelegramHelperProtocol.readReply(wire))
+                } finally { wire.recycle() }
+                store.reconcileTelegramDeliveryAttempt(restored, outcome, conflict.diagnostic)
+            }
+            openStore().use { store ->
+                val restored = assertNotNull(store.activeTelegramDeliveryAttempt())
+                val result = assertIs<TelegramSendResult.Failure>(reconciledTelegramResult(key(restored),
+                    assertNotNull(restored.reconciledOutcome), at).first)
+                val retryAt = at + TelegramRetryPolicy().delayForFailure(1)
+                store.settleTelegramDeliveryFailure(restored.attemptId, telegramFailureCode(result), at, retryAt)
+                store.acknowledgeTelegramDeliveryAttempt(restored.attemptId)
+                val recovered = assertNotNull(store.telegramMessageByDedupeKey(message.dedupeKey))
+                assertFalse(recovered.blocked)
+                assertEquals(retryAt, recovered.nextAttemptAtMs)
                 val following = store.prepare(next)
                 assertTrue(following.ownerId != attempt.ownerId)
                 assertEquals(1L, following.sequence)
                 assertEquals(TelegramHelperState.ABSENT, lane.telegramQuery(key(following)).state)
                 assertEquals(TelegramHelperAmbiguity.LEDGER_RECOVERED, lane.telegramQuery(persistedKey).ambiguity)
+                val diagnostic = store.recoveryDiagnosticLines().joinToString("\n")
+                assertTrue(diagnostic.contains("\"resolution\":\"settled\""))
+                assertTrue(diagnostic.contains("\"actual_sequence\":2"))
+                assertTrue(diagnostic.contains("IllegalArgumentException"))
+                assertFalse(diagnostic.contains(message.payload))
+                assertFalse(diagnostic.contains(attempt.ownerId))
+                assertFalse(diagnostic.contains(attempt.attemptId))
             }
             context.openOrCreateDatabase(name, 0, null).use { db ->
                 db.rawQuery("SELECT payload, diagnostic FROM telegram_conflicting_delivery", null).use {

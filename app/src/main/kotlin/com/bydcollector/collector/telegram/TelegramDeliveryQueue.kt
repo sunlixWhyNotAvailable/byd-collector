@@ -68,7 +68,8 @@ internal class TelegramDeliveryQueue(
 
     @Synchronized
     fun restorePersistedAttempt(trigger: String): TelegramDeliveryAttempt? {
-        val persisted = store.activeTelegramDeliveryAttempt() ?: return null
+        val persisted = store.activeTelegramDeliveryAttempt() ?: store.restoreConflictingTelegramAttempt() ?: return null
+        store.ensureDeliveryDurable()
         inFlight?.let { current ->
             check(current.persisted?.attemptId == persisted.attemptId) {
                 "A different Telegram delivery attempt is already active"
@@ -117,23 +118,24 @@ internal class TelegramDeliveryQueue(
         val persisted = checkNotNull(attempt.persisted) { "Attempt is not persisted" }
         check(inFlight == attempt) { "Telegram prepared attempt is not active" }
         store.discardPreparedTelegramDeliveryAttempt(persisted.attemptId)
+        store.ensureDeliveryDurable()
         inFlight = null
         return pendingDeadline()
     }
 
     @Synchronized
-    fun quarantineConflictingAttempt(attempt: TelegramDeliveryAttempt, diagnostic: String): Long? {
-        val persisted = checkNotNull(attempt.persisted) { "Telegram conflict has no persisted attempt" }
-        check(inFlight == attempt) { "Telegram conflicting attempt is not active" }
-        store.quarantineConflictingTelegramAttempt(persisted, diagnostic)
-        inFlight = null
-        return pendingDeadline()
+    fun reconcileConflictingAttempt(attempt: TelegramDeliveryAttempt, outcome: TelegramHelperOutcome,
+        diagnostic: String): TelegramPersistedDeliveryAttempt {
+        check(inFlight == attempt) { "Telegram reconciliation attempt is not active" }
+        return store.reconcileTelegramDeliveryAttempt(checkNotNull(attempt.persisted), outcome, diagnostic)
+            .also { store.ensureDeliveryDurable() }
     }
 
     @Synchronized
     fun acknowledgePersistedAttempt(attempt: TelegramDeliveryAttempt): Long? {
         val persisted = checkNotNull(attempt.persisted) { "Attempt is not persisted" }
         store.acknowledgeTelegramDeliveryAttempt(persisted.attemptId)
+        store.ensureDeliveryDurable()
         if (inFlight == attempt) inFlight = null
         return pendingDeadline()
     }
@@ -155,6 +157,7 @@ internal class TelegramDeliveryQueue(
         expediteLocal: Boolean = false
     ): TelegramDeliveryAttempt? {
         if (inFlight != null || !deliveryLaneAvailable()) return null
+        restorePersistedAttempt("recovery:$trigger")?.let { return it }
         val config = credentials()
         if (!canDeliver(config)) {
             finishDrain(null)
@@ -201,6 +204,7 @@ internal class TelegramDeliveryQueue(
             botScope = botScope(config.token),
             startedAtMs = now
         )
+        store.ensureDeliveryDurable()
         val attempt = TelegramDeliveryAttempt(
             token = allocateAttemptToken(),
             entry = entry,
@@ -253,6 +257,7 @@ internal class TelegramDeliveryQueue(
         val entry = attempt.entry
         try {
             if (attempt.persisted?.localSettled == true) {
+                store.ensureDeliveryDurable()
                 onDurablySettled()
                 return finishDrain(pendingDeadline())
             }
@@ -261,6 +266,7 @@ internal class TelegramDeliveryQueue(
                 is TelegramSendResult.Success -> {
                     // The owner atomically commits outbox removal, dependency release and semantic receipt.
                     commitDelivery(attempt, entry, result.messageId, confirmedAtMs)
+                    store.ensureDeliveryDurable()
                     attempt.persisted = attempt.persisted?.copy(localSettled = true)
                     onDurablySettled()
                     runCatching {
@@ -293,6 +299,7 @@ internal class TelegramDeliveryQueue(
                         )
                         null
                     }
+                    store.ensureDeliveryDurable()
                     attempt.persisted = attempt.persisted?.copy(localSettled = true)
                     onDurablySettled()
                     runCatching {

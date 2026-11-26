@@ -13,11 +13,12 @@ class TelegramDatabaseHelper(
 
     init {
         // WAL keeps the independent sender readable while its short writes commit.
-        setWriteAheadLoggingEnabled(true)
+        DurableSqlite.configure(this)
     }
 
     override fun onConfigure(db: SQLiteDatabase) {
         db.setForeignKeyConstraintsEnabled(true)
+        DurableSqlite.configureConnection(db)
     }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -97,6 +98,10 @@ class TelegramDatabaseHelper(
         db.execSQL(TelegramDatabaseSql.CREATE_DELIVERY_RECEIPT_INDEX)
         db.execSQL(TelegramDatabaseSql.CREATE_DELIVERY_OWNER_TABLE)
         db.execSQL(TelegramDatabaseSql.CREATE_DELIVERY_ATTEMPT_TABLE)
+        db.execSQL(TelegramDatabaseSql.CREATE_CONFLICT_RECOVERY_TABLE)
+        db.execSQL(TelegramDatabaseSql.CREATE_BUSINESS_RECOVERY_TABLE)
+        db.execSQL(TelegramDatabaseSql.CREATE_PAGE_RECEIPTS_TABLE)
+        db.execSQL(TelegramDatabaseSql.CREATE_COMPLETION_RECEIPTS_TABLE)
         db.execSQL(
             """
             INSERT OR IGNORE INTO telegram_migration_state(id, main_import_complete)
@@ -115,17 +120,32 @@ class TelegramDatabaseHelper(
         }
         if (oldVersion < 5) db.execSQL(TelegramDatabaseSql.MIGRATE_V4_TO_V5)
         onCreate(db)
+        if (oldVersion < 9) {
+            addColumn(db, "telegram_delivery_attempt", "reconciled_outcome", "TEXT")
+            addColumn(db, "telegram_conflicting_delivery", "recovered_at_ms", "INTEGER")
+            addColumn(db, "telegram_conflicting_delivery", "resolution", "TEXT NOT NULL DEFAULT 'pending'")
+            addColumn(db, "telegram_conflicting_delivery", "last_error", "TEXT")
+            addColumn(db, "telegram_conflicting_delivery", "reconciled_outcome", "TEXT")
+            addColumn(db, "telegram_unconfirmed_business_recovery", "before_state_json", "TEXT")
+            addColumn(db, "telegram_unconfirmed_business_recovery", "sources_json", "TEXT")
+            addColumn(db, "telegram_unconfirmed_business_recovery", "messages_json", "TEXT")
+            addColumn(db, "telegram_unconfirmed_business_recovery", "status", "TEXT NOT NULL DEFAULT 'pending'")
+            addColumn(db, "telegram_unconfirmed_business_recovery", "next_attempt_at_ms", "INTEGER NOT NULL DEFAULT 0")
+            addColumn(db, "telegram_unconfirmed_business_recovery", "updated_at_ms", "INTEGER NOT NULL DEFAULT 0")
+            addColumn(db, "telegram_unconfirmed_business_recovery", "last_error", "TEXT")
+            db.execSQL("INSERT OR IGNORE INTO telegram_completion_receipts(sequence, identity, created_at_ms) " +
+                "SELECT sequence, identity, 0 FROM telegram_trip_completion_receipt")
+        }
         if (oldVersion < 3) seedLegacyRateLimitCooldown(db)
     }
 
-    override fun onOpen(db: SQLiteDatabase) {
-        super.onOpen(db)
-        if (!db.isReadOnly) db.execSQL(
-            "CREATE TABLE IF NOT EXISTS telegram_conflicting_delivery (" +
-                "dedupe_key TEXT PRIMARY KEY NOT NULL, attempt_id TEXT NOT NULL, owner_id TEXT NOT NULL, " +
-                "sequence INTEGER NOT NULL, event_type TEXT NOT NULL, payload TEXT, key_json TEXT NOT NULL, " +
-                "diagnostic TEXT NOT NULL, archived_at_ms INTEGER NOT NULL)"
-        )
+    private fun addColumn(db: SQLiteDatabase, table: String, column: String, declaration: String) {
+        val exists = db.rawQuery("PRAGMA table_info($table)", null).use { cursor ->
+            var found = false
+            while (cursor.moveToNext()) if (cursor.getString(1) == column) found = true
+            found
+        }
+        if (!exists) db.execSQL("ALTER TABLE $table ADD COLUMN $column $declaration")
     }
 
     override fun onDowngrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -136,7 +156,7 @@ class TelegramDatabaseHelper(
 
     companion object {
         const val DATABASE_NAME = "bydcollector_telegram.db"
-        const val DATABASE_VERSION = 8
+        const val DATABASE_VERSION = 9
         const val MAX_PENDING = 1_000L
         const val RETENTION_MS = 30L * 24L * 60L * 60L * 1_000L
         const val LEGACY_UNCLAIMED_BOT_SCOPE = "__legacy_unclaimed__"

@@ -224,12 +224,14 @@ public final class CollectorHelperDaemon {
                 if (code == CollectorHelperProtocol.TX_TELEGRAM_SUBMIT ||
                     code == CollectorHelperProtocol.TX_TELEGRAM_QUERY ||
                     code == CollectorHelperProtocol.TX_TELEGRAM_ACK ||
-                    code == CollectorHelperProtocol.TX_TELEGRAM_RECOVER) {
+                    code == CollectorHelperProtocol.TX_TELEGRAM_RECOVER ||
+                    code == CollectorHelperProtocol.TX_TELEGRAM_RECONCILE) {
                     if (reply == null) return false;
                     String operation = code == CollectorHelperProtocol.TX_TELEGRAM_SUBMIT
                         ? "telegram_submit"
                         : code == CollectorHelperProtocol.TX_TELEGRAM_QUERY ? "telegram_query"
-                        : code == CollectorHelperProtocol.TX_TELEGRAM_ACK ? "telegram_ack" : "telegram_recover";
+                        : code == CollectorHelperProtocol.TX_TELEGRAM_ACK ? "telegram_ack"
+                        : code == CollectorHelperProtocol.TX_TELEGRAM_RECOVER ? "telegram_recover" : "telegram_reconcile";
                     TelegramSendMessage request = null;
                     try {
                         if ((flags & IBinder.FLAG_ONEWAY) != 0) {
@@ -249,7 +251,8 @@ public final class CollectorHelperDaemon {
                             outcome = code == CollectorHelperProtocol.TX_TELEGRAM_QUERY
                                 ? telegramLane.telegramQuery(key)
                                 : code == CollectorHelperProtocol.TX_TELEGRAM_ACK ? telegramLane.telegramAck(key)
-                                : telegramLane.telegramRecover(key);
+                                : code == CollectorHelperProtocol.TX_TELEGRAM_RECOVER ? telegramLane.telegramRecover(key)
+                                : telegramLane.telegramReconcile(key);
                         }
                         TelegramHelperProtocol.INSTANCE.writeSuccessReply(reply, outcome);
                         return true;
@@ -1213,7 +1216,8 @@ public final class CollectorHelperDaemon {
     private static boolean isTelegramDrainTransaction(int code) {
         return code == CollectorHelperProtocol.TX_TELEGRAM_QUERY ||
             code == CollectorHelperProtocol.TX_TELEGRAM_ACK ||
-            code == CollectorHelperProtocol.TX_TELEGRAM_RECOVER;
+            code == CollectorHelperProtocol.TX_TELEGRAM_RECOVER ||
+            code == CollectorHelperProtocol.TX_TELEGRAM_RECONCILE;
     }
 
     private static void prepareMainLooper() {

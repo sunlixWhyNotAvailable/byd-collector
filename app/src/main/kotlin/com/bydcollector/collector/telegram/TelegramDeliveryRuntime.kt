@@ -8,8 +8,8 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 
-internal class TelegramDeliveryConflictQuarantined(cause: TelegramHelperRemoteFailure) :
-    RuntimeException("Telegram delivery key conflict quarantined; original helper ledger retained", cause)
+internal class TelegramDeliveryConflictReconciled(cause: Exception) :
+    RuntimeException("Telegram delivery key conflict reconciled; original helper ledger retained", cause)
 
 /** Process-owned bridge between ordered Telegram state and the durable helper HTTP lane. */
 class TelegramDeliveryRuntime(
@@ -32,7 +32,7 @@ class TelegramDeliveryRuntime(
     private var restoreAttempt: (() -> TelegramDeliveryAttempt?)? = null
     private var preparedAttemptAction: ((TelegramDeliveryAttempt) -> TelegramPreparedAttemptAction)? = null
     private var discardPreparedAttempt: ((TelegramDeliveryAttempt) -> Long?)? = null
-    private var quarantineConflictingAttempt: ((TelegramDeliveryAttempt, String) -> Long?)? = null
+    private var reconcileConflictingAttempt: ((TelegramDeliveryAttempt, TelegramHelperOutcome, String) -> TelegramPersistedDeliveryAttempt)? = null
     private var acknowledgeAttempt: ((TelegramDeliveryAttempt) -> Long?)? = null
     private var activeAttempt: TelegramDeliveryAttempt? = null
     private var pendingResult: TelegramPendingResult? = null
@@ -65,7 +65,7 @@ class TelegramDeliveryRuntime(
         restoreAttempt: () -> TelegramDeliveryAttempt?,
         preparedAttemptAction: (TelegramDeliveryAttempt) -> TelegramPreparedAttemptAction,
         discardPreparedAttempt: (TelegramDeliveryAttempt) -> Long?,
-        quarantineConflictingAttempt: (TelegramDeliveryAttempt, String) -> Long?,
+        reconcileConflictingAttempt: (TelegramDeliveryAttempt, TelegramHelperOutcome, String) -> TelegramPersistedDeliveryAttempt,
         acknowledgeAttempt: (TelegramDeliveryAttempt) -> Long?
     ) {
         synchronized(lock) {
@@ -77,7 +77,7 @@ class TelegramDeliveryRuntime(
             this.restoreAttempt = restoreAttempt
             this.preparedAttemptAction = preparedAttemptAction
             this.discardPreparedAttempt = discardPreparedAttempt
-            this.quarantineConflictingAttempt = quarantineConflictingAttempt
+            this.reconcileConflictingAttempt = reconcileConflictingAttempt
             this.acknowledgeAttempt = acknowledgeAttempt
             restorePending = activeAttempt == null
             lock.notifyAll()
@@ -96,7 +96,7 @@ class TelegramDeliveryRuntime(
             restoreAttempt = null
             preparedAttemptAction = null
             discardPreparedAttempt = null
-            quarantineConflictingAttempt = null
+            reconcileConflictingAttempt = null
             acknowledgeAttempt = null
             if (activeAttempt == null) restorePending = true
             lock.notifyAll()
@@ -320,7 +320,19 @@ class TelegramDeliveryRuntime(
 
     private fun submitHelper(attempt: TelegramDeliveryAttempt) = runHelperCall(attempt, submit = true)
 
-    private fun queryHelper(attempt: TelegramDeliveryAttempt) = runHelperCall(attempt, submit = false)
+    private fun queryHelper(attempt: TelegramDeliveryAttempt) {
+        val recovered = attempt.persisted?.reconciledOutcome
+        if (recovered == null) {
+            runHelperCall(attempt, submit = false)
+            return
+        }
+        if (attempt.persisted?.localSettled == true) {
+            deliveryReady(acknowledgeHelperAndApp(attempt, helperAlreadyAcked = false))
+            return
+        }
+        val (result, at) = reconciledTelegramResult(helperKey(checkNotNull(attempt.persisted)), recovered, nowMs())
+        receiveResult(attempt, result, at)
+    }
 
     private fun runHelperCall(attempt: TelegramDeliveryAttempt, submit: Boolean, recover: Boolean = false) {
         val persisted = checkNotNull(attempt.persisted) { "Telegram helper call has no persisted attempt" }
@@ -352,7 +364,7 @@ class TelegramDeliveryRuntime(
                     try {
                         executor.execute {
                             synchronized(lock) { helperCallInFlight = false }
-                            if (!quarantinePersistedKeyConflict(attempt, error)) {
+                            if (!reconcilePersistedKeyConflict(attempt, error)) {
                                 notifyFailure(error)
                                 deliveryReady(nowMs() + HELPER_RETRY_MS)
                             }
@@ -368,20 +380,47 @@ class TelegramDeliveryRuntime(
         }
     }
 
-    private fun quarantinePersistedKeyConflict(attempt: TelegramDeliveryAttempt, error: Exception): Boolean {
+    private fun reconcilePersistedKeyConflict(attempt: TelegramDeliveryAttempt, error: Exception): Boolean {
         if (error !is TelegramHelperRemoteFailure || !error.isPersistedQueryKeyConflict()) return false
+        return reconcileAttempt(attempt, error)
+    }
+
+    private fun reconcileAttempt(attempt: TelegramDeliveryAttempt, error: Exception): Boolean {
         val handler = synchronized(lock) {
-            if (activeAttempt == attempt && pendingResult == null && !quiesced) quarantineConflictingAttempt else null
+            if (activeAttempt == attempt && pendingResult == null && !quiesced) reconcileConflictingAttempt else null
         } ?: return false
-        val deadline = try {
-            handler(attempt, error.diagnostic)
-        } catch (repair: Exception) {
-            error.addSuppressed(repair)
+        synchronized(lock) { helperCallInFlight = true }
+        try { httpExecutor.execute {
+            try {
+                val outcome = helper.reconcileTelegram(helperKey(checkNotNull(attempt.persisted)))
+                executor.execute apply@{
+                    synchronized(lock) { helperCallInFlight = false }
+                    if (synchronized(lock) { activeAttempt != attempt }) return@apply
+                    if (!outcome.ownerRetired) {
+                        notifyFailure(error)
+                        deliveryReady(nowMs() + HELPER_RETRY_MS)
+                    } else try {
+                        attempt.persisted = handler(attempt, outcome, error.stackTraceToString())
+                        notifyFailure(TelegramDeliveryConflictReconciled(error))
+                        queryHelper(attempt)
+                    } catch (repair: Exception) {
+                        error.addSuppressed(repair)
+                        notifyFailure(error)
+                        deliveryReady(nowMs() + HELPER_RETRY_MS)
+                    }
+                }
+            } catch (repair: Exception) {
+                if (repair is InterruptedException) Thread.currentThread().interrupt()
+                synchronized(lock) { helperCallInFlight = false }
+                error.addSuppressed(repair)
+                notifyFailure(error)
+                deliveryReady(nowMs() + HELPER_RETRY_MS)
+            }
+        } } catch (rejected: RejectedExecutionException) {
+            synchronized(lock) { helperCallInFlight = false }
+            error.addSuppressed(rejected)
             return false
         }
-        clearAttempt(attempt)
-        notifyFailure(TelegramDeliveryConflictQuarantined(error))
-        deliveryReady(deadline)
         return true
     }
 
@@ -393,6 +432,13 @@ class TelegramDeliveryRuntime(
         check(Thread.currentThread().name == OWNER_THREAD_NAME) { "Telegram helper result must be applied by its owner" }
         if (synchronized(lock) { activeAttempt != attempt }) return
         try {
+            if (outcome.ownerRetired) {
+                val handler = synchronized(lock) { reconcileConflictingAttempt }
+                    ?: error("Telegram reconciliation owner is detached")
+                attempt.persisted = handler(attempt, outcome, outcome.diagnostic ?: "Retained helper owner retirement")
+                queryHelper(attempt)
+                return
+            }
             when (outcome.state) {
                 TelegramHelperState.RUNNING -> deliveryReady(nowMs() + HELPER_POLL_MS)
                 TelegramHelperState.RESULT -> {
@@ -400,8 +446,10 @@ class TelegramDeliveryRuntime(
                     receiveResult(attempt, result, checkNotNull(outcome.confirmedAtMs))
                 }
                 TelegramHelperState.ACKED -> {
-                    check(attempt.persisted?.localSettled == true) {
-                        "Telegram helper ACKED before APP local settlement; attempt retained"
+                    if (attempt.persisted?.localSettled != true) {
+                        val error = IllegalStateException("Telegram helper ACKED before APP local settlement")
+                        if (!reconcileAttempt(attempt, error)) throw error
+                        return
                     }
                     deliveryReady(acknowledgeHelperAndApp(attempt, helperAlreadyAcked = true))
                 }
@@ -541,7 +589,7 @@ class TelegramDeliveryRuntime(
     }
 
     private fun acknowledgeHelperAndApp(attempt: TelegramDeliveryAttempt, helperAlreadyAcked: Boolean): Long? {
-        if (!helperAlreadyAcked) {
+        if (!helperAlreadyAcked && attempt.persisted?.reconciledOutcome?.ownerRetired != true) {
             val persisted = checkNotNull(attempt.persisted) { "Telegram ACK has no persisted attempt" }
             val ack = helper.acknowledgeTelegram(helperKey(persisted))
             check(ack.state == TelegramHelperState.ACKED) {
