@@ -68,7 +68,14 @@ class TelegramHelperRemoteFailure(
     val exceptionType: String,
     val diagnostic: String,
     cause: Throwable? = null
-) : RuntimeException("$operation failed in helper ($exceptionType)\n$diagnostic", cause)
+) : RuntimeException("$operation failed in helper ($exceptionType)\n$diagnostic", cause) {
+    /** v20 helpers report this precise conflict through the existing failure envelope. */
+    internal fun isPersistedQueryKeyConflict(): Boolean =
+        operation == "telegram_query" && exceptionType == IllegalArgumentException::class.java.name &&
+            diagnostic.lineSequence().any {
+                it == "java.lang.IllegalArgumentException: Telegram key conflicts with the persisted attempt at this sequence"
+            }
+}
 
 object TelegramHelperProtocol {
     const val TX_SUBMIT = 23

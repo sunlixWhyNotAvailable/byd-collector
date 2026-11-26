@@ -8,6 +8,9 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 
+internal class TelegramDeliveryConflictQuarantined(cause: TelegramHelperRemoteFailure) :
+    RuntimeException("Telegram delivery key conflict quarantined; original helper ledger retained", cause)
+
 /** Process-owned bridge between ordered Telegram state and the durable helper HTTP lane. */
 class TelegramDeliveryRuntime(
     private val send: (TelegramSendMessage) -> TelegramSendResult = TelegramHttpClient()::sendMessage,
@@ -29,6 +32,7 @@ class TelegramDeliveryRuntime(
     private var restoreAttempt: (() -> TelegramDeliveryAttempt?)? = null
     private var preparedAttemptAction: ((TelegramDeliveryAttempt) -> TelegramPreparedAttemptAction)? = null
     private var discardPreparedAttempt: ((TelegramDeliveryAttempt) -> Long?)? = null
+    private var quarantineConflictingAttempt: ((TelegramDeliveryAttempt, String) -> Long?)? = null
     private var acknowledgeAttempt: ((TelegramDeliveryAttempt) -> Long?)? = null
     private var activeAttempt: TelegramDeliveryAttempt? = null
     private var pendingResult: TelegramPendingResult? = null
@@ -61,6 +65,7 @@ class TelegramDeliveryRuntime(
         restoreAttempt: () -> TelegramDeliveryAttempt?,
         preparedAttemptAction: (TelegramDeliveryAttempt) -> TelegramPreparedAttemptAction,
         discardPreparedAttempt: (TelegramDeliveryAttempt) -> Long?,
+        quarantineConflictingAttempt: (TelegramDeliveryAttempt, String) -> Long?,
         acknowledgeAttempt: (TelegramDeliveryAttempt) -> Long?
     ) {
         synchronized(lock) {
@@ -72,6 +77,7 @@ class TelegramDeliveryRuntime(
             this.restoreAttempt = restoreAttempt
             this.preparedAttemptAction = preparedAttemptAction
             this.discardPreparedAttempt = discardPreparedAttempt
+            this.quarantineConflictingAttempt = quarantineConflictingAttempt
             this.acknowledgeAttempt = acknowledgeAttempt
             restorePending = activeAttempt == null
             lock.notifyAll()
@@ -90,6 +96,7 @@ class TelegramDeliveryRuntime(
             restoreAttempt = null
             preparedAttemptAction = null
             discardPreparedAttempt = null
+            quarantineConflictingAttempt = null
             acknowledgeAttempt = null
             if (activeAttempt == null) restorePending = true
             lock.notifyAll()
@@ -345,8 +352,10 @@ class TelegramDeliveryRuntime(
                     try {
                         executor.execute {
                             synchronized(lock) { helperCallInFlight = false }
-                            notifyFailure(error)
-                            deliveryReady(nowMs() + HELPER_RETRY_MS)
+                            if (!quarantinePersistedKeyConflict(attempt, error)) {
+                                notifyFailure(error)
+                                deliveryReady(nowMs() + HELPER_RETRY_MS)
+                            }
                         }
                     } catch (rejected: RejectedExecutionException) {
                         notifyFailure(error)
@@ -357,6 +366,23 @@ class TelegramDeliveryRuntime(
             synchronized(lock) { helperCallInFlight = false }
             notifyFailure(error)
         }
+    }
+
+    private fun quarantinePersistedKeyConflict(attempt: TelegramDeliveryAttempt, error: Exception): Boolean {
+        if (error !is TelegramHelperRemoteFailure || !error.isPersistedQueryKeyConflict()) return false
+        val handler = synchronized(lock) {
+            if (activeAttempt == attempt && pendingResult == null && !quiesced) quarantineConflictingAttempt else null
+        } ?: return false
+        val deadline = try {
+            handler(attempt, error.diagnostic)
+        } catch (repair: Exception) {
+            error.addSuppressed(repair)
+            return false
+        }
+        clearAttempt(attempt)
+        notifyFailure(TelegramDeliveryConflictQuarantined(error))
+        deliveryReady(deadline)
+        return true
     }
 
     private fun handleHelperOutcome(

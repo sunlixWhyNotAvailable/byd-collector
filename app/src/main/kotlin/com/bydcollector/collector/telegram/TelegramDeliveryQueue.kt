@@ -122,6 +122,15 @@ internal class TelegramDeliveryQueue(
     }
 
     @Synchronized
+    fun quarantineConflictingAttempt(attempt: TelegramDeliveryAttempt, diagnostic: String): Long? {
+        val persisted = checkNotNull(attempt.persisted) { "Telegram conflict has no persisted attempt" }
+        check(inFlight == attempt) { "Telegram conflicting attempt is not active" }
+        store.quarantineConflictingTelegramAttempt(persisted, diagnostic)
+        inFlight = null
+        return pendingDeadline()
+    }
+
+    @Synchronized
     fun acknowledgePersistedAttempt(attempt: TelegramDeliveryAttempt): Long? {
         val persisted = checkNotNull(attempt.persisted) { "Attempt is not persisted" }
         store.acknowledgeTelegramDeliveryAttempt(persisted.attemptId)

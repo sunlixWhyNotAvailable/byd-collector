@@ -501,6 +501,9 @@ class TelegramCoordinator internal constructor(
         if (settings.isUserShutdownRequested()) TelegramPreparedAttemptAction.WAIT
         else delivery.preparedAttemptAction(attempt)
 
+    internal fun quarantineConflictingAttempt(attempt: TelegramDeliveryAttempt, diagnostic: String): Long? =
+        delivery.quarantineConflictingAttempt(attempt, diagnostic)
+
     internal fun discardPreparedAttempt(attempt: TelegramDeliveryAttempt): Long? =
         delivery.discardPreparedAttempt(attempt)
 

@@ -25,6 +25,53 @@ import kotlin.test.*
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
 class BusinessPageRecoveryTest {
+    @Test fun completedPageWithoutTelegramReceiptIsArchivedBeforeConsumingExactTripsHandoff() {
+        val context = RuntimeEnvironment.getApplication()
+        val tripsName = "unconfirmed-page-trips.db"
+        val telegramName = "unconfirmed-page-telegram.db"
+        val old = TripCompletionIntent(1, "old", "2026-11-25T10:00:00Z")
+        val newer = TripCompletionIntent(2, "newer", "2026-11-25T11:00:00Z")
+        val page = BusinessPage("generation", "boot", listOf(
+            BusinessPageEntry(5, "input", null, false, TripBusinessResult(
+                consumed = true, priorCompletionWatermark = 0, completionWatermark = 1,
+                powerSessionId = null, confirmedPowerOn = false, closedPowerSession = true))
+        ))
+        try {
+            TripStore(TripDatabaseHelper(context, tripsName)).use { trips ->
+                trips.replaceCompletionState(2, listOf(old, newer))
+                trips.replaceBusinessPage(page)
+            }
+            TelegramStore(context, TelegramDatabaseHelper(context, telegramName)).use {
+                it.archiveUnconfirmedBusinessPage(page, listOf(old))
+            }
+            TripStore(TripDatabaseHelper(context, tripsName)).use { trips ->
+                assertFailsWith<IllegalStateException> { trips.acknowledgeBusinessPage("wrong", listOf(old)) }
+                assertEquals(listOf(old, newer), trips.allPendingCompletions())
+                assertEquals(page, trips.pendingBusinessPage())
+                TelegramStore(context, TelegramDatabaseHelper(context, telegramName)).use { telegram ->
+                    telegram.archiveUnconfirmedBusinessPage(page, listOf(old))
+                    assertFalse(telegram.hasBusinessPageReceipt(page.key))
+                    assertEquals(0L, telegram.diagnosticSnapshot().outboxTotal)
+                }
+                trips.acknowledgeBusinessPage(page.key, listOf(old))
+                assertNull(trips.pendingBusinessPage())
+                assertEquals(listOf(newer), trips.allPendingCompletions())
+            }
+            context.openOrCreateDatabase(telegramName, 0, null).use { db ->
+                db.rawQuery("SELECT page_payload, completions_json FROM telegram_unconfirmed_business_recovery", null)
+                    .use { cursor ->
+                        assertTrue(cursor.moveToFirst())
+                        assertEquals(page, BusinessPage.decode(cursor.getString(0)))
+                        val archived = org.json.JSONArray(cursor.getString(1))
+                        assertEquals(1, archived.length())
+                        assertEquals(old, TripCompletionIntentCodec.decode(archived.getJSONObject(0).toString()))
+                    }
+            }
+        } finally {
+            context.deleteDatabase(tripsName)
+            context.deleteDatabase(telegramName)
+        }
+    }
     @Test fun expiredFinalCountersRemainUnknownInStoredStationaryCompletion() {
         val context = RuntimeEnvironment.getApplication()
         val name = "missing_endpoint.db"

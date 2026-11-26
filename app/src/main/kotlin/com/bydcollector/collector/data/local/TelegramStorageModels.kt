@@ -66,6 +66,8 @@ public interface TelegramDeliveryStore {
 
     fun discardPreparedTelegramDeliveryAttempt(attemptId: String): Boolean
 
+    fun quarantineConflictingTelegramAttempt(attempt: TelegramPersistedDeliveryAttempt, diagnostic: String)
+
     fun protectedTelegramOutboxIds(): Set<Long>
 }
 

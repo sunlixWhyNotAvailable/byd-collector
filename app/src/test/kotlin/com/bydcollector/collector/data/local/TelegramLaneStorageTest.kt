@@ -31,6 +31,78 @@ import kotlin.test.assertTrue
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], application = Application::class)
 class TelegramLaneStorageTest {
+    @Test fun sameSequenceConflictQuarantinesOnlyThatReportAndStartsNewOwnerWithoutSending() {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "tg_conflict_" + System.nanoTime() + ".db"
+        val directory = File(context.cacheDir, name + ".ledger")
+        val message = TelegramOutboxMessage("old-summary", "trip_summary", "kept payload")
+        val next = TelegramOutboxMessage("new-summary", "trip_summary", "next payload")
+        val at = 1_000L
+        fun openStore() = TelegramStore(context, TelegramDatabaseHelper(context, name), { at })
+        fun TelegramStore.prepare(message: TelegramOutboxMessage) = prepareTelegramDeliveryAttempt(
+            assertNotNull(telegramMessageByDedupeKey(message.dedupeKey)),
+            sha("request:" + message.payload), sha("destination"), sha(message.dedupeKey), sha("bot"), at
+        )
+        fun key(a: TelegramPersistedDeliveryAttempt) = TelegramHelperAttemptKey(UUID.fromString(a.ownerId),
+            UUID.fromString(a.attemptId), a.sequence, a.requestDigest, a.destinationDigest, a.dedupeRef)
+        val lane = HelperTelegramLane(directory)
+        try {
+            val attempt = openStore().use { store ->
+                val earlier = TelegramOutboxMessage("completed-earlier", "trip_summary", "earlier")
+                store.commitTelegramEvents(listOf(earlier, message, next), null, at)
+                val completed = store.prepare(earlier)
+                store.settleTelegramDeliverySuccess(completed.attemptId,
+                    TelegramDeliveryReceipt(earlier.dedupeKey, earlier.eventType, at, 42L), null)
+                store.acknowledgeTelegramDeliveryAttempt(completed.attemptId)
+                store.prepare(message)
+            }
+            val persistedKey = key(attempt).copy(attemptId = UUID.randomUUID())
+            assertEquals(2L, persistedKey.sequence)
+            assertEquals(TelegramHelperAmbiguity.LEDGER_RECOVERED, lane.telegramRecover(persistedKey).ambiguity)
+            val original = assertFailsWith<IllegalArgumentException> { lane.telegramQuery(key(attempt)) }
+            val parcel = Parcel.obtain()
+            val conflict = try {
+                TelegramHelperProtocol.writeFailureReply(parcel, "telegram_query", original, null)
+                parcel.setDataPosition(0)
+                assertFailsWith<TelegramHelperRemoteFailure> { TelegramHelperProtocol.readReply(parcel) }
+            } finally { parcel.recycle() }
+            assertTrue(conflict.isPersistedQueryKeyConflict())
+            assertFalse(TelegramHelperRemoteFailure("telegram_submit", conflict.exceptionType, conflict.diagnostic)
+                .isPersistedQueryKeyConflict())
+            openStore().use { store ->
+                assertFailsWith<IllegalStateException> {
+                    store.quarantineConflictingTelegramAttempt(attempt.copy(outboxId = -1), conflict.diagnostic)
+                }
+                assertEquals(attempt, store.activeTelegramDeliveryAttempt())
+                store.quarantineConflictingTelegramAttempt(attempt, conflict.diagnostic)
+            }
+            openStore().use { store ->
+                assertNull(store.activeTelegramDeliveryAttempt())
+                store.unblockTelegramMessages(at)
+                assertTrue(assertNotNull(store.telegramMessageByDedupeKey(message.dedupeKey)).blocked)
+                assertNull(store.telegramDeliveryReceipt(message.dedupeKey))
+                assertEquals(42L, assertNotNull(store.telegramDeliveryReceipt("completed-earlier")).telegramMessageId)
+                assertFalse(store.commitTelegramEvents(listOf(message), null, at).single().inserted)
+                assertEquals(next.dedupeKey, store.oldestDueTelegramMessage(at)?.dedupeKey)
+                val following = store.prepare(next)
+                assertTrue(following.ownerId != attempt.ownerId)
+                assertEquals(1L, following.sequence)
+                assertEquals(TelegramHelperState.ABSENT, lane.telegramQuery(key(following)).state)
+                assertEquals(TelegramHelperAmbiguity.LEDGER_RECOVERED, lane.telegramQuery(persistedKey).ambiguity)
+            }
+            context.openOrCreateDatabase(name, 0, null).use { db ->
+                db.rawQuery("SELECT payload, diagnostic FROM telegram_conflicting_delivery", null).use {
+                    assertTrue(it.moveToFirst())
+                    assertEquals(message.payload, it.getString(0))
+                    assertEquals(conflict.diagnostic, it.getString(1))
+                }
+            }
+        } finally {
+            lane.closeAfterDrain()
+            directory.deleteRecursively()
+            context.deleteDatabase(name)
+        }
+    }
     @Test fun damagedTimingRetainsIndependentStateOutboxAndOriginalEvidenceAcrossReopen() {
         val context = RuntimeEnvironment.getApplication()
         val name = "tg_state_recovery_${System.nanoTime()}.db"

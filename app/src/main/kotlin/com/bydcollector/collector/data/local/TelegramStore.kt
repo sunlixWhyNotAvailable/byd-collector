@@ -3,6 +3,9 @@ package com.bydcollector.collector.data.local
 import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
+import com.bydcollector.collector.data.input.BusinessPage
+import com.bydcollector.collector.data.trips.TripCompletionIntent
+import com.bydcollector.collector.data.trips.TripCompletionIntentCodec
 import com.bydcollector.collector.diagnostics.diagnosticSha256
 import com.bydcollector.collector.service.TelegramEventState
 import com.bydcollector.collector.service.pendingTripEnergyEvidence
@@ -138,6 +141,33 @@ class TelegramStore(
     fun hasTripCompletionReceipt(sequence: Long, identity: String): Boolean =
         hasTripCompletionReceipt(helper.readableDatabase, sequence, identity)
 
+    internal fun archiveUnconfirmedBusinessPage(page: BusinessPage, completions: List<TripCompletionIntent>) {
+        val db = helper.writableDatabase
+        db.beginTransactionNonExclusive()
+        try {
+            db.execSQL("CREATE TABLE IF NOT EXISTS telegram_unconfirmed_business_recovery " +
+                "(page_key TEXT PRIMARY KEY, page_payload TEXT NOT NULL, completions_json TEXT NOT NULL)")
+            val payload = page.encode()
+            val intents = JSONArray().apply {
+                completions.forEach { put(JSONObject(TripCompletionIntentCodec.encode(it))) }
+            }.toString()
+            db.insertWithOnConflict("telegram_unconfirmed_business_recovery", null, ContentValues().apply {
+                put("page_key", page.key)
+                put("page_payload", payload)
+                put("completions_json", intents)
+            }, SQLiteDatabase.CONFLICT_IGNORE)
+            db.rawQuery("SELECT page_payload, completions_json FROM telegram_unconfirmed_business_recovery WHERE page_key=?",
+                arrayOf(page.key)).use {
+                check(it.moveToFirst() && it.getString(0) == payload && it.getString(1) == intents) {
+                    "Unconfirmed Telegram business-page archive differs from the pending handoff"
+                }
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
     internal fun hasBusinessPageReceipt(key: String): Boolean = helper.readableDatabase.rawQuery(
         "SELECT page_key FROM telegram_business_page_receipt WHERE singleton=1", null
     ).use { it.moveToFirst() && it.getString(0) == key }
@@ -173,6 +203,13 @@ class TelegramStore(
         require(message.dedupeKey.isNotBlank()) { "Telegram dedupe key must not be blank" }
         require(message.eventType.isNotBlank()) { "Telegram event type must not be blank" }
         require(message.payload.isNotBlank()) { "Telegram payload must not be blank" }
+        db.rawQuery("SELECT event_type FROM telegram_conflicting_delivery WHERE dedupe_key=?",
+            arrayOf(message.dedupeKey)).use {
+            if (it.moveToFirst()) {
+                check(it.getString(0) == message.eventType) { "Quarantined Telegram dedupe key changed event type" }
+                return TelegramEnqueueResult(inserted = false, expiredCount = 0, overflowCount = 0)
+            }
+        }
         pruneDeliveryReceipts(db, nowMs)
         telegramDeliveryReceipt(db, message.dedupeKey)?.let { receipt ->
             check(receipt.eventType == message.eventType) {
@@ -485,6 +522,58 @@ class TelegramStore(
             }
             db.setTransactionSuccessful()
             return true
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    override fun quarantineConflictingTelegramAttempt(attempt: TelegramPersistedDeliveryAttempt, diagnostic: String) {
+        val db = helper.writableDatabase
+        db.beginTransactionNonExclusive()
+        try {
+            check(readActiveTelegramDeliveryAttempt(db) == attempt) { "Telegram conflict no longer matches the active attempt" }
+            val entry = db.rawQuery("SELECT dedupe_key, event_type, payload FROM telegram_outbox WHERE id=?",
+                arrayOf(attempt.outboxId.toString())).use {
+                if (it.moveToFirst()) {
+                    check(it.getString(0) == attempt.dedupeKey && it.getString(1) == attempt.eventType) {
+                        "Telegram conflict outbox identity changed"
+                    }
+                    it.getString(2)
+                } else null
+            }
+            check(entry != null || attempt.localSettled) { "Telegram conflict outbox row is missing" }
+            db.insertOrThrow("telegram_conflicting_delivery", null, ContentValues().apply {
+                put("dedupe_key", attempt.dedupeKey)
+                put("attempt_id", attempt.attemptId)
+                put("owner_id", attempt.ownerId)
+                put("sequence", attempt.sequence)
+                put("event_type", attempt.eventType)
+                put("payload", entry)
+                put("key_json", JSONObject().put("outbox_id", attempt.outboxId)
+                    .put("request_digest", attempt.requestDigest).put("destination_digest", attempt.destinationDigest)
+                    .put("dedupe_ref", attempt.dedupeRef).put("bot_scope", attempt.botScope)
+                    .put("started_at_ms", attempt.startedAtMs).put("local_settled", attempt.localSettled).toString())
+                put("diagnostic", diagnostic)
+                put("archived_at_ms", clockMs())
+            })
+            if (entry != null) check(db.update("telegram_outbox", ContentValues().apply {
+                put("blocked", 1)
+                put("last_error", "helper_key_conflict_quarantined")
+            }, "id=? AND dedupe_key=?", arrayOf(attempt.outboxId.toString(), attempt.dedupeKey)) == 1) {
+                "Telegram conflict outbox row disappeared during quarantine"
+            }
+            check(db.delete("telegram_delivery_attempt", "id=1 AND attempt_id=?", arrayOf(attempt.attemptId)) == 1) {
+                "Telegram conflict attempt disappeared during quarantine"
+            }
+            // Keep the helper's old ledger intact. A different owner starts at sequence 1
+            // without reusing the conflicting key, acknowledging it, or retrying its outbox row.
+            check(db.update("telegram_delivery_owner", ContentValues().apply {
+                put("owner_id", UUID.randomUUID().toString())
+                put("last_sequence", 0L)
+            }, "id=1 AND owner_id=? AND last_sequence=?", arrayOf(attempt.ownerId, attempt.sequence.toString())) == 1) {
+                "Telegram delivery owner changed during conflict quarantine"
+            }
+            db.setTransactionSuccessful()
         } finally {
             db.endTransaction()
         }
@@ -807,7 +896,9 @@ class TelegramStore(
             UPDATE telegram_outbox
             SET blocked = 0,
                 next_attempt_at_ms = MAX(next_attempt_at_ms, ?)
-            WHERE blocked = 1
+            WHERE blocked = 1 AND NOT EXISTS (
+                SELECT 1 FROM telegram_conflicting_delivery q WHERE q.dedupe_key = telegram_outbox.dedupe_key
+            )
             """.trimIndent(),
             arrayOf(nowMs)
         )

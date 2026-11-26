@@ -132,6 +132,7 @@ import com.bydcollector.collector.mqtt.MqttPublishCoordinator
 import com.bydcollector.collector.mqtt.PahoMqttClientFacade
 import com.bydcollector.collector.system.CollectorAutoStart
 import com.bydcollector.collector.telegram.TelegramCoordinator
+import com.bydcollector.collector.telegram.TelegramDeliveryConflictQuarantined
 import com.bydcollector.collector.telegram.TelegramSendResult
 import java.time.Instant
 import com.bydcollector.collector.ui.DashboardDebugPollState
@@ -220,7 +221,6 @@ class CollectorService : Service() {
     private val mainPollFailure = java.util.concurrent.atomic.AtomicReference<PollCycleResult?>(null)
     private val lastMainCallbackCommitWallMs = AtomicLong(0L)
     @Volatile private var mainNormalizationFault: String? = null
-    @Volatile private var mainBusinessFault: String? = null
     private val businessDrainLock = Any()
     private val pendingMainSourceLoss = java.util.concurrent.ConcurrentLinkedQueue<DirectCallbackSourceLoss>()
     private val observedCallbackLoss = arrayOfNulls<String>(2)
@@ -654,15 +654,9 @@ class CollectorService : Service() {
         )
         businessWorker = CallbackNormalizationWorker(
             threadName = "byd-business-inputs",
-            drainPage = { drainBusinessPage().also { mainBusinessFault = null } },
+            drainPage = ::drainBusinessPage,
             requiresRepair = CallbackNormalizationWorker::isPersistentSqliteFault,
-            onFault = { error ->
-                mainBusinessFault = error.diagnosticDetail("Main business input")
-                val pending = if (CallbackNormalizationWorker.isPersistentSqliteFault(error))
-                    "Business input remains pending; schema/constraint repair and worker restart required"
-                    else "Business input remains pending"
-                store.recordEvent("business_input_error", pending, error.diagnosticDetail())
-            }
+            onFault = ::recordBusinessInputFault
         )
         poller = createTelemetryPoller()
         maintenanceCoordinator = DbMaintenanceCoordinator(
@@ -1401,10 +1395,11 @@ class CollectorService : Service() {
         if (pendingPage != null) {
             check(pendingPage.generation == generation) { "Unfinished business page belongs to another Main generation" }
             if (application.withDatabaseRead { selectedStore.completedBusinessInputId() } >= pendingPage.entries.last().inputId) {
-                check(checkNotNull(telegramCoordinator).hasBusinessPageReceipt(pendingPage.key)) {
-                    "Main business page committed without Telegram receipt"
+                if (checkNotNull(telegramCoordinator).hasBusinessPageReceipt(pendingPage.key)) {
+                    acknowledgeBusinessPage(pendingPage)
+                } else {
+                    recoverCommittedBusinessPage(pendingPage)
                 }
-                acknowledgeBusinessPage(pendingPage)
                 return@synchronized true
             }
         }
@@ -1751,6 +1746,24 @@ class CollectorService : Service() {
         }
         buffered.commitTo(trips)
         return BusinessPage(generation, mergeBoot, entries)
+    }
+
+    private fun recoverCommittedBusinessPage(page: BusinessPage) {
+        val application = applicationContext as BydCollectorApplication
+        val trips = BydCollectorApplication.trips(applicationContext)
+        val telegram = checkNotNull(application.telegramStoreOrNull())
+        val watermark = page.entries.maxOf { it.trip?.completionWatermark ?: 0L }
+        val uncertain = trips.allPendingCompletions().filter { it.sequence <= watermark }
+        // Main and Trips already committed. Preserve the handoff first, without
+        // fabricating a detector receipt or resending any uncertain report.
+        telegram.archiveUnconfirmedBusinessPage(page, uncertain)
+        trips.acknowledgeBusinessPage(page.key, uncertain)
+        store.recordEvent(
+            "business_page_recovery",
+            "Main business page committed without Telegram receipt",
+            "action=archived_unconfirmed_handoff first_input_id=${page.entries.first().inputId} " +
+                "last_input_id=${page.entries.last().inputId} quarantined_completions=${uncertain.size}"
+        )
     }
 
     private fun acknowledgeBusinessPage(page: BusinessPage) {
@@ -3488,10 +3501,19 @@ class CollectorService : Service() {
         )
     }
 
+    private fun recordBusinessInputFault(error: Throwable) {
+        // Trips and Telegram processing can stall after telemetry collection has succeeded.
+        // Keep the failure in diagnostics without reclassifying the collection queue.
+        val pending = if (CallbackNormalizationWorker.isPersistentSqliteFault(error))
+            "Business input remains pending; schema/constraint repair and worker restart required"
+        else "Business input remains pending"
+        store.recordEvent("business_input_error", pending, error.diagnosticDetail())
+    }
+
     private fun mainCollectionQueueState(): com.bydcollector.collector.data.callback.CallbackQueueState? {
         if (!::mainCallbackIntake.isInitialized) return null
         val fault = mainPollFailure.get()?.let { "${it.category}: ${it.errorMessage.orEmpty()}" }
-            ?: mainNormalizationFault ?: mainBusinessFault
+            ?: mainNormalizationFault
         return if (fault != null) com.bydcollector.collector.data.callback.CallbackQueueState(
             com.bydcollector.collector.data.callback.CallbackQueuePhase.ERROR, fault)
         else mainCallbackIntake.snapshotQueueState()
@@ -5615,13 +5637,15 @@ class CollectorService : Service() {
     }
 
     private fun handleTelegramExecutionFailure(error: Throwable) {
+        val quarantined = error is TelegramDeliveryConflictQuarantined
         runCatching {
             store.recordEvent(
-                "telegram_delivery_runtime_error",
-                "Telegram delivery result remains pending",
+                if (quarantined) "telegram_delivery_conflict_quarantined" else "telegram_delivery_runtime_error",
+                if (quarantined) "Conflicting Telegram report preserved without retry" else "Telegram delivery result remains pending",
                 error.diagnosticDetail()
             )
         }.onFailure(error::addSuppressed)
+        if (quarantined) return // the owner already schedules the next eligible report
         if (error !is SQLiteException) {
             if (telegramDeliveryRuntime.hasPendingResult) mainHandler.post { scheduleTelegramTick() }
             else if (telegramDeliveryRuntime.hasInFlightDelivery) mainHandler.post { scheduleTelegramTick() }
@@ -6328,6 +6352,7 @@ class CollectorService : Service() {
             restoreAttempt = coordinator::restoreDeliveryAttempt,
             preparedAttemptAction = coordinator::preparedAttemptAction,
             discardPreparedAttempt = coordinator::discardPreparedAttempt,
+            quarantineConflictingAttempt = coordinator::quarantineConflictingAttempt,
             acknowledgeAttempt = coordinator::acknowledgePersistedAttempt
         )
         telegramDeliveryRuntime.resume()

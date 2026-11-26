@@ -109,27 +109,52 @@ class TelegramChargingEtaRuntimeTest {
     }
 
     @Test
-    fun delayedProgressKeepsItsSourceTimeButDoesNotUseStalePower() {
+    fun delayedReportsPreserveTheirMeasurementTimeForecastForAcAndOem() {
+        val delayMs = 72L * 60L * 60L * 1_000L
+        for (selection in ChargingEtaSelection.entries) {
+            val config = config(acSelection = selection)
+            // Replay the same persisted session, not separately generated session IDs.
+            val seed = poll(TelegramEventEngine(), config, 0, 50.0, oemMinutes = 48)
+            fun report(offsetMs: Long, delayedOnlyAtThreshold: Boolean = false): TelegramDetectedEvent {
+                val engine = TelegramEventEngine(TelegramEventState.fromJson(seed.state.toJson()))
+                var result = seed
+                for (sequence in 1L..14L) {
+                    result = poll(engine, config, sequence, if (sequence == 14L) 55.0 else 50.0,
+                        oemMinutes = 48, nowOffsetMs = if (!delayedOnlyAtThreshold || sequence == 14L) offsetMs else 0L)
+                }
+                return result.events.single { it.type == TelegramEventType.CHARGING_PROGRESS }
+            }
+
+            val immediate = report(0)
+            val delayed = report(delayMs)
+            val delayedThresholdOnly = report(delayMs, delayedOnlyAtThreshold = true)
+            val minutes = if (selection == ChargingEtaSelection.CALCULATED) 50L else 48L
+            val finishAt = Instant.ofEpochMilli(WALL_BASE + 70_000L + minutes * 60_000L)
+            assertEquals(minutes.toString() + "m", immediate.variables["charge_time_to_full"])
+            assertEquals(
+                java.text.SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date.from(finishAt)),
+                immediate.variables["charge_full_time"]
+            )
+            for (event in listOf(delayed, delayedThresholdOnly)) {
+                assertEquals(WALL_BASE + 70_000L, event.occurredAtMs)
+                assertEquals(immediate.dedupeKey, event.dedupeKey)
+                assertEquals(immediate.variables, event.variables)
+                assertEquals(immediate.chargingEtaDiagnosticDetail, event.chargingEtaDiagnosticDetail)
+            }
+        }
+    }
+
+    @Test
+    fun delayedReportStillRejectsPowerThatWasAlreadyStaleAtTheMeasurement() {
         val engine = TelegramEventEngine()
         val config = config()
-        poll(engine, config, 0, 50.0)
-        poll(engine, config, 1, 50.0)
-        poll(engine, config, 2, 50.0)
-        var result = poll(engine, config, 3, 50.0)
-        for (sequence in 4L..14L) {
-            result = poll(
-                engine,
-                config,
-                sequence,
-                if (sequence == 14L) 55.0 else 50.0,
-                nowOffsetMs = if (sequence == 14L) 30_000L else 0L
-            )
-        }
-        val progress = result.events.single { it.type == TelegramEventType.CHARGING_PROGRESS }
-        assertEquals(WALL_BASE + 70_000L, progress.occurredAtMs)
-        assertEquals("—", progress.variables["charge_time_to_full"])
-        assertEquals("—", progress.variables["charge_full_time"])
-        assertTrue(progress.chargingEtaDiagnosticDetail.orEmpty().contains("eta_reason=insufficient_power_window"))
+        for (sequence in 0L..14L) poll(engine, config, sequence, 50.0)
+        val result = poll(engine, config, 20L, 55.0,
+            onlyKeys = setOf("statistic_1014_1145045040_5"), nowOffsetMs = 72L * 3_600_000L)
+        val event = result.events.single { it.type == TelegramEventType.CHARGING_PROGRESS }
+        assertEquals("—", event.variables["charge_time_to_full"])
+        assertEquals("—", event.variables["charge_full_time"])
+        assertTrue(event.chargingEtaDiagnosticDetail.orEmpty().contains("eta_reason=insufficient_power_window"))
     }
 
     @Test
@@ -212,7 +237,8 @@ class TelegramChargingEtaRuntimeTest {
         nowOffsetMs: Long = 0L,
         qualified: Boolean = false,
         onlyKeys: Set<String>? = null,
-        invalidVoltage: Boolean = false
+        invalidVoltage: Boolean = false,
+        oemMinutes: Int = 0
     ): TelegramEventResult {
         val elapsedMs = sequence * SAMPLE_INTERVAL_MS
         val source = PollSampleSource(
@@ -231,7 +257,7 @@ class TelegramChargingEtaRuntimeTest {
             PollReading("charging_1009_876609592_5", chargeType.toString(), chargeType.toString()),
             PollReading("charging_1009_876609560_5", bmsState.toString(), bmsState.toString()),
             PollReading("charging_1009_1146095640_5", "0", "0"),
-            PollReading("charging_1009_1146095648_5", "0", "0")
+            PollReading("charging_1009_1146095648_5", oemMinutes.toString(), oemMinutes.toString())
         ).filter { onlyKeys == null || it.rawKey in onlyKeys }.map { reading ->
             if (!qualified) reading else reading.copy(getLineage = DirectGetLineage(
                 BOOT_ID, "eta-helper", 1, 1L, "eta-read:$sequence:${reading.rawKey}", sequence,

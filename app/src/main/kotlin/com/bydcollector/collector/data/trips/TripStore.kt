@@ -87,10 +87,14 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
     }
 
     @Synchronized
-    internal fun acknowledgeBusinessPage(key: String) {
+    internal fun acknowledgeBusinessPage(key: String, archivedCompletions: List<TripCompletionIntent> = emptyList()) {
         val db = writableDb
         db.beginTransaction()
         try {
+            archivedCompletions.forEach {
+                check(db.delete("trip_completion_outbox", "sequence = ? AND identity = ?",
+                    arrayOf(it.sequence.toString(), it.identity)) == 1) { "Archived completion identity changed" }
+            }
             check(db.delete("business_page_handoff", "singleton=1 AND page_key=?", arrayOf(key)) == 1) {
                 "Business page acknowledgment identity changed"
             }
@@ -99,6 +103,7 @@ class TripStore(private val helper: TripDatabaseHelper) : AutoCloseable, EnergyR
         } finally {
             db.endTransaction()
         }
+        if (archivedCompletions.isNotEmpty()) markTripCompletionsChanged()
     }
 
     @Synchronized

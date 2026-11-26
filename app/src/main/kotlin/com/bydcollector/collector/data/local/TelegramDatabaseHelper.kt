@@ -118,6 +118,16 @@ class TelegramDatabaseHelper(
         if (oldVersion < 3) seedLegacyRateLimitCooldown(db)
     }
 
+    override fun onOpen(db: SQLiteDatabase) {
+        super.onOpen(db)
+        if (!db.isReadOnly) db.execSQL(
+            "CREATE TABLE IF NOT EXISTS telegram_conflicting_delivery (" +
+                "dedupe_key TEXT PRIMARY KEY NOT NULL, attempt_id TEXT NOT NULL, owner_id TEXT NOT NULL, " +
+                "sequence INTEGER NOT NULL, event_type TEXT NOT NULL, payload TEXT, key_json TEXT NOT NULL, " +
+                "diagnostic TEXT NOT NULL, archived_at_ms INTEGER NOT NULL)"
+        )
+    }
+
     override fun onDowngrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         error("Telegram database downgrade $oldVersion->$newVersion is not supported")
     }

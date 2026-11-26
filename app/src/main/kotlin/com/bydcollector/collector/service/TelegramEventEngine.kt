@@ -1062,16 +1062,18 @@ class TelegramEventEngine(
             }
             if (!freshness.hasCurrentBoot("charging_time_remaining")) chargingEtaCalculator.invalidateOem(session)
         }
+        // Processing time only bounds valid source stamps. Forecast freshness is event-relative.
+        val etaCycleTimeValid = etaCycleElapsedMs != null && etaNowElapsedMs != null &&
+            etaCycleElapsedMs in 0L..etaNowElapsedMs
         val chargingEtaStateDiagnosticDetail = if (freshness != null && origin == PollOrigin.LIVE &&
             etaCycleBootId == etaCurrentBootId && etaCurrentBootId != null &&
-            etaCycleElapsedMs != null && etaNowElapsedMs != null
+            etaCycleElapsedMs != null && etaCycleTimeValid
         ) {
             updateChargingEtaHistory(
                 input = freshness,
                 observations = observations,
                 currentBootId = etaCurrentBootId,
                 cycleElapsedMs = etaCycleElapsedMs,
-                nowElapsedMs = etaNowElapsedMs,
                 chargeType = resolvedChargeType,
                 batteryChargePower = batteryChargePower,
                 confirmedActive = state.chargingActive == true && evidence.active != false,
@@ -1095,12 +1097,12 @@ class TelegramEventEngine(
                 progressEta = {
                     if (origin == PollOrigin.LIVE && freshness != null && etaCurrentBootId != null &&
                         etaCycleBootId == etaCurrentBootId &&
-                        etaCycleElapsedMs != null && etaNowElapsedMs != null
+                        etaCycleElapsedMs != null && etaCycleTimeValid
                     ) {
                         chargingEtaPresentation(
                             input = freshness,
                             currentBootId = etaCurrentBootId,
-                            nowElapsedMs = etaNowElapsedMs,
+                            cycleElapsedMs = etaCycleElapsedMs,
                             soc = soc,
                             remainingEnergy = remainingEnergy,
                             batteryChargePower = batteryChargePower,
@@ -2256,7 +2258,6 @@ class TelegramEventEngine(
         observations: List<NormalizedObservation>,
         currentBootId: String,
         cycleElapsedMs: Long,
-        nowElapsedMs: Long,
         chargeType: ChargingType,
         batteryChargePower: Double?,
         confirmedActive: Boolean,
@@ -2329,7 +2330,7 @@ class TelegramEventEngine(
                 }
                 chargingEtaCalculator.observeOem(
                     session = session,
-                    evaluatedElapsedMs = nowElapsedMs,
+                    evaluatedElapsedMs = cycleElapsedMs,
                     minuteSourceElapsedMs = minuteStamp.elapsedMs,
                     cycleSourceElapsedMs = cycleElapsedMs,
                     sourceWallMs = minuteStamp.wallMs,
@@ -2345,7 +2346,7 @@ class TelegramEventEngine(
     private fun chargingEtaPresentation(
         input: TelegramOrderedPollInput,
         currentBootId: String,
-        nowElapsedMs: Long,
+        cycleElapsedMs: Long,
         soc: Double?,
         remainingEnergy: Double?,
         batteryChargePower: Double?,
@@ -2358,7 +2359,7 @@ class TelegramEventEngine(
     ): ChargingEtaPresentation {
         val session = chargingEtaSession
         val socStamp = input.sourceStamp("soc")
-            ?.takeIf { it.bootId == currentBootId && input.hasCurrentBoot("soc") }
+            ?.takeIf { it.bootId == currentBootId && it.elapsedMs <= cycleElapsedMs && input.hasCurrentBoot("soc") }
         val currentEnergyStamp = input.sourceStamp("battery_remaining_energy_kwh", freshOnly = false)
             ?.takeIf { it.bootId == currentBootId && input.hasCurrentBoot("battery_remaining_energy_kwh") }
         val useCurrentEnergy = currentEnergyStamp != null && socStamp != null &&
@@ -2372,7 +2373,8 @@ class TelegramEventEngine(
             chargingEtaCalculator.estimate(
                 ChargingEtaInput(
                     session = session,
-                    nowElapsedMs = nowElapsedMs,
+                    // Check power, remaining energy, and OEM freshness at the SOC event.
+                    nowElapsedMs = socStamp.elapsedMs,
                     measuredAtElapsedMs = socStamp.elapsedMs,
                     measuredAtWallMs = socStamp.wallMs,
                     socPct = soc,
